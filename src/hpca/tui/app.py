@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from typing import Any
 
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -16,18 +17,20 @@ from textual.widgets import Footer, Input, Label, ListItem, ListView, Static
 from hpca.agent.builtin_tools import default_tool_registry
 from hpca.agent.context import ToolContext
 from hpca.agent.graph import build_graph, run_turn
+from hpca.agent.job_tools import add_job_tools
 from hpca.agent.tools import ToolRegistry
 from hpca.clipboard import ClipboardManager, CopyResult
 from hpca.config import Settings, app_dir
 from hpca.db import checkpoints_db_path, connect, init_db
+from hpca.jobs import JobRow, JobStore, poll_active
 from hpca.llm import LLMClient
 from hpca.registry import PathRegistry
-from hpca.runner import ProcessRunner
-from hpca.runner import ProcessRecord
+from hpca.runner import ProcessRecord, ProcessRunner
 from hpca.sessions import Session, SessionStore
+from hpca.slurm import SlurmClient
 from hpca.tui.approval_screen import ApprovalScreen
 from hpca.tui.confirm_screen import ConfirmScreen
-from hpca.tui.inspect_screen import InspectScreen
+from hpca.tui.inspect_screen import InspectScreen, format_job, format_process
 from hpca.tui.settings_screen import SettingsScreen
 
 COLUMN_IDS = ("sessions", "chat", "processes")
@@ -160,6 +163,7 @@ class HpcaApp(App):
         *,
         llm: Any = None,
         tools: ToolRegistry | None = None,
+        slurm: SlurmClient | None = None,
         profile: str = "default",
     ) -> None:
         super().__init__()
@@ -167,7 +171,13 @@ class HpcaApp(App):
         self.profile = profile
         self._llm = llm
         self._owns_llm = llm is None
-        self._tools = tools if tools is not None else default_tool_registry()
+        self.slurm = slurm or self._detect_slurm()
+        if tools is not None:
+            self._tools = tools
+        else:
+            self._tools = default_tool_registry()
+            if self.slurm is not None:
+                add_job_tools(self._tools)
         self.active_session: Session | None = None
         self._tool_ctx: ToolContext | None = None
         self._chat_entries: list[tuple[str, str]] = []
@@ -200,10 +210,22 @@ class HpcaApp(App):
             ctx=lambda: self._tool_ctx,
             max_retries=self.settings.llm.max_retries,
         )
+        self.job_store = JobStore(self._conn)
         self._refresh_top_bar()
         await self._reload_sessions()
         self.set_interval(2.0, self.refresh_processes)
+        if self.slurm is not None:
+            self.set_interval(
+                max(5, self.settings.cluster.job_poll_seconds), self.poll_jobs
+            )
         self._focus_column("sessions")
+
+    def _detect_slurm(self) -> SlurmClient | None:
+        """Job tools are available when sbatch exists or a submit host is set."""
+        submit_host = self.settings.cluster.submit_host
+        if submit_host or shutil.which("sbatch"):
+            return SlurmClient(submit_host=submit_host)
+        return None
 
     async def on_unmount(self) -> None:
         if self._saver_ctx is not None:
@@ -289,6 +311,11 @@ class HpcaApp(App):
             ),
             settings=self.settings,
             scripts_dir=app_dir() / "scripts",
+            session_id=session.session_id,
+            profile=self.profile,
+            slurm=self.slurm,
+            jobs=self.job_store,
+            job_log_dir=app_dir() / "job_logs",
         )
 
     async def start_new_session(self) -> None:
@@ -329,13 +356,25 @@ class HpcaApp(App):
 
     async def refresh_processes(self) -> None:
         records = self._tool_ctx.runner.list() if self._tool_ctx else []
-        signature = [(r.pid, r.state) for r in records]
+        jobs = (
+            self.job_store.list(session_id=self.active_session.session_id)
+            if self.active_session
+            else []
+        )
+        signature = [(r.pid, r.state) for r in records] + [
+            (j.job_id, j.state) for j in jobs
+        ]
         if signature == getattr(self, "_process_signature", None):
             return  # unchanged; avoid churn from the 2s timer
         self._process_signature = signature
         processes_list = self.query_one("#processes-list", ListView)
         await processes_list.clear()
         items = []
+        for job in jobs:
+            label = f"{job.state:<9} job {job.job_id} ({job.script_key})"
+            item = ListItem(Static(Content(label), classes="proc-job"))
+            item.data_job = job
+            items.append(item)
         for record in records:
             label = f"{record.state:<9} {record.name} ({record.pid})"
             item = ListItem(Static(Content(label), classes=f"proc-{record.state}"))
@@ -343,36 +382,82 @@ class HpcaApp(App):
             items.append(item)
         processes_list.extend(items)
 
-    def _selected_process(self) -> ProcessRecord | None:
-        processes_list = self.query_one("#processes-list", ListView)
-        return getattr(processes_list.highlighted_child, "data_record", None)
-
-    def inspect_selected_process(self) -> None:
-        record = self._selected_process()
-        if record is not None:
-            self.push_screen(InspectScreen(record))
-
-    def kill_selected_process(self) -> None:
-        record = self._selected_process()
-        if record is None:
+    async def poll_jobs(self) -> None:
+        """Background sacct poll (§5.4); notifies on state changes."""
+        assert self.slurm is not None
+        try:
+            changes = await poll_active(self.slurm, self.job_store)
+        except Exception as e:
+            self.notify(f"Job polling failed: {e}", severity="warning")
             return
-        if record.state != "running":
-            self.notify(f"{record.name} is not running", severity="warning")
-            return
+        for change in changes:
+            self.notify(
+                f"Job {change.job_id}: {change.old_state} → {change.new_state}"
+            )
+        if changes:
+            await self.refresh_processes()
 
-        def on_confirm(confirmed: bool | None) -> None:
-            if confirmed:
-                self.run_worker(self._kill_and_refresh(record.pid))
-
-        self.push_screen(
-            ConfirmScreen(f"Kill process {record.name!r} (pid {record.pid})?"),
-            on_confirm,
+    def _selected_item(self) -> tuple[ProcessRecord | None, JobRow | None]:
+        highlighted = self.query_one("#processes-list", ListView).highlighted_child
+        return (
+            getattr(highlighted, "data_record", None),
+            getattr(highlighted, "data_job", None),
         )
 
-    async def _kill_and_refresh(self, pid: int) -> None:
+    def inspect_selected_process(self) -> None:
+        record, job = self._selected_item()
+        if record is not None:
+            self.push_screen(
+                InspectScreen(f"Process: {record.name}", format_process(record))
+            )
+        elif job is not None:
+            self.push_screen(InspectScreen(f"Job {job.job_id}", format_job(job)))
+
+    def kill_selected_process(self) -> None:
+        record, job = self._selected_item()
+        if record is not None:
+            if record.state != "running":
+                self.notify(f"{record.name} is not running", severity="warning")
+                return
+            self._confirm_then(
+                f"Kill process {record.name!r} (pid {record.pid})?",
+                self._kill_process_and_refresh(record.pid),
+            )
+        elif job is not None:
+            from hpca.slurm import TERMINAL_STATES
+
+            if job.state in TERMINAL_STATES:
+                self.notify(f"Job {job.job_id} is already {job.state}",
+                            severity="warning")
+                return
+            self._confirm_then(
+                f"Cancel cluster job {job.job_id} ({job.script_key})?",
+                self._cancel_job_and_refresh(job.job_id),
+            )
+
+    def _confirm_then(self, question: str, coro) -> None:
+        def on_confirm(confirmed: bool | None) -> None:
+            if confirmed:
+                self.run_worker(coro)
+            else:
+                coro.close()
+
+        self.push_screen(ConfirmScreen(question), on_confirm)
+
+    async def _kill_process_and_refresh(self, pid: int) -> None:
         assert self._tool_ctx is not None
         await self._tool_ctx.runner.kill(pid)
         await self._tool_ctx.runner.wait(pid)
+        await self.refresh_processes()
+
+    async def _cancel_job_and_refresh(self, job_id: str) -> None:
+        assert self.slurm is not None
+        try:
+            await self.slurm.cancel(job_id)
+        except Exception as e:
+            self.notify(f"Cancel failed: {e}", severity="error")
+            return
+        self.job_store.mark(job_id, "CANCELLING")
         await self.refresh_processes()
 
     # -------------------------------------------------------------- chat log

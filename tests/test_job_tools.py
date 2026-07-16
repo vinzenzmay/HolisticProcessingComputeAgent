@@ -1,0 +1,160 @@
+"""Tests for hpca.agent.job_tools: submit_job / job_status / cancel_job (§5.1)."""
+
+import pytest
+
+from hpca.agent.builtin_tools import default_tool_registry
+from hpca.agent.context import ToolContext
+from hpca.agent.job_tools import add_job_tools
+from hpca.config import Settings
+from hpca.db import connect, init_db
+from hpca.jobs import JobStore
+from hpca.registry import PathRegistry
+from hpca.runner import ProcessRunner
+from hpca.slurm import JobStatus, SlurmClient
+
+
+class FakeRun:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls: list[list[str]] = []
+
+    async def __call__(self, argv):
+        self.calls.append(argv)
+        return self.responses.pop(0)
+
+
+@pytest.fixture
+def tools():
+    registry = default_tool_registry()
+    add_job_tools(registry)
+    return registry
+
+
+def make_ctx(tmp_path, fake_run):
+    conn = connect(tmp_path / "hpca.db")
+    init_db(conn)
+    return ToolContext(
+        registry=PathRegistry(conn, profile="default", session_id="s1"),
+        runner=ProcessRunner(conn, session_id="s1", log_dir=tmp_path / "logs"),
+        settings=Settings(),
+        scripts_dir=tmp_path / "scripts",
+        session_id="s1",
+        profile="default",
+        slurm=SlurmClient(run=fake_run),
+        jobs=JobStore(conn),
+        job_log_dir=tmp_path / "job_logs",
+    )
+
+
+async def call(tools, name, ctx, **kwargs):
+    tool = tools.get(name)
+    return await tool.handler(tool.params.model_validate(kwargs), ctx)
+
+
+def register_script(ctx, tmp_path):
+    script = tmp_path / "job.sh"
+    script.write_text("#!/bin/bash\necho hi\n")
+    ctx.registry.register("my_job", script)
+
+
+class TestSubmitJob:
+    async def test_test_only_gate_then_submit(self, tools, tmp_path):
+        run = FakeRun(
+            [
+                (0, "", "sbatch: Job 999 to start at ...\n"),  # --test-only
+                (0, "Submitted batch job 27744534\n", ""),  # real submission
+            ]
+        )
+        ctx = make_ctx(tmp_path, run)
+        register_script(ctx, tmp_path)
+        result = await call(tools, "submit_job", ctx, registry_key="my_job")
+        assert "27744534" in result
+        assert "--test-only" in run.calls[0]
+        assert "--test-only" not in run.calls[1]
+        # job recorded with resolved %j log paths, registered in path registry
+        job = ctx.jobs.get("27744534")
+        assert job is not None
+        assert "27744534" in job.sbatch_stdout_path
+        assert "%j" not in job.sbatch_stdout_path
+        assert "my_job_job_stdout" in ctx.registry.list()
+
+    async def test_test_only_failure_blocks_submission(self, tools, tmp_path):
+        run = FakeRun([(1, "", "sbatch: error: Invalid partition specified\n")])
+        ctx = make_ctx(tmp_path, run)
+        register_script(ctx, tmp_path)
+        result = await call(tools, "submit_job", ctx, registry_key="my_job")
+        assert "NOT submitted" in result
+        assert "Invalid partition" in result
+        assert len(run.calls) == 1  # no real submission attempted
+        assert ctx.jobs.active() == []
+
+    async def test_extra_args_passed_through(self, tools, tmp_path):
+        run = FakeRun(
+            [(0, "", ""), (0, "Submitted batch job 1\n", "")]
+        )
+        ctx = make_ctx(tmp_path, run)
+        register_script(ctx, tmp_path)
+        await call(
+            tools, "submit_job", ctx,
+            registry_key="my_job", args="--mem=8G --time=01:00:00",
+        )
+        assert "--mem=8G" in run.calls[1]
+
+    async def test_unknown_script_key_raises(self, tools, tmp_path):
+        ctx = make_ctx(tmp_path, FakeRun([]))
+        from hpca.registry import UnknownKeyError
+
+        with pytest.raises(UnknownKeyError):
+            await call(tools, "submit_job", ctx, registry_key="ghost")
+
+
+class TestJobStatus:
+    async def test_reports_live_state(self, tools, tmp_path):
+        run = FakeRun(
+            [
+                (0, "", ""),
+                (0, "Submitted batch job 5\n", ""),
+                (0, "5|RUNNING|0:0|00:01:00||4G|01:00:00\n", ""),
+            ]
+        )
+        ctx = make_ctx(tmp_path, run)
+        register_script(ctx, tmp_path)
+        await call(tools, "submit_job", ctx, registry_key="my_job")
+        result = await call(tools, "job_status", ctx, job_id="5")
+        assert "RUNNING" in result
+
+    async def test_accounting_lag_reported_as_submitted(self, tools, tmp_path):
+        run = FakeRun(
+            [(0, "", ""), (0, "Submitted batch job 6\n", ""), (0, "", "")]
+        )
+        ctx = make_ctx(tmp_path, run)
+        register_script(ctx, tmp_path)
+        await call(tools, "submit_job", ctx, registry_key="my_job")
+        result = await call(tools, "job_status", ctx, job_id="6")
+        assert "SUBMITTED" in result
+
+    async def test_unknown_job_id(self, tools, tmp_path):
+        ctx = make_ctx(tmp_path, FakeRun([(0, "", "")]))
+        result = await call(tools, "job_status", ctx, job_id="404")
+        assert "unknown" in result.lower() or "not" in result.lower()
+
+
+class TestCancelJob:
+    async def test_cancel_flagged_destructive(self, tools):
+        assert tools.get("cancel_job").destructive is True
+
+    async def test_cancels_and_updates_store(self, tools, tmp_path):
+        run = FakeRun(
+            [
+                (0, "", ""),
+                (0, "Submitted batch job 7\n", ""),
+                (0, "", ""),  # scancel
+            ]
+        )
+        ctx = make_ctx(tmp_path, run)
+        register_script(ctx, tmp_path)
+        await call(tools, "submit_job", ctx, registry_key="my_job")
+        result = await call(tools, "cancel_job", ctx, job_id="7")
+        assert "cancel" in result.lower()
+        assert run.calls[2][:2] == ["scancel", "7"]
+        assert ctx.jobs.get("7").state == "CANCELLING"

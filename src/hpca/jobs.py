@@ -127,6 +127,14 @@ class JobStore:
         )
         self._conn.commit()
 
+    def mark(self, job_id: str, state: str) -> None:
+        """Set a provisional state (e.g. CANCELLING); sacct confirms it later."""
+        self._conn.execute(
+            "UPDATE jobs SET state = ?, last_checked = ? WHERE job_id = ?",
+            (state, _now(), job_id),
+        )
+        self._conn.commit()
+
     def add_log(
         self,
         job_id: str,
