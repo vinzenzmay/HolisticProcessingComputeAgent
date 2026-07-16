@@ -91,6 +91,9 @@ class PathRegistry:
             )
         return path
 
+    def __contains__(self, key: str) -> bool:
+        return self._get(key) is not None
+
     def list(self) -> dict[str, Path]:
         rows = self._conn.execute(
             "SELECT key, path FROM path_registry "

@@ -53,3 +53,10 @@ class TestInitDb:
         init_db(conn)  # must not raise
         assert EXPECTED_TABLES <= table_names(conn)
         conn.close()
+
+
+class TestConcurrencySettings:
+    def test_busy_timeout_set(self, tmp_path):
+        conn = connect(tmp_path / "hpca.db")
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] >= 5000
+        conn.close()

@@ -104,3 +104,27 @@ class TestList:
         await runner.wait(p2.pid)
         pids = [r.pid for r in runner.list()]
         assert pids == [p2.pid, p1.pid]
+
+
+class TestStartFailureCleanup:
+    async def test_db_insert_failure_kills_process_and_cleans_up(self, runner):
+        import sqlite3
+
+        class FailingConn:
+            """sqlite3.Connection attrs are read-only; proxy instead."""
+
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, *params):
+                if sql.strip().startswith("INSERT INTO processes"):
+                    raise sqlite3.OperationalError("database is locked")
+                return self._real.execute(sql, *params)
+
+            def commit(self):
+                self._real.commit()
+
+        runner._conn = FailingConn(runner._conn)
+        with pytest.raises(sqlite3.OperationalError):
+            await runner.start(["sleep", "60"], name="doomed")
+        assert runner.list() == []  # no half-tracked record

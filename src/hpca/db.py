@@ -67,6 +67,14 @@ def db_path() -> Path:
     return app_dir() / "hpca.db"
 
 
+def checkpoints_db_path() -> Path:
+    """LangGraph checkpoints live in their own file: the checkpointer writes
+    through its own aiosqlite connection during graph execution, and sharing
+    hpca.db produced writer contention ("database is locked") with tool code
+    updating the app tables mid-turn."""
+    return app_dir() / "checkpoints.db"
+
+
 def connect(path: Path | None = None) -> sqlite3.Connection:
     path = path or db_path()
     path.parent.mkdir(parents=True, exist_ok=True)

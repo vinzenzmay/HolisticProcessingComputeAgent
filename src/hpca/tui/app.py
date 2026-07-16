@@ -13,12 +13,16 @@ from textual.containers import Horizontal, Vertical
 from textual.content import Content
 from textual.widgets import Footer, Input, Label, ListItem, ListView, Static
 
+from hpca.agent.builtin_tools import default_tool_registry
+from hpca.agent.context import ToolContext
 from hpca.agent.graph import build_graph, run_turn
 from hpca.agent.tools import ToolRegistry
 from hpca.clipboard import ClipboardManager, CopyResult
-from hpca.config import Settings
-from hpca.db import connect, db_path, init_db
+from hpca.config import Settings, app_dir
+from hpca.db import checkpoints_db_path, connect, init_db
 from hpca.llm import LLMClient
+from hpca.registry import PathRegistry
+from hpca.runner import ProcessRunner
 from hpca.sessions import Session, SessionStore
 from hpca.tui.approval_screen import ApprovalScreen
 from hpca.tui.settings_screen import SettingsScreen
@@ -139,8 +143,9 @@ class HpcaApp(App):
         self.profile = profile
         self._llm = llm
         self._owns_llm = llm is None
-        self._tools = tools if tools is not None else ToolRegistry()
+        self._tools = tools if tools is not None else default_tool_registry()
         self.active_session: Session | None = None
+        self._tool_ctx: ToolContext | None = None
         self._chat_entries: list[tuple[str, str]] = []
         self._conn = None
         self._saver_ctx = None
@@ -160,7 +165,7 @@ class HpcaApp(App):
         self._conn = connect()
         init_db(self._conn)
         self.session_store = SessionStore(self._conn)
-        self._saver_ctx = AsyncSqliteSaver.from_conn_string(str(db_path()))
+        self._saver_ctx = AsyncSqliteSaver.from_conn_string(str(checkpoints_db_path()))
         checkpointer = await self._saver_ctx.__aenter__()
         if self._llm is None:
             self._llm = LLMClient(self.settings.llm)
@@ -168,6 +173,7 @@ class HpcaApp(App):
             llm=self._llm,
             tools=self._tools,
             checkpointer=checkpointer,
+            ctx=lambda: self._tool_ctx,
             max_retries=self.settings.llm.max_retries,
         )
         self._refresh_top_bar()
@@ -206,8 +212,10 @@ class HpcaApp(App):
             return
         event.input.value = ""
         if self.active_session is None:
-            self.active_session = self.session_store.create(
-                profile=self.profile, title=text[:SESSION_TITLE_MAX]
+            self._activate_session(
+                self.session_store.create(
+                    profile=self.profile, title=text[:SESSION_TITLE_MAX]
+                )
             )
             await self._reload_sessions()
         await self._append_chat("user", text)
@@ -242,13 +250,29 @@ class HpcaApp(App):
 
     # -------------------------------------------------------------- sessions
 
+    def _activate_session(self, session: Session) -> None:
+        self.active_session = session
+        self._tool_ctx = ToolContext(
+            registry=PathRegistry(
+                self._conn, profile=self.profile, session_id=session.session_id
+            ),
+            runner=ProcessRunner(
+                self._conn,
+                session_id=session.session_id,
+                log_dir=app_dir() / "proc_logs",
+            ),
+            settings=self.settings,
+            scripts_dir=app_dir() / "scripts",
+        )
+
     async def start_new_session(self) -> None:
         """Clear the chat; a session row is created on the first message."""
         self.active_session = None
+        self._tool_ctx = None
         await self._set_chat_messages([])
 
     async def open_session(self, session: Session) -> None:
-        self.active_session = session
+        self._activate_session(session)
         snapshot = await self.graph.aget_state(
             {"configurable": {"thread_id": session.session_id}}
         )

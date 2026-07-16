@@ -79,22 +79,30 @@ class ProcessRunner:
             stderr_path=stderr_path,
             started_at=datetime.now(timezone.utc).isoformat(),
         )
+        try:
+            self._conn.execute(
+                "INSERT INTO processes (pid, session_id, name, cmd, state, "
+                "stdout_path, stderr_path, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    record.pid,
+                    self._session_id,
+                    record.name,
+                    record.cmd,
+                    record.state,
+                    str(record.stdout_path),
+                    str(record.stderr_path),
+                    record.started_at,
+                ),
+            )
+            self._conn.commit()
+        except Exception:
+            # never leave an untracked process running
+            proc.kill()
+            await proc.wait()
+            stdout_file.close()
+            stderr_file.close()
+            raise
         self._records[proc.pid] = record
-        self._conn.execute(
-            "INSERT INTO processes (pid, session_id, name, cmd, state, "
-            "stdout_path, stderr_path, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                record.pid,
-                self._session_id,
-                record.name,
-                record.cmd,
-                record.state,
-                str(record.stdout_path),
-                str(record.stderr_path),
-                record.started_at,
-            ),
-        )
-        self._conn.commit()
         self._monitors[proc.pid] = asyncio.ensure_future(
             self._monitor(proc, record, stdout_file, stderr_file, timeout_s)
         )

@@ -105,8 +105,9 @@ def build_graph(
                     "the operation was not executed."
                 )
         arguments = tool.params.model_validate(pending["arguments"])
+        context = ctx() if callable(ctx) else ctx  # per-session context provider
         try:
-            output = await tool.handler(arguments, ctx)
+            output = await tool.handler(arguments, context)
             content = f"[tool result] {tool.name}: {output}"
         except Exception as e:  # surfaced to the model, never crashes the graph
             content = f"[tool error] {tool.name}: {type(e).__name__}: {e}"
