@@ -26,6 +26,7 @@ from hpca.config import Settings, app_dir
 from hpca.db import checkpoints_db_path, connect, init_db
 from hpca.jobs import JobRow, JobStore, poll_active
 from hpca.agent.conclude import propose_memories
+from hpca.agent.doc_tools import add_ask_docs, add_doc_tools
 from hpca.agent.prompts import orchestrator_system_prompt
 from hpca.editor import resolve_editor
 from hpca.llm import LLMClient
@@ -34,6 +35,7 @@ from hpca.registry import PathRegistry
 from hpca.runner import ProcessRecord, ProcessRunner
 from hpca.sessions import Session, SessionStore
 from hpca.slurm import SlurmClient
+from hpca.symbols import SymbolIndex
 from hpca.trash import TrashManager
 from hpca.tui.approval_screen import ApprovalScreen
 from hpca.tui.confirm_screen import ConfirmScreen
@@ -184,7 +186,9 @@ class HpcaApp(App):
         if tools is not None:
             self._tools = tools
         else:
-            self._tools = add_file_tools(default_tool_registry())
+            self._tools = add_ask_docs(
+                add_doc_tools(add_file_tools(default_tool_registry()))
+            )
             if self.slurm is not None:
                 add_job_tools(self._tools)
         self.active_session: Session | None = None
@@ -228,6 +232,7 @@ class HpcaApp(App):
             max_retries=self.settings.llm.max_retries,
         )
         self.job_store = JobStore(self._conn)
+        self.symbol_index = SymbolIndex(self._conn)
         self.trash = TrashManager(
             app_dir() / "trash",
             backup_limit_bytes=int(self.settings.safety.backup_limit_gb * 1024**3),
@@ -460,6 +465,7 @@ class HpcaApp(App):
             llm=self._llm,
             trash=self.trash,
             tier1_text=self.profile_memory.tier_text(1),
+            symbols=self.symbol_index,
         )
 
     async def start_new_session(self) -> None:

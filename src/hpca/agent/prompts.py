@@ -14,6 +14,13 @@ RESPOND_VS_TOOL_GUIDANCE = (
 )
 
 
+GROUNDED_ANSWERING_GUIDANCE = (
+    "Never answer technical questions about tools, libraries, APIs, CLI "
+    "flags, file formats, or error messages from memory — call ask_docs and "
+    "relay its cited answer. Answer directly only for conversation and for "
+    "information already present in this conversation."
+)
+
 PATH_WORKFLOW_GUIDANCE = (
     "Tools take registry KEYS, never literal paths. When the user mentions a "
     "path that is not registered yet, first call register_path (copy the "
@@ -41,6 +48,7 @@ def orchestrator_system_prompt(
         "processing on an HPC cluster.",
         RESPOND_VS_TOOL_GUIDANCE,
         PATH_WORKFLOW_GUIDANCE,
+        GROUNDED_ANSWERING_GUIDANCE,
     ]
     if tier1:
         parts.append(f"Standing site notes:\n{tier1}")
