@@ -67,10 +67,14 @@ async def explain_failure(
     llm,
     report: TriageReport,
     *,
+    tier1: str = "",
     max_retries: int = EXPLAIN_MAX_RETRIES,
 ) -> FailureExplanation:
+    system = SYSTEM_PROMPT
+    if tier1:  # tier 1 standing notes go into every agent's prompt (§6.1)
+        system += f"\n\nStanding site notes:\n{tier1}"
     conversation = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system},
         {"role": "user", "content": format_report(report)},
     ]
     last_error = ""

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+from os import environ as os_environ
 from typing import Any
 
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -24,7 +25,11 @@ from hpca.clipboard import ClipboardManager, CopyResult
 from hpca.config import Settings, app_dir
 from hpca.db import checkpoints_db_path, connect, init_db
 from hpca.jobs import JobRow, JobStore, poll_active
+from hpca.agent.conclude import propose_memories
+from hpca.agent.prompts import orchestrator_system_prompt
+from hpca.editor import resolve_editor
 from hpca.llm import LLMClient
+from hpca.profiles import Profile
 from hpca.registry import PathRegistry
 from hpca.runner import ProcessRecord, ProcessRunner
 from hpca.sessions import Session, SessionStore
@@ -33,6 +38,7 @@ from hpca.trash import TrashManager
 from hpca.tui.approval_screen import ApprovalScreen
 from hpca.tui.confirm_screen import ConfirmScreen
 from hpca.tui.inspect_screen import InspectScreen, format_job, format_process
+from hpca.tui.memory_screens import MemoryProposalScreen, TierSelectScreen
 from hpca.tui.settings_screen import SettingsScreen
 
 COLUMN_IDS = ("sessions", "chat", "processes")
@@ -156,6 +162,7 @@ class HpcaApp(App):
         Binding("left", "focus_column(-1)", "◀ column", show=False),
         Binding("right", "focus_column(1)", "column ▶", show=False),
         Binding("s", "open_settings", "settings"),
+        Binding("ctrl+e", "edit_profile", "edit profile", show=False),
         Binding("ctrl+q", "quit", "quit"),
     ]
 
@@ -205,11 +212,19 @@ class HpcaApp(App):
         checkpointer = await self._saver_ctx.__aenter__()
         if self._llm is None:
             self._llm = LLMClient(self.settings.llm)
+        self.profile_memory = Profile.load(self.profile)
+        if self.profile_memory.problems:
+            self.notify(
+                "Profile file has problems: "
+                + "; ".join(self.profile_memory.problems[:3]),
+                severity="warning",
+            )
         self.graph = build_graph(
             llm=self._llm,
             tools=self._tools,
             checkpointer=checkpointer,
             ctx=lambda: self._tool_ctx,
+            system_prompt_fn=self._render_system_prompt,
             max_retries=self.settings.llm.max_retries,
         )
         self.job_store = JobStore(self._conn)
@@ -260,6 +275,13 @@ class HpcaApp(App):
         self.notify(result.message, severity="information" if result.ok else "error")
         return result
 
+    def _render_system_prompt(self) -> str:
+        """Per-call prompt assembly (§4.3): memories + dynamic facts."""
+        return orchestrator_system_prompt(
+            tier1=self.profile_memory.tier_text(1),
+            tier2=self.profile_memory.tier_text(2),
+        )
+
     # ------------------------------------------------------------ chat/agent
 
     @on(Input.Submitted, "#chat-input")
@@ -268,6 +290,9 @@ class HpcaApp(App):
         if not text:
             return
         event.input.value = ""
+        if text.startswith("\\"):
+            self._handle_slash_command(text)
+            return
         if self.active_session is None:
             self._activate_session(
                 self.session_store.create(
@@ -306,6 +331,112 @@ class HpcaApp(App):
     def _on_approval(self, approved: bool | None) -> None:
         self._run_agent(resume=Command(resume={"approved": bool(approved)}))
 
+    # ---------------------------------------------------------------- memory
+
+    def _handle_slash_command(self, text: str) -> None:
+        command, _, rest = text[1:].partition(" ")
+        rest = rest.strip()
+        if command == "memorize":
+            if not rest:
+                self.notify(r"Usage: \memorize <text>", severity="warning")
+                return
+
+            def on_tier(tier: int | None) -> None:
+                if tier is None:
+                    return
+                self.profile_memory.add_memory(
+                    rest, tier=tier, backend=self.settings.llm.model, kind="note"
+                )
+                self.profile_memory.save()
+                self.notify(f"Memorized into tier {tier}.")
+                self.check_memory_caps()
+
+            self.push_screen(TierSelectScreen(rest), on_tier)
+        elif command == "conclude":
+            if self.active_session is None:
+                self.notify("No active session to conclude.", severity="warning")
+                return
+            self.run_worker(self._conclude_worker(), exclusive=True)
+        else:
+            self.notify(f"Unknown command: \\{command}", severity="warning")
+
+    async def _conclude_worker(self) -> None:
+        assert self.active_session is not None
+        snapshot = await self.graph.aget_state(
+            {"configurable": {"thread_id": self.active_session.session_id}}
+        )
+        messages = (snapshot.values or {}).get("messages", [])
+        if not messages:
+            self.notify("Nothing to conclude yet.", severity="warning")
+            return
+        try:
+            proposals = await propose_memories(
+                self._llm, messages, tier1=self.profile_memory.tier_text(1)
+            )
+        except Exception as e:
+            self.notify(f"\\conclude failed: {e}", severity="error")
+            return
+        if not proposals:
+            self.notify("The model proposed no memories for this conversation.")
+            return
+        kept = 0
+        for i, proposal in enumerate(proposals, start=1):
+            approved = await self.push_screen_wait(
+                MemoryProposalScreen(proposal, i, len(proposals))
+            )
+            if approved:
+                self.profile_memory.add_memory(
+                    proposal.text,
+                    tier=proposal.tier,
+                    backend=self.settings.llm.model,
+                    kind=proposal.kind,
+                )
+                kept += 1
+        if kept:
+            self.profile_memory.save()
+        self.notify(f"Kept {kept} of {len(proposals)} proposed memories.")
+        self.check_memory_caps()
+
+    def check_memory_caps(self) -> list[int]:
+        """§6.4 size warnings; returns the tiers currently over their cap."""
+        over = self.profile_memory.over_cap_tiers(
+            tier1_cap=self.settings.memory.tier1_token_cap,
+            tier2_cap=self.settings.memory.tier2_token_cap,
+        )
+        for tier in over:
+            self.notify(
+                f"Profile tier {tier} is over its token cap "
+                f"({self.profile_memory.tier_tokens(tier)} tokens) — "
+                "press ctrl+e to edit the profile externally.",
+                severity="warning",
+                timeout=12,
+            )
+        return over
+
+    def action_edit_profile(self) -> None:
+        """§6.4 (e): suspend the TUI, open the profile in the user's editor."""
+        import subprocess
+
+        self.profile_memory.save()  # ensure the file reflects current state
+        editor = resolve_editor(self.settings.editor, os_environ)
+        path = Profile.path_for(self.profile)
+        try:
+            with self.suspend():
+                subprocess.call(editor + [str(path)])
+        except Exception as e:
+            self.notify(f"Cannot suspend for editing: {e}", severity="error")
+            return
+        self.profile_memory = Profile.load(self.profile)
+        if self.profile_memory.problems:
+            self.notify(
+                "Profile problems after edit: "
+                + "; ".join(self.profile_memory.problems[:3]),
+                severity="warning",
+            )
+        else:
+            self.notify("Profile reloaded.")
+        self.check_memory_caps()
+
     # -------------------------------------------------------------- sessions
 
     def _activate_session(self, session: Session) -> None:
@@ -328,6 +459,7 @@ class HpcaApp(App):
             job_log_dir=app_dir() / "job_logs",
             llm=self._llm,
             trash=self.trash,
+            tier1_text=self.profile_memory.tier_text(1),
         )
 
     async def start_new_session(self) -> None:

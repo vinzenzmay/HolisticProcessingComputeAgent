@@ -22,14 +22,29 @@ PATH_WORKFLOW_GUIDANCE = (
 )
 
 
-def orchestrator_system_prompt(*, environment: str = "") -> str:
-    """System prompt for the orchestrator; dynamic facts injected per render."""
+def environment_facts() -> str:
+    """Dynamic facts, rendered per call — never stored as memories (§4.3)."""
+    from datetime import datetime
+
+    return f"Current date and time: {datetime.now():%Y-%m-%d %H:%M} (local)."
+
+
+def orchestrator_system_prompt(
+    *, environment: str = "", tier1: str = "", tier2: str = ""
+) -> str:
+    """System prompt for the orchestrator; dynamic facts injected per render.
+
+    Tier 1 memories go into *every* agent's prompt, tier 2 only here (§6.1).
+    """
     parts = [
         "You are HPCA, a terminal assistant helping a scientist with data "
         "processing on an HPC cluster.",
         RESPOND_VS_TOOL_GUIDANCE,
         PATH_WORKFLOW_GUIDANCE,
     ]
-    if environment:
-        parts.append(environment)
+    if tier1:
+        parts.append(f"Standing site notes:\n{tier1}")
+    if tier2:
+        parts.append(f"Learnings and preferences from earlier sessions:\n{tier2}")
+    parts.append(environment or environment_facts())
     return "\n\n".join(parts)

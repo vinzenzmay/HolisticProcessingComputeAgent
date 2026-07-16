@@ -201,3 +201,31 @@ class TestSessionSwitching:
             await pilot.pause()
             assert app.active_session is None
             assert chat_texts(app) == []
+
+
+class RecordingLLM(FakeLLM):
+    def __init__(self, outputs):
+        super().__init__(outputs)
+        self.calls = []
+
+    async def chat(self, messages, *, json_schema=None, **kwargs):
+        self.calls.append(list(messages))
+        return await super().chat(messages, json_schema=json_schema, **kwargs)
+
+
+async def test_profile_memories_injected_into_system_prompt(hpca_home):
+    from hpca.profiles import Profile
+
+    profile = Profile.load("default")
+    profile.add_memory("The cluster is called cubi.", tier=1)
+    profile.add_memory("User prefers verbose logs.", tier=2)
+    profile.save()
+
+    llm = RecordingLLM([respond_json("ok")])
+    app = HpcaApp(llm=llm)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await submit_chat(app, pilot, "hello")
+        system = llm.calls[0][0]
+        assert system["role"] == "system"
+        assert "cubi" in system["content"]
+        assert "verbose logs" in system["content"]

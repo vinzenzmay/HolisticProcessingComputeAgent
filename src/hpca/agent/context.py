@@ -26,3 +26,4 @@ class ToolContext:
     job_log_dir: Path | None = None
     llm: object | None = None  # for tools that run their own firewalled LLM call
     trash: TrashManager | None = None
+    tier1_text: str = ""  # standing notes for subagent-style tool calls (§6.1)

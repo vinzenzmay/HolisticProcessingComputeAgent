@@ -138,3 +138,12 @@ class TestExplainLive:
         combined = (result.why + result.suggested_fix).lower()
         assert "mem" in combined
         await llm.close()
+
+
+class TestTier1Injection:
+    async def test_standing_notes_in_system_prompt(self):
+        llm = FakeLLM([VALID])
+        await explain_failure(llm, oom_report(), tier1="Cluster is cubi.")
+        system = llm.calls[0]["messages"][0]
+        assert system["role"] == "system"
+        assert "Cluster is cubi." in system["content"]
