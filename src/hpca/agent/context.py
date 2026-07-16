@@ -10,6 +10,7 @@ from hpca.jobs import JobStore
 from hpca.registry import PathRegistry
 from hpca.runner import ProcessRunner
 from hpca.slurm import SlurmClient
+from hpca.symbols import SymbolIndex
 from hpca.trash import TrashManager
 
 
@@ -27,3 +28,4 @@ class ToolContext:
     llm: object | None = None  # for tools that run their own firewalled LLM call
     trash: TrashManager | None = None
     tier1_text: str = ""  # standing notes for subagent-style tool calls (§6.1)
+    symbols: SymbolIndex | None = None

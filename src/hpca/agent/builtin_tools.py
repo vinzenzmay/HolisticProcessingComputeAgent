@@ -17,6 +17,7 @@ from hpca.agent.context import ToolContext
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.checks import syntax_check
 from hpca.registry import RegistryError
+from hpca.verify_code import format_gate_failure, format_gate_warnings, verify_script
 
 SCRIPT_SUFFIX = {"bash": ".sh", "python": ".py", "R": ".R", "snakemake": ".smk"}
 INTERPRETER = {
@@ -60,7 +61,8 @@ async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
             "it would do nothing. Put each script line into its own "
             "content_lines array element and call create_script again."
         )
-    path.write_text("\n".join(lines) + "\n")
+    content = "\n".join(lines) + "\n"
+    path.write_text(content)
     check = await syntax_check(args.kind, path)
     if not check.ok:
         path.unlink(missing_ok=True)
@@ -68,8 +70,21 @@ async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
             f"Script NOT created: {check.checker} found syntax errors — fix "
             f"the script and call create_script again:\n{check.errors}"
         )
+    warnings: list[str] = []
+    if check.skipped:
+        warnings.append(check.errors)
+    if ctx.symbols is not None and ctx.symbols.count() > 0:
+        # semantic code-vs-docs gate (§5.2): mismatches block, gaps only warn
+        reports = verify_script(args.kind, content, index=ctx.symbols)
+        mismatches = [r for r in reports if r.status == "mismatch"]
+        if mismatches:
+            path.unlink(missing_ok=True)
+            return format_gate_failure(mismatches)
+        not_indexed = [r for r in reports if r.status == "not_indexed"]
+        if not_indexed:
+            warnings.append(format_gate_warnings(not_indexed))
     ctx.registry.register(args.registry_key, path)
-    note = f" ({check.errors})" if check.skipped else ""
+    note = f" ({'; '.join(warnings)})" if warnings else ""
     return (
         f"Created script {args.registry_key!r} ({args.kind}); "
         f"syntax check ok{note}. Start it with start_script."
