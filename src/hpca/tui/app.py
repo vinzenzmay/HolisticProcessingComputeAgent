@@ -16,6 +16,7 @@ from textual.widgets import Footer, Input, Label, ListItem, ListView, Static
 
 from hpca.agent.builtin_tools import default_tool_registry
 from hpca.agent.context import ToolContext
+from hpca.agent.file_tools import add_file_tools
 from hpca.agent.graph import build_graph, run_turn
 from hpca.agent.job_tools import add_job_tools
 from hpca.agent.tools import ToolRegistry
@@ -28,6 +29,7 @@ from hpca.registry import PathRegistry
 from hpca.runner import ProcessRecord, ProcessRunner
 from hpca.sessions import Session, SessionStore
 from hpca.slurm import SlurmClient
+from hpca.trash import TrashManager
 from hpca.tui.approval_screen import ApprovalScreen
 from hpca.tui.confirm_screen import ConfirmScreen
 from hpca.tui.inspect_screen import InspectScreen, format_job, format_process
@@ -175,7 +177,7 @@ class HpcaApp(App):
         if tools is not None:
             self._tools = tools
         else:
-            self._tools = default_tool_registry()
+            self._tools = add_file_tools(default_tool_registry())
             if self.slurm is not None:
                 add_job_tools(self._tools)
         self.active_session: Session | None = None
@@ -211,6 +213,14 @@ class HpcaApp(App):
             max_retries=self.settings.llm.max_retries,
         )
         self.job_store = JobStore(self._conn)
+        self.trash = TrashManager(
+            app_dir() / "trash",
+            backup_limit_bytes=int(self.settings.safety.backup_limit_gb * 1024**3),
+        )
+        removed = self.trash.cleanup(self.settings.safety.trash_ttl_days)
+        if removed:
+            self.notify(f"Trash: cleaned up {removed} expired entr"
+                        f"{'y' if removed == 1 else 'ies'}")
         self._refresh_top_bar()
         await self._reload_sessions()
         self.set_interval(2.0, self.refresh_processes)
@@ -317,6 +327,7 @@ class HpcaApp(App):
             jobs=self.job_store,
             job_log_dir=app_dir() / "job_logs",
             llm=self._llm,
+            trash=self.trash,
         )
 
     async def start_new_session(self) -> None:

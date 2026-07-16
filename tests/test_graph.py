@@ -155,6 +155,33 @@ class TestDestructiveGate:
         assert any("denied" in m["content"].lower() for m in second_call)
         assert not any("deleted results/" in m["content"] for m in second_call)
 
+    async def test_conditionally_destructive_tool(self, tools):
+        class FlagParams(BaseModel):
+            danger: bool = False
+
+        async def flag_handler(args, ctx):
+            return "flagged"
+
+        tools.register(
+            Tool(
+                name="flag",
+                description="conditionally destructive",
+                params=FlagParams,
+                handler=flag_handler,
+                is_destructive_call=lambda args, ctx: args.danger,
+            )
+        )
+        llm = FakeLLM(
+            [tool_json("flag", danger=False), respond_json("safe done"),
+             tool_json("flag", danger=True)]
+        )
+        graph = make_graph(llm, tools)
+        result = await run_turn(graph, session_id="s1", user_text="safe")
+        assert result.interrupt is None and result.reply == "safe done"
+        result = await run_turn(graph, session_id="s2", user_text="dangerous")
+        assert result.interrupt is not None
+        assert result.interrupt["tool"] == "flag"
+
     async def test_non_destructive_tool_does_not_interrupt(self, tools):
         llm = FakeLLM([tool_json("echo", text="x"), respond_json("done")])
         graph = make_graph(llm, tools)

@@ -22,6 +22,21 @@ class Tool:
     params: type[BaseModel]
     handler: Handler
     destructive: bool = False
+    # Conditional destructiveness (e.g. move only when the target exists).
+    # Must be a side-effect-free, deterministic predicate: the graph node
+    # re-runs it when resuming from an interrupt.
+    is_destructive_call: Callable[[BaseModel, Any], bool] | None = None
+    # Human-readable description of one call with *resolved real paths* for
+    # the confirmation modal (§5.3). Same purity rules as above.
+    describe_call: Callable[[BaseModel, Any], str] | None = None
+
+    def gates(self, arguments: BaseModel, ctx: Any) -> bool:
+        """Whether this specific call needs the HITL gate (§5.3)."""
+        if self.destructive:
+            return True
+        if self.is_destructive_call is not None:
+            return self.is_destructive_call(arguments, ctx)
+        return False
 
 
 @dataclass

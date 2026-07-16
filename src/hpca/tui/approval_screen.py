@@ -48,11 +48,15 @@ class ApprovalScreen(ModalScreen[bool]):
         self._payload = payload
 
     def details_text(self) -> str:
-        return (
+        text = (
             f"Tool: {self._payload.get('tool')}\n"
             f"Arguments: {json.dumps(self._payload.get('arguments'), indent=2)}\n"
             f"{self._payload.get('description', '')}"
         )
+        details = self._payload.get("details")
+        if details:  # resolved real paths (§5.3)
+            text += f"\n\n{details}"
+        return text
 
     def compose(self) -> ComposeResult:
         with Vertical(id="approval-dialog"):

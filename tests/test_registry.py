@@ -99,3 +99,28 @@ class TestScoping:
         with pytest.raises(UnknownKeyError):
             r2.resolve("x")
         conn.close()
+
+
+class TestRemoveReassign:
+    def test_remove(self, registry, tmp_path):
+        registry.register("x", tmp_path / "a.txt")
+        registry.remove("x")
+        assert "x" not in registry
+
+    def test_remove_unknown_raises(self, registry):
+        with pytest.raises(UnknownKeyError):
+            registry.remove("ghost")
+
+    def test_reassign(self, registry, tmp_path):
+        registry.register("x", tmp_path / "a.txt")
+        registry.reassign("x", tmp_path / "b.txt")
+        assert registry.resolve("x") == tmp_path / "b.txt"
+
+    def test_reassign_unknown_raises(self, registry, tmp_path):
+        with pytest.raises(UnknownKeyError):
+            registry.reassign("ghost", tmp_path / "b.txt")
+
+    def test_reassign_relative_rejected(self, registry, tmp_path):
+        registry.register("x", tmp_path / "a.txt")
+        with pytest.raises(RegistryError, match="absolute"):
+            registry.reassign("x", "rel/path.txt")

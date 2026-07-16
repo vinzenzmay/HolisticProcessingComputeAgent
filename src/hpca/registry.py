@@ -94,6 +94,29 @@ class PathRegistry:
     def __contains__(self, key: str) -> bool:
         return self._get(key) is not None
 
+    def remove(self, key: str) -> None:
+        """Drop a key (e.g. after its file was deleted); missing keys error."""
+        self.resolve(key)  # raises UnknownKeyError with the available keys
+        self._conn.execute(
+            "DELETE FROM path_registry "
+            "WHERE profile = ? AND session_id = ? AND key = ?",
+            (self._profile, self._session_id, key),
+        )
+        self._conn.commit()
+
+    def reassign(self, key: str, path: Path | str) -> None:
+        """Point an existing key at a new absolute path (e.g. after a move)."""
+        self.resolve(key)
+        path = Path(path)
+        if not path.is_absolute():
+            raise RegistryError(f"Registry paths must be absolute, got {path!r}")
+        self._conn.execute(
+            "UPDATE path_registry SET path = ? "
+            "WHERE profile = ? AND session_id = ? AND key = ?",
+            (str(path), self._profile, self._session_id, key),
+        )
+        self._conn.commit()
+
     def list(self) -> dict[str, Path]:
         rows = self._conn.execute(
             "SELECT key, path FROM path_registry "

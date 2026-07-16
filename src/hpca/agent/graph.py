@@ -86,14 +86,17 @@ def build_graph(
         pending = state["pending_tool"]
         assert pending is not None
         tool = tools.get(pending["tool"])
-        if tool.destructive:
-            verdict = interrupt(
-                {
-                    "tool": tool.name,
-                    "arguments": pending["arguments"],
-                    "description": tool.description,
-                }
-            )
+        arguments = tool.params.model_validate(pending["arguments"])
+        context = ctx() if callable(ctx) else ctx  # per-session context provider
+        if tool.gates(arguments, context):
+            payload = {
+                "tool": tool.name,
+                "arguments": pending["arguments"],
+                "description": tool.description,
+            }
+            if tool.describe_call is not None:
+                payload["details"] = tool.describe_call(arguments, context)
+            verdict = interrupt(payload)
             approved = (
                 bool(verdict.get("approved"))
                 if isinstance(verdict, dict)
@@ -104,8 +107,6 @@ def build_graph(
                     f"[tool result] {tool.name}: DENIED by the user — "
                     "the operation was not executed."
                 )
-        arguments = tool.params.model_validate(pending["arguments"])
-        context = ctx() if callable(ctx) else ctx  # per-session context provider
         try:
             output = await tool.handler(arguments, context)
             content = f"[tool result] {tool.name}: {output}"

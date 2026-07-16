@@ -10,6 +10,7 @@ from hpca.jobs import JobStore
 from hpca.registry import PathRegistry
 from hpca.runner import ProcessRunner
 from hpca.slurm import SlurmClient
+from hpca.trash import TrashManager
 
 
 @dataclass
@@ -24,3 +25,4 @@ class ToolContext:
     jobs: JobStore | None = None
     job_log_dir: Path | None = None
     llm: object | None = None  # for tools that run their own firewalled LLM call
+    trash: TrashManager | None = None

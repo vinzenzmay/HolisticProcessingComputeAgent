@@ -14,12 +14,21 @@ RESPOND_VS_TOOL_GUIDANCE = (
 )
 
 
+PATH_WORKFLOW_GUIDANCE = (
+    "Tools take registry KEYS, never literal paths. When the user mentions a "
+    "path that is not registered yet, first call register_path (copy the "
+    "path from the user's message exactly), then call the actual tool with "
+    "the new key. Do not ask the user to register paths — that is your job."
+)
+
+
 def orchestrator_system_prompt(*, environment: str = "") -> str:
     """System prompt for the orchestrator; dynamic facts injected per render."""
     parts = [
         "You are HPCA, a terminal assistant helping a scientist with data "
         "processing on an HPC cluster.",
         RESPOND_VS_TOOL_GUIDANCE,
+        PATH_WORKFLOW_GUIDANCE,
     ]
     if environment:
         parts.append(environment)
