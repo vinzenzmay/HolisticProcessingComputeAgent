@@ -134,3 +134,10 @@ class TestSettingsModal:
             await pilot.pause()
             assert isinstance(app.screen, SettingsScreen)
             assert not (hpca_home / "settings.json").exists()
+
+
+async def test_copy_text_uses_clipboard_manager(hpca_home):
+    app = HpcaApp()
+    async with app.run_test(size=(120, 40)):
+        result = app.copy_text("hello from hpca")
+        assert result.ok

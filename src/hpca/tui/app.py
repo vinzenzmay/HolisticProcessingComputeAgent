@@ -7,6 +7,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Footer, ListView, Static
 
+from hpca.clipboard import ClipboardManager, CopyResult
 from hpca.config import Settings
 from hpca.tui.settings_screen import SettingsScreen
 
@@ -100,8 +101,24 @@ class HpcaApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        self.clipboard_manager = ClipboardManager(
+            self.settings.clipboard, emit=self._emit_to_terminal
+        )
         self._refresh_top_bar()
         self._focus_column("sessions")
+
+    def _emit_to_terminal(self, sequence: str) -> None:
+        """Write a raw escape sequence through the driver (bypasses compositor)."""
+        driver = self._driver
+        if driver is None:
+            raise RuntimeError("no driver")
+        driver.write(sequence)
+
+    def copy_text(self, text: str) -> CopyResult:
+        """Copy text via the tiered ClipboardManager and toast the outcome."""
+        result = self.clipboard_manager.copy(text)
+        self.notify(result.message, severity="information" if result.ok else "error")
+        return result
 
     @property
     def focused_column_id(self) -> str | None:
