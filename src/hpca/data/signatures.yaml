@@ -1,0 +1,89 @@
+# Built-in error signature library (§5.5). User-extensible: entries in
+# ~/.HolisticProcessingComputeAgent/signatures.yaml are merged on top and an
+# entry with an existing id replaces the built-in one.
+#
+# Fields: id, title, patterns (list of case-insensitive regexes matched per
+# line), hint (deterministic suggestion shown alongside the excerpt).
+
+- id: oom_kill
+  title: Out of memory (OOM kill)
+  patterns:
+    - "oom[-_ ]?kill"
+    - "out of memory"
+    - "MemoryError"
+    - "Cannot allocate memory"
+    - "std::bad_alloc"
+  hint: >-
+    The job exceeded its memory allocation. Increase the request
+    (e.g. sbatch --mem=...) or reduce the working set / thread count.
+
+- id: time_limit
+  title: Walltime limit reached
+  patterns:
+    - "DUE TO TIME LIMIT"
+  hint: >-
+    The job hit its time limit. Increase --time, checkpoint/restart, or
+    split the work into smaller jobs.
+
+- id: command_not_found
+  title: Command not found
+  patterns:
+    - "command not found"
+    - "No module named "
+  hint: >-
+    A required tool or module is missing from the environment. Check
+    spelling, load the right environment module / conda env in the script.
+
+- id: python_traceback
+  title: Python exception
+  patterns:
+    - 'Traceback \(most recent call last\)'
+  hint: >-
+    The Python script raised an exception; the last excerpt line names the
+    error type and message.
+
+- id: r_error
+  title: R error
+  patterns:
+    - "^Error in "
+    - "^Error: "
+    - "Execution halted"
+  hint: The R script failed; see the Error line in the excerpt.
+
+- id: snakemake_rule_failure
+  title: Snakemake rule failure
+  patterns:
+    - "Error in rule "
+    - "SnakemakeError"
+    - "WorkflowError"
+  hint: >-
+    A workflow rule failed; check the rule's own log file listed near
+    'Error in rule' for the underlying tool error.
+
+- id: missing_input
+  title: Missing file
+  patterns:
+    - "No such file or directory"
+    - "MissingInputException"
+    - "FileNotFoundError"
+  hint: >-
+    An input path does not exist (or a filesystem was unavailable). Verify
+    the path and any preceding step that should have produced it.
+
+- id: permission_denied
+  title: Permission denied
+  patterns:
+    - "Permission denied"
+    - "PermissionError"
+  hint: >-
+    Access was refused. Check file/directory ownership and group permissions
+    (project directories often need the right group).
+
+- id: quota_exceeded
+  title: Disk quota exceeded
+  patterns:
+    - "quota exceeded"
+    - "No space left on device"
+  hint: >-
+    The filesystem is full or the quota is exhausted. Clean up scratch
+    space, or write outputs to a filesystem with room.
