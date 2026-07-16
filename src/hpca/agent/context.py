@@ -23,3 +23,4 @@ class ToolContext:
     slurm: SlurmClient | None = None
     jobs: JobStore | None = None
     job_log_dir: Path | None = None
+    llm: object | None = None  # for tools that run their own firewalled LLM call

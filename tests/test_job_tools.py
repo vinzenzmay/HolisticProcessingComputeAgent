@@ -158,3 +158,58 @@ class TestCancelJob:
         assert "cancel" in result.lower()
         assert run.calls[2][:2] == ["scancel", "7"]
         assert ctx.jobs.get("7").state == "CANCELLING"
+
+
+VALID_EXPLANATION = '{"why": "Ran out of memory loading the index.", "current_state": "Job was OOM-killed.", "suggested_fix": "Resubmit with --mem=50G.", "finickiness": "easy", "justification": "Simple resource bump."}'
+
+
+class FakeLLM:
+    def __init__(self, outputs):
+        self._outputs = list(outputs)
+
+    async def chat(self, messages, *, json_schema=None, **kwargs):
+        from hpca.llm import ChatResponse
+
+        return ChatResponse(content=self._outputs.pop(0))
+
+    async def supports_constrained_decoding(self):
+        return True
+
+
+class TestGetJobReport:
+    async def test_report_with_explanation(self, tools, tmp_path):
+        run = FakeRun(
+            [
+                (0, "", ""),
+                (0, "Submitted batch job 8\n", ""),
+                (0, "8|OUT_OF_MEMORY|0:125|00:05:00||25G|01:00:00\n", ""),
+            ]
+        )
+        ctx = make_ctx(tmp_path, run)
+        ctx.llm = FakeLLM([VALID_EXPLANATION])
+        register_script(ctx, tmp_path)
+        await call(tools, "submit_job", ctx, registry_key="my_job")
+        result = await call(tools, "get_job_report", ctx, job_id="8")
+        assert "OUT_OF_MEMORY" in result
+        assert "Out of memory" in result  # state-derived signature title
+        assert "finickiness: easy" in result
+        assert "--mem=50G" in result
+
+    async def test_unknown_job(self, tools, tmp_path):
+        ctx = make_ctx(tmp_path, FakeRun([]))
+        result = await call(tools, "get_job_report", ctx, job_id="404")
+        assert "not in the job DB" in result
+
+    async def test_without_llm_returns_deterministic_header(self, tools, tmp_path):
+        run = FakeRun(
+            [
+                (0, "", ""),
+                (0, "Submitted batch job 9\n", ""),
+                (0, "9|FAILED|1:0|00:01:00||4G|01:00:00\n", ""),
+            ]
+        )
+        ctx = make_ctx(tmp_path, run)
+        register_script(ctx, tmp_path)
+        await call(tools, "submit_job", ctx, registry_key="my_job")
+        result = await call(tools, "get_job_report", ctx, job_id="9")
+        assert "FAILED" in result

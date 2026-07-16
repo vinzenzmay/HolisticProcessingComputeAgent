@@ -316,6 +316,7 @@ class HpcaApp(App):
             slurm=self.slurm,
             jobs=self.job_store,
             job_log_dir=app_dir() / "job_logs",
+            llm=self._llm,
         )
 
     async def start_new_session(self) -> None:

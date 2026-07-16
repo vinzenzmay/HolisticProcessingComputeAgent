@@ -8,11 +8,15 @@ the job DB (§5.4), and registers the resolved paths in the path registry.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from pydantic import BaseModel, Field
 
 from hpca.agent.context import ToolContext
+from hpca.agent.explainer import explain_failure
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.slurm import JobStatus
+from hpca.triage import load_signatures, triage_job
 
 
 def _require_cluster(ctx: ToolContext):
@@ -105,6 +109,32 @@ async def job_status(args: JobStatusParams, ctx: ToolContext) -> str:
     return f"Job {args.job_id}: {_format_status(status)}"
 
 
+class GetJobReportParams(BaseModel):
+    job_id: str = Field(description="Slurm job id to triage")
+
+
+async def get_job_report(args: GetJobReportParams, ctx: ToolContext) -> str:
+    """Triaged failure report (§5.5): deterministic scan + firewalled explainer."""
+    slurm, jobs, _ = _require_cluster(ctx)
+    row = jobs.get(args.job_id)
+    if row is None:
+        return f"Job {args.job_id} is not in the job DB."
+    statuses = await slurm.status([args.job_id])
+    status = statuses.get(args.job_id)
+    if status is not None:
+        jobs.update_status(status)
+    extra_logs = [Path(log.log_path) for log in jobs.logs(args.job_id)]
+    report = triage_job(
+        row, status, signatures=load_signatures(), extra_logs=extra_logs
+    )
+    matched = ", ".join(m.title for m in report.matches) or "no known signature"
+    header = f"Job {args.job_id} ({row.script_key}): {report.state} — {matched}."
+    if ctx.llm is None:
+        return header
+    explanation = await explain_failure(ctx.llm, report)
+    return f"{header}\n{explanation.render()}"
+
+
 class CancelJobParams(BaseModel):
     job_id: str = Field(description="Slurm job id to cancel")
 
@@ -134,6 +164,15 @@ def add_job_tools(registry: ToolRegistry) -> ToolRegistry:
             description="Current state of a cluster job",
             params=JobStatusParams,
             handler=job_status,
+        )
+    )
+    registry.register(
+        Tool(
+            name="get_job_report",
+            description="Triaged failure report for a job: why it failed, "
+            "suggested fix",
+            params=GetJobReportParams,
+            handler=get_job_report,
         )
     )
     registry.register(
