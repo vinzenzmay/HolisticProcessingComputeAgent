@@ -51,11 +51,14 @@ CREATE TABLE IF NOT EXISTS path_registry (
 CREATE TABLE IF NOT EXISTS processes (
     pid INTEGER,
     session_id TEXT,
+    name TEXT,
     cmd TEXT,
     state TEXT,
     stdout_path TEXT,
     stderr_path TEXT,
-    started_at TEXT
+    started_at TEXT,
+    exit_code INTEGER,
+    exit_info TEXT
 );
 """
 
