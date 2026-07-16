@@ -23,8 +23,11 @@ from hpca.db import checkpoints_db_path, connect, init_db
 from hpca.llm import LLMClient
 from hpca.registry import PathRegistry
 from hpca.runner import ProcessRunner
+from hpca.runner import ProcessRecord
 from hpca.sessions import Session, SessionStore
 from hpca.tui.approval_screen import ApprovalScreen
+from hpca.tui.confirm_screen import ConfirmScreen
+from hpca.tui.inspect_screen import InspectScreen
 from hpca.tui.settings_screen import SettingsScreen
 
 COLUMN_IDS = ("sessions", "chat", "processes")
@@ -67,6 +70,27 @@ class ChatPanel(ColumnPanel):
         yield Static(self._title, classes="column-title")
         yield ListView(id="chat-list")
         yield Input(placeholder="Message the agent…", id="chat-input")
+
+
+class ProcessesList(ListView):
+    """Right-column list; its hotkeys appear in the footer when focused."""
+
+    BINDINGS = [
+        Binding("i", "inspect_process", "inspect"),
+        Binding("k", "kill_process", "kill"),
+    ]
+
+    def action_inspect_process(self) -> None:
+        self.app.inspect_selected_process()
+
+    def action_kill_process(self) -> None:
+        self.app.kill_selected_process()
+
+
+class ProcessesPanel(ColumnPanel):
+    def compose(self) -> ComposeResult:
+        yield Static(self._title, classes="column-title")
+        yield ProcessesList(id="processes-list")
 
 
 class HpcaApp(App):
@@ -155,7 +179,7 @@ class HpcaApp(App):
         with Horizontal(id="columns"):
             yield ColumnPanel("Sessions", id="sessions")
             yield ChatPanel("Chat", id="chat")
-            yield ColumnPanel("Processes", id="processes")
+            yield ProcessesPanel("Processes", id="processes")
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -178,6 +202,7 @@ class HpcaApp(App):
         )
         self._refresh_top_bar()
         await self._reload_sessions()
+        self.set_interval(2.0, self.refresh_processes)
         self._focus_column("sessions")
 
     async def on_unmount(self) -> None:
@@ -242,6 +267,7 @@ class HpcaApp(App):
             self.notify(str(e), severity="error")
             return
         await self._set_chat_messages(result.messages)
+        await self.refresh_processes()
         if result.interrupt is not None:
             self.push_screen(ApprovalScreen(result.interrupt), self._on_approval)
 
@@ -298,6 +324,56 @@ class HpcaApp(App):
             item.data_session = session
             items.append(item)
         sessions_list.extend(items)
+
+    # ------------------------------------------------------------- processes
+
+    async def refresh_processes(self) -> None:
+        records = self._tool_ctx.runner.list() if self._tool_ctx else []
+        signature = [(r.pid, r.state) for r in records]
+        if signature == getattr(self, "_process_signature", None):
+            return  # unchanged; avoid churn from the 2s timer
+        self._process_signature = signature
+        processes_list = self.query_one("#processes-list", ListView)
+        await processes_list.clear()
+        items = []
+        for record in records:
+            label = f"{record.state:<9} {record.name} ({record.pid})"
+            item = ListItem(Static(Content(label), classes=f"proc-{record.state}"))
+            item.data_record = record
+            items.append(item)
+        processes_list.extend(items)
+
+    def _selected_process(self) -> ProcessRecord | None:
+        processes_list = self.query_one("#processes-list", ListView)
+        return getattr(processes_list.highlighted_child, "data_record", None)
+
+    def inspect_selected_process(self) -> None:
+        record = self._selected_process()
+        if record is not None:
+            self.push_screen(InspectScreen(record))
+
+    def kill_selected_process(self) -> None:
+        record = self._selected_process()
+        if record is None:
+            return
+        if record.state != "running":
+            self.notify(f"{record.name} is not running", severity="warning")
+            return
+
+        def on_confirm(confirmed: bool | None) -> None:
+            if confirmed:
+                self.run_worker(self._kill_and_refresh(record.pid))
+
+        self.push_screen(
+            ConfirmScreen(f"Kill process {record.name!r} (pid {record.pid})?"),
+            on_confirm,
+        )
+
+    async def _kill_and_refresh(self, pid: int) -> None:
+        assert self._tool_ctx is not None
+        await self._tool_ctx.runner.kill(pid)
+        await self._tool_ctx.runner.wait(pid)
+        await self.refresh_processes()
 
     # -------------------------------------------------------------- chat log
 
