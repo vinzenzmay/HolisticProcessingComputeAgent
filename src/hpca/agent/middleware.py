@@ -79,6 +79,12 @@ def format_instruction(tools: ToolRegistry) -> str:
     output syntax — without this listing the model does not know which tools
     exist and claims it has none (observed on the live Qwen3.6 backend).
     """
+    if len(tools) == 0:
+        return (
+            "Answer with exactly one JSON object and nothing else: "
+            '{"action": "respond", "response": "<your answer>"}. '
+            "You have no tools available in this context."
+        )
     tool_lines = "\n".join(
         f'- {{"action": "tool_call", "tool": "{tool.name}", "arguments": '
         f"{json.dumps(_example_args(tool))}}} — {tool.description}"

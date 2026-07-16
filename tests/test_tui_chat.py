@@ -1,0 +1,203 @@
+"""Tests for the chat wiring: input → agent worker → chat log, sessions, approval."""
+
+import json
+
+import pytest
+from pydantic import BaseModel, Field
+from textual.widgets import Input, ListView
+
+from hpca.agent.tools import Tool, ToolRegistry
+from hpca.llm import ChatResponse
+from hpca.tui.app import HpcaApp
+from hpca.tui.approval_screen import ApprovalScreen
+
+
+class DeleteParams(BaseModel):
+    target: str = Field(description="What to delete")
+
+
+async def delete_handler(args, ctx):
+    return f"deleted {args.target}"
+
+
+class FakeLLM:
+    def __init__(self, outputs):
+        self._outputs = list(outputs)
+
+    async def chat(self, messages, *, json_schema=None, **kwargs):
+        return ChatResponse(content=self._outputs.pop(0))
+
+    async def supports_constrained_decoding(self):
+        return True
+
+
+def respond_json(text="done"):
+    return json.dumps({"action": "respond", "response": text})
+
+
+def tool_json(tool, **arguments):
+    return json.dumps({"action": "tool_call", "tool": tool, "arguments": arguments})
+
+
+@pytest.fixture
+def hpca_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("HPCA_HOME", str(tmp_path))
+    return tmp_path
+
+
+def destructive_tools():
+    registry = ToolRegistry()
+    registry.register(
+        Tool(
+            name="delete",
+            description="Delete something",
+            params=DeleteParams,
+            handler=delete_handler,
+            destructive=True,
+        )
+    )
+    return registry
+
+
+def chat_texts(app):
+    return app.chat_log_texts()
+
+
+async def submit_chat(app, pilot, text):
+    chat_input = app.query_one("#chat-input", Input)
+    chat_input.focus()
+    chat_input.value = text
+    await pilot.press("enter")
+    await app.workers.wait_for_complete()
+    await pilot.pause()
+
+
+class TestChatFlow:
+    async def test_user_and_assistant_messages_appear(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM([respond_json("hello back")]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "hello agent")
+            texts = chat_texts(app)
+            assert any("hello agent" in t for t in texts)
+            assert any("hello back" in t for t in texts)
+
+    async def test_first_message_creates_session(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM([respond_json()]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            assert app.session_store.list(profile="default") == []
+            await submit_chat(app, pilot, "start my session")
+            sessions = app.session_store.list(profile="default")
+            assert len(sessions) == 1
+            assert "start my session" in sessions[0].title
+
+    async def test_second_turn_same_session(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM([respond_json("one"), respond_json("two")]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "first")
+            await submit_chat(app, pilot, "second")
+            assert len(app.session_store.list(profile="default")) == 1
+            texts = chat_texts(app)
+            assert any("one" in t for t in texts)
+            assert any("two" in t for t in texts)
+
+    async def test_llm_failure_shown_as_error(self, hpca_home):
+        class BrokenLLM:
+            async def chat(self, *a, **k):
+                from hpca.llm import LLMError
+
+                raise LLMError("backend unreachable")
+
+            async def supports_constrained_decoding(self):
+                return True
+
+        app = HpcaApp(llm=BrokenLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "hi")
+            assert any("backend unreachable" in t for t in chat_texts(app))
+
+
+class TestApprovalFlow:
+    async def test_destructive_tool_opens_modal(self, hpca_home):
+        app = HpcaApp(
+            llm=FakeLLM([tool_json("delete", target="results/")]),
+            tools=destructive_tools(),
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "delete results")
+            assert isinstance(app.screen, ApprovalScreen)
+            rendered = app.screen.details_text()
+            assert "delete" in rendered
+            assert "results/" in rendered
+
+    async def test_approve_runs_tool(self, hpca_home):
+        app = HpcaApp(
+            llm=FakeLLM(
+                [tool_json("delete", target="results/"), respond_json("it is gone")]
+            ),
+            tools=destructive_tools(),
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "delete results")
+            await pilot.press("y")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            texts = chat_texts(app)
+            assert any("deleted results/" in t for t in texts)
+            assert any("it is gone" in t for t in texts)
+
+    async def test_reject_skips_tool(self, hpca_home):
+        app = HpcaApp(
+            llm=FakeLLM(
+                [tool_json("delete", target="results/"), respond_json("understood")]
+            ),
+            tools=destructive_tools(),
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "delete results")
+            await pilot.press("n")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            texts = chat_texts(app)
+            assert not any("deleted results/" in t for t in texts)
+            assert any("DENIED" in t for t in texts)
+
+
+class TestSessionSwitching:
+    async def test_sessions_listed_in_left_column(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM([respond_json()]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "my topic")
+            sessions_list = app.query_one("#sessions-list", ListView)
+            assert len(sessions_list) >= 2  # "(new session)" + the created one
+
+    async def test_switching_loads_history(self, hpca_home):
+        app = HpcaApp(
+            llm=FakeLLM([respond_json("answer A"), respond_json("answer B")])
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "question A")
+            first = app.active_session
+
+            await app.start_new_session()
+            await pilot.pause()
+            await submit_chat(app, pilot, "question B")
+            assert not any("question A" in t for t in chat_texts(app))
+
+            await app.open_session(first)
+            await pilot.pause()
+            texts = chat_texts(app)
+            assert any("question A" in t for t in texts)
+            assert any("answer A" in t for t in texts)
+            assert not any("question B" in t for t in texts)
+
+    async def test_new_session_via_ui_selection(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM([respond_json("a"), respond_json("b")]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "session one")
+            sessions_list = app.query_one("#sessions-list", ListView)
+            sessions_list.focus()
+            sessions_list.index = 0  # "(new session)"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.active_session is None
+            assert chat_texts(app) == []
