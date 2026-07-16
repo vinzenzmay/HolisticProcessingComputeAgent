@@ -16,13 +16,11 @@ sessions, and supervise running sub-processes and cluster jobs.
    model. The model explains, decides, and suggests; code observes and verifies.
 2. **The model never reproduces literal paths.** All paths/URIs live in a path
    registry; tools accept registry keys.
-3. **Few tools per agent.** Small models degrade past ~10 tool schemas in context, so
-   work is split across subagents, each seeing only its 3–5 tools.
-4. **Retry loops with validation feedback.** Malformed or semantically invalid tool
+3. **Retry loops with validation feedback.** Malformed or semantically invalid tool
    calls are caught by pydantic validation; the error message is fed back to the model
    for a bounded number of retries.
-5. **Human-in-the-loop for anything destructive.** Always. No exceptions.
-6. **Grounded answers over recall.** Technical claims about tools, APIs, and flags
+4. **Human-in-the-loop for anything destructive.** Always. No exceptions.
+5. **Grounded answers over recall.** Technical claims about tools, APIs, and flags
    come from indexed docs/source via the doc-researcher subagent, or are explicitly
    marked as ungrounded; generated scripts are verified against the same index
    before execution (§5.2).
@@ -188,8 +186,7 @@ contract: the caller passes a focused question plus optional context references
 (code excerpt, target library/tool, registry keys); the subagent may read as many
 raw chunks, man pages, or source excerpts as it needs *inside its own context*, and
 returns only a bounded, structured, cited answer. Raw retrieval results never enter
-the orchestrator's or another subagent's context. This is the "few tools per agent"
-rule (§1) extended from the tool-schema budget to the context budget.
+the orchestrator's or another subagent's context.
 
 ### 4.3 Middleware (deterministic layer around every model call)
 
