@@ -48,6 +48,18 @@ CREATE TABLE IF NOT EXISTS path_registry (
     created_at TEXT DEFAULT (datetime('now')),
     PRIMARY KEY (profile, session_id, key)
 );
+CREATE TABLE IF NOT EXISTS symbols (
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    parent TEXT,
+    signature TEXT,
+    params TEXT,
+    source TEXT NOT NULL,
+    lineno INTEGER,
+    doc TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
+CREATE INDEX IF NOT EXISTS idx_symbols_parent ON symbols(parent);
 CREATE TABLE IF NOT EXISTS processes (
     pid INTEGER,
     session_id TEXT,
