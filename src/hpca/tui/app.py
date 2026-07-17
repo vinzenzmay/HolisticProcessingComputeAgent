@@ -378,7 +378,9 @@ class HpcaApp(App):
         Binding("m", "manage_llms", "manage llms"),
         Binding("ctrl+l", "switch_llm", "switch llm"),
         Binding("ctrl+e", "edit_profile", "edit profile", show=False),
-        Binding("ctrl+q", "confirm_quit", "quit", priority=True),
+        # Not priority: (q) must reach the chat entry as a letter. Offered
+        # only on the sessions column, where no typing happens (check_action).
+        Binding("q", "confirm_quit", "quit"),
     ]
 
     def __init__(
@@ -1097,20 +1099,25 @@ class HpcaApp(App):
     def check_action(self, action: str, parameters) -> bool | None:
         """Context-sensitive availability of the global hotkeys.
 
-        (m) manage llms only from the main screen's sessions column, where
-        sessions are started; (ctrl+l) switch llm only from the chat column,
-        which is also the one place settings are not offered — its letter keys
-        belong to the message being typed. Returning False also hides the
-        binding from the footer.
+        (m) manage llms and (q) quit only from the main screen's sessions
+        column, where sessions are started and nothing is typed; (ctrl+l)
+        switch llm only from the chat column, which is also the one place
+        settings are not offered — its letter keys belong to the message being
+        typed. Returning False also hides the binding from the footer.
         """
         on_main_screen = len(self.screen_stack) == 1
+        on_sessions = on_main_screen and self.focused_column_id == "sessions"
         in_chat = on_main_screen and self.focused_column_id == "chat"
-        if action == "manage_llms":
-            return on_main_screen and self.focused_column_id == "sessions"
+        if action in ("manage_llms", "confirm_quit"):
+            return on_sessions
         if action == "switch_llm":
             return in_chat
         if action == "open_settings":
             return not in_chat
+        if action == "quit":
+            # Textual's own ctrl+q. Quitting goes through (q) on the sessions
+            # column, which confirms first — and ctrl+q belongs to zellij.
+            return False
         return True
 
     @property

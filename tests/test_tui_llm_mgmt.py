@@ -60,23 +60,70 @@ def fake_discovery(monkeypatch):
 
 
 class TestQuitConfirm:
-    async def test_ctrl_q_asks_and_n_stays(self, hpca_home):
+    """(q), and only from the sessions column: ctrl+q belongs to zellij."""
+
+    async def test_q_asks_and_n_stays(self, hpca_home):
         app = HpcaApp(llm=FakeLLM())
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.press("ctrl+q")
+            assert app.focused_column_id == "sessions"
+            await pilot.press("q")
             assert isinstance(app.screen, ConfirmScreen)
             await pilot.press("n")
             await pilot.pause()
             assert not isinstance(app.screen, ConfirmScreen)
             assert app.is_running
 
-    async def test_ctrl_q_then_y_quits(self, hpca_home):
+    async def test_q_then_y_quits(self, hpca_home):
         app = HpcaApp(llm=FakeLLM())
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.press("ctrl+q")
+            await pilot.press("q")
             await pilot.press("y")
             await pilot.pause()
         assert app.return_code == 0
+
+    async def test_ctrl_q_does_nothing(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("ctrl+q")  # zellij's key, and Textual's own
+            await pilot.pause()
+            assert app.is_running
+            assert not isinstance(app.screen, ConfirmScreen)
+
+    async def test_q_is_typed_in_the_chat_not_a_hotkey(self, hpca_home):
+        from hpca.tui.app import ChatInput
+
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            await pilot.pause()
+            assert app.check_action("confirm_quit", ()) is False
+            await pilot.press("q")
+            await pilot.pause()
+            assert app.query_one("#chat-input", ChatInput).text == "q"
+            assert not isinstance(app.screen, ConfirmScreen)
+
+    async def test_q_is_inert_on_the_processes_column(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            app._focus_column("processes")
+            await pilot.pause()
+            assert app.check_action("confirm_quit", ()) is False
+            await pilot.press("q")
+            await pilot.pause()
+            assert app.is_running
+            assert not isinstance(app.screen, ConfirmScreen)
+
+    async def test_q_does_not_quit_from_another_screen(self, hpca_home, fake_discovery):
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("m")
+            await app.screen.workers.wait_for_complete()
+            await pilot.pause()
+            assert app.check_action("confirm_quit", ()) is False
+            await pilot.press("q")
+            await pilot.pause()
+            assert app.is_running
+            assert isinstance(app.screen, ManageLLMsScreen)
 
 
 class TestManageScreen:
