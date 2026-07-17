@@ -23,8 +23,15 @@ from textual.content import Content
 from textual.screen import Screen
 from textual.widgets import Footer, Label, ListItem, ListView, Static
 
+from urllib.parse import urlparse
+
 from hpca.config import LLMBackend
-from hpca.discover import DiscoveredBackend, is_reachable, scan_local_ports
+from hpca.discover import (
+    DiscoveredBackend,
+    is_reachable,
+    ordered_ports,
+    scan_local_ports,
+)
 from hpca.tui.confirm_screen import ConfirmScreen
 
 
@@ -132,9 +139,29 @@ class ManageLLMsScreen(Screen):
                     f"scanning localhost… {done:,}/{total:,} ports",
                 )
 
-        discovered = asyncio.run(scan_local_ports(progress=report))
+        def found(backend: DiscoveredBackend) -> None:
+            # surface each endpoint the moment it is discovered
+            if not worker.is_cancelled:
+                self.app.call_from_thread(self._append_discovered, backend)
+
+        known_ports = [
+            port
+            for backend in self.app.settings.backends
+            if (port := urlparse(backend.base_url).port) is not None
+        ]
+        discovered = asyncio.run(
+            scan_local_ports(
+                ordered_ports(known_ports), progress=report, on_found=found
+            )
+        )
         if not worker.is_cancelled:
             self.app.call_from_thread(self._apply_scan_results, discovered)
+
+    async def _append_discovered(self, backend: DiscoveredBackend) -> None:
+        if not self.is_attached:
+            return
+        self._discovered.append(backend)
+        await self.refresh_discovered()
 
     def _set_status(self, text: str) -> None:
         if self.is_attached:
@@ -163,6 +190,7 @@ class ManageLLMsScreen(Screen):
 
     async def refresh_discovered(self) -> None:
         discovered_list = self.query_one("#llm-discovered", ListView)
+        previous_index = discovered_list.index
         await discovered_list.clear()
         items = []
         for backend in self._discovered:
@@ -172,8 +200,8 @@ class ManageLLMsScreen(Screen):
             item.data_discovered = backend
             items.append(item)
         discovered_list.extend(items)
-        if items and discovered_list.index is None:
-            discovered_list.index = 0
+        if items:  # keep the cursor where it was as entries stream in
+            discovered_list.index = min(previous_index or 0, len(items) - 1)
 
     async def refresh_configured(self) -> None:
         configured_list = self.query_one("#llm-configured", ListView)
@@ -206,7 +234,9 @@ class ManageLLMsScreen(Screen):
     def action_focus_panel(self, which: str) -> None:
         self.query_one(f"#llm-{which}", ListView).focus()
 
-    def action_rescan(self) -> None:
+    async def action_rescan(self) -> None:
+        self._discovered = []
+        await self.refresh_discovered()
         self._set_status("rescanning…")
         self.scan_worker()
 

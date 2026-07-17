@@ -160,3 +160,38 @@ class TestScanProgress:
         assert calls[-1] == (3000, 3000)
         assert len(calls) == 3  # 1024-port chunks
         assert calls[0][0] <= 1024
+
+
+class TestIncrementalDiscovery:
+    async def test_on_found_fires_before_scan_completes(self, live_stub):
+        progress_calls = []
+        found_at_progress: list[int] = []
+
+        await scan_local_ports(
+            # stub lands in the first of three 1024-port chunks
+            range(live_stub - 100, live_stub - 100 + 3000),
+            progress=lambda done, total: progress_calls.append(done),
+            on_found=lambda b: found_at_progress.append(len(progress_calls)),
+        )
+        assert len(found_at_progress) == 1
+        # found during the first chunk — before any later progress ticks
+        assert found_at_progress[0] == 0
+
+
+class TestOrderedPorts:
+    def test_priority_then_likely_then_rest(self):
+        from hpca.discover import LIKELY_PORTS, ordered_ports
+
+        order = ordered_ports([51941])
+        assert order[0] == 51941
+        assert order[1 : 1 + len(LIKELY_PORTS) - 1]  # likely ports follow
+        assert order.index(8000) < order.index(1024)
+        assert len(order) == len(set(order))  # no duplicates
+        assert len(order) == 64512  # full coverage preserved
+
+    def test_invalid_priority_ports_dropped(self):
+        from hpca.discover import ordered_ports
+
+        order = ordered_ports([0, 70000, 8000])
+        assert order[0] == 8000
+        assert 70000 not in order

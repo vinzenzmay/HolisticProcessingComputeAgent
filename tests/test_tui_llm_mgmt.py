@@ -351,3 +351,43 @@ class TestScanResponsiveness:
             await asyncio.sleep(0.8)
             await pilot.pause()
             assert app.is_running
+
+
+class TestIncrementalScanUI:
+    async def test_left_panel_fills_while_scan_still_running(
+        self, hpca_home, monkeypatch
+    ):
+        import asyncio
+
+        async def streaming_scan(*args, progress=None, on_found=None, **kwargs):
+            on_found(QWEN)  # found early in the sweep
+            await asyncio.sleep(0.5)  # rest of the port range
+            on_found(MINI)
+            return [QWEN, MINI]
+
+        async def fake_reachable(base_url, **kwargs):
+            return True
+
+        monkeypatch.setattr(manage_module, "scan_local_ports", streaming_scan)
+        monkeypatch.setattr(manage_module, "is_reachable", fake_reachable)
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("m")
+            left = app.screen.query_one("#llm-discovered", ListView)
+
+            def scan_running():
+                return any(
+                    w.group == "llm-scan" and w.is_running
+                    for w in app.screen.workers
+                )
+
+            for _ in range(50):  # wait for the early hit, max ~0.5s
+                await pilot.pause()
+                if len(left.children) > 0:
+                    break
+                await asyncio.sleep(0.01)
+            assert scan_running(), "scan should still be sweeping"
+            assert len(left.children) == 1  # QWEN visible before scan ends
+            await app.screen.workers.wait_for_complete()
+            await pilot.pause()
+            assert len(left.children) == 2
