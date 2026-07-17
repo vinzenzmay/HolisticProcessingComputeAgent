@@ -64,6 +64,8 @@ def chat_texts(app):
 
 
 async def submit_chat(app, pilot, text):
+    if app.active_session is None:
+        await app.start_new_session()  # the chat entry only exists in a session
     chat_input = app.query_one("#chat-input", Input)
     chat_input.focus()
     chat_input.value = text
@@ -81,7 +83,7 @@ class TestChatFlow:
             assert any("hello agent" in t for t in texts)
             assert any("hello back" in t for t in texts)
 
-    async def test_first_message_creates_session(self, hpca_home):
+    async def test_first_message_names_the_session(self, hpca_home):
         app = HpcaApp(llm=FakeLLM([respond_json()]))
         async with app.run_test(size=(120, 40)) as pilot:
             assert app.session_store.list(profile="default") == []
@@ -89,6 +91,15 @@ class TestChatFlow:
             sessions = app.session_store.list(profile="default")
             assert len(sessions) == 1
             assert "start my session" in sessions[0].title
+            assert app.active_session.title == sessions[0].title
+
+    async def test_later_messages_keep_the_title(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM([respond_json(), respond_json()]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "first thing")
+            await submit_chat(app, pilot, "second thing")
+            titles = [s.title for s in app.session_store.list(profile="default")]
+            assert titles == ["first thing"]
 
     async def test_second_turn_same_session(self, hpca_home):
         app = HpcaApp(llm=FakeLLM([respond_json("one"), respond_json("two")]))
@@ -194,13 +205,68 @@ class TestSessionSwitching:
         app = HpcaApp(llm=FakeLLM([respond_json("a"), respond_json("b")]))
         async with app.run_test(size=(120, 40)) as pilot:
             await submit_chat(app, pilot, "session one")
+            first = app.active_session
             sessions_list = app.query_one("#sessions-list", ListView)
             sessions_list.focus()
             sessions_list.index = 0  # "(new session)"
             await pilot.press("enter")
             await pilot.pause()
-            assert app.active_session is None
+            assert app.active_session is not first
             assert chat_texts(app) == []
+            assert app.focused.id == "chat-input"
+
+    async def test_selecting_a_session_focuses_its_chat_entry(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM([respond_json("a")]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "session one")
+            sessions_list = app.query_one("#sessions-list", ListView)
+            sessions_list.focus()
+            sessions_list.index = 1  # the session created above
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.active_session.title == "session one"
+            assert app.focused.id == "chat-input"
+
+    async def test_open_session_is_highlighted_in_the_column(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM([respond_json("a")]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "session one")
+            sessions_list = app.query_one("#sessions-list", ListView)
+            assert sessions_list.index == 1  # not "(new session)"
+
+
+class TestChatLogBrowsing:
+    async def test_up_leaves_the_entry_and_down_returns_to_it(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM([respond_json("hello back")]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "hello agent")
+            chat_list = app.query_one("#chat-list", ListView)
+            assert len(chat_list) == 2
+            chat_input = app.query_one("#chat-input", Input)
+            chat_input.value = "half typed"
+            app.focus_chat_input()
+            await pilot.pause()
+
+            await pilot.press("up")  # into the log, at the newest message
+            assert app.focused is chat_list
+            assert chat_list.index == 1
+            await pilot.press("up")  # older messages
+            assert chat_list.index == 0
+            await pilot.press("down")
+            assert app.focused is chat_list
+            assert chat_list.index == 1
+            await pilot.press("down")  # past the newest: back to the entry
+            assert app.focused is chat_input
+            assert chat_input.value == "half typed"
+            assert chat_input.cursor_position == len("half typed")
+
+    async def test_up_in_an_empty_log_stays_in_the_entry(self, hpca_home):
+        app = HpcaApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            await pilot.pause()
+            await pilot.press("up")
+            assert app.focused.id == "chat-input"
 
 
 class RecordingLLM(FakeLLM):

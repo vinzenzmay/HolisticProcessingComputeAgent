@@ -3,7 +3,7 @@
 import json
 
 import pytest
-from textual.widgets import Footer, ListView, TextArea
+from textual.widgets import Footer, Input, ListView, TextArea
 
 from hpca.config import Settings
 from hpca.tui.app import ColumnPanel, HpcaApp, TopBar
@@ -75,6 +75,93 @@ async def test_focused_widget_is_the_columns_list(hpca_home):
         await pilot.press("right")
         assert isinstance(app.focused, ListView)
         assert app.focused.id == "chat-list"
+
+
+class TestNewSession:
+    async def test_enter_on_new_session_opens_one_and_focuses_the_entry(
+        self, hpca_home
+    ):
+        app = HpcaApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            assert app.query_one("#sessions-list", ListView).index == 0
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.active_session is not None
+            assert app.session_store.list(profile="default") != []
+            assert app.focused.id == "chat-input"
+
+    async def test_chat_entry_only_exists_inside_a_session(self, hpca_home):
+        app = HpcaApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            chat_input = app.query_one("#chat-input", Input)
+            assert not chat_input.display
+            await pilot.press("right")  # chat column without a session
+            assert app.focused.id == "chat-list"
+            await pilot.press("left")
+            await pilot.press("enter")  # (new session)
+            await pilot.pause()
+            assert chat_input.display
+
+    async def test_repeated_new_session_reuses_the_empty_one(self, hpca_home):
+        app = HpcaApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("enter")
+            await pilot.pause()
+            first = app.active_session
+            sessions_list = app.query_one("#sessions-list", ListView)
+            sessions_list.focus()
+            sessions_list.index = 0  # "(new session)" again
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.active_session.session_id == first.session_id
+            assert len(app.session_store.list(profile="default")) == 1
+
+
+class TestChatEntryNavigation:
+    async def test_arrow_keys_leave_the_entry_only_at_its_edges(self, hpca_home):
+        app = HpcaApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("enter")  # (new session) -> entry focused
+            await pilot.pause()
+            await pilot.press("h", "i")
+            chat_input = app.query_one("#chat-input", Input)
+            assert chat_input.value == "hi"
+
+            await pilot.press("left")  # inside the text: cursor only
+            assert app.focused.id == "chat-input"
+            assert chat_input.cursor_position == 1
+            await pilot.press("left")
+            assert chat_input.cursor_position == 0
+            await pilot.press("left")  # at the left edge: leave the column
+            assert app.focused_column_id == "sessions"
+
+    async def test_returning_to_chat_resumes_typing_where_it_stopped(self, hpca_home):
+        app = HpcaApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("h", "i")
+            await pilot.press("right")  # cursor at the end: leave the column
+            assert app.focused_column_id == "processes"
+
+            await pilot.press("left")  # back into the chat column
+            chat_input = app.query_one("#chat-input", Input)
+            assert app.focused is chat_input
+            assert chat_input.value == "hi"
+            assert chat_input.cursor_position == 2
+            await pilot.press("!")
+            assert chat_input.value == "hi!"
+
+    async def test_settings_not_offered_in_the_chat_column(self, hpca_home):
+        app = HpcaApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            assert app.check_action("open_settings", ()) is True
+            await pilot.press("enter")  # (new session) -> chat entry
+            await pilot.pause()
+            assert app.check_action("open_settings", ()) is False
+            await pilot.press("s")  # typed, not a hotkey
+            assert app.query_one("#chat-input", Input).value == "s"
+            assert not isinstance(app.screen, SettingsScreen)
 
 
 class TestSettingsModal:

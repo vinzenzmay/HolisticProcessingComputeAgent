@@ -11,7 +11,8 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Literal
+from typing import Iterable, Literal
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
@@ -89,6 +90,7 @@ class LLMBackend(_Section):
 class Settings(_Section):
     llm: LLMSettings = LLMSettings()
     backends: list[LLMBackend] = []
+    known_llm_ports: list[int] = []
     cluster: ClusterSettings = ClusterSettings()
     safety: SafetySettings = SafetySettings()
     memory: MemorySettings = MemorySettings()
@@ -124,6 +126,21 @@ class Settings(_Section):
         self.llm.base_url = backend.base_url
         self.llm.model = backend.model
         self.llm.api_key = backend.api_key
+
+    def remember_llm_ports(self, base_urls: Iterable[str]) -> bool:
+        """Record ports that have served an LLM, so scans probe them first.
+
+        Which GPU node hosts a model changes often, the tunneled local port
+        rarely does. Returns whether anything new was learned, i.e. whether
+        the settings need saving.
+        """
+        learned = False
+        for base_url in base_urls:
+            port = urlparse(base_url).port
+            if port is not None and port not in self.known_llm_ports:
+                self.known_llm_ports.append(port)
+                learned = True
+        return learned
 
     def is_active(self, backend: LLMBackend) -> bool:
         return (

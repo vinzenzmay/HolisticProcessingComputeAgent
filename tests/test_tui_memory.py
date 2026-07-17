@@ -9,7 +9,7 @@ from textual.widgets import Input
 from hpca.editor import resolve_editor
 from hpca.llm import ChatResponse
 from hpca.profiles import Profile
-from hpca.tui.app import HpcaApp
+from hpca.tui.app import UNTITLED_SESSION, HpcaApp
 from hpca.tui.memory_screens import MemoryProposalScreen, TierSelectScreen
 
 
@@ -39,6 +39,8 @@ def hpca_home(monkeypatch, tmp_path):
 
 
 async def type_and_submit(app, pilot, text):
+    if app.active_session is None:
+        await app.start_new_session()
     chat_input = app.query_one("#chat-input", Input)
     chat_input.focus()
     chat_input.value = text
@@ -75,19 +77,21 @@ class TestMemorize:
             await pilot.pause()
             assert Profile.load("default").memories == []
 
-    async def test_no_session_created_by_slash_command(self, hpca_home):
+    async def test_slash_command_is_not_the_sessions_topic(self, hpca_home):
         app = HpcaApp(llm=FakeLLM([]))
         async with app.run_test(size=(120, 40)) as pilot:
             await type_and_submit(app, pilot, r"\memorize something")
             await pilot.press("escape")
-            assert app.session_store.list(profile="default") == []
+            # a command is not a message: it must not name the session
+            titles = [s.title for s in app.session_store.list(profile="default")]
+            assert titles == [UNTITLED_SESSION]
 
     async def test_unknown_command_is_reported_not_sent(self, hpca_home):
         app = HpcaApp(llm=FakeLLM([]))
         async with app.run_test(size=(120, 40)) as pilot:
             await type_and_submit(app, pilot, r"\frobnicate now")
-            assert app.session_store.list(profile="default") == []
             assert app.chat_log_texts() == []
+            assert app.active_session.title == UNTITLED_SESSION
 
 
 class TestConclude:

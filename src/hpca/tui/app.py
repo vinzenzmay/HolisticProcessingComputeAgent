@@ -57,6 +57,7 @@ from hpca.tui.switch_llm import SwitchLLMScreen
 
 COLUMN_IDS = ("sessions", "chat", "processes")
 SESSION_TITLE_MAX = 40
+UNTITLED_SESSION = "untitled"  # placeholder until the first message names it
 
 
 class TopBar(Static):
@@ -93,13 +94,58 @@ class ColumnPanel(Vertical):
         yield ListView(id=f"{self.id}-list")
 
 
+class ChatInput(Input):
+    """Chat entry. Arrow keys move the text cursor until it hits an edge, then
+    hand focus on: ← at the start leaves for the sessions column, → at the end
+    for the processes column, ↑ leaves to browse the message log. Text typed so
+    far is kept, so the user can step away mid-sentence and come back."""
+
+    BINDINGS = [Binding("up", "browse_messages", show=False)]
+
+    def __init__(self, **kwargs) -> None:
+        # A draft survives leaving the column, so focus must not select it
+        # away: the next keystroke would replace it.
+        super().__init__(select_on_focus=False, **kwargs)
+
+    def action_cursor_left(self, select: bool = False) -> None:
+        if not select and self.selection.is_empty and self.cursor_position == 0:
+            self.app.action_focus_column(-1)
+        else:
+            super().action_cursor_left(select)
+
+    def action_cursor_right(self, select: bool = False) -> None:
+        if not select and self.selection.is_empty and self.cursor_at_end:
+            self.app.action_focus_column(1)
+        else:
+            super().action_cursor_right(select)
+
+    def action_browse_messages(self) -> None:
+        self.app.browse_chat_messages()
+
+
+class ChatList(ListView):
+    """Message log; ↓ past the last message returns to the chat entry."""
+
+    def action_cursor_down(self) -> None:
+        if self.index is None or self.index >= len(self) - 1:
+            self.app.focus_chat_input()
+        else:
+            super().action_cursor_down()
+
+
 class ChatPanel(ColumnPanel):
-    """Center column: message log plus the chat input."""
+    """Center column: message log plus the chat input.
+
+    The input only exists inside a session, so an empty chat column cannot
+    invite typing that has nowhere to go.
+    """
 
     def compose(self) -> ComposeResult:
         yield Static(self._title, classes="column-title")
-        yield ListView(id="chat-list")
-        yield Input(placeholder="Message the agent…", id="chat-input")
+        yield ChatList(id="chat-list")
+        chat_input = ChatInput(placeholder="Message the agent…", id="chat-input")
+        chat_input.display = False
+        yield chat_input
 
 
 class ProcessesList(ListView):
@@ -182,7 +228,7 @@ class HpcaApp(App):
         Binding("right", "focus_column(1)", "column ▶", show=False),
         Binding("s", "open_settings", "settings"),
         Binding("m", "manage_llms", "manage llms"),
-        Binding("l", "switch_llm", "switch llm"),
+        Binding("ctrl+l", "switch_llm", "switch llm"),
         Binding("ctrl+e", "edit_profile", "edit profile", show=False),
         Binding("ctrl+q", "confirm_quit", "quit", priority=True),
     ]
@@ -337,11 +383,9 @@ class HpcaApp(App):
             self._handle_slash_command(text)
             return
         if self.active_session is None:
-            self._activate_session(
-                self.session_store.create(
-                    profile=self.profile, title=text[:SESSION_TITLE_MAX]
-                )
-            )
+            await self.start_new_session()
+        if self.active_session.title == UNTITLED_SESSION:
+            self._name_session(text[:SESSION_TITLE_MAX])
             await self._reload_sessions()
         await self._append_chat("user", text)
         self.warn_about_struggles(text)
@@ -538,12 +582,36 @@ class HpcaApp(App):
             embedder=self.embedder,
             skills=self.skills,
         )
+        self.query_one("#chat-input", Input).display = True
 
     async def start_new_session(self) -> None:
-        """Clear the chat; a session row is created on the first message."""
-        self.active_session = None
-        self._tool_ctx = None
-        await self._set_chat_messages([])
+        """Open an empty session on the default backend and start typing in it.
+
+        An untouched session is reused rather than piling up empty rows when
+        "(new session)" is entered repeatedly.
+        """
+        if not self._is_untouched(self.active_session):
+            self._activate_session(
+                self.session_store.create(
+                    profile=self.profile, title=UNTITLED_SESSION
+                )
+            )
+            await self._set_chat_messages([])
+            await self._reload_sessions()
+        self._focus_column("chat")
+
+    def _is_untouched(self, session: Session | None) -> bool:
+        return (
+            session is not None
+            and session.title == UNTITLED_SESSION
+            and not self._chat_entries
+        )
+
+    def _name_session(self, title: str) -> None:
+        """A session is named after its opening message (§3 sessions column)."""
+        assert self.active_session is not None
+        self.session_store.rename(self.active_session.session_id, title)
+        self.active_session.title = title
 
     async def open_session(self, session: Session) -> None:
         self._activate_session(session)
@@ -560,6 +628,7 @@ class HpcaApp(App):
             await self.start_new_session()
         else:
             await self.open_session(session)
+            self._focus_column("chat")  # entering a session means typing in it
 
     async def _reload_sessions(self) -> None:
         sessions_list = self.query_one("#sessions-list", ListView)
@@ -568,10 +637,27 @@ class HpcaApp(App):
         new_item.data_session = None
         items = [new_item]
         for session in self.session_store.list(profile=self.profile):
-            item = ListItem(Label(session.title))
+            item = ListItem(Label(Content(session.title)))
             item.data_session = session
             items.append(item)
         sessions_list.extend(items)
+        # A ListView filled after mount has no cursor, and without one Enter
+        # does nothing; highlight the open session, else "(new session)".
+        sessions_list.index = next(
+            (
+                index
+                for index, item in enumerate(items)
+                if self._is_active_session(item.data_session)
+            ),
+            0,
+        )
+
+    def _is_active_session(self, session: Session | None) -> bool:
+        return (
+            session is not None
+            and self.active_session is not None
+            and session.session_id == self.active_session.session_id
+        )
 
     # ------------------------------------------------------------- processes
 
@@ -721,15 +807,20 @@ class HpcaApp(App):
     def check_action(self, action: str, parameters) -> bool | None:
         """Context-sensitive availability of the global hotkeys.
 
-        (m) manage llms only from the main screen's sessions column (where
-        sessions are started); (l) switch llm only from the chat column.
-        Returning False also hides the binding from the footer.
+        (m) manage llms only from the main screen's sessions column, where
+        sessions are started; (ctrl+l) switch llm only from the chat column,
+        which is also the one place settings are not offered — its letter keys
+        belong to the message being typed. Returning False also hides the
+        binding from the footer.
         """
         on_main_screen = len(self.screen_stack) == 1
+        in_chat = on_main_screen and self.focused_column_id == "chat"
         if action == "manage_llms":
             return on_main_screen and self.focused_column_id == "sessions"
         if action == "switch_llm":
-            return on_main_screen and self.focused_column_id == "chat"
+            return in_chat
+        if action == "open_settings":
+            return not in_chat
         return True
 
     @property
@@ -743,7 +834,27 @@ class HpcaApp(App):
         return None
 
     def _focus_column(self, column_id: str) -> None:
-        self.query_one(f"#{column_id}-list", ListView).focus()
+        """Focus a column. The chat column lands on its entry, ready to type."""
+        if column_id == "chat" and self.active_session is not None:
+            self.focus_chat_input()
+        else:
+            self.query_one(f"#{column_id}-list", ListView).focus()
+
+    def focus_chat_input(self) -> None:
+        """Focus the chat entry with the cursor behind what was typed so far."""
+        chat_input = self.query_one("#chat-input", Input)
+        if not chat_input.display:
+            return  # no session: there is nothing to type into
+        chat_input.focus()
+        chat_input.cursor_position = len(chat_input.value)
+
+    def browse_chat_messages(self) -> None:
+        """Leave the entry for the message log, starting at the last message."""
+        chat_list = self.query_one("#chat-list", ListView)
+        if not len(chat_list):
+            return
+        chat_list.index = len(chat_list) - 1
+        chat_list.focus()
 
     def action_focus_column(self, delta: int) -> None:
         current = self.focused_column_id
@@ -753,7 +864,7 @@ class HpcaApp(App):
     @on(ListView.Selected, "#chat-list")
     def _on_chat_list_selected(self, event: ListView.Selected) -> None:
         # Enter in the chat column moves to the input (message actions later)
-        self.query_one("#chat-input", Input).focus()
+        self.focus_chat_input()
 
     # ---------------------------------------------------------- llm backends
 

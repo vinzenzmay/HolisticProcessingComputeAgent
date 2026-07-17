@@ -44,6 +44,7 @@ def hpca_home(monkeypatch, tmp_path):
 
 
 async def open_session_and_add_job(app, pilot, job_id="27744534"):
+    await app.start_new_session()
     chat_input = app.query_one("#chat-input", Input)
     chat_input.focus()
     chat_input.value = "hello"

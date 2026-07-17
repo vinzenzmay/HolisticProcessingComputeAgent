@@ -261,30 +261,83 @@ class TestManageScreen:
             assert not isinstance(app.screen, ManageLLMsScreen)
 
 
+class TestPortMemory:
+    async def test_discovered_ports_remembered_and_persisted(
+        self, hpca_home, fake_discovery
+    ):
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("m")
+            await app.screen.workers.wait_for_complete()
+            await pilot.pause()
+            assert app.settings.known_llm_ports == [51941, 51943]
+            assert Settings.load().known_llm_ports == [51941, 51943]
+
+    async def test_remembered_ports_scanned_first(self, hpca_home, monkeypatch):
+        settings = Settings()
+        settings.known_llm_ports = [51941]
+        settings.backends = [LLMBackend(model=MINI.model, base_url=MINI.base_url)]
+        settings.save()
+        scanned: list[list[int]] = []
+
+        async def recording_scan(ports, **kwargs):
+            scanned.append(list(ports))
+            return []
+
+        async def fake_reachable(base_url, **kwargs):
+            return False
+
+        monkeypatch.setattr(manage_module, "scan_local_ports", recording_scan)
+        monkeypatch.setattr(manage_module, "is_reachable", fake_reachable)
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("m")
+            await app.screen.workers.wait_for_complete()
+            await pilot.pause()
+        # remembered port first, then the configured backend's, then the rest
+        assert scanned[0][:2] == [51941, 51943]
+        assert len(scanned[0]) == 64512  # full range still covered
+
+    async def test_port_remembered_when_backend_configured(
+        self, hpca_home, fake_discovery
+    ):
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("m")
+            await app.screen.workers.wait_for_complete()
+            await pilot.pause()
+            left = app.screen.query_one("#llm-discovered", ListView)
+            left.focus()
+            left.index = 0
+            await pilot.press("enter")
+            await pilot.pause()
+            assert 51941 in Settings.load().known_llm_ports
+
+
 class TestSwitcher:
-    async def test_l_without_backends_warns(self, hpca_home):
+    async def test_ctrl_l_without_backends_warns(self, hpca_home):
         app = HpcaApp(llm=FakeLLM())
         async with app.run_test(size=(120, 40)) as pilot:
             app._focus_column("chat")
-            await pilot.press("l")
+            await pilot.press("ctrl+l")
             await pilot.pause()
             assert not isinstance(app.screen, SwitchLLMScreen)
 
-    async def test_l_only_available_in_chat_column(self, hpca_home, fake_discovery):
+    async def test_ctrl_l_only_available_in_chat_column(self, hpca_home, fake_discovery):
         settings = Settings()
         settings.backends = [LLMBackend(model=QWEN.model, base_url=QWEN.base_url)]
         settings.save()
         app = HpcaApp(llm=FakeLLM())
         async with app.run_test(size=(120, 40)) as pilot:
-            # sessions column focused at start: l is hidden and inert
+            # sessions column focused at start: ctrl+l is hidden and inert
             assert app.check_action("switch_llm", ()) is False
-            await pilot.press("l")
+            await pilot.press("ctrl+l")
             await pilot.pause()
             assert not isinstance(app.screen, SwitchLLMScreen)
             app._focus_column("chat")
             await pilot.pause()
             assert app.check_action("switch_llm", ()) is True
-            await pilot.press("l")
+            await pilot.press("ctrl+l")
             await pilot.pause()
             assert isinstance(app.screen, SwitchLLMScreen)
 
@@ -298,7 +351,7 @@ class TestSwitcher:
         async with app.run_test(size=(120, 40)) as pilot:
             old_graph = app.graph
             app._focus_column("chat")
-            await pilot.press("l")
+            await pilot.press("ctrl+l")
             assert isinstance(app.screen, SwitchLLMScreen)
             await pilot.press("enter")
             await app.workers.wait_for_complete()
@@ -318,7 +371,7 @@ class TestSwitcher:
         async with app.run_test(size=(120, 40)) as pilot:
             before = app.settings.llm.model
             app._focus_column("chat")
-            await pilot.press("l")
+            await pilot.press("ctrl+l")
             await pilot.press("escape")
             await pilot.pause()
             assert app.settings.llm.model == before

@@ -64,6 +64,8 @@ async def submit(app, pilot, text, *, expect_modal=False):
     user answers, so waiting for workers to finish would deadlock — pump the
     event loop instead and let the caller press a key.
     """
+    if app.active_session is None:
+        await app.start_new_session()
     chat_input = app.query_one("#chat-input", Input)
     chat_input.focus()
     chat_input.value = text

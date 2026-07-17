@@ -174,3 +174,40 @@ class TestBackendCatalog:
         assert not s.is_active(backend)
         s.activate_backend(backend)
         assert s.is_active(backend)
+
+
+class TestKnownLLMPorts:
+    def test_default_empty(self):
+        assert Settings().known_llm_ports == []
+
+    def test_remember_collects_ports_and_reports_change(self):
+        s = Settings()
+        assert s.remember_llm_ports(
+            ["http://localhost:51941/v1", "http://127.0.0.1:51943/v1"]
+        )
+        assert s.known_llm_ports == [51941, 51943]
+
+    def test_remember_is_idempotent(self):
+        s = Settings()
+        s.remember_llm_ports(["http://localhost:51941/v1"])
+        assert not s.remember_llm_ports(["http://localhost:51941/v1"])
+        assert s.known_llm_ports == [51941]
+
+    def test_new_port_learned_alongside_known_one(self):
+        s = Settings()
+        s.remember_llm_ports(["http://localhost:51941/v1"])
+        assert s.remember_llm_ports(
+            ["http://localhost:51941/v1", "http://localhost:8000/v1"]
+        )
+        assert s.known_llm_ports == [51941, 8000]
+
+    def test_urls_without_a_port_ignored(self):
+        s = Settings()
+        assert not s.remember_llm_ports(["http://example.invalid/v1"])
+        assert s.known_llm_ports == []
+
+    def test_roundtrip(self, tmp_path):
+        s = Settings()
+        s.remember_llm_ports(["http://localhost:51941/v1"])
+        s.save(tmp_path / "settings.json")
+        assert Settings.load(tmp_path / "settings.json").known_llm_ports == [51941]

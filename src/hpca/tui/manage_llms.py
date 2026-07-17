@@ -144,18 +144,23 @@ class ManageLLMsScreen(Screen):
             if not worker.is_cancelled:
                 self.app.call_from_thread(self._append_discovered, backend)
 
-        known_ports = [
-            port
-            for backend in self.app.settings.backends
-            if (port := urlparse(backend.base_url).port) is not None
-        ]
         discovered = asyncio.run(
             scan_local_ports(
-                ordered_ports(known_ports), progress=report, on_found=found
+                ordered_ports(self._priority_ports()), progress=report, on_found=found
             )
         )
         if not worker.is_cancelled:
             self.app.call_from_thread(self._apply_scan_results, discovered)
+
+    def _priority_ports(self) -> list[int]:
+        """Ports worth trying first: ones that served an LLM before, then
+        those of the configured backends."""
+        settings = self.app.settings
+        configured = (urlparse(b.base_url).port for b in settings.backends)
+        return [
+            *settings.known_llm_ports,
+            *(port for port in configured if port is not None),
+        ]
 
     async def _append_discovered(self, backend: DiscoveredBackend) -> None:
         if not self.is_attached:
@@ -172,6 +177,8 @@ class ManageLLMsScreen(Screen):
             return  # screen was closed while the scan finished
         self._discovered = discovered
         await self.refresh_discovered()
+        if self.app.settings.remember_llm_ports(b.base_url for b in discovered):
+            self.app.settings.save()  # next scan starts with these ports
         self._set_status(
             f"scan finished: {len(discovered)} endpoint(s) found · F5 to rescan"
         )
@@ -258,6 +265,7 @@ class ManageLLMsScreen(Screen):
                 max_model_len=discovered.max_model_len,
             )
         )
+        self.app.settings.remember_llm_ports([discovered.base_url])
         self.app.settings.save()
         self._reachable[discovered.base_url] = True  # just probed by the scan
         await self.refresh_discovered()

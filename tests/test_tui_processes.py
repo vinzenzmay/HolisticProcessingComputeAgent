@@ -34,6 +34,7 @@ def hpca_home(monkeypatch, tmp_path):
 
 async def start_session_with_process(app, pilot, argv, name):
     """Open a session via chat, then start a tracked process in its runner."""
+    await app.start_new_session()
     chat_input = app.query_one("#chat-input", Input)
     chat_input.focus()
     chat_input.value = "hello"
