@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from hpca.config import Settings
+from hpca.embeddings import EmbeddingClient
 from hpca.jobs import JobStore
+from hpca.rag import RagStore
 from hpca.registry import PathRegistry
 from hpca.runner import ProcessRunner
 from hpca.slurm import SlurmClient
@@ -29,3 +31,5 @@ class ToolContext:
     trash: TrashManager | None = None
     tier1_text: str = ""  # standing notes for subagent-style tool calls (§6.1)
     symbols: SymbolIndex | None = None
+    rag: RagStore | None = None
+    embedder: EmbeddingClient | None = None

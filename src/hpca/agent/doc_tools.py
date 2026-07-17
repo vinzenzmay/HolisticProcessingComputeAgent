@@ -17,10 +17,14 @@ from pydantic import BaseModel, Field
 
 from hpca.agent.context import ToolContext
 from hpca.agent.tools import Tool, ToolRegistry
+from hpca.embeddings import EmbeddingError
+from hpca.rag import chunk_text
 from hpca.symbols import index_python_source, parse_manpage_flags
 
 MANPAGE_MAX_LINES = 400
 SOURCE_MAX_LINES = 200
+SEARCH_TOP_K = 5
+DOC_SUFFIXES = {".md", ".txt", ".rst", ".text"}
 OVERSTRIKE_RE = re.compile(".\x08")
 
 
@@ -105,12 +109,50 @@ async def read_source(args: ReadSourceParams, ctx: ToolContext) -> str:
     return "\n".join(numbered) or "(empty range)"
 
 
+class SearchDocsParams(BaseModel):
+    query: str = Field(description="Prose question or topic to search for")
+
+
+async def search_docs(args: SearchDocsParams, ctx: ToolContext) -> str:
+    """Semantic retrieval over indexed docs (§5.6.2)."""
+    if ctx.rag is None or ctx.embedder is None:
+        return (
+            "Semantic search is not configured; use lookup_symbol or "
+            "read_manpage instead."
+        )
+    if ctx.rag.count() == 0:
+        return "The document index is empty — index something with index_docs first."
+    try:
+        vectors = await ctx.embedder.embed([args.query])
+    except EmbeddingError as e:
+        return f"Semantic search unavailable (embedding backend error: {e})."
+    hits = ctx.rag.query(vectors[0], k=SEARCH_TOP_K)
+    parts = []
+    for hit in hits:
+        parts.append(f"── {hit.source} (distance {hit.distance:.3f}) ──\n{hit.text}")
+    return "\n\n".join(parts)
+
+
+async def _rag_index_text(ctx: ToolContext, source: str, text: str) -> int | str:
+    """Chunk+embed+store one document; chunk count, or an error string."""
+    chunks = chunk_text(text)
+    if not chunks:
+        return 0
+    try:
+        vectors = await ctx.embedder.embed(chunks)
+    except EmbeddingError as e:
+        return f"embedding backend error: {e}"
+    ctx.rag.clear_source(source)
+    ctx.rag.add(source, chunks, vectors)
+    return len(chunks)
+
+
 class IndexDocsParams(BaseModel):
-    what: Literal["python_source", "manpages"] = Field(
+    what: Literal["python_source", "manpages", "docs_dir"] = Field(
         description="What to index"
     )
     target: str = Field(
-        description="python_source: registry key of a source directory; "
+        description="python_source/docs_dir: registry key of a directory; "
         "manpages: space-separated command names, e.g. 'grep samtools-view'"
     )
 
@@ -118,11 +160,37 @@ class IndexDocsParams(BaseModel):
 async def index_docs(args: IndexDocsParams, ctx: ToolContext) -> str:
     if ctx.symbols is None:
         raise RuntimeError("No symbol index configured in this session")
+    rag_ready = ctx.rag is not None and ctx.embedder is not None
+
     if args.what == "python_source":
         root = ctx.registry.resolve(args.target)
         files = index_python_source(ctx.symbols, root)
         return f"Indexed {files} Python files from {args.target!r}."
-    indexed, missing = [], []
+
+    if args.what == "docs_dir":
+        if not rag_ready:
+            return (
+                "Cannot index docs_dir: semantic search is not configured "
+                "(no embedding backend)."
+            )
+        root = ctx.registry.resolve(args.target)
+        indexed, problems = 0, []
+        for path in sorted(root.rglob("*")):
+            if path.suffix.lower() not in DOC_SUFFIXES or not path.is_file():
+                continue
+            outcome = await _rag_index_text(
+                ctx, str(path), path.read_text(errors="replace")
+            )
+            if isinstance(outcome, str):
+                problems.append(f"{path.name}: {outcome}")
+            elif outcome:
+                indexed += 1
+        message = f"Indexed {indexed} documents from {args.target!r} for search."
+        if problems:
+            message += " Problems: " + "; ".join(problems[:3])
+        return message
+
+    indexed, missing, searchable = [], [], 0
     for command in args.target.split():
         text = await fetch_manpage(command)
         if text is None:
@@ -132,9 +200,15 @@ async def index_docs(args: IndexDocsParams, ctx: ToolContext) -> str:
         ctx.symbols.clear_source(f"man:{command}")
         ctx.symbols.add(symbols)
         indexed.append(f"{command} ({len(symbols)} flags)")
+        if rag_ready:
+            outcome = await _rag_index_text(ctx, f"man:{command}", text)
+            if isinstance(outcome, int):
+                searchable += outcome
     parts = []
     if indexed:
         parts.append("Indexed man pages: " + ", ".join(indexed) + ".")
+    if searchable:
+        parts.append(f"Also indexed {searchable} chunks for semantic search.")
     if missing:
         parts.append("No man page found for: " + ", ".join(missing) + ".")
     return " ".join(parts) or "Nothing indexed."
@@ -156,7 +230,7 @@ async def ask_docs(args: AskDocsParams, ctx: ToolContext) -> str:
     )
 
 
-RESEARCH_TOOL_NAMES = ["lookup_symbol", "read_manpage", "read_source"]
+RESEARCH_TOOL_NAMES = ["lookup_symbol", "read_manpage", "read_source", "search_docs"]
 
 
 def add_doc_tools(registry: ToolRegistry) -> ToolRegistry:
@@ -182,6 +256,15 @@ def add_doc_tools(registry: ToolRegistry) -> ToolRegistry:
             description="Read a line range of a registered source file",
             params=ReadSourceParams,
             handler=read_source,
+        )
+    )
+    registry.register(
+        Tool(
+            name="search_docs",
+            description="Semantic search over indexed documentation (prose "
+            "questions)",
+            params=SearchDocsParams,
+            handler=search_docs,
         )
     )
     registry.register(

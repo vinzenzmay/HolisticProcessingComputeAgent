@@ -190,8 +190,14 @@ class TestResearcher:
         assert "exhausted" in answer
 
     async def test_research_tools_are_read_only_subset(self):
+        # no index_docs / ask_docs: the researcher reads, never writes or recurses
         tools = add_doc_tools(ToolRegistry()).subset(RESEARCH_TOOL_NAMES)
-        assert set(tools.names()) == {"lookup_symbol", "read_manpage", "read_source"}
+        assert set(tools.names()) == {
+            "lookup_symbol",
+            "read_manpage",
+            "read_source",
+            "search_docs",
+        }
 
 
 class TestAskDocsTool:
@@ -211,3 +217,119 @@ class TestAskDocsTool:
             registry, "ask_docs", ctx, question="What does samtools view -b do?"
         )
         assert result == "-b outputs BAM (man:samtools-view)."
+
+
+# ------------------------------------------------------ semantic search (11)
+
+from hpca.embeddings import EmbeddingClient  # noqa: E402
+from hpca.rag import RagStore  # noqa: E402
+
+
+class FakeEmbedder:
+    """Deterministic keyword-space embeddings; no backend needed."""
+
+    KEYWORDS = ["bam", "slurm", "memory", "quota"]
+
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.calls = []
+
+    async def embed(self, texts):
+        from hpca.embeddings import EmbeddingError
+
+        self.calls.append(list(texts))
+        if self.fail:
+            raise EmbeddingError("backend down")
+        vectors = []
+        for text in texts:
+            lowered = text.lower()
+            vectors.append(
+                [1.0 if kw in lowered else 0.0 for kw in self.KEYWORDS] + [0.1]
+            )
+        return vectors
+
+
+@pytest.fixture
+def rag_ctx(ctx, tmp_path):
+    ctx.rag = RagStore(tmp_path / "rag.db")
+    ctx.embedder = FakeEmbedder()
+    yield ctx
+    ctx.rag.close()
+
+
+class TestSearchDocs:
+    async def test_returns_nearest_chunks_with_sources(self, tools, rag_ctx):
+        rag_ctx.rag.add(
+            "guide.md",
+            ["How to subset a BAM by region", "How to request more memory"],
+            await rag_ctx.embedder.embed(
+                ["How to subset a BAM by region", "How to request more memory"]
+            ),
+        )
+        result = await call(tools, "search_docs", rag_ctx, query="subset bam file")
+        assert "subset a BAM" in result
+        assert "guide.md" in result
+
+    async def test_empty_index_is_explicit(self, tools, rag_ctx):
+        result = await call(tools, "search_docs", rag_ctx, query="anything")
+        assert "empty" in result.lower()
+
+    async def test_unconfigured_points_at_exact_tools(self, tools, ctx):
+        result = await call(tools, "search_docs", ctx, query="anything")
+        assert "lookup_symbol" in result
+
+    async def test_embedding_failure_degrades_gracefully(self, tools, rag_ctx):
+        rag_ctx.rag.add("d.md", ["bam stuff"], [[1.0, 0, 0, 0, 0.1]])
+        rag_ctx.embedder = FakeEmbedder(fail=True)
+        result = await call(tools, "search_docs", rag_ctx, query="bam")
+        assert "unavailable" in result.lower()
+
+
+class TestIndexDocsDir:
+    async def test_indexes_markdown_and_text(self, tools, rag_ctx, tmp_path):
+        docs = tmp_path / "docs"
+        (docs / "sub").mkdir(parents=True)
+        (docs / "a.md").write_text("Slurm job submission guide.")
+        (docs / "sub" / "b.txt").write_text("Memory limits on the cluster.")
+        (docs / "ignore.png").write_bytes(b"\x89PNG")
+        rag_ctx.registry.register("docs", docs)
+        result = await call(
+            tools, "index_docs", rag_ctx, what="docs_dir", target="docs"
+        )
+        assert "Indexed 2 documents" in result
+        assert rag_ctx.rag.count() == 2
+
+    async def test_reindex_replaces_not_duplicates(self, tools, rag_ctx, tmp_path):
+        docs = tmp_path / "docs"
+        docs.mkdir()
+        (docs / "a.md").write_text("Slurm guide.")
+        rag_ctx.registry.register("docs", docs)
+        await call(tools, "index_docs", rag_ctx, what="docs_dir", target="docs")
+        await call(tools, "index_docs", rag_ctx, what="docs_dir", target="docs")
+        assert rag_ctx.rag.count() == 1
+
+    async def test_without_embedder_refuses_clearly(self, tools, ctx, tmp_path):
+        docs = tmp_path / "docs"
+        docs.mkdir()
+        (docs / "a.md").write_text("x")
+        ctx.registry.register("docs", docs)
+        result = await call(tools, "index_docs", ctx, what="docs_dir", target="docs")
+        assert "not configured" in result
+
+    async def test_manpage_indexing_also_feeds_rag(self, tools, rag_ctx, monkeypatch):
+        async def fake_fetch(name):
+            return MAN_PAGE if name == "samtools-view" else None
+
+        monkeypatch.setattr(doc_tools_module, "fetch_manpage", fake_fetch)
+        result = await call(
+            tools, "index_docs", rag_ctx, what="manpages", target="samtools-view"
+        )
+        assert "2 flags" in result  # symbol table
+        assert "semantic search" in result  # vector store
+        assert rag_ctx.rag.count() >= 1
+
+
+class TestResearchToolset:
+    def test_search_docs_available_to_researcher(self):
+        tools = add_doc_tools(ToolRegistry()).subset(RESEARCH_TOOL_NAMES)
+        assert "search_docs" in tools.names()

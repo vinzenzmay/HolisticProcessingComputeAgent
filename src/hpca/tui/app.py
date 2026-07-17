@@ -29,7 +29,9 @@ from hpca.agent.conclude import propose_memories
 from hpca.agent.doc_tools import add_ask_docs, add_doc_tools
 from hpca.agent.prompts import orchestrator_system_prompt
 from hpca.editor import resolve_editor
+from hpca.embeddings import EmbeddingClient
 from hpca.llm import LLMClient
+from hpca.rag import RagStore
 from hpca.profiles import Profile
 from hpca.registry import PathRegistry
 from hpca.runner import ProcessRecord, ProcessRunner
@@ -233,6 +235,11 @@ class HpcaApp(App):
         )
         self.job_store = JobStore(self._conn)
         self.symbol_index = SymbolIndex(self._conn)
+        self.rag_store = RagStore(app_dir() / "rag.db")
+        self.embedder = EmbeddingClient(
+            base_url=self.settings.rag.embedding_base_url,
+            model=self.settings.rag.embedding,
+        )
         self.trash = TrashManager(
             app_dir() / "trash",
             backup_limit_bytes=int(self.settings.safety.backup_limit_gb * 1024**3),
@@ -262,6 +269,10 @@ class HpcaApp(App):
             await self._saver_ctx.__aexit__(None, None, None)
         if self._conn is not None:
             self._conn.close()
+        if getattr(self, "rag_store", None) is not None:
+            self.rag_store.close()
+        if getattr(self, "embedder", None) is not None:
+            await self.embedder.close()
         if self._owns_llm and self._llm is not None:
             await self._llm.close()
 
@@ -466,6 +477,8 @@ class HpcaApp(App):
             trash=self.trash,
             tier1_text=self.profile_memory.tier_text(1),
             symbols=self.symbol_index,
+            rag=self.rag_store,
+            embedder=self.embedder,
         )
 
     async def start_new_session(self) -> None:
