@@ -4,7 +4,8 @@ import json
 
 import pytest
 
-from hpca.config import LLMBackend, Settings, SettingsError, app_dir, settings_path
+from hpca.config import (LLMBackend, Settings, SettingsError, app_dir,
+                         settings_path)
 
 
 class TestAppDir:
@@ -34,7 +35,7 @@ class TestDefaults:
         # thinking is slow and not generally better: opt in, per backend
         assert s.llm.enable_thinking is False
         # each create+run (or run_bash) is one step; a real check needs several
-        assert s.llm.max_tool_rounds == 16
+        assert s.llm.max_tool_rounds == 30
 
     def test_cluster_defaults(self):
         s = Settings()

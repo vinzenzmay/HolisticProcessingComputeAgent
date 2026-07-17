@@ -49,6 +49,20 @@ DISCOVERY_GUIDANCE = (
 # The single most common way the agent burns its tool budget: it cannot run a
 # conda tool and thrashes on activation. `source .../envs/<env>/bin/activate`
 # does not exist (only the base install has activate). Give it the idiom.
+SCRIPT_GUIDANCE = (
+    "Run real work (a tool, a pipeline) with create_script then start_script — "
+    "those bash scripts run fail-fast (`set -euo pipefail` is added), so a "
+    "failed command stops the script and is reported as failed. Because of "
+    "that, never end a script with an unconditional `echo \"Done\"`: let the "
+    "exit code report success. run_bash is for quick look-around checks only. "
+    "Build each command plainly on one line — real flags and paths separated "
+    "by single spaces, nothing else. Do NOT insert quotes, commas or `\\` "
+    "line-continuations between arguments; a stray `\",` turns your command "
+    "into garbage the tool rejects. Reference paths by their registered value "
+    "or write the literal path; do not leave a shell variable unset."
+)
+
+
 ENVIRONMENT_TOOL_GUIDANCE = (
     "Most bioinformatics tools here live in conda environments, not on PATH. "
     "To run one, either use `conda run -n <env> <tool> <args>` (works inside a "
@@ -93,6 +107,7 @@ def orchestrator_system_prompt(
         PATH_WORKFLOW_GUIDANCE,
         DISCOVERY_GUIDANCE,
         ENVIRONMENT_TOOL_GUIDANCE,
+        SCRIPT_GUIDANCE,
         GROUNDED_ANSWERING_GUIDANCE,
     ]
     if skills:

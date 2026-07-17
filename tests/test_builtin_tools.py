@@ -45,7 +45,8 @@ class TestCreateScript:
             content_lines=["echo hello"],
         )
         path = ctx.registry.resolve("hello_sh")
-        assert path.read_text() == "echo hello\n"  # joined + trailing newline
+        # strict mode is injected, then the model's lines
+        assert path.read_text() == "set -euo pipefail\necho hello\n"
         assert "hello_sh" in result
         assert "ok" in result.lower()
 
@@ -368,3 +369,87 @@ class TestRunBash:
         # no bash_* keys clutter the registry the model reasons over
         assert not any(k.startswith("bash_") for k in ctx.registry.list())
         assert ctx.runner.list()[0].state == "finished"
+
+
+class TestBashFailFast:
+    """A bash execution script that runs a failing command must report the
+    failure, not march on to a success echo and exit 0 (this bit a real
+    sniffles run: the process showed 'finished (exit 0)' while it had failed)."""
+
+    async def test_failure_before_a_success_echo_is_not_masked(self, tools, ctx):
+        await call(
+            tools, "create_script", ctx,
+            kind="bash", registry_key="run_thing",
+            content_lines=[
+                "false",                       # the "tool" fails
+                'echo "Done. Output: out.vcf"',  # would otherwise mask it
+            ],
+        )
+        record = await ctx.runner.start(
+            ["bash", str(ctx.registry.resolve("run_thing"))], name="run_thing"
+        )
+        record = await ctx.runner.wait(record.pid)
+        assert record.state == "failed"
+        assert record.exit_code != 0
+        # the success line never ran
+        assert "Done" not in record.stdout_path.read_text()
+
+    async def test_strict_mode_is_injected_after_the_shebang(self, tools, ctx):
+        await call(
+            tools, "create_script", ctx,
+            kind="bash", registry_key="shebanged",
+            content_lines=["#!/bin/bash", "echo hi"],
+        )
+        text = ctx.registry.resolve("shebanged").read_text()
+        lines = text.splitlines()
+        assert lines[0] == "#!/bin/bash"
+        assert lines[1] == "set -euo pipefail"
+
+    async def test_strict_mode_prepended_when_no_shebang(self, tools, ctx):
+        await call(
+            tools, "create_script", ctx,
+            kind="bash", registry_key="bare", content_lines=["echo hi"],
+        )
+        assert ctx.registry.resolve("bare").read_text().startswith(
+            "set -euo pipefail\n"
+        )
+
+    async def test_the_models_own_set_e_is_respected(self, tools, ctx):
+        await call(
+            tools, "create_script", ctx,
+            kind="bash", registry_key="own",
+            content_lines=["set -e", "echo hi"],
+        )
+        text = ctx.registry.resolve("own").read_text()
+        assert text.count("set -e") == 1  # not doubled
+
+    async def test_the_success_note_warns_against_unconditional_done(
+        self, tools, ctx
+    ):
+        result = await call(
+            tools, "create_script", ctx,
+            kind="bash", registry_key="noted", content_lines=["echo hi"],
+        )
+        assert "fail-fast" in result
+
+    async def test_non_bash_scripts_are_not_touched(self, tools, ctx):
+        await call(
+            tools, "create_script", ctx,
+            kind="python", registry_key="py", content_lines=["print('hi')"],
+        )
+        text = ctx.registry.resolve("py").read_text()
+        assert "set -euo pipefail" not in text  # python fails on exception anyway
+
+    async def test_run_bash_stays_lenient_for_exploration(self, tools, ctx):
+        # `command -v missing` returns non-zero; exploration must still get the
+        # output, not abort — run_bash reports the exit code rather than
+        # fail-fasting like an execution script
+        result = await call(
+            tools, "run_bash", ctx,
+            content_lines=[
+                "command -v this_tool_does_not_exist_xyz || echo NOTFOUND",
+                "echo still-running",
+            ],
+        )
+        assert "still-running" in result  # did not abort at the missing tool
+        assert "exit 0" in result

@@ -57,7 +57,7 @@ class LLMSettings(_Section):
     # step; a real check needs several, and debugging a script costs more, so
     # this is generous. Raise for deeper autonomous work, lower to keep turns
     # snappy.
-    max_tool_rounds: int = 16
+    max_tool_rounds: int = 30
 
 
 class ClusterSettings(_Section):

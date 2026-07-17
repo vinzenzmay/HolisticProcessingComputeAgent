@@ -55,6 +55,25 @@ class CreateScriptParams(BaseModel):
     )
 
 
+def _strict_bash(lines: list[str]) -> list[str]:
+    """Prepend `set -euo pipefail` so a failing command aborts the script.
+
+    Default bash marches past a failed command, so a script that runs a tool
+    and then echoes "Done" exits 0 even when the tool failed — the runner
+    reports success and the agent reports success, both wrong (this bit a real
+    sniffles run). Strict mode makes the failure the script's exit code.
+    Scripts that already opt in are left alone.
+    """
+    if any(
+        line.strip().startswith("set -e") or "set -euo" in line for line in lines
+    ):
+        return lines
+    strict = "set -euo pipefail"
+    if lines and lines[0].lstrip().startswith("#!"):
+        return [lines[0], strict, *lines[1:]]
+    return [strict, *lines]
+
+
 async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
     ctx.scripts_dir.mkdir(parents=True, exist_ok=True)
     path = ctx.scripts_dir / f"{args.registry_key}{SCRIPT_SUFFIX[args.kind]}"
@@ -72,6 +91,9 @@ async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
             "it would do nothing. Put each script line into its own "
             "content_lines array element and call create_script again."
         )
+    if args.kind == "bash":
+        # execution scripts fail loudly; run_bash (exploration) stays lenient
+        lines = _strict_bash(lines)
     content = "\n".join(lines) + "\n"
     path.write_text(content)
     check = await syntax_check(args.kind, path)
@@ -96,9 +118,14 @@ async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
             warnings.append(format_gate_warnings(not_indexed))
     ctx.registry.register(args.registry_key, path)
     note = f" ({'; '.join(warnings)})" if warnings else ""
+    strict = (
+        " Runs fail-fast (set -euo pipefail): a failed command stops the "
+        "script, so do not print success unconditionally." if args.kind == "bash"
+        else ""
+    )
     return (
         f"Created script {args.registry_key!r} ({args.kind}); "
-        f"syntax check ok{note}. Start it with start_script."
+        f"syntax check ok{note}. Start it with start_script.{strict}"
     )
 
 

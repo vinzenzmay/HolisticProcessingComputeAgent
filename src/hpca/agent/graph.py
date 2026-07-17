@@ -30,7 +30,7 @@ from hpca.agent.prompts import orchestrator_system_prompt
 from hpca.agent.tools import ToolRegistry
 from hpca.llm import Message
 
-MAX_TOOL_ROUNDS = 16  # default; overridable per build (llm.max_tool_rounds)
+MAX_TOOL_ROUNDS = 30  # default; overridable per build (llm.max_tool_rounds)
 
 
 def _append(left: list, right: list) -> list:
