@@ -4,8 +4,10 @@ Two columns: the left lists endpoints discovered by a localhost port scan
 (run when the screen opens — on this HPC setup every backend is an
 SSH-tunneled local port); the right lists the configured catalog from
 settings, each labeled ● connected / ○ disconnected, ★ marking the active
-default. Enter on the left configures a backend; on the right it becomes the
-default; (r) removes it.
+default. ←/→ switch panels. Key bindings live on the panel widgets, so the
+footer only offers "add llm to list (enter)" while the cursor is on a
+discovered endpoint, and "set default"/"remove llm" only on a configured
+one; removal asks for confirmation.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from textual.widgets import Footer, Label, ListItem, ListView, Static
 
 from hpca.config import LLMBackend
 from hpca.discover import DiscoveredBackend, is_reachable, scan_local_ports
+from hpca.tui.confirm_screen import ConfirmScreen
 
 
 def backend_line(backend: LLMBackend) -> str:
@@ -31,11 +34,41 @@ def backend_line(backend: LLMBackend) -> str:
     ).describe()
 
 
+class DiscoveredList(ListView):
+    """Left panel; its bindings appear in the footer only when focused."""
+
+    BINDINGS = [
+        Binding("enter", "select_cursor", "add llm to list", show=True),
+    ]
+
+    def check_action(self, action: str, parameters) -> bool | None:
+        if action == "select_cursor":
+            return self.highlighted_child is not None
+        return True
+
+
+class ConfiguredList(ListView):
+    """Right panel; set-default and remove only offered on an entry."""
+
+    BINDINGS = [
+        Binding("enter", "select_cursor", "set default", show=True),
+        Binding("r", "remove_llm", "remove llm", show=True),
+    ]
+
+    def check_action(self, action: str, parameters) -> bool | None:
+        if action in ("select_cursor", "remove_llm"):
+            return self.highlighted_child is not None
+        return True
+
+    def action_remove_llm(self) -> None:
+        self.screen.confirm_remove_selected()
+
+
 class ManageLLMsScreen(Screen):
     BINDINGS = [
         Binding("escape", "close", "back", priority=True),
-        Binding("enter", "choose", "add / set default", show=True),
-        Binding("r", "remove", "remove"),
+        Binding("left", "focus_panel('discovered')", "◀ panel", show=False),
+        Binding("right", "focus_panel('configured')", "panel ▶", show=False),
         Binding("f5", "rescan", "rescan"),
     ]
 
@@ -63,14 +96,11 @@ class ManageLLMsScreen(Screen):
         yield Static("Manage LLM backends", id="llm-title", classes="llm-panel-title")
         with Horizontal(id="llm-columns"):
             with Vertical(classes="llm-panel"):
-                yield Static("Discovered (enter: configure)", classes="llm-panel-title")
-                yield ListView(id="llm-discovered")
+                yield Static("Discovered", classes="llm-panel-title")
+                yield DiscoveredList(id="llm-discovered")
             with Vertical(classes="llm-panel"):
-                yield Static(
-                    "Configured (enter: set default · r: remove)",
-                    classes="llm-panel-title",
-                )
-                yield ListView(id="llm-configured")
+                yield Static("Configured", classes="llm-panel-title")
+                yield ConfiguredList(id="llm-configured")
         yield Static("scanning localhost for LLM endpoints…", id="llm-status")
         yield Footer()
 
@@ -86,8 +116,7 @@ class ManageLLMsScreen(Screen):
     async def scan_worker(self) -> None:
         self._discovered = await scan_local_ports()
         await self.refresh_discovered()
-        status = self.query_one("#llm-status", Static)
-        status.update(
+        self.query_one("#llm-status", Static).update(
             f"scan finished: {len(self._discovered)} endpoint(s) found "
             "· F5 to rescan"
         )
@@ -115,6 +144,8 @@ class ManageLLMsScreen(Screen):
             item.data_discovered = backend
             items.append(item)
         discovered_list.extend(items)
+        if items and discovered_list.index is None:
+            discovered_list.index = 0
 
     async def refresh_configured(self) -> None:
         configured_list = self.query_one("#llm-configured", ListView)
@@ -136,56 +167,66 @@ class ManageLLMsScreen(Screen):
             item.data_configured = backend
             items.append(item)
         configured_list.extend(items)
+        if items and configured_list.index is None:
+            configured_list.index = 0
 
     # -------------------------------------------------------------- actions
 
     def action_close(self) -> None:
         self.dismiss(None)
 
+    def action_focus_panel(self, which: str) -> None:
+        self.query_one(f"#llm-{which}", ListView).focus()
+
     def action_rescan(self) -> None:
         self.query_one("#llm-status", Static).update("rescanning…")
         self.scan_worker()
 
-    async def action_choose(self) -> None:
-        focused = self.focused
-        if not isinstance(focused, ListView):
-            return
-        highlighted = focused.highlighted_child
-        discovered = getattr(highlighted, "data_discovered", None)
-        configured = getattr(highlighted, "data_configured", None)
+    @on(ListView.Selected)
+    async def _on_selected(self, event: ListView.Selected) -> None:
+        discovered = getattr(event.item, "data_discovered", None)
+        configured = getattr(event.item, "data_configured", None)
         if discovered is not None:
-            self.app.settings.backends.append(
-                LLMBackend(
-                    model=discovered.model,
-                    base_url=discovered.base_url,
-                    max_model_len=discovered.max_model_len,
-                )
-            )
-            self.app.settings.save()
-            self._reachable[discovered.base_url] = True  # just probed by the scan
-            await self.refresh_discovered()
-            await self.refresh_configured()
-            self.notify(f"Configured {discovered.model}")
+            await self._add_backend(discovered)
         elif configured is not None:
             self.app.switch_backend(configured)
             await self.refresh_configured()
 
-    async def action_remove(self) -> None:
-        focused = self.focused
-        if not isinstance(focused, ListView):
+    async def _add_backend(self, discovered: DiscoveredBackend) -> None:
+        self.app.settings.backends.append(
+            LLMBackend(
+                model=discovered.model,
+                base_url=discovered.base_url,
+                max_model_len=discovered.max_model_len,
+            )
+        )
+        self.app.settings.save()
+        self._reachable[discovered.base_url] = True  # just probed by the scan
+        await self.refresh_discovered()
+        await self.refresh_configured()
+        self.notify(f"Configured {discovered.model}")
+
+    def confirm_remove_selected(self) -> None:
+        configured_list = self.query_one("#llm-configured", ListView)
+        backend = getattr(configured_list.highlighted_child, "data_configured", None)
+        if backend is None:
             return
-        configured = getattr(focused.highlighted_child, "data_configured", None)
-        if configured is None:
-            return
+
+        def verdict(confirmed: bool | None) -> None:
+            if confirmed:
+                self.run_worker(self._remove_backend(backend), group="llm-remove")
+
+        self.app.push_screen(
+            ConfirmScreen(f"Really remove {backend.model}?"), verdict
+        )
+
+    async def _remove_backend(self, backend: LLMBackend) -> None:
         self.app.settings.backends = [
-            b for b in self.app.settings.backends
-            if not (b.base_url == configured.base_url and b.model == configured.model)
+            b
+            for b in self.app.settings.backends
+            if not (b.base_url == backend.base_url and b.model == backend.model)
         ]
         self.app.settings.save()
         await self.refresh_discovered()
         await self.refresh_configured()
-        self.notify(f"Removed {configured.model}")
-
-    @on(ListView.Selected)
-    async def _on_selected(self, event: ListView.Selected) -> None:
-        await self.action_choose()
+        self.notify(f"Removed {backend.model}")

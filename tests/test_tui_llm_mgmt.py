@@ -169,8 +169,88 @@ class TestManageScreen:
             right.index = 0
             await pilot.press("r")
             await pilot.pause()
+            assert isinstance(app.screen, ConfirmScreen)
+            assert QWEN.model in app.screen._question
+            await pilot.press("y")
+            await app.screen.workers.wait_for_complete()
+            await pilot.pause()
             assert app.settings.backends == []
             assert Settings.load().backends == []
+
+    async def test_remove_denied_keeps_backend(self, hpca_home, fake_discovery):
+        settings = Settings()
+        settings.backends = [LLMBackend(model=QWEN.model, base_url=QWEN.base_url)]
+        settings.save()
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("m")
+            await app.screen.workers.wait_for_complete()
+            await pilot.pause()
+            right = app.screen.query_one("#llm-configured", ListView)
+            right.focus()
+            right.index = 0
+            await pilot.press("r")
+            await pilot.press("n")
+            await pilot.pause()
+            assert len(app.settings.backends) == 1
+
+    async def test_remove_inert_from_left_panel(self, hpca_home, fake_discovery):
+        settings = Settings()
+        settings.backends = [LLMBackend(model=QWEN.model, base_url=QWEN.base_url)]
+        settings.save()
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("m")
+            await app.screen.workers.wait_for_complete()
+            await pilot.pause()
+            app.screen.query_one("#llm-discovered", ListView).focus()
+            await pilot.press("r")
+            await pilot.pause()
+            assert not isinstance(app.screen, ConfirmScreen)
+            assert len(app.settings.backends) == 1
+
+    async def test_arrow_keys_switch_panels(self, hpca_home, fake_discovery):
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("m")
+            await app.screen.workers.wait_for_complete()
+            await pilot.pause()
+            assert app.focused.id == "llm-discovered"
+            await pilot.press("right")
+            assert app.focused.id == "llm-configured"
+            await pilot.press("left")
+            assert app.focused.id == "llm-discovered"
+
+    async def test_m_only_from_sessions_column(self, hpca_home, fake_discovery):
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            app._focus_column("chat")
+            await pilot.pause()
+            assert app.check_action("manage_llms", ()) is False
+            await pilot.press("m")
+            await pilot.pause()
+            assert not isinstance(app.screen, ManageLLMsScreen)
+            app._focus_column("sessions")
+            await pilot.pause()
+            assert app.check_action("manage_llms", ()) is True
+            await pilot.press("m")
+            assert isinstance(app.screen, ManageLLMsScreen)
+            # inside the manager, (m) is no longer offered
+            assert app.check_action("manage_llms", ()) is False
+
+    async def test_footer_offers_add_only_on_discovered_entry(
+        self, hpca_home, fake_discovery
+    ):
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("m")
+            await app.screen.workers.wait_for_complete()
+            await pilot.pause()
+            left = app.screen.query_one("#llm-discovered", ListView)
+            right = app.screen.query_one("#llm-configured", ListView)
+            assert left.check_action("select_cursor", ()) is True  # add llm to list
+            assert right.check_action("select_cursor", ()) is False  # nothing there
+            assert right.check_action("remove_llm", ()) is False
 
     async def test_escape_closes(self, hpca_home, fake_discovery):
         app = HpcaApp(llm=FakeLLM())
@@ -185,9 +265,28 @@ class TestSwitcher:
     async def test_l_without_backends_warns(self, hpca_home):
         app = HpcaApp(llm=FakeLLM())
         async with app.run_test(size=(120, 40)) as pilot:
+            app._focus_column("chat")
             await pilot.press("l")
             await pilot.pause()
             assert not isinstance(app.screen, SwitchLLMScreen)
+
+    async def test_l_only_available_in_chat_column(self, hpca_home, fake_discovery):
+        settings = Settings()
+        settings.backends = [LLMBackend(model=QWEN.model, base_url=QWEN.base_url)]
+        settings.save()
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            # sessions column focused at start: l is hidden and inert
+            assert app.check_action("switch_llm", ()) is False
+            await pilot.press("l")
+            await pilot.pause()
+            assert not isinstance(app.screen, SwitchLLMScreen)
+            app._focus_column("chat")
+            await pilot.pause()
+            assert app.check_action("switch_llm", ()) is True
+            await pilot.press("l")
+            await pilot.pause()
+            assert isinstance(app.screen, SwitchLLMScreen)
 
     async def test_switch_updates_llm_and_topbar(self, hpca_home, fake_discovery):
         settings = Settings()
@@ -198,6 +297,7 @@ class TestSwitcher:
         app = HpcaApp(llm=FakeLLM())
         async with app.run_test(size=(120, 40)) as pilot:
             old_graph = app.graph
+            app._focus_column("chat")
             await pilot.press("l")
             assert isinstance(app.screen, SwitchLLMScreen)
             await pilot.press("enter")
@@ -217,6 +317,7 @@ class TestSwitcher:
         app = HpcaApp(llm=FakeLLM())
         async with app.run_test(size=(120, 40)) as pilot:
             before = app.settings.llm.model
+            app._focus_column("chat")
             await pilot.press("l")
             await pilot.press("escape")
             await pilot.pause()

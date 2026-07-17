@@ -718,6 +718,20 @@ class HpcaApp(App):
 
     # ----------------------------------------------------------- focus model
 
+    def check_action(self, action: str, parameters) -> bool | None:
+        """Context-sensitive availability of the global hotkeys.
+
+        (m) manage llms only from the main screen's sessions column (where
+        sessions are started); (l) switch llm only from the chat column.
+        Returning False also hides the binding from the footer.
+        """
+        on_main_screen = len(self.screen_stack) == 1
+        if action == "manage_llms":
+            return on_main_screen and self.focused_column_id == "sessions"
+        if action == "switch_llm":
+            return on_main_screen and self.focused_column_id == "chat"
+        return True
+
     @property
     def focused_column_id(self) -> str | None:
         """Id of the ColumnPanel containing the focused widget, if any."""
