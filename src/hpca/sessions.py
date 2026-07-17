@@ -68,6 +68,19 @@ class SessionStore:
         )
         self._conn.commit()
 
+    def reassign_profile(self, from_profile: str, to_profile: str) -> int:
+        """Move every session from one profile to another; returns how many.
+
+        Used when a profile is deleted: its sessions fall back to the default
+        rather than pointing at a profile file that no longer exists.
+        """
+        cursor = self._conn.execute(
+            "UPDATE sessions SET profile = ? WHERE profile = ?",
+            (to_profile, from_profile),
+        )
+        self._conn.commit()
+        return cursor.rowcount
+
     def delete(self, session_id: str) -> None:
         """Forget a chat thread and the path aliases it named.
 

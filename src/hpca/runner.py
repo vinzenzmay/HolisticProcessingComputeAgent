@@ -166,3 +166,27 @@ class ProcessRunner:
 
     def list(self) -> list[ProcessRecord]:
         return list(reversed(self._records.values()))
+
+
+def running_session_ids(conn: sqlite3.Connection) -> set[str]:
+    """Sessions with a still-running sub-process, store-wide.
+
+    The monitor keeps the DB ``state`` current even after the UI leaves the
+    session, so this reads the table rather than any one live runner. A row
+    left at ``running`` by a crashed previous run is verified against the OS,
+    so a stale pid never blocks forever.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT session_id, pid FROM processes WHERE state = 'running'"
+    ).fetchall()
+    alive: set[str] = set()
+    for row in rows:
+        pid = row["pid"]
+        try:
+            os.kill(pid, 0)  # signal 0: liveness check, does not touch the process
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            pass  # exists but ours to not signal; count it as alive
+        alive.add(row["session_id"])
+    return alive

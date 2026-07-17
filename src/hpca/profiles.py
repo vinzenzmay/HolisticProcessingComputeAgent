@@ -19,6 +19,9 @@ import yaml
 
 from hpca.config import app_dir
 
+DEFAULT_PROFILE = "default"
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]*$")
+
 TIER_HEADING_RE = re.compile(r"^##\s*\[tier([123])\]\s*$")
 HEADING_RE = re.compile(r"^##\s+")
 META_RE = re.compile(r"^<!--\s*(.*?)\s*-->\s*$")
@@ -72,9 +75,43 @@ class Profile:
 
     @staticmethod
     def list_profiles() -> list[str]:
-        if not profiles_dir().exists():
-            return []
-        return sorted(p.stem for p in profiles_dir().glob("*.md"))
+        """Every profile that exists, with the default first and always
+        present — it is the fallback, so it cannot be missing."""
+        names = set()
+        if profiles_dir().exists():
+            names = {p.stem for p in profiles_dir().glob("*.md")}
+        names.add(DEFAULT_PROFILE)
+        return [DEFAULT_PROFILE] + sorted(names - {DEFAULT_PROFILE})
+
+    @staticmethod
+    def validate_name(name: str) -> str:
+        """The name is a filename: reject what would escape the directory or
+        collide. Returns the cleaned name; raises ValueError with the reason."""
+        cleaned = name.strip()
+        if not cleaned:
+            raise ValueError("A profile needs a name.")
+        if not NAME_RE.match(cleaned):
+            raise ValueError(
+                "Use letters, digits, spaces, dots, dashes or underscores."
+            )
+        if cleaned in Profile.list_profiles():
+            raise ValueError(f"A profile called “{cleaned}” already exists.")
+        return cleaned
+
+    @classmethod
+    def create(cls, name: str) -> "Profile":
+        """A new, empty profile on disk (its name already validated)."""
+        profile = cls(name=name, created=date.today().isoformat())
+        profile.save()
+        return profile
+
+    @staticmethod
+    def delete(name: str) -> None:
+        """Remove a profile. The default is the fallback for sessions whose
+        profile is deleted, so it is not removable."""
+        if name == DEFAULT_PROFILE:
+            raise ValueError("The default profile cannot be deleted.")
+        Profile.path_for(name).unlink(missing_ok=True)
 
     def save(self) -> None:
         profiles_dir().mkdir(parents=True, exist_ok=True)

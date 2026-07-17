@@ -62,7 +62,7 @@ Terminals in 2026 are assumed wider than 80 columns
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│ Top bar: app name | profile | model | (s) settings           │
+│ Top bar: app name | profile | model | (c) config editor      │
 ├───────────────┬───────────────────────────┬──────────────────┤
 │ LEFT          │ CENTER                    │ RIGHT            │
 │ Sessions      │ Chat window of the        │ Sub-processes of │
@@ -88,11 +88,13 @@ Terminals in 2026 are assumed wider than 80 columns
   * *Sub-process (right column):* `(i)` inspect (open logs/status view),
     `(k)` kill (with confirmation), `(a)` ask — spawn a Q&A subagent about this
     sub-process.
-* **Top settings menu** `(s)`: edit configuration, persisted to
+* **Config editor** `(c)`: edit the settings JSON, persisted to
   `~/.HolisticProcessingComputeAgent/settings.json`.
-* **Slash commands** in the chat input:
-  * `\memorize [TEXT]` — add TEXT verbatim as a profile memory (tier 2).
-  * `\conclude` — the agent analyses the conversation and proposes memories to write
+* **Profiles & learnings** `(a)`: manage profiles and their tier-1 memories.
+* **Chat commands** (typing `/` or `\` lists them):
+  * `/memorize [NOTE]` — the agent forms memories from NOTE plus the conversation
+    so far and proposes them for approval (see §6).
+  * `/conclude` — the agent analyses the conversation and proposes memories to write
     into the profile (user approves before write, see §6).
 
 ### 3.4 Clipboard (must work under tmux, screen, and zellij)
@@ -403,8 +405,8 @@ the parser must be lenient and report problems clearly.
 
 ### 6.3 Writing memories
 
-* `\memorize [TEXT]` — appended verbatim to tier 2 (user chooses tier via a quick
-  modal, default 2).
+* `/memorize [NOTE]` — the model forms durable memories from NOTE and the
+  conversation so far; each is proposed for approval (choosing its own tier).
 * `\conclude` — the orchestrator analyses the conversation and **proposes** memory
   blocks; a modal shows the proposals; the user approves/edits/rejects each
   (HITL, consistent with §5.3 — a small model writes these, so review is essential).

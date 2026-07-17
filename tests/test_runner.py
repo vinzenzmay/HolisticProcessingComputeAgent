@@ -128,3 +128,34 @@ class TestStartFailureCleanup:
         with pytest.raises(sqlite3.OperationalError):
             await runner.start(["sleep", "60"], name="doomed")
         assert runner.list() == []  # no half-tracked record
+
+
+class TestRunningSessionIds:
+    def _insert(self, conn, *, pid, session_id, state):
+        conn.execute(
+            "INSERT INTO processes (pid, session_id, name, cmd, state, "
+            "stdout_path, stderr_path, started_at) "
+            "VALUES (?, ?, 'p', 'p', ?, '/o', '/e', 't')",
+            (pid, session_id, state),
+        )
+        conn.commit()
+
+    def test_only_live_running_processes_count(self, conn):
+        import os
+
+        from hpca.runner import running_session_ids
+
+        self._insert(conn, pid=os.getpid(), session_id="live", state="running")
+        self._insert(conn, pid=os.getpid(), session_id="done", state="finished")
+        # a pid that is extremely unlikely to exist: stale 'running' row
+        self._insert(conn, pid=2_000_000_000, session_id="stale", state="running")
+
+        ids = running_session_ids(conn)
+        assert "live" in ids  # our own pid is alive
+        assert "done" not in ids  # not running
+        assert "stale" not in ids  # running row, but the pid is gone
+
+    def test_empty_when_nothing_runs(self, conn):
+        from hpca.runner import running_session_ids
+
+        assert running_session_ids(conn) == set()

@@ -25,7 +25,12 @@ class TestNewProfile:
     def test_list_profiles(self, hpca_home):
         Profile.load("alpha").save()
         Profile.load("beta").save()
-        assert Profile.list_profiles() == ["alpha", "beta"]
+        # the default is always present and always listed first: it is the
+        # fallback for sessions whose profile is deleted
+        assert Profile.list_profiles() == ["default", "alpha", "beta"]
+
+    def test_default_is_listed_even_when_no_file_exists(self, hpca_home):
+        assert Profile.list_profiles() == ["default"]
 
 
 class TestRoundTrip:
@@ -156,3 +161,46 @@ class TestEstimateTokens:
         text = "the quick brown fox jumps over the lazy dog " * 50
         tokens = estimate_tokens(text)
         assert 200 < tokens < 1200
+
+
+class TestProfileManagement:
+    def test_validate_name_accepts_reasonable_names(self, hpca_home):
+        assert Profile.validate_name("  bam work ") == "bam work"
+        assert Profile.validate_name("proj-1.2_v3") == "proj-1.2_v3"
+
+    def test_validate_name_rejects_empty(self, hpca_home):
+        with pytest.raises(ValueError):
+            Profile.validate_name("   ")
+
+    def test_validate_name_rejects_path_characters(self, hpca_home):
+        for bad in ("../escape", "a/b", "with\ttab", ".hidden"):
+            with pytest.raises(ValueError):
+                Profile.validate_name(bad)
+
+    def test_validate_name_rejects_duplicates(self, hpca_home):
+        Profile.create("alpha")
+        with pytest.raises(ValueError):
+            Profile.validate_name("alpha")
+        with pytest.raises(ValueError):
+            Profile.validate_name("default")  # always exists
+
+    def test_create_writes_an_empty_profile(self, hpca_home):
+        profile = Profile.create("alpha")
+        assert profile.name == "alpha"
+        assert Profile.path_for("alpha").exists()
+        assert Profile.load("alpha").memories == []
+
+    def test_delete_removes_the_file(self, hpca_home):
+        Profile.create("alpha")
+        Profile.delete("alpha")
+        assert not Profile.path_for("alpha").exists()
+        assert "alpha" not in Profile.list_profiles()
+
+    def test_default_cannot_be_deleted(self, hpca_home):
+        Profile.load("default").save()
+        with pytest.raises(ValueError):
+            Profile.delete("default")
+        assert "default" in Profile.list_profiles()
+
+    def test_deleting_a_missing_profile_is_quiet(self, hpca_home):
+        Profile.delete("never-existed")  # must not raise

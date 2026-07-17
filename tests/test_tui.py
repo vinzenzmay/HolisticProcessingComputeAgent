@@ -152,29 +152,29 @@ class TestChatEntryNavigation:
             await pilot.press("!")
             assert chat_input.text == "hi!"
 
-    async def test_settings_not_offered_in_the_chat_column(self, hpca_home):
+    async def test_config_editor_not_offered_in_the_chat_column(self, hpca_home):
         app = HpcaApp()
         async with app.run_test(size=(120, 40)) as pilot:
             assert app.check_action("open_settings", ()) is True
             await pilot.press("enter")  # (new session) -> chat entry
             await pilot.pause()
             assert app.check_action("open_settings", ()) is False
-            await pilot.press("s")  # typed, not a hotkey
-            assert app.query_one("#chat-input", ChatInput).text == "s"
+            await pilot.press("c")  # typed, not a hotkey
+            assert app.query_one("#chat-input", ChatInput).text == "c"
             assert not isinstance(app.screen, SettingsScreen)
 
 
-class TestSettingsModal:
-    async def test_s_opens_settings_modal(self, hpca_home):
+class TestConfigEditorModal:
+    async def test_c_opens_the_config_editor(self, hpca_home):
         app = HpcaApp()
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.press("s")
+            await pilot.press("c")
             assert isinstance(app.screen, SettingsScreen)
 
     async def test_escape_closes_without_saving(self, hpca_home):
         app = HpcaApp()
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.press("s")
+            await pilot.press("c")
             await pilot.press("escape")
             assert not isinstance(app.screen, SettingsScreen)
             assert not (hpca_home / "settings.json").exists()
@@ -182,7 +182,7 @@ class TestSettingsModal:
     async def test_editor_prefilled_with_current_settings_json(self, hpca_home):
         app = HpcaApp()
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.press("s")
+            await pilot.press("c")
             editor = app.screen.query_one(TextArea)
             data = json.loads(editor.text)
             assert data["llm"]["model"] == "qwen3-6b"
@@ -190,7 +190,7 @@ class TestSettingsModal:
     async def test_save_persists_and_updates_app(self, hpca_home):
         app = HpcaApp()
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.press("s")
+            await pilot.press("c")
             editor = app.screen.query_one(TextArea)
             data = json.loads(editor.text)
             data["llm"]["model"] = "new-model"
@@ -207,7 +207,7 @@ class TestSettingsModal:
     async def test_invalid_json_shows_error_and_stays_open(self, hpca_home):
         app = HpcaApp()
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.press("s")
+            await pilot.press("c")
             editor = app.screen.query_one(TextArea)
             editor.text = "{broken"
             await pilot.press("ctrl+s")
@@ -220,7 +220,7 @@ class TestSettingsModal:
     async def test_invalid_value_shows_error_and_stays_open(self, hpca_home):
         app = HpcaApp()
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.press("s")
+            await pilot.press("c")
             editor = app.screen.query_one(TextArea)
             data = json.loads(editor.text)
             data["clipboard"]["mode"] = "telepathy"
