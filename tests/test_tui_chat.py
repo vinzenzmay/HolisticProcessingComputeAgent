@@ -321,3 +321,31 @@ async def test_profile_memories_injected_into_system_prompt(hpca_home):
         assert system["role"] == "system"
         assert "cubi" in system["content"]
         assert "verbose logs" in system["content"]
+
+
+async def test_memories_written_after_startup_reach_the_next_turn(hpca_home):
+    """Memories are shared through the profile file: a note made in another
+    session or another running hpca instance must be in this turn's prompt,
+    not only what was on disk when this instance started."""
+    from hpca.profiles import Profile
+
+    llm = RecordingLLM([respond_json("ok"), respond_json("ok again")])
+    app = HpcaApp(llm=llm)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await submit_chat(app, pilot, "hello")
+        assert "STAR needs 40G" not in llm.calls[0][0]["content"]
+
+        # another instance (or session) memorizes something
+        profile = Profile.load("default")
+        profile.add_memory("STAR needs 40G on this cluster.", tier=1)
+        profile.save()
+
+        await submit_chat(app, pilot, "hello again")
+        # the first turn predates the memory, so any prompt carrying it is
+        # from the second turn (calls include titler traffic; search them all)
+        assert any(
+            call[0]["role"] == "system" and "STAR needs 40G" in call[0]["content"]
+            for call in llm.calls
+        )
+        # and the tool context the turn carries has it too
+        assert "STAR needs 40G" in app._tool_ctx.tier1_text

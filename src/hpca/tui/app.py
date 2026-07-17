@@ -47,7 +47,7 @@ from hpca.rag import RagStore
 from hpca.transcript import THINKING, Entry, build_entries
 from hpca.profiles import Profile
 from hpca.registry import PathRegistry
-from hpca.runner import ProcessRecord, ProcessRunner
+from hpca.runner import ProcessRecord, ProcessRunner, running_session_ids
 from hpca.sessions import Session, SessionStore
 from hpca.skills import load_skills, summarize_skills
 from hpca.slurm import SlurmClient
@@ -57,7 +57,8 @@ from hpca.tui.approval_screen import ApprovalScreen
 from hpca.tui.confirm_screen import ConfirmScreen
 from hpca.tui.inspect_screen import InspectScreen, format_job, format_process
 from hpca.tui.manage_llms import ManageLLMsScreen
-from hpca.tui.memory_screens import MemoryProposalScreen, TierSelectScreen
+from hpca.tui.memory_screens import MemoryProposalScreen
+from hpca.tui.profiles_screen import ProfilesScreen
 from hpca.tui.rename_screen import RenameScreen
 from hpca.tui.settings_screen import SettingsScreen
 from hpca.tui.switch_llm import SwitchLLMScreen
@@ -66,6 +67,11 @@ COLUMN_IDS = ("sessions", "chat", "processes")
 SESSION_TITLE_MAX = 40
 UNTITLED_SESSION = "untitled"  # placeholder until the first message names it
 CHAT_TITLES = {"user": "you", "assistant": "agent", "error": "error"}
+# Chat commands ("/" or "\"): typing the prefix lists these above the entry.
+COMMANDS = (
+    ("memorize", "/memorize <note> — form memories from the note and this conversation"),
+    ("conclude", "/conclude — propose memories from this conversation"),
+)
 LOG_KINDS = {"user": "user", "assistant": "agent", "error": "error"}
 
 
@@ -87,7 +93,7 @@ class TopBar(Static):
 
         return (
             f" HPCA v{__version__} │ profile: {self._profile} │ "
-            f"model: {self._model} │ (s) settings"
+            f"model: {self._model} │ (c) config"
         )
 
 
@@ -317,6 +323,9 @@ class ChatPanel(ColumnPanel):
     def compose(self) -> ComposeResult:
         yield Static(self._title, classes="column-title")
         yield ChatList(id="chat-list")
+        menu = Static(id="command-menu")
+        menu.display = False
+        yield menu
         chat_input = ChatInput(placeholder="Message the agent…", id="chat-input")
         chat_input.display = False
         yield chat_input
@@ -429,13 +438,26 @@ class HpcaApp(App):
         color: $text-muted;
         padding: 0 1;
     }
+    #command-menu {
+        height: auto;
+        border: round $accent;
+        border-title-color: $accent;
+        color: $text-muted;
+        padding: 0 1;
+    }
+    /* A reply landed in a session the user has left: frame it, never
+       force it open. Cleared when the session is opened. */
+    #sessions-list > ListItem.session-updated {
+        border: round $success;
+    }
     """
 
     BINDINGS = [
         Binding("left", "focus_column(-1)", "◀ column", show=False),
         Binding("right", "focus_column(1)", "column ▶", show=False),
-        Binding("s", "open_settings", "settings"),
+        Binding("c", "open_settings", "config editor"),
         Binding("m", "manage_llms", "manage llms"),
+        Binding("a", "manage_profiles", "profiles & learnings"),
         Binding("ctrl+l", "switch_llm", "switch llm"),
         Binding("ctrl+e", "edit_profile", "edit profile", show=False),
         # Not priority: (q) must reach the chat entry as a letter. Offered
@@ -473,7 +495,11 @@ class HpcaApp(App):
         self._tool_ctx: ToolContext | None = None
         self._chat_entries: list[Entry] = []
         self._log: SessionLog | None = None
-        self._needs_title = False
+        self._untitled: set[str] = set()  # sessions awaiting their first title
+        self._updated: set[str] = set()  # replies that landed while switched away
+        self._busy_turn: Session | None = None  # the one turn in flight, if any
+        self._turn_ctx: ToolContext | None = None  # that turn's tool context
+        self._activity = "working"
         self._conn = None
         self._saver_ctx = None
 
@@ -601,8 +627,17 @@ class HpcaApp(App):
         text = event.text.strip()
         if not text:
             return
+        if self._busy_turn is not None:
+            # One orchestrator: a second turn would cancel the first mid-call.
+            # The draft stays in the entry, ready for when the reply lands.
+            self.notify(
+                f"Still working in “{self._busy_turn.title}” — "
+                "wait for that reply first.",
+                severity="warning",
+            )
+            return
         event.chat_input.text = ""
-        if text.startswith("\\"):
+        if text.startswith(("\\", "/")):
             self._handle_slash_command(text)
             return
         if self.active_session is None:
@@ -612,19 +647,61 @@ class HpcaApp(App):
             await self._reload_sessions()
         await self._append_chat("user", text)
         self.warn_about_struggles(text)
-        self._run_agent(user_text=text)
+        self._run_agent(self.active_session, user_text=text)
 
-    def _run_agent(self, *, user_text: str | None = None, resume: Command | None = None):
-        self.show_working()
+    @on(TextArea.Changed, "#chat-input")
+    def _on_draft_changed(self, event: TextArea.Changed) -> None:
+        self._update_command_menu(event.text_area.text)
+
+    def _update_command_menu(self, draft: str) -> None:
+        """List the chat commands above the entry while one is being typed,
+        narrowed as the name grows — so /memorize is discoverable, not lore."""
+        menu = self.query_one("#command-menu", Static)
+        stripped = draft.lstrip()
+        if not stripped.startswith(("/", "\\")):
+            menu.display = False
+            return
+        typed = stripped[1:].split(maxsplit=1)[0] if stripped[1:] else ""
+        matches = [usage for name, usage in COMMANDS if name.startswith(typed)]
+        if not matches:  # unknown: show what exists rather than nothing
+            matches = [usage for _, usage in COMMANDS]
+        menu.border_title = "commands"
+        menu.update(Content("\n".join(matches)))
+        menu.display = True
+
+    def _run_agent(
+        self,
+        session: Session,
+        *,
+        user_text: str | None = None,
+        resume: Command | None = None,
+    ):
+        """Start a turn for one session; it stays that session's turn even if
+        the user switches away while the model works. Everything the turn
+        touches — tool context, transcript log — is captured here, not read
+        from whatever session happens to be open when the reply lands.
+        """
+        # Memories are shared through the profile file: reload so notes made
+        # in another session (or another running instance, or an editor) are
+        # in this turn's prompt.
+        self.profile_memory = Profile.load(self.profile)
+        log = open_log(self.settings, session)
+        self._busy_turn = session
+        self._turn_ctx = self._make_tool_ctx(session, log)
+        if self._is_active_session(session):
+            # the UI's context (process list, registry) stays the turn's twin
+            self._tool_ctx = self._turn_ctx
+            self.show_working()
         return self.run_worker(
-            self._agent_turn(user_text=user_text, resume=resume), exclusive=True
+            self._agent_turn(session, user_text=user_text, resume=resume, log=log),
+            exclusive=True,
         )
 
     def show_working(self) -> None:
         """Put the spinner after the last message: a reply is on its way."""
         chat_list = self.query_one("#chat-list", ListView)
         if not chat_list.query(WorkingIndicator):
-            chat_list.append(ChatItem(WorkingIndicator()))
+            chat_list.append(ChatItem(WorkingIndicator(self._activity)))
             chat_list.scroll_end(animate=False)
 
     def hide_working(self) -> None:
@@ -634,58 +711,84 @@ class HpcaApp(App):
 
     def report_activity(self, activity: str) -> None:
         """What the graph is doing right now, for the spinner to say."""
+        self._activity = activity  # survives leaving and re-opening the session
         for indicator in self.query(WorkingIndicator):
             indicator.set_activity(activity)
 
     async def _agent_turn(
-        self, *, user_text: str | None, resume: Command | None
+        self,
+        session: Session,
+        *,
+        user_text: str | None,
+        resume: Command | None,
+        log: SessionLog | None,
     ) -> None:
-        assert self.active_session is not None
         try:
             result = await run_turn(
                 self.graph,
-                session_id=self.active_session.session_id,
+                session_id=session.session_id,
                 user_text=user_text,
                 resume=resume,
             )
         except Exception as e:
             self.hide_working()
-            await self._append_chat("error", f"Agent error: {e}")
-            self._log_write("error", str(e))
+            if log is not None:
+                log.write("error", str(e))
+            if self._is_active_session(session):
+                await self._append_chat("error", f"Agent error: {e}")
+            else:
+                self._mark_session_updated(session)
             self.notify(str(e), severity="error")
             return
+        finally:
+            self._busy_turn = None
+            self._turn_ctx = None
         self.hide_working()
-        self._log_turn(result)
-        await self._set_chat_messages(result.messages, result.thinking)
-        await self.refresh_processes()
+        self._log_turn(result, log)
+        if self._is_active_session(session):
+            await self._set_chat_messages(result.messages, result.thinking)
+            await self.refresh_processes()
+        else:
+            # The reply belongs to a session the user has left: never yank
+            # them back — frame its row in the list instead.
+            self._mark_session_updated(session)
         if result.interrupt is not None:
-            self.push_screen(ApprovalScreen(result.interrupt), self._on_approval)
+            # Parked on a destructive-op approval: the turn cannot move
+            # without an answer, so ask even if another session is open.
+            self.push_screen(
+                ApprovalScreen(result.interrupt),
+                lambda approved: self._on_approval(session, approved),
+            )
             return
-        await self.maybe_propose_struggle_note(result.messages)
-        await self.maybe_title_session(result.messages)
+        if self._is_active_session(session):
+            await self.maybe_propose_struggle_note(result.messages)
+        await self.maybe_title_session(session, result.messages, log=log)
 
-    async def maybe_title_session(self, messages: list[dict]) -> bool:
+    async def maybe_title_session(
+        self, session: Session, messages: list[dict], *, log: SessionLog | None = None
+    ) -> bool:
         """Name a fresh session after its first exchange, once.
 
         The opening message is only a placeholder — truncated mid-word, and
         wrong by the time the session has moved on. One attempt: a failure is
         not worth a second wait, and (t) is always there.
         """
-        if not self._needs_title or self.active_session is None:
+        if session.session_id not in self._untitled:
             return False
-        self._needs_title = False
-        title = await self._propose_title(messages)
+        self._untitled.discard(session.session_id)
+        title = await self._propose_title(messages, log=log)
         if title is None:
             return False
-        self._rename_session(self.active_session, title, by="llm")
+        self._rename_session(session, title, by="llm", log=log)
         return True
 
-    def _log_turn(self, result) -> None:
-        """Write what this turn added: the message, its thinking, the answer.
+    def _log_turn(self, result, log: SessionLog | None) -> None:
+        """Write what this turn added into the turn's own transcript — not
+        into whichever session is open when the reply lands.
 
         Only the tail is logged, so re-reading a session never duplicates it.
         """
-        if self._log is None:
+        if log is None:
             return
         for entry in build_entries(
             result.messages, result.thinking, start=result.first_new
@@ -693,14 +796,16 @@ class HpcaApp(App):
             kind = LOG_KINDS.get(entry.kind, entry.kind)
             if entry.kind == THINKING:
                 kind = f"thinking ({entry.summary()})"
-            self._log.write(kind, entry.text)
+            log.write(kind, entry.text)
 
     def _log_write(self, kind: str, text: str) -> None:
         if self._log is not None:
             self._log.write(kind, text)
 
-    def _on_approval(self, approved: bool | None) -> None:
-        self._run_agent(resume=Command(resume={"approved": bool(approved)}))
+    def _on_approval(self, session: Session, approved: bool | None) -> None:
+        # Resume the turn on the thread it belongs to — the user may have
+        # switched sessions while the approval dialog was up.
+        self._run_agent(session, resume=Command(resume={"approved": bool(approved)}))
 
     # ---------------------------------------------------------------- memory
 
@@ -709,27 +814,41 @@ class HpcaApp(App):
         rest = rest.strip()
         if command == "memorize":
             if not rest:
-                self.notify(r"Usage: \memorize <text>", severity="warning")
+                self.notify("Usage: /memorize <note>", severity="warning")
                 return
-
-            def on_tier(tier: int | None) -> None:
-                if tier is None:
-                    return
-                self.profile_memory.add_memory(
-                    rest, tier=tier, backend=self.settings.llm.model, kind="note"
-                )
-                self.profile_memory.save()
-                self.notify(f"Memorized into tier {tier}.")
-                self.check_memory_caps()
-
-            self.push_screen(TierSelectScreen(rest), on_tier)
+            self.run_worker(self._memorize_worker(rest), exclusive=True)
         elif command == "conclude":
             if self.active_session is None:
                 self.notify("No active session to conclude.", severity="warning")
                 return
             self.run_worker(self._conclude_worker(), exclusive=True)
         else:
-            self.notify(f"Unknown command: \\{command}", severity="warning")
+            self.notify(f"Unknown command: /{command}", severity="warning")
+
+    async def _memorize_worker(self, note: str) -> None:
+        """/memorize <note>: the model turns the note plus the conversation so
+        far into durable memory proposals; each needs the user's approval
+        (§5.3 — a small model writes these, so review is essential)."""
+        messages = (
+            await self._session_messages(self.active_session)
+            if self.active_session is not None
+            else []
+        )
+        self.profile_memory = Profile.load(self.profile)  # merge, don't clobber
+        try:
+            proposals = await propose_memories(
+                self._labelled_llm("memorize"),
+                messages,
+                tier1=self.profile_memory.tier_text(1),
+                guidance=note,
+            )
+        except Exception as e:
+            self.notify(f"/memorize failed: {e}", severity="error")
+            return
+        if not proposals:
+            self.notify("The model proposed no memories for that note.")
+            return
+        await self._review_proposals(proposals)
 
     async def _conclude_worker(self) -> None:
         assert self.active_session is not None
@@ -737,6 +856,7 @@ class HpcaApp(App):
         if not messages:
             self.notify("Nothing to conclude yet.", severity="warning")
             return
+        self.profile_memory = Profile.load(self.profile)
         try:
             proposals = await propose_memories(
                 self._labelled_llm("conclude"),
@@ -744,11 +864,15 @@ class HpcaApp(App):
                 tier1=self.profile_memory.tier_text(1),
             )
         except Exception as e:
-            self.notify(f"\\conclude failed: {e}", severity="error")
+            self.notify(f"/conclude failed: {e}", severity="error")
             return
         if not proposals:
             self.notify("The model proposed no memories for this conversation.")
             return
+        await self._review_proposals(proposals)
+
+    async def _review_proposals(self, proposals: list[MemoryProposal]) -> int:
+        """One approval dialog per proposal; only approved ones are kept."""
         kept = 0
         for i, proposal in enumerate(proposals, start=1):
             approved = await self.push_screen_wait(
@@ -766,6 +890,7 @@ class HpcaApp(App):
             self.profile_memory.save()
         self.notify(f"Kept {kept} of {len(proposals)} proposed memories.")
         self.check_memory_caps()
+        return kept
 
     async def maybe_propose_struggle_note(self, messages: list[dict]) -> bool:
         """§4.4: after a bad turn, propose a struggle note for approval."""
@@ -838,9 +963,10 @@ class HpcaApp(App):
 
     # -------------------------------------------------------------- sessions
 
-    def _activate_session(self, session: Session) -> None:
-        self.active_session = session
-        self._tool_ctx = ToolContext(
+    def _make_tool_ctx(self, session: Session, log: SessionLog | None) -> ToolContext:
+        """A tool context bound to one session and its transcript, so a turn
+        keeps its own registry, runner and log however the UI moves on."""
+        ctx = ToolContext(
             registry=PathRegistry(
                 self._conn, profile=self.profile, session_id=session.session_id
             ),
@@ -864,8 +990,18 @@ class HpcaApp(App):
             embedder=self.embedder,
             skills=self.skills,
         )
-        self.query_one("#chat-input", ChatInput).display = True
+        if log is not None:
+            ctx.llm = LoggedLLM(
+                self._llm,
+                log,
+                label=lambda: f"subagent:{ctx.current_tool or '?'}",
+            )
+        return ctx
+
+    def _activate_session(self, session: Session) -> None:
+        self.active_session = session
         self._refresh_session_log()
+        self.query_one("#chat-input", ChatInput).display = True
         if self._log is not None:
             self._log.write(
                 "session opened",
@@ -874,33 +1010,22 @@ class HpcaApp(App):
             )
 
     def _refresh_session_log(self) -> None:
-        """(Re)open the active session's transcript and re-wrap the client
-        tools call, so switching logging in the settings takes effect now."""
-        self._log = (
-            open_log(self.settings, self.active_session)
-            if self.active_session is not None
-            else None
-        )
-        if self._tool_ctx is not None:
-            self._tool_ctx.llm = self._subagent_llm()
+        """(Re)open the active session's transcript and rebuild its tool
+        context, so changed logging or llm settings take effect now."""
+        if self.active_session is None:
+            self._log = None
+            self._tool_ctx = None
+            return
+        self._log = open_log(self.settings, self.active_session)
+        self._tool_ctx = self._make_tool_ctx(self.active_session, self._log)
 
-    def _subagent_llm(self) -> Any:
-        """The client tools use for their own model calls (§4.2), logged."""
-        if self._log is None or self._tool_ctx is None:
-            return self._llm
-        context = self._tool_ctx
-        return LoggedLLM(
-            self._llm,
-            self._log,
-            label=lambda: f"subagent:{context.current_tool or '?'}",
-        )
-
-    def _labelled_llm(self, label: str) -> Any:
+    def _labelled_llm(self, label: str, *, log: SessionLog | None = None) -> Any:
         """The client for one of the app's own sub-agent calls (titling,
         \\conclude, struggle notes), logged under that name."""
-        if self._log is None:
+        sink = log if log is not None else self._log
+        if sink is None:
             return self._llm
-        return LoggedLLM(self._llm, self._log, label=lambda: f"subagent:{label}")
+        return LoggedLLM(self._llm, sink, label=lambda: f"subagent:{label}")
 
     async def start_new_session(self) -> None:
         """Open an empty session on the default backend and start typing in it.
@@ -931,15 +1056,26 @@ class HpcaApp(App):
         assert self.active_session is not None
         self.session_store.rename(self.active_session.session_id, title)
         self.active_session.title = title
-        self._needs_title = True
+        self._untitled.add(self.active_session.session_id)
 
-    def _rename_session(self, session: Session, title: str, *, by: str) -> None:
+    def _rename_session(
+        self,
+        session: Session,
+        title: str,
+        *,
+        by: str,
+        log: SessionLog | None = None,
+    ) -> None:
         self.session_store.rename(session.session_id, title)
         session.title = title
+        self._untitled.discard(session.session_id)  # named; don't overwrite it
         if self._is_active_session(session):
             self.active_session.title = title
-            self._needs_title = False  # named on purpose; do not overwrite it
-            self._log_write("session renamed", f"{title} (by {by})")
+        sink = log if log is not None else (
+            self._log if self._is_active_session(session) else None
+        )
+        if sink is not None:
+            sink.write("session renamed", f"{title} (by {by})")
         self.run_worker(self._reload_sessions(), group="sessions")
 
     async def _session_messages(self, session: Session) -> list[dict]:
@@ -977,9 +1113,13 @@ class HpcaApp(App):
         self._rename_session(session, title, by="llm")
         self.notify(f"Renamed to “{title}”")
 
-    async def _propose_title(self, messages: list[dict]) -> str | None:
+    async def _propose_title(
+        self, messages: list[dict], *, log: SessionLog | None = None
+    ) -> str | None:
         try:
-            return await propose_title(self._labelled_llm("title"), messages)
+            return await propose_title(
+                self._labelled_llm("title", log=log), messages
+            )
         except Exception:
             return None  # naming is a nicety; never break a turn over it
 
@@ -1013,6 +1153,8 @@ class HpcaApp(App):
         self._log_write("session deleted", f"{session.title} (log kept)")
         if self._is_active_session(session):
             await self.close_session()
+        self._untitled.discard(session.session_id)
+        self._updated.discard(session.session_id)
         self.session_store.delete(session.session_id)
         try:
             await self._checkpointer.adelete_thread(session.session_id)
@@ -1026,7 +1168,6 @@ class HpcaApp(App):
         self.active_session = None
         self._tool_ctx = None
         self._log = None
-        self._needs_title = False
         await self._set_chat_messages([])
         self.query_one("#chat-input", ChatInput).display = False
         self._focus_column("sessions")
@@ -1040,7 +1181,16 @@ class HpcaApp(App):
         await self._set_chat_messages(
             values.get("messages", []), values.get("thinking", [])
         )
-        self._needs_title = False  # an existing session keeps the name it has
+        self._updated.discard(session.session_id)  # its news is now on screen
+        for item in self.query_one("#sessions-list", ListView).children:
+            row_session = getattr(item, "data_session", None)
+            if row_session is not None and row_session.session_id == session.session_id:
+                item.remove_class("session-updated")
+        if (
+            self._busy_turn is not None
+            and self._busy_turn.session_id == session.session_id
+        ):
+            self.show_working()  # its turn is still in flight
 
     @on(ListView.Selected, "#sessions-list")
     async def _on_session_selected(self, event: ListView.Selected) -> None:
@@ -1060,6 +1210,7 @@ class HpcaApp(App):
         for session in self.session_store.list(profile=self.profile):
             item = ListItem(Label(Content(session.title)))
             item.data_session = session
+            item.set_class(session.session_id in self._updated, "session-updated")
             items.append(item)
         sessions_list.extend(items)
         # A ListView filled after mount has no cursor, and without one Enter
@@ -1072,6 +1223,14 @@ class HpcaApp(App):
             ),
             0,
         )
+
+    def _mark_session_updated(self, session: Session) -> None:
+        """Frame the session's row: a reply landed while the user was away."""
+        self._updated.add(session.session_id)
+        for item in self.query_one("#sessions-list", ListView).children:
+            row_session = getattr(item, "data_session", None)
+            if row_session is not None and row_session.session_id == session.session_id:
+                item.add_class("session-updated")
 
     def _is_active_session(self, session: Session | None) -> bool:
         return (
@@ -1232,7 +1391,7 @@ class HpcaApp(App):
         on_main_screen = len(self.screen_stack) == 1
         on_sessions = on_main_screen and self.focused_column_id == "sessions"
         in_chat = on_main_screen and self.focused_column_id == "chat"
-        if action in ("manage_llms", "confirm_quit"):
+        if action in ("manage_llms", "confirm_quit", "manage_profiles"):
             return on_sessions
         if action == "switch_llm":
             return in_chat
@@ -1296,6 +1455,69 @@ class HpcaApp(App):
     def action_manage_llms(self) -> None:
         self.push_screen(ManageLLMsScreen())
 
+    def action_manage_profiles(self) -> None:
+        def done(_: object) -> None:
+            # a memory edited here may be the active profile's; reload so the
+            # next turn sees it
+            self.profile_memory = Profile.load(self.profile)
+            self.run_worker(self._reload_sessions(), group="sessions")
+
+        self.push_screen(ProfilesScreen(), done)
+
+    def save_profile_memories(self, name: str, text: str) -> None:
+        """Persist the raw memory text a user edited; report parse trouble but
+        never lose their edits — the file is theirs to fix by hand (§6.4)."""
+        profile = Profile.parse(text, name=name)
+        profile.save()
+        if profile.problems:
+            self.notify(
+                "Saved with problems: " + "; ".join(profile.problems[:3]),
+                severity="warning",
+            )
+        else:
+            self.notify(f"Saved memories for “{name}”.")
+        if name == self.profile:
+            self.profile_memory = profile
+
+    def create_profile(self, name: str) -> str | None:
+        """Make a profile; returns an error message, or None on success."""
+        try:
+            cleaned = Profile.validate_name(name)
+        except ValueError as e:
+            return str(e)
+        Profile.create(cleaned)
+        return None
+
+    def profile_delete_blocker(self, name: str) -> str | None:
+        """Why this profile cannot be deleted right now, or None if it can.
+
+        A profile is in use while a turn on one of its sessions is in flight,
+        or while any of its sessions has a live sub-process — deleting it then
+        would strand running work under a gone profile.
+        """
+        if self._busy_turn is not None and self._busy_turn.profile == name:
+            return f"“{name}” has a reply in progress — wait for it to finish."
+        session_ids = {
+            session.session_id
+            for session in self.session_store.list(profile=name)
+        }
+        if session_ids & running_session_ids(self._conn):
+            return (
+                f"“{name}” has running sub-process(es) — "
+                "stop them before deleting it."
+            )
+        return None
+
+    def delete_profile(self, name: str) -> None:
+        moved = self.session_store.reassign_profile(name, "default")
+        Profile.delete(name)
+        if self.profile == name:  # unlikely, but keep the app coherent
+            self.profile = "default"
+            self.profile_memory = Profile.load("default")
+        self.notify(
+            f"Deleted “{name}”" + (f"; {moved} session(s) moved to default" if moved else "")
+        )
+
     def action_switch_llm(self) -> None:
         if not self.settings.backends:
             self.notify(
@@ -1315,6 +1537,12 @@ class HpcaApp(App):
 
     def switch_backend(self, backend: LLMBackend) -> None:
         """Make a configured backend the active one, now and on next start."""
+        if self._busy_turn is not None:
+            self.notify(
+                "The agent is mid-reply — switch backends once it finishes.",
+                severity="warning",
+            )
+            return
         self.settings.activate_backend(backend)
         self.settings.save()
         self._replace_llm()
@@ -1327,6 +1555,13 @@ class HpcaApp(App):
         An injected client belongs to whoever passed it in (tests, embedding
         hosts); only a client we built is ours to replace.
         """
+        if self._busy_turn is not None:
+            self.notify(
+                "The agent is mid-reply — the new LLM settings apply "
+                "after this turn.",
+                severity="warning",
+            )
+            return
         if self._owns_llm:
             self._replace_llm()
 
@@ -1335,8 +1570,7 @@ class HpcaApp(App):
         self._llm = LLMClient(self.settings.llm)
         self._owns_llm = True
         self._rebuild_graph()
-        if self._tool_ctx is not None:
-            self._tool_ctx.llm = self._subagent_llm()
+        self._refresh_session_log()  # rebind the tool context to the new client
         if owned and old_llm is not None:
             self.run_worker(old_llm.close(), group="llm-close")
 
@@ -1345,7 +1579,8 @@ class HpcaApp(App):
             llm=self._llm,
             tools=self._tools,
             checkpointer=self._checkpointer,
-            ctx=lambda: self._tool_ctx,
+            # a running turn keeps its own context however the UI moves on
+            ctx=lambda: self._turn_ctx if self._turn_ctx is not None else self._tool_ctx,
             system_prompt_fn=self._render_system_prompt,
             max_retries=self.settings.llm.max_retries,
             on_activity=lambda activity: self.report_activity(activity),
