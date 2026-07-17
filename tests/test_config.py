@@ -31,6 +31,8 @@ class TestDefaults:
         assert s.llm.constrained_decoding == "auto"
         assert s.llm.max_retries == 3
         assert s.llm.request_timeout_s == 120
+        # thinking is slow and not generally better: opt in, per backend
+        assert s.llm.enable_thinking is False
 
     def test_cluster_defaults(self):
         s = Settings()
@@ -167,6 +169,50 @@ class TestBackendCatalog:
         assert s.llm.api_key == "k"
         # client behavior settings are not clobbered
         assert s.llm.max_retries == 3
+
+    def test_backends_default_to_not_thinking(self):
+        assert LLMBackend(model="m", base_url="http://localhost:9/v1") \
+            .enable_thinking is False
+
+    def test_activating_carries_the_backends_thinking_mode(self):
+        s = Settings()
+        thinker = LLMBackend(
+            model="reasoner", base_url="http://localhost:9/v1", enable_thinking=True
+        )
+        plain = LLMBackend(model="plain", base_url="http://localhost:8/v1")
+        s.activate_backend(thinker)
+        assert s.llm.enable_thinking is True
+        s.activate_backend(plain)  # the next backend does not inherit it
+        assert s.llm.enable_thinking is False
+
+    def test_set_thinking_on_the_active_backend_applies_at_once(self):
+        s = Settings()
+        backend = LLMBackend(model="m", base_url="http://localhost:9/v1")
+        s.backends = [backend]
+        s.activate_backend(backend)
+        s.set_thinking(backend, True)
+        assert backend.enable_thinking is True
+        assert s.llm.enable_thinking is True
+        s.set_thinking(backend, False)
+        assert s.llm.enable_thinking is False
+
+    def test_set_thinking_on_an_inactive_backend_leaves_the_client_alone(self):
+        s = Settings()
+        other = LLMBackend(model="other", base_url="http://localhost:8/v1")
+        s.set_thinking(other, True)
+        assert other.enable_thinking is True
+        assert s.llm.enable_thinking is False  # not the one in use
+
+    def test_thinking_mode_roundtrips(self, tmp_path):
+        s = Settings()
+        s.backends = [
+            LLMBackend(
+                model="m", base_url="http://localhost:9/v1", enable_thinking=True
+            )
+        ]
+        s.save(tmp_path / "settings.json")
+        loaded = Settings.load(tmp_path / "settings.json")
+        assert loaded.backends[0].enable_thinking is True
 
     def test_is_active(self):
         s = Settings()

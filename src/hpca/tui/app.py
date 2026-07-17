@@ -8,10 +8,11 @@ from typing import Any
 
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
-from textual import on
+from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.geometry import Offset
 from textual.content import Content
 from textual.message import Message
 from textual.widgets import Footer, Label, ListItem, ListView, Static, TextArea
@@ -210,6 +211,34 @@ class ThinkingBox(Static):
         header = f"{marker} {self._entry.summary()}  ({hint})"
         body = "" if self._collapsed else "\n\n" + self._entry.text
         self.update(Content(header + body))
+
+
+class ChatItem(ListItem):
+    """A chat entry whose text can be marked with the mouse.
+
+    Textual turns a press and release on one widget into a Click however far
+    the mouse travelled between them, and ListItem reads any Click as
+    "activate me" — which is why dragging across a message used to jump focus
+    to the entry, or collapse the box under the cursor and take the selection
+    with it. A click that moved marked text; it did not ask for anything to
+    happen, so it suppresses ListItem's default action and nothing else.
+    Marking and copying (ctrl+c) are Textual's own; they only need us out of
+    the way.
+    """
+
+    def __init__(self, *children) -> None:
+        super().__init__(*children)
+        self._pressed_at: Offset | None = None
+
+    def _on_mouse_down(self, event: events.MouseDown) -> None:
+        self._pressed_at = event.screen_offset
+
+    def _on_click(self, event: events.Click) -> None:
+        pressed, self._pressed_at = self._pressed_at, None
+        if pressed is not None and pressed != event.screen_offset:
+            # Textual dispatches every _on_click up the MRO, so ListItem's
+            # "activate me" is stopped by preventing it, not by not calling it.
+            event.prevent_default()
 
 
 class ChatList(ListView):
@@ -463,6 +492,17 @@ class HpcaApp(App):
         result = self.clipboard_manager.copy(text)
         self.notify(result.message, severity="information" if result.ok else "error")
         return result
+
+    def copy_to_clipboard(self, text: str) -> None:
+        """Textual's own copy path — ctrl+c on a marked selection, and the
+        chat entry's copy — routed through the tiered manager. Textual emits
+        OSC 52 only, which tmux and screen swallow without passthrough, and
+        this agent is normally reached through both (§ clipboard).
+        """
+        if getattr(self, "clipboard_manager", None) is None:
+            super().copy_to_clipboard(text)  # before on_mount; nothing to tier with
+            return
+        self.copy_text(text)
 
     def _render_system_prompt(self) -> str:
         """Per-call prompt assembly (§4.3): memories, skills, dynamic facts."""
@@ -1034,7 +1074,7 @@ class HpcaApp(App):
     def _add_chat_entry(self, entry: Entry) -> None:
         self._chat_entries.append(entry)
         chat_list = self.query_one("#chat-list", ListView)
-        chat_list.append(ListItem(self._entry_widget(entry)))
+        chat_list.append(ChatItem(self._entry_widget(entry)))
         chat_list.scroll_end(animate=False)
 
     def _entry_widget(self, entry: Entry) -> Static:
@@ -1142,7 +1182,7 @@ class HpcaApp(App):
         self._refresh_top_bar()
         self.notify(f"Switched to {backend.model}")
 
-    def _reload_llm(self) -> None:
+    def reload_llm(self) -> None:
         """Rebuild the client so edited LLM settings apply to the next turn.
 
         An injected client belongs to whoever passed it in (tests, embedding
@@ -1185,7 +1225,7 @@ class HpcaApp(App):
             if result is not None:
                 self.settings = result
                 self.settings.save()
-                self._reload_llm()  # so llm settings take effect without a restart
+                self.reload_llm()  # so llm settings take effect without a restart
                 self._refresh_session_log()
                 self._refresh_top_bar()
 

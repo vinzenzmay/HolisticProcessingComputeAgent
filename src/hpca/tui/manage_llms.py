@@ -4,9 +4,10 @@ Two columns: the left lists endpoints discovered by a localhost port scan
 (run when the screen opens — on this HPC setup every backend is an
 SSH-tunneled local port); the right lists the configured catalog from
 settings, each labeled ● connected / ○ disconnected, ★ marking the active
-default. ←/→ switch panels. Key bindings live on the panel widgets, so the
-footer only offers "add llm to list (enter)" while the cursor is on a
-discovered endpoint, and "set default"/"remove llm" only on a configured
+default and ◆ thinking marking a backend that reasons before answering.
+←/→ switch panels. Key bindings live on the panel widgets, so the footer only
+offers "add llm to list (enter)" while the cursor is on a discovered endpoint,
+and "set default"/"toggle thinking mode"/"remove llm" only on a configured
 one; removal asks for confirmation.
 """
 
@@ -34,14 +35,33 @@ from hpca.discover import (
 )
 from hpca.tui.confirm_screen import ConfirmScreen
 
+# Shown whenever thinking is switched on, because the setting looks like a
+# free upgrade and is not. Both numbers are measured on this site's backend.
+THINKING_WARNING = (
+    "Thinking is not generally better. Small models often follow instructions "
+    "and route tools worse with it on, and it is slow: on Qwen3.6-27B here a "
+    "turn took 133s thinking against 2.3s without. Leave it off unless a "
+    "model clearly needs it for a hard question."
+)
 
-def backend_line(backend: LLMBackend) -> str:
+
+def _as_discovered(backend: LLMBackend) -> DiscoveredBackend:
     return DiscoveredBackend(
         base_url=backend.base_url,
         model=backend.model,
         max_model_len=backend.max_model_len,
         needs_key=backend.api_key is not None,
-    ).describe()
+    )
+
+
+def backend_details(backend: LLMBackend) -> str:
+    """Context size, key requirement and endpoint — no name."""
+    return _as_discovered(backend).details()
+
+
+def backend_line(backend: LLMBackend) -> str:
+    """Name and details on one line, for screens wide enough to hold it."""
+    return _as_discovered(backend).describe()
 
 
 class DiscoveredList(ListView):
@@ -58,20 +78,24 @@ class DiscoveredList(ListView):
 
 
 class ConfiguredList(ListView):
-    """Right panel; set-default and remove only offered on an entry."""
+    """Right panel; set-default, remove and thinking only offered on an entry."""
 
     BINDINGS = [
         Binding("enter", "select_cursor", "set default", show=True),
+        Binding("t", "toggle_thinking", "toggle thinking mode", show=True),
         Binding("r", "remove_llm", "remove llm", show=True),
     ]
 
     def check_action(self, action: str, parameters) -> bool | None:
-        if action in ("select_cursor", "remove_llm"):
+        if action in ("select_cursor", "remove_llm", "toggle_thinking"):
             return self.highlighted_child is not None
         return True
 
     def action_remove_llm(self) -> None:
         self.screen.confirm_remove_selected()
+
+    def action_toggle_thinking(self) -> None:
+        self.screen.toggle_thinking_selected()
 
 
 class ManageLLMsScreen(Screen):
@@ -223,9 +247,17 @@ class ManageLLMsScreen(Screen):
             else:
                 marker, css = "○ disconnected", "llm-disconnected"
             star = " ★" if self.app.settings.is_active(backend) else ""
+            thinking = " │ ◆ thinking" if backend.enable_thinking else ""
+            # Two lines: the name, then its state. On one line the state fell
+            # off the right edge of the panel, which is where the markers live.
             item = ListItem(
-                Label(Content(f"{backend_line(backend)} │ {marker}{star}"),
-                      classes=css)
+                Label(
+                    Content(
+                        f"{backend.model}{star}\n"
+                        f"{marker}{thinking} │ {backend_details(backend)}"
+                    ),
+                    classes=css,
+                )
             )
             item.data_configured = backend
             items.append(item)
@@ -271,6 +303,25 @@ class ManageLLMsScreen(Screen):
         await self.refresh_discovered()
         await self.refresh_configured()
         self.notify(f"Configured {discovered.model}")
+
+    def toggle_thinking_selected(self) -> None:
+        configured_list = self.query_one("#llm-configured", ListView)
+        backend = getattr(configured_list.highlighted_child, "data_configured", None)
+        if backend is None:
+            return
+        enabled = not backend.enable_thinking
+        self.app.settings.set_thinking(backend, enabled)
+        self.app.settings.save()
+        if self.app.settings.is_active(backend):
+            self.app.reload_llm()  # the running client picks the new mode up
+        self.run_worker(self.refresh_configured(), group="llm-configured")
+        if enabled:
+            self.app.notify(
+                THINKING_WARNING, title=f"Thinking on for {backend.model}",
+                severity="warning", timeout=15,
+            )
+        else:
+            self.app.notify(f"Thinking off for {backend.model}")
 
     def confirm_remove_selected(self) -> None:
         configured_list = self.query_one("#llm-configured", ListView)

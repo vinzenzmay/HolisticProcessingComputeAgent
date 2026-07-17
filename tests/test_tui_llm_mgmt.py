@@ -4,6 +4,7 @@ import json
 
 import pytest
 from textual.widgets import ListView
+from textual.widgets._toast import Toast
 
 from hpca.config import LLMBackend, Settings
 from hpca.discover import DiscoveredBackend
@@ -444,3 +445,149 @@ class TestIncrementalScanUI:
             await app.screen.workers.wait_for_complete()
             await pilot.pause()
             assert len(left.children) == 2
+
+
+class TestThinkingToggle:
+    """Thinking is per backend, off by default, and announces its cost."""
+
+    def configure(self, **overrides):
+        settings = Settings()
+        settings.backends = [
+            LLMBackend(
+                model=QWEN.model,
+                base_url=QWEN.base_url,
+                max_model_len=192000,
+                **overrides,
+            )
+        ]
+        settings.save()
+        return settings
+
+    async def focus_configured(self, app, pilot):
+        await pilot.press("m")
+        await app.screen.workers.wait_for_complete()
+        await pilot.pause()
+        right = app.screen.query_one("#llm-configured", ListView)
+        right.focus()
+        right.index = 0
+        return right
+
+    def labels(self, listview):
+        return [str(item.query_one("Label").content) for item in listview.children]
+
+    async def test_marker_shows_only_while_thinking_is_on(
+        self, hpca_home, fake_discovery
+    ):
+        self.configure()
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            right = await self.focus_configured(app, pilot)
+            assert "thinking" not in self.labels(right)[0]  # quiet when off
+            await pilot.press("t")
+            await pilot.pause()
+            assert "◆ thinking" in self.labels(right)[0]
+            await pilot.press("t")
+            await pilot.pause()
+            assert "thinking" not in self.labels(right)[0]
+
+    async def test_toggle_persists_on_the_backend(self, hpca_home, fake_discovery):
+        self.configure()
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self.focus_configured(app, pilot)
+            await pilot.press("t")
+            await pilot.pause()
+            assert app.settings.backends[0].enable_thinking is True
+            assert Settings.load().backends[0].enable_thinking is True
+
+    async def test_enabling_pops_up_that_thinking_is_not_better(
+        self, hpca_home, fake_discovery
+    ):
+        self.configure()
+        app = HpcaApp(llm=FakeLLM())
+        # notifications are off in run_test by default; this is about the popup
+        async with app.run_test(size=(120, 40), notifications=True) as pilot:
+            await self.focus_configured(app, pilot)
+            await pilot.press("t")
+            for _ in range(8):  # notify -> call_later -> mount -> render
+                await pilot.pause()
+            toasts = [str(toast.render()) for toast in app.screen.query(Toast)]
+            assert toasts, "enabling thinking must say so on screen"
+            assert any("not generally better" in t for t in toasts)
+            assert any("133s" in t for t in toasts)  # the measured cost
+
+    async def test_disabling_does_not_warn(self, hpca_home, fake_discovery):
+        self.configure(enable_thinking=True)
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40), notifications=True) as pilot:
+            await self.focus_configured(app, pilot)
+            await pilot.press("t")
+            for _ in range(8):
+                await pilot.pause()
+            toasts = [str(toast.render()) for toast in app.screen.query(Toast)]
+            assert not any("not generally better" in t for t in toasts)
+
+    async def test_toggling_the_active_backend_reloads_the_client(
+        self, hpca_home, fake_discovery
+    ):
+        settings = self.configure()
+        settings.activate_backend(settings.backends[0])
+        settings.save()
+        app = HpcaApp()  # owns its client, so it can be rebuilt
+        async with app.run_test(size=(120, 40)) as pilot:
+            before = app._llm
+            await self.focus_configured(app, pilot)
+            await pilot.press("t")
+            await pilot.pause()
+            assert app.settings.llm.enable_thinking is True
+            assert app._llm is not before  # the running client picked it up
+            assert app._llm._settings.enable_thinking is True
+
+    async def test_toggling_an_inactive_backend_leaves_the_client_alone(
+        self, hpca_home, fake_discovery
+    ):
+        settings = self.configure()
+        settings.llm.model = "something-else"  # a different backend is active
+        settings.save()
+        app = HpcaApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            before = app._llm
+            await self.focus_configured(app, pilot)
+            await pilot.press("t")
+            await pilot.pause()
+            assert app.settings.backends[0].enable_thinking is True
+            assert app.settings.llm.enable_thinking is False
+            assert app._llm is before
+
+    async def test_thinking_follows_the_backend_when_switching(
+        self, hpca_home, fake_discovery
+    ):
+        settings = Settings()
+        settings.backends = [
+            LLMBackend(model=QWEN.model, base_url=QWEN.base_url, enable_thinking=True),
+            LLMBackend(model=MINI.model, base_url=MINI.base_url),
+        ]
+        settings.save()
+        app = HpcaApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.switch_backend(app.settings.backends[0])
+            assert app.settings.llm.enable_thinking is True
+            app.switch_backend(app.settings.backends[1])
+            assert app.settings.llm.enable_thinking is False
+            await pilot.pause()
+
+    async def test_toggle_is_inert_without_a_configured_entry(
+        self, hpca_home, fake_discovery
+    ):
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("m")
+            await app.screen.workers.wait_for_complete()
+            await pilot.pause()
+            right = app.screen.query_one("#llm-configured", ListView)
+            assert right.check_action("toggle_thinking", ()) is False
+            left = app.screen.query_one("#llm-discovered", ListView)
+            left.focus()
+            await pilot.press("t")  # left panel: not a configured backend
+            await pilot.pause()
+            assert app.is_running

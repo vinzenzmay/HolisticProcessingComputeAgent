@@ -2,7 +2,7 @@
 
 import json
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
 import pytest
@@ -97,7 +97,10 @@ def live_stub():
             self.end_headers()
             self.wfile.write(body)
 
-    server = HTTPServer(("127.0.0.1", 0), Handler)
+    # Threaded: the scan checks the port, drops the connection, then probes
+    # it. A single-threaded stub can still be finishing with the dropped
+    # connection when the probe arrives, and the probe times out (flaky miss).
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     yield server.server_address[1]

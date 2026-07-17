@@ -49,15 +49,23 @@ class DiscoveredBackend:
     max_model_len: int | None = None
     needs_key: bool = False
 
-    def describe(self) -> str:
-        """One-line display: name, context size, key requirement, endpoint."""
+    def details(self) -> str:
+        """Everything but the name: context size, key requirement, endpoint."""
         if self.max_model_len:
-            ctx = f"{self.max_model_len // 1000}k" if self.max_model_len >= 1000 else str(self.max_model_len)
+            ctx = (
+                f"{self.max_model_len // 1000}k"
+                if self.max_model_len >= 1000
+                else str(self.max_model_len)
+            )
         else:
             ctx = "?"
         location = urlparse(self.base_url).netloc
         key = "yes" if self.needs_key else "no"
-        return f"{self.model} │ ctx {ctx} │ key: {key} │ {location}"
+        return f"ctx {ctx} │ key: {key} │ {location}"
+
+    def describe(self) -> str:
+        """One-line display: name, context size, key requirement, endpoint."""
+        return f"{self.model} │ {self.details()}"
 
 
 async def probe_endpoint(

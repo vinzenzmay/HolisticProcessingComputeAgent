@@ -47,9 +47,11 @@ class LLMSettings(_Section):
     max_retries: int = 3
     request_timeout_s: int = 120
     # Reasoning models think in a separate channel, shown in the chat window's
-    # thinking box. Measured on Qwen3.6-27B: ~17s and ~340 completion tokens
-    # per decision, against ~1s and ~20 without. Switch off for a snappy agent.
-    enable_thinking: bool = True
+    # thinking box. Off by default: it is not generally better — small models
+    # often route tools worse with it on — and it is slow. Measured on
+    # Qwen3.6-27B: a turn took 133s thinking against 2.3s without. Per backend
+    # in the catalog below; this is whichever one is active.
+    enable_thinking: bool = False
 
 
 class ClusterSettings(_Section):
@@ -96,6 +98,9 @@ class LLMBackend(_Section):
     base_url: str
     api_key: str | None = None
     max_model_len: int | None = None
+    # Thinking is a property of the model, not of the session: a reasoning
+    # model may earn it while the next backend in the list does not.
+    enable_thinking: bool = False
 
 
 class Settings(_Section):
@@ -138,6 +143,14 @@ class Settings(_Section):
         self.llm.base_url = backend.base_url
         self.llm.model = backend.model
         self.llm.api_key = backend.api_key
+        self.llm.enable_thinking = backend.enable_thinking
+
+    def set_thinking(self, backend: LLMBackend, enabled: bool) -> None:
+        """Toggle a catalog entry's thinking mode — and the live client's, if
+        that entry is the one in use."""
+        backend.enable_thinking = enabled
+        if self.is_active(backend):
+            self.llm.enable_thinking = enabled
 
     def remember_llm_ports(self, base_urls: Iterable[str]) -> bool:
         """Record ports that have served an LLM, so scans probe them first.
