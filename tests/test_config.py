@@ -56,8 +56,9 @@ class TestDefaults:
     def test_editor_and_rag_defaults(self):
         s = Settings()
         assert s.editor is None
-        assert s.rag.store == "chromadb"
+        assert s.rag.store == "sqlite-vec"
         assert s.rag.embedding == "sentence-transformers/all-MiniLM-L6-v2"
+        assert s.rag.embedding_base_url == "http://localhost:51943/v1"
 
 
 class TestLoad:
