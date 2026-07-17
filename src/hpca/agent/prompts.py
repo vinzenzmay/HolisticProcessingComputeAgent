@@ -25,7 +25,25 @@ PATH_WORKFLOW_GUIDANCE = (
     "Tools take registry KEYS, never literal paths. When the user mentions a "
     "path that is not registered yet, first call register_path (copy the "
     "path from the user's message exactly), then call the actual tool with "
-    "the new key. Do not ask the user to register paths — that is your job."
+    "the new key. When the user does NOT give you a path, find it yourself "
+    "(see below) and register what you found. Do not ask the user to "
+    "register paths — that is your job."
+)
+
+# Without this the model has no idea it may look around: every file tool takes
+# a key, and keys came from the user's message, so "find X somewhere on this
+# system" looked impossible and it narrated instead of acting.
+DISCOVERY_GUIDANCE = (
+    "You can look around this system, and you should rather than guess or ask. "
+    "To find a file, learn whether a program is installed, or see what "
+    "environments exist: write a small bash script with create_script and run "
+    "it with run_script, which waits and gives you its output. Useful lines: "
+    "`find <dirs> -maxdepth <n> -iname '<pattern>' 2>/dev/null | head -20` to "
+    "locate files; `command -v samtools` and `samtools --version` to check a "
+    "program; `conda env list`, `module avail <name> 2>&1` to find one that is "
+    "not on PATH. Keep searches bounded so they finish in seconds: start from "
+    "likely roots rather than /, cap the depth, pipe through head. Then "
+    "register_path the paths it printed and use them by key."
 )
 
 
@@ -60,6 +78,7 @@ def orchestrator_system_prompt(
         "processing on an HPC cluster.",
         RESPOND_VS_TOOL_GUIDANCE,
         PATH_WORKFLOW_GUIDANCE,
+        DISCOVERY_GUIDANCE,
         GROUNDED_ANSWERING_GUIDANCE,
     ]
     if skills:

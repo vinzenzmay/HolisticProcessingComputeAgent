@@ -188,7 +188,7 @@ def add_file_tools(registry: ToolRegistry) -> ToolRegistry:
     registry.register(
         Tool(
             name="register_path",
-            description="Register a path the user mentioned under a new key",
+            description="Register a path (the user's, or one you found) under a new key",
             params=RegisterPathParams,
             handler=register_path,
         )

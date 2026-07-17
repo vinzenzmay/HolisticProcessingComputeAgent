@@ -1,6 +1,12 @@
 """Core tool suite (§5.1): script creation with mandatory syntax gate, script
 execution through the tracked runner, bounded file reading, path listing.
 
+Scripts run two ways, both through the tracked runner (§5.1 — there is no
+free-form shell tool; a script is the unit of execution). ``run_script``
+waits and hands the output back, which is how the agent looks around the
+system: find a file, check a program exists, list conda environments.
+``start_script`` is for work that outlives the turn.
+
 Handlers return strings for the model; exceptions (unknown registry keys,
 key conflicts) propagate and are surfaced as ``[tool error]`` messages by the
 graph — the message text is written for the model to act on.
@@ -20,6 +26,10 @@ from hpca.registry import RegistryError
 from hpca.verify_code import format_gate_failure, format_gate_warnings, verify_script
 
 SCRIPT_SUFFIX = {"bash": ".sh", "python": ".py", "R": ".R", "snakemake": ".smk"}
+RUN_TIMEOUT_DEFAULT = 60
+RUN_TIMEOUT_MAX = 600
+RUN_OUTPUT_LINES = 60  # per stream, before the model is pointed at the log
+RUN_OUTPUT_CHARS = 4000
 INTERPRETER = {
     ".sh": ["bash"],
     ".py": [sys.executable],
@@ -139,6 +149,77 @@ async def start_script(args: StartScriptParams, ctx: ToolContext) -> str:
     )
 
 
+class RunScriptParams(BaseModel):
+    registry_key: str = Field(description="Registry key of the script to run")
+    args: str = Field(default="", description="Arguments, space-separated")
+    timeout_s: int = Field(
+        default=RUN_TIMEOUT_DEFAULT,
+        ge=1,
+        le=RUN_TIMEOUT_MAX,
+        description=f"Seconds to wait before killing it (max {RUN_TIMEOUT_MAX})",
+    )
+
+
+def _tail(text: str, stream: str, log_key: str) -> str:
+    """Bound one stream for the prompt, pointing at the log for the rest."""
+    lines = text.splitlines()
+    clipped = lines[-RUN_OUTPUT_LINES:]
+    body = "\n".join(clipped)[-RUN_OUTPUT_CHARS:]
+    if not body.strip():
+        return ""
+    omitted = len(lines) - len(clipped)
+    note = (
+        f"\n[... {omitted} earlier {stream} lines omitted; read_file {log_key!r} "
+        "for all of it]"
+        if omitted > 0
+        else ""
+    )
+    return f"{stream}:\n{body}{note}"
+
+
+async def run_script(args: RunScriptParams, ctx: ToolContext) -> str:
+    """Run a script and wait for it, returning what it printed.
+
+    The same tracked runner as start_script — the process shows in the TUI and
+    is killable — but awaited, so the output comes back in this tool result
+    instead of a log the model would have to poll.
+    """
+    path = ctx.registry.resolve(args.registry_key)
+    interpreter = INTERPRETER.get(path.suffix)
+    if interpreter is None:
+        raise ValueError(
+            f"Cannot run {args.registry_key!r}: unknown script type {path.suffix!r}"
+        )
+    argv = interpreter + [str(path)] + (args.args.split() if args.args else [])
+    record = await ctx.runner.start(
+        argv, name=args.registry_key, timeout_s=args.timeout_s
+    )
+    record = await ctx.runner.wait(record.pid)
+    stdout_key = ctx.registry.register_auto(
+        record.stdout_path, hint=f"{args.registry_key}_stdout"
+    )
+    stderr_key = ctx.registry.register_auto(
+        record.stderr_path, hint=f"{args.registry_key}_stderr"
+    )
+    parts = [
+        _tail(record.stdout_path.read_text(errors="replace"), "stdout", stdout_key),
+        _tail(record.stderr_path.read_text(errors="replace"), "stderr", stderr_key),
+    ]
+    output = "\n\n".join(part for part in parts if part) or "(no output)"
+    if record.state == "killed":
+        return (
+            f"TIMED OUT after {args.timeout_s}s and was killed. Narrow the "
+            f"script (fewer directories, -maxdepth, pipe through head) or "
+            f"raise timeout_s, then run it again.\n\n{output}"
+        )
+    status = (
+        "exit 0"
+        if record.exit_code == 0
+        else f"FAILED with exit code {record.exit_code}"
+    )
+    return f"{args.registry_key} finished ({status}).\n\n{output}"
+
+
 class ListPathsParams(BaseModel):
     pass
 
@@ -166,6 +247,17 @@ def default_tool_registry() -> ToolRegistry:
             description="Read a registered file (head/tail truncated)",
             params=ReadFileParams,
             handler=read_file,
+        )
+    )
+    registry.register(
+        Tool(
+            name="run_script",
+            description=(
+                "Run a registered script, wait for it, and return its output "
+                "(use this to look around: find files, check a program exists)"
+            ),
+            params=RunScriptParams,
+            handler=run_script,
         )
     )
     registry.register(
