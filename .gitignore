@@ -20,3 +20,6 @@ uv.lock
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+
+# Legacy log location (pre-chatlogs); still created by ad-hoc test runs
+hpca-logs/
