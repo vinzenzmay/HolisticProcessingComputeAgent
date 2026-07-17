@@ -84,17 +84,27 @@ async def propose_memories(
     messages: list[Message],
     *,
     tier1: str = "",
+    guidance: str = "",
     max_retries: int = CONCLUDE_MAX_RETRIES,
 ) -> list[MemoryProposal]:
+    """Memory proposals from the conversation; ``guidance`` is the user's own
+    /memorize note — what they, not the model, decided is worth keeping."""
     system = SYSTEM_PROMPT
     if tier1:
         system += (
             "\n\nAlready-known standing notes (do not propose duplicates):\n"
             + tier1
         )
+    prompt = transcript(messages)
+    if guidance:
+        prompt += (
+            "\n\nThe user explicitly asked to memorize the following — "
+            "propose the durable memory (or memories) it implies, using the "
+            f"conversation above for context:\n{guidance}"
+        )
     conversation = [
         {"role": "system", "content": system},
-        {"role": "user", "content": transcript(messages)},
+        {"role": "user", "content": prompt},
     ]
     last_error = ""
     for _ in range(max_retries + 1):

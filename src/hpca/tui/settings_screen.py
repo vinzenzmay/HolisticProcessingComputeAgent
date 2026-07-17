@@ -1,6 +1,8 @@
-"""Modal settings editor (§3.3): edit the settings JSON, validated on save.
+"""Modal config editor (§3.3): edit the settings JSON, validated on save.
 
-The screen validates and returns a new ``Settings`` object via ``dismiss``;
+Called the "config editor" in the UI — it is a raw JSON editor over the whole
+settings file, not a friendly settings menu, and the old name misled. The
+screen validates and returns a new ``Settings`` object via ``dismiss``;
 persisting it is the app's job.
 """
 
@@ -56,7 +58,7 @@ class SettingsScreen(ModalScreen[Settings | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="settings-dialog"):
-            yield Static("Settings — ctrl+s save · esc cancel", id="settings-title")
+            yield Static("Config editor — ctrl+s save · esc cancel", id="settings-title")
             yield TextArea(
                 self._settings.model_dump_json(indent=2), id="settings-editor"
             )

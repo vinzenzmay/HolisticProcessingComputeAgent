@@ -1,4 +1,4 @@
-"""Tests for the memory workflows: \\memorize, \\conclude, caps, editor (§6.3, §6.4)."""
+"""Tests for the memory workflows: /memorize, /conclude, caps, editor (§6.3, §6.4)."""
 
 import json
 from contextlib import contextmanager
@@ -10,7 +10,7 @@ from hpca.editor import resolve_editor
 from hpca.llm import ChatResponse
 from hpca.profiles import Profile
 from hpca.tui.app import ChatInput, HpcaApp, UNTITLED_SESSION
-from hpca.tui.memory_screens import MemoryProposalScreen, TierSelectScreen
+from hpca.tui.memory_screens import MemoryProposalScreen
 
 
 def is_title_request(json_schema):
@@ -32,6 +32,17 @@ class FakeLLM:
 
     async def supports_constrained_decoding(self):
         return True
+
+
+class RecordingLLM(FakeLLM):
+    def __init__(self, outputs):
+        super().__init__(outputs)
+        self.calls = []
+
+    async def chat(self, messages, *, json_schema=None, **kwargs):
+        if not is_title_request(json_schema):
+            self.calls.append(list(messages))
+        return await super().chat(messages, json_schema=json_schema, **kwargs)
 
 
 def respond_json(text="done"):
@@ -58,40 +69,82 @@ async def type_and_submit(app, pilot, text):
     await pilot.pause()
 
 
+MEMORIZE_REPLY = proposals_json(
+    {"tier": 1, "kind": "fact", "text": "STAR needs 40G on this cluster."}
+)
+
+
 class TestMemorize:
-    async def test_memorize_opens_tier_modal_then_saves(self, hpca_home):
-        app = HpcaApp(llm=FakeLLM([]))
-        async with app.run_test(size=(120, 40)) as pilot:
-            await type_and_submit(app, pilot, r"\memorize STAR needs 40G here")
-            assert isinstance(app.screen, TierSelectScreen)
-            await pilot.press("2")
-            await pilot.pause()
-            loaded = Profile.load("default")
-            tier2 = [m for m in loaded.memories if m.tier == 2]
-            assert any("STAR needs 40G" in m.text for m in tier2)
+    """/memorize <note>: the model forms memories from the note and the
+    conversation so far; each one still needs approval."""
 
-    async def test_memorize_tier1(self, hpca_home):
-        app = HpcaApp(llm=FakeLLM([]))
+    async def test_the_model_forms_the_memory_from_the_note(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM([MEMORIZE_REPLY]))
         async with app.run_test(size=(120, 40)) as pilot:
-            await type_and_submit(app, pilot, r"\memorize Cluster is cubi")
-            await pilot.press("1")
+            await type_and_submit(app, pilot, "/memorize STAR needed 40G here")
+            for _ in range(6):
+                await pilot.pause()
+            assert isinstance(app.screen, MemoryProposalScreen)
+            await pilot.press("y")
+            await app.workers.wait_for_complete()
             await pilot.pause()
-            loaded = Profile.load("default")
-            assert loaded.memories[0].tier == 1
+            saved = Profile.load("default").memories
+            assert len(saved) == 1
+            assert saved[0].text == "STAR needs 40G on this cluster."
+            assert saved[0].tier == 1  # the model chose the tier, not a picker
 
-    async def test_memorize_escape_saves_nothing(self, hpca_home):
-        app = HpcaApp(llm=FakeLLM([]))
+    async def test_the_note_and_the_conversation_reach_the_model(self, hpca_home):
+        llm = RecordingLLM([respond_json("ok"), MEMORIZE_REPLY])
+        app = HpcaApp(llm=llm)
         async with app.run_test(size=(120, 40)) as pilot:
-            await type_and_submit(app, pilot, r"\memorize forget me")
-            await pilot.press("escape")
+            await type_and_submit(app, pilot, "my STAR job was killed")
+            await app.workers.wait_for_complete()
+            await type_and_submit(app, pilot, "/memorize that was a memory limit")
+            for _ in range(6):
+                await pilot.pause()
+            prompt = llm.calls[-1][-1]["content"]
+            assert "that was a memory limit" in prompt  # the user's note
+            assert "my STAR job was killed" in prompt  # the conversation context
+            await pilot.press("n")
+            await app.workers.wait_for_complete()
+
+    async def test_rejecting_saves_nothing(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM([MEMORIZE_REPLY]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await type_and_submit(app, pilot, "/memorize forget me")
+            for _ in range(6):
+                await pilot.pause()
+            await pilot.press("n")
+            await app.workers.wait_for_complete()
             await pilot.pause()
             assert Profile.load("default").memories == []
 
-    async def test_slash_command_is_not_the_sessions_topic(self, hpca_home):
+    async def test_memorize_without_a_note_explains_itself(self, hpca_home):
         app = HpcaApp(llm=FakeLLM([]))
         async with app.run_test(size=(120, 40)) as pilot:
-            await type_and_submit(app, pilot, r"\memorize something")
-            await pilot.press("escape")
+            await type_and_submit(app, pilot, "/memorize")
+            await pilot.pause()
+            assert not isinstance(app.screen, MemoryProposalScreen)
+            assert Profile.load("default").memories == []
+
+    async def test_backslash_still_works(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM([MEMORIZE_REPLY]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await type_and_submit(app, pilot, r"\memorize STAR needed 40G")
+            for _ in range(6):
+                await pilot.pause()
+            assert isinstance(app.screen, MemoryProposalScreen)
+            await pilot.press("n")
+            await app.workers.wait_for_complete()
+
+    async def test_slash_command_is_not_the_sessions_topic(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM([MEMORIZE_REPLY]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await type_and_submit(app, pilot, "/memorize something")
+            for _ in range(6):
+                await pilot.pause()
+            await pilot.press("n")
+            await app.workers.wait_for_complete()
             # a command is not a message: it must not name the session
             titles = [s.title for s in app.session_store.list(profile="default")]
             assert titles == [UNTITLED_SESSION]
@@ -99,9 +152,65 @@ class TestMemorize:
     async def test_unknown_command_is_reported_not_sent(self, hpca_home):
         app = HpcaApp(llm=FakeLLM([]))
         async with app.run_test(size=(120, 40)) as pilot:
-            await type_and_submit(app, pilot, r"\frobnicate now")
+            await type_and_submit(app, pilot, "/frobnicate now")
             assert app.chat_log_texts() == []
             assert app.active_session.title == UNTITLED_SESSION
+
+
+class TestCommandMenu:
+    """Typing the prefix lists the commands: /memorize should be discoverable
+    rather than folklore."""
+
+    async def test_slash_lists_the_commands(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM([]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            await pilot.pause()
+            menu = app.query_one("#command-menu")
+            assert not menu.display  # quiet until a command is started
+
+            app.query_one("#chat-input", ChatInput).focus()
+            await pilot.press("/")
+            await pilot.pause()
+            assert menu.display
+            listed = str(menu.content)
+            assert "/memorize" in listed
+            assert "/conclude" in listed
+
+    async def test_the_list_narrows_as_the_name_is_typed(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM([]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            await pilot.pause()
+            app.query_one("#chat-input", ChatInput).focus()
+            await pilot.press("/", "m", "e")
+            await pilot.pause()
+            listed = str(app.query_one("#command-menu").content)
+            assert "/memorize" in listed
+            assert "/conclude" not in listed
+
+    async def test_the_menu_goes_when_the_draft_is_ordinary_text(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM([]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", ChatInput)
+            chat_input.focus()
+            await pilot.press("/")
+            await pilot.pause()
+            assert app.query_one("#command-menu").display
+            chat_input.text = "which BAMs are in the cohort?"
+            await pilot.pause()
+            assert not app.query_one("#command-menu").display
+
+    async def test_backslash_lists_them_too(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM([]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            await pilot.pause()
+            app.query_one("#chat-input", ChatInput).text = "\\"
+            await pilot.pause()
+            assert app.query_one("#command-menu").display
 
 
 class TestConclude:
