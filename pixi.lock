@@ -249,7 +249,7 @@ packages:
 - pypi: ./
   name: hpca
   version: 0.1.0
-  sha256: eaf0295a548ba4965ca1a399568e2901a3c5079f231d66d1a7cd496d791054eb
+  sha256: a2f60fa0cbecb7acf415d47c18d4ad6363d19deb0920115dcc6a4d461ec9d41c
   requires_dist:
   - textual>=0.80
   - pydantic>=2.7

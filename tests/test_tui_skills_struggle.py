@@ -13,12 +13,22 @@ from hpca.tui.app import ChatInput, HpcaApp
 from hpca.tui.memory_screens import MemoryProposalScreen
 
 
+def is_title_request(json_schema):
+    """The app names a session by asking the model (§3 sessions column); that
+    call is not one of the queued decisions."""
+    return bool(json_schema) and "title" in (json_schema.get("properties") or {})
+
+
+TITLE_REPLY = json.dumps({"title": "a test session"})
+
 class RecordingLLM:
     def __init__(self, outputs):
         self._outputs = list(outputs)
         self.calls = []
 
     async def chat(self, messages, *, json_schema=None, **kwargs):
+        if is_title_request(json_schema):
+            return ChatResponse(content=TITLE_REPLY)
         self.calls.append(list(messages))
         return ChatResponse(content=self._outputs.pop(0))
 

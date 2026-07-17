@@ -11,11 +11,21 @@ from hpca.tui.confirm_screen import ConfirmScreen
 from hpca.tui.inspect_screen import InspectScreen
 
 
+def is_title_request(json_schema):
+    """The app names a session by asking the model (§3 sessions column); that
+    call is not one of the queued decisions."""
+    return bool(json_schema) and "title" in (json_schema.get("properties") or {})
+
+
+TITLE_REPLY = json.dumps({"title": "a test session"})
+
 class FakeLLM:
     def __init__(self, outputs):
         self._outputs = list(outputs)
 
     async def chat(self, messages, *, json_schema=None, **kwargs):
+        if is_title_request(json_schema):
+            return ChatResponse(content=TITLE_REPLY)
         return ChatResponse(content=self._outputs.pop(0))
 
     async def supports_constrained_decoding(self):

@@ -20,11 +20,22 @@ async def delete_handler(args, ctx):
     return f"deleted {args.target}"
 
 
+def is_title_request(json_schema):
+    """The app names a session by asking the model (§3 sessions column); that
+    call is not one of the queued decisions."""
+    return bool(json_schema) and "title" in (json_schema.get("properties") or {})
+
+
+TITLE_REPLY = json.dumps({"title": "a test session"})
+
+
 class FakeLLM:
     def __init__(self, outputs):
         self._outputs = list(outputs)
 
     async def chat(self, messages, *, json_schema=None, **kwargs):
+        if is_title_request(json_schema):
+            return ChatResponse(content=TITLE_REPLY)
         return ChatResponse(content=self._outputs.pop(0))
 
     async def supports_constrained_decoding(self):
@@ -83,23 +94,37 @@ class TestChatFlow:
             assert any("hello agent" in t for t in texts)
             assert any("hello back" in t for t in texts)
 
-    async def test_first_message_names_the_session(self, hpca_home):
+    async def test_model_names_the_session_after_the_first_exchange(self, hpca_home):
         app = HpcaApp(llm=FakeLLM([respond_json()]))
         async with app.run_test(size=(120, 40)) as pilot:
             assert app.session_store.list(profile="default") == []
             await submit_chat(app, pilot, "start my session")
             sessions = app.session_store.list(profile="default")
             assert len(sessions) == 1
-            assert "start my session" in sessions[0].title
+            assert sessions[0].title == "a test session"
             assert app.active_session.title == sessions[0].title
 
-    async def test_later_messages_keep_the_title(self, hpca_home):
+    async def test_opening_message_names_it_when_the_model_cannot(self, hpca_home):
+        class NoTitleLLM(FakeLLM):
+            async def chat(self, messages, *, json_schema=None, **kwargs):
+                if is_title_request(json_schema):
+                    return ChatResponse(content="not a title object")
+                return await super().chat(messages, json_schema=json_schema, **kwargs)
+
+        app = HpcaApp(llm=NoTitleLLM([respond_json()]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "start my session")
+            # the placeholder stands rather than the session going nameless
+            assert app.active_session.title == "start my session"
+
+    async def test_later_messages_do_not_retitle(self, hpca_home):
         app = HpcaApp(llm=FakeLLM([respond_json(), respond_json()]))
         async with app.run_test(size=(120, 40)) as pilot:
             await submit_chat(app, pilot, "first thing")
+            named = app.active_session.title
             await submit_chat(app, pilot, "second thing")
             titles = [s.title for s in app.session_store.list(profile="default")]
-            assert titles == ["first thing"]
+            assert titles == [named]  # named once, not on every turn
 
     async def test_second_turn_same_session(self, hpca_home):
         app = HpcaApp(llm=FakeLLM([respond_json("one"), respond_json("two")]))
@@ -219,12 +244,13 @@ class TestSessionSwitching:
         app = HpcaApp(llm=FakeLLM([respond_json("a")]))
         async with app.run_test(size=(120, 40)) as pilot:
             await submit_chat(app, pilot, "session one")
+            first = app.active_session
             sessions_list = app.query_one("#sessions-list", ListView)
             sessions_list.focus()
             sessions_list.index = 1  # the session created above
             await pilot.press("enter")
             await pilot.pause()
-            assert app.active_session.title == "session one"
+            assert app.active_session.session_id == first.session_id
             assert app.focused.id == "chat-input"
 
     async def test_open_session_is_highlighted_in_the_column(self, hpca_home):

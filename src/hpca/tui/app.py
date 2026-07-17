@@ -30,6 +30,7 @@ from hpca.agent.conclude import MemoryProposal, propose_memories
 from hpca.agent.doc_tools import add_ask_docs, add_doc_tools
 from hpca.agent.prompts import orchestrator_system_prompt
 from hpca.agent.skill_tools import add_skill_tools
+from hpca.agent.titler import propose_title
 from hpca.agent.struggle import (
     STRUGGLE_KIND,
     matching_struggles,
@@ -55,6 +56,7 @@ from hpca.tui.confirm_screen import ConfirmScreen
 from hpca.tui.inspect_screen import InspectScreen, format_job, format_process
 from hpca.tui.manage_llms import ManageLLMsScreen
 from hpca.tui.memory_screens import MemoryProposalScreen, TierSelectScreen
+from hpca.tui.rename_screen import RenameScreen
 from hpca.tui.settings_screen import SettingsScreen
 from hpca.tui.switch_llm import SwitchLLMScreen
 
@@ -97,6 +99,32 @@ class ColumnPanel(Vertical):
     def compose(self) -> ComposeResult:
         yield Static(self._title, classes="column-title")
         yield ListView(id=f"{self.id}-list")
+
+
+class SessionsList(ListView):
+    """Left column; renaming applies to a session, not to "(new session)"."""
+
+    BINDINGS = [
+        Binding("r", "rename_session", "rename"),
+        Binding("t", "retitle_session", "ask llm for a title"),
+    ]
+
+    def check_action(self, action: str, parameters) -> bool | None:
+        if action in ("rename_session", "retitle_session"):
+            return getattr(self.highlighted_child, "data_session", None) is not None
+        return True
+
+    def action_rename_session(self) -> None:
+        self.app.rename_selected_session()
+
+    def action_retitle_session(self) -> None:
+        self.app.retitle_selected_session()
+
+
+class SessionsPanel(ColumnPanel):
+    def compose(self) -> ComposeResult:
+        yield Static(self._title, classes="column-title")
+        yield SessionsList(id="sessions-list")
 
 
 class ChatInput(TextArea):
@@ -346,13 +374,14 @@ class HpcaApp(App):
         self._tool_ctx: ToolContext | None = None
         self._chat_entries: list[Entry] = []
         self._log: SessionLog | None = None
+        self._needs_title = False
         self._conn = None
         self._saver_ctx = None
 
     def compose(self) -> ComposeResult:
         yield TopBar()
         with Horizontal(id="columns"):
-            yield ColumnPanel("Sessions", id="sessions")
+            yield SessionsPanel("Sessions", id="sessions")
             yield ChatPanel("Chat", id="chat")
             yield ProcessesPanel("Processes", id="processes")
         yield Footer()
@@ -503,6 +532,23 @@ class HpcaApp(App):
             self.push_screen(ApprovalScreen(result.interrupt), self._on_approval)
             return
         await self.maybe_propose_struggle_note(result.messages)
+        await self.maybe_title_session(result.messages)
+
+    async def maybe_title_session(self, messages: list[dict]) -> bool:
+        """Name a fresh session after its first exchange, once.
+
+        The opening message is only a placeholder — truncated mid-word, and
+        wrong by the time the session has moved on. One attempt: a failure is
+        not worth a second wait, and (t) is always there.
+        """
+        if not self._needs_title or self.active_session is None:
+            return False
+        self._needs_title = False
+        title = await self._propose_title(messages)
+        if title is None:
+            return False
+        self._rename_session(self.active_session, title, by="llm")
+        return True
 
     def _log_turn(self, result) -> None:
         """Write what this turn added: the message, its thinking, the answer.
@@ -557,16 +603,15 @@ class HpcaApp(App):
 
     async def _conclude_worker(self) -> None:
         assert self.active_session is not None
-        snapshot = await self.graph.aget_state(
-            {"configurable": {"thread_id": self.active_session.session_id}}
-        )
-        messages = (snapshot.values or {}).get("messages", [])
+        messages = await self._session_messages(self.active_session)
         if not messages:
             self.notify("Nothing to conclude yet.", severity="warning")
             return
         try:
             proposals = await propose_memories(
-                self._llm, messages, tier1=self.profile_memory.tier_text(1)
+                self._labelled_llm("conclude"),
+                messages,
+                tier1=self.profile_memory.tier_text(1),
             )
         except Exception as e:
             self.notify(f"\\conclude failed: {e}", severity="error")
@@ -597,7 +642,9 @@ class HpcaApp(App):
         if not turn_struggled(messages):
             return False
         try:
-            note = await propose_struggle_note(self._llm, messages)
+            note = await propose_struggle_note(
+                self._labelled_llm("struggle"), messages
+            )
         except Exception:
             return False  # reflection is best-effort; never disrupt the user
         proposal = MemoryProposal(
@@ -718,6 +765,13 @@ class HpcaApp(App):
             label=lambda: f"subagent:{context.current_tool or '?'}",
         )
 
+    def _labelled_llm(self, label: str) -> Any:
+        """The client for one of the app's own sub-agent calls (titling,
+        \\conclude, struggle notes), logged under that name."""
+        if self._log is None:
+            return self._llm
+        return LoggedLLM(self._llm, self._log, label=lambda: f"subagent:{label}")
+
     async def start_new_session(self) -> None:
         """Open an empty session on the default backend and start typing in it.
 
@@ -742,10 +796,66 @@ class HpcaApp(App):
         )
 
     def _name_session(self, title: str) -> None:
-        """A session is named after its opening message (§3 sessions column)."""
+        """Provisional name from the opening message, until the model or the
+        user writes a better one (§3 sessions column)."""
         assert self.active_session is not None
         self.session_store.rename(self.active_session.session_id, title)
         self.active_session.title = title
+        self._needs_title = True
+
+    def _rename_session(self, session: Session, title: str, *, by: str) -> None:
+        self.session_store.rename(session.session_id, title)
+        session.title = title
+        if self._is_active_session(session):
+            self.active_session.title = title
+            self._needs_title = False  # named on purpose; do not overwrite it
+            self._log_write("session renamed", f"{title} (by {by})")
+        self.run_worker(self._reload_sessions(), group="sessions")
+
+    async def _session_messages(self, session: Session) -> list[dict]:
+        snapshot = await self.graph.aget_state(
+            {"configurable": {"thread_id": session.session_id}}
+        )
+        return (snapshot.values or {}).get("messages", [])
+
+    def rename_selected_session(self) -> None:
+        session = self._highlighted_session()
+        if session is None:
+            return
+
+        def apply(title: str | None) -> None:
+            if title:
+                self._rename_session(session, title, by="user")
+
+        self.push_screen(RenameScreen(session.title), apply)
+
+    def retitle_selected_session(self) -> None:
+        session = self._highlighted_session()
+        if session is None:
+            return
+        self.run_worker(self._retitle_worker(session), group="title")
+
+    async def _retitle_worker(self, session: Session) -> None:
+        messages = await self._session_messages(session)
+        if not messages:
+            self.notify("Nothing to summarize yet.", severity="warning")
+            return
+        title = await self._propose_title(messages)
+        if title is None:
+            self.notify("The model could not write a title.", severity="error")
+            return
+        self._rename_session(session, title, by="llm")
+        self.notify(f"Renamed to “{title}”")
+
+    async def _propose_title(self, messages: list[dict]) -> str | None:
+        try:
+            return await propose_title(self._labelled_llm("title"), messages)
+        except Exception:
+            return None  # naming is a nicety; never break a turn over it
+
+    def _highlighted_session(self) -> Session | None:
+        highlighted = self.query_one("#sessions-list", ListView).highlighted_child
+        return getattr(highlighted, "data_session", None)
 
     async def open_session(self, session: Session) -> None:
         self._activate_session(session)
@@ -756,6 +866,7 @@ class HpcaApp(App):
         await self._set_chat_messages(
             values.get("messages", []), values.get("thinking", [])
         )
+        self._needs_title = False  # an existing session keeps the name it has
 
     @on(ListView.Selected, "#sessions-list")
     async def _on_session_selected(self, event: ListView.Selected) -> None:

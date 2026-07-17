@@ -12,6 +12,14 @@ from hpca.llm import ChatResponse
 from hpca.tui.app import ChatInput, HpcaApp, ThinkingBox
 
 
+def is_title_request(json_schema):
+    """The app names a session by asking the model (§3 sessions column); that
+    call is not one of the queued decisions."""
+    return bool(json_schema) and "title" in (json_schema.get("properties") or {})
+
+
+TITLE_REPLY = json.dumps({"title": "a test session"})
+
 class FakeLLM:
     """Answers with the queued decisions, thinking out loud alongside them."""
 
@@ -20,6 +28,8 @@ class FakeLLM:
         self._reasoning = list(reasoning or [])
 
     async def chat(self, messages, *, json_schema=None, **kwargs):
+        if is_title_request(json_schema):
+            return ChatResponse(content=TITLE_REPLY)
         return ChatResponse(
             content=self._outputs.pop(0),
             reasoning=self._reasoning.pop(0) if self._reasoning else None,
@@ -229,8 +239,10 @@ class TestSessionLogging:
             await pilot.pause()
             await submit_chat(app, pilot, "second question")
             text = log_path(logs_dir, session).read_text()
-            assert text.count("first question") == 1
-            assert text.count("second question") == 1
+            # count logged entries, not mentions: sub-agent queries quote the
+            # transcript, and quoting it is not re-logging it
+            assert text.count("] user\nfirst question") == 1
+            assert text.count("] user\nsecond question") == 1
 
     async def test_each_session_gets_its_own_file(self, logs_dir):
         app = HpcaApp(llm=FakeLLM([respond_json("a"), respond_json("b")]))
