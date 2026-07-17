@@ -56,6 +56,22 @@ class SessionStore:
         ).fetchall()
         return [self._to_session(row) for row in rows]
 
+    def list_all(self) -> list[Session]:
+        """Every session, newest first. The sessions column shows them all:
+        each session carries its own profile, so filtering by one would hide
+        the rest whenever a differently-profiled session is open."""
+        rows = self._conn.execute(
+            "SELECT * FROM sessions ORDER BY created_at DESC, rowid DESC"
+        ).fetchall()
+        return [self._to_session(row) for row in rows]
+
+    def set_profile(self, session_id: str, profile: str) -> None:
+        self._conn.execute(
+            "UPDATE sessions SET profile = ? WHERE session_id = ?",
+            (profile, session_id),
+        )
+        self._conn.commit()
+
     def get(self, session_id: str) -> Session | None:
         row = self._conn.execute(
             "SELECT * FROM sessions WHERE session_id = ?", (session_id,)

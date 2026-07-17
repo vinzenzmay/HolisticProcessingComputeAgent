@@ -1,4 +1,4 @@
-"""Rename a session by hand (§3 sessions column)."""
+"""Name something small: rename a session, name a new profile."""
 
 from __future__ import annotations
 
@@ -29,13 +29,14 @@ class RenameScreen(ModalScreen[str | None]):
     }
     """
 
-    def __init__(self, title: str) -> None:
+    def __init__(self, title: str, *, label: str = "Rename session") -> None:
         super().__init__()
         self._title = title
+        self._label = label
 
     def compose(self) -> ComposeResult:
         with Vertical(id="rename-dialog"):
-            yield Static("Rename session", id="rename-label")
+            yield Static(self._label, id="rename-label")
             yield Input(value=self._title, id="rename-input")
             yield Static("(enter) save · (escape) cancel", id="rename-hint")
 

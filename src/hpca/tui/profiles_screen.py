@@ -2,10 +2,13 @@
 
 A list like the sessions column: ↑/↓ move, enter opens the highlighted
 profile's memories in a plain-text editor (copy/paste works), escape asks
-whether to keep the edits. (n) on the "(new profile)" row names and creates
+whether to keep the edits. Enter on the "(new profile)" row names and creates
 one; (d) deletes — never the default, and never a profile a session is
 actively using (a turn in flight, or live sub-processes). Sessions on a
 deleted profile fall back to the default so nothing points at a gone file.
+
+``ProfilePickerScreen`` is the modal cousin: every new session starts by
+choosing its profile there (or creating one on the spot).
 
 The app owns the guards and the reassignment; this screen calls back into it
 so the checks live in one place.
@@ -27,25 +30,20 @@ NEW_PROFILE_LABEL = "(new profile)"
 
 
 class ProfilesList(ListView):
-    """The profile list; (n) always, (d) only on a real, removable profile."""
+    """The profile list; enter opens a profile's memories — or, on the
+    "(new profile)" row, creates one. (d) only on a removable profile."""
 
     BINDINGS = [
-        Binding("enter", "select_cursor", "edit memories", show=True),
-        Binding("n", "new_profile", "new profile", show=True),
+        Binding("enter", "select_cursor", "edit / create", show=True),
         Binding("d", "delete_profile", "delete profile", show=True),
     ]
 
     def check_action(self, action: str, parameters) -> bool | None:
         name = getattr(self.highlighted_child, "data_profile", None)
-        if action in ("select_cursor", "delete_profile"):
-            if name is None:  # the "(new profile)" row is not a profile
-                return False
-            if action == "delete_profile" and name == DEFAULT_PROFILE:
-                return False  # the default is the fallback; it cannot go
+        if action == "delete_profile":
+            # "(new profile)" is not a profile; the default is the fallback
+            return name is not None and name != DEFAULT_PROFILE
         return True
-
-    def action_new_profile(self) -> None:
-        self.screen.add_profile()
 
     def action_delete_profile(self) -> None:
         self.screen.delete_selected()
@@ -188,7 +186,7 @@ class ProfilesScreen(Screen):
             else:
                 self.run_worker(self.refresh_profiles(), group="profiles")
 
-        self.app.push_screen(RenameScreen(""), apply)
+        self.app.push_screen(RenameScreen("", label="New profile name"), apply)
 
     def delete_selected(self) -> None:
         highlighted = self.query_one("#profiles-list", ListView).highlighted_child
@@ -213,3 +211,74 @@ class ProfilesScreen(Screen):
             ),
             verdict,
         )
+
+
+class ProfilePickerScreen(ModalScreen[str | None]):
+    """Choose the profile a new session runs under — or create one first.
+
+    The cursor starts on the current profile, so the common case is just
+    enter; escape means no session. Choosing "(new profile)" names one, and
+    a successful creation is the choice.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "cancel", priority=True)]
+
+    DEFAULT_CSS = """
+    ProfilePickerScreen { align: center middle; }
+    #picker-dialog {
+        width: 64;
+        height: auto;
+        max-height: 80%;
+        border: heavy $accent;
+        background: $surface;
+        padding: 1;
+    }
+    #picker-title { height: 1; text-style: bold; }
+    #picker-hint { color: $text-muted; }
+    """
+
+    def __init__(self, current: str = DEFAULT_PROFILE) -> None:
+        super().__init__()
+        self._current = current
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="picker-dialog"):
+            yield Static("Profile for the new session", id="picker-title")
+            yield ListView(id="picker-list")
+            yield Static("(enter) choose · (esc) cancel", id="picker-hint")
+
+    def on_mount(self) -> None:
+        picker = self.query_one("#picker-list", ListView)
+        names = Profile.list_profiles()
+        for name in names:
+            star = " ★" if name == DEFAULT_PROFILE else ""
+            item = ListItem(Label(Content(f"{name}{star}")))
+            item.data_profile = name
+            picker.append(item)
+        new_item = ListItem(Label(NEW_PROFILE_LABEL))
+        new_item.data_profile = None
+        picker.append(new_item)
+        picker.index = names.index(self._current) if self._current in names else 0
+        picker.focus()
+
+    @on(ListView.Selected, "#picker-list")
+    def _on_selected(self, event: ListView.Selected) -> None:
+        name = getattr(event.item, "data_profile", None)
+        if name is not None:
+            self.dismiss(name)
+            return
+        from hpca.tui.rename_screen import RenameScreen
+
+        def apply(new_name: str | None) -> None:
+            if not new_name:
+                return  # back to the picker
+            error = self.app.create_profile(new_name)
+            if error:
+                self.notify(error, severity="error")
+            else:
+                self.dismiss(new_name)
+
+        self.app.push_screen(RenameScreen("", label="New profile name"), apply)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)

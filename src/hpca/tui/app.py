@@ -45,7 +45,7 @@ from hpca.llm import LLMClient
 from hpca.logs import LoggedLLM, SessionLog, open_log
 from hpca.rag import RagStore
 from hpca.transcript import THINKING, Entry, build_entries
-from hpca.profiles import Profile
+from hpca.profiles import DEFAULT_PROFILE, Profile
 from hpca.registry import PathRegistry
 from hpca.runner import ProcessRecord, ProcessRunner, running_session_ids
 from hpca.sessions import Session, SessionStore
@@ -58,7 +58,7 @@ from hpca.tui.confirm_screen import ConfirmScreen
 from hpca.tui.inspect_screen import InspectScreen, format_job, format_process
 from hpca.tui.manage_llms import ManageLLMsScreen
 from hpca.tui.memory_screens import MemoryProposalScreen
-from hpca.tui.profiles_screen import ProfilesScreen
+from hpca.tui.profiles_screen import ProfilePickerScreen, ProfilesScreen
 from hpca.tui.rename_screen import RenameScreen
 from hpca.tui.settings_screen import SettingsScreen
 from hpca.tui.switch_llm import SwitchLLMScreen
@@ -499,6 +499,7 @@ class HpcaApp(App):
         self._updated: set[str] = set()  # replies that landed while switched away
         self._busy_turn: Session | None = None  # the one turn in flight, if any
         self._turn_ctx: ToolContext | None = None  # that turn's tool context
+        self._turn_memory: Profile | None = None  # that turn's profile memories
         self._activity = "working"
         self._conn = None
         self._saver_ctx = None
@@ -601,10 +602,14 @@ class HpcaApp(App):
         self.copy_text(text)
 
     def _render_system_prompt(self) -> str:
-        """Per-call prompt assembly (§4.3): memories, skills, dynamic facts."""
+        """Per-call prompt assembly (§4.3): memories, skills, dynamic facts.
+
+        A running turn reads its own session's profile memories, which may
+        not be the profile on screen."""
+        memory = self._turn_memory if self._turn_memory is not None else self.profile_memory
         return orchestrator_system_prompt(
-            tier1=self.profile_memory.tier_text(1),
-            tier2=self.profile_memory.tier_text(2),
+            tier1=memory.tier_text(1),
+            tier2=memory.tier_text(2),
             skills=summarize_skills(self.skills),
         )
 
@@ -683,11 +688,15 @@ class HpcaApp(App):
         """
         # Memories are shared through the profile file: reload so notes made
         # in another session (or another running instance, or an editor) are
-        # in this turn's prompt.
-        self.profile_memory = Profile.load(self.profile)
+        # in this turn's prompt. The turn reads its own session's profile —
+        # an approval may resume it while a differently-profiled session is
+        # open on screen.
+        self._turn_memory = Profile.load(session.profile)
+        if session.profile == self.profile:
+            self.profile_memory = self._turn_memory
         log = open_log(self.settings, session)
         self._busy_turn = session
-        self._turn_ctx = self._make_tool_ctx(session, log)
+        self._turn_ctx = self._make_tool_ctx(session, log, memory=self._turn_memory)
         if self._is_active_session(session):
             # the UI's context (process list, registry) stays the turn's twin
             self._tool_ctx = self._turn_ctx
@@ -743,6 +752,7 @@ class HpcaApp(App):
         finally:
             self._busy_turn = None
             self._turn_ctx = None
+            self._turn_memory = None
         self.hide_working()
         self._log_turn(result, log)
         if self._is_active_session(session):
@@ -963,12 +973,34 @@ class HpcaApp(App):
 
     # -------------------------------------------------------------- sessions
 
-    def _make_tool_ctx(self, session: Session, log: SessionLog | None) -> ToolContext:
+    def _set_working_profile(self, profile: str) -> None:
+        """The working profile is the active session's: its memories, its
+        file under ctrl+e, its name in the top bar."""
+        if profile == self.profile:
+            return
+        self.profile = profile
+        self.profile_memory = Profile.load(profile)
+        if self.profile_memory.problems:
+            self.notify(
+                "Profile file has problems: "
+                + "; ".join(self.profile_memory.problems[:3]),
+                severity="warning",
+            )
+        self._refresh_top_bar()
+
+    def _make_tool_ctx(
+        self,
+        session: Session,
+        log: SessionLog | None,
+        memory: Profile | None = None,
+    ) -> ToolContext:
         """A tool context bound to one session and its transcript, so a turn
         keeps its own registry, runner and log however the UI moves on."""
+        if memory is None:
+            memory = self.profile_memory
         ctx = ToolContext(
             registry=PathRegistry(
-                self._conn, profile=self.profile, session_id=session.session_id
+                self._conn, profile=session.profile, session_id=session.session_id
             ),
             runner=ProcessRunner(
                 self._conn,
@@ -978,13 +1010,13 @@ class HpcaApp(App):
             settings=self.settings,
             scripts_dir=app_dir() / "scripts",
             session_id=session.session_id,
-            profile=self.profile,
+            profile=session.profile,
             slurm=self.slurm,
             jobs=self.job_store,
             job_log_dir=app_dir() / "job_logs",
             llm=self._llm,
             trash=self.trash,
-            tier1_text=self.profile_memory.tier_text(1),
+            tier1_text=memory.tier_text(1),
             symbols=self.symbol_index,
             rag=self.rag_store,
             embedder=self.embedder,
@@ -1027,17 +1059,37 @@ class HpcaApp(App):
             return self._llm
         return LoggedLLM(self._llm, sink, label=lambda: f"subagent:{label}")
 
-    async def start_new_session(self) -> None:
-        """Open an empty session on the default backend and start typing in it.
+    def pick_profile_for_new_session(self) -> None:
+        """Every new session starts by choosing its profile (or creating one)."""
 
-        An untouched session is reused rather than piling up empty rows when
-        "(new session)" is entered repeatedly.
-        """
-        if not self._is_untouched(self.active_session):
-            self._activate_session(
-                self.session_store.create(
-                    profile=self.profile, title=UNTITLED_SESSION
+        def chosen(profile: str | None) -> None:
+            if profile is not None:
+                self.run_worker(
+                    self.start_new_session(profile=profile), group="sessions"
                 )
+
+        self.push_screen(ProfilePickerScreen(current=self.profile), chosen)
+
+    async def start_new_session(self, profile: str | None = None) -> None:
+        """Open an empty session under the given profile and start typing.
+
+        An untouched session is reused (and retagged to the chosen profile)
+        rather than piling up empty rows when "(new session)" is entered
+        repeatedly.
+        """
+        profile = profile or self.profile
+        self._set_working_profile(profile)
+        if self._is_untouched(self.active_session):
+            if self.active_session.profile != profile:
+                self.session_store.set_profile(
+                    self.active_session.session_id, profile
+                )
+                self.active_session.profile = profile
+                self._refresh_session_log()
+                await self._reload_sessions()
+        else:
+            self._activate_session(
+                self.session_store.create(profile=profile, title=UNTITLED_SESSION)
             )
             await self._set_chat_messages([])
             await self._reload_sessions()
@@ -1173,6 +1225,7 @@ class HpcaApp(App):
         self._focus_column("sessions")
 
     async def open_session(self, session: Session) -> None:
+        self._set_working_profile(session.profile)
         self._activate_session(session)
         snapshot = await self.graph.aget_state(
             {"configurable": {"thread_id": session.session_id}}
@@ -1196,7 +1249,7 @@ class HpcaApp(App):
     async def _on_session_selected(self, event: ListView.Selected) -> None:
         session = getattr(event.item, "data_session", None)
         if session is None:
-            await self.start_new_session()
+            self.pick_profile_for_new_session()
         else:
             await self.open_session(session)
             self._focus_column("chat")  # entering a session means typing in it
@@ -1207,8 +1260,13 @@ class HpcaApp(App):
         new_item = ListItem(Label("(new session)"))
         new_item.data_session = None
         items = [new_item]
-        for session in self.session_store.list(profile=self.profile):
-            item = ListItem(Label(Content(session.title)))
+        for session in self.session_store.list_all():
+            tag = (
+                f"  · {session.profile}"
+                if session.profile != DEFAULT_PROFILE
+                else ""
+            )
+            item = ListItem(Label(Content(f"{session.title}{tag}")))
             item.data_session = session
             item.set_class(session.session_id in self._updated, "session-updated")
             items.append(item)

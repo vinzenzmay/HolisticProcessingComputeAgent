@@ -155,12 +155,12 @@ class TestEditMemories:
 
 
 class TestAddProfile:
-    async def test_new_profile_row_prompts_for_a_name_and_creates_it(self, hpca_home):
+    async def test_enter_on_the_new_profile_row_prompts_and_creates(self, hpca_home):
         app = HpcaApp(llm=FakeLLM())
         async with app.run_test(size=(120, 40)) as pilot:
             profiles = await open_profiles(app, pilot)
             profiles.index = 0  # "(new profile)"
-            await pilot.press("n")
+            await pilot.press("enter")
             await pilot.pause()
             assert isinstance(app.screen, RenameScreen)
             app.screen.query_one(Input).value = "bam-work"
@@ -172,8 +172,9 @@ class TestAddProfile:
     async def test_a_bad_name_is_reported_and_nothing_is_created(self, hpca_home):
         app = HpcaApp(llm=FakeLLM())
         async with app.run_test(size=(120, 40)) as pilot:
-            await open_profiles(app, pilot)
-            await pilot.press("n")
+            profiles = await open_profiles(app, pilot)
+            profiles.index = 0  # "(new profile)"
+            await pilot.press("enter")
             await pilot.pause()
             app.screen.query_one(Input).value = "../escape"
             await pilot.press("enter")
@@ -255,3 +256,133 @@ class TestDeleteGuards:
             app.session_store.create(profile="alpha", title="idle")
             monkeypatch.setattr(app_module, "running_session_ids", lambda conn: set())
             assert app.profile_delete_blocker("alpha") is None
+
+
+class RecordingLLM(FakeLLM):
+    def __init__(self, outputs=()):
+        super().__init__(outputs)
+        self.calls = []
+
+    async def chat(self, messages, *, json_schema=None, **kwargs):
+        if not is_title_request(json_schema):
+            self.calls.append(list(messages))
+        return await super().chat(messages, json_schema=json_schema, **kwargs)
+
+
+def respond_json(text="done"):
+    return json.dumps({"action": "respond", "response": text})
+
+
+async def pick_new_session(app, pilot, profile):
+    """(new session) -> picker -> choose the given profile."""
+    from hpca.tui.profiles_screen import ProfilePickerScreen
+
+    sessions_list = app.query_one("#sessions-list", ListView)
+    sessions_list.focus()
+    sessions_list.index = 0
+    await pilot.press("enter")
+    await pilot.pause()
+    assert isinstance(app.screen, ProfilePickerScreen)
+    picker = app.screen.query_one("#picker-list", ListView)
+    picker.index = next(
+        i
+        for i, item in enumerate(picker.children)
+        if getattr(item, "data_profile", None) == profile
+    )
+    await pilot.press("enter")
+    await pilot.pause()
+    await pilot.pause()
+
+
+class TestSessionProfilePicker:
+    async def test_the_session_runs_under_the_chosen_profile(self, hpca_home):
+        Profile.create("alpha")
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pick_new_session(app, pilot, "alpha")
+            assert app.active_session.profile == "alpha"
+            assert app.profile == "alpha"  # working profile follows the session
+            from hpca.tui.app import TopBar
+
+            assert "alpha" in app.query_one(TopBar).render_text()
+
+    async def test_the_chosen_profiles_memories_reach_the_prompt(self, hpca_home):
+        alpha = Profile.create("alpha")
+        alpha.add_memory("Alpha-only fact: use scratch volume B.", tier=1)
+        alpha.save()
+        llm = RecordingLLM([respond_json("ok")])
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pick_new_session(app, pilot, "alpha")
+            from hpca.tui.app import ChatInput
+
+            chat_input = app.query_one("#chat-input", ChatInput)
+            chat_input.focus()
+            chat_input.text = "hello"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            system = llm.calls[0][0]
+            assert system["role"] == "system"
+            assert "Alpha-only fact" in system["content"]
+
+    async def test_sessions_of_all_profiles_stay_listed_with_tags(self, hpca_home):
+        Profile.create("alpha")
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.session_store.create(profile="default", title="on default")
+            app.session_store.create(profile="alpha", title="on alpha")
+            await app._reload_sessions()
+            await pilot.pause()
+            rows = [
+                str(item.query_one("Label").content)
+                for item in app.query_one("#sessions-list", ListView).children
+            ]
+            assert any(r == "on default" for r in rows)  # default: no tag
+            assert any("on alpha" in r and "alpha" in r for r in rows)
+
+    async def test_opening_a_session_switches_to_its_profile(self, hpca_home):
+        alpha = Profile.create("alpha")
+        alpha.add_memory("Alpha-only fact.", tier=1)
+        alpha.save()
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            session = app.session_store.create(profile="alpha", title="on alpha")
+            await app.open_session(session)
+            await pilot.pause()
+            assert app.profile == "alpha"
+            assert "Alpha-only fact." in app.profile_memory.tier_text(1)
+
+    async def test_creating_a_profile_inside_the_picker_uses_it(self, hpca_home):
+        from hpca.tui.profiles_screen import ProfilePickerScreen
+
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            sessions_list = app.query_one("#sessions-list", ListView)
+            sessions_list.focus()
+            sessions_list.index = 0
+            await pilot.press("enter")
+            await pilot.pause()
+            picker = app.screen.query_one("#picker-list", ListView)
+            picker.index = len(picker.children) - 1  # "(new profile)"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, RenameScreen)
+            app.screen.query_one(Input).value = "fresh"
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            assert "fresh" in Profile.list_profiles()
+            assert app.active_session.profile == "fresh"
+
+    async def test_reused_untouched_session_is_retagged(self, hpca_home):
+        Profile.create("alpha")
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pick_new_session(app, pilot, "default")
+            first = app.active_session
+            await pick_new_session(app, pilot, "alpha")
+            # same empty session, now under the newly chosen profile
+            assert app.active_session.session_id == first.session_id
+            assert app.session_store.get(first.session_id).profile == "alpha"
+            assert len(app.session_store.list_all()) == 1

@@ -77,18 +77,44 @@ async def test_focused_widget_is_the_columns_list(hpca_home):
         assert app.focused.id == "chat-list"
 
 
+async def new_session_via_picker(app, pilot):
+    """Enter on "(new session)" opens the profile picker; enter again takes
+    the highlighted (current) profile."""
+    await pilot.press("enter")
+    await pilot.pause()
+    await pilot.press("enter")
+    await pilot.pause()
+    await pilot.pause()
+
+
 class TestNewSession:
-    async def test_enter_on_new_session_opens_one_and_focuses_the_entry(
+    async def test_enter_asks_for_a_profile_then_opens_the_session(
         self, hpca_home
     ):
+        from hpca.tui.profiles_screen import ProfilePickerScreen
+
         app = HpcaApp()
         async with app.run_test(size=(120, 40)) as pilot:
             assert app.query_one("#sessions-list", ListView).index == 0
             await pilot.press("enter")
             await pilot.pause()
+            assert isinstance(app.screen, ProfilePickerScreen)
+            await pilot.press("enter")  # the current profile is highlighted
+            await pilot.pause()
+            await pilot.pause()
             assert app.active_session is not None
+            assert app.active_session.profile == "default"
             assert app.session_store.list(profile="default") != []
             assert app.focused.id == "chat-input"
+
+    async def test_escaping_the_picker_opens_nothing(self, hpca_home):
+        app = HpcaApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("enter")
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app.active_session is None
+            assert app.session_store.list_all() == []
 
     async def test_chat_entry_only_exists_inside_a_session(self, hpca_home):
         app = HpcaApp()
@@ -98,21 +124,18 @@ class TestNewSession:
             await pilot.press("right")  # chat column without a session
             assert app.focused.id == "chat-list"
             await pilot.press("left")
-            await pilot.press("enter")  # (new session)
-            await pilot.pause()
+            await new_session_via_picker(app, pilot)
             assert chat_input.display
 
     async def test_repeated_new_session_reuses_the_empty_one(self, hpca_home):
         app = HpcaApp()
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.press("enter")
-            await pilot.pause()
+            await new_session_via_picker(app, pilot)
             first = app.active_session
             sessions_list = app.query_one("#sessions-list", ListView)
             sessions_list.focus()
             sessions_list.index = 0  # "(new session)" again
-            await pilot.press("enter")
-            await pilot.pause()
+            await new_session_via_picker(app, pilot)
             assert app.active_session.session_id == first.session_id
             assert len(app.session_store.list(profile="default")) == 1
 
@@ -121,8 +144,7 @@ class TestChatEntryNavigation:
     async def test_arrow_keys_leave_the_entry_only_at_its_edges(self, hpca_home):
         app = HpcaApp()
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.press("enter")  # (new session) -> entry focused
-            await pilot.pause()
+            await new_session_via_picker(app, pilot)  # -> entry focused
             await pilot.press("h", "i")
             chat_input = app.query_one("#chat-input", ChatInput)
             assert chat_input.text == "hi"
@@ -138,8 +160,7 @@ class TestChatEntryNavigation:
     async def test_returning_to_chat_resumes_typing_where_it_stopped(self, hpca_home):
         app = HpcaApp()
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.press("enter")
-            await pilot.pause()
+            await new_session_via_picker(app, pilot)
             await pilot.press("h", "i")
             await pilot.press("right")  # cursor at the end: leave the column
             assert app.focused_column_id == "processes"
@@ -156,8 +177,7 @@ class TestChatEntryNavigation:
         app = HpcaApp()
         async with app.run_test(size=(120, 40)) as pilot:
             assert app.check_action("open_settings", ()) is True
-            await pilot.press("enter")  # (new session) -> chat entry
-            await pilot.pause()
+            await new_session_via_picker(app, pilot)  # -> chat entry
             assert app.check_action("open_settings", ()) is False
             await pilot.press("c")  # typed, not a hotkey
             assert app.query_one("#chat-input", ChatInput).text == "c"
@@ -242,8 +262,7 @@ class TestMultiLineEntry:
     async def test_draft_wraps_and_the_box_grows_with_it(self, hpca_home):
         app = HpcaApp()
         async with app.run_test(size=(80, 40)) as pilot:
-            await pilot.press("enter")  # (new session)
-            await pilot.pause()
+            await new_session_via_picker(app, pilot)
             chat_input = app.query_one("#chat-input", ChatInput)
             assert chat_input.soft_wrap
             one_line = chat_input.size.height
@@ -257,8 +276,7 @@ class TestMultiLineEntry:
     async def test_growth_is_capped_so_the_log_stays_visible(self, hpca_home):
         app = HpcaApp()
         async with app.run_test(size=(80, 40)) as pilot:
-            await pilot.press("enter")
-            await pilot.pause()
+            await new_session_via_picker(app, pilot)
             chat_input = app.query_one("#chat-input", ChatInput)
             chat_input.text = "line\n" * 100
             for _ in range(3):
@@ -269,8 +287,7 @@ class TestMultiLineEntry:
     async def test_enter_sends_and_shift_enter_starts_a_line(self, hpca_home):
         app = HpcaApp()
         async with app.run_test(size=(80, 40)) as pilot:
-            await pilot.press("enter")
-            await pilot.pause()
+            await new_session_via_picker(app, pilot)
             chat_input = app.query_one("#chat-input", ChatInput)
             await pilot.press("a")
             await pilot.press("shift+enter")
@@ -280,8 +297,7 @@ class TestMultiLineEntry:
     async def test_alt_enter_and_ctrl_j_also_start_a_line(self, hpca_home):
         app = HpcaApp()
         async with app.run_test(size=(80, 40)) as pilot:
-            await pilot.press("enter")
-            await pilot.pause()
+            await new_session_via_picker(app, pilot)
             chat_input = app.query_one("#chat-input", ChatInput)
             await pilot.press("a", "alt+enter", "b", "ctrl+j", "c")
             assert chat_input.text == "a\nb\nc"
@@ -289,8 +305,7 @@ class TestMultiLineEntry:
     async def test_up_moves_between_draft_lines_before_leaving(self, hpca_home):
         app = HpcaApp()
         async with app.run_test(size=(80, 40)) as pilot:
-            await pilot.press("enter")
-            await pilot.pause()
+            await new_session_via_picker(app, pilot)
             chat_input = app.query_one("#chat-input", ChatInput)
             await pilot.press("a", "shift+enter", "b")
             assert chat_input.cursor_location == (1, 1)

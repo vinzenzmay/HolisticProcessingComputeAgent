@@ -234,7 +234,10 @@ class TestSessionSwitching:
             sessions_list = app.query_one("#sessions-list", ListView)
             sessions_list.focus()
             sessions_list.index = 0  # "(new session)"
-            await pilot.press("enter")
+            await pilot.press("enter")  # opens the profile picker
+            await pilot.pause()
+            await pilot.press("enter")  # take the current profile
+            await pilot.pause()
             await pilot.pause()
             assert app.active_session is not first
             assert chat_texts(app) == []
