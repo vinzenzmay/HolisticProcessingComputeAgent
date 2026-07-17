@@ -1641,6 +1641,7 @@ class HpcaApp(App):
             ctx=lambda: self._turn_ctx if self._turn_ctx is not None else self._tool_ctx,
             system_prompt_fn=self._render_system_prompt,
             max_retries=self.settings.llm.max_retries,
+            max_tool_rounds=self.settings.llm.max_tool_rounds,
             on_activity=lambda activity: self.report_activity(activity),
         )
 

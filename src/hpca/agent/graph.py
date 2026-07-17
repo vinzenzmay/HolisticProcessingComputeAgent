@@ -30,7 +30,7 @@ from hpca.agent.prompts import orchestrator_system_prompt
 from hpca.agent.tools import ToolRegistry
 from hpca.llm import Message
 
-MAX_TOOL_ROUNDS = 8
+MAX_TOOL_ROUNDS = 16  # default; overridable per build (llm.max_tool_rounds)
 
 
 def _append(left: list, right: list) -> list:
@@ -55,6 +55,7 @@ def build_graph(
     system_prompt_fn: Callable[[], str] | None = None,
     ctx: Any = None,
     max_retries: int = 3,
+    max_tool_rounds: int = MAX_TOOL_ROUNDS,
     on_activity: Callable[[str], None] | None = None,
 ):
     render_system_prompt = system_prompt_fn or orchestrator_system_prompt
@@ -64,12 +65,11 @@ def build_graph(
 
     async def orchestrator(state: AgentState) -> dict:
         rounds = state.get("tool_rounds", 0)
-        if rounds >= MAX_TOOL_ROUNDS:
-            note = (
-                f"I stopped after {MAX_TOOL_ROUNDS} tool calls in one turn "
-                "(tool budget exhausted). Tell me how to proceed."
-            )
-            return _final(note)
+        if rounds >= max_tool_rounds:
+            # Budget spent: don't throw away what the tools found. One last
+            # call with NO tools forces the model to answer from the results
+            # it already has (it often has the answer and just kept digging).
+            return await _summarise_and_stop(state)
         system: Message = {"role": "system", "content": render_system_prompt()}
         report("thinking")
         try:
@@ -139,6 +139,42 @@ def build_graph(
                 {"after": len(state.get("messages", [])), "reasoning": reasoning}
             ]
         }
+
+    async def _summarise_and_stop(state: AgentState) -> dict:
+        """Answer from the tool results already gathered, tools withdrawn.
+
+        Uses the empty-registry branch of `decide`, so the model can only
+        respond — the same firewalled path, just with nothing left to call.
+        """
+        budget_note = {
+            "role": "user",
+            "content": (
+                f"[tool budget: you have used all {max_tool_rounds} tool calls "
+                "for this turn]\nDo not ask to call more tools. Answer the "
+                "user now from what the tool results above already show — state "
+                "the finding if you have it, or say plainly what is still "
+                "missing and what single next step would get it."
+            ),
+        }
+        system: Message = {"role": "system", "content": render_system_prompt()}
+        report("thinking")
+        try:
+            decision = await decide(
+                llm,
+                [system] + list(state.get("messages", [])) + [budget_note],
+                ToolRegistry(),  # no tools: respond-only
+                max_retries=max_retries,
+            )
+        except DecisionError:
+            return _final(
+                f"I used all {max_tool_rounds} tool calls this turn without a "
+                "clean finish. Tell me how to proceed."
+            )
+        text = decision.text if isinstance(decision, DirectResponse) else (
+            f"I used all {max_tool_rounds} tool calls this turn. Tell me how "
+            "to proceed."
+        )
+        return _final(text) | _thinking(state, decision.reasoning)
 
     def _final(text: str) -> dict:
         return {

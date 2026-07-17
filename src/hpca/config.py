@@ -52,6 +52,12 @@ class LLMSettings(_Section):
     # Qwen3.6-27B: a turn took 133s thinking against 2.3s without. Per backend
     # in the catalog below; this is whichever one is active.
     enable_thinking: bool = False
+    # Tool calls allowed in one turn before the agent must stop and summarise.
+    # Each create_script+run_script (or run_bash) is one "look at the system"
+    # step; a real check needs several, and debugging a script costs more, so
+    # this is generous. Raise for deeper autonomous work, lower to keep turns
+    # snappy.
+    max_tool_rounds: int = 16
 
 
 class ClusterSettings(_Section):

@@ -15,6 +15,7 @@ graph — the message text is written for the model to act on.
 from __future__ import annotations
 
 import sys
+import time
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -160,7 +161,7 @@ class RunScriptParams(BaseModel):
     )
 
 
-def _tail(text: str, stream: str, log_key: str) -> str:
+def _tail(text: str, stream: str, log_key: str | None) -> str:
     """Bound one stream for the prompt, pointing at the log for the rest."""
     lines = text.splitlines()
     clipped = lines[-RUN_OUTPUT_LINES:]
@@ -168,12 +169,13 @@ def _tail(text: str, stream: str, log_key: str) -> str:
     if not body.strip():
         return ""
     omitted = len(lines) - len(clipped)
-    note = (
-        f"\n[... {omitted} earlier {stream} lines omitted; read_file {log_key!r} "
-        "for all of it]"
-        if omitted > 0
-        else ""
-    )
+    if omitted > 0:
+        where = f"read_file {log_key!r} for all of it" if log_key else (
+            "re-run with a tighter filter for the rest"
+        )
+        note = f"\n[... {omitted} earlier {stream} lines omitted; {where}]"
+    else:
+        note = ""
     return f"{stream}:\n{body}{note}"
 
 
@@ -220,6 +222,71 @@ async def run_script(args: RunScriptParams, ctx: ToolContext) -> str:
     return f"{args.registry_key} finished ({status}).\n\n{output}"
 
 
+class RunBashParams(BaseModel):
+    # An array of lines, not one string: the live model reliably fills string
+    # arrays but mangles \n escapes in long strings under guided decoding.
+    content_lines: list[str] = Field(
+        min_length=1,
+        description="Bash script content as an array of lines, one per line",
+    )
+    timeout_s: int = Field(
+        default=RUN_TIMEOUT_DEFAULT,
+        ge=1,
+        le=RUN_TIMEOUT_MAX,
+        description=f"Seconds to wait before killing it (max {RUN_TIMEOUT_MAX})",
+    )
+
+
+async def run_bash(args: RunBashParams, ctx: ToolContext) -> str:
+    """Write a throwaway bash script, syntax-check it, run it, wait, and return
+    its output — all in one call.
+
+    This is the look-around workhorse: find a file, check a program, read a BAM
+    header, list conda envs. create_script + run_script does the same thing in
+    two steps and is for scripts worth keeping (submitted to Slurm, re-run);
+    this is for the one-shot check you would otherwise pay two tool rounds for.
+    """
+    ctx.scripts_dir.mkdir(parents=True, exist_ok=True)
+    name = f"bash_{time.time_ns()}"  # throwaway, unique on disk, never registered
+    path = ctx.scripts_dir / f"{name}.sh"
+    lines = args.content_lines
+    nonempty = [line for line in lines if line.strip()]
+    if len(nonempty) == 1 and nonempty[0].lstrip().startswith("#!"):
+        return (
+            "NOT run: the whole script is a single shebang line, so it would do "
+            "nothing. Put each command on its own content_lines element."
+        )
+    path.write_text("\n".join(lines) + "\n")
+    check = await syntax_check("bash", path)
+    if not check.ok:
+        path.unlink(missing_ok=True)
+        return (
+            f"NOT run: {check.checker} found syntax errors — fix the script and "
+            f"call run_bash again:\n{check.errors}"
+        )
+    record = await ctx.runner.start(
+        ["bash", str(path)], name=name, timeout_s=args.timeout_s
+    )
+    record = await ctx.runner.wait(record.pid)
+    parts = [
+        _tail(record.stdout_path.read_text(errors="replace"), "stdout", name),
+        _tail(record.stderr_path.read_text(errors="replace"), "stderr", name),
+    ]
+    output = "\n\n".join(part for part in parts if part) or "(no output)"
+    if record.state == "killed":
+        return (
+            f"TIMED OUT after {args.timeout_s}s and was killed. Narrow it "
+            f"(fewer directories, -maxdepth, pipe through head) or raise "
+            f"timeout_s, then run it again.\n\n{output}"
+        )
+    if record.exit_code == 0:
+        return f"ran (exit 0).\n\n{output}"
+    return (
+        f"ran (FAILED, exit {record.exit_code}). Read the error, fix the "
+        f"script, and call run_bash again.\n\n{output}"
+    )
+
+
 class ListPathsParams(BaseModel):
     pass
 
@@ -247,6 +314,18 @@ def default_tool_registry() -> ToolRegistry:
             description="Read a registered file (head/tail truncated)",
             params=ReadFileParams,
             handler=read_file,
+        )
+    )
+    registry.register(
+        Tool(
+            name="run_bash",
+            description=(
+                "Write and run a one-shot bash script in a single call, return "
+                "its output (the tool for looking around: find files, check a "
+                "program, read a BAM header, list conda envs)"
+            ),
+            params=RunBashParams,
+            handler=run_bash,
         )
     )
     registry.register(

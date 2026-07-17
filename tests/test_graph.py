@@ -103,13 +103,50 @@ class TestToolLoop:
             m["role"] == "user" and "echo: hi" in m["content"] for m in second_call
         )
 
-    async def test_tool_rounds_capped(self, tools):
-        llm = FakeLLM([tool_json("echo", text="x")] * (MAX_TOOL_ROUNDS + 5))
+    async def test_tool_rounds_capped_then_summarises(self, tools):
+        # MAX tool calls, then one tools-stripped call that answers from what
+        # the results already show — the model does not just say "I stopped".
+        llm = FakeLLM(
+            [tool_json("echo", text="x")] * MAX_TOOL_ROUNDS
+            + [respond_json("From the results so far: it is GRCh38.")]
+        )
         graph = make_graph(llm, tools)
         result = await run_turn(graph, session_id="s1", user_text="loop forever")
         assert result.interrupt is None
-        assert "tool" in result.reply.lower()  # explains the cap was hit
-        assert len(llm.calls) == MAX_TOOL_ROUNDS
+        assert "GRCh38" in result.reply  # answered, not a canned stop
+        # MAX tool decisions + 1 summary decision
+        assert len(llm.calls) == MAX_TOOL_ROUNDS + 1
+
+    async def test_the_summary_call_has_no_tools(self, tools):
+        llm = FakeLLM(
+            [tool_json("echo", text="x")] * MAX_TOOL_ROUNDS
+            + [respond_json("done summarising")]
+        )
+        graph = make_graph(llm, tools)
+        await run_turn(graph, session_id="s1", user_text="go")
+        # the last decision was made with the budget note and no tool listing
+        last = llm.calls[-1]["messages"]
+        combined = " ".join(m["content"] for m in last)
+        assert "tool budget" in combined
+        assert "To call a tool" not in combined  # tool listing withdrawn
+
+    async def test_budget_is_configurable(self, tools):
+        llm = FakeLLM([tool_json("echo", text="x")] * 3 + [respond_json("stopped")])
+        graph = build_graph(
+            llm=llm, tools=tools, checkpointer=InMemorySaver(), max_tool_rounds=3
+        )
+        result = await run_turn(graph, session_id="s1", user_text="go")
+        assert result.interrupt is None
+        assert len(llm.calls) == 3 + 1  # 3 tool rounds, then the summary
+
+    async def test_summary_falling_over_still_stops_cleanly(self, tools):
+        # if even the summary call cannot produce a valid decision, the turn
+        # ends with a plain message rather than looping or raising
+        llm = FakeLLM([tool_json("echo", text="x")] * MAX_TOOL_ROUNDS + ["garbage"] * 4)
+        graph = make_graph(llm, tools)
+        result = await run_turn(graph, session_id="s1", user_text="go")
+        assert result.interrupt is None
+        assert "tool call" in result.reply.lower()
 
     async def test_handler_exception_surfaces_as_tool_error(self, tools):
         async def boom(args, ctx):

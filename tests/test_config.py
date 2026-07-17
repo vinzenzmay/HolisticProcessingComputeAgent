@@ -33,6 +33,8 @@ class TestDefaults:
         assert s.llm.request_timeout_s == 120
         # thinking is slow and not generally better: opt in, per backend
         assert s.llm.enable_thinking is False
+        # each create+run (or run_bash) is one step; a real check needs several
+        assert s.llm.max_tool_rounds == 16
 
     def test_cluster_defaults(self):
         s = Settings()

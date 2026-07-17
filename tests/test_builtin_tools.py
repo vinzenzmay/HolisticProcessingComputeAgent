@@ -164,6 +164,7 @@ class TestRegistryShape:
         assert set(tools.names()) == {
             "create_script",
             "read_file",
+            "run_bash",
             "run_script",
             "start_script",
             "list_paths",
@@ -297,3 +298,73 @@ class TestRunScript:
     async def test_unknown_key_is_a_useful_error(self, tools, ctx):
         with pytest.raises(Exception):
             await call(tools, "run_script", ctx, registry_key="nope")
+
+
+class TestRunBash:
+    """run_bash writes, syntax-checks and runs a one-shot script in a single
+    call — the look-around workhorse, one round instead of create+run's two."""
+
+    async def test_writes_and_runs_in_one_call(self, tools, ctx):
+        result = await call(
+            tools, "run_bash", ctx,
+            content_lines=["echo hello", "echo world"],
+        )
+        assert "hello" in result and "world" in result
+        assert "exit 0" in result
+        # exactly one process ran; no separate create step
+        assert len(ctx.runner.list()) == 1
+
+    async def test_a_find_search_comes_back(self, tools, ctx, tmp_path):
+        planted = tmp_path / "refs" / "GRCh38.fa"
+        planted.parent.mkdir(parents=True)
+        planted.write_text(">chr1\n")
+        result = await call(
+            tools, "run_bash", ctx,
+            content_lines=[f"find {tmp_path} -iname '*GRCh38*' 2>/dev/null"],
+        )
+        assert str(planted) in result
+
+    async def test_syntax_error_is_not_run(self, tools, ctx):
+        before = len(ctx.runner.list())
+        result = await call(
+            tools, "run_bash", ctx,
+            content_lines=["if [ 1 -eq 1 ]; then", "echo unclosed"],
+        )
+        assert "NOT run" in result and "syntax" in result.lower()
+        assert len(ctx.runner.list()) == before  # nothing executed
+
+    async def test_failure_returns_stderr_and_says_to_fix(self, tools, ctx):
+        result = await call(
+            tools, "run_bash", ctx,
+            content_lines=["echo oops >&2", "exit 2"],
+        )
+        assert "FAILED, exit 2" in result
+        assert "oops" in result
+        assert "run_bash again" in result
+
+    async def test_timeout_kills_and_explains(self, tools, ctx):
+        result = await call(
+            tools, "run_bash", ctx, content_lines=["sleep 30"], timeout_s=1
+        )
+        assert "TIMED OUT" in result
+
+    async def test_long_output_is_bounded(self, tools, ctx):
+        result = await call(
+            tools, "run_bash", ctx, content_lines=["seq 1 500"]
+        )
+        assert len(result) < 6000
+        assert "500" in result  # the tail — what a search prints last
+        assert "omitted" in result
+
+    async def test_shebang_only_is_rejected(self, tools, ctx):
+        result = await call(
+            tools, "run_bash", ctx, content_lines=["#!/bin/bash echo hi"]
+        )
+        assert "NOT run" in result
+
+    async def test_throwaway_scripts_are_not_registered(self, tools, ctx):
+        await call(tools, "run_bash", ctx, content_lines=["echo x"])
+        await call(tools, "run_bash", ctx, content_lines=["echo y"])
+        # no bash_* keys clutter the registry the model reasons over
+        assert not any(k.startswith("bash_") for k in ctx.registry.list())
+        assert ctx.runner.list()[0].state == "finished"

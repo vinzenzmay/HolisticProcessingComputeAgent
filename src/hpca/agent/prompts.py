@@ -35,15 +35,28 @@ PATH_WORKFLOW_GUIDANCE = (
 # system" looked impossible and it narrated instead of acting.
 DISCOVERY_GUIDANCE = (
     "You can look around this system, and you should rather than guess or ask. "
-    "To find a file, learn whether a program is installed, or see what "
-    "environments exist: write a small bash script with create_script and run "
-    "it with run_script, which waits and gives you its output. Useful lines: "
+    "Use run_bash for a one-shot check — it writes, runs and returns the "
+    "output of a small bash script in one step (create_script + run_script is "
+    "for scripts worth keeping, e.g. submitted to Slurm). Useful lines: "
     "`find <dirs> -maxdepth <n> -iname '<pattern>' 2>/dev/null | head -20` to "
-    "locate files; `command -v samtools` and `samtools --version` to check a "
-    "program; `conda env list`, `module avail <name> 2>&1` to find one that is "
-    "not on PATH. Keep searches bounded so they finish in seconds: start from "
-    "likely roots rather than /, cap the depth, pipe through head. Then "
-    "register_path the paths it printed and use them by key."
+    "locate files; `command -v samtools` to check a program; `conda env list`, "
+    "`module avail <name> 2>&1` to find one that is not on PATH. Keep searches "
+    "bounded so they finish in seconds: start from likely roots rather than /, "
+    "cap the depth, pipe through head. Then register_path the paths it printed "
+    "and use them by key."
+)
+
+# The single most common way the agent burns its tool budget: it cannot run a
+# conda tool and thrashes on activation. `source .../envs/<env>/bin/activate`
+# does not exist (only the base install has activate). Give it the idiom.
+ENVIRONMENT_TOOL_GUIDANCE = (
+    "Most bioinformatics tools here live in conda environments, not on PATH. "
+    "To run one, either use `conda run -n <env> <tool> <args>` (works inside a "
+    "script without activating anything), or call the tool by its full binary "
+    "path `<conda-root>/envs/<env>/bin/<tool>` — find that path with a "
+    "run_bash search first. Do NOT `source .../envs/<env>/bin/activate`: that "
+    "file does not exist and wastes a step. `conda env list` shows the "
+    "environments and their roots."
 )
 
 
@@ -79,6 +92,7 @@ def orchestrator_system_prompt(
         RESPOND_VS_TOOL_GUIDANCE,
         PATH_WORKFLOW_GUIDANCE,
         DISCOVERY_GUIDANCE,
+        ENVIRONMENT_TOOL_GUIDANCE,
         GROUNDED_ANSWERING_GUIDANCE,
     ]
     if skills:
