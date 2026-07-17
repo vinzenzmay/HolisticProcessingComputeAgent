@@ -71,7 +71,12 @@ class TopBar(Static):
         self.update(self.render_text())
 
     def render_text(self) -> str:
-        return f" HPCA │ profile: {self._profile} │ model: {self._model} │ (s) settings"
+        from hpca import __version__
+
+        return (
+            f" HPCA v{__version__} │ profile: {self._profile} │ "
+            f"model: {self._model} │ (s) settings"
+        )
 
 
 class ColumnPanel(Vertical):

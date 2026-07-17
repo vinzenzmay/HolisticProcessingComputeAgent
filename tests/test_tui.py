@@ -34,6 +34,14 @@ async def test_top_bar_shows_model_from_settings(hpca_home):
         assert "Qwen/Qwen3.6-35B-A3B-FP8" in top.render_text()
 
 
+async def test_top_bar_shows_version(hpca_home):
+    from hpca import __version__
+
+    app = HpcaApp()
+    async with app.run_test(size=(120, 40)):
+        assert f"v{__version__}" in app.query_one(TopBar).render_text()
+
+
 async def test_footer_present(hpca_home):
     app = HpcaApp()
     async with app.run_test(size=(120, 40)):
