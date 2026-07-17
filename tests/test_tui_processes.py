@@ -3,10 +3,10 @@
 import json
 
 import pytest
-from textual.widgets import Input, ListView
+from textual.widgets import ListView
 
 from hpca.llm import ChatResponse
-from hpca.tui.app import HpcaApp
+from hpca.tui.app import ChatInput, HpcaApp
 from hpca.tui.confirm_screen import ConfirmScreen
 from hpca.tui.inspect_screen import InspectScreen
 
@@ -35,9 +35,9 @@ def hpca_home(monkeypatch, tmp_path):
 async def start_session_with_process(app, pilot, argv, name):
     """Open a session via chat, then start a tracked process in its runner."""
     await app.start_new_session()
-    chat_input = app.query_one("#chat-input", Input)
+    chat_input = app.query_one("#chat-input", ChatInput)
     chat_input.focus()
-    chat_input.value = "hello"
+    chat_input.text = "hello"
     await pilot.press("enter")
     await app.workers.wait_for_complete()
     record = await app._tool_ctx.runner.start(argv, name=name)
@@ -72,7 +72,7 @@ class TestProcessList:
 
 
 class TestInspect:
-    async def test_i_opens_inspect_with_logs(self, hpca_home):
+    async def test_enter_opens_inspect_with_logs(self, hpca_home):
         app = HpcaApp(llm=FakeLLM([respond_json()]))
         async with app.run_test(size=(120, 40)) as pilot:
             record = await start_session_with_process(
@@ -83,7 +83,7 @@ class TestInspect:
             processes_list = app.query_one("#processes-list", ListView)
             processes_list.focus()
             processes_list.index = 0
-            await pilot.press("i")
+            await pilot.press("enter")
             await pilot.pause()
             assert isinstance(app.screen, InspectScreen)
             body = app.screen.body_text()

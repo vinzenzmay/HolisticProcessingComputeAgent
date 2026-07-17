@@ -4,11 +4,11 @@ import json
 
 import pytest
 from pydantic import BaseModel, Field
-from textual.widgets import Input, ListView
+from textual.widgets import ListView
 
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.llm import ChatResponse
-from hpca.tui.app import HpcaApp
+from hpca.tui.app import ChatInput, HpcaApp
 from hpca.tui.approval_screen import ApprovalScreen
 
 
@@ -66,9 +66,9 @@ def chat_texts(app):
 async def submit_chat(app, pilot, text):
     if app.active_session is None:
         await app.start_new_session()  # the chat entry only exists in a session
-    chat_input = app.query_one("#chat-input", Input)
+    chat_input = app.query_one("#chat-input", ChatInput)
     chat_input.focus()
-    chat_input.value = text
+    chat_input.text = text
     await pilot.press("enter")
     await app.workers.wait_for_complete()
     await pilot.pause()
@@ -242,8 +242,8 @@ class TestChatLogBrowsing:
             await submit_chat(app, pilot, "hello agent")
             chat_list = app.query_one("#chat-list", ListView)
             assert len(chat_list) == 2
-            chat_input = app.query_one("#chat-input", Input)
-            chat_input.value = "half typed"
+            chat_input = app.query_one("#chat-input", ChatInput)
+            chat_input.text = "half typed"
             app.focus_chat_input()
             await pilot.pause()
 
@@ -257,8 +257,8 @@ class TestChatLogBrowsing:
             assert chat_list.index == 1
             await pilot.press("down")  # past the newest: back to the entry
             assert app.focused is chat_input
-            assert chat_input.value == "half typed"
-            assert chat_input.cursor_position == len("half typed")
+            assert chat_input.text == "half typed"
+            assert chat_input.cursor_location == (0, len("half typed"))
 
     async def test_up_in_an_empty_log_stays_in_the_entry(self, hpca_home):
         app = HpcaApp()

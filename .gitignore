@@ -17,6 +17,7 @@ uv.lock
 
 # App runtime data (never commit user data)
 .HolisticProcessingComputeAgent/
+hpca-logs/
 # pixi environments
 .pixi/*
 !.pixi/config.toml

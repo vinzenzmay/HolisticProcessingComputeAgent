@@ -47,13 +47,17 @@ def tools():
 
 
 class FakeLLM:
-    def __init__(self, outputs):
+    def __init__(self, outputs, reasoning=None):
         self._outputs = list(outputs)
+        self._reasoning = list(reasoning or [])
         self.calls: list[dict] = []
 
     async def chat(self, messages, *, json_schema=None, **kwargs):
         self.calls.append({"messages": list(messages), "json_schema": json_schema})
-        return ChatResponse(content=self._outputs.pop(0))
+        return ChatResponse(
+            content=self._outputs.pop(0),
+            reasoning=self._reasoning.pop(0) if self._reasoning else None,
+        )
 
     async def supports_constrained_decoding(self):
         return True
@@ -247,7 +251,13 @@ from tests.live_backend import LIVE_MODEL, LIVE_URL, integration  # noqa: E402
 class TestGraphLive:
     async def test_full_tool_loop_with_live_model(self, tools):
         llm = LLMClient(
-            LLMSettings(base_url=LIVE_URL, model=LIVE_MODEL, request_timeout_s=120)
+            LLMSettings(
+                base_url=LIVE_URL,
+                model=LIVE_MODEL,
+                request_timeout_s=120,
+                # these test routing, not reasoning; thinking is ~15x slower
+                enable_thinking=False,
+            )
         )
         graph = make_graph(llm, tools)
         result = await run_turn(
@@ -266,7 +276,13 @@ class TestGraphLive:
 
     async def test_live_destructive_gate_roundtrip(self, tools):
         llm = LLMClient(
-            LLMSettings(base_url=LIVE_URL, model=LIVE_MODEL, request_timeout_s=120)
+            LLMSettings(
+                base_url=LIVE_URL,
+                model=LIVE_MODEL,
+                request_timeout_s=120,
+                # these test routing, not reasoning; thinking is ~15x slower
+                enable_thinking=False,
+            )
         )
         graph = make_graph(llm, tools)
         first = await run_turn(
@@ -282,3 +298,77 @@ class TestGraphLive:
         assert result.interrupt is None
         assert any("deleted old_logs" in m["content"] for m in result.messages)
         await llm.close()
+
+
+class TestThinkingState:
+    async def test_reasoning_is_kept_out_of_the_messages(self, tools):
+        llm = FakeLLM([respond_json("42")], reasoning=["Let me think about this."])
+        graph = make_graph(llm, tools)
+        result = await run_turn(graph, session_id="t1", user_text="how many?")
+        assert all(
+            "Let me think" not in m["content"] for m in result.messages
+        ), "reasoning must never enter the conversation fed back to the model"
+        assert result.thinking == [{"after": 1, "reasoning": "Let me think about this."}]
+
+    async def test_reasoning_anchors_to_the_message_it_produced(self, tools):
+        llm = FakeLLM(
+            [tool_json("echo", text="hi"), respond_json("done")],
+            reasoning=["I should echo first.", "Now I can answer."],
+        )
+        graph = make_graph(llm, tools)
+        result = await run_turn(graph, session_id="t2", user_text="echo hi")
+        # 0: user, 1: tool result (from the first decision), 2: the answer
+        assert result.thinking == [
+            {"after": 1, "reasoning": "I should echo first."},
+            {"after": 2, "reasoning": "Now I can answer."},
+        ]
+        assert result.messages[1]["content"].startswith("[tool result]")
+        assert result.messages[2]["role"] == "assistant"
+
+    async def test_no_reasoning_no_entries(self, tools):
+        llm = FakeLLM([respond_json("hi")])
+        graph = make_graph(llm, tools)
+        result = await run_turn(graph, session_id="t3", user_text="hello")
+        assert result.thinking == []
+
+    async def test_blank_reasoning_ignored(self, tools):
+        llm = FakeLLM([respond_json("hi")], reasoning=["   \n "])
+        graph = make_graph(llm, tools)
+        result = await run_turn(graph, session_id="t4", user_text="hello")
+        assert result.thinking == []
+
+    async def test_thinking_accumulates_across_turns(self, tools):
+        llm = FakeLLM([respond_json("a"), respond_json("b")], reasoning=["one", "two"])
+        graph = make_graph(llm, tools)
+        await run_turn(graph, session_id="t5", user_text="first")
+        result = await run_turn(graph, session_id="t5", user_text="second")
+        assert result.thinking == [
+            {"after": 1, "reasoning": "one"},
+            {"after": 3, "reasoning": "two"},
+        ]
+
+
+class TestNewThisTurn:
+    async def test_first_new_marks_the_turns_own_messages(self, tools):
+        llm = FakeLLM([respond_json("a"), respond_json("b")])
+        graph = make_graph(llm, tools)
+        first = await run_turn(graph, session_id="n1", user_text="one")
+        assert first.first_new == 0  # the whole session is new
+        second = await run_turn(graph, session_id="n1", user_text="two")
+        assert second.first_new == 2
+        assert [m["content"] for m in second.messages[second.first_new:]] == ["two", "b"]
+
+    async def test_interrupt_and_resume_split_the_turn_without_overlap(self, tools):
+        llm = FakeLLM([tool_json("delete", target="x"), respond_json("gone")])
+        graph = make_graph(llm, tools)
+        first = await run_turn(graph, session_id="n2", user_text="delete x")
+        assert first.interrupt is not None
+        assert first.first_new == 0
+        resumed = await run_turn(
+            graph, session_id="n2", resume=Command(resume={"approved": True})
+        )
+        # the resume logs only what it added: the tool result and the answer
+        new = [m["content"] for m in resumed.messages[resumed.first_new:]]
+        assert len(new) == 2
+        assert new[0].startswith("[tool result] delete")
+        assert new[1] == "gone"

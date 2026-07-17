@@ -20,6 +20,9 @@ from hpca.agent.tools import Tool, ToolRegistry
 from hpca.llm import Message
 
 DEFAULT_MAX_RETRIES = 3
+# Caps a runaway generation. Reasoning models spend this budget on thinking
+# before the JSON decision, so it is roomier than a decision alone needs.
+MAX_DECISION_TOKENS = 4096
 
 
 class DecisionError(Exception):
@@ -29,12 +32,14 @@ class DecisionError(Exception):
 @dataclass
 class DirectResponse:
     text: str
+    reasoning: str = ""  # the model's thinking, shown in the TUI's thinking box
 
 
 @dataclass
 class ToolCall:
     tool: Tool
     arguments: BaseModel
+    reasoning: str = ""
 
     async def execute(self, ctx: Any) -> str:
         return await self.tool.handler(self.arguments, ctx)
@@ -138,13 +143,18 @@ def _parse(raw: str, tools: ToolRegistry) -> Decision:
     )
 
 
+def _with_reasoning(decision: Decision, reasoning: str) -> Decision:
+    decision.reasoning = reasoning
+    return decision
+
+
 async def decide(
     llm: Any,
     messages: list[Message],
     tools: ToolRegistry,
     *,
     max_retries: int = DEFAULT_MAX_RETRIES,
-    max_tokens: int | None = 2048,
+    max_tokens: int | None = MAX_DECISION_TOKENS,
 ) -> Decision:
     """Ask the model for a decision, validating and retrying with feedback."""
     constrained = await llm.supports_constrained_decoding()
@@ -167,7 +177,7 @@ async def decide(
         )
         raw = response.content
         try:
-            return _parse(raw, tools)
+            return _with_reasoning(_parse(raw, tools), response.reasoning or "")
         except ValueError as e:
             last_error = str(e)
             conversation = conversation + [

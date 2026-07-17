@@ -3,10 +3,11 @@
 Design notes for the small-model reality (§1):
 
 * The backend model may be a *reasoning* model (e.g. Qwen3.6). vLLM exposes
-  thinking tokens in a separate ``reasoning`` field; thinking is disabled by
-  default here (``enable_thinking=False`` via ``chat_template_kwargs``) so
-  short, tool-call-shaped completions don't burn the token budget on
-  chain-of-thought. Callers can opt back in per request.
+  thinking tokens in a separate ``reasoning`` field, which the TUI shows in
+  the collapsible thinking box. Whether to think at all is the
+  ``llm.enable_thinking`` setting — it buys better decisions for roughly 15x
+  the latency and 15x the completion tokens (measured on Qwen3.6-27B) — and
+  callers can override it per request.
 * Constrained decoding (``response_format`` with a JSON schema) makes tool
   calls syntactically valid *by construction*. Support is probed once against
   the backend when settings say ``auto``.
@@ -88,9 +89,11 @@ class LLMClient:
         schema_name: str,
         max_tokens: int | None,
         temperature: float | None,
-        enable_thinking: bool,
+        enable_thinking: bool | None,
         stream: bool,
     ) -> dict[str, Any]:
+        if enable_thinking is None:
+            enable_thinking = self._settings.enable_thinking
         payload: dict[str, Any] = {
             "model": self._settings.model,
             "messages": messages,
@@ -117,7 +120,7 @@ class LLMClient:
         schema_name: str = "output",
         max_tokens: int | None = None,
         temperature: float | None = None,
-        enable_thinking: bool = False,
+        enable_thinking: bool | None = None,
     ) -> ChatResponse:
         payload = self._payload(
             messages,
@@ -159,7 +162,7 @@ class LLMClient:
         *,
         max_tokens: int | None = None,
         temperature: float | None = None,
-        enable_thinking: bool = False,
+        enable_thinking: bool | None = None,
     ) -> AsyncIterator[StreamDelta]:
         payload = self._payload(
             messages,
@@ -228,6 +231,9 @@ class LLMClient:
                     json_schema=PROBE_SCHEMA,
                     schema_name="probe",
                     max_tokens=20,
+                    # Never think here: reasoning would blow the 20-token cap,
+                    # and a truncation error reads as "unsupported".
+                    enable_thinking=False,
                 )
                 self._constrained_supported = True
             except LLMError:

@@ -34,6 +34,9 @@ packages = ["src/hpca"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "real_log_default: test asserts the shipped session-log directory default",
+]
 
 [tool.pixi.workspace]
 channels = ["conda-forge"]

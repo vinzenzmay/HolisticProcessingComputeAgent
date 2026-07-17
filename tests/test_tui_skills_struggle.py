@@ -3,13 +3,13 @@
 import json
 
 import pytest
-from textual.widgets import Input
+from textual.widgets import ListView
 
 from hpca.agent.struggle import STRUGGLE_KIND
 from hpca.llm import ChatResponse
 from hpca.profiles import Profile
 from hpca.skills import skills_dir
-from hpca.tui.app import HpcaApp
+from hpca.tui.app import ChatInput, HpcaApp
 from hpca.tui.memory_screens import MemoryProposalScreen
 
 
@@ -66,9 +66,9 @@ async def submit(app, pilot, text, *, expect_modal=False):
     """
     if app.active_session is None:
         await app.start_new_session()
-    chat_input = app.query_one("#chat-input", Input)
+    chat_input = app.query_one("#chat-input", ChatInput)
     chat_input.focus()
-    chat_input.value = text
+    chat_input.text = text
     await pilot.press("enter")
     if expect_modal:
         for _ in range(20):

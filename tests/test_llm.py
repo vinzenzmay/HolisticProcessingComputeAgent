@@ -44,7 +44,7 @@ def completion_body(content="hi", reasoning=None, finish_reason="stop"):
 
 
 class TestChat:
-    async def test_sends_model_messages_and_disables_thinking(self):
+    async def test_sends_model_and_messages(self):
         seen = {}
 
         def handler(request):
@@ -55,7 +55,7 @@ class TestChat:
         await client.chat([{"role": "user", "content": "hi"}])
         assert seen["model"] == "test-model"
         assert seen["messages"] == [{"role": "user", "content": "hi"}]
-        assert seen["chat_template_kwargs"] == {"enable_thinking": False}
+
 
     async def test_parses_response(self):
         def handler(request):
@@ -161,6 +161,45 @@ class TestChat:
             await client.chat([{"role": "user", "content": "q"}])
 
 
+class TestThinking:
+    def payload_of(self, seen, **settings_kwargs):
+        def handler(request):
+            seen.update(json.loads(request.content))
+            return httpx.Response(200, json=completion_body())
+
+        return make_client(handler, **settings_kwargs)
+
+    async def test_setting_drives_the_default(self):
+        for enabled in (True, False):
+            seen = {}
+            client = self.payload_of(seen, enable_thinking=enabled)
+            await client.chat([{"role": "user", "content": "hi"}])
+            assert seen["chat_template_kwargs"] == {"enable_thinking": enabled}
+
+    async def test_per_call_override_wins(self):
+        seen = {}
+        client = self.payload_of(seen, enable_thinking=True)
+        await client.chat([{"role": "user", "content": "hi"}], enable_thinking=False)
+        assert seen["chat_template_kwargs"] == {"enable_thinking": False}
+
+    async def test_streaming_follows_the_setting(self):
+        seen = {}
+
+        def handler(request):
+            seen.update(json.loads(request.content))
+            return httpx.Response(200, text="data: [DONE]\n")
+
+        client = make_client(handler, enable_thinking=True)
+        async for _ in client.chat_stream([{"role": "user", "content": "hi"}]):
+            pass
+        assert seen["chat_template_kwargs"] == {"enable_thinking": True}
+
+    async def test_capability_probe_never_thinks(self):
+        seen = {}
+        client = self.payload_of(seen, enable_thinking=True)
+        await client.supports_constrained_decoding()
+        assert seen["chat_template_kwargs"] == {"enable_thinking": False}
+
 class TestChatStream:
     async def test_yields_content_deltas(self):
         chunks = [
@@ -251,7 +290,13 @@ from tests.live_backend import LIVE_MODEL, LIVE_URL, integration  # noqa: E402
 
 @pytest.fixture
 def live_client():
-    settings = LLMSettings(base_url=LIVE_URL, model=LIVE_MODEL, request_timeout_s=120)
+    settings = LLMSettings(
+            base_url=LIVE_URL,
+            model=LIVE_MODEL,
+            request_timeout_s=120,
+            # these test routing, not reasoning; thinking is ~15x slower
+            enable_thinking=False,
+        )
     return LLMClient(settings)
 
 
@@ -294,3 +339,70 @@ class TestLiveBackend:
         data = json.loads(resp.content)
         assert isinstance(data["name"], str)
         assert isinstance(data["age"], int)
+
+
+@integration
+class TestLiveThinking:
+    """Reasoning is a separate channel that survives constrained decoding.
+
+    Probed on Qwen3.6-27B/vLLM: guided decoding applies to the content after
+    the reasoning block, so a thinking model still emits schema-valid JSON.
+    The cost is the reason `enable_thinking` is a setting: ~17s and ~340
+    completion tokens per decision, against ~1s and ~20 without.
+    """
+
+    QUESTION = [
+        {
+            "role": "user",
+            "content": "A cohort has 4 BAMs of 8 GB each. Disk for a 2x copy?",
+        }
+    ]
+
+    def client(self, **overrides):
+        return LLMClient(
+            LLMSettings(
+                base_url=LIVE_URL, model=LIVE_MODEL, request_timeout_s=180, **overrides
+            )
+        )
+
+    async def test_thinking_off_by_setting_returns_no_reasoning(self):
+        async with self.client(enable_thinking=False) as llm:
+            resp = await llm.chat(self.QUESTION, max_tokens=2000, temperature=0)
+            assert not resp.reasoning
+
+    async def test_thinking_on_by_setting_returns_reasoning(self):
+        async with self.client(enable_thinking=True) as llm:
+            resp = await llm.chat(self.QUESTION, max_tokens=2000, temperature=0)
+            assert resp.reasoning
+            assert resp.content  # the answer stays in the content channel
+
+    async def test_per_call_override_beats_the_setting(self):
+        async with self.client(enable_thinking=True) as llm:
+            resp = await llm.chat(
+                self.QUESTION, max_tokens=2000, temperature=0, enable_thinking=False
+            )
+            assert not resp.reasoning
+
+    async def test_reasoning_and_json_schema_coexist(self):
+        schema = {
+            "type": "object",
+            "properties": {"action": {"const": "respond"},
+                           "response": {"type": "string"}},
+            "required": ["action", "response"],
+            "additionalProperties": False,
+        }
+        async with self.client(enable_thinking=True) as llm:
+            resp = await llm.chat(
+                self.QUESTION,
+                json_schema=schema,
+                schema_name="decision",
+                max_tokens=4096,
+                temperature=0,
+            )
+            assert resp.reasoning
+            assert json.loads(resp.content)["action"] == "respond"
+
+    async def test_capability_probe_never_thinks(self):
+        # thinking would blow the probe's 20-token cap and read as "unsupported"
+        async with self.client(enable_thinking=True) as llm:
+            assert await llm.supports_constrained_decoding() is True

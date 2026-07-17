@@ -111,7 +111,13 @@ from tests.live_backend import LIVE_MODEL, LIVE_URL, integration  # noqa: E402
 class TestExplainLive:
     async def test_oom_explanation_from_live_model(self):
         llm = LLMClient(
-            LLMSettings(base_url=LIVE_URL, model=LIVE_MODEL, request_timeout_s=120)
+            LLMSettings(
+                base_url=LIVE_URL,
+                model=LIVE_MODEL,
+                request_timeout_s=120,
+                # these test routing, not reasoning; thinking is ~15x slower
+                enable_thinking=False,
+            )
         )
         result = await explain_failure(llm, oom_report())
         assert result.why

@@ -222,7 +222,13 @@ class TestDecideLive:
     @pytest.fixture
     def llm(self):
         return LLMClient(
-            LLMSettings(base_url=LIVE_URL, model=LIVE_MODEL, request_timeout_s=120)
+            LLMSettings(
+                base_url=LIVE_URL,
+                model=LIVE_MODEL,
+                request_timeout_s=120,
+                # these test routing, not reasoning; thinking is ~15x slower
+                enable_thinking=False,
+            )
         )
 
     async def test_picks_tool_call(self, tools, llm):

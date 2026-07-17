@@ -3,11 +3,11 @@
 import json
 
 import pytest
-from textual.widgets import Input, ListView
+from textual.widgets import ListView
 
 from hpca.llm import ChatResponse
 from hpca.slurm import SlurmClient
-from hpca.tui.app import HpcaApp
+from hpca.tui.app import ChatInput, HpcaApp
 from hpca.tui.confirm_screen import ConfirmScreen
 from hpca.tui.inspect_screen import InspectScreen
 
@@ -45,9 +45,9 @@ def hpca_home(monkeypatch, tmp_path):
 
 async def open_session_and_add_job(app, pilot, job_id="27744534"):
     await app.start_new_session()
-    chat_input = app.query_one("#chat-input", Input)
+    chat_input = app.query_one("#chat-input", ChatInput)
     chat_input.focus()
-    chat_input.value = "hello"
+    chat_input.text = "hello"
     await pilot.press("enter")
     await app.workers.wait_for_complete()
     app.job_store.add(
@@ -134,7 +134,7 @@ class TestCancelJob:
 
 
 class TestInspectJob:
-    async def test_i_shows_job_details(self, hpca_home):
+    async def test_enter_shows_job_details(self, hpca_home):
         app = HpcaApp(
             llm=FakeLLM([respond_json()]), slurm=SlurmClient(run=FakeRun([]))
         )
@@ -143,7 +143,7 @@ class TestInspectJob:
             processes_list = app.query_one("#processes-list", ListView)
             processes_list.focus()
             processes_list.index = 0
-            await pilot.press("i")
+            await pilot.press("enter")
             await pilot.pause()
             assert isinstance(app.screen, InspectScreen)
             body = app.screen.body_text()

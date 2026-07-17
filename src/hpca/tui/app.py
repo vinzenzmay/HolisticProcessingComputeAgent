@@ -13,7 +13,8 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.content import Content
-from textual.widgets import Footer, Input, Label, ListItem, ListView, Static
+from textual.message import Message
+from textual.widgets import Footer, Label, ListItem, ListView, Static, TextArea
 
 from hpca.agent.builtin_tools import default_tool_registry
 from hpca.agent.context import ToolContext
@@ -38,7 +39,9 @@ from hpca.agent.struggle import (
 from hpca.editor import resolve_editor
 from hpca.embeddings import EmbeddingClient
 from hpca.llm import LLMClient
+from hpca.logs import LoggedLLM, SessionLog, open_log
 from hpca.rag import RagStore
+from hpca.transcript import THINKING, Entry, build_entries
 from hpca.profiles import Profile
 from hpca.registry import PathRegistry
 from hpca.runner import ProcessRecord, ProcessRunner
@@ -58,6 +61,8 @@ from hpca.tui.switch_llm import SwitchLLMScreen
 COLUMN_IDS = ("sessions", "chat", "processes")
 SESSION_TITLE_MAX = 40
 UNTITLED_SESSION = "untitled"  # placeholder until the first message names it
+CHAT_TITLES = {"user": "you", "assistant": "agent", "error": "error"}
+LOG_KINDS = {"user": "user", "assistant": "agent", "error": "error"}
 
 
 class TopBar(Static):
@@ -94,33 +99,89 @@ class ColumnPanel(Vertical):
         yield ListView(id=f"{self.id}-list")
 
 
-class ChatInput(Input):
-    """Chat entry. Arrow keys move the text cursor until it hits an edge, then
-    hand focus on: ← at the start leaves for the sessions column, → at the end
-    for the processes column, ↑ leaves to browse the message log. Text typed so
-    far is kept, so the user can step away mid-sentence and come back."""
+class ChatInput(TextArea):
+    """Chat entry: a wrapping, multi-line field that grows with the draft, so
+    a long message is readable while it is being written.
 
-    BINDINGS = [Binding("up", "browse_messages", show=False)]
+    Enter sends; shift+enter, alt+enter or ctrl+j start a new line (terminals
+    that cannot report shift+enter still have the other two). Arrow keys move
+    the text cursor and only hand focus on at the edges of the draft: ← at the
+    very start leaves for the sessions column, → at the very end for the
+    processes column, ↑ on the first line leaves to browse the message log.
+    The draft is kept, so the user can step away mid-sentence and come back.
+    """
+
+    NEWLINE_KEYS = ("shift+enter", "alt+enter", "ctrl+j")
+
+    class Submitted(Message):
+        def __init__(self, chat_input: "ChatInput", text: str) -> None:
+            super().__init__()
+            self.chat_input = chat_input
+            self.text = text
+
+        @property
+        def control(self) -> "ChatInput":
+            return self.chat_input
 
     def __init__(self, **kwargs) -> None:
-        # A draft survives leaving the column, so focus must not select it
-        # away: the next keystroke would replace it.
-        super().__init__(select_on_focus=False, **kwargs)
+        super().__init__(soft_wrap=True, **kwargs)
+
+    async def _on_key(self, event) -> None:
+        if event.key == "enter":
+            event.stop()
+            event.prevent_default()
+            self.post_message(self.Submitted(self, self.text))
+        elif event.key in self.NEWLINE_KEYS:
+            event.stop()
+            event.prevent_default()
+            self.insert("\n")
+        else:
+            await super()._on_key(event)
 
     def action_cursor_left(self, select: bool = False) -> None:
-        if not select and self.selection.is_empty and self.cursor_position == 0:
+        if not select and self.selection.is_empty and self.cursor_at_start_of_text:
             self.app.action_focus_column(-1)
         else:
             super().action_cursor_left(select)
 
     def action_cursor_right(self, select: bool = False) -> None:
-        if not select and self.selection.is_empty and self.cursor_at_end:
+        if not select and self.selection.is_empty and self.cursor_at_end_of_text:
             self.app.action_focus_column(1)
         else:
             super().action_cursor_right(select)
 
-    def action_browse_messages(self) -> None:
-        self.app.browse_chat_messages()
+    def action_cursor_up(self, select: bool = False) -> None:
+        if not select and self.cursor_at_first_line:
+            self.app.browse_chat_messages()
+        else:
+            super().action_cursor_up(select)
+
+
+class ThinkingBox(Static):
+    """One turn's working — the model's reasoning and the tool steps it led
+    to — folded into a single box. Collapsed by default; enter toggles it."""
+
+    def __init__(self, entry: Entry) -> None:
+        super().__init__(classes="chat-thinking")
+        self.border_title = "thinking"
+        self._entry = entry
+        self._collapsed = True
+        self._render_entry()
+
+    @property
+    def collapsed(self) -> bool:
+        return self._collapsed
+
+    def toggle(self) -> None:
+        self._collapsed = not self._collapsed
+        self._render_entry()
+
+    def _render_entry(self) -> None:
+        marker = "▶" if self._collapsed else "▼"
+        hint = "enter to expand" if self._collapsed else "enter to collapse"
+        header = f"{marker} {self._entry.summary()}  ({hint})"
+        body = "" if self._collapsed else "\n\n" + self._entry.text
+        self.update(Content(header + body))
 
 
 class ChatList(ListView):
@@ -152,9 +213,14 @@ class ProcessesList(ListView):
     """Right-column list; its hotkeys appear in the footer when focused."""
 
     BINDINGS = [
-        Binding("i", "inspect_process", "inspect"),
+        Binding("enter", "inspect_process", "inspect"),
         Binding("k", "kill_process", "kill"),
     ]
+
+    def check_action(self, action: str, parameters) -> bool | None:
+        if action in ("inspect_process", "kill_process"):
+            return self.highlighted_child is not None
+        return True
 
     def action_inspect_process(self) -> None:
         self.app.inspect_selected_process()
@@ -204,21 +270,38 @@ class HpcaApp(App):
     #chat-list {
         height: 1fr;
     }
+    /* Grows with the draft, then scrolls: a long message stays readable
+       without ever crowding out the conversation above it. */
+    #chat-input {
+        height: auto;
+        max-height: 10;
+        border: round $panel;
+    }
+    #chat-input:focus {
+        border: round $accent;
+    }
     #processes {
         width: 1fr;
         min-width: 24;
     }
+    /* Each entry is a titled box; who is speaking is a colour, not a prefix. */
+    #chat-list > ListItem {
+        background: transparent;
+    }
     .chat-user {
+        border: round $accent;
         color: $text;
-        text-style: bold;
     }
     .chat-assistant {
+        border: round $success;
         color: $text;
     }
-    .chat-tool {
+    .chat-thinking {
+        border: round $panel-lighten-2;
         color: $text-muted;
     }
     .chat-error {
+        border: round $error;
         color: $error;
     }
     """
@@ -261,7 +344,8 @@ class HpcaApp(App):
                 add_skill_tools(self._tools)
         self.active_session: Session | None = None
         self._tool_ctx: ToolContext | None = None
-        self._chat_entries: list[tuple[str, str]] = []
+        self._chat_entries: list[Entry] = []
+        self._log: SessionLog | None = None
         self._conn = None
         self._saver_ctx = None
 
@@ -373,12 +457,12 @@ class HpcaApp(App):
 
     # ------------------------------------------------------------ chat/agent
 
-    @on(Input.Submitted, "#chat-input")
-    async def _on_chat_submitted(self, event: Input.Submitted) -> None:
-        text = event.value.strip()
+    @on(ChatInput.Submitted)
+    async def _on_chat_submitted(self, event: ChatInput.Submitted) -> None:
+        text = event.text.strip()
         if not text:
             return
-        event.input.value = ""
+        event.chat_input.text = ""
         if text.startswith("\\"):
             self._handle_slash_command(text)
             return
@@ -409,14 +493,35 @@ class HpcaApp(App):
             )
         except Exception as e:
             await self._append_chat("error", f"Agent error: {e}")
+            self._log_write("error", str(e))
             self.notify(str(e), severity="error")
             return
-        await self._set_chat_messages(result.messages)
+        self._log_turn(result)
+        await self._set_chat_messages(result.messages, result.thinking)
         await self.refresh_processes()
         if result.interrupt is not None:
             self.push_screen(ApprovalScreen(result.interrupt), self._on_approval)
             return
         await self.maybe_propose_struggle_note(result.messages)
+
+    def _log_turn(self, result) -> None:
+        """Write what this turn added: the message, its thinking, the answer.
+
+        Only the tail is logged, so re-reading a session never duplicates it.
+        """
+        if self._log is None:
+            return
+        for entry in build_entries(
+            result.messages, result.thinking, start=result.first_new
+        ):
+            kind = LOG_KINDS.get(entry.kind, entry.kind)
+            if entry.kind == THINKING:
+                kind = f"thinking ({entry.summary()})"
+            self._log.write(kind, entry.text)
+
+    def _log_write(self, kind: str, text: str) -> None:
+        if self._log is not None:
+            self._log.write(kind, text)
 
     def _on_approval(self, approved: bool | None) -> None:
         self._run_agent(resume=Command(resume={"approved": bool(approved)}))
@@ -582,7 +687,36 @@ class HpcaApp(App):
             embedder=self.embedder,
             skills=self.skills,
         )
-        self.query_one("#chat-input", Input).display = True
+        self.query_one("#chat-input", ChatInput).display = True
+        self._refresh_session_log()
+        if self._log is not None:
+            self._log.write(
+                "session opened",
+                f"{session.session_id} · profile {self.profile} · "
+                f"model {self.settings.llm.model}",
+            )
+
+    def _refresh_session_log(self) -> None:
+        """(Re)open the active session's transcript and re-wrap the client
+        tools call, so switching logging in the settings takes effect now."""
+        self._log = (
+            open_log(self.settings, self.active_session)
+            if self.active_session is not None
+            else None
+        )
+        if self._tool_ctx is not None:
+            self._tool_ctx.llm = self._subagent_llm()
+
+    def _subagent_llm(self) -> Any:
+        """The client tools use for their own model calls (§4.2), logged."""
+        if self._log is None or self._tool_ctx is None:
+            return self._llm
+        context = self._tool_ctx
+        return LoggedLLM(
+            self._llm,
+            self._log,
+            label=lambda: f"subagent:{context.current_tool or '?'}",
+        )
 
     async def start_new_session(self) -> None:
         """Open an empty session on the default backend and start typing in it.
@@ -618,8 +752,10 @@ class HpcaApp(App):
         snapshot = await self.graph.aget_state(
             {"configurable": {"thread_id": session.session_id}}
         )
-        messages = (snapshot.values or {}).get("messages", [])
-        await self._set_chat_messages(messages)
+        values = snapshot.values or {}
+        await self._set_chat_messages(
+            values.get("messages", []), values.get("thinking", [])
+        )
 
     @on(ListView.Selected, "#sessions-list")
     async def _on_session_selected(self, event: ListView.Selected) -> None:
@@ -770,37 +906,32 @@ class HpcaApp(App):
     # -------------------------------------------------------------- chat log
 
     def chat_log_texts(self) -> list[str]:
-        return [text for _, text in self._chat_entries]
+        return [entry.text for entry in self._chat_entries]
 
-    async def _set_chat_messages(self, messages: list[dict]) -> None:
-        entries: list[tuple[str, str]] = []
-        for message in messages:
-            role, content = message["role"], message["content"]
-            if role == "system":
-                continue
-            if role == "assistant":
-                entries.append(("assistant", content))
-            elif content.startswith(("[tool result]", "[tool error]")):
-                entries.append(("tool", content))
-            else:
-                entries.append(("user", content))
+    async def _set_chat_messages(
+        self, messages: list[dict], thinking: list[dict] | None = None
+    ) -> None:
         chat_list = self.query_one("#chat-list", ListView)
         await chat_list.clear()
         self._chat_entries = []
-        for kind, text in entries:
-            await self._append_chat(kind, text)
+        for entry in build_entries(messages, thinking or []):
+            self._add_chat_entry(entry)
 
     async def _append_chat(self, kind: str, text: str) -> None:
-        self._chat_entries.append((kind, text))
+        self._add_chat_entry(Entry(kind=kind, text=text))
+
+    def _add_chat_entry(self, entry: Entry) -> None:
+        self._chat_entries.append(entry)
         chat_list = self.query_one("#chat-list", ListView)
-        prefix = {"user": "you", "assistant": "agent", "tool": "tool", "error": "!"}[
-            kind
-        ]
-        item = ListItem(
-            Static(Content(f"{prefix} ▏{text}"), classes=f"chat-{kind}")
-        )
-        chat_list.append(item)
+        chat_list.append(ListItem(self._entry_widget(entry)))
         chat_list.scroll_end(animate=False)
+
+    def _entry_widget(self, entry: Entry) -> Static:
+        if entry.kind == THINKING:
+            return ThinkingBox(entry)
+        widget = Static(Content(entry.text), classes=f"chat-{entry.kind}")
+        widget.border_title = CHAT_TITLES.get(entry.kind, entry.kind)
+        return widget
 
     # ----------------------------------------------------------- focus model
 
@@ -842,11 +973,11 @@ class HpcaApp(App):
 
     def focus_chat_input(self) -> None:
         """Focus the chat entry with the cursor behind what was typed so far."""
-        chat_input = self.query_one("#chat-input", Input)
+        chat_input = self.query_one("#chat-input", ChatInput)
         if not chat_input.display:
             return  # no session: there is nothing to type into
         chat_input.focus()
-        chat_input.cursor_position = len(chat_input.value)
+        chat_input.move_cursor(chat_input.document.end)
 
     def browse_chat_messages(self) -> None:
         """Leave the entry for the message log, starting at the last message."""
@@ -863,8 +994,12 @@ class HpcaApp(App):
 
     @on(ListView.Selected, "#chat-list")
     def _on_chat_list_selected(self, event: ListView.Selected) -> None:
-        # Enter in the chat column moves to the input (message actions later)
-        self.focus_chat_input()
+        boxes = list(event.item.query(ThinkingBox))
+        if boxes:
+            boxes[0].toggle()
+        else:
+            # Enter on a message moves to the input (message actions later)
+            self.focus_chat_input()
 
     # ---------------------------------------------------------- llm backends
 
@@ -892,16 +1027,28 @@ class HpcaApp(App):
         """Make a configured backend the active one, now and on next start."""
         self.settings.activate_backend(backend)
         self.settings.save()
+        self._replace_llm()
+        self._refresh_top_bar()
+        self.notify(f"Switched to {backend.model}")
+
+    def _reload_llm(self) -> None:
+        """Rebuild the client so edited LLM settings apply to the next turn.
+
+        An injected client belongs to whoever passed it in (tests, embedding
+        hosts); only a client we built is ours to replace.
+        """
+        if self._owns_llm:
+            self._replace_llm()
+
+    def _replace_llm(self) -> None:
         old_llm, owned = self._llm, self._owns_llm
         self._llm = LLMClient(self.settings.llm)
         self._owns_llm = True
         self._rebuild_graph()
         if self._tool_ctx is not None:
-            self._tool_ctx.llm = self._llm
+            self._tool_ctx.llm = self._subagent_llm()
         if owned and old_llm is not None:
             self.run_worker(old_llm.close(), group="llm-close")
-        self._refresh_top_bar()
-        self.notify(f"Switched to {backend.model}")
 
     def _rebuild_graph(self) -> None:
         self.graph = build_graph(
@@ -927,6 +1074,8 @@ class HpcaApp(App):
             if result is not None:
                 self.settings = result
                 self.settings.save()
+                self._reload_llm()  # so llm settings take effect without a restart
+                self._refresh_session_log()
                 self._refresh_top_bar()
 
         self.push_screen(SettingsScreen(self.settings), apply)

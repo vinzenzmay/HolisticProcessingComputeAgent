@@ -39,6 +39,10 @@ def _append(left: list, right: list) -> list:
 
 class AgentState(TypedDict, total=False):
     messages: Annotated[list[Message], _append]
+    # The model's reasoning, anchored to the message index it produced. Kept
+    # out of `messages` so it is never fed back to the model, only shown and
+    # logged (§4.2 context firewall).
+    thinking: Annotated[list[dict], _append]
     pending_tool: dict | None
     tool_rounds: int
 
@@ -72,14 +76,18 @@ def build_graph(
             )
         except DecisionError as e:
             return _final(f"I failed to produce a valid action: {e}")
+        # This decision produces the next message, whether it is the answer
+        # below or the tool result execute_tool appends.
+        thinking = _thinking(state, decision.reasoning)
         if isinstance(decision, DirectResponse):
-            return _final(decision.text)
+            return _final(decision.text) | thinking
         return {
             "pending_tool": {
                 "tool": decision.tool.name,
                 "arguments": decision.arguments.model_dump(),
             },
             "tool_rounds": rounds + 1,
+            **thinking,
         }
 
     async def execute_tool(state: AgentState) -> dict:
@@ -88,6 +96,9 @@ def build_graph(
         tool = tools.get(pending["tool"])
         arguments = tool.params.model_validate(pending["arguments"])
         context = ctx() if callable(ctx) else ctx  # per-session context provider
+        if context is not None:
+            # so a tool's own model calls are logged under its name
+            context.current_tool = tool.name
         if tool.gates(arguments, context):
             payload = {
                 "tool": tool.name,
@@ -113,6 +124,15 @@ def build_graph(
         except Exception as e:  # surfaced to the model, never crashes the graph
             content = f"[tool error] {tool.name}: {type(e).__name__}: {e}"
         return _tool_message(content)
+
+    def _thinking(state: AgentState, reasoning: str) -> dict:
+        if not reasoning.strip():
+            return {}
+        return {
+            "thinking": [
+                {"after": len(state.get("messages", [])), "reasoning": reasoning}
+            ]
+        }
 
     def _final(text: str) -> dict:
         return {
@@ -147,6 +167,10 @@ class TurnResult:
     reply: str | None
     interrupt: dict | None
     messages: list[Message] = field(default_factory=list)
+    thinking: list[dict] = field(default_factory=list)
+    # Index of the first message this turn appended: everything from here on
+    # is new, which is what the session log needs and history does not.
+    first_new: int = 0
 
 
 async def run_turn(
@@ -166,12 +190,27 @@ async def run_turn(
             "pending_tool": None,
             "tool_rounds": 0,
         }
+    before = await graph.aget_state(config)
+    first_new = len((before.values or {}).get("messages", []))
     result = await graph.ainvoke(payload, config)
     messages = result.get("messages", [])
+    thinking = result.get("thinking", [])
     interrupts = result.get("__interrupt__") or []
     if interrupts:
-        return TurnResult(reply=None, interrupt=interrupts[0].value, messages=messages)
+        return TurnResult(
+            reply=None,
+            interrupt=interrupts[0].value,
+            messages=messages,
+            thinking=thinking,
+            first_new=first_new,
+        )
     reply = next(
         (m["content"] for m in reversed(messages) if m["role"] == "assistant"), None
     )
-    return TurnResult(reply=reply, interrupt=None, messages=messages)
+    return TurnResult(
+        reply=reply,
+        interrupt=None,
+        messages=messages,
+        thinking=thinking,
+        first_new=first_new,
+    )

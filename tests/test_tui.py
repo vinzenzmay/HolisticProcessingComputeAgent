@@ -3,10 +3,10 @@
 import json
 
 import pytest
-from textual.widgets import Footer, Input, ListView, TextArea
+from textual.widgets import Footer, ListView, TextArea
 
 from hpca.config import Settings
-from hpca.tui.app import ColumnPanel, HpcaApp, TopBar
+from hpca.tui.app import ChatInput, ColumnPanel, HpcaApp, TopBar
 from hpca.tui.settings_screen import SettingsScreen
 
 
@@ -93,7 +93,7 @@ class TestNewSession:
     async def test_chat_entry_only_exists_inside_a_session(self, hpca_home):
         app = HpcaApp()
         async with app.run_test(size=(120, 40)) as pilot:
-            chat_input = app.query_one("#chat-input", Input)
+            chat_input = app.query_one("#chat-input", ChatInput)
             assert not chat_input.display
             await pilot.press("right")  # chat column without a session
             assert app.focused.id == "chat-list"
@@ -124,14 +124,14 @@ class TestChatEntryNavigation:
             await pilot.press("enter")  # (new session) -> entry focused
             await pilot.pause()
             await pilot.press("h", "i")
-            chat_input = app.query_one("#chat-input", Input)
-            assert chat_input.value == "hi"
+            chat_input = app.query_one("#chat-input", ChatInput)
+            assert chat_input.text == "hi"
 
             await pilot.press("left")  # inside the text: cursor only
             assert app.focused.id == "chat-input"
-            assert chat_input.cursor_position == 1
+            assert chat_input.cursor_location == (0, 1)
             await pilot.press("left")
-            assert chat_input.cursor_position == 0
+            assert chat_input.cursor_location == (0, 0)
             await pilot.press("left")  # at the left edge: leave the column
             assert app.focused_column_id == "sessions"
 
@@ -145,12 +145,12 @@ class TestChatEntryNavigation:
             assert app.focused_column_id == "processes"
 
             await pilot.press("left")  # back into the chat column
-            chat_input = app.query_one("#chat-input", Input)
+            chat_input = app.query_one("#chat-input", ChatInput)
             assert app.focused is chat_input
-            assert chat_input.value == "hi"
-            assert chat_input.cursor_position == 2
+            assert chat_input.text == "hi"
+            assert chat_input.cursor_location == (0, 2)
             await pilot.press("!")
-            assert chat_input.value == "hi!"
+            assert chat_input.text == "hi!"
 
     async def test_settings_not_offered_in_the_chat_column(self, hpca_home):
         app = HpcaApp()
@@ -160,7 +160,7 @@ class TestChatEntryNavigation:
             await pilot.pause()
             assert app.check_action("open_settings", ()) is False
             await pilot.press("s")  # typed, not a hotkey
-            assert app.query_one("#chat-input", Input).value == "s"
+            assert app.query_one("#chat-input", ChatInput).text == "s"
             assert not isinstance(app.screen, SettingsScreen)
 
 
@@ -236,3 +236,66 @@ async def test_copy_text_uses_clipboard_manager(hpca_home):
     async with app.run_test(size=(120, 40)):
         result = app.copy_text("hello from hpca")
         assert result.ok
+
+
+class TestMultiLineEntry:
+    async def test_draft_wraps_and_the_box_grows_with_it(self, hpca_home):
+        app = HpcaApp()
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.press("enter")  # (new session)
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", ChatInput)
+            assert chat_input.soft_wrap
+            one_line = chat_input.size.height
+
+            chat_input.text = "x" * 400  # far wider than the chat column
+            await pilot.pause()
+            assert chat_input.size.height > one_line
+            # the whole draft is laid out, not clipped to a single strip
+            assert chat_input.wrapped_document.height > 1
+
+    async def test_growth_is_capped_so_the_log_stays_visible(self, hpca_home):
+        app = HpcaApp()
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.press("enter")
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", ChatInput)
+            chat_input.text = "line\n" * 100
+            for _ in range(3):
+                await pilot.pause()
+            assert chat_input.size.height <= 10
+            assert app.query_one("#chat-list", ListView).size.height > 0
+
+    async def test_enter_sends_and_shift_enter_starts_a_line(self, hpca_home):
+        app = HpcaApp()
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.press("enter")
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", ChatInput)
+            await pilot.press("a")
+            await pilot.press("shift+enter")
+            await pilot.press("b")
+            assert chat_input.text == "a\nb"  # newline, not a submit
+
+    async def test_alt_enter_and_ctrl_j_also_start_a_line(self, hpca_home):
+        app = HpcaApp()
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.press("enter")
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", ChatInput)
+            await pilot.press("a", "alt+enter", "b", "ctrl+j", "c")
+            assert chat_input.text == "a\nb\nc"
+
+    async def test_up_moves_between_draft_lines_before_leaving(self, hpca_home):
+        app = HpcaApp()
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.press("enter")
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", ChatInput)
+            await pilot.press("a", "shift+enter", "b")
+            assert chat_input.cursor_location == (1, 1)
+            await pilot.press("up")  # within the draft
+            assert app.focused is chat_input
+            assert chat_input.cursor_location[0] == 0
+            await pilot.press("up")  # first line: leave for the log (empty here)
+            assert app.focused is chat_input

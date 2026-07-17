@@ -4,12 +4,12 @@ import json
 from contextlib import contextmanager
 
 import pytest
-from textual.widgets import Input
+from textual.widgets import ListView
 
 from hpca.editor import resolve_editor
 from hpca.llm import ChatResponse
 from hpca.profiles import Profile
-from hpca.tui.app import UNTITLED_SESSION, HpcaApp
+from hpca.tui.app import ChatInput, HpcaApp, UNTITLED_SESSION
 from hpca.tui.memory_screens import MemoryProposalScreen, TierSelectScreen
 
 
@@ -41,9 +41,9 @@ def hpca_home(monkeypatch, tmp_path):
 async def type_and_submit(app, pilot, text):
     if app.active_session is None:
         await app.start_new_session()
-    chat_input = app.query_one("#chat-input", Input)
+    chat_input = app.query_one("#chat-input", ChatInput)
     chat_input.focus()
-    chat_input.value = text
+    chat_input.text = text
     await pilot.press("enter")
     await pilot.pause()
 

@@ -46,6 +46,10 @@ class LLMSettings(_Section):
     constrained_decoding: Literal["auto", "on", "off"] = "auto"
     max_retries: int = 3
     request_timeout_s: int = 120
+    # Reasoning models think in a separate channel, shown in the chat window's
+    # thinking box. Measured on Qwen3.6-27B: ~17s and ~340 completion tokens
+    # per decision, against ~1s and ~20 without. Switch off for a snappy agent.
+    enable_thinking: bool = True
 
 
 class ClusterSettings(_Section):
@@ -70,6 +74,13 @@ class ClipboardSettings(_Section):
     mode: ClipboardMode = "auto"
     command: str | None = None
     osc52_limit_kb: int = 74
+
+
+class LoggingSettings(_Section):
+    """Plain-text session transcripts for later analysis (see hpca.logs)."""
+
+    enabled: bool = True
+    dir: str | None = None  # default: ./hpca-logs, where hpca was started
 
 
 class RagSettings(_Section):
@@ -97,6 +108,7 @@ class Settings(_Section):
     clipboard: ClipboardSettings = ClipboardSettings()
     editor: str | None = None
     rag: RagSettings = RagSettings()
+    logging: LoggingSettings = LoggingSettings()
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Settings":
