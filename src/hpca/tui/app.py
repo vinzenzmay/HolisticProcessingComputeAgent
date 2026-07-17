@@ -304,6 +304,14 @@ class HpcaApp(App):
     }
     #columns {
         height: 1fr;
+        /* Narrower than this the columns keep these sizes and the terminal
+           clips them. Without it the chat column — the one without a
+           min-width of its own — is squeezed to nothing, and a bordered
+           widget with zero content width crashes Rich's text wrapping
+           (a resize to ~50 columns used to take the whole app down).
+           A per-column min-width does not work: when it binds, every column
+           balloons past the terminal instead. */
+        min-width: 74;
     }
     ColumnPanel {
         border: solid $panel;
