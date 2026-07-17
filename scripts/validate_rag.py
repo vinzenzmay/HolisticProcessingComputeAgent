@@ -160,7 +160,7 @@ async def main() -> None:
         record(
             "researcher answers from indexed docs",
             "samtools" in answer.lower(),
-            "cited" if "cluster.md" in answer or "man:" in answer else "no citation",
+            "cited" if ("bam.md" in answer or "man:" in answer) else "no citation",
         )
         await llm.close()
 

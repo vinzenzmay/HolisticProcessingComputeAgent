@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from hpca.config import Settings
@@ -11,6 +11,7 @@ from hpca.jobs import JobStore
 from hpca.rag import RagStore
 from hpca.registry import PathRegistry
 from hpca.runner import ProcessRunner
+from hpca.skills import Skill
 from hpca.slurm import SlurmClient
 from hpca.symbols import SymbolIndex
 from hpca.trash import TrashManager
@@ -33,3 +34,4 @@ class ToolContext:
     symbols: SymbolIndex | None = None
     rag: RagStore | None = None
     embedder: EmbeddingClient | None = None
+    skills: list[Skill] = field(default_factory=list)

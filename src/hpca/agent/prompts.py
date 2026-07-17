@@ -36,12 +36,24 @@ def environment_facts() -> str:
     return f"Current date and time: {datetime.now():%Y-%m-%d %H:%M} (local)."
 
 
+SKILLS_GUIDANCE = (
+    "The user has defined skills: written procedures for specific tasks. "
+    "When a request matches one, call read_skill to get the procedure and "
+    "follow it. Available skills:"
+)
+
+
 def orchestrator_system_prompt(
-    *, environment: str = "", tier1: str = "", tier2: str = ""
+    *,
+    environment: str = "",
+    tier1: str = "",
+    tier2: str = "",
+    skills: str = "",
 ) -> str:
     """System prompt for the orchestrator; dynamic facts injected per render.
 
     Tier 1 memories go into *every* agent's prompt, tier 2 only here (§6.1).
+    Skills are listed by name/description only; bodies are fetched on demand.
     """
     parts = [
         "You are HPCA, a terminal assistant helping a scientist with data "
@@ -50,6 +62,8 @@ def orchestrator_system_prompt(
         PATH_WORKFLOW_GUIDANCE,
         GROUNDED_ANSWERING_GUIDANCE,
     ]
+    if skills:
+        parts.append(f"{SKILLS_GUIDANCE}\n{skills}")
     if tier1:
         parts.append(f"Standing site notes:\n{tier1}")
     if tier2:

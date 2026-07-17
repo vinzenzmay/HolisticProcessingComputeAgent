@@ -25,9 +25,16 @@ from hpca.clipboard import ClipboardManager, CopyResult
 from hpca.config import Settings, app_dir
 from hpca.db import checkpoints_db_path, connect, init_db
 from hpca.jobs import JobRow, JobStore, poll_active
-from hpca.agent.conclude import propose_memories
+from hpca.agent.conclude import MemoryProposal, propose_memories
 from hpca.agent.doc_tools import add_ask_docs, add_doc_tools
 from hpca.agent.prompts import orchestrator_system_prompt
+from hpca.agent.skill_tools import add_skill_tools
+from hpca.agent.struggle import (
+    STRUGGLE_KIND,
+    matching_struggles,
+    propose_struggle_note,
+    turn_struggled,
+)
 from hpca.editor import resolve_editor
 from hpca.embeddings import EmbeddingClient
 from hpca.llm import LLMClient
@@ -36,6 +43,7 @@ from hpca.profiles import Profile
 from hpca.registry import PathRegistry
 from hpca.runner import ProcessRecord, ProcessRunner
 from hpca.sessions import Session, SessionStore
+from hpca.skills import load_skills, summarize_skills
 from hpca.slurm import SlurmClient
 from hpca.symbols import SymbolIndex
 from hpca.trash import TrashManager
@@ -185,6 +193,7 @@ class HpcaApp(App):
         self._llm = llm
         self._owns_llm = llm is None
         self.slurm = slurm or self._detect_slurm()
+        self.skills = load_skills()
         if tools is not None:
             self._tools = tools
         else:
@@ -193,6 +202,8 @@ class HpcaApp(App):
             )
             if self.slurm is not None:
                 add_job_tools(self._tools)
+            if self.skills:
+                add_skill_tools(self._tools)
         self.active_session: Session | None = None
         self._tool_ctx: ToolContext | None = None
         self._chat_entries: list[tuple[str, str]] = []
@@ -292,11 +303,24 @@ class HpcaApp(App):
         return result
 
     def _render_system_prompt(self) -> str:
-        """Per-call prompt assembly (§4.3): memories + dynamic facts."""
+        """Per-call prompt assembly (§4.3): memories, skills, dynamic facts."""
         return orchestrator_system_prompt(
             tier1=self.profile_memory.tier_text(1),
             tier2=self.profile_memory.tier_text(2),
+            skills=summarize_skills(self.skills),
         )
+
+    def warn_about_struggles(self, text: str) -> list:
+        """§4.4: warn up front when a request matches a past struggle."""
+        matches = matching_struggles(self.profile_memory.memories, text)
+        for memory in matches:
+            first_line = memory.text.splitlines()[0]
+            self.notify(
+                f"I have struggled with this before: {first_line}",
+                severity="warning",
+                timeout=10,
+            )
+        return matches
 
     # ------------------------------------------------------------ chat/agent
 
@@ -317,6 +341,7 @@ class HpcaApp(App):
             )
             await self._reload_sessions()
         await self._append_chat("user", text)
+        self.warn_about_struggles(text)
         self._run_agent(user_text=text)
 
     def _run_agent(self, *, user_text: str | None = None, resume: Command | None = None):
@@ -343,6 +368,8 @@ class HpcaApp(App):
         await self.refresh_processes()
         if result.interrupt is not None:
             self.push_screen(ApprovalScreen(result.interrupt), self._on_approval)
+            return
+        await self.maybe_propose_struggle_note(result.messages)
 
     def _on_approval(self, approved: bool | None) -> None:
         self._run_agent(resume=Command(resume={"approved": bool(approved)}))
@@ -413,6 +440,33 @@ class HpcaApp(App):
         self.notify(f"Kept {kept} of {len(proposals)} proposed memories.")
         self.check_memory_caps()
 
+    async def maybe_propose_struggle_note(self, messages: list[dict]) -> bool:
+        """§4.4: after a bad turn, propose a struggle note for approval."""
+        if not turn_struggled(messages):
+            return False
+        try:
+            note = await propose_struggle_note(self._llm, messages)
+        except Exception:
+            return False  # reflection is best-effort; never disrupt the user
+        proposal = MemoryProposal(
+            tier=2, kind=STRUGGLE_KIND, text=note.render()
+        )
+        approved = await self.push_screen_wait(
+            MemoryProposalScreen(proposal, 1, 1)
+        )
+        if not approved:
+            return False
+        self.profile_memory.add_memory(
+            proposal.text,
+            tier=2,
+            backend=self.settings.llm.model,
+            kind=STRUGGLE_KIND,
+        )
+        self.profile_memory.save()
+        self.notify("Struggle note saved to the profile.")
+        self.check_memory_caps()
+        return True
+
     def check_memory_caps(self) -> list[int]:
         """§6.4 size warnings; returns the tiers currently over their cap."""
         over = self.profile_memory.over_cap_tiers(
@@ -479,6 +533,7 @@ class HpcaApp(App):
             symbols=self.symbol_index,
             rag=self.rag_store,
             embedder=self.embedder,
+            skills=self.skills,
         )
 
     async def start_new_session(self) -> None:
