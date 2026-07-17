@@ -77,8 +77,18 @@ class RagSettings(_Section):
     embedding_base_url: str = "http://localhost:51943/v1"
 
 
+class LLMBackend(_Section):
+    """One entry of the configured backend catalog (manage-LLMs screen)."""
+
+    model: str
+    base_url: str
+    api_key: str | None = None
+    max_model_len: int | None = None
+
+
 class Settings(_Section):
     llm: LLMSettings = LLMSettings()
+    backends: list[LLMBackend] = []
     cluster: ClusterSettings = ClusterSettings()
     safety: SafetySettings = SafetySettings()
     memory: MemorySettings = MemorySettings()
@@ -104,3 +114,19 @@ class Settings(_Section):
         path = path or settings_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(self.model_dump_json(indent=2) + "\n")
+
+    def activate_backend(self, backend: LLMBackend) -> None:
+        """Make a catalog entry the active/default backend (used on startup).
+
+        Only connection fields change; client behavior (retries, timeout,
+        constrained decoding) is kept.
+        """
+        self.llm.base_url = backend.base_url
+        self.llm.model = backend.model
+        self.llm.api_key = backend.api_key
+
+    def is_active(self, backend: LLMBackend) -> bool:
+        return (
+            self.llm.base_url == backend.base_url
+            and self.llm.model == backend.model
+        )

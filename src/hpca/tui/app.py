@@ -22,7 +22,7 @@ from hpca.agent.graph import build_graph, run_turn
 from hpca.agent.job_tools import add_job_tools
 from hpca.agent.tools import ToolRegistry
 from hpca.clipboard import ClipboardManager, CopyResult
-from hpca.config import Settings, app_dir
+from hpca.config import LLMBackend, Settings, app_dir
 from hpca.db import checkpoints_db_path, connect, init_db
 from hpca.jobs import JobRow, JobStore, poll_active
 from hpca.agent.conclude import MemoryProposal, propose_memories
@@ -50,8 +50,10 @@ from hpca.trash import TrashManager
 from hpca.tui.approval_screen import ApprovalScreen
 from hpca.tui.confirm_screen import ConfirmScreen
 from hpca.tui.inspect_screen import InspectScreen, format_job, format_process
+from hpca.tui.manage_llms import ManageLLMsScreen
 from hpca.tui.memory_screens import MemoryProposalScreen, TierSelectScreen
 from hpca.tui.settings_screen import SettingsScreen
+from hpca.tui.switch_llm import SwitchLLMScreen
 
 COLUMN_IDS = ("sessions", "chat", "processes")
 SESSION_TITLE_MAX = 40
@@ -179,8 +181,10 @@ class HpcaApp(App):
         Binding("left", "focus_column(-1)", "◀ column", show=False),
         Binding("right", "focus_column(1)", "column ▶", show=False),
         Binding("s", "open_settings", "settings"),
+        Binding("m", "manage_llms", "manage llms"),
+        Binding("l", "switch_llm", "switch llm"),
         Binding("ctrl+e", "edit_profile", "edit profile", show=False),
-        Binding("ctrl+q", "quit", "quit"),
+        Binding("ctrl+q", "confirm_quit", "quit", priority=True),
     ]
 
     def __init__(
@@ -232,6 +236,7 @@ class HpcaApp(App):
         self.session_store = SessionStore(self._conn)
         self._saver_ctx = AsyncSqliteSaver.from_conn_string(str(checkpoints_db_path()))
         checkpointer = await self._saver_ctx.__aenter__()
+        self._checkpointer = checkpointer  # kept for graph rebuilds on switch
         if self._llm is None:
             self._llm = LLMClient(self.settings.llm)
         self.profile_memory = Profile.load(self.profile)
@@ -241,14 +246,7 @@ class HpcaApp(App):
                 + "; ".join(self.profile_memory.problems[:3]),
                 severity="warning",
             )
-        self.graph = build_graph(
-            llm=self._llm,
-            tools=self._tools,
-            checkpointer=checkpointer,
-            ctx=lambda: self._tool_ctx,
-            system_prompt_fn=self._render_system_prompt,
-            max_retries=self.settings.llm.max_retries,
-        )
+        self._rebuild_graph()
         self.job_store = JobStore(self._conn)
         self.symbol_index = SymbolIndex(self._conn)
         self.rag_store = RagStore(app_dir() / "rag.db")
@@ -742,6 +740,60 @@ class HpcaApp(App):
     def _on_chat_list_selected(self, event: ListView.Selected) -> None:
         # Enter in the chat column moves to the input (message actions later)
         self.query_one("#chat-input", Input).focus()
+
+    # ---------------------------------------------------------- llm backends
+
+    def action_manage_llms(self) -> None:
+        self.push_screen(ManageLLMsScreen())
+
+    def action_switch_llm(self) -> None:
+        if not self.settings.backends:
+            self.notify(
+                "No backends configured yet — press (m) to discover and add some.",
+                severity="warning",
+            )
+            return
+
+        def apply(backend: LLMBackend | None) -> None:
+            if backend is not None:
+                self.switch_backend(backend)
+
+        self.push_screen(
+            SwitchLLMScreen(list(self.settings.backends), self.settings.is_active),
+            apply,
+        )
+
+    def switch_backend(self, backend: LLMBackend) -> None:
+        """Make a configured backend the active one, now and on next start."""
+        self.settings.activate_backend(backend)
+        self.settings.save()
+        old_llm, owned = self._llm, self._owns_llm
+        self._llm = LLMClient(self.settings.llm)
+        self._owns_llm = True
+        self._rebuild_graph()
+        if self._tool_ctx is not None:
+            self._tool_ctx.llm = self._llm
+        if owned and old_llm is not None:
+            self.run_worker(old_llm.close(), group="llm-close")
+        self._refresh_top_bar()
+        self.notify(f"Switched to {backend.model}")
+
+    def _rebuild_graph(self) -> None:
+        self.graph = build_graph(
+            llm=self._llm,
+            tools=self._tools,
+            checkpointer=self._checkpointer,
+            ctx=lambda: self._tool_ctx,
+            system_prompt_fn=self._render_system_prompt,
+            max_retries=self.settings.llm.max_retries,
+        )
+
+    def action_confirm_quit(self) -> None:
+        def verdict(confirmed: bool | None) -> None:
+            if confirmed:
+                self.exit()
+
+        self.push_screen(ConfirmScreen("Really quit?"), verdict)
 
     # -------------------------------------------------------------- settings
 

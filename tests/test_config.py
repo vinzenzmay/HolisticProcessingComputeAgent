@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from hpca.config import Settings, SettingsError, app_dir, settings_path
+from hpca.config import LLMBackend, Settings, SettingsError, app_dir, settings_path
 
 
 class TestAppDir:
@@ -129,3 +129,48 @@ class TestSave:
         monkeypatch.setenv("HPCA_HOME", str(tmp_path))
         Settings().save()
         assert (tmp_path / "settings.json").exists()
+
+
+class TestBackendCatalog:
+    def test_default_empty(self):
+        assert Settings().backends == []
+
+    def test_roundtrip(self, tmp_path):
+        path = tmp_path / "settings.json"
+        s = Settings()
+        s.backends = [
+            LLMBackend(
+                model="Qwen/Qwen3.6-27B-FP8",
+                base_url="http://localhost:51941/v1",
+                max_model_len=192000,
+            ),
+            LLMBackend(
+                model="other",
+                base_url="http://localhost:8000/v1",
+                api_key="sekrit",
+            ),
+        ]
+        s.save(path)
+        loaded = Settings.load(path)
+        assert len(loaded.backends) == 2
+        assert loaded.backends[0].max_model_len == 192000
+        assert loaded.backends[1].api_key == "sekrit"
+
+    def test_activate_backend_updates_llm_section(self):
+        s = Settings()
+        backend = LLMBackend(
+            model="m", base_url="http://localhost:9/v1", api_key="k"
+        )
+        s.activate_backend(backend)
+        assert s.llm.model == "m"
+        assert s.llm.base_url == "http://localhost:9/v1"
+        assert s.llm.api_key == "k"
+        # client behavior settings are not clobbered
+        assert s.llm.max_retries == 3
+
+    def test_is_active(self):
+        s = Settings()
+        backend = LLMBackend(model="m", base_url="http://localhost:9/v1")
+        assert not s.is_active(backend)
+        s.activate_backend(backend)
+        assert s.is_active(backend)
