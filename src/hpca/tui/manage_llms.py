@@ -12,8 +12,11 @@ one; removal asks for confirmation.
 
 from __future__ import annotations
 
+import asyncio
+
 from textual import on, work
 from textual.app import ComposeResult
+from textual.worker import get_current_worker
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.content import Content
@@ -112,13 +115,38 @@ class ManageLLMsScreen(Screen):
 
     # ------------------------------------------------------------ populate
 
-    @work(exclusive=True, group="llm-scan")
-    async def scan_worker(self) -> None:
-        self._discovered = await scan_local_ports()
+    @work(thread=True, exclusive=True, group="llm-scan")
+    def scan_worker(self) -> None:
+        """Port scan in its own thread + event loop.
+
+        Probing ~64k localhost ports floods an event loop with connection
+        attempts; run on the UI loop it made the whole app unresponsive.
+        Only tiny UI updates are marshalled back via call_from_thread.
+        """
+        worker = get_current_worker()
+
+        def report(done: int, total: int) -> None:
+            if not worker.is_cancelled:
+                self.app.call_from_thread(
+                    self._set_status,
+                    f"scanning localhost… {done:,}/{total:,} ports",
+                )
+
+        discovered = asyncio.run(scan_local_ports(progress=report))
+        if not worker.is_cancelled:
+            self.app.call_from_thread(self._apply_scan_results, discovered)
+
+    def _set_status(self, text: str) -> None:
+        if self.is_attached:
+            self.query_one("#llm-status", Static).update(text)
+
+    async def _apply_scan_results(self, discovered: list[DiscoveredBackend]) -> None:
+        if not self.is_attached:
+            return  # screen was closed while the scan finished
+        self._discovered = discovered
         await self.refresh_discovered()
-        self.query_one("#llm-status", Static).update(
-            f"scan finished: {len(self._discovered)} endpoint(s) found "
-            "· F5 to rescan"
+        self._set_status(
+            f"scan finished: {len(discovered)} endpoint(s) found · F5 to rescan"
         )
 
     @work(group="llm-reach")
@@ -179,7 +207,7 @@ class ManageLLMsScreen(Screen):
         self.query_one(f"#llm-{which}", ListView).focus()
 
     def action_rescan(self) -> None:
-        self.query_one("#llm-status", Static).update("rescanning…")
+        self._set_status("rescanning…")
         self.scan_worker()
 
     @on(ListView.Selected)

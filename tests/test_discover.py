@@ -148,3 +148,15 @@ class TestBackendDisplay:
         text = b.describe()
         assert "ctx ?" in text
         assert "key: yes" in text
+
+
+class TestScanProgress:
+    async def test_progress_reported_in_chunks(self, live_stub):
+        calls = []
+        await scan_local_ports(
+            range(1024, 1024 + 3000),
+            progress=lambda done, total: calls.append((done, total)),
+        )
+        assert calls[-1] == (3000, 3000)
+        assert len(calls) == 3  # 1024-port chunks
+        assert calls[0][0] <= 1024

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from typing import Callable
 from urllib.parse import urlparse
 
 import httpx
@@ -18,7 +19,7 @@ import httpx
 DEFAULT_PORT_RANGE = range(1024, 65536)
 TCP_TIMEOUT_S = 0.25
 PROBE_TIMEOUT_S = 2.0
-SCAN_CONCURRENCY = 500
+SCAN_CHUNK = 1024  # ports probed concurrently per batch
 
 
 @dataclass
@@ -97,18 +98,27 @@ async def _port_open(host: str, port: int) -> bool:
 
 
 async def scan_local_ports(
-    ports=DEFAULT_PORT_RANGE, *, host: str = "127.0.0.1"
+    ports=DEFAULT_PORT_RANGE,
+    *,
+    host: str = "127.0.0.1",
+    progress: Callable[[int, int], None] | None = None,
 ) -> list[DiscoveredBackend]:
-    """Find OpenAI-compatible endpoints on the given localhost ports."""
-    semaphore = asyncio.Semaphore(SCAN_CONCURRENCY)
+    """Find OpenAI-compatible endpoints on the given localhost ports.
 
-    async def check(port: int) -> int | None:
-        async with semaphore:
-            return port if await _port_open(host, port) else None
-
-    open_ports = [
-        p for p in await asyncio.gather(*(check(p) for p in ports)) if p is not None
-    ]
+    Ports are probed in bounded chunks (never tens of thousands of pending
+    coroutines at once), and ``progress(done, total)`` is called after each
+    chunk. Callers embedding a UI should run this scan in a separate thread
+    with its own event loop so their loop stays responsive.
+    """
+    port_list = list(ports)
+    total = len(port_list)
+    open_ports: list[int] = []
+    for start in range(0, total, SCAN_CHUNK):
+        chunk = port_list[start : start + SCAN_CHUNK]
+        results = await asyncio.gather(*(_port_open(host, p) for p in chunk))
+        open_ports.extend(p for p, is_open in zip(chunk, results) if is_open)
+        if progress is not None:
+            progress(min(start + SCAN_CHUNK, total), total)
     backends: list[DiscoveredBackend] = []
     for results in await asyncio.gather(
         *(probe_endpoint(f"http://{host}:{port}/v1") for port in open_ports)

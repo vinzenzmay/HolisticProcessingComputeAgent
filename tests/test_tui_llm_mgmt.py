@@ -322,3 +322,32 @@ class TestSwitcher:
             await pilot.press("escape")
             await pilot.pause()
             assert app.settings.llm.model == before
+
+
+class TestScanResponsiveness:
+    async def test_ui_responsive_and_closable_during_slow_scan(
+        self, hpca_home, monkeypatch
+    ):
+        import asyncio
+
+        async def slow_scan(*args, progress=None, **kwargs):
+            await asyncio.sleep(0.6)
+            return [QWEN]
+
+        async def fake_reachable(base_url, **kwargs):
+            return True
+
+        monkeypatch.setattr(manage_module, "scan_local_ports", slow_scan)
+        monkeypatch.setattr(manage_module, "is_reachable", fake_reachable)
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("m")
+            assert isinstance(app.screen, ManageLLMsScreen)
+            # while the scan runs, the UI must still process input:
+            await pilot.press("escape")
+            await pilot.pause()
+            assert not isinstance(app.screen, ManageLLMsScreen)
+            # the late-finishing scan must not crash against the gone screen
+            await asyncio.sleep(0.8)
+            await pilot.pause()
+            assert app.is_running
