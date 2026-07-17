@@ -101,27 +101,10 @@ class TestExplainFailure:
 
 # --------------------------------------------------------- integration tests
 
-import os  # noqa: E402
-
-import httpx  # noqa: E402
-
 from hpca.config import LLMSettings  # noqa: E402
 from hpca.llm import LLMClient  # noqa: E402
 
-LIVE_URL = os.environ.get("HPCA_TEST_LLM_URL", "http://localhost:51941/v1")
-LIVE_MODEL = os.environ.get("HPCA_TEST_LLM_MODEL", "Qwen/Qwen3.6-35B-A3B-FP8")
-
-
-def _backend_reachable() -> bool:
-    try:
-        return httpx.get(f"{LIVE_URL}/models", timeout=3).status_code == 200
-    except httpx.HTTPError:
-        return False
-
-
-integration = pytest.mark.skipif(
-    not _backend_reachable(), reason=f"LLM backend at {LIVE_URL} not reachable"
-)
+from tests.live_backend import LIVE_MODEL, LIVE_URL, integration  # noqa: E402
 
 
 @integration
