@@ -55,8 +55,12 @@ def build_graph(
     system_prompt_fn: Callable[[], str] | None = None,
     ctx: Any = None,
     max_retries: int = 3,
+    on_activity: Callable[[str], None] | None = None,
 ):
     render_system_prompt = system_prompt_fn or orchestrator_system_prompt
+    # A turn is silent for seconds or minutes; this is what the TUI's spinner
+    # names, so a wait is legible as thinking or as a particular tool running.
+    report = on_activity or (lambda activity: None)
 
     async def orchestrator(state: AgentState) -> dict:
         rounds = state.get("tool_rounds", 0)
@@ -67,6 +71,7 @@ def build_graph(
             )
             return _final(note)
         system: Message = {"role": "system", "content": render_system_prompt()}
+        report("thinking")
         try:
             decision = await decide(
                 llm,
@@ -94,6 +99,7 @@ def build_graph(
         pending = state["pending_tool"]
         assert pending is not None
         tool = tools.get(pending["tool"])
+        report(f"running {tool.name}")
         arguments = tool.params.model_validate(pending["arguments"])
         context = ctx() if callable(ctx) else ctx  # per-session context provider
         if context is not None:

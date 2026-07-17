@@ -50,3 +50,56 @@ class TestSessionStore:
         # thread_id for the LangGraph checkpointer
         session = store.create(profile="default")
         assert session.checkpoint_ref == session.session_id
+
+
+class TestDelete:
+    def test_delete_removes_only_that_session(self, store):
+        keep = store.create(profile="default", title="keep me")
+        drop = store.create(profile="default", title="drop me")
+        store.delete(drop.session_id)
+        assert [s.session_id for s in store.list(profile="default")] == [
+            keep.session_id
+        ]
+        assert store.get(drop.session_id) is None
+        assert store.get(keep.session_id) is not None
+
+    def test_delete_takes_the_sessions_path_aliases_with_it(self, store, tmp_path):
+        from hpca.registry import PathRegistry
+
+        session = store.create(profile="default")
+        other = store.create(profile="default")
+        registry = PathRegistry(
+            store._conn, profile="default", session_id=session.session_id
+        )
+        registry.register("cohort", str(tmp_path))
+        PathRegistry(
+            store._conn, profile="default", session_id=other.session_id
+        ).register("cohort", str(tmp_path))
+
+        store.delete(session.session_id)
+        assert registry.list() == {}  # its aliases meant nothing without it
+        kept = PathRegistry(
+            store._conn, profile="default", session_id=other.session_id
+        )
+        assert "cohort" in kept.list()
+
+    def test_deleting_an_unknown_session_is_quiet(self, store):
+        store.delete("no-such-session")  # must not raise
+
+    def test_jobs_outlive_the_session_they_were_submitted_from(self, store):
+        from hpca.jobs import JobStore
+
+        session = store.create(profile="default")
+        jobs = JobStore(store._conn)
+        jobs.add(
+            job_id="27744534",
+            kind="sbatch",
+            session_id=session.session_id,
+            profile="default",
+            script_key="align",
+            stdout_path="/tmp/out",
+            stderr_path="/tmp/err",
+        )
+        store.delete(session.session_id)
+        # the cluster job runs on; its record must not vanish with the chat
+        assert jobs.get("27744534") is not None

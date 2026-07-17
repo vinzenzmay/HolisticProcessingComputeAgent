@@ -1,9 +1,13 @@
 """Plain-text session transcripts (§7 ``logging`` settings).
 
-One file per session, written where hpca was started (``./hpca-logs`` by
-default) so transcripts land next to the analysis they belong to. The format
-is deliberately dumb — a timestamped header line, the text, a blank line — so
-a later reader can grep it and a later script can split it on the headers.
+One file per session, collected in one place — ``chatlogs`` inside the app
+directory — rather than scattered wherever hpca happened to be started;
+``logging.dir`` overrides it. The format is deliberately dumb — a timestamped
+header line, the text, a blank line — so a later reader can grep it and a
+later script can split it on the headers.
+
+A session's log outlives the session: deleting a session in the TUI never
+touches it.
 
 Sub-agent traffic (the model calls tools make on their own, §4.2) goes through
 ``LoggedLLM``, a proxy around the client the tool context hands out.
@@ -15,15 +19,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from hpca.config import Settings
+from hpca.config import Settings, app_dir
 from hpca.llm import Message
 from hpca.sessions import Session
 
-DEFAULT_LOG_DIR = "hpca-logs"
+LOG_DIR_NAME = "chatlogs"
 
 
 def log_dir(settings: Settings) -> Path:
-    return Path(settings.logging.dir or DEFAULT_LOG_DIR)
+    """Where transcripts are collected: the app dir, unless configured."""
+    if settings.logging.dir:
+        return Path(settings.logging.dir).expanduser()
+    return app_dir() / LOG_DIR_NAME
 
 
 def log_path(directory: Path, session: Session) -> Path:

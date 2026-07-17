@@ -68,6 +68,23 @@ class SessionStore:
         )
         self._conn.commit()
 
+    def delete(self, session_id: str) -> None:
+        """Forget a chat thread and the path aliases it named.
+
+        Job and process rows stay: they record work that outlives the
+        conversation about it — a cluster job runs on whether or not the chat
+        it was submitted from still exists. The plain-text log stays too; it
+        is the durable record (see hpca.logs). LangGraph's checkpoints are the
+        caller's to drop, since only it holds the checkpointer.
+        """
+        self._conn.execute(
+            "DELETE FROM path_registry WHERE session_id = ?", (session_id,)
+        )
+        self._conn.execute(
+            "DELETE FROM sessions WHERE session_id = ?", (session_id,)
+        )
+        self._conn.commit()
+
     @staticmethod
     def _to_session(row: sqlite3.Row) -> Session:
         return Session(

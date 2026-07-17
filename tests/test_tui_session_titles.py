@@ -252,3 +252,134 @@ class TestTitleLogging:
             assert "subagent:title query" in text  # the titler is a sub-agent
             assert "subagent:title reply" in text
             assert "session renamed\nCohort BAMs (by llm)" in text
+
+
+class TestDeleteSession:
+    async def test_d_asks_then_deletes_and_keeps_the_log(self, hpca_home, tmp_path):
+        from hpca.config import Settings
+        from hpca.logs import log_path
+        from hpca.tui.confirm_screen import ConfirmScreen
+
+        directory = tmp_path / "chatlogs"
+        settings = Settings()
+        settings.logging.dir = str(directory)
+        settings.save()
+        app = HpcaApp(llm=FakeLLM([respond_json("a")], titles=["Cohort BAMs"]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "which BAMs?")
+            session = app.active_session
+            log = log_path(directory, session)
+            assert log.exists()
+
+            sessions_list = app.query_one("#sessions-list", ListView)
+            sessions_list.focus()
+            sessions_list.index = 1
+            await pilot.press("d")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmScreen)
+            assert "Cohort BAMs" in app.screen._question
+            assert "log" in app.screen._question  # the dialog says the log stays
+
+            await pilot.press("y")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert app.session_store.list(profile="default") == []
+            assert session_rows(app) == ["(new session)"]
+            # the transcript is the durable record; it outlives the session
+            assert log.exists()
+            assert "which BAMs?" in log.read_text()
+
+    async def test_declining_keeps_the_session(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM([respond_json("a")]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "hello")
+            sessions_list = app.query_one("#sessions-list", ListView)
+            sessions_list.focus()
+            sessions_list.index = 1
+            await pilot.press("d")
+            await pilot.press("n")
+            await pilot.pause()
+            assert len(app.session_store.list(profile="default")) == 1
+
+    async def test_deleting_the_open_session_empties_the_chat(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM([respond_json("a")]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "hello")
+            assert app.query_one("#chat-input", ChatInput).display
+            sessions_list = app.query_one("#sessions-list", ListView)
+            sessions_list.focus()
+            sessions_list.index = 1
+            await pilot.press("d")
+            await pilot.press("y")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert app.active_session is None
+            assert app.chat_log_texts() == []
+            # nothing to type into once the session it belonged to is gone
+            assert not app.query_one("#chat-input", ChatInput).display
+            assert app.focused_column_id == "sessions"
+
+    async def test_deleting_another_session_leaves_the_open_one_alone(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM([respond_json("a"), respond_json("b")]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "first")
+            first = app.active_session
+            await app.start_new_session()
+            await pilot.pause()
+            await submit_chat(app, pilot, "second")
+            second = app.active_session
+
+            sessions_list = app.query_one("#sessions-list", ListView)
+            sessions_list.focus()
+            sessions_list.index = [
+                i
+                for i, item in enumerate(sessions_list.children)
+                if getattr(item, "data_session", None)
+                and item.data_session.session_id == first.session_id
+            ][0]
+            await pilot.press("d")
+            await pilot.press("y")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert app.active_session.session_id == second.session_id
+            assert app.query_one("#chat-input", ChatInput).display
+            assert [s.session_id for s in app.session_store.list(profile="default")] == [
+                second.session_id
+            ]
+
+    async def test_the_chat_history_is_dropped_with_the_session(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM([respond_json("an answer")]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "a question")
+            session = app.active_session
+            snapshot = await app.graph.aget_state(
+                {"configurable": {"thread_id": session.session_id}}
+            )
+            assert (snapshot.values or {}).get("messages")
+
+            sessions_list = app.query_one("#sessions-list", ListView)
+            sessions_list.focus()
+            sessions_list.index = 1
+            await pilot.press("d")
+            await pilot.press("y")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            after = await app.graph.aget_state(
+                {"configurable": {"thread_id": session.session_id}}
+            )
+            assert not (after.values or {}).get("messages")
+
+    async def test_delete_is_inert_on_the_new_session_row(self, hpca_home):
+        from hpca.tui.confirm_screen import ConfirmScreen
+
+        app = HpcaApp(llm=FakeLLM([respond_json("a")]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "hello")
+            sessions_list = app.query_one("#sessions-list", ListView)
+            sessions_list.focus()
+            sessions_list.index = 0  # "(new session)" is not a session
+            assert sessions_list.check_action("delete_session", ()) is False
+            await pilot.press("d")
+            await pilot.pause()
+            assert not isinstance(app.screen, ConfirmScreen)
+            assert len(app.session_store.list(profile="default")) == 1

@@ -5,8 +5,6 @@ from pathlib import Path
 
 import pytest
 
-import hpca.logs
-
 from hpca.config import Settings
 from hpca.llm import ChatResponse
 from hpca.logs import (
@@ -33,20 +31,23 @@ def at(second: int):
 
 
 class TestPaths:
-    @pytest.mark.real_log_default
-    def test_defaults_to_hpca_logs_in_the_working_directory(self):
+    def test_defaults_to_one_place_inside_the_app_dir(self, monkeypatch, tmp_path):
+        # collected centrally, not wherever hpca happened to be started
+        monkeypatch.setenv("HPCA_HOME", str(tmp_path))
         directory = log_dir(Settings())
-        assert directory == Path("hpca-logs")
-        assert not directory.is_absolute()  # i.e. where hpca was started
-
-    def test_no_dir_setting_falls_back_to_the_default(self, monkeypatch):
-        monkeypatch.setattr(hpca.logs, "DEFAULT_LOG_DIR", "/somewhere/else")
-        assert log_dir(Settings()) == Path("/somewhere/else")
+        assert directory == tmp_path / "chatlogs"
+        assert directory.is_absolute()
 
     def test_dir_setting_overrides(self):
         settings = Settings()
         settings.logging.dir = "/data/transcripts"
         assert str(log_dir(settings)) == "/data/transcripts"
+
+    def test_dir_setting_expands_home(self, monkeypatch):
+        monkeypatch.setenv("HOME", "/home/someone")
+        settings = Settings()
+        settings.logging.dir = "~/transcripts"
+        assert str(log_dir(settings)) == "/home/someone/transcripts"
 
     def test_filename_is_local_start_time_and_session(self, tmp_path):
         # created_at is UTC; the name must agree with the local stamps inside

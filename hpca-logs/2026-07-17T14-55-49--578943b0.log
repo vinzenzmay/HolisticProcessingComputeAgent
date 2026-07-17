@@ -1,0 +1,34 @@
+[2026-07-17 14:55:49] session opened
+578943b0-8440-4751-887d-fee658ebf3b6 · profile default · model Qwen/Qwen3.6-27B-FP8
+
+[2026-07-17 14:55:52] user
+what are your current memories?
+
+[2026-07-17 14:55:52] agent
+Here are my current memories:
+
+1. The **clearcnv** conda environment (`/home/vinzenz/miniforge3/envs/clearcnv`) contains `samtools`.
+2. The **GRCh38 reference genome** is located at `/data/cephfs-1/work/groups/cubi/projects/2022-10-18_May_LRSV-detection/development/references/GRCh38/GRCh38.fa.gz`.
+3. The genome has been indexed, and the resulting index file is at `/data/cephfs-1/work/groups/cubi/projects/2022-10-18_May_LRSV-detection/development/references/GRCh38/GRCh38.fa.gz.fai`.
+
+[2026-07-17 14:56:00] session opened
+578943b0-8440-4751-887d-fee658ebf3b6 · profile default · model Qwen/Qwen3.6-27B-FP8
+
+[2026-07-17 14:56:27] session opened
+578943b0-8440-4751-887d-fee658ebf3b6 · profile default · model Qwen/Qwen3.6-27B-FP8
+
+[2026-07-17 14:56:40] session opened
+578943b0-8440-4751-887d-fee658ebf3b6 · profile default · model Qwen/Qwen3.6-27B-FP8
+
+[2026-07-17 14:57:10] session opened
+578943b0-8440-4751-887d-fee658ebf3b6 · profile default · model Qwen/Qwen3.6-27B-FP8
+
+[2026-07-17 15:10:44] session opened
+578943b0-8440-4751-887d-fee658ebf3b6 · profile default · model Qwen/Qwen3.6-27B-FP8
+
+[2026-07-17 15:11:01] session opened
+578943b0-8440-4751-887d-fee658ebf3b6 · profile default · model Qwen/Qwen3.6-27B-FP8
+
+[2026-07-17 15:11:02] session opened
+578943b0-8440-4751-887d-fee658ebf3b6 · profile default · model Qwen/Qwen3.6-27B-FP8
+

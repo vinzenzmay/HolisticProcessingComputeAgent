@@ -82,7 +82,9 @@ class LoggingSettings(_Section):
     """Plain-text session transcripts for later analysis (see hpca.logs)."""
 
     enabled: bool = True
-    dir: str | None = None  # default: ./hpca-logs, where hpca was started
+    # Default: <app dir>/chatlogs. Set to collect them somewhere else, e.g. on
+    # a project share; ~ is expanded.
+    dir: str | None = None
 
 
 class RagSettings(_Section):

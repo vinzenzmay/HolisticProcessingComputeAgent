@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 from os import environ as os_environ
+from time import monotonic
 from typing import Any
 
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -108,10 +109,11 @@ class SessionsList(ListView):
     BINDINGS = [
         Binding("r", "rename_session", "rename"),
         Binding("t", "retitle_session", "ask llm for a title"),
+        Binding("d", "delete_session", "delete session"),
     ]
 
     def check_action(self, action: str, parameters) -> bool | None:
-        if action in ("rename_session", "retitle_session"):
+        if action in ("rename_session", "retitle_session", "delete_session"):
             return getattr(self.highlighted_child, "data_session", None) is not None
         return True
 
@@ -120,6 +122,9 @@ class SessionsList(ListView):
 
     def action_retitle_session(self) -> None:
         self.app.retitle_selected_session()
+
+    def action_delete_session(self) -> None:
+        self.app.confirm_delete_session()
 
 
 class SessionsPanel(ColumnPanel):
@@ -239,6 +244,57 @@ class ChatItem(ListItem):
             # Textual dispatches every _on_click up the MRO, so ListItem's
             # "activate me" is stopped by preventing it, not by not calling it.
             event.prevent_default()
+
+
+class WorkingIndicator(Static):
+    """Sits at the end of the log while a reply is on its way.
+
+    A turn is silent for seconds, or minutes with thinking on, and a still
+    screen looks like a hung one. It names the step the graph reports —
+    thinking, or the tool in flight — and times that step, which is how you
+    tell a slow answer from a lost one.
+    """
+
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    INTERVAL = 0.08
+
+    def __init__(self, activity: str = "working") -> None:
+        super().__init__(classes="chat-working")
+        self._frame = 0
+        self._activity = activity
+        self._started = monotonic()
+
+    def on_mount(self) -> None:
+        self._started = monotonic()
+        self.set_interval(self.INTERVAL, self._advance)
+        self._render_frame()
+
+    @property
+    def activity(self) -> str:
+        return self._activity
+
+    @property
+    def elapsed(self) -> int:
+        return int(monotonic() - self._started)
+
+    def set_activity(self, activity: str) -> None:
+        """Name the step now in flight; its clock starts over, so the number
+        answers "is this step stuck?" rather than "how long since I asked?"."""
+        if activity == self._activity:
+            return
+        self._activity = activity
+        self._started = monotonic()
+        self._render_frame()
+
+    def _advance(self) -> None:
+        self._frame = (self._frame + 1) % len(self.FRAMES)
+        self._render_frame()
+
+    def _render_frame(self) -> None:
+        elapsed = f" {self.elapsed}s" if self.elapsed else ""
+        self.update(
+            Content(f"{self.FRAMES[self._frame]} {self._activity}…{elapsed}")
+        )
 
 
 class ChatList(ListView):
@@ -368,6 +424,10 @@ class HpcaApp(App):
     .chat-error {
         border: round $error;
         color: $error;
+    }
+    .chat-working {
+        color: $text-muted;
+        padding: 0 1;
     }
     """
 
@@ -555,9 +615,27 @@ class HpcaApp(App):
         self._run_agent(user_text=text)
 
     def _run_agent(self, *, user_text: str | None = None, resume: Command | None = None):
+        self.show_working()
         return self.run_worker(
             self._agent_turn(user_text=user_text, resume=resume), exclusive=True
         )
+
+    def show_working(self) -> None:
+        """Put the spinner after the last message: a reply is on its way."""
+        chat_list = self.query_one("#chat-list", ListView)
+        if not chat_list.query(WorkingIndicator):
+            chat_list.append(ChatItem(WorkingIndicator()))
+            chat_list.scroll_end(animate=False)
+
+    def hide_working(self) -> None:
+        for item in list(self.query_one("#chat-list", ListView).children):
+            if item.query(WorkingIndicator):
+                item.remove()
+
+    def report_activity(self, activity: str) -> None:
+        """What the graph is doing right now, for the spinner to say."""
+        for indicator in self.query(WorkingIndicator):
+            indicator.set_activity(activity)
 
     async def _agent_turn(
         self, *, user_text: str | None, resume: Command | None
@@ -571,10 +649,12 @@ class HpcaApp(App):
                 resume=resume,
             )
         except Exception as e:
+            self.hide_working()
             await self._append_chat("error", f"Agent error: {e}")
             self._log_write("error", str(e))
             self.notify(str(e), severity="error")
             return
+        self.hide_working()
         self._log_turn(result)
         await self._set_chat_messages(result.messages, result.thinking)
         await self.refresh_processes()
@@ -907,6 +987,50 @@ class HpcaApp(App):
         highlighted = self.query_one("#sessions-list", ListView).highlighted_child
         return getattr(highlighted, "data_session", None)
 
+    def confirm_delete_session(self) -> None:
+        session = self._highlighted_session()
+        if session is None:
+            return
+
+        def verdict(confirmed: bool | None) -> None:
+            if confirmed:
+                self.run_worker(self._delete_session(session), group="sessions")
+
+        self.push_screen(
+            ConfirmScreen(
+                f"Really delete “{session.title}”?\n"
+                "The chat is dropped; its log on disk is kept."
+            ),
+            verdict,
+        )
+
+    async def _delete_session(self, session: Session) -> None:
+        """Drop a chat thread: its row, its aliases, its checkpoints.
+
+        The transcript on disk is deliberately untouched — it is the record
+        the session existed at all.
+        """
+        self._log_write("session deleted", f"{session.title} (log kept)")
+        if self._is_active_session(session):
+            await self.close_session()
+        self.session_store.delete(session.session_id)
+        try:
+            await self._checkpointer.adelete_thread(session.session_id)
+        except Exception as e:  # the row is already gone; say so and move on
+            self.notify(f"Chat history left behind: {e}", severity="warning")
+        await self._reload_sessions()
+        self.notify(f"Deleted “{session.title}”")
+
+    async def close_session(self) -> None:
+        """Leave the active session: empty chat, no entry, nothing to type in."""
+        self.active_session = None
+        self._tool_ctx = None
+        self._log = None
+        self._needs_title = False
+        await self._set_chat_messages([])
+        self.query_one("#chat-input", ChatInput).display = False
+        self._focus_column("sessions")
+
     async def open_session(self, session: Session) -> None:
         self._activate_session(session)
         snapshot = await self.graph.aget_state(
@@ -1224,6 +1348,7 @@ class HpcaApp(App):
             ctx=lambda: self._tool_ctx,
             system_prompt_fn=self._render_system_prompt,
             max_retries=self.settings.llm.max_retries,
+            on_activity=lambda activity: self.report_activity(activity),
         )
 
     def action_confirm_quit(self) -> None:
