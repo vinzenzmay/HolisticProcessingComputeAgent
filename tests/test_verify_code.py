@@ -306,12 +306,10 @@ class TestCreateScriptGate:
 def faketool(tmp_path):
     """A real executable with a real --help, so the probe path runs for real.
 
-    Lives in a bin/ directory because that is what marks a command as packaged
-    software the probe is allowed to execute (see TestProbeSafety).
+    Deliberately *not* in a bin/ directory: an installed tool may sit
+    anywhere, and probing must not depend on where it was put.
     """
-    bindir = tmp_path / "bin"
-    bindir.mkdir(exist_ok=True)
-    path = bindir / "faketool"
+    path = tmp_path / "faketool"
     path.write_text(
         "#!/bin/bash\n"
         "cat <<'EOF'\n"
@@ -372,23 +370,22 @@ class TestAutoIndexing:
 
 
 class TestProbeSafety:
-    """The probe runs a program to read its --help, so it must never run the
-    user's own code: create_script happens before the §5.3 approval gate."""
-
-    async def test_user_script_outside_bin_is_never_executed(self, ctx, tmp_path):
-        marker = tmp_path / "side-effect.txt"
-        script = tmp_path / "mypipeline.sh"  # the user's tree, not a bin/ dir
-        script.write_text(f"#!/bin/bash\ntouch {marker}\n")
-        script.chmod(0o755)
-
-        result = await create(ctx, "custom", [f"{script} in.bam -x 5"])
-
-        assert not marker.exists(), "probing executed the user's script"
-        assert "custom" in ctx.registry.list()  # unverifiable, but not a failure
-        assert "not indexed" in result.lower()
+    """The probe runs a program to read its --help, so what it refuses to run
+    matters. Location is not one of the tests: requiring a bin/ directory
+    refused real tools at /software/<tool>-<version>/<tool> while still
+    running anything dropped in ~/bin, so it cost coverage and bought no
+    guarantee."""
 
     def test_installed_software_is_probeable(self):
-        assert safe_to_execute("sort")  # /usr/bin/sort
+        assert safe_to_execute("sort")
+
+    def test_a_tool_outside_bin_is_probeable(self, tmp_path):
+        """The HPC layout the old bin/ rule silently refused."""
+        tool = tmp_path / "software" / "minimap2-2.24" / "minimap2"
+        tool.parent.mkdir(parents=True)
+        tool.write_text("#!/bin/bash\necho hi\n")
+        tool.chmod(0o755)
+        assert safe_to_execute(str(tool))
 
     def test_destructive_commands_are_never_probed(self):
         assert not safe_to_execute("rm")
@@ -396,6 +393,30 @@ class TestProbeSafety:
 
     def test_unknown_command_is_not_probeable(self):
         assert not safe_to_execute("no-such-program-xyz")
+
+    def test_the_agents_own_scripts_are_never_executed(self, tmp_path):
+        """A generated script has no --help to read, and running one before
+        the §5.3 approval gate has seen it would invert that gate."""
+        scripts = tmp_path / "scripts"
+        scripts.mkdir()
+        generated = scripts / "pipeline.sh"
+        generated.write_text("#!/bin/bash\necho hi\n")
+        generated.chmod(0o755)
+        assert not safe_to_execute(str(generated), scripts_dir=scripts)
+        assert safe_to_execute(str(generated))  # the rule is the directory
+
+    async def test_a_generated_script_is_not_run_by_the_gate(self, ctx, tmp_path):
+        marker = tmp_path / "side-effect.txt"
+        ctx.scripts_dir.mkdir(parents=True, exist_ok=True)
+        helper = ctx.scripts_dir / "helper.sh"
+        helper.write_text(f"#!/bin/bash\ntouch {marker}\n")
+        helper.chmod(0o755)
+
+        result = await create(ctx, "wrapper", [f"{helper} in.bam -x 5"])
+
+        assert not marker.exists(), "the gate executed a script the agent wrote"
+        assert "wrapper" in ctx.registry.list()  # unverifiable is not a failure
+        assert "not indexed" in result.lower()
 
 
 class TestCommandsNeedingDocs:

@@ -64,24 +64,36 @@ async def fetch_manpage(name: str) -> str | None:
     return OVERSTRIKE_RE.sub("", stdout.decode(errors="replace"))
 
 
-def safe_to_execute(executable: str) -> bool:
-    """Whether probing this command with ``--help`` is safe.
+def safe_to_execute(executable: str, *, scripts_dir: Path | None = None) -> bool:
+    """Whether probing this command with ``--help`` may run it.
 
-    Packaged software living in a ``bin/`` directory — system tools, conda
-    envs, module installs — implements ``--help`` by convention and exits.
-    A script in the user's own tree is *their* code: it may ignore ``--help``
-    and simply run, which would mean executing it before the human approval
-    gate (§5.3) ever saw the script that calls it. Such commands stay
-    unindexed, which is only a warning; man pages are still consulted for
-    them, since fetching one never runs the tool.
+    Deliberately not a judgement about *where* the program lives. An earlier
+    version demanded a ``bin/`` directory as a proxy for "packaged software"
+    and was wrong in both directions: it refused real tools installed at
+    ``/software/<tool>-<version>/<tool>``, an ordinary HPC layout, while
+    happily running whatever a user had dropped in ``~/bin``. Location
+    describes where something was put, not what it does, so the restriction
+    cost real coverage — unindexed commands are unverifiable, which is the
+    problem this whole path exists to fix — and bought no guarantee.
+
+    Two exact rules remain. Known-destructive commands are never run; their
+    man pages still cover them, and fetching one executes nothing. Neither is
+    anything the agent itself wrote: a generated script has no ``--help`` to
+    read, and running one before the approval gate (§5.3) has seen it would
+    invert that gate.
     """
     if basename(executable) in NEVER_EXECUTE:
         return False
     resolved = shutil.which(executable)
     if resolved is None:
+        return False  # not on PATH and not an executable path: nothing to run
+    if scripts_dir is not None:
+        try:
+            Path(resolved).resolve().relative_to(Path(scripts_dir).resolve())
+        except ValueError:
+            return True  # outside the agent's own scripts, which is the norm
         return False
-    parts = Path(resolved).resolve().parts
-    return "bin" in parts or "sbin" in parts
+    return True
 
 
 async def fetch_help(executable: str, subcommand: str = "") -> str | None:
@@ -139,7 +151,7 @@ async def learn_command(executable: str, subcommand: str, ctx: ToolContext) -> s
         manpage = await fetch_manpage(key)
         if manpage is not None:
             symbols += parse_manpage_flags(manpage, command=key)
-        if safe_to_execute(executable):
+        if safe_to_execute(executable, scripts_dir=ctx.scripts_dir):
             help_text = await fetch_help(executable, sub)
             if help_text is not None:
                 symbols += parse_help_flags(help_text, command=key)
