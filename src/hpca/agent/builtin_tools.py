@@ -171,6 +171,17 @@ async def start_script(args: StartScriptParams, ctx: ToolContext) -> str:
         raise ValueError(
             f"Cannot start {args.registry_key!r}: unknown script type {path.suffix!r}"
         )
+    # A model that does not get an immediate result readily starts the script
+    # twice; both copies then write the same outputs, and the corrupted result
+    # is far worse than the wasted CPU (seen in a live session: two sniffles
+    # runs onto one VCF). The wait is now honest — §5.4 reports the exit.
+    running = ctx.runner.running_named(args.registry_key)
+    if running is not None:
+        return (
+            f"NOT started: {args.registry_key!r} is already running (pid "
+            f"{running}), and a second copy would write the same output files. "
+            "Wait for it — you will be told when it finishes — or kill it first."
+        )
     argv = interpreter + [str(path)] + (args.args.split() if args.args else [])
     record = await ctx.runner.start(argv, name=args.registry_key, background=True)
     stdout_key = ctx.registry.register_auto(

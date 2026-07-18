@@ -164,6 +164,29 @@ class ProcessRunner:
             except ProcessLookupError:
                 pass
 
+    def running_named(self, name: str) -> int | None:
+        """Live pid of a still-running process with this name, or None.
+
+        Reads the table, not ``_records``: the TUI builds a fresh runner per
+        turn, and the duplicate this guards against is precisely a second
+        start in a *later* turn. Liveness is confirmed against the OS so a row
+        left at 'running' by a crashed app cannot block the name forever.
+        """
+        rows = self._conn.execute(
+            "SELECT pid FROM processes WHERE session_id = ? AND name = ? "
+            "AND state = 'running'",
+            (self._session_id, name),
+        ).fetchall()
+        for row in rows:
+            try:
+                os.kill(row["pid"], 0)  # signal 0: liveness only
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                pass  # exists, just not ours to signal
+            return row["pid"]
+        return None
+
     def get(self, pid: int) -> ProcessRecord:
         return self._records[pid]
 

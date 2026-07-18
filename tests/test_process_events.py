@@ -126,6 +126,74 @@ class TestOnlyBackgroundWork:
         assert changes[0].state == "failed"
 
 
+class TestNoDuplicateStart:
+    """A live session started one script twice (pids 38429 and 38443), both
+    writing the same VCF. Corrupted output, not just wasted CPU."""
+
+    @pytest.fixture
+    def ctx(self, conn, tmp_path):
+        from hpca.agent.context import ToolContext
+        from hpca.config import Settings
+        from hpca.registry import PathRegistry
+
+        return ToolContext(
+            registry=PathRegistry(conn, profile="default", session_id="s1"),
+            runner=ProcessRunner(conn, session_id="s1", log_dir=tmp_path / "logs"),
+            settings=Settings(),
+            scripts_dir=tmp_path / "scripts",
+        )
+
+    async def _make(self, ctx, key, lines):
+        from hpca.agent.builtin_tools import default_tool_registry
+
+        tools = default_tool_registry()
+        create = tools.get("create_script")
+        await create.handler(
+            create.params.model_validate(
+                {"kind": "bash", "registry_key": key, "content_lines": lines}
+            ),
+            ctx,
+        )
+        return tools.get("start_script")
+
+    async def test_second_start_is_refused(self, ctx):
+        start = await self._make(ctx, "slow_job", ["sleep 5"])
+        first = await start.handler(
+            start.params.model_validate({"registry_key": "slow_job"}), ctx
+        )
+        second = await start.handler(
+            start.params.model_validate({"registry_key": "slow_job"}), ctx
+        )
+        assert "Started" in first
+        assert "NOT started" in second
+        assert "already running" in second
+        assert len(ctx.runner.list()) == 1
+
+    async def test_restart_allowed_once_it_has_finished(self, ctx):
+        start = await self._make(ctx, "quick_job", ["true"])
+        first = await start.handler(
+            start.params.model_validate({"registry_key": "quick_job"}), ctx
+        )
+        pid = int(first.split("pid ")[1].split(")")[0])
+        await ctx.runner.wait(pid)
+        again = await start.handler(
+            start.params.model_validate({"registry_key": "quick_job"}), ctx
+        )
+        assert "Started" in again
+
+    async def test_stale_running_row_does_not_block_forever(self, conn, ctx):
+        """A row left at 'running' by a crashed app must not wedge the name."""
+        start = await self._make(ctx, "ghost", ["true"])
+        await start.handler(
+            start.params.model_validate({"registry_key": "ghost"}), ctx
+        )
+        conn.execute(
+            "UPDATE processes SET state = 'running', pid = 999999 WHERE name = 'ghost'"
+        )
+        conn.commit()
+        assert ctx.runner.running_named("ghost") is None
+
+
 class TestFormatProcessEvent:
     async def test_failure_names_the_error_and_asks_for_a_fix(self, conn, runner):
         record = await runner.start(
