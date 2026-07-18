@@ -46,16 +46,19 @@ DISCOVERY_GUIDANCE = (
     "output of a small bash script in one step (create_script + run_script is "
     "for scripts worth keeping, e.g. submitted to Slurm). Useful lines: "
     "`find <dirs> -maxdepth <n> -iname '<pattern>' 2>/dev/null | head -20` to "
-    "locate files; `command -v samtools` to check a program; `conda env list`, "
-    "`module avail <name> 2>&1` to find one that is not on PATH. Keep searches "
+    "locate files; `command -v samtools` to check a program. For a tool that "
+    "is not on PATH, first see which package managers this site actually has "
+    "(`command -v conda mamba micromamba spack module apptainer`) and query "
+    "only the ones that answered, or search the likely install roots directly "
+    "with find. Keep searches "
     "bounded so they finish in seconds: start from likely roots rather than /, "
     "cap the depth, pipe through head. Then register_path the paths it printed "
     "and use them by key."
 )
 
-# The single most common way the agent burns its tool budget: it cannot run a
-# conda tool and thrashes on activation. `source .../envs/<env>/bin/activate`
-# does not exist (only the base install has activate). Give it the idiom.
+# The single most common way the agent burns its tool budget: it cannot run an
+# environment-managed tool and thrashes trying to activate one. The idiom that
+# ends that thrashing lives in ENVIRONMENT_TOOL_GUIDANCE below.
 SCRIPT_GUIDANCE = (
     "Run real work (a tool, a pipeline) with create_script then start_script — "
     "those bash scripts run fail-fast (`set -euo pipefail` is added), so a "
@@ -70,14 +73,25 @@ SCRIPT_GUIDANCE = (
 )
 
 
+# Retired the conda-specific idioms. They were wrong on the very machine this
+# runs on, where conda is not installed at all (mamba is), and wrong again on
+# any site using modules, Spack or containers. A live session followed them and
+# failed twice — `conda run` then `mamba run`, both "command not found" — and
+# only succeeded once it called the binary by its full path. So teach the form
+# that works whatever installed the tool, and teach checking before assuming.
+# The real fix is a provider registry rendering these facts per site; until
+# then this says only what is true regardless of packaging system.
 ENVIRONMENT_TOOL_GUIDANCE = (
-    "Most bioinformatics tools here live in conda environments, not on PATH. "
-    "To run one, either use `conda run -n <env> <tool> <args>` (works inside a "
-    "script without activating anything), or call the tool by its full binary "
-    "path `<conda-root>/envs/<env>/bin/<tool>` — find that path with a "
-    "run_bash search first. Do NOT `source .../envs/<env>/bin/activate`: that "
-    "file does not exist and wastes a step. `conda env list` shows the "
-    "environments and their roots."
+    "Scientific tools here are usually NOT on PATH: they live in package "
+    "environments or module trees, and which system manages them differs per "
+    "site (conda, mamba, micromamba, Spack, Lmod, containers). Assume nothing "
+    "— neither that a tool name works as typed, nor that any particular "
+    "package manager exists. Find the executable first (see below), then call "
+    "it by its full binary path in your script: that is the one form that "
+    "works whatever installed it. A wrapper like `conda run -n <env> <tool>` "
+    "only works if that wrapper is itself installed, so check with "
+    "`command -v conda` before relying on one. Do not try to `source` an "
+    "activate script: it is rarely where you expect and wastes a step."
 )
 
 
