@@ -36,3 +36,5 @@ class ToolContext:
     rag: RagStore | None = None
     embedder: EmbeddingClient | None = None
     skills: list[Skill] = field(default_factory=list)
+    # Commands whose docs could not be fetched; probed at most once per session
+    doc_probe_failed: set[str] = field(default_factory=set)

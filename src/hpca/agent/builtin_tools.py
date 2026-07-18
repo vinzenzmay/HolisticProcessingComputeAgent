@@ -106,6 +106,14 @@ async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
     warnings: list[str] = []
     if check.skipped:
         warnings.append(check.errors)
+    if ctx.symbols is not None:
+        # Learn the flags of the external programs this script drives before
+        # judging it. Without this the gate below has nothing to check for
+        # exactly the tools that matter (minimap2, samtools, ...), because
+        # index_docs is explicit-only and nothing ever calls it (§5.2, §5.6).
+        from hpca.agent.doc_tools import autoindex_script_commands
+
+        await autoindex_script_commands(args.kind, content, ctx)
     if ctx.symbols is not None and ctx.symbols.count() > 0:
         # semantic code-vs-docs gate (§5.2): mismatches block, gaps only warn
         reports = verify_script(args.kind, content, index=ctx.symbols)

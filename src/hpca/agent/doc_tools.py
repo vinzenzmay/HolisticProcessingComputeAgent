@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shutil
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -19,13 +21,29 @@ from hpca.agent.context import ToolContext
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.embeddings import EmbeddingError
 from hpca.rag import chunk_text
-from hpca.symbols import index_python_source, parse_manpage_flags
+from hpca.symbols import index_python_source, parse_help_flags, parse_manpage_flags
+from hpca.verify_code import basename, commands_needing_docs
 
 MANPAGE_MAX_LINES = 400
 SOURCE_MAX_LINES = 200
 SEARCH_TOP_K = 5
 DOC_SUFFIXES = {".md", ".txt", ".rst", ".text"}
 OVERSTRIKE_RE = re.compile(".\x08")
+
+HELP_TIMEOUT_SECONDS = 10
+HELP_MAX_CHARS = 200_000
+# Below this, assume the parse failed rather than that the tool has no flags.
+# A half-parsed flag list is worse than none: it turns correct scripts into
+# gate failures. Falling short here leaves the command unindexed, which only
+# warns — the pre-existing behaviour.
+MIN_PARSED_FLAGS = 4
+MAX_AUTOINDEX_PROBES = 6
+# Probing runs the program with --help. Fetching a man page never does, so
+# these stay reachable by the man path; only the exec probe is refused.
+NEVER_EXECUTE = {
+    "rm", "rmdir", "dd", "mkfs", "shred", "mv", "cp", "chmod", "chown",
+    "truncate", "fdisk", "mkswap", "wipefs", "sbatch", "srun", "scancel",
+}
 
 
 async def fetch_manpage(name: str) -> str | None:
@@ -44,6 +62,121 @@ async def fetch_manpage(name: str) -> str | None:
     if proc.returncode != 0 or not stdout:
         return None
     return OVERSTRIKE_RE.sub("", stdout.decode(errors="replace"))
+
+
+def safe_to_execute(executable: str) -> bool:
+    """Whether probing this command with ``--help`` is safe.
+
+    Packaged software living in a ``bin/`` directory — system tools, conda
+    envs, module installs — implements ``--help`` by convention and exits.
+    A script in the user's own tree is *their* code: it may ignore ``--help``
+    and simply run, which would mean executing it before the human approval
+    gate (§5.3) ever saw the script that calls it. Such commands stay
+    unindexed, which is only a warning; man pages are still consulted for
+    them, since fetching one never runs the tool.
+    """
+    if basename(executable) in NEVER_EXECUTE:
+        return False
+    resolved = shutil.which(executable)
+    if resolved is None:
+        return False
+    parts = Path(resolved).resolve().parts
+    return "bin" in parts or "sbin" in parts
+
+
+async def fetch_help(executable: str, subcommand: str = "") -> str | None:
+    """``<cmd> [sub] --help`` text, or None if the program yielded nothing.
+
+    Output is read from both streams and regardless of exit status: plenty of
+    bioinformatics tools print their usage to stderr and exit non-zero
+    (minimap2, bwa), which a returncode check would throw away.
+    """
+    argv = [executable] + ([subcommand] if subcommand else [])
+    for flag in ("--help", "-h"):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv, flag,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=dict(os.environ, COLUMNS="80", MANWIDTH="80"),
+            )
+        except (OSError, ValueError):
+            return None  # not executable / not found — no point trying -h
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), HELP_TIMEOUT_SECONDS
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            proc.kill()
+            await proc.wait()
+            return None  # give up on a hanging tool rather than hang again on -h
+        text = (stdout + stderr).decode(errors="replace")[:HELP_MAX_CHARS]
+        if text.strip():
+            return text
+    return None
+
+
+async def learn_command(executable: str, subcommand: str, ctx: ToolContext) -> str | None:
+    """Index one CLI's flags on demand; returns the index key, or None.
+
+    Both sources are unioned rather than tried in order, because each misses
+    flags the other has: ``sort``/``head``/``sed`` document no OPTIONS section
+    a man parser can find, while ``find``'s man page lists 9 flags and hides
+    ``-maxdepth`` in EXPRESSION, where ``--help`` does list it. Missing a real
+    flag is what turns a correct script into a gate failure, so coverage wins.
+    The subcommand-qualified key is tried first because ``samtools --help``
+    lists subcommands rather than ``samtools view``'s flags.
+    """
+    if ctx.symbols is None:
+        return None
+    name = basename(executable)
+    candidates = [(f"{name}-{subcommand}", subcommand)] if subcommand else []
+    candidates.append((name, ""))
+    for key, sub in candidates:
+        if ctx.symbols.has_command(key):
+            return key
+        symbols = []
+        manpage = await fetch_manpage(key)
+        if manpage is not None:
+            symbols += parse_manpage_flags(manpage, command=key)
+        if safe_to_execute(executable):
+            help_text = await fetch_help(executable, sub)
+            if help_text is not None:
+                symbols += parse_help_flags(help_text, command=key)
+        unique = list({symbol.name: symbol for symbol in reversed(symbols)}.values())
+        if len(unique) >= MIN_PARSED_FLAGS:
+            ctx.symbols.clear_source(f"man:{key}")
+            ctx.symbols.clear_source(f"help:{key}")
+            ctx.symbols.add(unique)
+            return key
+    return None
+
+
+async def autoindex_script_commands(
+    kind: str, content: str, ctx: ToolContext
+) -> list[str]:
+    """Learn the flags of every external program a script drives (§5.2).
+
+    Runs before the verification gate so that gate has something to check.
+    Deterministic on purpose: the model never decides whether to look a tool
+    up, because under instruction load a small model reliably decides not to.
+    Commands that cannot be learned are remembered as failures so a session
+    probes each one at most once.
+    """
+    if ctx.symbols is None:
+        return []
+    pending = commands_needing_docs(kind, content, index=ctx.symbols)
+    learned: list[str] = []
+    for executable, subcommand in pending[:MAX_AUTOINDEX_PROBES]:
+        name = basename(executable)
+        if name in ctx.doc_probe_failed:
+            continue
+        key = await learn_command(executable, subcommand, ctx)
+        if key is None:
+            ctx.doc_probe_failed.add(name)
+        else:
+            learned.append(key)
+    return learned
 
 
 class LookupSymbolParams(BaseModel):

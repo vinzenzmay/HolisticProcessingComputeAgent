@@ -6,6 +6,7 @@ from hpca.db import connect, init_db
 from hpca.symbols import (
     SymbolIndex,
     index_python_source,
+    parse_help_flags,
     parse_manpage_flags,
     parse_python_module,
 )
@@ -100,6 +101,43 @@ class TestParseManpageFlags:
     def test_see_also_section_not_scanned(self):
         symbols = parse_manpage_flags(MAN_PAGE, command="samtools-view")
         assert all(s.name.startswith("-") for s in symbols)
+
+
+HELP_TEXT = """Usage: minimap2 [options] <target.fa>|<target.idx> [query.fa] [...]
+Options:
+  Indexing:
+    -k INT       minimizer k-mer length [15]
+    -w INT       minimizer window size [10]
+  Alignment:
+    -A INT       matching score [2]
+    -x STR       preset: map-ont, map-pb, sr
+    --version    show version number
+"""
+
+
+class TestParseHelpFlags:
+    def test_flags_found_without_manstyle_section_headers(self):
+        symbols = parse_help_flags(HELP_TEXT, command="minimap2")
+        assert {s.name for s in symbols} == {"-k", "-w", "-A", "-x", "--version"}
+
+    def test_nested_indentation_does_not_hide_flags(self):
+        # minimap2 groups options under indented "Indexing:" / "Alignment:"
+        # sub-headers; a man-style OPTIONS gate finds none of them.
+        assert parse_manpage_flags(HELP_TEXT, command="minimap2") == []
+
+    def test_metavar_split_from_description(self):
+        by_name = {s.name: s for s in parse_help_flags(HELP_TEXT, command="minimap2")}
+        assert by_name["-x"].doc == "preset: map-ont, map-pb, sr"
+
+    def test_usage_line_is_not_read_as_a_flag(self):
+        assert all(
+            s.name.startswith("-")
+            for s in parse_help_flags(HELP_TEXT, command="minimap2")
+        )
+
+    def test_source_marks_provenance(self):
+        symbols = parse_help_flags(HELP_TEXT, command="minimap2")
+        assert all(s.source == "help:minimap2" for s in symbols)
 
 
 class TestSymbolIndex:

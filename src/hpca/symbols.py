@@ -119,10 +119,18 @@ def parse_python_module(text: str, *, module: str, source: str) -> list[Symbol]:
 # ---------------------------------------------------------------- man pages
 
 
-def parse_manpage_flags(text: str, *, command: str) -> list[Symbol]:
-    """Extract flags from the OPTIONS section(s) of rendered man-page text."""
+def _parse_flag_entries(
+    text: str, *, command: str, source: str, section_gated: bool
+) -> list[Symbol]:
+    """Shared flag scanner for man pages and ``--help`` output.
+
+    ``section_gated`` selects the man-page dialect: only lines inside an
+    all-caps OPTIONS section count. ``--help`` output has no such headers (it
+    uses "Options:", "Alignment:", or no header at all), so help mode scans
+    every indented flag entry instead.
+    """
     symbols: list[Symbol] = []
-    in_options = False
+    in_options = not section_gated
     entry_symbols: list[Symbol] = []  # flags of the entry being read
     doc_lines: list[str] = []
 
@@ -135,7 +143,12 @@ def parse_manpage_flags(text: str, *, command: str) -> list[Symbol]:
 
     for lineno, line in enumerate(text.splitlines()):
         stripped = line.strip()
-        if line and not line[0].isspace() and SECTION_RE.match(stripped):
+        if (
+            section_gated
+            and line
+            and not line[0].isspace()
+            and SECTION_RE.match(stripped)
+        ):
             flush()
             in_options = "OPTION" in stripped
             continue
@@ -163,7 +176,7 @@ def parse_manpage_flags(text: str, *, command: str) -> list[Symbol]:
                     kind="cli-flag",
                     parent=command,
                     signature=stripped,
-                    source=f"man:{command}",
+                    source=source,
                     lineno=lineno,
                 )
                 symbols.append(symbol)
@@ -172,6 +185,24 @@ def parse_manpage_flags(text: str, *, command: str) -> list[Symbol]:
             doc_lines.append(stripped)
     flush()
     return symbols
+
+
+def parse_manpage_flags(text: str, *, command: str) -> list[Symbol]:
+    """Extract flags from the OPTIONS section(s) of rendered man-page text."""
+    return _parse_flag_entries(
+        text, command=command, source=f"man:{command}", section_gated=True
+    )
+
+
+def parse_help_flags(text: str, *, command: str) -> list[Symbol]:
+    """Extract flags from ``<cmd> --help`` output.
+
+    Many bioinformatics tools ship no man page inside a conda env, so help
+    text is the only machine-readable flag list available.
+    """
+    return _parse_flag_entries(
+        text, command=command, source=f"help:{command}", section_gated=False
+    )
 
 
 # -------------------------------------------------------------------- store

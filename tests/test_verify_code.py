@@ -5,6 +5,7 @@ import pytest
 from hpca.db import connect, init_db
 from hpca.symbols import Symbol, SymbolIndex
 from hpca.verify_code import (
+    commands_needing_docs,
     extract_bash,
     extract_python,
     verify_script,
@@ -40,6 +41,89 @@ class TestExtractBash:
     def test_command_after_and_and(self):
         usages = extract_bash("mkdir -p out && cd out\n")
         assert ("mkdir", [], ["-p"]) in usages
+
+
+class TestComments:
+    def test_full_line_comments_and_shebang_ignored(self):
+        usages = extract_bash("#!/bin/bash\n# dedupe with -x speed\nsort -u f.txt\n")
+        assert usages == [("sort", [], ["-u"])]
+
+    def test_trailing_comment_contributes_no_flags(self):
+        usages = extract_bash("sort -u f.txt  # not a --invented-flag\n")
+        assert usages == [("sort", [], ["-u"])]
+
+    def test_quoted_hash_is_data_not_a_comment(self):
+        # VCF headers start with '#'; treating it as a comment would drop the
+        # rest of the pipeline from verification entirely
+        usages = extract_bash("grep '#CHROM' in.vcf | cut -f1\n")
+        assert usages == [("grep", [], []), ("cut", [], ["-f1"])]
+
+    def test_hash_inside_a_regex_survives(self):
+        usages = extract_bash('grep -v "^#" in.vcf | sort -k1,1\n')
+        assert usages == [("grep", [], ["-v"]), ("sort", [], ["-k1,1"])]
+
+
+class TestPipelines:
+    """Every stage of a pipeline is its own command with its own flags."""
+
+    def test_three_stage_pipeline(self):
+        usages = extract_bash("grep -v chrM in.sam | sort -k1,1 | gzip -c > out.gz\n")
+        assert usages == [
+            ("grep", [], ["-v"]),
+            ("sort", [], ["-k1,1"]),
+            ("gzip", [], ["-c"]),
+        ]
+
+    def test_unspaced_pipe_still_splits(self):
+        # shlex.split leaves "in.bam|gzip" as one token, which merged both
+        # stages and checked gzip's flags against samtools
+        usages = extract_bash("samtools view -b in.bam|gzip -c > out.gz\n")
+        assert usages == [("samtools", ["view"], ["-b"]), ("gzip", [], ["-c"])]
+
+    def test_pipe_inside_quotes_is_data_not_a_separator(self):
+        usages = extract_bash("awk -F'|' '{print $1}' f.txt\n")
+        assert usages == [("awk", [], ["-F|"])]
+
+    def test_each_stage_may_be_separately_wrapped(self):
+        usages = extract_bash(
+            "conda run -n bio minimap2 -ax map-ont ref.fa r.fq | "
+            "conda run -n bio samtools sort -o out.bam -\n"
+        )
+        assert usages == [("minimap2", [], ["-ax"]), ("samtools", ["sort"], ["-o"])]
+
+    def test_bare_dash_operand_is_not_a_flag(self):
+        # `-` means stdin/stdout; treating it as a flag blocked every
+        # `samtools sort -o out.bam -` pipeline
+        usages = extract_bash("samtools sort -o out.bam -\n")
+        assert usages == [("samtools", ["sort"], ["-o"])]
+
+    def test_end_of_options_marker_stops_flag_collection(self):
+        usages = extract_bash("grep -- -weird file.txt\n")
+        assert usages == [("grep", [], [])]
+
+
+class TestUnwrapWrappers:
+    """ENVIRONMENT_TOOL_GUIDANCE tells the agent to write `conda run -n env
+    <tool>`; without unwrapping, every such line reads as a call to conda and
+    the tool's flags get checked against conda's."""
+
+    def test_conda_run_attributes_flags_to_the_inner_tool(self):
+        usages = extract_bash("conda run -n bio minimap2 -x map-ont ref.fa r.fq\n")
+        assert usages == [("minimap2", [], ["-x"])]
+
+    def test_long_form_env_flag_consumed_with_its_value(self):
+        usages = extract_bash("micromamba run --name bio bwa mem -t 4 ref.fa\n")
+        assert usages == [("bwa", ["mem"], ["-t"])]
+
+    def test_transparent_prefixes_stripped(self):
+        usages = extract_bash("time nohup samtools sort -o out.bam in.bam\n")
+        assert usages == [("samtools", ["sort"], ["-o"])]
+
+    def test_absolute_path_keeps_its_path_for_probing(self):
+        # the literal token is preserved so the auto-indexer can execute it;
+        # the index key is the basename (see TestVerifyBash)
+        usages = extract_bash("/opt/conda/envs/bio/bin/samtools view -b in.bam\n")
+        assert usages == [("/opt/conda/envs/bio/bin/samtools", ["view"], ["-b"])]
 
 
 class TestExtractPython:
@@ -112,6 +196,26 @@ class TestVerifyBash:
         reports = verify_script("bash", "samtools view -o out.bam in.bam\n", index=index)
         assert reports[0].status == "confirmed"
 
+    def test_absolute_path_resolves_to_the_basename_key(self, index):
+        reports = verify_script(
+            "bash", "/opt/conda/envs/bio/bin/samtools view -b in.bam\n", index=index
+        )
+        assert reports[0].status == "confirmed"
+
+    def test_attached_short_option_value_is_not_a_mismatch(self, index):
+        # `-q20` and `-q 20` are the same flag; an exact-match test would
+        # block a correct script (this bit `sort -k1,1` in a live run)
+        reports = verify_script("bash", "samtools view -q20 in.bam\n", index=index)
+        assert reports[0].status == "confirmed"
+
+    def test_clustered_short_options_accepted(self, index):
+        reports = verify_script("bash", "samtools view -bq in.bam\n", index=index)
+        assert reports[0].status == "confirmed"
+
+    def test_invented_long_flag_still_blocked(self, index):
+        reports = verify_script("bash", "grep --notaflag x f\n", index=index)
+        assert reports[0].status == "mismatch"
+
 
 class TestVerifyPython:
     def test_valid_kwargs_confirmed(self, index):
@@ -146,6 +250,7 @@ class TestVerifyOtherKinds:
 
 from hpca.agent.builtin_tools import default_tool_registry  # noqa: E402
 from hpca.agent.context import ToolContext  # noqa: E402
+from hpca.agent.doc_tools import safe_to_execute  # noqa: E402
 from hpca.config import Settings  # noqa: E402
 from hpca.registry import PathRegistry  # noqa: E402
 from hpca.runner import ProcessRunner  # noqa: E402
@@ -195,3 +300,119 @@ class TestCreateScriptGate:
         ctx.symbols = None
         result = await create(ctx, "ungated", ["samtools view -e in.bam"])
         assert "ungated" in ctx.registry.list()
+
+
+@pytest.fixture
+def faketool(tmp_path):
+    """A real executable with a real --help, so the probe path runs for real.
+
+    Lives in a bin/ directory because that is what marks a command as packaged
+    software the probe is allowed to execute (see TestProbeSafety).
+    """
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    path = bindir / "faketool"
+    path.write_text(
+        "#!/bin/bash\n"
+        "cat <<'EOF'\n"
+        "Usage: faketool [options] <in>\n"
+        "Options:\n"
+        "  -a           enable the first thing\n"
+        "  -b INT       the second thing\n"
+        "  -c STR       the third thing\n"
+        "  --verbose    say more\n"
+        "EOF\n"
+    )
+    path.chmod(0o755)
+    return path
+
+
+class TestAutoIndexing:
+    """The gate is useless on commands nobody indexed, and index_docs is
+    explicit-only — so create_script learns them itself (§5.2)."""
+
+    async def test_unknown_command_is_learned_from_its_help(self, ctx, faketool):
+        assert not ctx.symbols.has_command("faketool")
+        await create(ctx, "ok", [f"{faketool} -a -b 3 in.txt"])
+        assert ctx.symbols.has_command("faketool")
+        assert set(ctx.symbols.flags_for("faketool")) == {"-a", "-b", "-c", "--verbose"}
+
+    async def test_correct_usage_of_a_learned_command_passes(self, ctx, faketool):
+        result = await create(ctx, "ok", [f"{faketool} -a --verbose in.txt"])
+        assert "NOT created" not in result
+        assert "ok" in ctx.registry.list()
+
+    async def test_invented_flag_blocks_once_the_command_is_learned(
+        self, ctx, faketool
+    ):
+        result = await create(ctx, "bad", [f"{faketool} -z in.txt"])
+        assert "NOT created" in result
+        assert "-z" in result
+        assert "bad" not in ctx.registry.list()
+
+    async def test_unprobeable_command_warns_and_is_not_retried(self, ctx):
+        result = await create(ctx, "warned", ["no-such-program-xyz -q in.txt"])
+        assert "warned" in ctx.registry.list()  # unverifiable is not a failure
+        assert "not indexed" in result.lower()
+        assert "no-such-program-xyz" in ctx.doc_probe_failed
+
+    async def test_every_stage_of_a_pipeline_is_learned(self, ctx, faketool):
+        await create(ctx, "piped", [f"cat in.txt | {faketool} -a | gzip -c > o.gz"])
+        assert ctx.symbols.has_command("faketool")
+        assert ctx.symbols.has_command("gzip")  # downstream stage, learned too
+
+    async def test_bad_flag_in_a_downstream_stage_blocks(self, ctx, faketool):
+        result = await create(ctx, "bad", [f"cat in.txt | {faketool} -z"])
+        assert "NOT created" in result
+        assert "bad" not in ctx.registry.list()
+
+    async def test_flagless_commands_are_not_probed(self, ctx):
+        await create(ctx, "plain", ["no-such-program-xyz in.txt"])
+        assert "no-such-program-xyz" not in ctx.doc_probe_failed
+
+
+class TestProbeSafety:
+    """The probe runs a program to read its --help, so it must never run the
+    user's own code: create_script happens before the §5.3 approval gate."""
+
+    async def test_user_script_outside_bin_is_never_executed(self, ctx, tmp_path):
+        marker = tmp_path / "side-effect.txt"
+        script = tmp_path / "mypipeline.sh"  # the user's tree, not a bin/ dir
+        script.write_text(f"#!/bin/bash\ntouch {marker}\n")
+        script.chmod(0o755)
+
+        result = await create(ctx, "custom", [f"{script} in.bam -x 5"])
+
+        assert not marker.exists(), "probing executed the user's script"
+        assert "custom" in ctx.registry.list()  # unverifiable, but not a failure
+        assert "not indexed" in result.lower()
+
+    def test_installed_software_is_probeable(self):
+        assert safe_to_execute("sort")  # /usr/bin/sort
+
+    def test_destructive_commands_are_never_probed(self):
+        assert not safe_to_execute("rm")
+        assert not safe_to_execute("/bin/rm")
+
+    def test_unknown_command_is_not_probeable(self):
+        assert not safe_to_execute("no-such-program-xyz")
+
+
+class TestCommandsNeedingDocs:
+    def test_only_unindexed_commands_used_with_flags(self, index):
+        pending = commands_needing_docs(
+            "bash",
+            "grep -v x f\nbwa mem -t 4 ref.fa\ncat plain.txt\n",
+            index=index,
+        )
+        assert pending == [("bwa", "mem")]  # grep is indexed, cat has no flags
+
+    def test_deduplicated_by_command(self, index):
+        pending = commands_needing_docs(
+            "bash", "bwa index ref.fa\nbwa mem -t 4 ref.fa\nbwa aln -n 2 r.fq\n",
+            index=index,
+        )
+        assert [name for name, _ in pending] == ["bwa"]
+
+    def test_non_bash_kinds_are_skipped(self, index):
+        assert commands_needing_docs("python", "subprocess.run(['bwa'])", index=index) == []

@@ -14,9 +14,16 @@ RESPOND_VS_TOOL_GUIDANCE = (
 )
 
 
+# Scoped deliberately: the earlier blanket "never answer from memory" made the
+# agent research its OWN tools before calling them, which is pure waste — their
+# schemas are already in this prompt. The hallucination risk is in the *external*
+# programs it drives from scripts (samtools, minimap2, ...), not in its toolbox.
 GROUNDED_ANSWERING_GUIDANCE = (
-    "Never answer technical questions about tools, libraries, APIs, CLI "
-    "flags, file formats, or error messages from memory — call ask_docs and "
+    "Your own tools need no research: you already have their schemas, so never "
+    "look up documentation before calling one — just call it. Grounding applies "
+    "to EXTERNAL software instead: command-line programs you invoke from scripts "
+    "(samtools, minimap2, bcftools, ...), libraries, file formats, and error "
+    "messages. Never state their flags or syntax from memory — call ask_docs and "
     "relay its cited answer. Answer directly only for conversation and for "
     "information already present in this conversation."
 )

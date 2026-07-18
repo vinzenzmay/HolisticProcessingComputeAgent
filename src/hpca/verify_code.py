@@ -25,6 +25,14 @@ BASH_KEYWORDS = {
 SEGMENT_SEPARATORS = {"|", "||", "&&", ";", "&"}
 PYTHON_BUILTINS = frozenset(dir(__builtins__)) | {"print", "range", "len"}
 
+# Wrappers that run *another* program; the flags after them belong to that
+# program, not the wrapper. ENVIRONMENT_TOOL_GUIDANCE actively tells the agent
+# to write `conda run -n <env> <tool> ...`, so without unwrapping the gate reads
+# every such line as a call to `conda` and checks minimap2's flags against it.
+ENV_RUNNERS = {"conda", "mamba", "micromamba"}
+RUNNER_VALUE_FLAGS = {"-n", "--name", "-p", "--prefix", "--cwd"}
+TRANSPARENT_PREFIXES = {"env", "time", "nohup", "nice", "stdbuf", "exec"}
+
 
 @dataclass
 class SymbolReport:
@@ -38,19 +46,35 @@ class SymbolReport:
 BashUsage = tuple[str, list[str], list[str]]  # command, subcommand words, flags
 
 
+def _tokenize(line: str) -> list[str]:
+    """Words plus shell operators, with operators as their own tokens.
+
+    ``shlex.split`` leaves ``a|b`` as a single token, so an unspaced pipeline
+    collapsed into one command and the downstream command's flags were checked
+    against the upstream one — ``grep -v x f|minimap2 -x map-ont`` asked grep
+    about ``-x``. ``punctuation_chars`` splits on operators while still
+    respecting quoting, so ``grep 'a|b'`` stays one word.
+    """
+    lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        return list(lexer)
+    except ValueError:
+        return line.split()  # unbalanced quotes: best effort
+
+
 def extract_bash(content: str) -> list[BashUsage]:
     usages: list[BashUsage] = []
     for line in content.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        try:
-            tokens = shlex.split(line, comments=True)
-        except ValueError:
-            tokens = line.split()
+        tokens = _tokenize(line)
         segment: list[str] = []
         for token in tokens + ["|"]:
-            if token in SEGMENT_SEPARATORS or token.endswith(("|", ";")):
+            # _tokenize already isolates operators, so a trailing "|" inside a
+            # token is data (awk -F'|'), not a pipeline separator
+            if token in SEGMENT_SEPARATORS:
                 if segment:
                     usage = _parse_segment(segment)
                     if usage:
@@ -61,9 +85,38 @@ def extract_bash(content: str) -> list[BashUsage]:
     return usages
 
 
-def _parse_segment(tokens: list[str]) -> BashUsage | None:
+def _strip_assignments(tokens: list[str]) -> list[str]:
     while tokens and ("=" in tokens[0] and not tokens[0].startswith("-")):
         tokens = tokens[1:]  # leading VAR=value assignments
+    return tokens
+
+
+def _unwrap_prefixes(tokens: list[str]) -> list[str]:
+    """Drop wrapper commands so flags are attributed to the program that owns them."""
+    while tokens:
+        head = basename(tokens[0])
+        if head in TRANSPARENT_PREFIXES:
+            tokens = _strip_assignments(tokens[1:])
+            continue
+        if head in ENV_RUNNERS and len(tokens) > 1 and tokens[1] == "run":
+            tokens = tokens[2:]
+            while tokens and tokens[0].startswith("-"):
+                takes_value = (
+                    tokens[0] in RUNNER_VALUE_FLAGS
+                )  # `-n env`; `--name=env` carries its own value
+                tokens = tokens[2:] if takes_value else tokens[1:]
+            continue
+        break
+    return tokens
+
+
+def basename(executable: str) -> str:
+    """Index key for a command written as a bare name or an absolute path."""
+    return executable.rsplit("/", 1)[-1]
+
+
+def _parse_segment(tokens: list[str]) -> BashUsage | None:
+    tokens = _unwrap_prefixes(_strip_assignments(tokens))
     if not tokens:
         return None
     command = tokens[0]
@@ -74,6 +127,10 @@ def _parse_segment(tokens: list[str]) -> BashUsage | None:
     for token in tokens[1:]:
         if token.startswith(">") or token.startswith("<"):
             break
+        if token == "--":
+            break  # end-of-options marker; everything after it is an operand
+        if token == "-":
+            continue  # stdin/stdout placeholder, e.g. `samtools sort -o out.bam -`
         if token.startswith("-"):
             flags.append(token.split("=", 1)[0])
         elif not flags and not subcommands and token.isalpha():
@@ -114,10 +171,28 @@ def verify_script(kind: str, content: str, *, index: SymbolIndex) -> list[Symbol
     return []  # R / snakemake: extraction is best-effort, deferred
 
 
+def _flag_matches(flag: str, known: set[str]) -> bool:
+    """Whether a flag token as written is consistent with a command's flag set.
+
+    Short options may carry their value attached (``sort -k1,1``, ``samtools
+    view -q20``) or be clustered (``-bh``), so an exact-match test rejects
+    correct scripts. Matching on the leading short option is deliberately
+    permissive: the failure this gate exists to catch is an *invented flag
+    name*, and blocking a valid command is far more costly than letting a
+    malformed value through to the tool's own error message.
+    """
+    if flag in known:
+        return True
+    if flag.startswith("--") or len(flag) <= 2:
+        return False
+    return f"-{flag[1]}" in known
+
+
 def _verify_bash(content: str, index: SymbolIndex) -> list[SymbolReport]:
     reports: list[SymbolReport] = []
     unindexed_seen: set[str] = set()
-    for command, subcommands, flags in extract_bash(content):
+    for executable, subcommands, flags in extract_bash(content):
+        command = basename(executable)  # /path/to/envs/bio/bin/minimap2 -> minimap2
         display = command
         key = command
         if not index.has_command(key) and subcommands:
@@ -136,9 +211,9 @@ def _verify_bash(content: str, index: SymbolIndex) -> list[SymbolReport]:
                     )
                 )
             continue
-        known = index.flags_for(key)
+        known = set(index.flags_for(key))
         for flag in flags:
-            if flag in known:
+            if _flag_matches(flag, known):
                 reports.append(
                     SymbolReport(symbol=f"{display} {flag}", status="confirmed")
                 )
@@ -189,6 +264,37 @@ def _verify_python(content: str, index: SymbolIndex) -> list[SymbolReport]:
         else:
             reports.append(SymbolReport(symbol=f"{name}(...)", status="confirmed"))
     return reports
+
+
+def commands_needing_docs(
+    kind: str, content: str, *, index: SymbolIndex
+) -> list[tuple[str, str]]:
+    """Commands used with flags that the index cannot check yet.
+
+    Feeds the on-demand indexing step in ``create_script``: an unindexed
+    command means the gate silently passes exactly the usage most likely to be
+    hallucinated. Returns ``(executable, subcommand)`` with the executable as
+    written in the script — possibly an absolute path — so the caller can run
+    it to fetch help text. Deduplicated by command name.
+    """
+    if kind != "bash":
+        return []
+    seen: set[str] = set()
+    pending: list[tuple[str, str]] = []
+    for executable, subcommands, flags in extract_bash(content):
+        if not flags:
+            continue  # nothing to check, so nothing to look up
+        command = basename(executable)
+        subcommand = subcommands[0] if subcommands else ""
+        if command in seen:
+            continue
+        if index.has_command(command):
+            continue
+        if subcommand and index.has_command(f"{command}-{subcommand}"):
+            continue
+        seen.add(command)
+        pending.append((executable, subcommand))
+    return pending
 
 
 def format_gate_failure(mismatches: list[SymbolReport]) -> str:

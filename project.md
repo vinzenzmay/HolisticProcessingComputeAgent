@@ -173,10 +173,13 @@ The orchestrator itself has: route-to-subagent, `list_paths` (registry), memory 
 answering policy below).
 
 **Grounded answering policy.** Small models hallucinate API details, so technical
-questions are never answered from model weights. Any query that names a tool,
-library, API/function, file format, or error message is routed to the
+questions are never answered from model weights. Any query that names an *external*
+program, library, API/function, file format, or error message is routed to the
 doc-researcher; the orchestrator answers directly only for trivial conversational
-turns. Doc-researcher answers must carry citations (source + section). If retrieval
+turns. The policy explicitly does **not** cover the agent's own tools: their
+schemas are already in its prompt, so researching them before a call is pure
+overhead and is forbidden. The hallucination risk lives in the command-line
+programs the agent drives from generated scripts, not in its own toolbox. Doc-researcher answers must carry citations (source + section). If retrieval
 finds nothing relevant, the answer is explicitly marked
 `[ungrounded — not in indexed docs]` so the user always knows which kind of answer
 they are reading. Accepted cost: a technical question takes ≥2 model calls
@@ -272,12 +275,35 @@ deprecated or misspelled kwargs, wrong subcommands. After a clean syntax dry-run
 every script therefore passes a second, mostly deterministic gate that compares it
 against the indexed documentation and source (§5.6):
 
+0. **On-demand indexing.** A command nobody indexed is a command the gate cannot
+   check, which is exactly the case for the tools that matter (`minimap2`,
+   `samtools`). So before the gate runs, `create_script` learns the flags of every
+   external program the script drives, from the man page **unioned with** `--help`
+   output — neither source alone is sufficient (`sort` exposes no parseable
+   OPTIONS section; `find` hides `-maxdepth` outside its own). This is
+   deterministic and unskippable on purpose: the model never decides whether to
+   look a tool up, because under instruction load a small model reliably decides
+   not to. A parse yielding too few flags counts as a failed probe and leaves the
+   command unindexed — a half-parsed flag list would turn correct scripts into
+   gate failures. Probes are bounded and cached per session. Only *packaged*
+   software is ever executed: a command resolving into a `bin/` directory
+   implements `--help` by convention, whereas a script in the user's own tree is
+   their code and may ignore `--help` and simply run — which would execute it
+   before the §5.3 approval gate saw the script that calls it. User scripts and
+   destructive commands stay unindexed (a warning), though man pages are still
+   read for them, since fetching one never runs anything.
 1. **Deterministic extraction** of used APIs: Python via `ast` (imports, calls,
    keyword names), bash and snakemake `shell:` blocks via command tokenization
-   (command + flags), R best-effort (`library()`, `pkg::fn` calls).
+   (command + flags), R best-effort (`library()`, `pkg::fn` calls). Wrapper
+   prefixes (`conda run -n env …`, `time`, `nohup`) are unwrapped and absolute
+   paths reduced to their basename, so flags are attributed to the program that
+   owns them rather than to the wrapper.
 2. **Exact lookup, not embeddings:** extracted symbols are checked against the
-   symbol table (§5.6) — CLI flags against man-page OPTIONS, functions and kwargs
-   against indexed signatures.
+   symbol table (§5.6) — CLI flags against the learned flag set, functions and
+   kwargs against indexed signatures. Flag matching allows attached values and
+   clustering (`-k1,1`, `-q20`, `-bh`): the target is an invented flag *name*, and
+   blocking a valid command costs far more than passing a malformed value through
+   to the tool's own error message.
 3. Mechanical mismatches (flag absent from the man page, kwarg absent from the
    signature) are flagged by code alone. Only fuzzy cases (ambiguous parse,
    partial match) go to the doc-researcher as a focused judgment call: "code calls
@@ -353,14 +379,16 @@ pipeline turns "job 48812 failed" into a compact structured report:
 
 ### 5.6 RAG for documentation
 
-Embedded, daemon-free stack (HPC users have no root, no services). Indexing runs as
-an explicit command, not implicitly, over: man pages of cluster-relevant tools,
-user-supplied docs directories, selected source trees. Indexing builds **two**
-structures:
+Embedded, daemon-free stack (HPC users have no root, no services). *Bulk* indexing
+runs as an explicit command, not implicitly, over: man pages of cluster-relevant
+tools, user-supplied docs directories, selected source trees. The one implicit path
+is the narrow, bounded flag lookup the verification gate performs on the specific
+commands a script is about to run (§5.2 step 0) — without it the gate has no data
+precisely when it matters. Indexing builds **two** structures:
 
 1. **Symbol table (exact retrieval)** — plain sqlite tables: function/class
    signatures extracted from indexed Python source via `ast`, CLI flags parsed from
-   man-page OPTIONS sections. This is what the verification gate (§5.2) and
+   man-page OPTIONS sections and `--help` output. This is what the gate (§5.2) and
    `lookup_symbol` query. "Does `samtools view -e` exist?" is an exact-match
    question; embeddings are the wrong tool for it. Requires no embedding model, so
    it works in a slim base install.
