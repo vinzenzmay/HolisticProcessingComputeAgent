@@ -97,6 +97,18 @@ Terminals in 2026 are assumed wider than 80 columns
   * `/conclude` — the agent analyses the conversation and proposes memories to write
     into the profile (user approves before write, see §6).
 
+**Typing is never blocked.** One turn runs at a time — two invocations on a single
+`thread_id` would interleave checkpoint writes — but that is the orchestrator's
+constraint, not the user's. A message sent while a turn is running is accepted,
+shown in the transcript as `queued`, and started when the orchestrator frees up;
+the entry field clears immediately, so the next thought can be typed while the
+current one is still being answered. Queued work drains in arrival order, one item
+per pass, and shares the queue with background completions (§5.4) so both go
+through the same one-at-a-time discipline. A session parked on an approval holds
+only its own queued messages; other sessions keep draining. Slash commands are not
+turns — they act on the UI and run their own exclusive workers — so they are still
+refused while busy rather than queued.
+
 ### 3.4 Clipboard (must work under tmux, screen, and zellij)
 
 Copying must never silently fail. Implement a `ClipboardManager` with a tiered

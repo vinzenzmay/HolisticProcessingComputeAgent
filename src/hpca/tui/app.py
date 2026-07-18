@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+from dataclasses import dataclass
 from os import environ as os_environ
 from time import monotonic
 from typing import Any
@@ -82,7 +83,19 @@ CHAT_TITLES = {
     "assistant": "agent",
     "error": "error",
     "event": "background",
+    "queued": "queued",
 }
+
+
+@dataclass
+class PendingWork:
+    """One turn's worth of input waiting for the orchestrator to be free."""
+
+    session_id: str
+    text: str
+    kind: str  # "user" — typed and waiting | "event" — background completion
+
+
 # Chat commands ("/" or "\"): typing the prefix lists these above the entry.
 COMMANDS = (
     ("memorize", "/memorize <note> — form memories from the note and this conversation"),
@@ -459,6 +472,10 @@ class HpcaApp(App):
         border: round $warning;
         color: $text-muted;
     }
+    .chat-queued {
+        border: round $panel-lighten-2;
+        color: $text-muted;
+    }
     .chat-working {
         color: $text-muted;
         padding: 0 1;
@@ -523,11 +540,16 @@ class HpcaApp(App):
         self._untitled: set[str] = set()  # sessions awaiting their first title
         self._updated: set[str] = set()  # replies that landed while switched away
         self._busy_turn: Session | None = None  # the one turn in flight, if any
-        # Completions of background work waiting to reach the agent, drained
-        # by the watch timer. Buffered rather than delivered on the spot: only
-        # one turn may run at a time, and a process can finish while the
-        # user's own turn is still in flight.
-        self._pending_events: list[tuple[str, str]] = []
+        # Work waiting for the orchestrator: messages the user typed while a
+        # turn was running, and background completions reporting in. Exactly
+        # one turn runs at a time — two on one thread_id would interleave
+        # checkpoint writes — so anything arriving mid-turn waits here rather
+        # than being refused. Drained in order, one item per pass.
+        self._pending_work: list[PendingWork] = []
+        # Sessions whose thread is parked on a destructive-op approval. Their
+        # queued messages wait for the resume; other sessions are unaffected.
+        self._awaiting_approval: set[str] = set()
+        self._shutting_down = False
         self._turn_ctx: ToolContext | None = None  # that turn's tool context
         self._turn_memory: Profile | None = None  # that turn's profile memories
         self._activity = "working"
@@ -595,6 +617,10 @@ class HpcaApp(App):
         return None
 
     async def on_unmount(self) -> None:
+        # Quitting must not kick off whatever was still queued: the database
+        # and checkpointer are about to close under it.
+        self._shutting_down = True
+        self._pending_work.clear()
         if self._saver_ctx is not None:
             await self._saver_ctx.__aexit__(None, None, None)
         if self._conn is not None:
@@ -663,27 +689,36 @@ class HpcaApp(App):
         text = event.text.strip()
         if not text:
             return
-        if self._busy_turn is not None:
-            # One orchestrator: a second turn would cancel the first mid-call.
-            # The draft stays in the entry, ready for when the reply lands.
-            self.notify(
-                f"Still working in “{self._busy_turn.title}” — "
-                "wait for that reply first.",
-                severity="warning",
-            )
-            return
-        event.chat_input.text = ""
         if text.startswith(("\\", "/")):
+            # Slash commands act on the UI and run their own exclusive
+            # workers; they are not turns and are not queued.
+            if self._busy_turn is not None:
+                self.notify(
+                    f"Still working in “{self._busy_turn.title}” — "
+                    "commands wait for that reply.",
+                    severity="warning",
+                )
+                return
+            event.chat_input.text = ""
             self._handle_slash_command(text)
             return
+        event.chat_input.text = ""
         if self.active_session is None:
             await self.start_new_session()
         if self.active_session.title == UNTITLED_SESSION:
             self._name_session(text[:SESSION_TITLE_MAX])
             await self._reload_sessions()
-        await self._append_chat("user", text)
         self.warn_about_struggles(text)
-        self._run_agent(self.active_session, user_text=text)
+        # The message is accepted either way; only its turn may have to wait.
+        # It goes in the transcript now so typing ahead looks like it worked.
+        queued = self._busy_turn is not None
+        await self._append_chat("queued" if queued else "user", text)
+        self._pending_work.append(
+            PendingWork(
+                session_id=self.active_session.session_id, text=text, kind="user"
+            )
+        )
+        await self.drain_work()
 
     @on(TextArea.Changed, "#chat-input")
     def _on_draft_changed(self, event: TextArea.Changed) -> None:
@@ -737,15 +772,30 @@ class HpcaApp(App):
             exclusive=True,
         )
 
+    def _chat_list(self) -> ListView | None:
+        """The chat column, or None once the screen is gone.
+
+        A queued turn can start — and finish — while the app is shutting
+        down, and neither the spinner appearing nor disappearing is worth
+        raising over at that point.
+        """
+        found = self.query("#chat-list")
+        return found.first(ListView) if found else None
+
     def show_working(self) -> None:
         """Put the spinner after the last message: a reply is on its way."""
-        chat_list = self.query_one("#chat-list", ListView)
+        chat_list = self._chat_list()
+        if chat_list is None:
+            return
         if not chat_list.query(WorkingIndicator):
             chat_list.append(ChatItem(WorkingIndicator(self._activity)))
             chat_list.scroll_end(animate=False)
 
     def hide_working(self) -> None:
-        for item in list(self.query_one("#chat-list", ListView).children):
+        chat_list = self._chat_list()
+        if chat_list is None:
+            return
+        for item in list(chat_list.children):
             if item.query(WorkingIndicator):
                 item.remove()
 
@@ -784,6 +834,9 @@ class HpcaApp(App):
             self._busy_turn = None
             self._turn_ctx = None
             self._turn_memory = None
+            # Whatever queued up behind this turn starts as soon as this
+            # handler unwinds, rather than waiting for the next timer tick.
+            self.call_later(self.drain_work)
         self.hide_working()
         self._log_turn(result, log)
         if self._is_active_session(session):
@@ -796,6 +849,7 @@ class HpcaApp(App):
         if result.interrupt is not None:
             # Parked on a destructive-op approval: the turn cannot move
             # without an answer, so ask even if another session is open.
+            self._awaiting_approval.add(session.session_id)
             self.push_screen(
                 ApprovalScreen(result.interrupt),
                 lambda approved: self._on_approval(session, approved),
@@ -846,6 +900,7 @@ class HpcaApp(App):
     def _on_approval(self, session: Session, approved: bool | None) -> None:
         # Resume the turn on the thread it belongs to — the user may have
         # switched sessions while the approval dialog was up.
+        self._awaiting_approval.discard(session.session_id)
         self._run_agent(session, resume=Command(resume={"approved": bool(approved)}))
 
     # ---------------------------------------------------------------- memory
@@ -1371,14 +1426,17 @@ class HpcaApp(App):
                 f"Job {change.job_id}: {change.old_state} → {change.new_state}"
             )
             if change.new_state in SLURM_TERMINAL_STATES and change.session_id:
-                self._pending_events.append((
-                    change.session_id,
-                    f"[job {change.new_state.lower()}] cluster job "
-                    f"{change.job_id} is now {change.new_state}. Check its "
-                    "logs with triage_job and act on the result.",
+                self._pending_work.append(PendingWork(
+                    session_id=change.session_id,
+                    kind="event",
+                    text=(
+                        f"[job {change.new_state.lower()}] cluster job "
+                        f"{change.job_id} is now {change.new_state}. Check its "
+                        "logs with triage_job and act on the result."
+                    ),
                 ))
         if changes:
-            await self.drain_events()
+            await self.drain_work()
             await self.refresh_processes()
 
     async def watch_processes(self) -> None:
@@ -1407,8 +1465,10 @@ class HpcaApp(App):
                 # Tier 3: the keyword scan found candidates but cannot say
                 # which one caused it. That judgment is worth a model call.
                 text = await self._explain_candidates(change, finding, text)
-            self._pending_events.append((change.session_id, text))
-        await self.drain_events()
+            self._pending_work.append(
+                PendingWork(session_id=change.session_id, text=text, kind="event")
+            )
+        await self.drain_work()
 
     async def _explain_candidates(self, change, finding, fallback: str) -> str:
         """Ask the explainer to pick the causing line, and learn from it."""
@@ -1455,21 +1515,55 @@ class HpcaApp(App):
             save(),
         )
 
-    async def drain_events(self) -> None:
-        """Deliver one queued event, never racing a live turn.
+    async def drain_work(self) -> None:
+        """Start the next waiting turn, if the orchestrator is free.
 
-        Concurrent ainvoke on one thread_id would interleave writes to the
-        same checkpoint, so an event that arrives mid-turn waits for the next
-        tick instead. One per tick keeps a burst of completions from stacking
-        model calls on top of each other.
+        One item per pass: concurrent ainvoke on a thread would interleave
+        checkpoint writes, and draining a burst all at once would stack model
+        calls anyway. Called when work arrives and again when a turn ends, so
+        the queue does not sit waiting for the next timer tick.
         """
-        if self._busy_turn is not None or not self._pending_events:
+        if self._busy_turn is not None or self._shutting_down:
             return
-        session_id, text = self._pending_events.pop(0)
+        # A session parked on an approval has a thread mid-interrupt; its next
+        # message must wait for the resume, but other sessions need not.
+        index = next(
+            (
+                i
+                for i, work in enumerate(self._pending_work)
+                if work.session_id not in self._awaiting_approval
+            ),
+            None,
+        )
+        if index is None:
+            return
+        item = self._pending_work.pop(index)
         try:
-            await self._deliver_event(session_id, text)
+            if item.kind == "user":
+                session = self.session_store.get(item.session_id)
+                if session is not None:
+                    if self._is_active_session(session):
+                        await self._promote_queued_entry(item.text)
+                    self._run_agent(session, user_text=item.text)
+            else:
+                await self._deliver_event(item.session_id, item.text)
         except Exception as e:
-            self.notify(f"Event delivery failed: {e}", severity="error")
+            self.notify(f"Queued work failed: {e}", severity="error")
+
+    async def _promote_queued_entry(self, text: str) -> None:
+        """A queued message is starting: show it as sent rather than waiting."""
+        for entry in self._chat_entries:
+            if entry.kind == "queued" and entry.text == text:
+                entry.kind = "user"
+                break
+        await self._rerender_chat()
+
+    def queued_texts_for(self, session_id: str) -> list[str]:
+        return [
+            work.text
+            for work in self._pending_work
+            if work.kind == "user" and work.session_id == session_id
+        ]
 
     async def _deliver_event(self, session_id: str, text: str) -> None:
         """React now if the session is open, otherwise leave it in the thread.
@@ -1567,13 +1661,29 @@ class HpcaApp(App):
         self._chat_entries = []
         for entry in build_entries(messages, thinking or []):
             self._add_chat_entry(entry)
+        # Messages typed while this turn ran are not in the graph yet, so the
+        # rebuild would erase them from under the user.
+        if self.active_session is not None:
+            for text in self.queued_texts_for(self.active_session.session_id):
+                self._add_chat_entry(Entry(kind="queued", text=text))
+
+    async def _rerender_chat(self) -> None:
+        """Redraw the chat from the entries already held, without rebuilding
+        them from the graph — used when only an entry's kind changed."""
+        chat_list = self.query_one("#chat-list", ListView)
+        await chat_list.clear()
+        for entry in self._chat_entries:
+            chat_list.append(ChatItem(self._entry_widget(entry)))
+        chat_list.scroll_end(animate=False)
 
     async def _append_chat(self, kind: str, text: str) -> None:
         self._add_chat_entry(Entry(kind=kind, text=text))
 
     def _add_chat_entry(self, entry: Entry) -> None:
         self._chat_entries.append(entry)
-        chat_list = self.query_one("#chat-list", ListView)
+        chat_list = self._chat_list()
+        if chat_list is None:
+            return  # screen already gone (shutdown); the entry is still kept
         chat_list.append(ChatItem(self._entry_widget(entry)))
         chat_list.scroll_end(animate=False)
 

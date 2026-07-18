@@ -203,9 +203,11 @@ class TestBackgroundReply:
 
 
 class TestBusyGuard:
-    async def test_sending_elsewhere_while_busy_is_refused_and_keeps_the_draft(
+    async def test_sending_elsewhere_while_busy_is_queued_not_refused(
         self, hpca_home
     ):
+        """Typing is never blocked: a message sent mid-turn is accepted and
+        waits its turn, rather than being bounced back into the input."""
         llm = GatedLLM([respond_json("the answer for A")])
         app = HpcaApp(llm=llm)
         async with app.run_test(size=(120, 40)) as pilot:
@@ -213,17 +215,17 @@ class TestBusyGuard:
             await pilot.pause()
             await submit(app, pilot, "question in A")
             await app.start_new_session()
+            session_b = app.active_session
             await pilot.pause()
 
             await submit(app, pilot, "question in B")
             chat_input = app.query_one("#chat-input", ChatInput)
-            assert chat_input.text == "question in B"  # kept, not swallowed
+            assert chat_input.text == ""  # accepted, so the field is free again
+            assert app.queued_texts_for(session_b.session_id) == ["question in B"]
             llm.released.set()
             await settle(app, pilot)
-            # the refused message never became a turn
-            assert not any("question in B" in t for t in app.chat_log_texts())
 
-    async def test_the_first_turn_survives_the_refused_second(self, hpca_home):
+    async def test_the_first_turn_survives_the_queued_second(self, hpca_home):
         llm = GatedLLM([respond_json("the answer for A")])
         app = HpcaApp(llm=llm)
         async with app.run_test(size=(120, 40)) as pilot:
@@ -233,7 +235,7 @@ class TestBusyGuard:
             await submit(app, pilot, "question in A")
             await app.start_new_session()
             await pilot.pause()
-            await submit(app, pilot, "question in B")  # refused, must not cancel A
+            await submit(app, pilot, "question in B")  # queued, must not cancel A
             llm.released.set()
             await settle(app, pilot)
             await app.open_session(session_a)

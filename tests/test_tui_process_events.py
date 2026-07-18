@@ -125,10 +125,10 @@ class TestEventDelivery:
             app._busy_turn = app.active_session  # pretend a turn is running
             await app.watch_processes()
             await pilot.pause()
-            assert len(app._pending_events) == 1  # buffered, not delivered
+            assert len(app._pending_work) == 1  # buffered, not delivered
 
             app._busy_turn = None
-            await app.drain_events()
+            await app.drain_work()
             await app.workers.wait_for_complete()
             await pilot.pause()
-            assert app._pending_events == []
+            assert app._pending_work == []
