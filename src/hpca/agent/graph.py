@@ -215,6 +215,24 @@ class TurnResult:
     first_new: int = 0
 
 
+async def deliver_event(graph, *, session_id: str, text: str) -> None:
+    """Append a system event to a session thread without running the model.
+
+    The cheap half of event delivery: ``aupdate_state`` writes the message
+    into the checkpointed thread, so the agent sees it on its next turn at no
+    cost. Used when reacting immediately is not wanted — the session is not
+    open, or a turn is already in flight. Reacting immediately is just
+    ``run_turn(..., user_text=text)`` on the same thread instead; both are the
+    same LangGraph primitive, a new input on an existing ``thread_id``.
+
+    The role is "user" because that is how every other machine-generated
+    message reaches this model — tool results included — and a 27B model
+    follows the shape it has already seen far more reliably than a new one.
+    """
+    config = {"configurable": {"thread_id": session_id}}
+    await graph.aupdate_state(config, {"messages": [{"role": "user", "content": text}]})
+
+
 async def run_turn(
     graph,
     *,

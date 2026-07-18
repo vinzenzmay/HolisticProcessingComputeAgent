@@ -349,11 +349,33 @@ jobs(job_id PK, kind, session_id, profile, submit_time, state,
 job_logs(job_id FK, rule_or_step, log_path, tool_name)
 sessions(session_id PK, profile, title, created_at, checkpoint_ref)
 path_registry(profile, session_id, key, path, created_at)
-processes(pid, session_id, cmd, state, stdout_path, stderr_path, started_at)
+processes(pid, session_id, cmd, state, stdout_path, stderr_path, started_at,
+          notified, background)
 ```
 
 A background asyncio task polls `squeue`/`sacct` (interval `job_poll_seconds`,
-default 30) and updates states; state changes surface as TUI notifications.
+default 30) and updates states; a sibling timer polls the `processes` table for
+local subprocesses that have ended.
+
+**Completion reaches the agent, not just the user.** A turn ends when the model
+answers, and nothing else starts one — so "I'll check on it in a moment" was a
+promise the runtime could not keep, and a background script could fail silently
+until the user noticed. Terminal transitions are therefore delivered *into the
+conversation*: the change is formatted with its exit code and a log tail and
+appended to the session's LangGraph thread as new input. Reacting immediately is
+`run_turn` on that thread (the agent speaks unprompted); deferring is
+`aupdate_state`, which leaves the message in checkpointed history for the next
+turn at no model cost. Both are the same primitive — new input on an existing
+`thread_id` — and the choice is only whether the model runs now.
+
+Three constraints shape it. Delivery is serialised against live turns, because
+concurrent `ainvoke` on one `thread_id` interleaves checkpoint writes. Only
+`start_script` work qualifies (`background = 1`): `run_script` and `run_bash`
+block and return their output as the tool result, so an event for those would
+report the same failure twice. And `notified` lives in the table rather than in
+memory, so a job that ends while the TUI is closed is still announced on the
+next start — the watcher reads the table, since a fresh `ProcessRunner` is built
+per turn and no single instance knows about processes an earlier one started.
 
 ### 5.5 Log triage (the killer feature — ~80% deterministic)
 

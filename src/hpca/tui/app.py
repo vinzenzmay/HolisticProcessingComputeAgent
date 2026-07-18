@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 from os import environ as os_environ
 from time import monotonic
@@ -21,7 +22,7 @@ from textual.widgets import Footer, Label, ListItem, ListView, Static, TextArea
 from hpca.agent.builtin_tools import default_tool_registry
 from hpca.agent.context import ToolContext
 from hpca.agent.file_tools import add_file_tools
-from hpca.agent.graph import build_graph, run_turn
+from hpca.agent.graph import build_graph, deliver_event, run_turn
 from hpca.agent.job_tools import add_job_tools
 from hpca.agent.tools import ToolRegistry
 from hpca.clipboard import ClipboardManager, CopyResult
@@ -47,9 +48,16 @@ from hpca.rag import RagStore
 from hpca.transcript import THINKING, Entry, build_entries
 from hpca.profiles import DEFAULT_PROFILE, Profile
 from hpca.registry import PathRegistry
-from hpca.runner import ProcessRecord, ProcessRunner, running_session_ids
+from hpca.runner import (
+    ProcessRecord,
+    ProcessRunner,
+    format_process_event,
+    poll_processes,
+    running_session_ids,
+)
 from hpca.sessions import Session, SessionStore
 from hpca.skills import load_skills, summarize_skills
+from hpca.slurm import TERMINAL_STATES as SLURM_TERMINAL_STATES
 from hpca.slurm import SlurmClient
 from hpca.symbols import SymbolIndex
 from hpca.trash import TrashManager
@@ -66,13 +74,23 @@ from hpca.tui.switch_llm import SwitchLLMScreen
 COLUMN_IDS = ("sessions", "chat", "processes")
 SESSION_TITLE_MAX = 40
 UNTITLED_SESSION = "untitled"  # placeholder until the first message names it
-CHAT_TITLES = {"user": "you", "assistant": "agent", "error": "error"}
+CHAT_TITLES = {
+    "user": "you",
+    "assistant": "agent",
+    "error": "error",
+    "event": "background",
+}
 # Chat commands ("/" or "\"): typing the prefix lists these above the entry.
 COMMANDS = (
     ("memorize", "/memorize <note> — form memories from the note and this conversation"),
     ("conclude", "/conclude — propose memories from this conversation"),
 )
-LOG_KINDS = {"user": "user", "assistant": "agent", "error": "error"}
+LOG_KINDS = {
+    "user": "user",
+    "assistant": "agent",
+    "error": "error",
+    "event": "background",
+}
 
 
 class TopBar(Static):
@@ -434,6 +452,10 @@ class HpcaApp(App):
         border: round $error;
         color: $error;
     }
+    .chat-event {
+        border: round $warning;
+        color: $text-muted;
+    }
     .chat-working {
         color: $text-muted;
         padding: 0 1;
@@ -498,6 +520,11 @@ class HpcaApp(App):
         self._untitled: set[str] = set()  # sessions awaiting their first title
         self._updated: set[str] = set()  # replies that landed while switched away
         self._busy_turn: Session | None = None  # the one turn in flight, if any
+        # Completions of background work waiting to reach the agent, drained
+        # by the watch timer. Buffered rather than delivered on the spot: only
+        # one turn may run at a time, and a process can finish while the
+        # user's own turn is still in flight.
+        self._pending_events: list[tuple[str, str]] = []
         self._turn_ctx: ToolContext | None = None  # that turn's tool context
         self._turn_memory: Profile | None = None  # that turn's profile memories
         self._activity = "working"
@@ -550,6 +577,7 @@ class HpcaApp(App):
         self._refresh_top_bar()
         await self._reload_sessions()
         self.set_interval(2.0, self.refresh_processes)
+        self.set_interval(2.0, self.watch_processes)
         if self.slurm is not None:
             self.set_interval(
                 max(5, self.settings.cluster.job_poll_seconds), self.poll_jobs
@@ -1339,8 +1367,73 @@ class HpcaApp(App):
             self.notify(
                 f"Job {change.job_id}: {change.old_state} → {change.new_state}"
             )
+            if change.new_state in SLURM_TERMINAL_STATES and change.session_id:
+                self._pending_events.append((
+                    change.session_id,
+                    f"[job {change.new_state.lower()}] cluster job "
+                    f"{change.job_id} is now {change.new_state}. Check its "
+                    "logs with triage_job and act on the result.",
+                ))
         if changes:
+            await self.drain_events()
             await self.refresh_processes()
+
+    async def watch_processes(self) -> None:
+        """Turn finished background subprocesses into agent-visible events.
+
+        The sibling of poll_jobs for local work. refresh_processes only
+        repaints the sidebar, so before this nothing ever told the agent that
+        the script it started had exited — it promised to check back and had
+        no way to keep the promise.
+        """
+        if self._conn is None:
+            return
+        try:
+            changes = poll_processes(self._conn)
+        except Exception as e:
+            self.notify(f"Process watch failed: {e}", severity="warning")
+            return
+        for change in changes:
+            self._pending_events.append(
+                (change.session_id, format_process_event(change))
+            )
+        await self.drain_events()
+
+    async def drain_events(self) -> None:
+        """Deliver one queued event, never racing a live turn.
+
+        Concurrent ainvoke on one thread_id would interleave writes to the
+        same checkpoint, so an event that arrives mid-turn waits for the next
+        tick instead. One per tick keeps a burst of completions from stacking
+        model calls on top of each other.
+        """
+        if self._busy_turn is not None or not self._pending_events:
+            return
+        session_id, text = self._pending_events.pop(0)
+        try:
+            await self._deliver_event(session_id, text)
+        except Exception as e:
+            self.notify(f"Event delivery failed: {e}", severity="error")
+
+    async def _deliver_event(self, session_id: str, text: str) -> None:
+        """React now if the session is open, otherwise leave it in the thread.
+
+        Both paths are the same LangGraph primitive — new input on an existing
+        thread_id. The difference is only whether the model runs immediately
+        (one call, agent speaks unprompted) or the message simply waits in the
+        checkpointed history for the next turn (free).
+        """
+        session = self.session_store.get(session_id)
+        if session is None:
+            await deliver_event(self.graph, session_id=session_id, text=text)
+            return
+        if self._is_active_session(session):
+            await self._append_chat("event", text)
+            self._run_agent(session, user_text=text)
+        else:
+            await deliver_event(self.graph, session_id=session_id, text=text)
+            self._mark_session_updated(session)
+            self.notify(f"{session.title}: background work finished")
 
     def _selected_item(self) -> tuple[ProcessRecord | None, JobRow | None]:
         highlighted = self.query_one("#processes-list", ListView).highlighted_child

@@ -70,9 +70,25 @@ CREATE TABLE IF NOT EXISTS processes (
     stderr_path TEXT,
     started_at TEXT,
     exit_code INTEGER,
-    exit_info TEXT
+    exit_info TEXT,
+    -- 1 once the agent has been told this process reached a terminal state.
+    -- Persisted rather than kept in memory so a completion that happens while
+    -- the TUI is closed is still delivered on the next start (§5.4).
+    notified INTEGER NOT NULL DEFAULT 0,
+    -- 1 only for start_script. run_script and run_bash hand their result back
+    -- as the tool result the agent is already reading, so announcing those
+    -- again would tell it the same thing twice.
+    background INTEGER NOT NULL DEFAULT 0
 );
 """
+
+# Columns added after the first release. sqlite has no "ADD COLUMN IF NOT
+# EXISTS", and CREATE TABLE IF NOT EXISTS silently leaves an existing table
+# alone, so an additive migration is the only way an old database gains them.
+ADDED_COLUMNS = [
+    ("processes", "notified", "INTEGER NOT NULL DEFAULT 0"),
+    ("processes", "background", "INTEGER NOT NULL DEFAULT 0"),
+]
 
 
 def db_path() -> Path:
@@ -99,4 +115,8 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    for table, column, decl in ADDED_COLUMNS:
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
     conn.commit()

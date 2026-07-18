@@ -49,6 +49,7 @@ class StateChange:
     old_state: str
     new_state: str
     status: JobStatus
+    session_id: str = ""  # which conversation to deliver the change to
 
 
 class JobStore:
@@ -187,6 +188,7 @@ async def poll_active(slurm: SlurmClient, store: JobStore) -> list[StateChange]:
                 old_state=job.state,
                 new_state=status.state,
                 status=status,
+                session_id=job.session_id,
             )
         )
     return changes

@@ -172,7 +172,7 @@ async def start_script(args: StartScriptParams, ctx: ToolContext) -> str:
             f"Cannot start {args.registry_key!r}: unknown script type {path.suffix!r}"
         )
     argv = interpreter + [str(path)] + (args.args.split() if args.args else [])
-    record = await ctx.runner.start(argv, name=args.registry_key)
+    record = await ctx.runner.start(argv, name=args.registry_key, background=True)
     stdout_key = ctx.registry.register_auto(
         record.stdout_path, hint=f"{args.registry_key}_stdout"
     )

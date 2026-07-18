@@ -51,6 +51,7 @@ class ProcessRunner:
         cwd: Path | None = None,
         env: dict[str, str] | None = None,
         timeout_s: float | None = None,
+        background: bool = False,
     ) -> ProcessRecord:
         self._log_dir.mkdir(parents=True, exist_ok=True)
         stamp = time.time_ns()
@@ -82,7 +83,8 @@ class ProcessRunner:
         try:
             self._conn.execute(
                 "INSERT INTO processes (pid, session_id, name, cmd, state, "
-                "stdout_path, stderr_path, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "stdout_path, stderr_path, started_at, background) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     record.pid,
                     self._session_id,
@@ -92,6 +94,7 @@ class ProcessRunner:
                     str(record.stdout_path),
                     str(record.stderr_path),
                     record.started_at,
+                    int(background),
                 ),
             )
             self._conn.commit()
@@ -166,6 +169,112 @@ class ProcessRunner:
 
     def list(self) -> list[ProcessRecord]:
         return list(reversed(self._records.values()))
+
+
+TERMINAL_STATES = {"finished", "failed", "killed"}
+EVENT_TAIL_LINES = 20
+EVENT_TAIL_CHARS = 1500
+
+
+@dataclass
+class ProcessChange:
+    """One subprocess reaching a terminal state, for delivery to the agent."""
+
+    pid: int
+    session_id: str
+    name: str
+    state: str
+    exit_code: int | None
+    stdout_path: Path
+    stderr_path: Path
+    exit_info: str | None = None
+
+
+def _tail(path: Path) -> str:
+    """Last few lines of a log, bounded — this goes straight into a prompt."""
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return ""
+    body = "\n".join(lines[-EVENT_TAIL_LINES:]).strip()
+    return body[-EVENT_TAIL_CHARS:]
+
+
+def format_process_event(change: ProcessChange) -> str:
+    """The message the agent receives when a background process ends.
+
+    Failures mirror the wording run_bash already uses for a failed script, so
+    the model meets a shape it has been trained on by the rest of the session:
+    state the failure, then tell it to fix and retry. The log tail is included
+    inline so reacting does not cost a read_file round-trip first.
+    """
+    if change.state == "finished":
+        head = f"[process finished] {change.name} (pid {change.pid}) exited 0."
+    elif change.state == "killed":
+        head = (
+            f"[process killed] {change.name} (pid {change.pid}) was killed"
+            f"{' — ' + change.exit_info if change.exit_info else ''}."
+        )
+    else:
+        head = (
+            f"[process failed] {change.name} (pid {change.pid}) exited "
+            f"{change.exit_code}. Read the error, fix the script, and start it "
+            "again."
+        )
+    parts = [head]
+    # On failure the cause is in stderr; on success stdout is the result.
+    streams = (
+        [("stderr", change.stderr_path), ("stdout", change.stdout_path)]
+        if change.state != "finished"
+        else [("stdout", change.stdout_path), ("stderr", change.stderr_path)]
+    )
+    for label, path in streams:
+        body = _tail(path)
+        if body:
+            parts.append(f"{label} tail:\n{body}")
+            break  # one stream is enough context; keep the prompt small
+    return "\n\n".join(parts)
+
+
+def poll_processes(conn: sqlite3.Connection) -> list[ProcessChange]:
+    """Subprocesses that ended since the last poll, store-wide.
+
+    Reads the table rather than any one ``ProcessRunner``: the TUI builds a
+    fresh runner per turn, so no single instance knows about processes started
+    by an earlier one. The monitor keeps the DB current regardless of which
+    runner owns the process. Rows are flagged as they are returned, so each
+    completion is delivered exactly once even across restarts.
+
+    Only backgrounded scripts qualify. run_script and run_bash block until the
+    process ends and return its output as the tool result, so an event for
+    those would repeat what the agent has already read.
+    """
+    placeholders = ", ".join("?" for _ in TERMINAL_STATES)
+    rows = conn.execute(
+        f"SELECT * FROM processes WHERE notified = 0 AND background = 1 "
+        f"AND state IN ({placeholders})",
+        tuple(TERMINAL_STATES),
+    ).fetchall()
+    if not rows:
+        return []
+    conn.executemany(
+        "UPDATE processes SET notified = 1 WHERE pid = ? AND session_id = ?",
+        [(row["pid"], row["session_id"]) for row in rows],
+    )
+    conn.commit()
+    return [
+        ProcessChange(
+            pid=row["pid"],
+            session_id=row["session_id"],
+            name=row["name"],
+            state=row["state"],
+            exit_code=row["exit_code"],
+            stdout_path=Path(row["stdout_path"]),
+            stderr_path=Path(row["stderr_path"]),
+            exit_info=row["exit_info"],
+        )
+        for row in rows
+    ]
 
 
 def running_session_ids(conn: sqlite3.Connection) -> set[str]:

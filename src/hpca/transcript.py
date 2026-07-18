@@ -16,11 +16,16 @@ from dataclasses import dataclass
 from hpca.llm import Message
 
 TOOL_PREFIXES = ("[tool result]", "[tool error]")
+# Background work reporting in on its own (§5.4). Rides the user role like
+# tool results do, and is marked so the transcript does not attribute a
+# process crash to the human sitting there.
+EVENT_PREFIXES = ("[process ", "[job ")
 
 USER = "user"
 ASSISTANT = "assistant"
 THINKING = "thinking"
 ERROR = "error"
+EVENT = "event"
 
 
 @dataclass
@@ -44,6 +49,13 @@ def is_tool_message(message: Message) -> bool:
     """Tool results ride the user role (§4.3); the prefix is what marks them."""
     return message["role"] == USER and str(message["content"]).startswith(
         TOOL_PREFIXES
+    )
+
+
+def is_event_message(message: Message) -> bool:
+    """A completion the watcher delivered, not something the user typed."""
+    return message["role"] == USER and str(message["content"]).startswith(
+        EVENT_PREFIXES
     )
 
 
@@ -99,6 +111,9 @@ def build_entries(
         elif is_tool_message(message):
             pending.append(("step", content))
             steps += 1
+        elif is_event_message(message):
+            flush()
+            entries.append(Entry(kind=EVENT, text=content))
         else:
             flush()
             entries.append(Entry(kind=USER, text=content))
