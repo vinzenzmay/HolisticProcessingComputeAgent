@@ -1,6 +1,6 @@
 # Built-in error signature library (§5.5). User-extensible: entries in
-# ~/.HolisticProcessingComputeAgent/signatures.yaml are merged on top and an
-# entry with an existing id replaces the built-in one.
+# ~/.HolisticProcessingComputeAgent/error_signatures.yaml are merged on top and
+# an entry with an existing id replaces the built-in one.
 #
 # Fields: id, title, patterns (list of case-insensitive regexes matched per
 # line), hint (deterministic suggestion shown alongside the excerpt).
@@ -87,3 +87,57 @@
   hint: >-
     The filesystem is full or the quota is exhausted. Clean up scratch
     space, or write outputs to a filesystem with room.
+
+# --------------------------------------------------------------------------
+# Local CLI tools (§5.4). The library above was written for cluster job logs;
+# these cover how a tool invoked from a generated script actually fails.
+
+- id: cli_usage_error
+  title: Wrong command-line arguments
+  patterns:
+    - ": error: unrecognized arguments"
+    - ": error: (the following )?arguments? "
+    - ": error: invalid choice"
+    - ": error: argument "
+    - "unrecognized option"
+    - "invalid option"
+    - "illegal option"
+  hint: >-
+    The tool rejected its arguments — usually a flag that does not exist, or
+    a value passed positionally where a flag was required. Read its --help
+    for the exact spelling before rewriting the script.
+
+- id: htslib_open_failure
+  title: samtools/htslib could not open a file
+  patterns:
+    - "\\[E::hts_open"
+    - "\\[E::.*fail"
+    - "fail(ed)? to open"
+    - "truncated file"
+    - "invalid BGZF header"
+  hint: >-
+    htslib could not read an input. Check the path, that the file is not
+    truncated, and that a .bai/.crai index exists next to it where one is
+    required.
+
+- id: missing_index
+  title: Alignment index missing
+  patterns:
+    - "index file .* not found"
+    - "fail(ed)? to load .*index"
+    - "no (BAI|CSI|CRAI) index"
+    - "random alignment retrieval only works for indexed"
+  hint: >-
+    The tool needs an index beside the alignment. Run `samtools index` on the
+    BAM/CRAM first.
+
+- id: reference_mismatch
+  title: Reference does not match the alignment
+  patterns:
+    - "does not match .*reference"
+    - "SQ lines? .* mismatch"
+    - "reference .* not found in"
+    - "chromosome .* not (found|present)"
+  hint: >-
+    The reference FASTA and the alignment disagree on contigs. Confirm both
+    were built against the same assembly (and the same naming, chr20 vs 20).

@@ -71,10 +71,15 @@ class TriageReport:
 
 
 def builtin_signatures_path() -> Path:
-    return Path(__file__).parent / "data" / "signatures.yaml"
+    return Path(__file__).parent / "data" / "error_signatures.yaml"
 
 
 def user_signatures_path() -> Path:
+    return app_dir() / "error_signatures.yaml"
+
+
+def legacy_user_signatures_path() -> Path:
+    """Pre-rename location; still read so nobody's entries vanish silently."""
     return app_dir() / "signatures.yaml"
 
 
@@ -108,10 +113,14 @@ def _parse_signature_file(path: Path) -> list[Signature]:
 def load_signatures(user_file: Path | None = None) -> list[Signature]:
     """Built-in library plus user entries; user ids override built-ins."""
     by_id = {s.id: s for s in _parse_signature_file(builtin_signatures_path())}
-    user_file = user_file if user_file is not None else user_signatures_path()
-    if user_file.exists():
-        for signature in _parse_signature_file(user_file):
-            by_id[signature.id] = signature
+    if user_file is not None:
+        candidates = [user_file]
+    else:
+        candidates = [legacy_user_signatures_path(), user_signatures_path()]
+    for path in candidates:
+        if path.exists():
+            for signature in _parse_signature_file(path):
+                by_id[signature.id] = signature
     return list(by_id.values())
 
 
@@ -147,6 +156,181 @@ def scan_log(
             )
         )
     return matches
+
+
+# ------------------------------------------------------- tier 2: keyword scan
+#
+# When no signature matches, a broad keyword sweep still finds most real
+# failures. The trap is that it also finds statistics: on a chatty log,
+# "Reads failing QC filter: 1423" and "Error rate: 0.012%" match just as
+# readily as the actual cause, and taking the last hit lands on a cleanup
+# line. So candidates are scored rather than picked by position, and several
+# are kept — choosing between them is judgment, which is tier 3's job.
+
+GENERIC_CONTEXT = 3
+GENERIC_TOP_N = 5
+
+# A structured error marker: tools emit these deliberately when something
+# broke, rather than in passing.
+STRONG_MARKERS = re.compile(
+    r"(?:^|\W)(?:error|fatal|traceback|exception|abort(?:ed)?|core dumped|"
+    r"segmentation fault|panic)\s*:|"
+    r"\[E::|^E:|"
+    r"(?:failed|unable) to |cannot |could not |no such file|not found|"
+    r"permission denied|command not found",
+    re.IGNORECASE,
+)
+WEAK_MARKERS = re.compile(
+    r"error|fail(?:ed|ure)?|invalid|denied|broken|missing|refus|corrupt",
+    re.IGNORECASE,
+)
+# Counters and rates. "0 errors" and "Error rate: 0.01%" are reports of
+# health, not failures, and they are extremely common in aligner output.
+STATISTIC_MARKERS = re.compile(
+    r"\d\s*%|"
+    r"\b0\s+(?:errors?|failures?|failed)\b|"
+    r"\b(?:error|failure)\s+rate\b|"
+    r"\b\d+\s+(?:reads?|records?|sequences?|entries)\b",
+    re.IGNORECASE,
+)
+
+
+@dataclass
+class Candidate:
+    """A line that might be the cause, with the lines around it."""
+
+    line_no: int  # 1-based, within the scanned tail
+    line: str
+    score: float
+    excerpt: str
+
+
+def scan_generic(
+    path: Path,
+    *,
+    context: int = GENERIC_CONTEXT,
+    top_n: int = GENERIC_TOP_N,
+    tail_lines: int = TAIL_LINES,
+) -> list[Candidate]:
+    """Scored error-ish lines from a log, best first, each with context.
+
+    Deliberately deterministic and exhaustive: it proposes, something else
+    disposes. Returning several candidates instead of one guess is the point
+    — a regex cannot tell a cleanup message from the failure that caused it.
+    """
+    try:
+        lines = Path(path).read_text(errors="replace").splitlines()[-tail_lines:]
+    except OSError:
+        return []
+    scored: list[Candidate] = []
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        score = 0.0
+        if STRONG_MARKERS.search(line):
+            score += 3.0
+        elif WEAK_MARKERS.search(line):
+            score += 1.0
+        else:
+            continue
+        if STATISTIC_MARKERS.search(line):
+            score -= 4.0  # a health report, not a failure
+        if score <= 0:
+            continue
+        # Later lines are somewhat more likely to be the cause, but never
+        # enough to outrank a genuine error marker further up.
+        score += (index / max(len(lines) - 1, 1)) * 0.5
+        start = max(0, index - context)
+        scored.append(
+            Candidate(
+                line_no=index + 1,
+                line=line.strip(),
+                score=round(score, 3),
+                excerpt="\n".join(lines[start : index + 1 + context]),
+            )
+        )
+    scored.sort(key=lambda c: (-c.score, -c.line_no))
+    return scored[:top_n]
+
+
+# ------------------------------------------------------ tiered log analysis
+
+
+@dataclass
+class LogFinding:
+    """What the deterministic tiers could establish about a failed log."""
+
+    tier: int  # 1 = signature matched, 2 = keyword candidates, 3 = nothing
+    title: str = ""
+    hint: str = ""
+    matched_line: str = ""
+    excerpt: str = ""
+    candidates: list[Candidate] = field(default_factory=list)
+
+    @property
+    def conclusive(self) -> bool:
+        """Tier 1 names the failure class; the rest only narrow it down."""
+        return self.tier == 1
+
+
+def analyse_log(
+    path: Path, signatures: list[Signature], *, tail_lines: int = TAIL_LINES
+) -> LogFinding:
+    """Tier 1 then tier 2; tier 3 (the model) is the caller's business."""
+    matches = scan_log(path, signatures, tail_lines=tail_lines)
+    if matches:
+        # Last match wins: signatures scan in library order, and the failure
+        # that actually stopped the run is the one nearest the end.
+        best = matches[-1]
+        return LogFinding(
+            tier=1,
+            title=best.title,
+            hint=best.hint,
+            matched_line=best.matched_line,
+            excerpt=best.excerpt,
+        )
+    candidates = scan_generic(path, tail_lines=tail_lines)
+    if candidates:
+        return LogFinding(
+            tier=2,
+            title="Possible error lines",
+            matched_line=candidates[0].line,
+            excerpt=candidates[0].excerpt,
+            candidates=candidates,
+        )
+    return LogFinding(tier=3)
+
+
+def append_user_signature(
+    signature: Signature, *, user_file: Path | None = None
+) -> Path:
+    """Add a signature to the user library, so tier 3 teaches tiers 1–2.
+
+    Every tier-3 explanation is evidence that a signature is missing: the
+    expensive path ran because the cheap one had nothing to say. Writing the
+    result back means a tool that fails oddly on this cluster costs a model
+    call once rather than every time. Validated before it is written — a bad
+    regex here would break loading for every later triage.
+    """
+    path = user_file if user_file is not None else user_signatures_path()
+    for pattern in signature.patterns:
+        re.compile(pattern)  # raises re.error on a malformed proposal
+    entry = {
+        "id": signature.id,
+        "title": signature.title,
+        "patterns": list(signature.patterns),
+        "hint": signature.hint,
+    }
+    existing = []
+    if path.exists():
+        existing = [
+            e
+            for e in (yaml.safe_load(path.read_text()) or [])
+            if e.get("id") != signature.id
+        ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(existing + [entry], sort_keys=False))
+    return path
 
 
 def triage_job(

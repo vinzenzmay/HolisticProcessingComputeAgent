@@ -390,7 +390,8 @@ pipeline turns "job 48812 failed" into a compact structured report:
    OOM-kill (`oom-kill`, `Out Of Memory`), `DUE TO TIME LIMIT`, command not found,
    Python tracebacks, R errors (`Error in …`), snakemake rule failures
    (`Error in rule …`), missing input files, permission denied, quota exceeded, …
-   The signature library is a data file (YAML) and user-extensible.
+   The signature library is a data file (`error_signatures.yaml`) and
+   user-extensible.
 4. Extract the ~30 most relevant lines per matched signature.
 5. Hand the structured report `{job meta, matched signatures, excerpts}` to the
    log-explainer subagent, which produces: **why the job failed, its current state, a
@@ -398,6 +399,34 @@ pipeline turns "job 48812 failed" into a compact structured report:
    with one sentence of justification). Given the small model, the suggestion is
    always framed as a suggestion; fixes touching files re-enter the dry-run and HITL
    gates.
+
+**Three tiers of error identification.** The same pipeline reads the logs of local
+background processes (§5.4), and there the naive answer — send the tail of stderr —
+fails badly: a tool that errors on its last line after printing 25 lines of usage
+buries the cause, and a grep for `error|fail` on a chatty aligner log matches
+statistics (`Error rate: 0.012%`) and cleanup messages (`0 errors during cleanup`)
+just as readily as the failure. So identification escalates, each tier running only
+when the cheaper one above it found nothing:
+
+1. **Signature library** — deterministic, and the only tier that names the failure
+   *class* and carries a `hint`. For a small model that hint is worth more than the
+   log text: it says what kind of mistake was made, not just what was printed.
+2. **Scored keyword scan** — a broad sweep whose candidates are *ranked*, not picked
+   by position. Structured markers (`error:`, `[E::`, `Traceback`) score up; things
+   shaped like counters or rates score down and drop out; lateness contributes a
+   little and never outranks a real marker. Several candidates survive, each with
+   three lines of context either side. Deliberately proposes rather than decides.
+3. **The log-explainer** — chooses among those candidates. Grep is better at
+   *finding* and a model is better at *judging*, so the model never searches: it is
+   handed retrieved lines and asked which one caused the failure. It must quote a
+   candidate verbatim or return an empty cause; a quote that is not in the log is
+   discarded in code and marked unverified. Admitting "cannot tell from this log" is
+   a correct answer, and cheaper than a confident wrong one.
+
+Tier 3 running at all is evidence that a signature is missing, so the explainer may
+propose one — id, patterns, hint — offered to the user for approval and appended to
+their `error_signatures.yaml`. The expensive path teaches the cheap path, and a tool
+that fails oddly on this cluster costs a model call once rather than every time.
 
 ### 5.6 RAG for documentation
 

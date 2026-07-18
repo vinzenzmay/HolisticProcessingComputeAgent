@@ -17,6 +17,10 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from hpca.triage import LogFinding
 
 
 @dataclass
@@ -223,13 +227,39 @@ def _tail(path: Path) -> str:
     return body[-EVENT_TAIL_CHARS:]
 
 
-def format_process_event(change: ProcessChange) -> str:
+def analyse_process_failure(change: ProcessChange) -> LogFinding:
+    """Best deterministic reading of why a process failed (§5.5 tiers 1–2).
+
+    Both streams are examined because tools disagree about where errors go,
+    and the more conclusive finding wins.
+    """
+    from hpca.triage import LogFinding as _LF
+    from hpca.triage import analyse_log, load_signatures
+
+    signatures = load_signatures()
+    findings = [
+        analyse_log(path, signatures)
+        for path in (change.stderr_path, change.stdout_path)
+    ]
+    findings.sort(key=lambda f: f.tier)  # tier 1 beats tier 2 beats nothing
+    return findings[0] if findings else _LF(tier=3)
+
+
+def format_process_event(
+    change: ProcessChange, finding: "LogFinding | None" = None
+) -> str:
     """The message the agent receives when a background process ends.
 
     Failures mirror the wording run_bash already uses for a failed script, so
-    the model meets a shape it has been trained on by the rest of the session:
-    state the failure, then tell it to fix and retry. The log tail is included
-    inline so reacting does not cost a read_file round-trip first.
+    the model meets a shape the rest of the session has taught it: state the
+    failure, then say to fix and retry. The diagnosis is inline so reacting
+    does not cost a read_file round-trip first.
+
+    What goes in depends on how much the deterministic tiers established. A
+    matched signature names the failure *class* and carries a hint, which is
+    worth more to a small model than raw log text. Keyword candidates are
+    offered as possibilities, explicitly unconfirmed. Only when both come up
+    empty does this fall back to the blunt tail.
     """
     if change.state == "finished":
         head = f"[process finished] {change.name} (pid {change.pid}) exited 0."
@@ -245,17 +275,38 @@ def format_process_event(change: ProcessChange) -> str:
             "again."
         )
     parts = [head]
-    # On failure the cause is in stderr; on success stdout is the result.
-    streams = (
-        [("stderr", change.stderr_path), ("stdout", change.stdout_path)]
-        if change.state != "finished"
-        else [("stdout", change.stdout_path), ("stderr", change.stderr_path)]
-    )
-    for label, path in streams:
-        body = _tail(path)
+
+    if change.state == "finished":
+        body = _tail(change.stdout_path) or _tail(change.stderr_path)
         if body:
-            parts.append(f"{label} tail:\n{body}")
-            break  # one stream is enough context; keep the prompt small
+            parts.append(f"stdout tail:\n{body}")
+        return "\n\n".join(parts)
+
+    if finding is None:
+        finding = analyse_process_failure(change)
+    if finding.tier == 1:
+        parts.append(f"cause: {finding.title}")
+        # Stated separately because the excerpt is padded for job logs, where
+        # what follows an error matters; a CLI tool errors on its last line,
+        # so the key line would otherwise sit at the bottom of a usage dump.
+        if finding.matched_line:
+            parts.append(f"cause line: {finding.matched_line}")
+        if finding.hint:
+            parts.append(f"hint: {finding.hint}")
+        parts.append(f"log:\n{finding.excerpt}")
+    elif finding.tier == 2:
+        lines = "\n".join(
+            f"  line {c.line_no}: {c.line}" for c in finding.candidates
+        )
+        parts.append(
+            "No known error signature matched. Most likely error lines "
+            f"(unconfirmed):\n{lines}"
+        )
+        parts.append(f"around the first of them:\n{finding.excerpt}")
+    else:
+        body = _tail(change.stderr_path) or _tail(change.stdout_path)
+        if body:
+            parts.append(f"stderr tail:\n{body}")
     return "\n\n".join(parts)
 
 

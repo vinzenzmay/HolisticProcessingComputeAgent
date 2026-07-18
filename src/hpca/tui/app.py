@@ -22,6 +22,7 @@ from textual.widgets import Footer, Label, ListItem, ListView, Static, TextArea
 from hpca.agent.builtin_tools import default_tool_registry
 from hpca.agent.context import ToolContext
 from hpca.agent.file_tools import add_file_tools
+from hpca.agent.explainer import explain_process_failure
 from hpca.agent.graph import build_graph, deliver_event, run_turn
 from hpca.agent.job_tools import add_job_tools
 from hpca.agent.tools import ToolRegistry
@@ -51,10 +52,12 @@ from hpca.registry import PathRegistry
 from hpca.runner import (
     ProcessRecord,
     ProcessRunner,
+    analyse_process_failure,
     format_process_event,
     poll_processes,
     running_session_ids,
 )
+from hpca.triage import Signature, append_user_signature
 from hpca.sessions import Session, SessionStore
 from hpca.skills import load_skills, summarize_skills
 from hpca.slurm import TERMINAL_STATES as SLURM_TERMINAL_STATES
@@ -1394,10 +1397,63 @@ class HpcaApp(App):
             self.notify(f"Process watch failed: {e}", severity="warning")
             return
         for change in changes:
-            self._pending_events.append(
-                (change.session_id, format_process_event(change))
+            finding = (
+                analyse_process_failure(change)
+                if change.state != "finished"
+                else None
             )
+            text = format_process_event(change, finding)
+            if finding is not None and finding.tier == 2:
+                # Tier 3: the keyword scan found candidates but cannot say
+                # which one caused it. That judgment is worth a model call.
+                text = await self._explain_candidates(change, finding, text)
+            self._pending_events.append((change.session_id, text))
         await self.drain_events()
+
+    async def _explain_candidates(self, change, finding, fallback: str) -> str:
+        """Ask the explainer to pick the causing line, and learn from it."""
+        if self._llm is None:
+            return fallback
+        try:
+            explanation = await explain_process_failure(
+                self._llm,
+                name=change.name,
+                exit_code=change.exit_code,
+                candidates=finding.candidates,
+                tier1=self.profile_memory.tier_text(1) if self.profile_memory else "",
+            )
+        except Exception as e:
+            self.notify(f"Log explainer failed: {e}", severity="warning")
+            return fallback
+        if not explanation.conclusive:
+            return fallback  # it said it could not tell; do not dress that up
+        if explanation.proposed_signature is not None:
+            self._offer_signature(explanation.proposed_signature)
+        head = fallback.split("\n\n", 1)[0]
+        return f"{head}\n\n{explanation.render()}\n\nlog:\n{finding.excerpt}"
+
+    def _offer_signature(self, proposed) -> None:
+        """A tier-3 diagnosis means a signature was missing; offer to keep it."""
+        signature = Signature(
+            id=proposed.id,
+            title=proposed.title,
+            patterns=list(proposed.patterns),
+            hint=proposed.hint,
+        )
+
+        async def save() -> None:
+            try:
+                path = append_user_signature(signature)
+            except Exception as e:
+                self.notify(f"Could not save signature: {e}", severity="error")
+                return
+            self.notify(f"Saved error signature {signature.id!r} to {path.name}")
+
+        self._confirm_then(
+            f"Remember this failure as {signature.id!r} "
+            f"({signature.title}) so it is recognised next time?",
+            save(),
+        )
 
     async def drain_events(self) -> None:
         """Deliver one queued event, never racing a live turn.
