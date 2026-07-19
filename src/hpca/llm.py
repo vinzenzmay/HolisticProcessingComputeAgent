@@ -25,6 +25,27 @@ from hpca.config import LLMSettings
 
 Message = dict[str, Any]
 
+# A message may carry an API-only sidecar: recalled memory context (redesign
+# Phase 1) is appended to what the *model* sees without polluting the stored
+# transcript. The checkpointer round-trips the key untouched; only the wire
+# encoding below substitutes it for the content.
+API_CONTENT_KEY = "api_content"
+
+
+def wire_messages(messages: list[Message]) -> list[Message]:
+    """Messages as sent to the backend: sidecar applied, extras dropped.
+
+    Backends vary in how strictly they validate message objects, so only
+    ``role`` and ``content`` go on the wire.
+    """
+    return [
+        {
+            "role": message["role"],
+            "content": message.get(API_CONTENT_KEY) or message["content"],
+        }
+        for message in messages
+    ]
+
 PROBE_SCHEMA = {
     "type": "object",
     "properties": {"ok": {"type": "boolean"}},
@@ -96,7 +117,7 @@ class LLMClient:
             enable_thinking = self._settings.enable_thinking
         payload: dict[str, Any] = {
             "model": self._settings.model,
-            "messages": messages,
+            "messages": wire_messages(messages),
             "chat_template_kwargs": {"enable_thinking": enable_thinking},
         }
         if json_schema is not None:
@@ -203,7 +224,7 @@ class LLMClient:
 
     # ------------------------------------------------------------ discovery
 
-    async def models(self) -> list[str]:
+    async def _model_entries(self) -> list[dict]:
         try:
             response = await self._client.get("models")
         except httpx.HTTPError as e:
@@ -212,7 +233,28 @@ class LLMClient:
             raise LLMError(
                 f"Listing models failed ({response.status_code}): {response.text[:500]}"
             )
-        return [entry["id"] for entry in response.json().get("data", [])]
+        return response.json().get("data", [])
+
+    async def models(self) -> list[str]:
+        return [entry["id"] for entry in await self._model_entries()]
+
+    async def context_window(self) -> int | None:
+        """The served model's context length, if the backend advertises it.
+
+        vLLM puts ``max_model_len`` on each /v1/models entry, which is the
+        honest number: it reflects how the server was actually launched, not
+        what the model card claims. Returns None when the backend does not
+        say, and the caller falls back to the configured value.
+        """
+        try:
+            entries = await self._model_entries()
+        except LLMError:
+            return None
+        for entry in entries:
+            if entry.get("id") == self._settings.model:
+                window = entry.get("max_model_len")
+                return int(window) if window else None
+        return None
 
     async def supports_constrained_decoding(self) -> bool:
         """Whether tool calls can use JSON-schema constrained decoding (§2).

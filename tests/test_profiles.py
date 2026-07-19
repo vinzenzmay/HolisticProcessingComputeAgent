@@ -204,3 +204,151 @@ class TestProfileManagement:
 
     def test_deleting_a_missing_profile_is_quiet(self, hpca_home):
         Profile.delete("never-existed")  # must not raise
+
+
+class TestCharBudgets:
+    """Redesign Phase 1: hard, model-independent character budgets."""
+
+    def test_tier_chars_counts_injected_text(self, hpca_home):
+        profile = Profile.load("default")
+        profile.add_memory("abcd", tier=1)
+        profile.add_memory("efgh", tier=1)
+        assert profile.tier_chars(1) == len("abcd\n\nefgh")
+
+    def test_usage_meter_format(self, hpca_home):
+        profile = Profile.load("default")
+        profile.add_memory("x" * 600, tier=2)
+        assert profile.usage_meter(2, 1200) == "50% — 600/1200 chars"
+
+    def test_usage_meter_zero_cap_does_not_divide(self, hpca_home):
+        assert Profile.load("default").usage_meter(1, 0) == "0% — 0/0 chars"
+
+    def test_would_exceed_counts_the_joiner(self, hpca_home):
+        profile = Profile.load("default")
+        profile.add_memory("x" * 10, tier=1)
+        # 10 used + 2 joiner + 5 new = 17
+        assert not profile.would_exceed(1, "y" * 5, cap=17)
+        assert profile.would_exceed(1, "y" * 5, cap=16)
+
+    def test_would_exceed_empty_tier_has_no_joiner(self, hpca_home):
+        profile = Profile.load("default")
+        assert not profile.would_exceed(1, "y" * 5, cap=5)
+
+    def test_over_cap_tiers_uses_chars(self, hpca_home):
+        profile = Profile.load("default")
+        profile.add_memory("x" * 100, tier=2)
+        assert profile.over_cap_tiers(tier1_cap=50, tier2_cap=99) == [2]
+        assert profile.over_cap_tiers(tier1_cap=50, tier2_cap=100) == []
+
+
+class TestBackendAnnotation:
+    """Memories from another backend are annotated at injection, not dropped —
+    a workaround for one small model often transfers."""
+
+    def test_other_backend_annotated(self, hpca_home):
+        profile = Profile.load("default")
+        profile.add_memory("Use --no-mmap here.", tier=2, backend="qwen3-6b")
+        text = profile.tier_prompt_text(2, active_backend="gemma3-27b")
+        assert text == "(learned on qwen3-6b) Use --no-mmap here."
+
+    def test_same_backend_unannotated(self, hpca_home):
+        profile = Profile.load("default")
+        profile.add_memory("Use --no-mmap here.", tier=2, backend="qwen3-6b")
+        text = profile.tier_prompt_text(2, active_backend="qwen3-6b")
+        assert text == "Use --no-mmap here."
+
+    def test_untagged_memory_unannotated(self, hpca_home):
+        profile = Profile.load("default")
+        profile.add_memory("Cluster is cubi.", tier=1)
+        assert (
+            profile.tier_prompt_text(1, active_backend="qwen3-6b")
+            == "Cluster is cubi."
+        )
+
+
+class TestDuplication:
+    """A copy starts from everything the original learned, then diverges —
+    the workflow is a general base profile forked per specialism."""
+
+    def base(self, name="base"):
+        profile = Profile.create(name)
+        profile.default_backend = "qwen3-35b"
+        profile.add_memory("Cluster is cubi, scheduler is Slurm.", tier=1)
+        profile.add_memory("The user prefers R.", tier=2)
+        profile.add_memory("Snakemake dry-runs fail here.", tier=3, kind="struggle")
+        profile.save()
+        return profile
+
+    def test_all_tiers_copied(self, hpca_home):
+        self.base()
+        copy = Profile.duplicate("base", "variants")
+        assert [(m.tier, m.text) for m in copy.memories] == [
+            (1, "Cluster is cubi, scheduler is Slurm."),
+            (2, "The user prefers R."),
+            (3, "Snakemake dry-runs fail here."),
+        ]
+
+    def test_metadata_preserved_and_provenance_recorded(self, hpca_home):
+        self.base()
+        copy = Profile.duplicate("base", "variants")
+        assert copy.default_backend == "qwen3-35b"
+        assert copy.copied_from == "base"
+        assert copy.copied_on
+        # struggle notes stay struggle notes, so matching still works
+        assert copy.memories[2].kind == "struggle"
+
+    def test_provenance_survives_a_round_trip(self, hpca_home):
+        self.base()
+        Profile.duplicate("base", "variants")
+        assert Profile.load("variants").copied_from == "base"
+
+    def test_ordinary_profiles_carry_no_provenance(self, hpca_home):
+        Profile.create("plain").save()
+        assert Profile.load("plain").copied_from == ""
+        assert "copied_from" not in Profile.path_for("plain").read_text()
+
+    def test_the_copy_is_written_to_disk(self, hpca_home):
+        self.base()
+        Profile.duplicate("base", "variants")
+        assert "variants" in Profile.list_profiles()
+
+    def test_they_diverge(self, hpca_home):
+        self.base()
+        Profile.duplicate("base", "variants")
+
+        original = Profile.load("base")
+        original.add_memory("Learned later by the base.", tier=2)
+        original.save()
+
+        copy = Profile.load("variants")
+        copy.add_memory("Learned later by the copy.", tier=2)
+        copy.save()
+
+        base_texts = [m.text for m in Profile.load("base").memories]
+        copy_texts = [m.text for m in Profile.load("variants").memories]
+        assert "Learned later by the base." in base_texts
+        assert "Learned later by the base." not in copy_texts
+        assert "Learned later by the copy." in copy_texts
+        assert "Learned later by the copy." not in base_texts
+        # and the shared base is still in both
+        assert "The user prefers R." in base_texts
+        assert "The user prefers R." in copy_texts
+
+    def test_editing_a_copied_memory_does_not_touch_the_original(self, hpca_home):
+        self.base()
+        copy = Profile.duplicate("base", "variants")
+        copy.memories[1].text = "The user prefers Python now."
+        copy.save()
+        assert Profile.load("base").memories[1].text == "The user prefers R."
+
+    def test_copying_an_empty_profile(self, hpca_home):
+        Profile.create("blank")
+        copy = Profile.duplicate("blank", "also-blank")
+        assert copy.memories == []
+        assert copy.copied_from == "blank"
+
+    def test_copy_of_a_copy_records_its_immediate_source(self, hpca_home):
+        self.base()
+        Profile.duplicate("base", "variants")
+        grandchild = Profile.duplicate("variants", "variants-wgs")
+        assert grandchild.copied_from == "variants"

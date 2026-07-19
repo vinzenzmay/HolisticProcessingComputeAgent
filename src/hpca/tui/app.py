@@ -6,7 +6,7 @@ import asyncio
 import shutil
 from dataclasses import dataclass
 from os import environ as os_environ
-from time import monotonic
+from time import monotonic, time
 from typing import Any
 
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -20,6 +20,7 @@ from textual.content import Content
 from textual.message import Message
 from textual.widgets import Footer, Label, ListItem, ListView, Static, TextArea
 
+from hpca.agent import compact
 from hpca.agent.builtin_tools import default_tool_registry
 from hpca.agent.context import ToolContext
 from hpca.agent.file_tools import add_file_tools
@@ -28,26 +29,37 @@ from hpca.agent.graph import build_graph, deliver_event, run_turn
 from hpca.agent.job_tools import add_job_tools
 from hpca.agent.tools import ToolRegistry
 from hpca.clipboard import ClipboardManager, CopyResult
+from hpca import curator
 from hpca.config import LLMBackend, Settings, app_dir
 from hpca.db import checkpoints_db_path, connect, init_db
 from hpca.jobs import JobRow, JobStore, poll_active
 from hpca.agent.conclude import MemoryProposal, propose_memories
 from hpca.agent.doc_tools import add_ask_docs, add_doc_tools
+from hpca.agent.memory_context import (
+    build_memory_context,
+    compose_api_content,
+    note_line,
+    retrieved_line,
+)
+from hpca.agent.memory_tools import add_memory_tools
 from hpca.agent.prompts import orchestrator_system_prompt
+from hpca.agent.reflect import Reflection, propose_reflections
 from hpca.agent.skill_tools import add_skill_tools
 from hpca.agent.titler import propose_title
 from hpca.agent.struggle import (
     STRUGGLE_KIND,
     matching_struggles,
-    propose_struggle_note,
     turn_struggled,
 )
 from hpca.editor import resolve_editor
 from hpca.embeddings import EmbeddingClient
+from hpca.episodic import EpisodicStore
 from hpca.llm import LLMClient
 from hpca.logs import LoggedLLM, SessionLog, open_log
 from hpca.rag import RagStore
+from hpca.transcript import ASSISTANT as ASSISTANT_ENTRY
 from hpca.transcript import THINKING, Entry, build_entries
+from hpca.transcript import USER as USER_ENTRY
 from hpca.profiles import DEFAULT_PROFILE, Profile
 from hpca.registry import PathRegistry
 from hpca.runner import (
@@ -60,16 +72,37 @@ from hpca.runner import (
 )
 from hpca.triage import Signature, append_user_signature
 from hpca.sessions import Session, SessionStore
-from hpca.skills import load_skills, summarize_skills
+from hpca.skills import (
+    Skill,
+    any_skills,
+    copy_profile_skills,
+    delete_profile_skills,
+    load_skills,
+    patched_body,
+    summarize_skills,
+    write_skill,
+)
 from hpca.slurm import TERMINAL_STATES as SLURM_TERMINAL_STATES
 from hpca.slurm import SlurmClient
 from hpca.symbols import SymbolIndex
 from hpca.trash import TrashManager
 from hpca.tui.approval_screen import ApprovalScreen
 from hpca.tui.confirm_screen import ConfirmScreen
+from hpca.tui.context_bar import ContextBar
 from hpca.tui.inspect_screen import InspectScreen, format_job, format_process
 from hpca.tui.manage_llms import ManageLLMsScreen
-from hpca.tui.memory_screens import MemoryProposalScreen
+from hpca.memory_index import MemoryIndex
+from hpca.memory_ops import (
+    MemoryOp,
+    MemoryOpError,
+    apply_batch,
+    drift_detected,
+)
+from hpca.tui.memory_screens import (
+    MemoryBatchScreen,
+    MemoryProposalScreen,
+    ReflectionScreen,
+)
 from hpca.tui.profiles_screen import ProfilePickerScreen, ProfilesScreen
 from hpca.tui.rename_screen import RenameScreen
 from hpca.tui.settings_screen import SettingsScreen
@@ -84,6 +117,7 @@ CHAT_TITLES = {
     "error": "error",
     "event": "background",
     "queued": "queued",
+    "recall": "recalled from memory",
 }
 
 
@@ -106,6 +140,7 @@ LOG_KINDS = {
     "assistant": "agent",
     "error": "error",
     "event": "background",
+    "recall": "recalled from memory",
 }
 
 
@@ -356,6 +391,7 @@ class ChatPanel(ColumnPanel):
 
     def compose(self) -> ComposeResult:
         yield Static(self._title, classes="column-title")
+        yield ContextBar(id="context-bar")
         yield ChatList(id="chat-list")
         menu = Static(id="command-menu")
         menu.display = False
@@ -476,6 +512,10 @@ class HpcaApp(App):
         border: round $panel-lighten-2;
         color: $text-muted;
     }
+    .chat-recall {
+        border: round $panel-lighten-2;
+        color: $text-muted;
+    }
     .chat-working {
         color: $text-muted;
         padding: 0 1;
@@ -522,7 +562,7 @@ class HpcaApp(App):
         self._llm = llm
         self._owns_llm = llm is None
         self.slurm = slurm or self._detect_slurm()
-        self.skills = load_skills()
+        self.skills = load_skills(profile)
         if tools is not None:
             self._tools = tools
         else:
@@ -531,8 +571,11 @@ class HpcaApp(App):
             )
             if self.slurm is not None:
                 add_job_tools(self._tools)
-            if self.skills:
+            # Registered when ANY profile has a skill: the active profile
+            # changes per session, but the tool registry does not.
+            if any_skills():
                 add_skill_tools(self._tools)
+            add_memory_tools(self._tools)
         self.active_session: Session | None = None
         self._tool_ctx: ToolContext | None = None
         self._chat_entries: list[Entry] = []
@@ -552,6 +595,22 @@ class HpcaApp(App):
         self._shutting_down = False
         self._turn_ctx: ToolContext | None = None  # that turn's tool context
         self._turn_memory: Profile | None = None  # that turn's profile memories
+        self._turn_skills: list[Skill] | None = None  # that turn's skills
+        # Frozen per-session memory views (redesign Phase 1): one snapshot per
+        # profile, reused across turns so the system-prompt prefix stays
+        # byte-stable for the backend's prefix cache. Refreshed on approved
+        # writes and profile edits, never silently mid-session.
+        self._memory_snapshots: dict[str, Profile] = {}
+        # User turns since the last self-review, per session (redesign P4).
+        self._turns_since_review: dict[str, int] = {}
+        # Messages compaction dropped from the model's view, waiting to be
+        # reviewed once the turn they were dropped during has finished (P6).
+        self._evicted: dict[str, list[dict]] = {}
+        # Context meter state: the window the backend reports, and the last
+        # measured prompt size (per session — a different thread is a
+        # different context).
+        self._discovered_window: int | None = None
+        self._context_used = 0
         self._activity = "working"
         self._conn = None
         self._saver_ctx = None
@@ -571,12 +630,15 @@ class HpcaApp(App):
         self._conn = connect()
         init_db(self._conn)
         self.session_store = SessionStore(self._conn)
+        self.episodic = EpisodicStore(self._conn)
+        self.memory_index = MemoryIndex(self._conn)
         self._saver_ctx = AsyncSqliteSaver.from_conn_string(str(checkpoints_db_path()))
         checkpointer = await self._saver_ctx.__aenter__()
         self._checkpointer = checkpointer  # kept for graph rebuilds on switch
         if self._llm is None:
             self._llm = LLMClient(self.settings.llm)
         self.profile_memory = Profile.load(self.profile)
+        self._memory_snapshots[self.profile] = self.profile_memory
         if self.profile_memory.problems:
             self.notify(
                 "Profile file has problems: "
@@ -600,7 +662,10 @@ class HpcaApp(App):
             self.notify(f"Trash: cleaned up {removed} expired entr"
                         f"{'y' if removed == 1 else 'ies'}")
         self._refresh_top_bar()
+        self._refresh_context_bar()
+        self.run_worker(self._discover_context_window(), group="llm-probe")
         await self._reload_sessions()
+        self.run_curator_if_due()
         self.set_interval(2.0, self.refresh_processes)
         self.set_interval(2.0, self.watch_processes)
         if self.slurm is not None:
@@ -658,20 +723,91 @@ class HpcaApp(App):
             return
         self.copy_text(text)
 
+    def _memory_snapshot(self, profile: str) -> Profile:
+        """The frozen memory view for a profile (loaded once, reused across
+        turns). See ``_memory_snapshots`` for why it is not reloaded per turn.
+
+        Loading is also when the tier-3 index is rebuilt: the markdown file is
+        the source of truth, and it may have been edited by hand since.
+        """
+        snapshot = self._memory_snapshots.get(profile)
+        if snapshot is None:
+            snapshot = Profile.load(profile)
+            self._memory_snapshots[profile] = snapshot
+            index = getattr(self, "memory_index", None)
+            if index is not None:
+                try:
+                    index.reindex(snapshot)
+                except Exception:
+                    pass  # retrieval is an optimization; never block a turn
+        return snapshot
+
+    def _refresh_memory_snapshot(self, profile: str) -> None:
+        """Drop a profile's frozen view; the next turn reloads from disk and
+        rebuilds the tier-3 index.
+
+        Called after approved writes and profile edits — the deliberate
+        refresh points where invalidating the backend's prefix cache is
+        worth it."""
+        self._memory_snapshots.pop(profile, None)
+
     def _render_system_prompt(self) -> str:
         """Per-call prompt assembly (§4.3): memories, skills, dynamic facts.
 
         A running turn reads its own session's profile memories, which may
         not be the profile on screen."""
-        memory = self._turn_memory if self._turn_memory is not None else self.profile_memory
+        memory = (
+            self._turn_memory
+            if self._turn_memory is not None
+            else self._memory_snapshot(self.profile)
+        )
+        skills = self._turn_skills if self._turn_skills is not None else self.skills
+        caps = self.settings.memory
+        backend = self.settings.llm.model
         return orchestrator_system_prompt(
-            tier1=memory.tier_text(1),
-            tier2=memory.tier_text(2),
-            skills=summarize_skills(self.skills),
+            tier1=memory.tier_prompt_text(1, active_backend=backend),
+            tier2=memory.tier_prompt_text(2, active_backend=backend),
+            tier1_meter=memory.usage_meter(1, caps.cap_chars(1)),
+            tier2_meter=memory.usage_meter(2, caps.cap_chars(2)),
+            skills=summarize_skills(skills),
+            session_search="session_search" in self._tools.names(),
+            memory_tool="memory" in self._tools.names(),
         )
 
+    def _recall_lines(
+        self, user_text: str, memory: Profile, profile: str
+    ) -> list[str]:
+        """What this request recalls: matching tier-2 struggle notes plus
+        retrieved tier-3 memories (redesign Phase 5).
+
+        Tier 3 is retrieved rather than injected wholesale, which is what lets
+        it grow: situational memories cost context only on the turns they
+        actually match.
+        """
+        lines = [note_line(m) for m in matching_struggles(memory.memories, user_text)]
+        seen = set(lines)
+        index = getattr(self, "memory_index", None)
+        if index is not None:
+            try:
+                hits = index.search(
+                    user_text,
+                    profile=profile,
+                    active_backend=self.settings.llm.model,
+                    limit=self.settings.memory.tier3_prefetch_count,
+                )
+            except Exception:
+                hits = []
+            for hit in hits:
+                line = retrieved_line(hit)
+                if line not in seen:
+                    seen.add(line)
+                    lines.append(line)
+        return lines
+
     def warn_about_struggles(self, text: str) -> list:
-        """§4.4: warn up front when a request matches a past struggle."""
+        """§4.4: warn the *user* up front when a request matches a past
+        struggle. The model gets its own copy as a fenced memory-context
+        block when the turn starts (``_run_agent``)."""
         matches = matching_struggles(self.profile_memory.memories, text)
         for memory in matches:
             first_line = memory.text.splitlines()[0]
@@ -752,14 +888,26 @@ class HpcaApp(App):
         touches — tool context, transcript log — is captured here, not read
         from whatever session happens to be open when the reply lands.
         """
-        # Memories are shared through the profile file: reload so notes made
-        # in another session (or another running instance, or an editor) are
-        # in this turn's prompt. The turn reads its own session's profile —
-        # an approval may resume it while a differently-profiled session is
-        # open on screen.
-        self._turn_memory = Profile.load(session.profile)
+        # The turn reads its own session's profile snapshot — an approval may
+        # resume it while a differently-profiled session is open on screen.
+        # The snapshot is frozen per session (not reloaded per turn) so the
+        # prompt prefix stays cacheable; approved writes refresh it.
+        self._turn_memory = self._memory_snapshot(session.profile)
         if session.profile == self.profile:
             self.profile_memory = self._turn_memory
+        self._turn_skills = load_skills(session.profile)
+        # Recalled memory rides on the API copy of the user message — the
+        # model is warned in-context, the stored transcript stays clean.
+        api_content = None
+        if user_text is not None:
+            lines = self._recall_lines(user_text, self._turn_memory, session.profile)
+            block = build_memory_context(
+                lines,
+                max_notes=self.settings.memory.tier3_prefetch_count,
+                max_chars=self.settings.memory.tier3_prefetch_chars,
+            )
+            if block:
+                api_content = compose_api_content(user_text, block)
         log = open_log(self.settings, session)
         self._busy_turn = session
         self._turn_ctx = self._make_tool_ctx(session, log, memory=self._turn_memory)
@@ -768,7 +916,13 @@ class HpcaApp(App):
             self._tool_ctx = self._turn_ctx
             self.show_working()
         return self.run_worker(
-            self._agent_turn(session, user_text=user_text, resume=resume, log=log),
+            self._agent_turn(
+                session,
+                user_text=user_text,
+                resume=resume,
+                log=log,
+                api_content=api_content,
+            ),
             exclusive=True,
         )
 
@@ -812,6 +966,7 @@ class HpcaApp(App):
         user_text: str | None,
         resume: Command | None,
         log: SessionLog | None,
+        api_content: str | None = None,
     ) -> None:
         try:
             result = await run_turn(
@@ -819,6 +974,7 @@ class HpcaApp(App):
                 session_id=session.session_id,
                 user_text=user_text,
                 resume=resume,
+                api_content=api_content,
             )
         except Exception as e:
             self.hide_working()
@@ -834,11 +990,12 @@ class HpcaApp(App):
             self._busy_turn = None
             self._turn_ctx = None
             self._turn_memory = None
+            self._turn_skills = None
             # Whatever queued up behind this turn starts as soon as this
             # handler unwinds, rather than waiting for the next timer tick.
             self.call_later(self.drain_work)
         self.hide_working()
-        self._log_turn(result, log)
+        self._log_turn(result, log, session)
         if self._is_active_session(session):
             await self._set_chat_messages(result.messages, result.thinking)
             await self.refresh_processes()
@@ -856,7 +1013,14 @@ class HpcaApp(App):
             )
             return
         if self._is_active_session(session):
-            await self.maybe_propose_struggle_note(result.messages)
+            # Context dropped by compaction first: it is gone from the
+            # model's view and this is the last chance to keep anything.
+            evicted = self._evicted.pop(session.session_id, None)
+            if evicted:
+                await self.maybe_review(
+                    session, evicted, forced=True, span="whole"
+                )
+            await self.maybe_review(session, result.messages)
         await self.maybe_title_session(session, result.messages, log=log)
 
     async def maybe_title_session(
@@ -877,21 +1041,38 @@ class HpcaApp(App):
         self._rename_session(session, title, by="llm", log=log)
         return True
 
-    def _log_turn(self, result, log: SessionLog | None) -> None:
+    def _log_turn(self, result, log: SessionLog | None, session: Session) -> None:
         """Write what this turn added into the turn's own transcript — not
         into whichever session is open when the reply lands.
 
         Only the tail is logged, so re-reading a session never duplicates it.
+        The same tail feeds the episodic index (redesign Phase 2): user and
+        assistant messages only — tool traffic and thinking would drown BM25
+        in tool vocabulary.
         """
-        if log is None:
-            return
-        for entry in build_entries(
+        entries = build_entries(
             result.messages, result.thinking, start=result.first_new
-        ):
-            kind = LOG_KINDS.get(entry.kind, entry.kind)
-            if entry.kind == THINKING:
-                kind = f"thinking ({entry.summary()})"
-            log.write(kind, entry.text)
+        )
+        if log is not None:
+            for entry in entries:
+                kind = LOG_KINDS.get(entry.kind, entry.kind)
+                if entry.kind == THINKING:
+                    kind = f"thinking ({entry.summary()})"
+                log.write(kind, entry.text)
+        turns = [
+            (entry.kind, entry.text)
+            for entry in entries
+            if entry.kind in (USER_ENTRY, ASSISTANT_ENTRY)
+        ]
+        try:
+            self.episodic.record(
+                session_id=session.session_id,
+                profile=session.profile,
+                entries=turns,
+            )
+        except Exception as e:  # recall is best-effort; never fail the turn
+            if log is not None:
+                log.write("error", f"episodic index write failed: {e}")
 
     def _log_write(self, kind: str, text: str) -> None:
         if self._log is not None:
@@ -967,6 +1148,32 @@ class HpcaApp(App):
             return
         await self._review_proposals(proposals)
 
+    def _memory_write_blocked(
+        self, tier: int, text: str, memory: Profile | None = None
+    ) -> bool:
+        """Hard char budget on writes (redesign Phase 1): a full tier rejects
+        new memories until the user condenses it. Injection never truncates;
+        only growth is stopped.
+
+        ``memory`` is the profile the caller is about to write to — pass the
+        same object, or the budget gets checked against one state and the
+        write lands in another.
+        """
+        if tier not in (1, 2):
+            return False  # tier 3 is retrieved, not injected: no budget
+        target = memory if memory is not None else self.profile_memory
+        cap = self.settings.memory.cap_chars(tier)
+        if not target.would_exceed(tier, text, cap=cap):
+            return False
+        self.notify(
+            f"Tier {tier} is full "
+            f"({target.usage_meter(tier, cap)}) — memory NOT "
+            "saved. Press ctrl+e to condense the profile, then retry.",
+            severity="warning",
+            timeout=12,
+        )
+        return True
+
     async def _review_proposals(self, proposals: list[MemoryProposal]) -> int:
         """One approval dialog per proposal; only approved ones are kept."""
         kept = 0
@@ -975,6 +1182,8 @@ class HpcaApp(App):
                 MemoryProposalScreen(proposal, i, len(proposals))
             )
             if approved:
+                if self._memory_write_blocked(proposal.tier, proposal.text):
+                    continue
                 self.profile_memory.add_memory(
                     proposal.text,
                     tier=proposal.tier,
@@ -984,49 +1193,234 @@ class HpcaApp(App):
                 kept += 1
         if kept:
             self.profile_memory.save()
+            self._refresh_memory_snapshot(self.profile)
         self.notify(f"Kept {kept} of {len(proposals)} proposed memories.")
         self.check_memory_caps()
         return kept
 
-    async def maybe_propose_struggle_note(self, messages: list[dict]) -> bool:
-        """§4.4: after a bad turn, propose a struggle note for approval."""
-        if not turn_struggled(messages):
-            return False
+    async def propose_memory_edits(
+        self, operations: list[MemoryOp], *, profile: str
+    ) -> str:
+        """The `memory` tool's write path: validate, ask, apply (P3).
+
+        Returns the tool result — what the user approved, or why the batch
+        did not apply. The model is told the outcome plainly so it can react
+        (condense and retry, or move on) instead of guessing.
+        """
+        loaded = Profile.load(profile)
+        caps = {1: self.settings.memory.cap_chars(1), 2: self.settings.memory.cap_chars(2)}
         try:
-            note = await propose_struggle_note(
-                self._labelled_llm("struggle"), messages
+            result = apply_batch(
+                loaded,
+                operations,
+                backend=self.settings.llm.model,
+                caps=caps,
             )
-        except Exception:
-            return False  # reflection is best-effort; never disrupt the user
-        proposal = MemoryProposal(
-            tier=2, kind=STRUGGLE_KIND, text=note.render()
-        )
+        except MemoryOpError as e:
+            return f"Memory unchanged: {e}"
+        if not result.applied:
+            return "Memory unchanged: " + "; ".join(result.skipped)
         approved = await self.push_screen_wait(
-            MemoryProposalScreen(proposal, 1, 1)
+            MemoryBatchScreen(operations, result.flagged)
         )
         if not approved:
-            return False
-        self.profile_memory.add_memory(
-            proposal.text,
-            tier=2,
-            backend=self.settings.llm.model,
-            kind=STRUGGLE_KIND,
-        )
-        self.profile_memory.save()
-        self.notify("Struggle note saved to the profile.")
+            return "Memory unchanged: the user rejected the proposed changes."
+        # The user may have edited this file by hand since it was loaded;
+        # rewriting from a stale copy would silently discard those edits.
+        path = Profile.path_for(profile)
+        if path.exists() and drift_detected(loaded, path.read_text()):
+            backup = path.with_suffix(f".bak.{int(time())}")
+            backup.write_text(path.read_text())
+            self._refresh_memory_snapshot(profile)
+            return (
+                "Memory unchanged: the profile file changed on disk since "
+                f"this session read it (backed up to {backup.name}). "
+                "The edits were not applied."
+            )
+        result.profile.save()
+        self._refresh_memory_snapshot(profile)
+        if profile == self.profile:
+            self.profile_memory = Profile.load(profile)
+        self.notify(f"Memory updated ({len(result.applied)} change(s)).")
         self.check_memory_caps()
+        report = "; ".join(result.applied)
+        if result.skipped:
+            report += " (skipped: " + "; ".join(result.skipped) + ")"
+        return f"Saved to memory: {report}"
+
+    def _review_due(self, session: Session, messages: list[dict]) -> bool:
+        """Whether to look back at this stretch now (redesign Phase 4).
+
+        Two triggers: a turn that visibly went wrong (§4.4 — reviewed at once,
+        while the evidence is in context) and a plain counter, so learnings
+        from conversations that went *fine* are captured too. The counter is
+        what the old struggle-only heuristic was missing: a session where the
+        user corrects a preference never trips a failure marker.
+        """
+        session_id = session.session_id
+        count = self._turns_since_review.get(session_id, 0) + 1
+        self._turns_since_review[session_id] = count
+        if turn_struggled(messages):
+            self._turns_since_review[session_id] = 0
+            return True
+        if count >= max(1, self.settings.memory.review_interval):
+            self._turns_since_review[session_id] = 0
+            return True
+        return False
+
+    async def maybe_review(
+        self,
+        session: Session,
+        messages: list[dict],
+        *,
+        forced: bool = False,
+        span: str = "recent",
+    ) -> int:
+        """Self-review: propose what this stretch is worth remembering.
+
+        Runs after the reply is delivered, so it never competes with the
+        user's turn. Best-effort throughout — a failed review is invisible.
+        ``forced`` skips the cadence check, for the one case that cannot
+        wait: context about to be discarded by compaction.
+        """
+        if forced:
+            # A forced review covers this stretch as thoroughly as a due one,
+            # so restart the cadence — otherwise the counter trips again a
+            # turn later and re-proposes what was just reviewed.
+            self._turns_since_review[session.session_id] = 0
+        elif not self._review_due(session, messages):
+            return 0
+        memory = self._memory_snapshot(session.profile)
+        skills = load_skills(session.profile)
+        try:
+            proposals = await propose_reflections(
+                self._labelled_llm("review"),
+                messages,
+                tier1=memory.tier_text(1),
+                tier2=memory.tier_text(2),
+                tier3=memory.tier_text(3),
+                skills=summarize_skills(skills),
+                allow_new_skills=self.settings.memory.propose_new_skills,
+                span=span,
+            )
+        except Exception:
+            return 0  # reflection is best-effort; never disrupt the user
+        if not proposals:
+            return 0
+        kept = 0
+        for index, proposal in enumerate(proposals, start=1):
+            approved = await self.push_screen_wait(
+                ReflectionScreen(proposal, index, len(proposals))
+            )
+            if approved and self._apply_reflection(proposal, session.profile):
+                kept += 1
+        if kept:
+            self.notify(f"Self-review: kept {kept} of {len(proposals)}.")
+            self.check_memory_caps()
+        return kept
+
+    def _apply_reflection(self, proposal: Reflection, profile: str) -> bool:
+        """Persist one approved proposal; returns whether anything was written."""
+        if proposal.kind in ("memory", "struggle"):
+            text = proposal.memory_text()
+            # Struggle notes go to tier 3: they are situational by nature and
+            # were the main source of tier-2 bloat. Retrieval brings them
+            # back when a request actually resembles the old one.
+            tier = 3 if proposal.kind == "struggle" else proposal.tier
+            target = Profile.load(profile)  # merge, don't clobber
+            if self._memory_write_blocked(tier, text, target):
+                return False
+            target.add_memory(
+                text,
+                tier=tier,
+                backend=self.settings.llm.model,
+                kind=STRUGGLE_KIND if proposal.kind == "struggle" else "learning",
+            )
+            target.save()
+            self._refresh_memory_snapshot(profile)
+            if profile == self.profile:
+                self.profile_memory = target
+            return True
+        return self._apply_skill_reflection(proposal, profile)
+
+    def _apply_skill_reflection(self, proposal: Reflection, profile: str) -> bool:
+        existing = {s.name: s for s in load_skills(profile)}
+        if proposal.kind == "skill_patch":
+            skill = existing.get(proposal.skill_name)
+            if skill is None:
+                self.notify(
+                    f"No skill named “{proposal.skill_name}” to patch.",
+                    severity="warning",
+                )
+                return False
+            # Patches land in the profile's own copy, never in _shared/: one
+            # profile's correction must not change another's procedure.
+            skill.body = patched_body(skill, proposal.text)
+            write_skill(skill, profile)
+        else:
+            if proposal.skill_name in existing:
+                self.notify(
+                    f"A skill named “{proposal.skill_name}” already exists.",
+                    severity="warning",
+                )
+                return False
+            write_skill(
+                Skill(
+                    name=proposal.skill_name,
+                    description=" ".join(proposal.text.split())[:60],
+                    triggers=proposal.keywords,
+                    body=proposal.text,
+                ),
+                profile,
+            )
+        if profile == self.profile:
+            self.skills = load_skills(profile)
+        if "read_skill" not in self._tools.names():
+            add_skill_tools(self._tools)  # the first skill enables the tool
         return True
 
+    def run_curator_if_due(self) -> dict:
+        """Age old tier-3 entries out, at most once every few days (P6).
+
+        Runs at startup rather than on a timer: the app is idle then by
+        definition, and this touches the same profile files a turn reads.
+        """
+        interval = self.settings.memory.curator_interval_days
+        if interval <= 0 or not curator.due(interval_days=interval):
+            return {}
+        try:
+            reports = curator.run(
+                Profile.list_profiles(),
+                stale_days=self.settings.memory.curator_stale_days,
+                archive_days=self.settings.memory.curator_archive_days,
+            )
+        except Exception as e:
+            self.notify(f"Memory curation skipped: {e}", severity="warning")
+            return {}
+        for name, report in reports.items():
+            if report.changed:
+                self._refresh_memory_snapshot(name)
+                self.notify(
+                    f"Memory curation ({name}): {report.summary()} — "
+                    f"archived entries are in {name}.archive.md",
+                    timeout=10,
+                )
+        return reports
+
     def check_memory_caps(self) -> list[int]:
-        """§6.4 size warnings; returns the tiers currently over their cap."""
+        """§6.4 size warnings; returns the tiers currently over their cap.
+
+        A tier can only get over cap through hand edits (in-app writes are
+        rejected at the cap), so the fix offered is the external editor."""
+        caps = self.settings.memory
         over = self.profile_memory.over_cap_tiers(
-            tier1_cap=self.settings.memory.tier1_token_cap,
-            tier2_cap=self.settings.memory.tier2_token_cap,
+            tier1_cap=caps.cap_chars(1),
+            tier2_cap=caps.cap_chars(2),
         )
         for tier in over:
+            meter = self.profile_memory.usage_meter(tier, caps.cap_chars(tier))
             self.notify(
-                f"Profile tier {tier} is over its token cap "
-                f"({self.profile_memory.tier_tokens(tier)} tokens) — "
+                f"Profile tier {tier} is over its budget ({meter}) — "
                 "press ctrl+e to edit the profile externally.",
                 severity="warning",
                 timeout=12,
@@ -1047,6 +1441,7 @@ class HpcaApp(App):
             self.notify(f"Cannot suspend for editing: {e}", severity="error")
             return
         self.profile_memory = Profile.load(self.profile)
+        self._refresh_memory_snapshot(self.profile)
         if self.profile_memory.problems:
             self.notify(
                 "Profile problems after edit: "
@@ -1066,6 +1461,8 @@ class HpcaApp(App):
             return
         self.profile = profile
         self.profile_memory = Profile.load(profile)
+        self._memory_snapshots[profile] = self.profile_memory
+        self.skills = load_skills(profile)
         if self.profile_memory.problems:
             self.notify(
                 "Profile file has problems: "
@@ -1102,11 +1499,17 @@ class HpcaApp(App):
             job_log_dir=app_dir() / "job_logs",
             llm=self._llm,
             trash=self.trash,
-            tier1_text=memory.tier_text(1),
+            tier1_text=memory.tier_prompt_text(
+                1, active_backend=self.settings.llm.model
+            ),
             symbols=self.symbol_index,
             rag=self.rag_store,
             embedder=self.embedder,
-            skills=self.skills,
+            episodic=self.episodic,
+            skills=self._turn_skills if self._turn_skills is not None else self.skills,
+            propose_memory_edits=lambda operations: self.propose_memory_edits(
+                operations, profile=session.profile
+            ),
         )
         if log is not None:
             ctx.llm = LoggedLLM(
@@ -1117,6 +1520,11 @@ class HpcaApp(App):
         return ctx
 
     def _activate_session(self, session: Session) -> None:
+        # A session boundary is a deliberate refresh point (redesign Phase 1):
+        # memories written by another session or instance are picked up here,
+        # while WITHIN a session the frozen snapshot keeps the prompt prefix
+        # byte-stable for the backend's prefix cache.
+        self._refresh_memory_snapshot(session.profile)
         self.active_session = session
         self._refresh_session_log()
         self.query_one("#chat-input", ChatInput).display = True
@@ -1178,6 +1586,10 @@ class HpcaApp(App):
                 self.session_store.create(profile=profile, title=UNTITLED_SESSION)
             )
             await self._set_chat_messages([])
+            self._context_used = 0
+            bar = self._context_bar()
+            if bar is not None:
+                bar.reset()  # a fresh thread starts from an empty window
             await self._reload_sessions()
         self._focus_column("chat")
 
@@ -1294,6 +1706,9 @@ class HpcaApp(App):
         self._untitled.discard(session.session_id)
         self._updated.discard(session.session_id)
         self.session_store.delete(session.session_id)
+        # Patient-data environment: a deleted conversation must not resurface
+        # through episodic search either.
+        self.episodic.forget_session(session.session_id)
         try:
             await self._checkpointer.adelete_thread(session.session_id)
         except Exception as e:  # the row is already gone; say so and move on
@@ -1301,11 +1716,35 @@ class HpcaApp(App):
         await self._reload_sessions()
         self.notify(f"Deleted “{session.title}”")
 
+    def _show_context_estimate(self, values: dict) -> None:
+        """How full a reopened session's context already is.
+
+        Estimated from the checkpointed history, since nothing has been sent
+        yet this run. Compaction is accounted for: what the model will
+        receive is the folded view, not the whole transcript.
+        """
+        bar = self._context_bar()
+        if bar is None:
+            return
+        self._context_used = 0
+        messages = list(values.get("messages", []))
+        compacted = values.get("compacted")
+        if compacted:
+            messages = [compacted["summary"]] + messages[compacted["upto"] :]
+        if not messages:
+            bar.reset()
+            return
+        bar.set_estimate(compact.estimate_tokens(messages))
+
     async def close_session(self) -> None:
         """Leave the active session: empty chat, no entry, nothing to type in."""
         self.active_session = None
         self._tool_ctx = None
         self._log = None
+        self._context_used = 0
+        bar = self._context_bar()
+        if bar is not None:
+            bar.reset()
         await self._set_chat_messages([])
         self.query_one("#chat-input", ChatInput).display = False
         self._focus_column("sessions")
@@ -1320,6 +1759,7 @@ class HpcaApp(App):
         await self._set_chat_messages(
             values.get("messages", []), values.get("thinking", [])
         )
+        self._show_context_estimate(values)
         self._updated.discard(session.session_id)  # its news is now on screen
         for item in self.query_one("#sessions-list", ListView).children:
             row_session = getattr(item, "data_session", None)
@@ -1774,8 +2214,9 @@ class HpcaApp(App):
 
     def action_manage_profiles(self) -> None:
         def done(_: object) -> None:
-            # a memory edited here may be the active profile's; reload so the
-            # next turn sees it
+            # a memory edited here may be any profile's; drop every frozen
+            # snapshot so the next turn sees the edits
+            self._memory_snapshots.clear()
             self.profile_memory = Profile.load(self.profile)
             self.run_worker(self._reload_sessions(), group="sessions")
 
@@ -1793,16 +2234,42 @@ class HpcaApp(App):
             )
         else:
             self.notify(f"Saved memories for “{name}”.")
+        self._refresh_memory_snapshot(name)
         if name == self.profile:
             self.profile_memory = profile
 
     def create_profile(self, name: str) -> str | None:
-        """Make a profile; returns an error message, or None on success."""
+        """Make a blank profile; returns an error message, or None on success."""
         try:
             cleaned = Profile.validate_name(name)
         except ValueError as e:
             return str(e)
         Profile.create(cleaned)
+        return None
+
+    def duplicate_profile(self, source: str, name: str) -> str | None:
+        """Fork a profile: same learnings, its own future.
+
+        Copies the memories and the source's own skills, then the two are
+        independent — which is the point, a shared base that specialises in
+        different directions. Returns an error message, or None on success.
+        """
+        try:
+            cleaned = Profile.validate_name(name)
+        except ValueError as e:
+            return str(e)
+        if source not in Profile.list_profiles():
+            return f"There is no profile called “{source}”."
+        Profile.duplicate(source, cleaned)
+        skills = copy_profile_skills(source, cleaned)
+        self._refresh_memory_snapshot(cleaned)
+        memories = len(Profile.load(cleaned).memories)
+        self.notify(
+            f"Copied “{source}” to “{cleaned}” "
+            f"({memories} memor{'y' if memories == 1 else 'ies'}"
+            + (f", {skills} skill{'' if skills == 1 else 's'}" if skills else "")
+            + "). They diverge from here."
+        )
         return None
 
     def profile_delete_blocker(self, name: str) -> str | None:
@@ -1828,9 +2295,16 @@ class HpcaApp(App):
     def delete_profile(self, name: str) -> None:
         moved = self.session_store.reassign_profile(name, "default")
         Profile.delete(name)
+        # Its learnings go with it: memories, retrieval index, and the skills
+        # it accumulated. Leaving orphaned skills behind would silently
+        # resurrect them under a profile created with the same name later.
+        delete_profile_skills(name)
+        self._refresh_memory_snapshot(name)
+        self.memory_index.forget_profile(name)
         if self.profile == name:  # unlikely, but keep the app coherent
             self.profile = "default"
             self.profile_memory = Profile.load("default")
+            self.skills = load_skills("default")
         self.notify(
             f"Deleted “{name}”" + (f"; {moved} session(s) moved to default" if moved else "")
         )
@@ -1888,6 +2362,15 @@ class HpcaApp(App):
         self._owns_llm = True
         self._rebuild_graph()
         self._refresh_session_log()  # rebind the tool context to the new client
+        # A different model means a different window, and the token count
+        # measured against the old one no longer describes this one.
+        self._discovered_window = None
+        self._context_used = 0
+        bar = self._context_bar()
+        if bar is not None:
+            bar.reset()
+        self._refresh_context_bar()
+        self.run_worker(self._discover_context_window(), group="llm-probe")
         if owned and old_llm is not None:
             self.run_worker(old_llm.close(), group="llm-close")
 
@@ -1902,7 +2385,90 @@ class HpcaApp(App):
             max_retries=self.settings.llm.max_retries,
             max_tool_rounds=self.settings.llm.max_tool_rounds,
             on_activity=lambda activity: self.report_activity(activity),
+            max_model_len=self._active_max_model_len,
+            on_evict=self._extract_before_eviction,
+            on_usage=self._on_usage,
         )
+
+    def _active_max_model_len(self) -> int | None:
+        """The active backend's context window.
+
+        Preferred source is what the backend told us on connect (it knows how
+        it was launched); the catalog entry is the fallback for a backend that
+        does not advertise it. Without either, compaction stays off — better
+        than guessing a window and folding history needlessly.
+        """
+        if self._discovered_window is not None:
+            return self._discovered_window
+        for backend in self.settings.backends:
+            if self.settings.is_active(backend):
+                return backend.max_model_len
+        return None
+
+    def _on_usage(self, usage: dict) -> None:
+        """The backend's token count for the decision just made.
+
+        prompt_tokens is what occupies the window; the completion is spent
+        the moment it is generated. Reported per round, so a tool-heavy turn
+        visibly fills the bar as it works.
+        """
+        prompt_tokens = usage.get("prompt_tokens")
+        if not prompt_tokens:
+            return
+        self._context_used = int(prompt_tokens)
+        bar = self._context_bar()
+        if bar is not None:
+            bar.set_used(self._context_used)
+
+    def _context_bar(self) -> ContextBar | None:
+        found = self.query("#context-bar")
+        return found.first(ContextBar) if found else None
+
+    def _refresh_context_bar(self) -> None:
+        bar = self._context_bar()
+        if bar is None:
+            return
+        bar.set_window(self._active_max_model_len())
+        if self._context_used:
+            bar.set_used(self._context_used)
+
+    async def _discover_context_window(self) -> None:
+        """Ask the backend how big its window is, and remember it.
+
+        This is why the meter needs no configuration: vLLM reports
+        max_model_len per model, so switching from a 192k model to a 32k one
+        moves the bar without anyone editing settings. The answer is written
+        back to the catalog entry so compaction also benefits, and so the
+        number survives a backend that is offline next time.
+        """
+        try:
+            window = await self._llm.context_window()
+        except Exception:
+            window = None
+        if not window:
+            return
+        self._discovered_window = window
+        for backend in self.settings.backends:
+            if self.settings.is_active(backend) and backend.max_model_len != window:
+                backend.max_model_len = window
+                self.settings.save()
+                break
+        self._refresh_context_bar()
+
+    async def _extract_before_eviction(self, messages: list[dict]) -> None:
+        """Last look at context about to leave the model's view (Phase 6).
+
+        Compaction is the one moment where something the agent learned can
+        disappear without anyone deciding to drop it, so the review loop gets
+        a chance at it first — but this runs *inside* the graph round, where
+        putting a modal on screen would suspend the turn behind a dialog the
+        user did not ask for. So the slice is only captured here; the review
+        itself runs after the reply lands, like every other review.
+        """
+        session = self._busy_turn
+        if session is None:
+            return
+        self._evicted.setdefault(session.session_id, []).extend(messages)
 
     def action_confirm_quit(self) -> None:
         def verdict(confirmed: bool | None) -> None:

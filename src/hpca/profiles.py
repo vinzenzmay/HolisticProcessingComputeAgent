@@ -57,6 +57,11 @@ class Profile:
     name: str
     created: str = ""
     default_backend: str = ""
+    # Which profile this one was copied from, and when. Two profiles that
+    # share a base diverge from the moment of the copy, and months later the
+    # only way to know why they overlap is if the copy said so.
+    copied_from: str = ""
+    copied_on: str = ""
     memories: list[Memory] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
 
@@ -105,6 +110,33 @@ class Profile:
         profile.save()
         return profile
 
+    @classmethod
+    def duplicate(cls, source: str, new_name: str) -> "Profile":
+        """A copy of ``source`` under ``new_name``, free to diverge from it.
+
+        Everything the profile has *learned* comes along — all memory tiers,
+        struggle notes, the lot — because the point of a copy is to start
+        specialised work from an established base rather than from nothing.
+        Sessions do not: they belong to the conversations that happened, not
+        to the knowledge that came out of them. Skills are copied by the
+        caller (``skills.copy_profile_skills``), which owns that directory.
+
+        The copy records where it came from, so two profiles that share a
+        base can still be told apart from two that merely resemble each other.
+        """
+        original = cls.load(source)
+        today = date.today().isoformat()
+        copy = cls(
+            name=new_name,
+            created=today,
+            default_backend=original.default_backend,
+            copied_from=source,
+            copied_on=today,
+            memories=[Memory(**vars(memory)) for memory in original.memories],
+        )
+        copy.save()
+        return copy
+
     @staticmethod
     def delete(name: str) -> None:
         """Remove a profile. The default is the fallback for sessions whose
@@ -131,6 +163,8 @@ class Profile:
                 meta = yaml.safe_load("\n".join(lines[1:end])) or {}
                 profile.created = str(meta.get("created", ""))
                 profile.default_backend = str(meta.get("default_backend", ""))
+                profile.copied_from = str(meta.get("copied_from", ""))
+                profile.copied_on = str(meta.get("copied_on", ""))
                 index = end + 1
             except (ValueError, yaml.YAMLError) as e:
                 profile.problems.append(f"Unreadable front matter: {e}")
@@ -181,14 +215,15 @@ class Profile:
     # ------------------------------------------------------------ rendering
 
     def render(self) -> str:
-        front = yaml.safe_dump(
-            {
-                "name": self.name,
-                "created": self.created or date.today().isoformat(),
-                "default_backend": self.default_backend,
-            },
-            sort_keys=False,
-        ).strip()
+        meta = {
+            "name": self.name,
+            "created": self.created or date.today().isoformat(),
+            "default_backend": self.default_backend,
+        }
+        if self.copied_from:  # only on copies, so ordinary files stay clean
+            meta["copied_from"] = self.copied_from
+            meta["copied_on"] = self.copied_on
+        front = yaml.safe_dump(meta, sort_keys=False).strip()
         parts = ["---", front, "---"]
         for tier in (1, 2, 3):
             memories = [m for m in self.memories if m.tier == tier]
@@ -229,14 +264,53 @@ class Profile:
     def tier_text(self, tier: int) -> str:
         return "\n\n".join(m.text for m in self.memories if m.tier == tier)
 
+    def tier_prompt_text(self, tier: int, *, active_backend: str = "") -> str:
+        """The tier as injected into a prompt: memories learned on a different
+        backend are annotated, not dropped — a workaround for one small model
+        often transfers, and the annotation lets the model weigh it."""
+        parts = []
+        for memory in self.memories:
+            if memory.tier != tier:
+                continue
+            text = memory.text
+            if memory.backend and active_backend and memory.backend != active_backend:
+                text = f"(learned on {memory.backend}) {text}"
+            parts.append(text)
+        return "\n\n".join(parts)
+
     def tier_tokens(self, tier: int) -> int:
         return estimate_tokens(self.tier_text(tier))
 
+    def tier_chars(self, tier: int) -> int:
+        return len(self.tier_text(tier))
+
+    def usage_meter(self, tier: int, cap: int) -> str:
+        """Hermes-style usage meter, e.g. ``58% — 693/1200 chars``.
+
+        Character budgets are model-independent, unlike token counts, which
+        depend on whichever tokenizer the active backend uses.
+        """
+        used = self.tier_chars(tier)
+        percent = round(100 * used / cap) if cap else 0
+        return f"{percent}% — {used}/{cap} chars"
+
+    def would_exceed(self, tier: int, text: str, *, cap: int) -> bool:
+        """Whether adding ``text`` to the tier would break its char budget.
+
+        The budget is hard for *writes* (§6.4 redesign): a full tier rejects
+        new memories until the user condenses it. Injection never truncates —
+        what is in the file is what the model sees.
+        """
+        used = self.tier_chars(tier)
+        added = len(text.strip()) + (2 if used else 0)  # joined with "\n\n"
+        return used + added > cap
+
     def over_cap_tiers(self, *, tier1_cap: int, tier2_cap: int) -> list[int]:
+        """Tiers over their character budget (caps are chars, not tokens)."""
         over = []
-        if self.tier_tokens(1) > tier1_cap:
+        if self.tier_chars(1) > tier1_cap:
             over.append(1)
-        if self.tier_tokens(2) > tier2_cap:
+        if self.tier_chars(2) > tier2_cap:
             over.append(2)
         return over
 

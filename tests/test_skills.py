@@ -172,3 +172,154 @@ class TestReadSkillTool:
         tools = add_skill_tools(ToolRegistry())
         result = await call(tools, "read_skill", ctx, name="x")
         assert "no skills" in result.lower()
+
+
+class TestPerProfileSkills:
+    """Redesign Phase 1: skills/_shared/ + skills/<profile>/, flat files
+    counting as shared, profile winning name collisions."""
+
+    def write_in(self, subdir, name, content):
+        directory = skills_dir() / subdir if subdir else skills_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / name).write_text(content)
+
+    def test_profile_sees_shared_and_own(self, hpca_home):
+        self.write_in("_shared", "a.md", "---\nname: shared-a\n---\nbody")
+        self.write_in("genetics", "b.md", "---\nname: gen-b\n---\nbody")
+        self.write_in("hpc-admin", "c.md", "---\nname: admin-c\n---\nbody")
+        names = [s.name for s in load_skills("genetics")]
+        assert names == ["gen-b", "shared-a"]
+
+    def test_flat_files_count_as_shared(self, hpca_home):
+        self.write_in(None, "legacy.md", "---\nname: legacy\n---\nbody")
+        assert [s.name for s in load_skills("genetics")] == ["legacy"]
+
+    def test_profile_wins_name_collision(self, hpca_home):
+        self.write_in("_shared", "a.md", "---\nname: align\n---\nshared body")
+        self.write_in("genetics", "a.md", "---\nname: align\n---\nprofile body")
+        skills = load_skills("genetics")
+        assert len(skills) == 1
+        assert skills[0].body == "profile body"
+
+    def test_any_skills(self, hpca_home):
+        from hpca.skills import any_skills
+
+        assert not any_skills()
+        self.write_in("genetics", "b.md", "---\nname: gen-b\n---\nbody")
+        assert any_skills()
+
+
+class TestSkillWriting:
+    """Redesign Phase 4: the self-review loop writes skills back."""
+
+    def test_write_and_reload_round_trip(self, hpca_home):
+        from hpca.skills import write_skill
+
+        write_skill(
+            Skill(
+                name="read-qc",
+                description="Run fastqc then multiqc",
+                triggers=["fastqc", "qc"],
+                body="1. fastqc\n2. multiqc",
+            ),
+            "genetics",
+        )
+        loaded = load_skills("genetics")
+        assert len(loaded) == 1
+        assert loaded[0].name == "read-qc"
+        assert loaded[0].description == "Run fastqc then multiqc"
+        assert loaded[0].triggers == ["fastqc", "qc"]
+        assert "multiqc" in loaded[0].body
+
+    def test_write_goes_under_the_profile(self, hpca_home):
+        from hpca.skills import skills_dir, write_skill
+
+        write_skill(Skill("a", "d", [], "body"), "genetics")
+        assert (skills_dir() / "genetics" / "a.md").exists()
+
+    def test_unsafe_names_are_sanitized(self, hpca_home):
+        from hpca.skills import skill_path
+
+        path = skill_path("../../etc/passwd", "genetics")
+        assert path.name == "etc-passwd.md"  # no separators, no leading dots
+        assert path.parent.name == "genetics"
+
+    def test_empty_name_falls_back(self, hpca_home):
+        from hpca.skills import skill_path
+
+        assert skill_path("...", "genetics").name == "skill.md"
+
+    def test_patched_body_appends_under_a_heading(self):
+        from hpca.skills import patched_body
+
+        skill = Skill("a", "d", [], "1. do the thing")
+        patched = patched_body(skill, "check the index first")
+        assert "1. do the thing" in patched  # original steps survive
+        assert "## Corrections" in patched
+        assert "- check the index first" in patched
+
+    def test_second_patch_reuses_the_heading(self):
+        from hpca.skills import patched_body
+
+        skill = Skill("a", "d", [], "1. do the thing")
+        once = patched_body(skill, "first correction")
+        skill.body = once
+        twice = patched_body(skill, "second correction")
+        assert twice.count("## Corrections") == 1
+        assert "- first correction" in twice and "- second correction" in twice
+
+
+class TestProfileSkillLifecycle:
+    """Skills follow their profile when it is copied or deleted."""
+
+    def write_in(self, subdir, name, content):
+        directory = skills_dir() / subdir if subdir else skills_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / name).write_text(content)
+
+    def test_copy_takes_the_profiles_own_skills(self, hpca_home):
+        from hpca.skills import copy_profile_skills
+
+        self.write_in("base", "a.md", "---\nname: align\n---\nbase body")
+        assert copy_profile_skills("base", "variants") == 1
+        assert [s.name for s in load_skills("variants")] == ["align"]
+
+    def test_shared_skills_are_not_duplicated(self, hpca_home):
+        """_shared is already visible to both; copying it would turn one
+        procedure into two that drift apart silently."""
+        from hpca.skills import copy_profile_skills
+
+        self.write_in("_shared", "s.md", "---\nname: shared\n---\nbody")
+        self.write_in("base", "a.md", "---\nname: align\n---\nbody")
+        assert copy_profile_skills("base", "variants") == 1
+        assert not (skills_dir() / "variants" / "s.md").exists()
+        # but the copy still sees the shared one through _shared
+        assert sorted(s.name for s in load_skills("variants")) == ["align", "shared"]
+
+    def test_copied_skills_diverge(self, hpca_home):
+        from hpca.skills import copy_profile_skills, write_skill
+
+        self.write_in("base", "a.md", "---\nname: align\n---\nbase body")
+        copy_profile_skills("base", "variants")
+        write_skill(Skill("align", "d", [], "changed in the copy"), "variants")
+        assert "base body" in load_skills("base")[0].body
+        assert "changed in the copy" in load_skills("variants")[0].body
+
+    def test_copying_a_profile_without_skills(self, hpca_home):
+        from hpca.skills import copy_profile_skills
+
+        assert copy_profile_skills("base", "variants") == 0
+
+    def test_delete_removes_only_that_profiles_skills(self, hpca_home):
+        from hpca.skills import delete_profile_skills
+
+        self.write_in("_shared", "s.md", "---\nname: shared\n---\nbody")
+        self.write_in("base", "a.md", "---\nname: align\n---\nbody")
+        delete_profile_skills("base")
+        assert [s.name for s in load_skills("base")] == ["shared"]
+        assert not (skills_dir() / "base").exists()
+
+    def test_deleting_skills_of_an_unknown_profile_is_quiet(self, hpca_home):
+        from hpca.skills import delete_profile_skills
+
+        delete_profile_skills("never-existed")  # must not raise

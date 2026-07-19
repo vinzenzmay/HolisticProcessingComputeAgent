@@ -326,13 +326,16 @@ async def test_profile_memories_injected_into_system_prompt(hpca_home):
         assert "verbose logs" in system["content"]
 
 
-async def test_memories_written_after_startup_reach_the_next_turn(hpca_home):
-    """Memories are shared through the profile file: a note made in another
-    session or another running hpca instance must be in this turn's prompt,
-    not only what was on disk when this instance started."""
+async def test_memories_are_frozen_per_session_and_refresh_at_boundaries(hpca_home):
+    """Redesign Phase 1: the memory snapshot is frozen per session so the
+    system-prompt prefix stays byte-stable for the backend's prefix cache.
+    A note written by another session or instance mid-session does NOT shift
+    the prompt; it is picked up at the next session boundary."""
     from hpca.profiles import Profile
 
-    llm = RecordingLLM([respond_json("ok"), respond_json("ok again")])
+    llm = RecordingLLM(
+        [respond_json("ok"), respond_json("ok again"), respond_json("ok third")]
+    )
     app = HpcaApp(llm=llm)
     async with app.run_test(size=(120, 40)) as pilot:
         await submit_chat(app, pilot, "hello")
@@ -343,12 +346,150 @@ async def test_memories_written_after_startup_reach_the_next_turn(hpca_home):
         profile.add_memory("STAR needs 40G on this cluster.", tier=1)
         profile.save()
 
+        # mid-session the frozen snapshot keeps the prompt stable
+        seen = len(llm.calls)
         await submit_chat(app, pilot, "hello again")
-        # the first turn predates the memory, so any prompt carrying it is
-        # from the second turn (calls include titler traffic; search them all)
+        assert not any(
+            call[0]["role"] == "system" and "STAR needs 40G" in call[0]["content"]
+            for call in llm.calls[seen:]
+        )
+
+        # reopening the session is a boundary: the note is picked up
+        await app.open_session(app.active_session)
+        seen = len(llm.calls)
+        await submit_chat(app, pilot, "and again")
         assert any(
             call[0]["role"] == "system" and "STAR needs 40G" in call[0]["content"]
-            for call in llm.calls
+            for call in llm.calls[seen:]
         )
         # and the tool context the turn carries has it too
         assert "STAR needs 40G" in app._tool_ctx.tier1_text
+
+
+async def test_turns_are_indexed_and_recallable_across_sessions(hpca_home):
+    """Redesign Phase 2: user/assistant turns land in the episodic index and
+    a later session can recall them with session_search — no model call."""
+    llm = RecordingLLM([respond_json("STAR needs 40G on this cluster")])
+    app = HpcaApp(llm=llm)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await submit_chat(app, pilot, "how much memory does STAR need")
+        first_session = app.active_session
+
+        # a fresh session recalls the earlier one
+        hits = app.episodic.search("STAR", profile="default")
+        assert len(hits) == 1
+        assert hits[0].session_id == first_session.session_id
+        assert hits[0].goal == "how much memory does STAR need"
+        assert hits[0].resolution == "STAR needs 40G on this cluster"
+
+        # deleting the session forgets its transcript from search too
+        await app._delete_session(first_session)
+        assert app.episodic.search("STAR", profile="default") == []
+
+
+async def test_tool_traffic_is_not_indexed(hpca_home):
+    """Tool results ride the user role; indexing them would drown BM25 in
+    tool vocabulary."""
+    llm = RecordingLLM(
+        [tool_json("delete", target="scratch"), respond_json("removed it")]
+    )
+    app = HpcaApp(llm=llm, tools=destructive_tools())
+    async with app.run_test(size=(120, 40)) as pilot:
+        await submit_chat(app, pilot, "please delete scratch")
+        await pilot.pause()
+        if isinstance(app.screen, ApprovalScreen):
+            await pilot.press("y")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+        rows = app.episodic.window(app.active_session.session_id)
+        contents = [r["content"] for r in rows]
+        assert "please delete scratch" in contents
+        assert not any("[tool result]" in c for c in contents)
+
+
+class UsageLLM(FakeLLM):
+    """A backend that reports token usage, as vLLM does."""
+
+    def __init__(self, outputs, prompt_tokens=1234, window=32_000):
+        super().__init__(outputs)
+        self._prompt_tokens = prompt_tokens
+        self._window = window
+
+    async def chat(self, messages, *, json_schema=None, **kwargs):
+        response = await super().chat(messages, json_schema=json_schema, **kwargs)
+        response.usage = {
+            "prompt_tokens": self._prompt_tokens,
+            "completion_tokens": 20,
+        }
+        return response
+
+    async def context_window(self):
+        return self._window
+
+
+async def test_context_bar_reports_measured_usage(hpca_home):
+    """The bar shows the backend's own prompt_tokens, not an estimate."""
+    from hpca.tui.context_bar import ContextBar
+
+    app = HpcaApp(llm=UsageLLM([respond_json("ok")], prompt_tokens=8000))
+    async with app.run_test(size=(120, 40)) as pilot:
+        bar = app.query_one("#context-bar", ContextBar)
+        assert "no reply yet" in bar.text  # nothing measured before the turn
+        await submit_chat(app, pilot, "hello")
+        assert "8,000 / 32,000" in bar.text
+        assert "(25%)" in bar.text
+        assert "~" not in bar.text  # measured, so not marked as an estimate
+
+
+async def test_context_window_discovered_from_the_backend(hpca_home):
+    """No configuration needed: the backend says how it was launched."""
+    app = HpcaApp(llm=UsageLLM([respond_json("ok")], window=32_768))
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        assert app._active_max_model_len() == 32_768
+
+
+async def test_a_small_window_turns_the_bar_red(hpca_home):
+    """The case this exists for: on 32k a long turn saturates the window."""
+    from hpca.tui.context_bar import ContextBar
+
+    app = HpcaApp(llm=UsageLLM([respond_json("ok")], prompt_tokens=30_000))
+    async with app.run_test(size=(120, 40)) as pilot:
+        await submit_chat(app, pilot, "hello")
+        bar = app.query_one("#context-bar", ContextBar)
+        assert bar.has_class("context-danger")
+        assert "(94%)" in bar.text
+
+
+async def test_reopening_a_session_estimates_before_the_next_reply(hpca_home):
+    """A long session should show it is nearly full before you send, not
+    after the reply that overflows it."""
+    from hpca.tui.context_bar import ContextBar
+
+    app = HpcaApp(llm=UsageLLM([respond_json("ok")]))
+    async with app.run_test(size=(120, 40)) as pilot:
+        await submit_chat(app, pilot, "hello")
+        session = app.active_session
+        # ~30k tokens at 4 chars/token, i.e. 94% of the 32k window
+        await app.graph.aupdate_state(
+            {"configurable": {"thread_id": session.session_id}},
+            {"messages": [{"role": "user", "content": "x" * 120_000}]},
+        )
+        await app.close_session()
+        bar = app.query_one("#context-bar", ContextBar)
+        assert "no reply yet" in bar.text  # leaving clears the old number
+        await app.open_session(session)
+        assert "~" in bar.text  # estimated from the stored history
+        assert bar.has_class("context-danger")
+
+
+async def test_switching_session_does_not_show_the_previous_context(hpca_home):
+    from hpca.tui.context_bar import ContextBar
+
+    app = HpcaApp(llm=UsageLLM([respond_json("a"), respond_json("b")]))
+    async with app.run_test(size=(120, 40)) as pilot:
+        await submit_chat(app, pilot, "first")
+        bar = app.query_one("#context-bar", ContextBar)
+        assert "1,234" in bar.text or "8,000" in bar.text or "/" in bar.text
+        await app.start_new_session()
+        assert "no reply yet" in bar.text

@@ -26,6 +26,13 @@ ASSISTANT = "assistant"
 THINKING = "thinking"
 ERROR = "error"
 EVENT = "event"
+# Memory recalled into a turn (redesign Phase 5). Shown so the user can see
+# what the agent was reminded of — silent injection would make the agent's
+# behavior inexplicable from the transcript alone.
+RECALL = "recall"
+
+FENCE_OPEN = "<memory-context>"
+FENCE_CLOSE = "</memory-context>"
 
 
 @dataclass
@@ -57,6 +64,25 @@ def is_event_message(message: Message) -> bool:
     return message["role"] == USER and str(message["content"]).startswith(
         EVENT_PREFIXES
     )
+
+
+def recalled_text(message: Message) -> str:
+    """What was recalled into this message, if anything.
+
+    The fenced block lives only in the API copy (``api_content``), so the
+    stored transcript keeps the user's own words; this reads it back out for
+    display.
+    """
+    api_content = message.get("api_content")
+    if not api_content or FENCE_OPEN not in api_content:
+        return ""
+    body = api_content.split(FENCE_OPEN, 1)[1].split(FENCE_CLOSE, 1)[0]
+    lines = [
+        line.strip()
+        for line in body.splitlines()
+        if line.strip() and not line.strip().startswith("[System note:")
+    ]
+    return "\n".join(lines)
 
 
 def _block(parts: list[tuple[str, str]]) -> str:
@@ -117,5 +143,8 @@ def build_entries(
         else:
             flush()
             entries.append(Entry(kind=USER, text=content))
+            recalled = recalled_text(message)
+            if recalled:
+                entries.append(Entry(kind=RECALL, text=recalled))
     flush()  # a turn interrupted for approval leaves its box open
     return entries

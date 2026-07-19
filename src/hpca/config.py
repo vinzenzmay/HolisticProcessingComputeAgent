@@ -71,8 +71,49 @@ class SafetySettings(_Section):
 
 
 class MemorySettings(_Section):
+    # Character budgets for injected profile memory (redesign §2). Chars, not
+    # tokens: char counts are model-independent, and ~4 chars ≈ 1 token. The
+    # caps are hard for writes — a full tier rejects new memories until the
+    # user condenses it — but injection never truncates what is in the file.
+    tier1_char_cap: int = 1200
+    tier2_char_cap: int = 3200
+    # Pre-redesign token caps. Honored (×4 chars) when the char caps above are
+    # left at their defaults, so a hand-tuned settings.json keeps working.
     tier1_token_cap: int = 300
     tier2_token_cap: int = 800
+    # Whether session_search may recall sessions of OTHER profiles. Off by
+    # default: profiles exist to isolate what each context learns and sees
+    # (redesign, resolved question 2).
+    cross_profile_search: bool = False
+    # Tier 3 (retrieved memory, redesign Phase 5): not injected wholesale,
+    # only the entries matching the current request, within this budget.
+    tier3_prefetch_chars: int = 800
+    tier3_prefetch_count: int = 3
+    # Curator (redesign Phase 6): ages tier-3 entries out so retrieval does
+    # not decay as notes accumulate. Archived entries are moved to
+    # <profile>.archive.md, never deleted. 0 disables the pass.
+    curator_interval_days: int = 7
+    curator_stale_days: int = 30
+    curator_archive_days: int = 90
+    # Self-review cadence (redesign Phase 4). Reviews run after the reply is
+    # delivered, so they never compete with the user's turn. Counted in user
+    # turns; a struggling turn triggers one immediately regardless.
+    review_interval: int = 8
+    # Whether self-review may propose entirely NEW skills, as opposed to
+    # patches to existing ones. On so the quality can be judged in practice;
+    # set false if a small model's skill drafts prove not worth reviewing.
+    propose_new_skills: bool = True
+
+    def cap_chars(self, tier: int) -> int:
+        """Effective char budget for a tier, respecting legacy token caps."""
+        char_field, token_field = {
+            1: ("tier1_char_cap", "tier1_token_cap"),
+            2: ("tier2_char_cap", "tier2_token_cap"),
+        }[tier]
+        char_cap = getattr(self, char_field)
+        if char_cap != type(self).model_fields[char_field].default:
+            return char_cap
+        return getattr(self, token_field) * 4
 
 
 ClipboardMode = Literal["auto", "tmux", "screen", "zellij", "osc52", "command", "file"]

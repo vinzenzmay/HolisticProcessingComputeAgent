@@ -102,6 +102,40 @@ def environment_facts() -> str:
     return f"Current date and time: {datetime.now():%Y-%m-%d %H:%M} (local)."
 
 
+# The tool schema alone does not teach *when* to reach for recall; small
+# models ask the user to repeat themselves instead. The second half is the
+# Hermes "source-first limit": recall is what was SAID, not what currently IS.
+SESSION_SEARCH_GUIDANCE = (
+    "Past sessions are searchable with session_search. When the user refers "
+    "to something from an earlier conversation ('like last time', 'the "
+    "pipeline we set up'), search before asking them to repeat it. "
+    "session_search shows what was said back then — never treat it as "
+    "evidence about the current state of files, jobs, or the cluster; check "
+    "the system itself for that."
+)
+
+
+# Adapted from Hermes' MEMORY_GUIDANCE. The declarative-vs-imperative rule is
+# the load-bearing one: an imperative memory ("always use --no-mmap") is
+# re-read as a standing order in later sessions and overrides what the user is
+# actually asking for now — a failure mode small models are especially prone
+# to, since they weight instructions in context over the current request.
+MEMORY_GUIDANCE = (
+    "You have memory that persists across sessions, and the memory tool "
+    "writes to it. Save proactively when the user states a preference, "
+    "corrects you, or tells you a durable fact about this site — the best "
+    "memory is one that stops the user having to repeat themselves. "
+    "Priority: corrections and preferences first, then site facts, then "
+    "workarounds. Write memories as declarative FACTS, not instructions to "
+    "yourself: “the user prefers R over Python” is right, “always answer in "
+    "R” is wrong — an instruction gets re-read as a standing order in a "
+    "later session and overrides what is being asked then. Do NOT save task "
+    "progress, what you did this session, file names, job ids, or anything "
+    "that will be stale in a week; past sessions are searchable instead. "
+    "The user approves every write, so propose rather than agonize."
+)
+
+
 SKILLS_GUIDANCE = (
     "The user has defined skills: written procedures for specific tasks. "
     "When a request matches one, call read_skill to get the procedure and "
@@ -114,12 +148,18 @@ def orchestrator_system_prompt(
     environment: str = "",
     tier1: str = "",
     tier2: str = "",
+    tier1_meter: str = "",
+    tier2_meter: str = "",
     skills: str = "",
+    session_search: bool = False,
+    memory_tool: bool = False,
 ) -> str:
     """System prompt for the orchestrator; dynamic facts injected per render.
 
     Tier 1 memories go into *every* agent's prompt, tier 2 only here (§6.1).
     Skills are listed by name/description only; bodies are fetched on demand.
+    The meters show how full each memory tier is — groundwork for the model
+    managing its own memory under a hard budget (redesign Phase 3).
     """
     parts = [
         "You are HPCA, a terminal assistant helping a scientist with data "
@@ -131,11 +171,23 @@ def orchestrator_system_prompt(
         SCRIPT_GUIDANCE,
         GROUNDED_ANSWERING_GUIDANCE,
     ]
+    if session_search:
+        parts.append(SESSION_SEARCH_GUIDANCE)
+    if memory_tool:
+        parts.append(MEMORY_GUIDANCE)
     if skills:
         parts.append(f"{SKILLS_GUIDANCE}\n{skills}")
     if tier1:
-        parts.append(f"Standing site notes:\n{tier1}")
+        label = _metered("Standing site notes", tier1_meter)
+        parts.append(f"{label}:\n{tier1}")
     if tier2:
-        parts.append(f"Learnings and preferences from earlier sessions:\n{tier2}")
+        label = _metered(
+            "Learnings and preferences from earlier sessions", tier2_meter
+        )
+        parts.append(f"{label}:\n{tier2}")
     parts.append(environment or environment_facts())
     return "\n\n".join(parts)
+
+
+def _metered(label: str, meter: str) -> str:
+    return f"{label} [{meter}]" if meter else label
