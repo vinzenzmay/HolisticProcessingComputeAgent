@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import shutil
 from dataclasses import dataclass
+from datetime import datetime
 from os import environ as os_environ
 from time import monotonic, time
 from typing import Any
@@ -66,8 +67,13 @@ from hpca.runner import (
     ProcessRecord,
     ProcessRunner,
     analyse_process_failure,
+    count_processes,
+    describe,
     format_process_event,
+    kill_unowned,
+    list_processes,
     poll_processes,
+    reconcile_orphans,
     running_session_ids,
 )
 from hpca.triage import Signature, append_user_signature
@@ -109,6 +115,29 @@ from hpca.tui.settings_screen import SettingsScreen
 from hpca.tui.switch_llm import SwitchLLMScreen
 
 COLUMN_IDS = ("sessions", "chat", "processes")
+# Rows the processes column shows before summarising the rest. A long-lived
+# session accumulates hundreds; the panel is a view, not an archive.
+PROCESS_HISTORY_LIMIT = 60
+
+
+def format_started(started_at: str) -> str:
+    """When a process started, in the reader's own timezone.
+
+    Stored UTC, shown local — the times are read next to a wall clock. The
+    date is omitted for today, which is most of what the panel holds, and
+    the narrow column has no room to spend on it.
+    """
+    if not started_at:
+        return "  --  "
+    try:
+        moment = datetime.fromisoformat(started_at)
+    except ValueError:
+        return "  --  "
+    if moment.tzinfo is not None:
+        moment = moment.astimezone()
+    if moment.date() == datetime.now().date():
+        return moment.strftime(" %H:%M")
+    return moment.strftime("%m-%d %H:%M")
 SESSION_TITLE_MAX = 40
 UNTITLED_SESSION = "untitled"  # placeholder until the first message names it
 CHAT_TITLES = {
@@ -516,6 +545,9 @@ class HpcaApp(App):
         border: round $panel-lighten-2;
         color: $text-muted;
     }
+    /* Secondary rows in the processes column: the count of history not shown,
+       and processes whose fate was never recorded because hpca exited first. */
+    .proc-more, .proc-unknown { color: $text-muted; }
     .chat-working {
         color: $text-muted;
         padding: 0 1;
@@ -611,6 +643,9 @@ class HpcaApp(App):
         # different context).
         self._discovered_window: int | None = None
         self._context_used = 0
+        # Panel labels by pid: describe() reads a script off disk, and the
+        # script behind a finished process never changes.
+        self._process_labels: dict[int, str] = {}
         self._activity = "working"
         self._conn = None
         self._saver_ctx = None
@@ -629,6 +664,10 @@ class HpcaApp(App):
         )
         self._conn = connect()
         init_db(self._conn)
+        # Processes the previous run was watching when it exited would claim
+        # to be running forever; harmless while the panel was empty on
+        # restart, a standing lie now that it shows history.
+        reconcile_orphans(self._conn)
         self.session_store = SessionStore(self._conn)
         self.episodic = EpisodicStore(self._conn)
         self.memory_index = MemoryIndex(self._conn)
@@ -1826,12 +1865,27 @@ class HpcaApp(App):
     # ------------------------------------------------------------- processes
 
     async def refresh_processes(self) -> None:
-        records = self._tool_ctx.runner.list() if self._tool_ctx else []
-        jobs = (
-            self.job_store.list(session_id=self.active_session.session_id)
-            if self.active_session
-            else []
-        )
+        """Repaint the right column from the *table*, not the live runner.
+
+        The runner only knows the processes it started, and a fresh one is
+        built per turn, so reading it emptied the panel the moment a session
+        was reopened. The table outlives all of that, which is what makes the
+        history still be there after a restart.
+        """
+        session = self.active_session
+        records: list[ProcessRecord] = []
+        truncated = 0
+        if session is not None and self._conn is not None:
+            records = list_processes(
+                self._conn, session_id=session.session_id, limit=PROCESS_HISTORY_LIMIT
+            )
+            if len(records) > PROCESS_HISTORY_LIMIT:
+                records = records[:PROCESS_HISTORY_LIMIT]
+                truncated = (
+                    count_processes(self._conn, session_id=session.session_id)
+                    - PROCESS_HISTORY_LIMIT
+                )
+        jobs = self.job_store.list(session_id=session.session_id) if session else []
         signature = [(r.pid, r.state) for r in records] + [
             (j.job_id, j.state) for j in jobs
         ]
@@ -1847,11 +1901,32 @@ class HpcaApp(App):
             item.data_job = job
             items.append(item)
         for record in records:
-            label = f"{record.state:<9} {record.name} ({record.pid})"
+            label = (
+                f"{format_started(record.started_at)} {record.state:<8} "
+                f"{self._describe_process(record)} ({record.pid})"
+            )
             item = ListItem(Static(Content(label), classes=f"proc-{record.state}"))
             item.data_record = record
             items.append(item)
+        if truncated > 0:
+            # Never let a cut list read as the whole history.
+            items.append(
+                ListItem(Static(Content(f"… {truncated} older"), classes="proc-more"))
+            )
         processes_list.extend(items)
+
+    def _describe_process(self, record: ProcessRecord) -> str:
+        """Panel label for a process, cached by pid.
+
+        ``describe`` reads the script from disk for throwaway run_bash names,
+        and the panel repaints on every change; the content of a written
+        script never changes, so once is enough.
+        """
+        cached = self._process_labels.get(record.pid)
+        if cached is None:
+            cached = describe(record)
+            self._process_labels[record.pid] = cached
+        return cached
 
     async def poll_jobs(self) -> None:
         """Background sacct poll (§5.4); notifies on state changes."""
@@ -2073,9 +2148,21 @@ class HpcaApp(App):
         self.push_screen(ConfirmScreen(question), on_confirm)
 
     async def _kill_process_and_refresh(self, pid: int) -> None:
-        assert self._tool_ctx is not None
-        await self._tool_ctx.runner.kill(pid)
-        await self._tool_ctx.runner.wait(pid)
+        """Kill by pid, whichever turn started it.
+
+        The panel now shows the session's whole history, so the highlighted
+        process may predate the current runner — which would have no monitor
+        for it and raise. Prefer the owning runner when there is one, since
+        its monitor records the outcome properly.
+        """
+        runner = self._tool_ctx.runner if self._tool_ctx else None
+        if runner is not None and runner.owns(pid):
+            await runner.kill(pid)
+            await runner.wait(pid)
+        elif self._conn is not None and self.active_session is not None:
+            kill_unowned(
+                self._conn, pid=pid, session_id=self.active_session.session_id
+            )
         await self.refresh_processes()
 
     async def _cancel_job_and_refresh(self, job_id: str) -> None:

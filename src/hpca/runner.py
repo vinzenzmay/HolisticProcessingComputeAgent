@@ -9,6 +9,7 @@ deliberately no free-form shell tool; tools pass argv lists.
 from __future__ import annotations
 
 import asyncio
+import re
 import os
 import shlex
 import signal
@@ -137,9 +138,13 @@ class ProcessRunner:
             record.state = "finished"
         else:
             record.state = "failed"
+        # Only settle a row nobody has settled yet. A process killed from the
+        # panel is recorded as 'killed' by whoever sent the signal; this
+        # monitor then wakes to a non-zero exit and would otherwise relabel a
+        # deliberate kill as a failure.
         self._conn.execute(
             "UPDATE processes SET state = ?, exit_code = ?, exit_info = ? "
-            "WHERE pid = ? AND session_id = ?",
+            "WHERE pid = ? AND session_id = ? AND state = 'running'",
             (
                 record.state,
                 record.exit_code,
@@ -191,11 +196,174 @@ class ProcessRunner:
             return row["pid"]
         return None
 
+    def owns(self, pid: int) -> bool:
+        """Whether this runner started the process, and so has a monitor that
+        will record how it ended. Processes from earlier turns do not."""
+        return pid in self._records
+
     def get(self, pid: int) -> ProcessRecord:
         return self._records[pid]
 
     def list(self) -> list[ProcessRecord]:
+        """Only what *this* runner started. The TUI builds a fresh runner per
+        turn, so the durable view is ``list_processes`` over the table."""
         return list(reversed(self._records.values()))
+
+
+# Script suffixes the agent's own tools produce; used to recover which script
+# a process ran from its recorded command line.
+SCRIPT_SUFFIXES = (".sh", ".py", ".R", ".smk")
+
+
+def script_path_for(cmd: str) -> Path | None:
+    """The script a recorded command line ran, if it ran one.
+
+    Derived from ``cmd`` rather than stored separately: every argv the agent
+    builds is ``interpreter + [script] + args``, so the script is simply the
+    first argument that names a script file. Deriving it means the panel can
+    show scripts for processes recorded before this existed, and there is no
+    second copy of the truth to drift.
+    """
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return None
+    for token in tokens:
+        path = Path(token)
+        if path.suffix in SCRIPT_SUFFIXES and path.is_file():
+            return path
+    return None
+
+
+# run_bash names its throwaway scripts after the clock, which is unique on
+# disk but says nothing in a list of them.
+THROWAWAY_NAME = re.compile(r"^bash_\d+$")
+
+
+def first_command(path: Path, limit: int = 40) -> str:
+    """The first real command in a script, for labelling it.
+
+    A one-shot look-around script is identified by what it ran, not by the
+    nanosecond it was written at. Comments, shebangs and `set -e` preamble
+    are skipped because every script has them and none of them distinguish.
+    """
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return ""
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith("set -"):
+            continue
+        return stripped if len(stripped) <= limit else stripped[: limit - 1] + "…"
+    return ""
+
+
+def describe(record: ProcessRecord) -> str:
+    """What to call this process in a list.
+
+    Named scripts keep their registry key — the user chose it. Throwaway
+    run_bash scripts get their first command instead, since a column of
+    `bash_1784458703578782438` identifies nothing.
+    """
+    if not THROWAWAY_NAME.match(record.name):
+        return record.name
+    path = script_path_for(record.cmd)
+    return (path and first_command(path)) or record.name
+
+
+def _row_to_record(row: sqlite3.Row) -> ProcessRecord:
+    return ProcessRecord(
+        pid=row["pid"],
+        name=row["name"],
+        cmd=row["cmd"] or "",
+        state=row["state"],
+        stdout_path=Path(row["stdout_path"] or ""),
+        stderr_path=Path(row["stderr_path"] or ""),
+        started_at=row["started_at"] or "",
+        exit_code=row["exit_code"],
+        exit_info=row["exit_info"],
+    )
+
+
+def list_processes(
+    conn: sqlite3.Connection, *, session_id: str, limit: int | None = None
+) -> list[ProcessRecord]:
+    """A session's processes, newest first, from the table.
+
+    The table is the durable record: a ProcessRunner only knows the processes
+    it started itself, and the TUI builds a new one per turn, so reading the
+    runner showed an empty panel the moment a session was reopened.
+    """
+    sql = (
+        "SELECT * FROM processes WHERE session_id = ? "
+        "ORDER BY started_at DESC, rowid DESC"
+    )
+    params: list = [session_id]
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit + 1)  # one extra: lets the caller detect a cut
+    rows = conn.execute(sql, params).fetchall()
+    return [_row_to_record(row) for row in rows]
+
+
+def count_processes(conn: sqlite3.Connection, *, session_id: str) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM processes WHERE session_id = ?", (session_id,)
+    ).fetchone()
+    return row["n"] if row else 0
+
+
+def kill_unowned(conn: sqlite3.Connection, *, pid: int, session_id: str) -> None:
+    """Kill a process no live runner owns, and record that it was killed.
+
+    A background script started in an earlier turn outlives the runner that
+    started it, so there is no monitor left to notice the signal and write
+    the row. Without this the panel would show it running forever, which is
+    the same lie the history was meant to stop telling.
+    """
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass  # already gone; the row still needs settling
+    conn.execute(
+        "UPDATE processes SET state = 'killed', exit_info = ? "
+        "WHERE pid = ? AND session_id = ?",
+        ("killed from the processes panel", pid, session_id),
+    )
+    conn.commit()
+
+
+def reconcile_orphans(conn: sqlite3.Connection) -> int:
+    """Settle rows left at 'running' by a previous run; returns how many.
+
+    A monitor updates the row when its process exits, so a killed or crashed
+    hpca leaves rows claiming to run forever. That was invisible while the
+    panel only showed the live runner's own processes; now that history
+    persists, an ancient 'running' row would be a standing lie. Liveness is
+    checked against the OS, so another instance's genuinely live processes
+    are left alone.
+    """
+    rows = conn.execute(
+        "SELECT pid, session_id FROM processes WHERE state = 'running'"
+    ).fetchall()
+    orphaned = []
+    for row in rows:
+        try:
+            os.kill(row["pid"], 0)  # signal 0: liveness only
+        except ProcessLookupError:
+            orphaned.append((row["pid"], row["session_id"]))
+        except PermissionError:
+            continue  # exists, just not ours to signal
+    if not orphaned:
+        return 0
+    conn.executemany(
+        "UPDATE processes SET state = 'unknown', exit_info = ? "
+        "WHERE pid = ? AND session_id = ?",
+        [("still running when hpca last exited", pid, sid) for pid, sid in orphaned],
+    )
+    conn.commit()
+    return len(orphaned)
 
 
 TERMINAL_STATES = {"finished", "failed", "killed"}

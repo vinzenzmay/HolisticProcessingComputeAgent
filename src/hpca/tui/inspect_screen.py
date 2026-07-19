@@ -12,9 +12,13 @@ from textual.screen import ModalScreen
 from textual.widgets import Static
 
 from hpca.jobs import JobRow
-from hpca.runner import ProcessRecord
+from hpca.runner import ProcessRecord, script_path_for
 
 TAIL_LINES = 40
+# The script comes first in the view, so it must not push the output off the
+# top of a long scroll. Agent-written scripts are short; a long one is
+# usually generated, and its head is the informative part.
+SCRIPT_LINES = 80
 
 
 def _tail(path: Path, lines: int = TAIL_LINES) -> str:
@@ -26,6 +30,27 @@ def _tail(path: Path, lines: int = TAIL_LINES) -> str:
     return "\n".join(tail) if tail else "(empty)"
 
 
+def _script_section(record: ProcessRecord) -> list[str]:
+    """The script that produced this output, when the process ran one.
+
+    Output without the script behind it is half the story: the usual question
+    after reading an error is what exactly was run, and that otherwise means
+    hunting through the chat log for the create_script call.
+    """
+    path = script_path_for(record.cmd)
+    if path is None:
+        return []
+    try:
+        content = Path(path).read_text(errors="replace")
+    except OSError as e:
+        return ["", f"── script ({path}) ──", f"(could not read: {e})"]
+    lines = content.splitlines()
+    body = "\n".join(lines[:SCRIPT_LINES]) if lines else "(empty)"
+    if len(lines) > SCRIPT_LINES:
+        body += f"\n… {len(lines) - SCRIPT_LINES} more lines in {path}"
+    return ["", f"── script ({path}) ──", body]
+
+
 def format_process(record: ProcessRecord) -> str:
     parts = [
         f"pid {record.pid} · {record.state}"
@@ -35,6 +60,7 @@ def format_process(record: ProcessRecord) -> str:
     ]
     if record.exit_info:
         parts.append(f"info: {record.exit_info}")
+    parts += _script_section(record)
     parts += [
         "",
         f"── stdout tail ({record.stdout_path}) ──",

@@ -1,5 +1,6 @@
 """Tests for hpca.runner: the single internal subprocess runner (§5.1, §5.4)."""
 
+import os
 import asyncio
 
 import pytest
@@ -159,3 +160,192 @@ class TestRunningSessionIds:
         from hpca.runner import running_session_ids
 
         assert running_session_ids(conn) == set()
+
+
+# ---------------------------------------------- persisted process history
+
+from hpca.runner import (  # noqa: E402
+    count_processes,
+    kill_unowned,
+    list_processes,
+    reconcile_orphans,
+    script_path_for,
+)
+
+
+def insert_process(conn, *, pid, session_id="s1", name="job", state="finished",
+                   started_at="2026-07-19T10:00:00+00:00", cmd="bash /tmp/x.sh"):
+    conn.execute(
+        "INSERT INTO processes (pid, session_id, name, cmd, state, stdout_path, "
+        "stderr_path, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (pid, session_id, name, cmd, state, "/tmp/o", "/tmp/e", started_at),
+    )
+    conn.commit()
+
+
+class TestListProcesses:
+    """The panel reads the table, not a runner: a runner only knows what it
+    started itself, and the TUI builds a new one every turn."""
+
+    def test_returns_persisted_rows(self, conn):
+        insert_process(conn, pid=101, name="align")
+        records = list_processes(conn, session_id="s1")
+        assert [r.name for r in records] == ["align"]
+        assert records[0].pid == 101
+
+    def test_newest_first(self, conn):
+        insert_process(conn, pid=1, name="old", started_at="2026-07-19T09:00:00+00:00")
+        insert_process(conn, pid=2, name="new", started_at="2026-07-19T11:00:00+00:00")
+        assert [r.name for r in list_processes(conn, session_id="s1")] == ["new", "old"]
+
+    def test_scoped_to_the_session(self, conn):
+        insert_process(conn, pid=1, session_id="s1", name="mine")
+        insert_process(conn, pid=2, session_id="s2", name="theirs")
+        assert [r.name for r in list_processes(conn, session_id="s1")] == ["mine"]
+
+    def test_limit_returns_one_extra_so_a_cut_is_detectable(self, conn):
+        for pid in range(1, 6):
+            insert_process(conn, pid=pid, started_at=f"2026-07-19T10:0{pid}:00+00:00")
+        assert len(list_processes(conn, session_id="s1", limit=3)) == 4
+        assert count_processes(conn, session_id="s1") == 5
+
+    def test_unknown_session_is_empty(self, conn):
+        assert list_processes(conn, session_id="nope") == []
+
+    def test_null_columns_do_not_crash(self, conn):
+        """A row written before a later column existed still has to render."""
+        conn.execute(
+            "INSERT INTO processes (pid, session_id, name, state) "
+            "VALUES (?, ?, ?, ?)", (7, "s1", "sparse", "finished"))
+        conn.commit()
+        record = list_processes(conn, session_id="s1")[0]
+        assert record.cmd == ""
+        assert record.exit_code is None
+
+
+class TestReconcileOrphans:
+    """A monitor writes the row when its process exits, so a killed hpca
+    leaves rows claiming to run forever."""
+
+    def test_dead_running_row_is_settled(self, conn):
+        insert_process(conn, pid=999_999, state="running")  # certainly not alive
+        assert reconcile_orphans(conn) == 1
+        record = list_processes(conn, session_id="s1")[0]
+        assert record.state == "unknown"
+        assert "last exited" in record.exit_info
+
+    def test_live_process_is_left_alone(self, conn):
+        insert_process(conn, pid=os.getpid(), state="running")
+        assert reconcile_orphans(conn) == 0
+        assert list_processes(conn, session_id="s1")[0].state == "running"
+
+    def test_finished_rows_untouched(self, conn):
+        insert_process(conn, pid=999_998, state="finished")
+        assert reconcile_orphans(conn) == 0
+        assert list_processes(conn, session_id="s1")[0].state == "finished"
+
+    def test_idempotent(self, conn):
+        insert_process(conn, pid=999_997, state="running")
+        assert reconcile_orphans(conn) == 1
+        assert reconcile_orphans(conn) == 0
+
+
+class TestKillUnowned:
+    def test_settles_the_row_even_when_the_process_is_gone(self, conn):
+        insert_process(conn, pid=999_996, state="running")
+        kill_unowned(conn, pid=999_996, session_id="s1")
+        record = list_processes(conn, session_id="s1")[0]
+        assert record.state == "killed"
+        assert "panel" in record.exit_info
+
+
+class TestScriptPathFor:
+    """Derived from the command line, so it works for processes recorded
+    before this existed and there is no second copy of the truth."""
+
+    def test_finds_the_script(self, tmp_path):
+        script = tmp_path / "align.sh"
+        script.write_text("echo hi\n")
+        assert script_path_for(f"bash {script}") == script
+
+    def test_finds_it_past_arguments(self, tmp_path):
+        script = tmp_path / "run.py"
+        script.write_text("print(1)\n")
+        assert script_path_for(f"python3 {script} --threads 8") == script
+
+    def test_ignores_a_missing_file(self, tmp_path):
+        assert script_path_for(f"bash {tmp_path / 'gone.sh'}") is None
+
+    def test_no_script_in_a_plain_command(self):
+        assert script_path_for("ls -la /data") is None
+
+    def test_unparseable_command_is_not_an_error(self):
+        assert script_path_for('bash "unclosed') is None
+
+    def test_empty(self):
+        assert script_path_for("") is None
+
+
+class TestDescribe:
+    """A history of `bash_1784458703578782438` rows identifies nothing."""
+
+    def record(self, name, cmd):
+        from hpca.runner import ProcessRecord
+        from pathlib import Path as P
+
+        return ProcessRecord(
+            pid=1, name=name, cmd=cmd, state="finished",
+            stdout_path=P("/tmp/o"), stderr_path=P("/tmp/e"),
+            started_at="2026-07-19T10:00:00+00:00",
+        )
+
+    def test_named_scripts_keep_their_key(self, tmp_path):
+        from hpca.runner import describe
+
+        script = tmp_path / "align-cohort.sh"
+        script.write_text("samtools view in.bam\n")
+        assert describe(self.record("align-cohort", f"bash {script}")) == "align-cohort"
+
+    def test_throwaway_shows_its_first_command(self, tmp_path):
+        from hpca.runner import describe
+
+        script = tmp_path / "bash_123.sh"
+        script.write_text("#!/bin/bash\nset -euo pipefail\nnproc --all\n")
+        assert describe(self.record("bash_123", f"bash {script}")) == "nproc --all"
+
+    def test_long_command_is_truncated(self, tmp_path):
+        from hpca.runner import describe
+
+        script = tmp_path / "bash_1.sh"
+        script.write_text("find /data -name '*.bam' -maxdepth 3 -type f | head -20\n")
+        described = describe(self.record("bash_1", f"bash {script}"))
+        assert len(described) <= 40
+        assert described.endswith("…")
+
+    def test_falls_back_to_the_name_when_the_script_is_gone(self, tmp_path):
+        from hpca.runner import describe
+
+        assert describe(
+            self.record("bash_9", f"bash {tmp_path / 'gone.sh'}")
+        ) == "bash_9"
+
+    def test_empty_script_falls_back(self, tmp_path):
+        from hpca.runner import describe
+
+        script = tmp_path / "bash_2.sh"
+        script.write_text("# only a comment\n")
+        assert describe(self.record("bash_2", f"bash {script}")) == "bash_2"
+
+
+class TestFirstCommand:
+    def test_skips_shebang_comments_and_preamble(self, tmp_path):
+        from hpca.runner import first_command
+
+        script = tmp_path / "s.sh"
+        script.write_text("#!/bin/bash\n# a note\nset -euo pipefail\n\nuname -r\n")
+        assert first_command(script) == "uname -r"
+
+    def test_missing_file(self, tmp_path):
+        from hpca.runner import first_command
+
+        assert first_command(tmp_path / "nope.sh") == ""
