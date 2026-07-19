@@ -115,6 +115,27 @@ SESSION_SEARCH_GUIDANCE = (
 )
 
 
+# Adapted from Hermes' MEMORY_GUIDANCE. The declarative-vs-imperative rule is
+# the load-bearing one: an imperative memory ("always use --no-mmap") is
+# re-read as a standing order in later sessions and overrides what the user is
+# actually asking for now — a failure mode small models are especially prone
+# to, since they weight instructions in context over the current request.
+MEMORY_GUIDANCE = (
+    "You have memory that persists across sessions, and the memory tool "
+    "writes to it. Save proactively when the user states a preference, "
+    "corrects you, or tells you a durable fact about this site — the best "
+    "memory is one that stops the user having to repeat themselves. "
+    "Priority: corrections and preferences first, then site facts, then "
+    "workarounds. Write memories as declarative FACTS, not instructions to "
+    "yourself: “the user prefers R over Python” is right, “always answer in "
+    "R” is wrong — an instruction gets re-read as a standing order in a "
+    "later session and overrides what is being asked then. Do NOT save task "
+    "progress, what you did this session, file names, job ids, or anything "
+    "that will be stale in a week; past sessions are searchable instead. "
+    "The user approves every write, so propose rather than agonize."
+)
+
+
 SKILLS_GUIDANCE = (
     "The user has defined skills: written procedures for specific tasks. "
     "When a request matches one, call read_skill to get the procedure and "
@@ -131,6 +152,7 @@ def orchestrator_system_prompt(
     tier2_meter: str = "",
     skills: str = "",
     session_search: bool = False,
+    memory_tool: bool = False,
 ) -> str:
     """System prompt for the orchestrator; dynamic facts injected per render.
 
@@ -151,6 +173,8 @@ def orchestrator_system_prompt(
     ]
     if session_search:
         parts.append(SESSION_SEARCH_GUIDANCE)
+    if memory_tool:
+        parts.append(MEMORY_GUIDANCE)
     if skills:
         parts.append(f"{SKILLS_GUIDANCE}\n{skills}")
     if tier1:

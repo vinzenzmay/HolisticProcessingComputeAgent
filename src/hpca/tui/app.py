@@ -6,7 +6,7 @@ import asyncio
 import shutil
 from dataclasses import dataclass
 from os import environ as os_environ
-from time import monotonic
+from time import monotonic, time
 from typing import Any
 
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -78,7 +78,13 @@ from hpca.tui.approval_screen import ApprovalScreen
 from hpca.tui.confirm_screen import ConfirmScreen
 from hpca.tui.inspect_screen import InspectScreen, format_job, format_process
 from hpca.tui.manage_llms import ManageLLMsScreen
-from hpca.tui.memory_screens import MemoryProposalScreen
+from hpca.memory_ops import (
+    MemoryOp,
+    MemoryOpError,
+    apply_batch,
+    drift_detected,
+)
+from hpca.tui.memory_screens import MemoryBatchScreen, MemoryProposalScreen
 from hpca.tui.profiles_screen import ProfilePickerScreen, ProfilesScreen
 from hpca.tui.rename_screen import RenameScreen
 from hpca.tui.settings_screen import SettingsScreen
@@ -715,6 +721,7 @@ class HpcaApp(App):
             tier2_meter=memory.usage_meter(2, caps.cap_chars(2)),
             skills=summarize_skills(skills),
             session_search="session_search" in self._tools.names(),
+            memory_tool="memory" in self._tools.names(),
         )
 
     def warn_about_struggles(self, text: str) -> list:
@@ -1093,6 +1100,56 @@ class HpcaApp(App):
         self.check_memory_caps()
         return kept
 
+    async def propose_memory_edits(
+        self, operations: list[MemoryOp], *, profile: str
+    ) -> str:
+        """The `memory` tool's write path: validate, ask, apply (P3).
+
+        Returns the tool result — what the user approved, or why the batch
+        did not apply. The model is told the outcome plainly so it can react
+        (condense and retry, or move on) instead of guessing.
+        """
+        loaded = Profile.load(profile)
+        caps = {1: self.settings.memory.cap_chars(1), 2: self.settings.memory.cap_chars(2)}
+        try:
+            result = apply_batch(
+                loaded,
+                operations,
+                backend=self.settings.llm.model,
+                caps=caps,
+            )
+        except MemoryOpError as e:
+            return f"Memory unchanged: {e}"
+        if not result.applied:
+            return "Memory unchanged: " + "; ".join(result.skipped)
+        approved = await self.push_screen_wait(
+            MemoryBatchScreen(operations, result.flagged)
+        )
+        if not approved:
+            return "Memory unchanged: the user rejected the proposed changes."
+        # The user may have edited this file by hand since it was loaded;
+        # rewriting from a stale copy would silently discard those edits.
+        path = Profile.path_for(profile)
+        if path.exists() and drift_detected(loaded, path.read_text()):
+            backup = path.with_suffix(f".bak.{int(time())}")
+            backup.write_text(path.read_text())
+            self._refresh_memory_snapshot(profile)
+            return (
+                "Memory unchanged: the profile file changed on disk since "
+                f"this session read it (backed up to {backup.name}). "
+                "The edits were not applied."
+            )
+        result.profile.save()
+        self._refresh_memory_snapshot(profile)
+        if profile == self.profile:
+            self.profile_memory = Profile.load(profile)
+        self.notify(f"Memory updated ({len(result.applied)} change(s)).")
+        self.check_memory_caps()
+        report = "; ".join(result.applied)
+        if result.skipped:
+            report += " (skipped: " + "; ".join(result.skipped) + ")"
+        return f"Saved to memory: {report}"
+
     async def maybe_propose_struggle_note(self, messages: list[dict]) -> bool:
         """§4.4: after a bad turn, propose a struggle note for approval."""
         if not turn_struggled(messages):
@@ -1225,6 +1282,9 @@ class HpcaApp(App):
             embedder=self.embedder,
             episodic=self.episodic,
             skills=self._turn_skills if self._turn_skills is not None else self.skills,
+            propose_memory_edits=lambda operations: self.propose_memory_edits(
+                operations, profile=session.profile
+            ),
         )
         if log is not None:
             ctx.llm = LoggedLLM(

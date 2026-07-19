@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Awaitable, Callable
 
 from hpca.config import Settings
 from hpca.embeddings import EmbeddingClient
@@ -36,6 +37,9 @@ class ToolContext:
     symbols: SymbolIndex | None = None
     rag: RagStore | None = None
     episodic: EpisodicStore | None = None  # past-session recall (redesign P2)
+    # Hands a proposed memory batch to the TUI, which owns the approval
+    # dialog and the profile file; returns what the user approved (P3).
+    propose_memory_edits: Callable[[list], Awaitable[str]] | None = None
     embedder: EmbeddingClient | None = None
     skills: list[Skill] = field(default_factory=list)
     # Commands whose docs could not be fetched; probed at most once per session

@@ -1,9 +1,15 @@
-"""Memory tools (redesign Phase 2): episodic recall via ``session_search``.
+"""Memory tools: episodic recall (Phase 2) and curated memory edits (Phase 3).
 
-Recall costs no model call: FTS5 BM25 over persisted user/assistant messages.
-Discovery mode returns Hermes-style bookends (goal → match → resolution) per
-hit; read mode pages through one session's messages. Output is char-bounded
-like every other tool, so a hit-rich search cannot flood a 27B's context.
+``session_search`` costs no model call: FTS5 BM25 over persisted
+user/assistant messages. Discovery mode returns Hermes-style bookends
+(goal → match → resolution) per hit; read mode pages through one session.
+
+``memory`` lets the agent propose edits to the profile's curated tiers the
+moment a user states a preference or correction, instead of waiting for
+``/conclude``. Unlike Hermes, which lets the model write directly, every
+batch here goes through the approval dialog — a 27B is not trusted to
+maintain its own memory unsupervised — and the tool result reports what the
+user actually approved.
 """
 
 from __future__ import annotations
@@ -13,6 +19,7 @@ from pydantic import BaseModel, Field
 from hpca.agent.context import ToolContext
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.episodic import MESSAGE_CHARS, EpisodicStore
+from hpca.memory_ops import MemoryOp
 
 RESULT_BUDGET = 2500
 
@@ -96,6 +103,46 @@ async def session_search(args: SessionSearchParams, ctx: ToolContext) -> str:
     return _clip_to_budget(lines)
 
 
+MEMORY_DESCRIPTION = (
+    "Save durable facts to this profile's memory, which is injected into "
+    "every future session. Make ALL changes in ONE call via the operations "
+    "array: the batch is applied together and the size budget is checked "
+    "only on the final result, so one call can remove or shorten stale "
+    "entries AND add a new one. Tier 1 is for stable site facts (cluster, "
+    "scheduler, filesystem layout), tier 2 for learnings, user preferences "
+    "and workarounds. Address an existing entry by a short unique substring "
+    "of its text. The user approves every change."
+)
+
+
+class MemoryOperation(BaseModel):
+    op: str = Field(description="add, replace, or remove")
+    tier: int = Field(default=2, description="1 for site facts, 2 for learnings")
+    match: str = Field(
+        default="",
+        description="replace/remove: a short unique substring of the entry",
+    )
+    text: str = Field(default="", description="add/replace: the new entry text")
+
+
+class MemoryParams(BaseModel):
+    operations: list[MemoryOperation] = Field(
+        description="The changes to apply together"
+    )
+
+
+async def memory(args: MemoryParams, ctx: ToolContext) -> str:
+    """The write itself happens in the TUI, which owns the approval dialog and
+    the profile file; the tool only validates and hands the batch over."""
+    if ctx.propose_memory_edits is None:
+        return "Memory editing is not available in this context."
+    operations = [
+        MemoryOp(op=o.op.strip().lower(), tier=o.tier, match=o.match, text=o.text)
+        for o in args.operations
+    ]
+    return await ctx.propose_memory_edits(operations)
+
+
 def add_memory_tools(registry: ToolRegistry) -> ToolRegistry:
     registry.register(
         Tool(
@@ -103,6 +150,14 @@ def add_memory_tools(registry: ToolRegistry) -> ToolRegistry:
             description=SESSION_SEARCH_DESCRIPTION,
             params=SessionSearchParams,
             handler=session_search,
+        )
+    )
+    registry.register(
+        Tool(
+            name="memory",
+            description=MEMORY_DESCRIPTION,
+            params=MemoryParams,
+            handler=memory,
         )
     )
     return registry

@@ -10,6 +10,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Static
 
 from hpca.agent.conclude import MemoryProposal
+from hpca.memory_ops import MemoryOp
 
 
 class TierSelectScreen(ModalScreen[int | None]):
@@ -93,6 +94,70 @@ class MemoryProposalScreen(ModalScreen[bool]):
             )
             yield Static(Content(p.text), id="proposal-text")
             yield Static("(y) keep · (n) discard", id="proposal-hint")
+
+    def action_accept(self) -> None:
+        self.dismiss(True)
+
+    def action_reject(self) -> None:
+        self.dismiss(False)
+
+
+class MemoryBatchScreen(ModalScreen[bool]):
+    """The `memory` tool's batch: approve or reject it whole (§6.3, P3).
+
+    Whole-batch rather than per-operation, because a batch is often a trade —
+    remove two stale entries to make room for one new one — and approving
+    half of that leaves memory in a state nobody chose.
+    """
+
+    BINDINGS = [
+        Binding("y", "accept", "accept"),
+        Binding("n", "reject", "reject"),
+        Binding("escape", "reject", "reject", priority=True),
+    ]
+
+    DEFAULT_CSS = """
+    MemoryBatchScreen { align: center middle; }
+    #batch-dialog {
+        width: 76;
+        height: auto;
+        max-height: 80%;
+        border: heavy $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    #batch-hint { color: $text-muted; }
+    #batch-warning { color: $warning; }
+    """
+
+    def __init__(self, operations: list[MemoryOp], flagged: list[str]) -> None:
+        super().__init__()
+        self._operations = operations
+        self._flagged = flagged
+
+    def compose(self) -> ComposeResult:
+        count = len(self._operations)
+        with Vertical(id="batch-dialog"):
+            yield Static(
+                f"The agent proposes {count} memory change"
+                f"{'' if count == 1 else 's'}",
+                id="batch-title",
+            )
+            yield Static(
+                Content(
+                    "\n".join(f"• {op.describe()}" for op in self._operations)
+                ),
+                id="batch-text",
+            )
+            if self._flagged:
+                yield Static(
+                    Content(
+                        "⚠ text matches a prompt-injection pattern "
+                        f"({', '.join(self._flagged[:2])}) — read it closely"
+                    ),
+                    id="batch-warning",
+                )
+            yield Static("(y) apply all · (n) discard", id="batch-hint")
 
     def action_accept(self) -> None:
         self.dismiss(True)
