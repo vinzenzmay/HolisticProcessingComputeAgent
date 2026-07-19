@@ -104,23 +104,28 @@ async def session_search(args: SessionSearchParams, ctx: ToolContext) -> str:
 
 
 MEMORY_DESCRIPTION = (
-    "Save durable facts to this profile's memory, which is injected into "
-    "every future session. Make ALL changes in ONE call via the operations "
-    "array: the batch is applied together and the size budget is checked "
-    "only on the final result, so one call can remove or shorten stale "
-    "entries AND add a new one. Tier 1 is for stable site facts (cluster, "
-    "scheduler, filesystem layout), tier 2 for learnings, user preferences "
-    "and workarounds. Address an existing entry by a short unique substring "
-    "of its text. The user approves every change."
+    "Save durable facts to this profile's memory. Tier 1 (stable site facts: "
+    "cluster, scheduler, filesystem layout) and tier 2 (learnings, user "
+    "preferences, workarounds) are injected into every future session; tier 3 "
+    "is retrieved only when a request matches it, so situational notes belong "
+    "there. Make ALL changes in ONE call via the operations array: the batch "
+    "is applied together and the size budget is checked only on the final "
+    "result, so one call can free room AND use it. When a tier is full, "
+    "prefer demoting situational entries to tier 3 over removing them. "
+    "Address an existing entry by a short unique substring of its text. The "
+    "user approves every change."
 )
 
 
 class MemoryOperation(BaseModel):
-    op: str = Field(description="add, replace, or remove")
-    tier: int = Field(default=2, description="1 for site facts, 2 for learnings")
+    op: str = Field(description="add, replace, remove, or demote")
+    tier: int = Field(
+        default=2,
+        description="1 site facts, 2 learnings, 3 situational (retrieved only)",
+    )
     match: str = Field(
         default="",
-        description="replace/remove: a short unique substring of the entry",
+        description="replace/remove/demote: a unique substring of the entry",
     )
     text: str = Field(default="", description="add/replace: the new entry text")
 

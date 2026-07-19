@@ -97,3 +97,39 @@ class TestSummary:
     def test_summary_without_steps_does_not_advertise_zero(self):
         entry = Entry(kind="thinking", text="", steps=0, reasoning_chars=111)
         assert entry.summary() == "111 chars reasoning"
+
+
+class TestRecalledMemory:
+    """Redesign Phase 5: recall is visible in the transcript — silent
+    injection would make the agent's behavior inexplicable."""
+
+    def test_recall_entry_after_the_user_message(self):
+        messages = [
+            {
+                "role": "user",
+                "content": "run my snakemake workflow",
+                "api_content": (
+                    "run my snakemake workflow\n\n<memory-context>\n"
+                    "[System note: recalled memory, NOT new user input.]\n"
+                    "Past struggle (2026-06-02): dry-runs fail here.\n"
+                    "</memory-context>"
+                ),
+            },
+            {"role": "assistant", "content": "ok"},
+        ]
+        entries = build_entries(messages)
+        assert [e.kind for e in entries] == ["user", "recall", "assistant"]
+        assert entries[0].text == "run my snakemake workflow"
+        assert entries[1].text == "Past struggle (2026-06-02): dry-runs fail here."
+        # the system-note scaffolding is not shown to the user
+        assert "System note" not in entries[1].text
+
+    def test_no_recall_entry_without_a_sidecar(self):
+        entries = build_entries([{"role": "user", "content": "hello"}])
+        assert [e.kind for e in entries] == ["user"]
+
+    def test_sidecar_without_a_fence_is_ignored(self):
+        entries = build_entries(
+            [{"role": "user", "content": "hi", "api_content": "hi"}]
+        )
+        assert [e.kind for e in entries] == ["user"]

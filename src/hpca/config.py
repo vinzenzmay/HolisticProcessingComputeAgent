@@ -85,6 +85,10 @@ class MemorySettings(_Section):
     # default: profiles exist to isolate what each context learns and sees
     # (redesign, resolved question 2).
     cross_profile_search: bool = False
+    # Tier 3 (retrieved memory, redesign Phase 5): not injected wholesale,
+    # only the entries matching the current request, within this budget.
+    tier3_prefetch_chars: int = 800
+    tier3_prefetch_count: int = 3
     # Self-review cadence (redesign Phase 4). Reviews run after the reply is
     # delivered, so they never compete with the user's turn. Counted in user
     # turns; a struggling turn triggers one immediately regardless.

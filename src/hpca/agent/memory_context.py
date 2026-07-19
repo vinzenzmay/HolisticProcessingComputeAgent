@@ -28,16 +28,30 @@ MAX_CHARS = 600
 KEYWORDS_LINE_RE = re.compile(r"^keywords:\s*.*$", re.MULTILINE)
 
 
-def note_line(memory: Memory) -> str:
-    """One recalled note, with provenance and without the matching keywords
-    line (that line exists for the matcher, not the model)."""
-    text = KEYWORDS_LINE_RE.sub("", memory.text).strip()
-    provenance = ", ".join(
-        bit for bit in (memory.created, memory.backend and f"backend {memory.backend}")
-        if bit
+def _provenance(created: str, backend: str) -> str:
+    return ", ".join(
+        bit for bit in (created, backend and f"backend {backend}") if bit
     )
+
+
+def _strip_keywords(text: str) -> str:
+    """The keywords line exists for the matcher, not for the model."""
+    return KEYWORDS_LINE_RE.sub("", text).strip()
+
+
+def note_line(memory: Memory) -> str:
+    """One recalled struggle note, with provenance."""
+    provenance = _provenance(memory.created, memory.backend)
     prefix = f"Past struggle ({provenance}): " if provenance else "Past struggle: "
-    return prefix + text
+    return prefix + _strip_keywords(memory.text)
+
+
+def retrieved_line(hit) -> str:
+    """One retrieved tier-3 memory (redesign Phase 5)."""
+    provenance = _provenance(hit.created, hit.backend)
+    label = "Past struggle" if hit.kind == "struggle" else "Recalled"
+    prefix = f"{label} ({provenance}): " if provenance else f"{label}: "
+    return prefix + _strip_keywords(hit.text)
 
 
 def build_memory_context(

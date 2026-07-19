@@ -300,3 +300,72 @@ class TestFencedRecall:
         async with app.run_test(size=(120, 40)) as pilot:
             await submit(app, pilot, "hello")
             assert "api_content" not in llm.calls[0][-1]
+
+
+class TestTierThreeRecall:
+    """Redesign Phase 5: tier 3 is retrieved per request, not injected."""
+
+    def write_tier3(self, text, **kwargs):
+        profile = Profile.load("default")
+        profile.add_memory(text, tier=3, **kwargs)
+        profile.save()
+
+    async def test_tier3_is_not_in_the_system_prompt(self, hpca_home):
+        self.write_tier3("Deepvariant needs a GPU partition here.")
+        llm = RecordingLLM([respond_json("ok")])
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit(app, pilot, "hello")
+            assert "Deepvariant" not in llm.calls[0][0]["content"]
+
+    async def test_matching_request_retrieves_it(self, hpca_home):
+        self.write_tier3("Deepvariant needs a GPU partition here.")
+        llm = RecordingLLM([respond_json("ok")])
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit(app, pilot, "run deepvariant on this sample")
+            user = llm.calls[0][-1]
+            assert "Deepvariant needs a GPU partition here." in user["api_content"]
+            assert "<memory-context>" in user["api_content"]
+            # the stored message stays the user's own words
+            assert user["content"] == "run deepvariant on this sample"
+
+    async def test_unrelated_request_retrieves_nothing(self, hpca_home):
+        self.write_tier3("Deepvariant needs a GPU partition here.")
+        llm = RecordingLLM([respond_json("ok")])
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit(app, pilot, "what time is it")
+            assert "api_content" not in llm.calls[0][-1]
+
+    async def test_recall_is_visible_in_the_transcript(self, hpca_home):
+        self.write_tier3("Deepvariant needs a GPU partition here.")
+        llm = RecordingLLM([respond_json("ok")])
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit(app, pilot, "run deepvariant on this sample")
+            texts = app.chat_log_texts()
+            assert any("Deepvariant needs a GPU partition" in t for t in texts)
+            # shown as recall, not as something the user said
+            assert any(e.kind == "recall" for e in app._chat_entries)
+
+    async def test_prefetch_respects_the_char_budget(self, hpca_home):
+        for i in range(5):
+            self.write_tier3(f"bam handling note {i}: " + "x" * 400)
+        llm = RecordingLLM([respond_json("ok")])
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit(app, pilot, "help me with this bam handling problem")
+            block = llm.calls[0][-1]["api_content"]
+            assert len(block) < 1200  # message + fence, budget is 800
+
+    async def test_struggle_notes_from_review_land_in_tier3(self, hpca_home):
+        llm = RecordingLLM(["garbage"] * 4 + [REVIEW_JSON])
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit(app, pilot, "run my snakemake workflow", expect_modal=True)
+            await pilot.press("y")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            memories = Profile.load("default").memories
+            assert memories[0].tier == 3  # situational: retrieved, not injected

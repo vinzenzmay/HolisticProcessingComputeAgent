@@ -45,9 +45,9 @@ class MemoryOpError(Exception):
 
 @dataclass
 class MemoryOp:
-    op: str  # add | replace | remove
+    op: str  # add | replace | remove | demote
     tier: int = 2
-    match: str = ""  # replace/remove: a short unique substring of the target
+    match: str = ""  # replace/remove/demote: a unique substring of the target
     text: str = ""  # add/replace: the new text
 
     def describe(self) -> str:
@@ -55,6 +55,8 @@ class MemoryOp:
             return f"add to tier {self.tier}: {self.text}"
         if self.op == "remove":
             return f"remove from tier {self.tier}: “{self.match}”"
+        if self.op == "demote":
+            return f"move “{self.match}” from tier {self.tier} to tier 3"
         return f"replace “{self.match}” (tier {self.tier}) with: {self.text}"
 
 
@@ -111,10 +113,18 @@ def _inventory(profile: Profile, tier: int) -> str:
 
 def inventory_report(profile: Profile, tier: int, cap: int) -> str:
     """What the model is shown when a batch does not fit: the full tier plus
-    its usage, so it can reissue one batch that frees room and adds."""
+    its usage, so it can reissue one batch that frees room and adds.
+
+    Demotion is offered before removal — a situational memory moved to tier 3
+    stops costing context on every turn but stays retrievable, so nothing has
+    to be thrown away to make room.
+    """
     return (
         f"Tier {tier} is full ({profile.usage_meter(tier, cap)}). "
-        f"Current tier-{tier} memories: {_inventory(profile, tier)}"
+        f"Current tier-{tier} memories: {_inventory(profile, tier)}. "
+        "Reissue ONE batch that frees room and adds: prefer 'demote' on "
+        "situational entries (they move to tier 3 and stay retrievable) over "
+        "removing them outright."
     )
 
 
@@ -167,6 +177,12 @@ def apply_batch(
         elif operation.op == "remove":
             target = resolve(working, operation.tier, operation.match)
             working.memories.remove(target)
+            result.applied.append(operation.describe())
+        elif operation.op == "demote":
+            # Tier 3 is retrieved, not injected: the entry stops costing
+            # context every turn but is still there when it matches.
+            target = resolve(working, operation.tier, operation.match)
+            target.tier = 3
             result.applied.append(operation.describe())
         elif operation.op == "replace":
             text = operation.text.strip()

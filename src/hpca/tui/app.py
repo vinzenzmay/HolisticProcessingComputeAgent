@@ -37,6 +37,7 @@ from hpca.agent.memory_context import (
     build_memory_context,
     compose_api_content,
     note_line,
+    retrieved_line,
 )
 from hpca.agent.memory_tools import add_memory_tools
 from hpca.agent.prompts import orchestrator_system_prompt
@@ -85,6 +86,7 @@ from hpca.tui.approval_screen import ApprovalScreen
 from hpca.tui.confirm_screen import ConfirmScreen
 from hpca.tui.inspect_screen import InspectScreen, format_job, format_process
 from hpca.tui.manage_llms import ManageLLMsScreen
+from hpca.memory_index import MemoryIndex
 from hpca.memory_ops import (
     MemoryOp,
     MemoryOpError,
@@ -110,6 +112,7 @@ CHAT_TITLES = {
     "error": "error",
     "event": "background",
     "queued": "queued",
+    "recall": "recalled from memory",
 }
 
 
@@ -132,6 +135,7 @@ LOG_KINDS = {
     "assistant": "agent",
     "error": "error",
     "event": "background",
+    "recall": "recalled from memory",
 }
 
 
@@ -502,6 +506,10 @@ class HpcaApp(App):
         border: round $panel-lighten-2;
         color: $text-muted;
     }
+    .chat-recall {
+        border: round $panel-lighten-2;
+        color: $text-muted;
+    }
     .chat-working {
         color: $text-muted;
         padding: 0 1;
@@ -609,6 +617,7 @@ class HpcaApp(App):
         init_db(self._conn)
         self.session_store = SessionStore(self._conn)
         self.episodic = EpisodicStore(self._conn)
+        self.memory_index = MemoryIndex(self._conn)
         self._saver_ctx = AsyncSqliteSaver.from_conn_string(str(checkpoints_db_path()))
         checkpointer = await self._saver_ctx.__aenter__()
         self._checkpointer = checkpointer  # kept for graph rebuilds on switch
@@ -699,15 +708,26 @@ class HpcaApp(App):
 
     def _memory_snapshot(self, profile: str) -> Profile:
         """The frozen memory view for a profile (loaded once, reused across
-        turns). See ``_memory_snapshots`` for why it is not reloaded per turn."""
+        turns). See ``_memory_snapshots`` for why it is not reloaded per turn.
+
+        Loading is also when the tier-3 index is rebuilt: the markdown file is
+        the source of truth, and it may have been edited by hand since.
+        """
         snapshot = self._memory_snapshots.get(profile)
         if snapshot is None:
             snapshot = Profile.load(profile)
             self._memory_snapshots[profile] = snapshot
+            index = getattr(self, "memory_index", None)
+            if index is not None:
+                try:
+                    index.reindex(snapshot)
+                except Exception:
+                    pass  # retrieval is an optimization; never block a turn
         return snapshot
 
     def _refresh_memory_snapshot(self, profile: str) -> None:
-        """Drop a profile's frozen view; the next turn reloads from disk.
+        """Drop a profile's frozen view; the next turn reloads from disk and
+        rebuilds the tier-3 index.
 
         Called after approved writes and profile edits — the deliberate
         refresh points where invalidating the backend's prefix cache is
@@ -736,6 +756,36 @@ class HpcaApp(App):
             session_search="session_search" in self._tools.names(),
             memory_tool="memory" in self._tools.names(),
         )
+
+    def _recall_lines(
+        self, user_text: str, memory: Profile, profile: str
+    ) -> list[str]:
+        """What this request recalls: matching tier-2 struggle notes plus
+        retrieved tier-3 memories (redesign Phase 5).
+
+        Tier 3 is retrieved rather than injected wholesale, which is what lets
+        it grow: situational memories cost context only on the turns they
+        actually match.
+        """
+        lines = [note_line(m) for m in matching_struggles(memory.memories, user_text)]
+        seen = {line for line in lines}
+        index = getattr(self, "memory_index", None)
+        if index is not None:
+            try:
+                hits = index.search(
+                    user_text,
+                    profile=profile,
+                    active_backend=self.settings.llm.model,
+                    limit=self.settings.memory.tier3_prefetch_count,
+                )
+            except Exception:
+                hits = []
+            for hit in hits:
+                line = retrieved_line(hit)
+                if line not in seen:
+                    seen.add(line)
+                    lines.append(line)
+        return lines
 
     def warn_about_struggles(self, text: str) -> list:
         """§4.4: warn the *user* up front when a request matches a past
@@ -829,15 +879,18 @@ class HpcaApp(App):
         if session.profile == self.profile:
             self.profile_memory = self._turn_memory
         self._turn_skills = load_skills(session.profile)
-        # Recalled struggle notes ride on the API copy of the user message —
-        # the model is warned in-context, the stored transcript stays clean.
+        # Recalled memory rides on the API copy of the user message — the
+        # model is warned in-context, the stored transcript stays clean.
         api_content = None
         if user_text is not None:
-            matches = matching_struggles(self._turn_memory.memories, user_text)
-            if matches:
-                block = build_memory_context([note_line(m) for m in matches])
-                if block:
-                    api_content = compose_api_content(user_text, block)
+            lines = self._recall_lines(user_text, self._turn_memory, session.profile)
+            block = build_memory_context(
+                lines,
+                max_notes=self.settings.memory.tier3_prefetch_count,
+                max_chars=self.settings.memory.tier3_prefetch_chars,
+            )
+            if block:
+                api_content = compose_api_content(user_text, block)
         log = open_log(self.settings, session)
         self._busy_turn = session
         self._turn_ctx = self._make_tool_ctx(session, log, memory=self._turn_memory)
@@ -1222,7 +1275,10 @@ class HpcaApp(App):
         """Persist one approved proposal; returns whether anything was written."""
         if proposal.kind in ("memory", "struggle"):
             text = proposal.memory_text()
-            tier = 2 if proposal.kind == "struggle" else proposal.tier
+            # Struggle notes go to tier 3: they are situational by nature and
+            # were the main source of tier-2 bloat. Retrieval brings them
+            # back when a request actually resembles the old one.
+            tier = 3 if proposal.kind == "struggle" else proposal.tier
             if self._memory_write_blocked(tier, text):
                 return False
             target = Profile.load(profile)  # merge, don't clobber
@@ -2110,6 +2166,7 @@ class HpcaApp(App):
         moved = self.session_store.reassign_profile(name, "default")
         Profile.delete(name)
         self._refresh_memory_snapshot(name)
+        self.memory_index.forget_profile(name)
         if self.profile == name:  # unlikely, but keep the app coherent
             self.profile = "default"
             self.profile_memory = Profile.load("default")

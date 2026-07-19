@@ -178,3 +178,41 @@ class TestDriftDetection:
         profile = profile_with(("STAR needs 40G.", 2))
         edited = profile.render() + "\nA note added by hand.\n"
         assert drift_detected(profile, edited)
+
+
+class TestDemoteOperation:
+    """Redesign Phase 5: a full tier is relieved by demotion, not deletion."""
+
+    def test_demote_moves_to_tier3(self):
+        result = apply_batch(
+            profile_with(("Snakemake dry-runs fail.", 2)),
+            [MemoryOp(op="demote", tier=2, match="Snakemake")],
+        )
+        assert result.profile.memories[0].tier == 3
+        assert result.profile.tier_chars(2) == 0  # out of the injected budget
+
+    def test_demote_then_add_fits_in_one_batch(self):
+        profile = profile_with(("x" * 90, 2))
+        result = apply_batch(
+            profile,
+            [
+                MemoryOp(op="demote", tier=2, match="x" * 20),
+                MemoryOp(op="add", tier=2, text="y" * 90),
+            ],
+            caps={2: 100},
+        )
+        assert result.profile.tier_chars(2) == 90
+        assert len([m for m in result.profile.memories if m.tier == 3]) == 1
+
+    def test_describe(self):
+        op = MemoryOp(op="demote", tier=2, match="Snakemake")
+        assert op.describe() == "move “Snakemake” from tier 2 to tier 3"
+
+    def test_full_tier_message_suggests_demotion(self):
+        with pytest.raises(MemoryOpError) as excinfo:
+            apply_batch(
+                profile_with(("x" * 90, 2)),
+                [MemoryOp(op="add", tier=2, text="y" * 90)],
+                caps={2: 100},
+            )
+        assert "demote" in str(excinfo.value)
