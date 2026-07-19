@@ -206,3 +206,41 @@ class TestWholeSpanDigest:
         await propose_reflections(llm, self.messages(80), span="whole")
         sent = llm.calls[0]["messages"][1]["content"]
         assert "msg0" in sent
+
+
+class TestTierThreeDeduplication:
+    """Found in a live run against Qwen3.6-27B: a retrieved tier-3 note is in
+    the conversation when the reviewer reads it, so unless it is listed as
+    known the reviewer re-proposes it — for tier 1 or 2, promoting a
+    situational note into the always-injected budget tier 3 keeps it out of."""
+
+    async def test_tier3_listed_as_known(self):
+        llm = FakeLLM([reply()])
+        await propose_reflections(
+            llm, MESSAGES, tier3="DeepVariant needs the gpu partition."
+        )
+        system = llm.calls[0]["messages"][0]["content"]
+        assert "do NOT propose these again" in system
+        assert "DeepVariant needs the gpu partition." in system
+
+    async def test_all_three_tiers_listed(self):
+        llm = FakeLLM([reply()])
+        await propose_reflections(
+            llm, MESSAGES, tier1="one", tier2="two", tier3="three"
+        )
+        system = llm.calls[0]["messages"][0]["content"]
+        assert "one" in system and "two" in system and "three" in system
+
+    async def test_large_tier3_is_capped(self):
+        llm = FakeLLM([reply()])
+        await propose_reflections(llm, MESSAGES, tier3="x" * 50_000)
+        system = llm.calls[0]["messages"][0]["content"]
+        assert len(system) < 12_000  # bounded, not the whole tier
+
+    async def test_cap_keeps_the_most_recent_entries(self):
+        llm = FakeLLM([reply()])
+        tier3 = "\n\n".join(f"note number {i}" for i in range(500))
+        await propose_reflections(llm, MESSAGES, tier3=tier3)
+        system = llm.calls[0]["messages"][0]["content"]
+        assert "note number 499" in system  # newest kept
+        assert "note number 0\n" not in system  # oldest dropped

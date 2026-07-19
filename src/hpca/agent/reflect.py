@@ -36,6 +36,9 @@ MAX_MESSAGE_CHARS = 400
 MAX_DIGEST_MESSAGES = 40
 MAX_PROPOSALS = 4
 REFLECT_MAX_RETRIES = 1
+# Tier 3 is unbounded by design, but the review prompt is not: enough of it
+# to stop the obvious re-proposals without swamping a 27B's attention.
+KNOWN_TIER3_CHARS = 2000
 
 # Adapted from Hermes' _SKILL_REVIEW_PROMPT. Every "do not capture" line is a
 # real self-poisoning mode: a small model that writes "browser tools do not
@@ -150,6 +153,14 @@ class ReflectError(Exception):
     """No valid proposal list within the retry budget."""
 
 
+def _cap(text: str, limit: int) -> str:
+    """Keep the most recent entries: they are the ones a review is likeliest
+    to duplicate, since they came from recent work."""
+    if len(text) <= limit:
+        return text
+    return "…\n\n" + text[-limit:]
+
+
 def _line(message: Message) -> str:
     content = " ".join(str(message["content"]).split())[:MAX_MESSAGE_CHARS]
     return f"{message['role']}: {content}"
@@ -197,16 +208,26 @@ async def propose_reflections(
     *,
     tier1: str = "",
     tier2: str = "",
+    tier3: str = "",
     skills: str = "",
     allow_new_skills: bool = True,
     span: str = "recent",
     max_retries: int = REFLECT_MAX_RETRIES,
 ) -> list[Reflection]:
-    """What this stretch of conversation is worth remembering, if anything."""
+    """What this stretch of conversation is worth remembering, if anything.
+
+    All three tiers are listed as already-known. Tier 3 especially: a
+    retrieved note is *in the conversation* when the reviewer reads it, so
+    without this the reviewer re-proposes what it just saw — and proposes it
+    for tier 1 or 2, promoting a situational note into the always-injected
+    budget that tier 3 exists to keep it out of.
+    """
     system = SYSTEM_PROMPT
     if allow_new_skills:
         system += SKILL_CREATION_CLAUSE
-    known = "\n\n".join(part for part in (tier1, tier2) if part)
+    known = "\n\n".join(
+        part for part in (tier1, tier2, _cap(tier3, KNOWN_TIER3_CHARS)) if part
+    )
     if known:
         system += (
             "\n\nAlready in memory — do NOT propose these again, and do not "

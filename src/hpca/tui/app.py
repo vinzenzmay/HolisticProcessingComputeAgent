@@ -1288,6 +1288,7 @@ class HpcaApp(App):
                 messages,
                 tier1=memory.tier_text(1),
                 tier2=memory.tier_text(2),
+                tier3=memory.tier_text(3),
                 skills=summarize_skills(skills),
                 allow_new_skills=self.settings.memory.propose_new_skills,
                 span=span,
