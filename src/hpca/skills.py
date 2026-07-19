@@ -174,6 +174,39 @@ def write_skill(
     return path
 
 
+def copy_profile_skills(
+    source: str, target: str, *, root: Path | None = None
+) -> int:
+    """Copy one profile's own skills to another; returns how many.
+
+    Only the profile's own directory is copied — ``_shared/`` is already
+    visible to both, and duplicating it would turn one shared procedure into
+    two that drift apart silently.
+    """
+    root = root or skills_dir()
+    source_dir, target_dir = root / source, root / target
+    if not source_dir.exists():
+        return 0
+    target_dir.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for path in sorted(source_dir.iterdir()):
+        if path.suffix.lower() not in SKILL_SUFFIXES or not path.is_file():
+            continue
+        (target_dir / path.name).write_text(path.read_text(errors="replace"))
+        copied += 1
+    return copied
+
+
+def delete_profile_skills(name: str, *, root: Path | None = None) -> None:
+    """Remove a profile's own skills. ``_shared/`` is never touched."""
+    import shutil
+
+    root = root or skills_dir()
+    directory = root / name
+    if directory.exists() and directory.is_dir():
+        shutil.rmtree(directory)
+
+
 def patched_body(skill: Skill, correction: str) -> str:
     """A skill body with a correction appended under a stable heading.
 

@@ -74,6 +74,8 @@ from hpca.sessions import Session, SessionStore
 from hpca.skills import (
     Skill,
     any_skills,
+    copy_profile_skills,
+    delete_profile_skills,
     load_skills,
     patched_body,
     summarize_skills,
@@ -2197,12 +2199,37 @@ class HpcaApp(App):
             self.profile_memory = profile
 
     def create_profile(self, name: str) -> str | None:
-        """Make a profile; returns an error message, or None on success."""
+        """Make a blank profile; returns an error message, or None on success."""
         try:
             cleaned = Profile.validate_name(name)
         except ValueError as e:
             return str(e)
         Profile.create(cleaned)
+        return None
+
+    def duplicate_profile(self, source: str, name: str) -> str | None:
+        """Fork a profile: same learnings, its own future.
+
+        Copies the memories and the source's own skills, then the two are
+        independent — which is the point, a shared base that specialises in
+        different directions. Returns an error message, or None on success.
+        """
+        try:
+            cleaned = Profile.validate_name(name)
+        except ValueError as e:
+            return str(e)
+        if source not in Profile.list_profiles():
+            return f"There is no profile called “{source}”."
+        Profile.duplicate(source, cleaned)
+        skills = copy_profile_skills(source, cleaned)
+        self._refresh_memory_snapshot(cleaned)
+        memories = len(Profile.load(cleaned).memories)
+        self.notify(
+            f"Copied “{source}” to “{cleaned}” "
+            f"({memories} memor{'y' if memories == 1 else 'ies'}"
+            + (f", {skills} skill{'' if skills == 1 else 's'}" if skills else "")
+            + "). They diverge from here."
+        )
         return None
 
     def profile_delete_blocker(self, name: str) -> str | None:
@@ -2228,6 +2255,10 @@ class HpcaApp(App):
     def delete_profile(self, name: str) -> None:
         moved = self.session_store.reassign_profile(name, "default")
         Profile.delete(name)
+        # Its learnings go with it: memories, retrieval index, and the skills
+        # it accumulated. Leaving orphaned skills behind would silently
+        # resurrect them under a profile created with the same name later.
+        delete_profile_skills(name)
         self._refresh_memory_snapshot(name)
         self.memory_index.forget_profile(name)
         if self.profile == name:  # unlikely, but keep the app coherent

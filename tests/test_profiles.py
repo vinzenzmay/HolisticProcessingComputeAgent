@@ -264,3 +264,91 @@ class TestBackendAnnotation:
             profile.tier_prompt_text(1, active_backend="qwen3-6b")
             == "Cluster is cubi."
         )
+
+
+class TestDuplication:
+    """A copy starts from everything the original learned, then diverges —
+    the workflow is a general base profile forked per specialism."""
+
+    def base(self, name="base"):
+        profile = Profile.create(name)
+        profile.default_backend = "qwen3-35b"
+        profile.add_memory("Cluster is cubi, scheduler is Slurm.", tier=1)
+        profile.add_memory("The user prefers R.", tier=2)
+        profile.add_memory("Snakemake dry-runs fail here.", tier=3, kind="struggle")
+        profile.save()
+        return profile
+
+    def test_all_tiers_copied(self, hpca_home):
+        self.base()
+        copy = Profile.duplicate("base", "variants")
+        assert [(m.tier, m.text) for m in copy.memories] == [
+            (1, "Cluster is cubi, scheduler is Slurm."),
+            (2, "The user prefers R."),
+            (3, "Snakemake dry-runs fail here."),
+        ]
+
+    def test_metadata_preserved_and_provenance_recorded(self, hpca_home):
+        self.base()
+        copy = Profile.duplicate("base", "variants")
+        assert copy.default_backend == "qwen3-35b"
+        assert copy.copied_from == "base"
+        assert copy.copied_on
+        # struggle notes stay struggle notes, so matching still works
+        assert copy.memories[2].kind == "struggle"
+
+    def test_provenance_survives_a_round_trip(self, hpca_home):
+        self.base()
+        Profile.duplicate("base", "variants")
+        assert Profile.load("variants").copied_from == "base"
+
+    def test_ordinary_profiles_carry_no_provenance(self, hpca_home):
+        Profile.create("plain").save()
+        assert Profile.load("plain").copied_from == ""
+        assert "copied_from" not in Profile.path_for("plain").read_text()
+
+    def test_the_copy_is_written_to_disk(self, hpca_home):
+        self.base()
+        Profile.duplicate("base", "variants")
+        assert "variants" in Profile.list_profiles()
+
+    def test_they_diverge(self, hpca_home):
+        self.base()
+        Profile.duplicate("base", "variants")
+
+        original = Profile.load("base")
+        original.add_memory("Learned later by the base.", tier=2)
+        original.save()
+
+        copy = Profile.load("variants")
+        copy.add_memory("Learned later by the copy.", tier=2)
+        copy.save()
+
+        base_texts = [m.text for m in Profile.load("base").memories]
+        copy_texts = [m.text for m in Profile.load("variants").memories]
+        assert "Learned later by the base." in base_texts
+        assert "Learned later by the base." not in copy_texts
+        assert "Learned later by the copy." in copy_texts
+        assert "Learned later by the copy." not in base_texts
+        # and the shared base is still in both
+        assert "The user prefers R." in base_texts
+        assert "The user prefers R." in copy_texts
+
+    def test_editing_a_copied_memory_does_not_touch_the_original(self, hpca_home):
+        self.base()
+        copy = Profile.duplicate("base", "variants")
+        copy.memories[1].text = "The user prefers Python now."
+        copy.save()
+        assert Profile.load("base").memories[1].text == "The user prefers R."
+
+    def test_copying_an_empty_profile(self, hpca_home):
+        Profile.create("blank")
+        copy = Profile.duplicate("blank", "also-blank")
+        assert copy.memories == []
+        assert copy.copied_from == "blank"
+
+    def test_copy_of_a_copy_records_its_immediate_source(self, hpca_home):
+        self.base()
+        Profile.duplicate("base", "variants")
+        grandchild = Profile.duplicate("variants", "variants-wgs")
+        assert grandchild.copied_from == "variants"

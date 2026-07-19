@@ -1,11 +1,17 @@
-"""Profiles & learnings screen (a): manage profiles and their tier-1 memories.
+"""Profiles & learnings screen (a): manage profiles and their memories.
+
+Profiles are entirely the user's: there are no built-in ones beyond the
+default, and each accumulates its own memories and skills over time.
 
 A list like the sessions column: ↑/↓ move, enter opens the highlighted
 profile's memories in a plain-text editor (copy/paste works), escape asks
 whether to keep the edits. Enter on the "(new profile)" row names and creates
-one; (d) deletes — never the default, and never a profile a session is
-actively using (a turn in flight, or live sub-processes). Sessions on a
-deleted profile fall back to the default so nothing points at a gone file.
+a blank one; (c) copies the highlighted profile under a new name — the copy
+starts from everything the original has learned and diverges from there,
+which is how a general base profile becomes several specialised ones; (d)
+deletes — never the default, and never a profile a session is actively using
+(a turn in flight, or live sub-processes). Sessions on a deleted profile fall
+back to the default so nothing points at a gone file.
 
 ``ProfilePickerScreen`` is the modal cousin: every new session starts by
 choosing its profile there (or creating one on the spot).
@@ -31,10 +37,13 @@ NEW_PROFILE_LABEL = "(new profile)"
 
 class ProfilesList(ListView):
     """The profile list; enter opens a profile's memories — or, on the
-    "(new profile)" row, creates one. (d) only on a removable profile."""
+    "(new profile)" row, creates one. (c) copies the highlighted profile,
+    (d) deletes it — neither applies to "(new profile)", and the default
+    cannot be deleted."""
 
     BINDINGS = [
         Binding("enter", "select_cursor", "edit / create", show=True),
+        Binding("c", "copy_profile", "copy profile", show=True),
         Binding("d", "delete_profile", "delete profile", show=True),
     ]
 
@@ -43,7 +52,12 @@ class ProfilesList(ListView):
         if action == "delete_profile":
             # "(new profile)" is not a profile; the default is the fallback
             return name is not None and name != DEFAULT_PROFILE
+        if action == "copy_profile":
+            return name is not None  # the default is copyable, just not removable
         return True
+
+    def action_copy_profile(self) -> None:
+        self.screen.copy_selected()
 
     def action_delete_profile(self) -> None:
         self.screen.delete_selected()
@@ -138,11 +152,15 @@ class ProfilesScreen(Screen):
         items = [new_item]
         for name in Profile.list_profiles():
             profile = Profile.load(name)
-            tier1 = sum(1 for m in profile.memories if m.tier == 1)
+            total = len(profile.memories)
             star = " ★" if name == DEFAULT_PROFILE else ""  # the default profile
-            label = f"{name}{star}  ·  {tier1} tier-1 " + (
-                "memory" if tier1 == 1 else "memories"
+            label = f"{name}{star}  ·  {total} " + (
+                "memory" if total == 1 else "memories"
             )
+            if profile.copied_from:
+                # Which profiles share a base is the thing you need to know
+                # when they start disagreeing with each other.
+                label += f"  ·  copied from {profile.copied_from}"
             item = ListItem(Label(Content(label)))
             item.data_profile = name
             items.append(item)
@@ -187,6 +205,32 @@ class ProfilesScreen(Screen):
                 self.run_worker(self.refresh_profiles(), group="profiles")
 
         self.app.push_screen(RenameScreen("", label="New profile name"), apply)
+
+    def copy_selected(self) -> None:
+        """Fork the highlighted profile under a new name (§ profiles).
+
+        The workflow this exists for: work under a base profile until it
+        knows the site, then copy it per specialism so each one accumulates
+        its own learnings from that common starting point.
+        """
+        highlighted = self.query_one("#profiles-list", ListView).highlighted_child
+        source = getattr(highlighted, "data_profile", None)
+        if source is None:
+            return
+        from hpca.tui.rename_screen import RenameScreen
+
+        def apply(name: str | None) -> None:
+            if not name:
+                return
+            error = self.app.duplicate_profile(source, name)
+            if error:
+                self.notify(error, severity="error")
+            else:
+                self.run_worker(self.refresh_profiles(), group="profiles")
+
+        self.app.push_screen(
+            RenameScreen(f"{source} copy", label=f"Copy “{source}” to"), apply
+        )
 
     def delete_selected(self) -> None:
         highlighted = self.query_one("#profiles-list", ListView).highlighted_child

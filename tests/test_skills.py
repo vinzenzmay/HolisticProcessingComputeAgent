@@ -267,3 +267,59 @@ class TestSkillWriting:
         twice = patched_body(skill, "second correction")
         assert twice.count("## Corrections") == 1
         assert "- first correction" in twice and "- second correction" in twice
+
+
+class TestProfileSkillLifecycle:
+    """Skills follow their profile when it is copied or deleted."""
+
+    def write_in(self, subdir, name, content):
+        directory = skills_dir() / subdir if subdir else skills_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / name).write_text(content)
+
+    def test_copy_takes_the_profiles_own_skills(self, hpca_home):
+        from hpca.skills import copy_profile_skills
+
+        self.write_in("base", "a.md", "---\nname: align\n---\nbase body")
+        assert copy_profile_skills("base", "variants") == 1
+        assert [s.name for s in load_skills("variants")] == ["align"]
+
+    def test_shared_skills_are_not_duplicated(self, hpca_home):
+        """_shared is already visible to both; copying it would turn one
+        procedure into two that drift apart silently."""
+        from hpca.skills import copy_profile_skills
+
+        self.write_in("_shared", "s.md", "---\nname: shared\n---\nbody")
+        self.write_in("base", "a.md", "---\nname: align\n---\nbody")
+        assert copy_profile_skills("base", "variants") == 1
+        assert not (skills_dir() / "variants" / "s.md").exists()
+        # but the copy still sees the shared one through _shared
+        assert sorted(s.name for s in load_skills("variants")) == ["align", "shared"]
+
+    def test_copied_skills_diverge(self, hpca_home):
+        from hpca.skills import copy_profile_skills, write_skill
+
+        self.write_in("base", "a.md", "---\nname: align\n---\nbase body")
+        copy_profile_skills("base", "variants")
+        write_skill(Skill("align", "d", [], "changed in the copy"), "variants")
+        assert "base body" in load_skills("base")[0].body
+        assert "changed in the copy" in load_skills("variants")[0].body
+
+    def test_copying_a_profile_without_skills(self, hpca_home):
+        from hpca.skills import copy_profile_skills
+
+        assert copy_profile_skills("base", "variants") == 0
+
+    def test_delete_removes_only_that_profiles_skills(self, hpca_home):
+        from hpca.skills import delete_profile_skills
+
+        self.write_in("_shared", "s.md", "---\nname: shared\n---\nbody")
+        self.write_in("base", "a.md", "---\nname: align\n---\nbody")
+        delete_profile_skills("base")
+        assert [s.name for s in load_skills("base")] == ["shared"]
+        assert not (skills_dir() / "base").exists()
+
+    def test_deleting_skills_of_an_unknown_profile_is_quiet(self, hpca_home):
+        from hpca.skills import delete_profile_skills
+
+        delete_profile_skills("never-existed")  # must not raise

@@ -386,3 +386,111 @@ class TestSessionProfilePicker:
             assert app.active_session.session_id == first.session_id
             assert app.session_store.get(first.session_id).profile == "alpha"
             assert len(app.session_store.list_all()) == 1
+
+
+class TestCopyProfile:
+    """A base profile forked per specialism: the copy inherits everything the
+    original learned, then the two accumulate separately."""
+
+    def base_with_memories(self, name="base"):
+        profile = Profile.create(name)
+        profile.add_memory("Cluster is cubi.", tier=1)
+        profile.add_memory("The user prefers R.", tier=2)
+        profile.save()
+        return profile
+
+    def row_index(self, profiles, name):
+        return next(
+            i
+            for i, item in enumerate(profiles.children)
+            if getattr(item, "data_profile", None) == name
+        )
+
+    async def copy_via_ui(self, app, pilot, source, new_name):
+        profiles = await open_profiles(app, pilot)
+        profiles.index = self.row_index(profiles, source)
+        await pilot.press("c")
+        await pilot.pause()
+        assert isinstance(app.screen, RenameScreen)
+        app.screen.query_one(Input).value = new_name
+        await pilot.press("enter")
+        await pilot.pause()
+
+    async def test_copy_inherits_the_memories(self, hpca_home):
+        self.base_with_memories()
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self.copy_via_ui(app, pilot, "base", "variants")
+            assert "variants" in Profile.list_profiles()
+            texts = [m.text for m in Profile.load("variants").memories]
+            assert texts == ["Cluster is cubi.", "The user prefers R."]
+
+    async def test_provenance_shown_in_the_list(self, hpca_home):
+        self.base_with_memories()
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self.copy_via_ui(app, pilot, "base", "variants")
+            rows = profile_rows(app.screen)
+            assert any("copied from base" in row for row in rows)
+
+    async def test_the_two_diverge(self, hpca_home):
+        self.base_with_memories()
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self.copy_via_ui(app, pilot, "base", "variants")
+
+            copy = Profile.load("variants")
+            copy.add_memory("Deepvariant needs a GPU.", tier=2)
+            copy.save()
+
+            base_texts = [m.text for m in Profile.load("base").memories]
+            assert "Deepvariant needs a GPU." not in base_texts
+            assert "The user prefers R." in base_texts  # the shared base
+
+    async def test_the_default_is_copyable_though_not_deletable(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            profiles = await open_profiles(app, pilot)
+            profiles.index = self.row_index(profiles, "default")
+            assert profiles.check_action("copy_profile", ()) is True
+            assert profiles.check_action("delete_profile", ()) is False
+
+    async def test_copy_is_inert_on_the_new_profile_row(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            profiles = await open_profiles(app, pilot)
+            profiles.index = 0  # "(new profile)"
+            assert profiles.check_action("copy_profile", ()) is False
+
+    async def test_a_duplicate_name_is_refused(self, hpca_home):
+        self.base_with_memories()
+        Profile.create("taken")
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self.copy_via_ui(app, pilot, "base", "taken")
+            # the existing profile is untouched, not overwritten
+            assert Profile.load("taken").memories == []
+
+    async def test_copying_carries_the_profiles_own_skills(self, hpca_home):
+        from hpca.skills import load_skills, skills_dir
+
+        self.base_with_memories()
+        (skills_dir() / "base").mkdir(parents=True, exist_ok=True)
+        (skills_dir() / "base" / "a.md").write_text(
+            "---\nname: align\n---\nthe procedure"
+        )
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self.copy_via_ui(app, pilot, "base", "variants")
+            assert [s.name for s in load_skills("variants")] == ["align"]
+
+    async def test_deleting_a_profile_removes_its_skills(self, hpca_home):
+        from hpca.skills import skills_dir
+
+        Profile.create("doomed")
+        (skills_dir() / "doomed").mkdir(parents=True, exist_ok=True)
+        (skills_dir() / "doomed" / "a.md").write_text("---\nname: x\n---\nbody")
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)):
+            app.delete_profile("doomed")
+            assert not (skills_dir() / "doomed").exists()
