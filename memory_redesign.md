@@ -1,6 +1,32 @@
 # Memory & self-learning redesign (per-profile, Hermes-inspired)
 
-Status: proposal. Extends project.md §4.4 (self-reflection) and §6 (profiles & memory).
+Status: **implemented** (all six phases, branch `feature/memory-redesign`).
+Extends project.md §4.4 (self-reflection) and §6 (profiles & memory).
+
+Implementation notes, where the built thing differs from the plan below:
+
+* **Struggle notes live in tier 3, not tier 2** (§5 anticipated this; it is
+  what shipped). They are situational and were the main tier-2 bloat source.
+* **`session_search` ranks with OR over distinctive terms**, not the AND the
+  first cut used — an AND over every word of a natural request never matches.
+  Stop words are dropped so an OR match does not pull in every session.
+* **Skill patches append under a `## Corrections` heading** in the profile's
+  own copy rather than rewriting the skill: a small model asked to restate a
+  procedure drops steps, and one profile's correction must not change
+  another's.
+* **The `memory` tool gained a `demote` operation** (§6 planned demotion only
+  as a UI flow). A `replace` cannot move tiers, so freeing tier 2 by demoting
+  to tier 3 needed its own verb.
+* **Compaction folds the view, not the stored history** — the transcript keeps
+  everything; only what the model sees is folded.
+* **Pre-eviction review is deferred to after the reply**, not run inline: a
+  modal opened mid-round would suspend the turn behind an unrequested dialog.
+* **The curator is deterministic only.** The LLM consolidation pass (§7) was
+  not built; ageing and archival cover the decay problem, and merge proposals
+  from a 27B are worth revisiting only once there is real accumulated data.
+
+The one deliberate omission: the LLM curator pass. Everything else in §2–§8
+is in place, with 1010 tests passing.
 
 ## 0. Motivation and sources
 
@@ -252,35 +278,43 @@ Activates the format-reserved tier using infrastructure already in the repo.
 
 ## 8. Config additions (`settings.json`, `memory` section)
 
+As implemented:
+
 ```json
 "memory": {
   "tier1_char_cap": 1200,
   "tier2_char_cap": 3200,
   "tier3_prefetch_chars": 800,
-  "tier3_embeddings": false,
+  "tier3_prefetch_count": 3,
+  "cross_profile_search": false,
   "review_interval": 8,
-  "skill_review_interval": 12,
-  "auto_approve_tiers": [],
+  "propose_new_skills": true,
   "curator_interval_days": 7,
-  "curator_min_idle_hours": 2
+  "curator_stale_days": 30,
+  "curator_archive_days": 90
 }
 ```
 
-Old `tier1_token_cap`/`tier2_token_cap` read as fallbacks for one release.
+`tier1_token_cap`/`tier2_token_cap` are still honored (×4 chars) when the
+char caps are left at their defaults, so a hand-tuned settings.json keeps
+working.
+
+Compaction has no setting of its own: it activates when the active backend
+in the catalog records a `max_model_len`, and stays off otherwise rather
+than guessing a window.
 
 ## 9. Build order, effort, and dependencies
 
-| Phase | Contents | Depends on | Rough size |
-|---|---|---|---|
-| 1 | Budgets, snapshot, fenced struggle injection, backend tags, per-profile skills | — | S–M |
-| 2 | messages table + FTS5 + `session_search` | — | M |
-| 3 | `memory` tool + guidance + write hygiene | 1 | M |
-| 4 | Reflection loop + proposal screens | 3 | M |
-| 5 | Tier 3 store + prefetch + demotion flow | 1 (2 helps) | M |
-| 6 | Curator + compaction + pre-compress hook | 4, 5 | M–L |
+All six phases are implemented, one commit each:
 
-Phases 1–2 are independent and can land in either order; each phase is
-shippable alone.
+| Phase | Contents | Key modules |
+|---|---|---|
+| 1 | Budgets, frozen snapshot, fenced struggle injection, backend tags, per-profile skills | `profiles.py`, `agent/memory_context.py`, `skills.py` |
+| 2 | messages table + FTS5 + `session_search` | `episodic.py`, `agent/memory_tools.py` |
+| 3 | `memory` tool + guidance + write hygiene | `memory_ops.py`, `tui/memory_screens.py` |
+| 4 | Reflection loop + proposal screens | `agent/reflect.py` |
+| 5 | Tier 3 store + prefetch + demotion | `memory_index.py` |
+| 6 | Compaction + pre-eviction extraction + curator | `agent/compact.py`, `curator.py` |
 
 ## 10. Testing strategy
 
