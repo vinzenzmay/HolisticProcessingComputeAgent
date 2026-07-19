@@ -41,3 +41,10 @@ class TestOrchestratorPrompt:
     def test_meter_without_tier_text_adds_no_section(self):
         prompt = orchestrator_system_prompt(tier1_meter="0% — 0/1200 chars")
         assert "Standing site notes" not in prompt
+
+    def test_session_search_guidance_only_when_tool_present(self):
+        assert "session_search" not in orchestrator_system_prompt()
+        with_tool = orchestrator_system_prompt(session_search=True)
+        assert "session_search" in with_tool
+        # the source-first limit: recall is what was said, not what now is
+        assert "current state of files" in with_tool

@@ -38,6 +38,7 @@ from hpca.agent.memory_context import (
     compose_api_content,
     note_line,
 )
+from hpca.agent.memory_tools import add_memory_tools
 from hpca.agent.prompts import orchestrator_system_prompt
 from hpca.agent.skill_tools import add_skill_tools
 from hpca.agent.titler import propose_title
@@ -49,10 +50,13 @@ from hpca.agent.struggle import (
 )
 from hpca.editor import resolve_editor
 from hpca.embeddings import EmbeddingClient
+from hpca.episodic import EpisodicStore
 from hpca.llm import LLMClient
 from hpca.logs import LoggedLLM, SessionLog, open_log
 from hpca.rag import RagStore
+from hpca.transcript import ASSISTANT as ASSISTANT_ENTRY
 from hpca.transcript import THINKING, Entry, build_entries
+from hpca.transcript import USER as USER_ENTRY
 from hpca.profiles import DEFAULT_PROFILE, Profile
 from hpca.registry import PathRegistry
 from hpca.runner import (
@@ -540,6 +544,7 @@ class HpcaApp(App):
             # changes per session, but the tool registry does not.
             if any_skills():
                 add_skill_tools(self._tools)
+            add_memory_tools(self._tools)
         self.active_session: Session | None = None
         self._tool_ctx: ToolContext | None = None
         self._chat_entries: list[Entry] = []
@@ -584,6 +589,7 @@ class HpcaApp(App):
         self._conn = connect()
         init_db(self._conn)
         self.session_store = SessionStore(self._conn)
+        self.episodic = EpisodicStore(self._conn)
         self._saver_ctx = AsyncSqliteSaver.from_conn_string(str(checkpoints_db_path()))
         checkpointer = await self._saver_ctx.__aenter__()
         self._checkpointer = checkpointer  # kept for graph rebuilds on switch
@@ -708,6 +714,7 @@ class HpcaApp(App):
             tier1_meter=memory.usage_meter(1, caps.cap_chars(1)),
             tier2_meter=memory.usage_meter(2, caps.cap_chars(2)),
             skills=summarize_skills(skills),
+            session_search="session_search" in self._tools.names(),
         )
 
     def warn_about_struggles(self, text: str) -> list:
@@ -898,7 +905,7 @@ class HpcaApp(App):
             # handler unwinds, rather than waiting for the next timer tick.
             self.call_later(self.drain_work)
         self.hide_working()
-        self._log_turn(result, log)
+        self._log_turn(result, log, session)
         if self._is_active_session(session):
             await self._set_chat_messages(result.messages, result.thinking)
             await self.refresh_processes()
@@ -937,21 +944,38 @@ class HpcaApp(App):
         self._rename_session(session, title, by="llm", log=log)
         return True
 
-    def _log_turn(self, result, log: SessionLog | None) -> None:
+    def _log_turn(self, result, log: SessionLog | None, session: Session) -> None:
         """Write what this turn added into the turn's own transcript — not
         into whichever session is open when the reply lands.
 
         Only the tail is logged, so re-reading a session never duplicates it.
+        The same tail feeds the episodic index (redesign Phase 2): user and
+        assistant messages only — tool traffic and thinking would drown BM25
+        in tool vocabulary.
         """
-        if log is None:
-            return
-        for entry in build_entries(
+        entries = build_entries(
             result.messages, result.thinking, start=result.first_new
-        ):
-            kind = LOG_KINDS.get(entry.kind, entry.kind)
-            if entry.kind == THINKING:
-                kind = f"thinking ({entry.summary()})"
-            log.write(kind, entry.text)
+        )
+        if log is not None:
+            for entry in entries:
+                kind = LOG_KINDS.get(entry.kind, entry.kind)
+                if entry.kind == THINKING:
+                    kind = f"thinking ({entry.summary()})"
+                log.write(kind, entry.text)
+        turns = [
+            (entry.kind, entry.text)
+            for entry in entries
+            if entry.kind in (USER_ENTRY, ASSISTANT_ENTRY)
+        ]
+        try:
+            self.episodic.record(
+                session_id=session.session_id,
+                profile=session.profile,
+                entries=turns,
+            )
+        except Exception as e:  # recall is best-effort; never fail the turn
+            if log is not None:
+                log.write("error", f"episodic index write failed: {e}")
 
     def _log_write(self, kind: str, text: str) -> None:
         if self._log is not None:
@@ -1199,7 +1223,8 @@ class HpcaApp(App):
             symbols=self.symbol_index,
             rag=self.rag_store,
             embedder=self.embedder,
-            skills=self.skills,
+            episodic=self.episodic,
+            skills=self._turn_skills if self._turn_skills is not None else self.skills,
         )
         if log is not None:
             ctx.llm = LoggedLLM(
@@ -1392,6 +1417,9 @@ class HpcaApp(App):
         self._untitled.discard(session.session_id)
         self._updated.discard(session.session_id)
         self.session_store.delete(session.session_id)
+        # Patient-data environment: a deleted conversation must not resurface
+        # through episodic search either.
+        self.episodic.forget_session(session.session_id)
         try:
             await self._checkpointer.adelete_thread(session.session_id)
         except Exception as e:  # the row is already gone; say so and move on

@@ -286,3 +286,6 @@ class TestMemoryCharCaps:
         s.memory.tier2_char_cap = 2400
         s.memory.tier2_token_cap = 1000
         assert s.memory.cap_chars(2) == 2400
+
+    def test_cross_profile_search_off_by_default(self):
+        assert Settings().memory.cross_profile_search is False

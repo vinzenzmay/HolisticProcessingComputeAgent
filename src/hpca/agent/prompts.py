@@ -102,6 +102,19 @@ def environment_facts() -> str:
     return f"Current date and time: {datetime.now():%Y-%m-%d %H:%M} (local)."
 
 
+# The tool schema alone does not teach *when* to reach for recall; small
+# models ask the user to repeat themselves instead. The second half is the
+# Hermes "source-first limit": recall is what was SAID, not what currently IS.
+SESSION_SEARCH_GUIDANCE = (
+    "Past sessions are searchable with session_search. When the user refers "
+    "to something from an earlier conversation ('like last time', 'the "
+    "pipeline we set up'), search before asking them to repeat it. "
+    "session_search shows what was said back then — never treat it as "
+    "evidence about the current state of files, jobs, or the cluster; check "
+    "the system itself for that."
+)
+
+
 SKILLS_GUIDANCE = (
     "The user has defined skills: written procedures for specific tasks. "
     "When a request matches one, call read_skill to get the procedure and "
@@ -117,6 +130,7 @@ def orchestrator_system_prompt(
     tier1_meter: str = "",
     tier2_meter: str = "",
     skills: str = "",
+    session_search: bool = False,
 ) -> str:
     """System prompt for the orchestrator; dynamic facts injected per render.
 
@@ -135,6 +149,8 @@ def orchestrator_system_prompt(
         SCRIPT_GUIDANCE,
         GROUNDED_ANSWERING_GUIDANCE,
     ]
+    if session_search:
+        parts.append(SESSION_SEARCH_GUIDANCE)
     if skills:
         parts.append(f"{SKILLS_GUIDANCE}\n{skills}")
     if tier1:

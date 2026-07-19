@@ -364,3 +364,44 @@ async def test_memories_are_frozen_per_session_and_refresh_at_boundaries(hpca_ho
         )
         # and the tool context the turn carries has it too
         assert "STAR needs 40G" in app._tool_ctx.tier1_text
+
+
+async def test_turns_are_indexed_and_recallable_across_sessions(hpca_home):
+    """Redesign Phase 2: user/assistant turns land in the episodic index and
+    a later session can recall them with session_search — no model call."""
+    llm = RecordingLLM([respond_json("STAR needs 40G on this cluster")])
+    app = HpcaApp(llm=llm)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await submit_chat(app, pilot, "how much memory does STAR need")
+        first_session = app.active_session
+
+        # a fresh session recalls the earlier one
+        hits = app.episodic.search("STAR", profile="default")
+        assert len(hits) == 1
+        assert hits[0].session_id == first_session.session_id
+        assert hits[0].goal == "how much memory does STAR need"
+        assert hits[0].resolution == "STAR needs 40G on this cluster"
+
+        # deleting the session forgets its transcript from search too
+        await app._delete_session(first_session)
+        assert app.episodic.search("STAR", profile="default") == []
+
+
+async def test_tool_traffic_is_not_indexed(hpca_home):
+    """Tool results ride the user role; indexing them would drown BM25 in
+    tool vocabulary."""
+    llm = RecordingLLM(
+        [tool_json("delete", target="scratch"), respond_json("removed it")]
+    )
+    app = HpcaApp(llm=llm, tools=destructive_tools())
+    async with app.run_test(size=(120, 40)) as pilot:
+        await submit_chat(app, pilot, "please delete scratch")
+        await pilot.pause()
+        if isinstance(app.screen, ApprovalScreen):
+            await pilot.press("y")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+        rows = app.episodic.window(app.active_session.session_id)
+        contents = [r["content"] for r in rows]
+        assert "please delete scratch" in contents
+        assert not any("[tool result]" in c for c in contents)

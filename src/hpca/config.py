@@ -81,6 +81,10 @@ class MemorySettings(_Section):
     # left at their defaults, so a hand-tuned settings.json keeps working.
     tier1_token_cap: int = 300
     tier2_token_cap: int = 800
+    # Whether session_search may recall sessions of OTHER profiles. Off by
+    # default: profiles exist to isolate what each context learns and sees
+    # (redesign, resolved question 2).
+    cross_profile_search: bool = False
 
     def cap_chars(self, tier: int) -> int:
         """Effective char budget for a tier, respecting legacy token caps."""

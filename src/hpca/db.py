@@ -60,6 +60,15 @@ CREATE TABLE IF NOT EXISTS symbols (
 );
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
 CREATE INDEX IF NOT EXISTS idx_symbols_parent ON symbols(parent);
+CREATE TABLE IF NOT EXISTS messages (
+    session_id TEXT NOT NULL,
+    profile TEXT NOT NULL,
+    turn_no INTEGER NOT NULL,
+    role TEXT NOT NULL,      -- user | assistant; tool traffic is not indexed
+    content TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, turn_no);
 CREATE TABLE IF NOT EXISTS processes (
     pid INTEGER,
     session_id TEXT,
@@ -90,6 +99,27 @@ ADDED_COLUMNS = [
     ("processes", "background", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
+# Episodic search index (redesign Phase 2): an external-content FTS5 table
+# over messages, kept in sync by triggers. Separate from SCHEMA because FTS5
+# is a compile-time sqlite option; a build without it still gets a working
+# app, just with `session_search` reporting itself unavailable.
+FTS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    content, content='messages', content_rowid='rowid');
+CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content)
+    VALUES ('delete', old.rowid, old.content);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content)
+    VALUES ('delete', old.rowid, old.content);
+    INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+"""
+
 
 def db_path() -> Path:
     return app_dir() / "hpca.db"
@@ -119,4 +149,8 @@ def init_db(conn: sqlite3.Connection) -> None:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
         if column not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    try:
+        conn.executescript(FTS_SCHEMA)
+    except sqlite3.OperationalError:
+        pass  # sqlite built without FTS5; episodic search degrades gracefully
     conn.commit()

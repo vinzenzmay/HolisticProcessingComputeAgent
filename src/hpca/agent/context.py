@@ -7,6 +7,7 @@ from pathlib import Path
 
 from hpca.config import Settings
 from hpca.embeddings import EmbeddingClient
+from hpca.episodic import EpisodicStore
 from hpca.jobs import JobStore
 from hpca.rag import RagStore
 from hpca.registry import PathRegistry
@@ -34,6 +35,7 @@ class ToolContext:
     tier1_text: str = ""  # standing notes for subagent-style tool calls (§6.1)
     symbols: SymbolIndex | None = None
     rag: RagStore | None = None
+    episodic: EpisodicStore | None = None  # past-session recall (redesign P2)
     embedder: EmbeddingClient | None = None
     skills: list[Skill] = field(default_factory=list)
     # Commands whose docs could not be fetched; probed at most once per session
