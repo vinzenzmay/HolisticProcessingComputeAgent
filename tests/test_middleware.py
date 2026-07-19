@@ -11,6 +11,8 @@ from hpca.agent.middleware import (
     ToolCall,
     decide,
     decision_schema,
+    format_instruction,
+    inline_refs,
 )
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.llm import ChatResponse
@@ -254,3 +256,121 @@ class TestDecideLive:
         ]
         decision = await decide(llm, messages, tools)
         assert isinstance(decision, DirectResponse)
+
+
+class TestNestedToolSchemas:
+    """A tool whose params nest another model generates $ref/$defs pointing
+    at the document root — which, once embedded as one branch of the decision
+    envelope, is the envelope. vLLM rejects the request outright:
+    "Grammar error: Pointer '/$defs/X' does not exist"."""
+
+    def registry(self):
+        from hpca.agent.memory_tools import add_memory_tools
+
+        return add_memory_tools(ToolRegistry())
+
+    def test_no_dangling_refs_in_the_decision_schema(self):
+        blob = json.dumps(decision_schema(self.registry()))
+        assert "$ref" not in blob
+        assert "$defs" not in blob
+
+    def test_every_registered_tool_is_self_contained(self):
+        """Regression guard for the next nested tool, whichever it is."""
+        from hpca.agent.builtin_tools import default_tool_registry
+        from hpca.agent.doc_tools import add_ask_docs, add_doc_tools
+        from hpca.agent.file_tools import add_file_tools
+        from hpca.agent.job_tools import add_job_tools
+        from hpca.agent.memory_tools import add_memory_tools
+        from hpca.agent.skill_tools import add_skill_tools
+
+        registry = add_memory_tools(
+            add_skill_tools(
+                add_job_tools(
+                    add_ask_docs(add_doc_tools(add_file_tools(default_tool_registry())))
+                )
+            )
+        )
+        blob = json.dumps(decision_schema(registry))
+        assert "$ref" not in blob and "$defs" not in blob
+
+    def test_the_nested_shape_survives_inlining(self):
+        schema = decision_schema(self.registry())
+        branch = next(
+            b
+            for b in schema["anyOf"]
+            if b["properties"].get("tool", {}).get("const") == "memory"
+        )
+        item = branch["properties"]["arguments"]["properties"]["operations"]["items"]
+        assert item["type"] == "object"
+        assert set(item["properties"]) == {"op", "tier", "match", "text"}
+
+    def test_example_shows_the_nested_shape_not_a_placeholder(self):
+        """Shown `"operations": "<the changes>"` a small model writes exactly
+        that string and the call fails validation."""
+        text = format_instruction(self.registry())
+        line = next(line for line in text.splitlines() if '"memory"' in line)
+        arguments = json.loads(
+            line[line.index('"arguments": ') + len('"arguments": ') : line.rindex("}} —") + 1]
+        )
+        assert isinstance(arguments["operations"], list)
+        assert set(arguments["operations"][0]) == {"op", "tier", "match", "text"}
+
+
+class TestInlineRefs:
+    def test_plain_schema_unchanged(self):
+        schema = {"type": "object", "properties": {"a": {"type": "string"}}}
+        assert inline_refs(schema) == schema
+
+    def test_definition_substituted(self):
+        schema = {
+            "$defs": {"Inner": {"type": "object", "properties": {"x": {"type": "integer"}}}},
+            "type": "object",
+            "properties": {"inner": {"$ref": "#/$defs/Inner"}},
+        }
+        assert inline_refs(schema) == {
+            "type": "object",
+            "properties": {
+                "inner": {"type": "object", "properties": {"x": {"type": "integer"}}}
+            },
+        }
+
+    def test_siblings_of_a_ref_are_kept(self):
+        schema = {
+            "$defs": {"Inner": {"type": "object"}},
+            "properties": {
+                "inner": {"$ref": "#/$defs/Inner", "description": "the inner thing"}
+            },
+        }
+        inner = inline_refs(schema)["properties"]["inner"]
+        assert inner["type"] == "object"
+        assert inner["description"] == "the inner thing"
+
+    def test_nested_definitions_resolved(self):
+        schema = {
+            "$defs": {
+                "A": {"type": "object", "properties": {"b": {"$ref": "#/$defs/B"}}},
+                "B": {"type": "string"},
+            },
+            "properties": {"a": {"$ref": "#/$defs/A"}},
+        }
+        result = inline_refs(schema)
+        assert result["properties"]["a"]["properties"]["b"] == {"type": "string"}
+
+    def test_recursive_definition_left_alone_rather_than_hanging(self):
+        schema = {
+            "$defs": {
+                "Node": {
+                    "type": "object",
+                    "properties": {"child": {"$ref": "#/$defs/Node"}},
+                }
+            },
+            "properties": {"root": {"$ref": "#/$defs/Node"}},
+        }
+        result = inline_refs(schema)  # must terminate
+        assert result["properties"]["root"]["properties"]["child"] == {
+            "$ref": "#/$defs/Node"
+        }
+
+    def test_unknown_ref_left_alone(self):
+        schema = {"properties": {"a": {"$ref": "#/$defs/Missing"}}}
+        assert inline_refs(schema)["properties"]["a"] == {"$ref": "#/$defs/Missing"}

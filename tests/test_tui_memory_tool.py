@@ -182,3 +182,34 @@ class TestGuidance:
             system = llm.calls[0][0]["content"]
             assert "declarative FACTS" in system
             assert "stale in a week" in system
+
+
+class TestDecisionSchemaIsSendable:
+    """The schema the app actually sends must be self-contained.
+
+    This is the shape that failed in the field: the first tool with a nested
+    model made every turn fail at the backend with
+    "Grammar error: Pointer '/$defs/MemoryOperation' does not exist",
+    because the tool's $defs do not survive being embedded in the envelope.
+    A FakeLLM ignores json_schema, so no behavioural test can catch it.
+    """
+
+    async def test_app_registry_produces_a_schema_with_no_dangling_pointers(
+        self, hpca_home
+    ):
+        import json
+
+        from hpca.agent.middleware import decision_schema
+
+        app = HpcaApp(llm=FakeLLM([]))
+        async with app.run_test(size=(120, 40)):
+            blob = json.dumps(decision_schema(app._tools))
+            assert "$ref" not in blob
+            assert "$defs" not in blob
+
+    async def test_a_turn_runs_with_the_memory_tool_registered(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM([respond_json("hello")]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            assert "memory" in app._tools.names()
+            await submit(app, pilot, "hi")
+            assert any("hello" == t for t in app.chat_log_texts())

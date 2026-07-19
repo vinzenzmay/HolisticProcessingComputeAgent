@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, get_args, get_origin
 
 from pydantic import BaseModel, ValidationError
 
@@ -48,6 +48,49 @@ class ToolCall:
 Decision = DirectResponse | ToolCall
 
 
+def inline_refs(schema: dict) -> dict:
+    """A pydantic schema with its ``$defs`` substituted in place.
+
+    A model with a nested model (``list[MemoryOperation]``) generates
+    ``{"$ref": "#/$defs/MemoryOperation"}`` plus a sibling ``$defs``. The
+    ``#/`` in that pointer means *the root of the whole document* — and here
+    the schema gets embedded as one branch of the decision envelope, so the
+    root is the envelope, which has no ``$defs``. The backend's grammar
+    compiler then rejects the request outright:
+
+        Grammar error: Pointer '/$defs/MemoryOperation' does not exist
+
+    Substituting the definitions removes the pointers entirely, which keeps
+    every tool's arguments self-contained however deeply they nest.
+    Self-referential models cannot be inlined this way and are left alone;
+    no tool has one, and a broken pointer is more debuggable than a hang.
+    """
+    defs = schema.get("$defs", {})
+
+    def resolve(node: Any, expanding: frozenset[str]) -> Any:
+        if isinstance(node, list):
+            return [resolve(item, expanding) for item in node]
+        if not isinstance(node, dict):
+            return node
+        ref = node.get("$ref")
+        if isinstance(ref, str) and ref.startswith("#/$defs/"):
+            name = ref[len("#/$defs/") :]
+            if name in defs and name not in expanding:
+                # Merge any siblings of $ref (e.g. a description) over the
+                # definition, so local annotations are not lost.
+                target = resolve(defs[name], expanding | {name})
+                extra = {k: v for k, v in node.items() if k != "$ref"}
+                return {**target, **extra} if extra else target
+            return node  # unknown or recursive: leave the pointer in place
+        return {
+            key: resolve(value, expanding)
+            for key, value in node.items()
+            if key != "$defs"
+        }
+
+    return resolve(schema, frozenset())
+
+
 def decision_schema(tools: ToolRegistry) -> dict:
     """JSON schema for the decision envelope: respond | one branch per tool."""
     branches: list[dict] = [
@@ -68,7 +111,7 @@ def decision_schema(tools: ToolRegistry) -> dict:
                 "properties": {
                     "action": {"const": "tool_call"},
                     "tool": {"const": tool.name},
-                    "arguments": tool.params.model_json_schema(),
+                    "arguments": inline_refs(tool.params.model_json_schema()),
                 },
                 "required": ["action", "tool", "arguments"],
                 "additionalProperties": False,
@@ -103,10 +146,31 @@ def format_instruction(tools: ToolRegistry) -> str:
 
 
 def _example_args(tool: Tool) -> dict:
+    """A filled-in example of the tool's arguments for the textual listing.
+
+    Nested models get an example element rather than a placeholder string:
+    shown `"operations": "<the changes>"` a small model writes exactly that
+    string, and the call fails validation. Showing the shape it must produce
+    is the difference between a tool it can call and one it cannot.
+    """
     return {
-        name: f"<{f.description or name}>"
-        for name, f in tool.params.model_fields.items()
+        name: _example_value(field.annotation, field.description or name)
+        for name, field in tool.params.model_fields.items()
     }
+
+
+def _example_value(annotation: Any, description: str) -> Any:
+    origin = get_origin(annotation)
+    if origin in (list, set, tuple):
+        args = get_args(annotation)
+        inner = args[0] if args else str
+        return [_example_value(inner, description)]
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return {
+            name: _example_value(field.annotation, field.description or name)
+            for name, field in annotation.model_fields.items()
+        }
+    return f"<{description}>"
 
 
 def _parse(raw: str, tools: ToolRegistry) -> Decision:
