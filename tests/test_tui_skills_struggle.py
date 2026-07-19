@@ -6,6 +6,7 @@ import pytest
 from textual.widgets import ListView
 
 from hpca.agent.struggle import STRUGGLE_KIND
+from hpca.config import LLMBackend
 from hpca.llm import ChatResponse
 from hpca.profiles import Profile
 from hpca.skills import load_skills, skills_dir
@@ -369,3 +370,55 @@ class TestTierThreeRecall:
             await pilot.pause()
             memories = Profile.load("default").memories
             assert memories[0].tier == 3  # situational: retrieved, not injected
+
+
+class TestEvictionReview:
+    """Redesign Phase 6: compaction hands its evicted slice to the review
+    loop — but after the reply lands, never as a modal mid-turn."""
+
+    def long_history(self, count=40, chars=200):
+        return [
+            {
+                "role": "user" if i % 2 == 0 else "assistant",
+                "content": f"m{i} " + "x" * chars,
+            }
+            for i in range(count)
+        ]
+
+    async def prime(self, app, session_id):
+        await app.graph.aupdate_state(
+            {"configurable": {"thread_id": session_id}},
+            {"messages": self.long_history()},
+        )
+
+    async def test_evicted_context_is_reviewed_after_the_reply(self, hpca_home):
+        llm = RecordingLLM(
+            ["a summary of earlier work", respond_json("done"), REVIEW_JSON]
+        )
+        app = HpcaApp(llm=llm)
+        app.settings.backends.append(
+            LLMBackend(
+                model=app.settings.llm.model,
+                base_url=app.settings.llm.base_url,
+                max_model_len=2000,
+            )
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            await self.prime(app, app.active_session.session_id)
+            await submit(app, pilot, "carry on", expect_modal=True)
+            # the reply landed before the review modal appeared
+            assert any("done" == t for t in app.chat_log_texts())
+            assert isinstance(app.screen, ReflectionScreen)
+            await pilot.press("y")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert len(Profile.load("default").memories) == 1
+
+    async def test_no_eviction_no_extra_review(self, hpca_home):
+        llm = RecordingLLM([respond_json("done")])
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit(app, pilot, "hello")
+            assert app._evicted == {}
+            assert not isinstance(app.screen, ReflectionScreen)

@@ -142,3 +142,45 @@ class TestForget:
         store.forget_session(session.session_id)
         assert store.search("confidential") == []
         assert store.window(session.session_id) == []
+
+
+class TestNaturalLanguageQueries:
+    """The tool passes the model's own phrasing, so recall must survive a
+    full sentence — an AND match over every word never fires."""
+
+    def setup_session(self, store, conn):
+        session = make_session(conn, title="STAR alignment")
+        record(
+            store,
+            session,
+            [
+                ("user", "how do I align reads with STAR"),
+                ("assistant", "STAR needs 40G of memory on this cluster"),
+            ],
+        )
+        return session
+
+    def test_full_sentence_matches(self, store, conn):
+        self.setup_session(store, conn)
+        assert store.search("how much memory does STAR need") != []
+
+    def test_partial_overlap_matches(self, store, conn):
+        self.setup_session(store, conn)
+        assert store.search("STAR memory settings") != []
+
+    def test_still_no_false_positive_on_unrelated_words(self, store, conn):
+        self.setup_session(store, conn)
+        assert store.search("kubernetes ingress certificates") == []
+
+    def test_stop_words_alone_do_not_match_everything(self, store, conn):
+        self.setup_session(store, conn)
+        # only stop words: falls back to the raw terms, which are not indexed
+        # as content words here, so this must not return the whole database
+        assert store.search("how do I") == []
+
+    def test_rarer_terms_rank_the_right_session_first(self, store, conn):
+        self.setup_session(store, conn)
+        other = make_session(conn, title="bwa run")
+        record(store, other, [("user", "align reads with bwa instead")])
+        hits = store.search("align reads with STAR")
+        assert hits[0].title == "STAR alignment"

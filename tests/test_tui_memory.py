@@ -324,3 +324,48 @@ class TestHardWriteBudget:
         app = HpcaApp(llm=FakeLLM([]))
         async with app.run_test(size=(120, 40)):
             assert not app._memory_write_blocked(3, "x" * 10000)
+
+
+class TestCuratorWiring:
+    """Redesign Phase 6: the curator runs at startup, when the app is idle
+    by definition, at most once every few days."""
+
+    def old_note(self):
+        from datetime import date, timedelta
+
+        profile = Profile.load("default")
+        memory = profile.add_memory("an old struggle note", tier=3)
+        memory.created = (date.today() - timedelta(days=200)).isoformat()
+        profile.save()
+
+    async def test_startup_archives_old_tier3(self, hpca_home):
+        from hpca import curator
+
+        self.old_note()
+        app = HpcaApp(llm=FakeLLM([]))
+        async with app.run_test(size=(120, 40)):
+            assert Profile.load("default").memories == []
+            assert curator.archive_path("default").exists()
+
+    async def test_second_start_does_not_re_run(self, hpca_home):
+        from hpca import curator
+
+        self.old_note()
+        app = HpcaApp(llm=FakeLLM([]))
+        async with app.run_test(size=(120, 40)):
+            pass
+        first = curator.load_state()["last_run"]
+        app2 = HpcaApp(llm=FakeLLM([]))
+        async with app2.run_test(size=(120, 40)):
+            assert app2.run_curator_if_due() == {}
+        assert curator.load_state()["last_run"] == first
+
+    async def test_can_be_disabled(self, hpca_home):
+        from hpca import curator
+
+        self.old_note()
+        app = HpcaApp(llm=FakeLLM([]))
+        app.settings.memory.curator_interval_days = 0
+        async with app.run_test(size=(120, 40)):
+            assert app.run_curator_if_due() == {}
+        assert not curator.archive_path("default").exists()

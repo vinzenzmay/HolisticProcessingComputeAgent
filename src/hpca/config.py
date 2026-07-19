@@ -89,6 +89,12 @@ class MemorySettings(_Section):
     # only the entries matching the current request, within this budget.
     tier3_prefetch_chars: int = 800
     tier3_prefetch_count: int = 3
+    # Curator (redesign Phase 6): ages tier-3 entries out so retrieval does
+    # not decay as notes accumulate. Archived entries are moved to
+    # <profile>.archive.md, never deleted. 0 disables the pass.
+    curator_interval_days: int = 7
+    curator_stale_days: int = 30
+    curator_archive_days: int = 90
     # Self-review cadence (redesign Phase 4). Reviews run after the reply is
     # delivered, so they never compete with the user's turn. Counted in user
     # turns; a struggling turn triggers one immediately regardless.

@@ -172,3 +172,37 @@ class TestReflectionModel:
     def test_describe_new_skill(self):
         proposal = Reflection(kind="skill_new", text="x", skill_name="align")
         assert proposal.describe() == "new skill “align”"
+
+
+class TestWholeSpanDigest:
+    """The pre-eviction review sees a stretch that is about to be discarded,
+    so both ends must stay verbatim — the goal and the site facts are stated
+    at the beginning, and a recency bias would lose exactly those."""
+
+    def messages(self, count):
+        return [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg{i}"}
+            for i in range(count)
+        ]
+
+    def test_keeps_both_ends(self):
+        text = digest(self.messages(80), span="whole")
+        assert "msg0" in text  # the oldest, which recency would drop
+        assert "msg79" in text
+        assert "messages omitted" in text
+
+    def test_recent_span_drops_the_oldest(self):
+        text = digest(self.messages(80), span="recent")
+        assert "user: msg0" not in text
+        assert "msg79" in text
+
+    def test_short_stretch_is_whole_either_way(self):
+        text = digest(self.messages(6), span="whole")
+        assert "msg0" in text and "msg5" in text
+        assert "omitted" not in text
+
+    async def test_propose_uses_the_span(self):
+        llm = FakeLLM([reply()])
+        await propose_reflections(llm, self.messages(80), span="whole")
+        sent = llm.calls[0]["messages"][1]["content"]
+        assert "msg0" in sent

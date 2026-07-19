@@ -28,6 +28,7 @@ from hpca.agent.graph import build_graph, deliver_event, run_turn
 from hpca.agent.job_tools import add_job_tools
 from hpca.agent.tools import ToolRegistry
 from hpca.clipboard import ClipboardManager, CopyResult
+from hpca import curator
 from hpca.config import LLMBackend, Settings, app_dir
 from hpca.db import checkpoints_db_path, connect, init_db
 from hpca.jobs import JobRow, JobStore, poll_active
@@ -597,6 +598,9 @@ class HpcaApp(App):
         self._memory_snapshots: dict[str, Profile] = {}
         # User turns since the last self-review, per session (redesign P4).
         self._turns_since_review: dict[str, int] = {}
+        # Messages compaction dropped from the model's view, waiting to be
+        # reviewed once the turn they were dropped during has finished (P6).
+        self._evicted: dict[str, list[dict]] = {}
         self._activity = "working"
         self._conn = None
         self._saver_ctx = None
@@ -649,6 +653,7 @@ class HpcaApp(App):
                         f"{'y' if removed == 1 else 'ies'}")
         self._refresh_top_bar()
         await self._reload_sessions()
+        self.run_curator_if_due()
         self.set_interval(2.0, self.refresh_processes)
         self.set_interval(2.0, self.watch_processes)
         if self.slurm is not None:
@@ -768,7 +773,7 @@ class HpcaApp(App):
         actually match.
         """
         lines = [note_line(m) for m in matching_struggles(memory.memories, user_text)]
-        seen = {line for line in lines}
+        seen = set(lines)
         index = getattr(self, "memory_index", None)
         if index is not None:
             try:
@@ -996,6 +1001,13 @@ class HpcaApp(App):
             )
             return
         if self._is_active_session(session):
+            # Context dropped by compaction first: it is gone from the
+            # model's view and this is the last chance to keep anything.
+            evicted = self._evicted.pop(session.session_id, None)
+            if evicted:
+                await self.maybe_review(
+                    session, evicted, forced=True, span="whole"
+                )
             await self.maybe_review(session, result.messages)
         await self.maybe_title_session(session, result.messages, log=log)
 
@@ -1124,18 +1136,26 @@ class HpcaApp(App):
             return
         await self._review_proposals(proposals)
 
-    def _memory_write_blocked(self, tier: int, text: str) -> bool:
+    def _memory_write_blocked(
+        self, tier: int, text: str, memory: Profile | None = None
+    ) -> bool:
         """Hard char budget on writes (redesign Phase 1): a full tier rejects
         new memories until the user condenses it. Injection never truncates;
-        only growth is stopped."""
+        only growth is stopped.
+
+        ``memory`` is the profile the caller is about to write to — pass the
+        same object, or the budget gets checked against one state and the
+        write lands in another.
+        """
         if tier not in (1, 2):
-            return False
+            return False  # tier 3 is retrieved, not injected: no budget
+        target = memory if memory is not None else self.profile_memory
         cap = self.settings.memory.cap_chars(tier)
-        if not self.profile_memory.would_exceed(tier, text, cap=cap):
+        if not target.would_exceed(tier, text, cap=cap):
             return False
         self.notify(
             f"Tier {tier} is full "
-            f"({self.profile_memory.usage_meter(tier, cap)}) — memory NOT "
+            f"({target.usage_meter(tier, cap)}) — memory NOT "
             "saved. Press ctrl+e to condense the profile, then retry.",
             severity="warning",
             timeout=12,
@@ -1236,13 +1256,27 @@ class HpcaApp(App):
             return True
         return False
 
-    async def maybe_review(self, session: Session, messages: list[dict]) -> int:
+    async def maybe_review(
+        self,
+        session: Session,
+        messages: list[dict],
+        *,
+        forced: bool = False,
+        span: str = "recent",
+    ) -> int:
         """Self-review: propose what this stretch is worth remembering.
 
         Runs after the reply is delivered, so it never competes with the
         user's turn. Best-effort throughout — a failed review is invisible.
+        ``forced`` skips the cadence check, for the one case that cannot
+        wait: context about to be discarded by compaction.
         """
-        if not self._review_due(session, messages):
+        if forced:
+            # A forced review covers this stretch as thoroughly as a due one,
+            # so restart the cadence — otherwise the counter trips again a
+            # turn later and re-proposes what was just reviewed.
+            self._turns_since_review[session.session_id] = 0
+        elif not self._review_due(session, messages):
             return 0
         memory = self._memory_snapshot(session.profile)
         skills = load_skills(session.profile)
@@ -1254,6 +1288,7 @@ class HpcaApp(App):
                 tier2=memory.tier_text(2),
                 skills=summarize_skills(skills),
                 allow_new_skills=self.settings.memory.propose_new_skills,
+                span=span,
             )
         except Exception:
             return 0  # reflection is best-effort; never disrupt the user
@@ -1279,9 +1314,9 @@ class HpcaApp(App):
             # were the main source of tier-2 bloat. Retrieval brings them
             # back when a request actually resembles the old one.
             tier = 3 if proposal.kind == "struggle" else proposal.tier
-            if self._memory_write_blocked(tier, text):
-                return False
             target = Profile.load(profile)  # merge, don't clobber
+            if self._memory_write_blocked(tier, text, target):
+                return False
             target.add_memory(
                 text,
                 tier=tier,
@@ -1330,6 +1365,34 @@ class HpcaApp(App):
         if "read_skill" not in self._tools.names():
             add_skill_tools(self._tools)  # the first skill enables the tool
         return True
+
+    def run_curator_if_due(self) -> dict:
+        """Age old tier-3 entries out, at most once every few days (P6).
+
+        Runs at startup rather than on a timer: the app is idle then by
+        definition, and this touches the same profile files a turn reads.
+        """
+        interval = self.settings.memory.curator_interval_days
+        if interval <= 0 or not curator.due(interval_days=interval):
+            return {}
+        try:
+            reports = curator.run(
+                Profile.list_profiles(),
+                stale_days=self.settings.memory.curator_stale_days,
+                archive_days=self.settings.memory.curator_archive_days,
+            )
+        except Exception as e:
+            self.notify(f"Memory curation skipped: {e}", severity="warning")
+            return {}
+        for name, report in reports.items():
+            if report.changed:
+                self._refresh_memory_snapshot(name)
+                self.notify(
+                    f"Memory curation ({name}): {report.summary()} — "
+                    f"archived entries are in {name}.archive.md",
+                    timeout=10,
+                )
+        return reports
 
     def check_memory_caps(self) -> list[int]:
         """§6.4 size warnings; returns the tiers currently over their cap.
@@ -2242,7 +2305,35 @@ class HpcaApp(App):
             max_retries=self.settings.llm.max_retries,
             max_tool_rounds=self.settings.llm.max_tool_rounds,
             on_activity=lambda activity: self.report_activity(activity),
+            max_model_len=self._active_max_model_len,
+            on_evict=self._extract_before_eviction,
         )
+
+    def _active_max_model_len(self) -> int | None:
+        """The active backend's context window, if the catalog records one.
+
+        Without it there is nothing to compact against, so compaction simply
+        stays off — better than guessing a window and truncating needlessly.
+        """
+        for backend in self.settings.backends:
+            if self.settings.is_active(backend):
+                return backend.max_model_len
+        return None
+
+    async def _extract_before_eviction(self, messages: list[dict]) -> None:
+        """Last look at context about to leave the model's view (Phase 6).
+
+        Compaction is the one moment where something the agent learned can
+        disappear without anyone deciding to drop it, so the review loop gets
+        a chance at it first — but this runs *inside* the graph round, where
+        putting a modal on screen would suspend the turn behind a dialog the
+        user did not ask for. So the slice is only captured here; the review
+        itself runs after the reply lands, like every other review.
+        """
+        session = self._busy_turn
+        if session is None:
+            return
+        self._evicted.setdefault(session.session_id, []).extend(messages)
 
     def action_confirm_quit(self) -> None:
         def verdict(confirmed: bool | None) -> None:

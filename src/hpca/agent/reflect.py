@@ -150,18 +150,34 @@ class ReflectError(Exception):
     """No valid proposal list within the retry budget."""
 
 
-def digest(messages: list[Message]) -> str:
-    """The reviewed stretch: recent turns verbatim, older ones compressed.
+def _line(message: Message) -> str:
+    content = " ".join(str(message["content"]).split())[:MAX_MESSAGE_CHARS]
+    return f"{message['role']}: {content}"
 
-    Small models lose the thread on long transcripts, and the recent turns are
-    where the learnings are; older context only needs to establish what the
-    session was about.
+
+def digest(messages: list[Message], *, span: str = "recent") -> str:
+    """The reviewed stretch, bounded for a small model's attention.
+
+    ``span="recent"`` (the ordinary cadence) keeps the recent turns verbatim
+    and compresses what came before: the session is still going, and the
+    learnings are in what just happened.
+
+    ``span="whole"`` is for the pre-eviction review, where the whole stretch
+    is about to be discarded. Both ends stay verbatim — the beginning of a
+    stretch is where the goal and the site facts are stated, and with a
+    recency bias that is exactly what would be lost forever.
     """
-    usable = [
-        message
-        for message in messages[-MAX_DIGEST_MESSAGES:]
-        if message["role"] != "system"
-    ]
+    usable = [message for message in messages if message["role"] != "system"]
+    if span == "whole" and len(usable) > MAX_DIGEST_MESSAGES:
+        half = MAX_TRANSCRIPT_MESSAGES // 2
+        head, tail = usable[:half], usable[-half:]
+        middle = len(usable) - len(head) - len(tail)
+        return "\n".join(
+            [_line(m) for m in head]
+            + [f"[{middle} messages omitted]"]
+            + [_line(m) for m in tail]
+        )
+    usable = usable[-MAX_DIGEST_MESSAGES:]
     older, recent = usable[:-MAX_TRANSCRIPT_MESSAGES], usable[-MAX_TRANSCRIPT_MESSAGES:]
     lines = []
     if older:
@@ -171,9 +187,7 @@ def digest(messages: list[Message]) -> str:
             if m["role"] == "user"
         )
         lines.append(f"[earlier in this session: {summary[:600]}]")
-    for message in recent:
-        content = " ".join(str(message["content"]).split())[:MAX_MESSAGE_CHARS]
-        lines.append(f"{message['role']}: {content}")
+    lines += [_line(message) for message in recent]
     return "\n".join(lines)
 
 
@@ -185,6 +199,7 @@ async def propose_reflections(
     tier2: str = "",
     skills: str = "",
     allow_new_skills: bool = True,
+    span: str = "recent",
     max_retries: int = REFLECT_MAX_RETRIES,
 ) -> list[Reflection]:
     """What this stretch of conversation is worth remembering, if anything."""
@@ -201,7 +216,7 @@ async def propose_reflections(
         system += "\n\nExisting skills:\n" + skills
     conversation = [
         {"role": "system", "content": system},
-        {"role": "user", "content": digest(messages)},
+        {"role": "user", "content": digest(messages, span=span)},
     ]
     last_error = ""
     for _ in range(max_retries + 1):

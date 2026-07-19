@@ -21,6 +21,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
+from hpca.agent import compact
 from hpca.agent.middleware import (
     DecisionError,
     DirectResponse,
@@ -45,6 +46,11 @@ class AgentState(TypedDict, total=False):
     thinking: Annotated[list[dict], _append]
     pending_tool: dict | None
     tool_rounds: int
+    # Compaction (redesign Phase 6): {"upto": int, "summary": Message}. The
+    # stored history is never rewritten — the transcript keeps everything and
+    # only the view sent to the model is folded, so compaction can never lose
+    # what the user can still scroll back to.
+    compacted: dict | None
 
 
 def build_graph(
@@ -57,11 +63,56 @@ def build_graph(
     max_retries: int = 3,
     max_tool_rounds: int = MAX_TOOL_ROUNDS,
     on_activity: Callable[[str], None] | None = None,
+    max_model_len: Callable[[], int | None] | None = None,
+    on_evict: Callable[[list[Message]], Any] | None = None,
 ):
     render_system_prompt = system_prompt_fn or orchestrator_system_prompt
     # A turn is silent for seconds or minutes; this is what the TUI's spinner
     # names, so a wait is legible as thinking or as a particular tool running.
     report = on_activity or (lambda activity: None)
+    window = max_model_len or (lambda: None)
+
+    def _view(state: AgentState) -> list[Message]:
+        """The history as the model sees it: folded once compacted."""
+        messages = list(state.get("messages", []))
+        compacted = state.get("compacted")
+        if not compacted:
+            return messages
+        return [compacted["summary"]] + messages[compacted["upto"] :]
+
+    async def _maybe_compact(state: AgentState) -> dict:
+        """Fold the older history into a summary before it overflows.
+
+        Returns the state update (empty when nothing was compacted). The
+        messages about to leave the model's view are handed to ``on_evict``
+        first: the moment before context is dropped is the last chance to
+        extract a durable learning from it.
+        """
+        view = _view(state)
+        if not compact.should_compact(view, max_model_len=window()):
+            return {}
+        messages = list(state.get("messages", []))
+        already = (state.get("compacted") or {}).get("upto", 0)
+        older, _ = compact.split(messages[already:])
+        if not older:
+            return {}
+        report("compacting context")
+        previous = (state.get("compacted") or {}).get("summary")
+        # Fold the previous summary in too, so a second compaction carries
+        # the early session forward instead of forgetting it.
+        to_summarize = ([previous] if previous else []) + older
+        try:
+            summary = await compact.summarize(llm, to_summarize)
+        except Exception:
+            # Best-effort: an oversized prompt is still better than a turn
+            # that cannot run at all.
+            return {}
+        if on_evict is not None:
+            try:
+                await on_evict(older)
+            except Exception:
+                pass  # extraction is best-effort too
+        return {"compacted": {"upto": already + len(older), "summary": summary}}
 
     async def orchestrator(state: AgentState) -> dict:
         rounds = state.get("tool_rounds", 0)
@@ -70,22 +121,25 @@ def build_graph(
             # call with NO tools forces the model to answer from the results
             # it already has (it often has the answer and just kept digging).
             return await _summarise_and_stop(state)
+        compaction = await _maybe_compact(state)
+        if compaction:
+            state = {**state, **compaction}
         system: Message = {"role": "system", "content": render_system_prompt()}
         report("thinking")
         try:
             decision = await decide(
                 llm,
-                [system] + list(state.get("messages", [])),
+                [system] + _view(state),
                 tools,
                 max_retries=max_retries,
             )
         except DecisionError as e:
-            return _final(f"I failed to produce a valid action: {e}")
+            return _final(f"I failed to produce a valid action: {e}") | compaction
         # This decision produces the next message, whether it is the answer
         # below or the tool result execute_tool appends.
         thinking = _thinking(state, decision.reasoning)
         if isinstance(decision, DirectResponse):
-            return _final(decision.text) | thinking
+            return _final(decision.text) | thinking | compaction
         return {
             "pending_tool": {
                 "tool": decision.tool.name,
@@ -93,6 +147,7 @@ def build_graph(
             },
             "tool_rounds": rounds + 1,
             **thinking,
+            **compaction,
         }
 
     async def execute_tool(state: AgentState) -> dict:
@@ -146,6 +201,12 @@ def build_graph(
         Uses the empty-registry branch of `decide`, so the model can only
         respond — the same firewalled path, just with nothing left to call.
         """
+        # This call is the one that rescues the turn's findings, so it must
+        # not be the one that overflows: compact first if the accumulated
+        # tool results have pushed the history over the line.
+        compaction = await _maybe_compact(state)
+        if compaction:
+            state = {**state, **compaction}
         budget_note = {
             "role": "user",
             "content": (
@@ -161,7 +222,7 @@ def build_graph(
         try:
             decision = await decide(
                 llm,
-                [system] + list(state.get("messages", [])) + [budget_note],
+                [system] + _view(state) + [budget_note],
                 ToolRegistry(),  # no tools: respond-only
                 max_retries=max_retries,
             )
@@ -169,12 +230,12 @@ def build_graph(
             return _final(
                 f"I used all {max_tool_rounds} tool calls this turn without a "
                 "clean finish. Tell me how to proceed."
-            )
+            ) | compaction
         text = decision.text if isinstance(decision, DirectResponse) else (
             f"I used all {max_tool_rounds} tool calls this turn. Tell me how "
             "to proceed."
         )
-        return _final(text) | _thinking(state, decision.reasoning)
+        return _final(text) | _thinking(state, decision.reasoning) | compaction
 
     def _final(text: str) -> dict:
         return {

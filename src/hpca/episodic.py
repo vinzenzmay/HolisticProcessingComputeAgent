@@ -37,10 +37,36 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+# Words that carry no signal but, under an OR match, pull in every session.
+STOP_WORDS = frozenset(
+    "the a an and or but for with from into how what when where which who why "
+    "this that these those there here can could would should did does do is "
+    "are was were be been being it its my our your me you we they them him "
+    "her his get got have has had need needs want wants please help about "
+    "again also just now then than too very".split()
+)
+
+
 def _fts_query(query: str) -> str:
-    """Every term quoted: user text must never be parsed as FTS5 syntax."""
-    terms = [term.replace('"', "") for term in query.split()]
-    return " ".join(f'"{term}"' for term in terms if term)
+    """Quoted terms joined with OR.
+
+    Every term is quoted because user text must never be parsed as FTS5
+    syntax. They are joined with OR, not the implicit AND: a natural request
+    ("how much memory does STAR need") shares only its rare words with the
+    session that answered it, and requiring every word means never matching.
+    Stop words and very short tokens are dropped, since under OR they would
+    match everything; bm25 ranking then puts the sessions sharing the rare
+    terms on top. A query with no distinctive term left returns nothing
+    rather than falling back to the stop words themselves — matching on
+    "how" would rank arbitrary sessions above nothing at all, which reads as
+    a real recall.
+    """
+    terms = [
+        term
+        for term in (word.strip('"').lower() for word in query.split())
+        if len(term) > 2 and term not in STOP_WORDS
+    ]
+    return " OR ".join(f'"{term}"' for term in terms)
 
 
 class EpisodicStore:

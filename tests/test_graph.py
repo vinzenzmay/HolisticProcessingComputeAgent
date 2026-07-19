@@ -409,3 +409,142 @@ class TestNewThisTurn:
         assert len(new) == 2
         assert new[0].startswith("[tool result] delete")
         assert new[1] == "gone"
+
+
+class TestCompaction:
+    """Redesign Phase 6: fold the old history before it overflows the window.
+
+    The stored history is never rewritten — only the view sent to the model —
+    so the transcript keeps everything the user can scroll back to.
+    """
+
+    def long_history(self, count=40, chars=200):
+        return [
+            {
+                "role": "user" if i % 2 == 0 else "assistant",
+                "content": f"m{i} " + "x" * chars,
+            }
+            for i in range(count)
+        ]
+
+    async def prime(self, graph, session_id, messages):
+        await graph.aupdate_state(
+            {"configurable": {"thread_id": session_id}}, {"messages": messages}
+        )
+
+    async def test_off_without_a_known_window(self, tools):
+        llm = FakeLLM([respond_json("ok")])
+        graph = build_graph(llm=llm, tools=tools, checkpointer=InMemorySaver())
+        await self.prime(graph, "s1", self.long_history())
+        await run_turn(graph, session_id="s1", user_text="and now?")
+        # every message still went to the model
+        assert len(llm.calls[0]["messages"]) > 40
+
+    async def test_folds_the_old_history_when_the_window_is_small(self, tools):
+        llm = FakeLLM(["a summary of the earlier work", respond_json("ok")])
+        graph = build_graph(
+            llm=llm,
+            tools=tools,
+            checkpointer=InMemorySaver(),
+            max_model_len=lambda: 2000,
+        )
+        await self.prime(graph, "s1", self.long_history())
+        result = await run_turn(graph, session_id="s1", user_text="and now?")
+        assert result.reply == "ok"
+        summarize_call, decide_call = llm.calls[0], llm.calls[1]
+        assert summarize_call["json_schema"] is None  # the summarizer is free-form
+        # the decision saw a folded view: far fewer messages, summary first
+        sent = decide_call["messages"]
+        assert len(sent) < 25
+        assert any(
+            "a summary of the earlier work" in str(m["content"]) for m in sent
+        )
+        # the recent tail survived verbatim
+        assert any("and now?" == str(m["content"]) for m in sent)
+
+    async def test_stored_history_is_not_rewritten(self, tools):
+        llm = FakeLLM(["a summary", respond_json("ok")])
+        graph = build_graph(
+            llm=llm,
+            tools=tools,
+            checkpointer=InMemorySaver(),
+            max_model_len=lambda: 2000,
+        )
+        await self.prime(graph, "s1", self.long_history())
+        result = await run_turn(graph, session_id="s1", user_text="and now?")
+        # the transcript keeps the whole session, summary or not
+        assert len(result.messages) > 40
+        assert any("m0 " in str(m["content"]) for m in result.messages)
+
+    async def test_evicted_messages_are_offered_for_extraction(self, tools):
+        seen = []
+
+        async def on_evict(messages):
+            seen.append(messages)
+
+        llm = FakeLLM(["a summary", respond_json("ok")])
+        graph = build_graph(
+            llm=llm,
+            tools=tools,
+            checkpointer=InMemorySaver(),
+            max_model_len=lambda: 2000,
+            on_evict=on_evict,
+        )
+        await self.prime(graph, "s1", self.long_history())
+        await run_turn(graph, session_id="s1", user_text="and now?")
+        assert seen and len(seen[0]) > 10
+        assert "m0 " in str(seen[0][0]["content"])  # the oldest, before it goes
+
+    async def test_a_failing_summarizer_does_not_break_the_turn(self, tools):
+        class Failing(FakeLLM):
+            async def chat(self, messages, *, json_schema=None, **kwargs):
+                if json_schema is None:  # the summarize call
+                    raise RuntimeError("backend down")
+                return await super().chat(messages, json_schema=json_schema, **kwargs)
+
+        llm = Failing([respond_json("ok")])
+        graph = build_graph(
+            llm=llm,
+            tools=tools,
+            checkpointer=InMemorySaver(),
+            max_model_len=lambda: 2000,
+        )
+        await self.prime(graph, "s1", self.long_history())
+        result = await run_turn(graph, session_id="s1", user_text="and now?")
+        assert result.reply == "ok"  # oversized beats not running at all
+
+    async def test_compaction_persists_across_turns(self, tools):
+        llm = FakeLLM(["a summary", respond_json("first"), respond_json("second")])
+        graph = build_graph(
+            llm=llm,
+            tools=tools,
+            checkpointer=InMemorySaver(),
+            max_model_len=lambda: 2000,
+        )
+        await self.prime(graph, "s1", self.long_history())
+        await run_turn(graph, session_id="s1", user_text="first question")
+        await run_turn(graph, session_id="s1", user_text="second question")
+        # only one summarize call: the second turn reused the stored fold
+        free_form = [c for c in llm.calls if c["json_schema"] is None]
+        assert len(free_form) == 1
+
+    async def test_budget_exhaustion_path_compacts_too(self, tools):
+        """The tools-withdrawn call is the one that rescues the turn's
+        findings, so it must not be the one that overflows."""
+        llm = FakeLLM(
+            [tool_json("echo", text="x")] * 2
+            + ["a summary of the earlier work", respond_json("here is what I found")]
+        )
+        graph = build_graph(
+            llm=llm,
+            tools=tools,
+            checkpointer=InMemorySaver(),
+            max_tool_rounds=2,
+            max_model_len=lambda: 2000,
+        )
+        await self.prime(graph, "s1", self.long_history())
+        result = await run_turn(graph, session_id="s1", user_text="dig into this")
+        assert result.reply == "here is what I found"
+        final = llm.calls[-1]["messages"]
+        assert len(final) < 25  # folded, not the whole history
+        assert any("a summary of the earlier work" in str(m["content"]) for m in final)

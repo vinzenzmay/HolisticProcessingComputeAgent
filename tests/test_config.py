@@ -289,3 +289,12 @@ class TestMemoryCharCaps:
 
     def test_cross_profile_search_off_by_default(self):
         assert Settings().memory.cross_profile_search is False
+
+    def test_phase6_defaults(self):
+        memory = Settings().memory
+        assert memory.curator_interval_days == 7
+        assert memory.curator_stale_days == 30
+        assert memory.curator_archive_days == 90
+        assert memory.tier3_prefetch_chars == 800
+        assert memory.review_interval == 8
+        assert memory.propose_new_skills is True
