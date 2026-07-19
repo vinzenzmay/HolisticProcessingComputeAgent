@@ -224,7 +224,7 @@ class LLMClient:
 
     # ------------------------------------------------------------ discovery
 
-    async def models(self) -> list[str]:
+    async def _model_entries(self) -> list[dict]:
         try:
             response = await self._client.get("models")
         except httpx.HTTPError as e:
@@ -233,7 +233,28 @@ class LLMClient:
             raise LLMError(
                 f"Listing models failed ({response.status_code}): {response.text[:500]}"
             )
-        return [entry["id"] for entry in response.json().get("data", [])]
+        return response.json().get("data", [])
+
+    async def models(self) -> list[str]:
+        return [entry["id"] for entry in await self._model_entries()]
+
+    async def context_window(self) -> int | None:
+        """The served model's context length, if the backend advertises it.
+
+        vLLM puts ``max_model_len`` on each /v1/models entry, which is the
+        honest number: it reflects how the server was actually launched, not
+        what the model card claims. Returns None when the backend does not
+        say, and the caller falls back to the configured value.
+        """
+        try:
+            entries = await self._model_entries()
+        except LLMError:
+            return None
+        for entry in entries:
+            if entry.get("id") == self._settings.model:
+                window = entry.get("max_model_len")
+                return int(window) if window else None
+        return None
 
     async def supports_constrained_decoding(self) -> bool:
         """Whether tool calls can use JSON-schema constrained decoding (§2).

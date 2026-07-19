@@ -20,6 +20,7 @@ from textual.content import Content
 from textual.message import Message
 from textual.widgets import Footer, Label, ListItem, ListView, Static, TextArea
 
+from hpca.agent import compact
 from hpca.agent.builtin_tools import default_tool_registry
 from hpca.agent.context import ToolContext
 from hpca.agent.file_tools import add_file_tools
@@ -87,6 +88,7 @@ from hpca.symbols import SymbolIndex
 from hpca.trash import TrashManager
 from hpca.tui.approval_screen import ApprovalScreen
 from hpca.tui.confirm_screen import ConfirmScreen
+from hpca.tui.context_bar import ContextBar
 from hpca.tui.inspect_screen import InspectScreen, format_job, format_process
 from hpca.tui.manage_llms import ManageLLMsScreen
 from hpca.memory_index import MemoryIndex
@@ -389,6 +391,7 @@ class ChatPanel(ColumnPanel):
 
     def compose(self) -> ComposeResult:
         yield Static(self._title, classes="column-title")
+        yield ContextBar(id="context-bar")
         yield ChatList(id="chat-list")
         menu = Static(id="command-menu")
         menu.display = False
@@ -603,6 +606,11 @@ class HpcaApp(App):
         # Messages compaction dropped from the model's view, waiting to be
         # reviewed once the turn they were dropped during has finished (P6).
         self._evicted: dict[str, list[dict]] = {}
+        # Context meter state: the window the backend reports, and the last
+        # measured prompt size (per session — a different thread is a
+        # different context).
+        self._discovered_window: int | None = None
+        self._context_used = 0
         self._activity = "working"
         self._conn = None
         self._saver_ctx = None
@@ -654,6 +662,8 @@ class HpcaApp(App):
             self.notify(f"Trash: cleaned up {removed} expired entr"
                         f"{'y' if removed == 1 else 'ies'}")
         self._refresh_top_bar()
+        self._refresh_context_bar()
+        self.run_worker(self._discover_context_window(), group="llm-probe")
         await self._reload_sessions()
         self.run_curator_if_due()
         self.set_interval(2.0, self.refresh_processes)
@@ -1576,6 +1586,10 @@ class HpcaApp(App):
                 self.session_store.create(profile=profile, title=UNTITLED_SESSION)
             )
             await self._set_chat_messages([])
+            self._context_used = 0
+            bar = self._context_bar()
+            if bar is not None:
+                bar.reset()  # a fresh thread starts from an empty window
             await self._reload_sessions()
         self._focus_column("chat")
 
@@ -1702,11 +1716,35 @@ class HpcaApp(App):
         await self._reload_sessions()
         self.notify(f"Deleted “{session.title}”")
 
+    def _show_context_estimate(self, values: dict) -> None:
+        """How full a reopened session's context already is.
+
+        Estimated from the checkpointed history, since nothing has been sent
+        yet this run. Compaction is accounted for: what the model will
+        receive is the folded view, not the whole transcript.
+        """
+        bar = self._context_bar()
+        if bar is None:
+            return
+        self._context_used = 0
+        messages = list(values.get("messages", []))
+        compacted = values.get("compacted")
+        if compacted:
+            messages = [compacted["summary"]] + messages[compacted["upto"] :]
+        if not messages:
+            bar.reset()
+            return
+        bar.set_estimate(compact.estimate_tokens(messages))
+
     async def close_session(self) -> None:
         """Leave the active session: empty chat, no entry, nothing to type in."""
         self.active_session = None
         self._tool_ctx = None
         self._log = None
+        self._context_used = 0
+        bar = self._context_bar()
+        if bar is not None:
+            bar.reset()
         await self._set_chat_messages([])
         self.query_one("#chat-input", ChatInput).display = False
         self._focus_column("sessions")
@@ -1721,6 +1759,7 @@ class HpcaApp(App):
         await self._set_chat_messages(
             values.get("messages", []), values.get("thinking", [])
         )
+        self._show_context_estimate(values)
         self._updated.discard(session.session_id)  # its news is now on screen
         for item in self.query_one("#sessions-list", ListView).children:
             row_session = getattr(item, "data_session", None)
@@ -2323,6 +2362,15 @@ class HpcaApp(App):
         self._owns_llm = True
         self._rebuild_graph()
         self._refresh_session_log()  # rebind the tool context to the new client
+        # A different model means a different window, and the token count
+        # measured against the old one no longer describes this one.
+        self._discovered_window = None
+        self._context_used = 0
+        bar = self._context_bar()
+        if bar is not None:
+            bar.reset()
+        self._refresh_context_bar()
+        self.run_worker(self._discover_context_window(), group="llm-probe")
         if owned and old_llm is not None:
             self.run_worker(old_llm.close(), group="llm-close")
 
@@ -2339,18 +2387,73 @@ class HpcaApp(App):
             on_activity=lambda activity: self.report_activity(activity),
             max_model_len=self._active_max_model_len,
             on_evict=self._extract_before_eviction,
+            on_usage=self._on_usage,
         )
 
     def _active_max_model_len(self) -> int | None:
-        """The active backend's context window, if the catalog records one.
+        """The active backend's context window.
 
-        Without it there is nothing to compact against, so compaction simply
-        stays off — better than guessing a window and truncating needlessly.
+        Preferred source is what the backend told us on connect (it knows how
+        it was launched); the catalog entry is the fallback for a backend that
+        does not advertise it. Without either, compaction stays off — better
+        than guessing a window and folding history needlessly.
         """
+        if self._discovered_window is not None:
+            return self._discovered_window
         for backend in self.settings.backends:
             if self.settings.is_active(backend):
                 return backend.max_model_len
         return None
+
+    def _on_usage(self, usage: dict) -> None:
+        """The backend's token count for the decision just made.
+
+        prompt_tokens is what occupies the window; the completion is spent
+        the moment it is generated. Reported per round, so a tool-heavy turn
+        visibly fills the bar as it works.
+        """
+        prompt_tokens = usage.get("prompt_tokens")
+        if not prompt_tokens:
+            return
+        self._context_used = int(prompt_tokens)
+        bar = self._context_bar()
+        if bar is not None:
+            bar.set_used(self._context_used)
+
+    def _context_bar(self) -> ContextBar | None:
+        found = self.query("#context-bar")
+        return found.first(ContextBar) if found else None
+
+    def _refresh_context_bar(self) -> None:
+        bar = self._context_bar()
+        if bar is None:
+            return
+        bar.set_window(self._active_max_model_len())
+        if self._context_used:
+            bar.set_used(self._context_used)
+
+    async def _discover_context_window(self) -> None:
+        """Ask the backend how big its window is, and remember it.
+
+        This is why the meter needs no configuration: vLLM reports
+        max_model_len per model, so switching from a 192k model to a 32k one
+        moves the bar without anyone editing settings. The answer is written
+        back to the catalog entry so compaction also benefits, and so the
+        number survives a backend that is offline next time.
+        """
+        try:
+            window = await self._llm.context_window()
+        except Exception:
+            window = None
+        if not window:
+            return
+        self._discovered_window = window
+        for backend in self.settings.backends:
+            if self.settings.is_active(backend) and backend.max_model_len != window:
+                backend.max_model_len = window
+                self.settings.save()
+                break
+        self._refresh_context_bar()
 
     async def _extract_before_eviction(self, messages: list[dict]) -> None:
         """Last look at context about to leave the model's view (Phase 6).

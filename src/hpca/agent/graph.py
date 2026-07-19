@@ -65,12 +65,18 @@ def build_graph(
     on_activity: Callable[[str], None] | None = None,
     max_model_len: Callable[[], int | None] | None = None,
     on_evict: Callable[[list[Message]], Any] | None = None,
+    on_usage: Callable[[dict], None] | None = None,
 ):
     render_system_prompt = system_prompt_fn or orchestrator_system_prompt
     # A turn is silent for seconds or minutes; this is what the TUI's spinner
     # names, so a wait is legible as thinking or as a particular tool running.
     report = on_activity or (lambda activity: None)
     window = max_model_len or (lambda: None)
+    # The backend's own token count for each decision — what the context
+    # meter shows. Reported per round, not per turn, because a tool-heavy
+    # turn grows the prompt as it goes and that is exactly what fills a 32k
+    # window.
+    report_usage = on_usage or (lambda usage: None)
 
     def _view(state: AgentState) -> list[Message]:
         """The history as the model sees it: folded once compacted."""
@@ -135,6 +141,7 @@ def build_graph(
             )
         except DecisionError as e:
             return _final(f"I failed to produce a valid action: {e}") | compaction
+        report_usage(decision.usage)
         # This decision produces the next message, whether it is the answer
         # below or the tool result execute_tool appends.
         thinking = _thinking(state, decision.reasoning)
@@ -231,6 +238,7 @@ def build_graph(
                 f"I used all {max_tool_rounds} tool calls this turn without a "
                 "clean finish. Tell me how to proceed."
             ) | compaction
+        report_usage(decision.usage)
         text = decision.text if isinstance(decision, DirectResponse) else (
             f"I used all {max_tool_rounds} tool calls this turn. Tell me how "
             "to proceed."

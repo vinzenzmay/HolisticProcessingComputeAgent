@@ -405,3 +405,91 @@ async def test_tool_traffic_is_not_indexed(hpca_home):
         contents = [r["content"] for r in rows]
         assert "please delete scratch" in contents
         assert not any("[tool result]" in c for c in contents)
+
+
+class UsageLLM(FakeLLM):
+    """A backend that reports token usage, as vLLM does."""
+
+    def __init__(self, outputs, prompt_tokens=1234, window=32_000):
+        super().__init__(outputs)
+        self._prompt_tokens = prompt_tokens
+        self._window = window
+
+    async def chat(self, messages, *, json_schema=None, **kwargs):
+        response = await super().chat(messages, json_schema=json_schema, **kwargs)
+        response.usage = {
+            "prompt_tokens": self._prompt_tokens,
+            "completion_tokens": 20,
+        }
+        return response
+
+    async def context_window(self):
+        return self._window
+
+
+async def test_context_bar_reports_measured_usage(hpca_home):
+    """The bar shows the backend's own prompt_tokens, not an estimate."""
+    from hpca.tui.context_bar import ContextBar
+
+    app = HpcaApp(llm=UsageLLM([respond_json("ok")], prompt_tokens=8000))
+    async with app.run_test(size=(120, 40)) as pilot:
+        bar = app.query_one("#context-bar", ContextBar)
+        assert "no reply yet" in bar.text  # nothing measured before the turn
+        await submit_chat(app, pilot, "hello")
+        assert "8,000 / 32,000" in bar.text
+        assert "(25%)" in bar.text
+        assert "~" not in bar.text  # measured, so not marked as an estimate
+
+
+async def test_context_window_discovered_from_the_backend(hpca_home):
+    """No configuration needed: the backend says how it was launched."""
+    app = HpcaApp(llm=UsageLLM([respond_json("ok")], window=32_768))
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        assert app._active_max_model_len() == 32_768
+
+
+async def test_a_small_window_turns_the_bar_red(hpca_home):
+    """The case this exists for: on 32k a long turn saturates the window."""
+    from hpca.tui.context_bar import ContextBar
+
+    app = HpcaApp(llm=UsageLLM([respond_json("ok")], prompt_tokens=30_000))
+    async with app.run_test(size=(120, 40)) as pilot:
+        await submit_chat(app, pilot, "hello")
+        bar = app.query_one("#context-bar", ContextBar)
+        assert bar.has_class("context-danger")
+        assert "(94%)" in bar.text
+
+
+async def test_reopening_a_session_estimates_before_the_next_reply(hpca_home):
+    """A long session should show it is nearly full before you send, not
+    after the reply that overflows it."""
+    from hpca.tui.context_bar import ContextBar
+
+    app = HpcaApp(llm=UsageLLM([respond_json("ok")]))
+    async with app.run_test(size=(120, 40)) as pilot:
+        await submit_chat(app, pilot, "hello")
+        session = app.active_session
+        # ~30k tokens at 4 chars/token, i.e. 94% of the 32k window
+        await app.graph.aupdate_state(
+            {"configurable": {"thread_id": session.session_id}},
+            {"messages": [{"role": "user", "content": "x" * 120_000}]},
+        )
+        await app.close_session()
+        bar = app.query_one("#context-bar", ContextBar)
+        assert "no reply yet" in bar.text  # leaving clears the old number
+        await app.open_session(session)
+        assert "~" in bar.text  # estimated from the stored history
+        assert bar.has_class("context-danger")
+
+
+async def test_switching_session_does_not_show_the_previous_context(hpca_home):
+    from hpca.tui.context_bar import ContextBar
+
+    app = HpcaApp(llm=UsageLLM([respond_json("a"), respond_json("b")]))
+    async with app.run_test(size=(120, 40)) as pilot:
+        await submit_chat(app, pilot, "first")
+        bar = app.query_one("#context-bar", ContextBar)
+        assert "1,234" in bar.text or "8,000" in bar.text or "/" in bar.text
+        await app.start_new_session()
+        assert "no reply yet" in bar.text

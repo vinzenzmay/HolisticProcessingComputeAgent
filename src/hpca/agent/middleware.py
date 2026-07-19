@@ -11,7 +11,7 @@ can correct itself, a bounded number of times.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, get_args, get_origin
 
 from pydantic import BaseModel, ValidationError
@@ -33,6 +33,10 @@ class DecisionError(Exception):
 class DirectResponse:
     text: str
     reasoning: str = ""  # the model's thinking, shown in the TUI's thinking box
+    # The backend's own token accounting for the call that produced this
+    # (prompt_tokens/completion_tokens). Measured, not estimated — it is what
+    # the context meter reports.
+    usage: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -40,6 +44,7 @@ class ToolCall:
     tool: Tool
     arguments: BaseModel
     reasoning: str = ""
+    usage: dict = field(default_factory=dict)
 
     async def execute(self, ctx: Any) -> str:
         return await self.tool.handler(self.arguments, ctx)
@@ -207,8 +212,9 @@ def _parse(raw: str, tools: ToolRegistry) -> Decision:
     )
 
 
-def _with_reasoning(decision: Decision, reasoning: str) -> Decision:
-    decision.reasoning = reasoning
+def _annotate(decision: Decision, response: Any) -> Decision:
+    decision.reasoning = response.reasoning or ""
+    decision.usage = response.usage or {}
     return decision
 
 
@@ -241,7 +247,7 @@ async def decide(
         )
         raw = response.content
         try:
-            return _with_reasoning(_parse(raw, tools), response.reasoning or "")
+            return _annotate(_parse(raw, tools), response)
         except ValueError as e:
             last_error = str(e)
             conversation = conversation + [
