@@ -204,3 +204,63 @@ class TestProfileManagement:
 
     def test_deleting_a_missing_profile_is_quiet(self, hpca_home):
         Profile.delete("never-existed")  # must not raise
+
+
+class TestCharBudgets:
+    """Redesign Phase 1: hard, model-independent character budgets."""
+
+    def test_tier_chars_counts_injected_text(self, hpca_home):
+        profile = Profile.load("default")
+        profile.add_memory("abcd", tier=1)
+        profile.add_memory("efgh", tier=1)
+        assert profile.tier_chars(1) == len("abcd\n\nefgh")
+
+    def test_usage_meter_format(self, hpca_home):
+        profile = Profile.load("default")
+        profile.add_memory("x" * 600, tier=2)
+        assert profile.usage_meter(2, 1200) == "50% — 600/1200 chars"
+
+    def test_usage_meter_zero_cap_does_not_divide(self, hpca_home):
+        assert Profile.load("default").usage_meter(1, 0) == "0% — 0/0 chars"
+
+    def test_would_exceed_counts_the_joiner(self, hpca_home):
+        profile = Profile.load("default")
+        profile.add_memory("x" * 10, tier=1)
+        # 10 used + 2 joiner + 5 new = 17
+        assert not profile.would_exceed(1, "y" * 5, cap=17)
+        assert profile.would_exceed(1, "y" * 5, cap=16)
+
+    def test_would_exceed_empty_tier_has_no_joiner(self, hpca_home):
+        profile = Profile.load("default")
+        assert not profile.would_exceed(1, "y" * 5, cap=5)
+
+    def test_over_cap_tiers_uses_chars(self, hpca_home):
+        profile = Profile.load("default")
+        profile.add_memory("x" * 100, tier=2)
+        assert profile.over_cap_tiers(tier1_cap=50, tier2_cap=99) == [2]
+        assert profile.over_cap_tiers(tier1_cap=50, tier2_cap=100) == []
+
+
+class TestBackendAnnotation:
+    """Memories from another backend are annotated at injection, not dropped —
+    a workaround for one small model often transfers."""
+
+    def test_other_backend_annotated(self, hpca_home):
+        profile = Profile.load("default")
+        profile.add_memory("Use --no-mmap here.", tier=2, backend="qwen3-6b")
+        text = profile.tier_prompt_text(2, active_backend="gemma3-27b")
+        assert text == "(learned on qwen3-6b) Use --no-mmap here."
+
+    def test_same_backend_unannotated(self, hpca_home):
+        profile = Profile.load("default")
+        profile.add_memory("Use --no-mmap here.", tier=2, backend="qwen3-6b")
+        text = profile.tier_prompt_text(2, active_backend="qwen3-6b")
+        assert text == "Use --no-mmap here."
+
+    def test_untagged_memory_unannotated(self, hpca_home):
+        profile = Profile.load("default")
+        profile.add_memory("Cluster is cubi.", tier=1)
+        assert (
+            profile.tier_prompt_text(1, active_backend="qwen3-6b")
+            == "Cluster is cubi."
+        )

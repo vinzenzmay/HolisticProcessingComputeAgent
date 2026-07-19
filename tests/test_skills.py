@@ -172,3 +172,38 @@ class TestReadSkillTool:
         tools = add_skill_tools(ToolRegistry())
         result = await call(tools, "read_skill", ctx, name="x")
         assert "no skills" in result.lower()
+
+
+class TestPerProfileSkills:
+    """Redesign Phase 1: skills/_shared/ + skills/<profile>/, flat files
+    counting as shared, profile winning name collisions."""
+
+    def write_in(self, subdir, name, content):
+        directory = skills_dir() / subdir if subdir else skills_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / name).write_text(content)
+
+    def test_profile_sees_shared_and_own(self, hpca_home):
+        self.write_in("_shared", "a.md", "---\nname: shared-a\n---\nbody")
+        self.write_in("genetics", "b.md", "---\nname: gen-b\n---\nbody")
+        self.write_in("hpc-admin", "c.md", "---\nname: admin-c\n---\nbody")
+        names = [s.name for s in load_skills("genetics")]
+        assert names == ["gen-b", "shared-a"]
+
+    def test_flat_files_count_as_shared(self, hpca_home):
+        self.write_in(None, "legacy.md", "---\nname: legacy\n---\nbody")
+        assert [s.name for s in load_skills("genetics")] == ["legacy"]
+
+    def test_profile_wins_name_collision(self, hpca_home):
+        self.write_in("_shared", "a.md", "---\nname: align\n---\nshared body")
+        self.write_in("genetics", "a.md", "---\nname: align\n---\nprofile body")
+        skills = load_skills("genetics")
+        assert len(skills) == 1
+        assert skills[0].body == "profile body"
+
+    def test_any_skills(self, hpca_home):
+        from hpca.skills import any_skills
+
+        assert not any_skills()
+        self.write_in("genetics", "b.md", "---\nname: gen-b\n---\nbody")
+        assert any_skills()

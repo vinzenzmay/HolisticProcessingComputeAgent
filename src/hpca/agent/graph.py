@@ -239,14 +239,23 @@ async def run_turn(
     session_id: str,
     user_text: str | None = None,
     resume: Command | None = None,
+    api_content: str | None = None,
 ) -> TurnResult:
-    """Run one turn (new user message or interrupt resume) on a session thread."""
+    """Run one turn (new user message or interrupt resume) on a session thread.
+
+    ``api_content`` is the message as the *model* should see it (recalled
+    memory context appended); the transcript stores the clean ``user_text``
+    and the LLM client substitutes the sidecar at the wire.
+    """
     config = {"configurable": {"thread_id": session_id}}
     if resume is not None:
         payload: Any = resume
     else:
+        message: Message = {"role": "user", "content": user_text}
+        if api_content is not None:
+            message["api_content"] = api_content
         payload = {
-            "messages": [{"role": "user", "content": user_text}],
+            "messages": [message],
             "pending_tool": None,
             "tool_rounds": 0,
         }

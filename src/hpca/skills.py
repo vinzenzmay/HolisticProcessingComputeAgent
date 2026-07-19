@@ -1,10 +1,15 @@
 """User-defined skills (§5.1): procedure files loaded per profile.
 
-Markdown or YAML files in ``<app_dir>/skills/`` describing how the agent
+Markdown or YAML files under ``<app_dir>/skills/`` describing how the agent
 should handle specific tasks. Like profiles (§6.2), these are hand-edited, so
 parsing is lenient: a file without front matter is still a skill (its filename
 is the name, its text the body), and a broken header reports a problem rather
 than vanishing.
+
+Layout (redesign Phase 1): ``skills/_shared/`` holds skills for every
+profile, ``skills/<profile>/`` the profile's own; files directly in
+``skills/`` are the legacy flat layout and count as shared. On a name
+collision the profile's own skill wins.
 
 Skills are *surfaced* to the model as a short list in the system prompt; the
 full body is fetched on demand via ``read_skill``, keeping the prompt small.
@@ -21,6 +26,7 @@ import yaml
 from hpca.config import app_dir
 
 SKILL_SUFFIXES = {".md", ".yaml", ".yml"}
+SHARED_SKILLS_DIR = "_shared"
 
 
 def skills_dir() -> Path:
@@ -100,8 +106,7 @@ def parse_skill(text: str, *, filename: str) -> Skill | None:
     )
 
 
-def load_skills(directory: Path | None = None) -> list[Skill]:
-    directory = directory or skills_dir()
+def _load_dir(directory: Path) -> list[Skill]:
     if not directory.exists():
         return []
     skills = []
@@ -111,7 +116,33 @@ def load_skills(directory: Path | None = None) -> list[Skill]:
         skill = parse_skill(path.read_text(errors="replace"), filename=path.name)
         if skill is not None:
             skills.append(skill)
-    return sorted(skills, key=lambda s: s.name)
+    return skills
+
+
+def load_skills(profile: str | None = None, *, root: Path | None = None) -> list[Skill]:
+    """Skills visible to one profile: legacy flat files, ``_shared/``, then
+    the profile's own directory — later sources win on a name collision."""
+    root = root or skills_dir()
+    directories = [root, root / SHARED_SKILLS_DIR]
+    if profile:
+        directories.append(root / profile)
+    by_name: dict[str, Skill] = {}
+    for directory in directories:
+        for skill in _load_dir(directory):
+            by_name[skill.name] = skill
+    return sorted(by_name.values(), key=lambda s: s.name)
+
+
+def any_skills(root: Path | None = None) -> bool:
+    """Whether any profile has any skill at all — decides if the skill tools
+    are registered, since the active profile can change per session."""
+    root = root or skills_dir()
+    if not root.exists():
+        return False
+    return any(
+        path.suffix.lower() in SKILL_SUFFIXES and path.is_file()
+        for path in root.rglob("*")
+    )
 
 
 def summarize_skills(skills: list[Skill]) -> str:

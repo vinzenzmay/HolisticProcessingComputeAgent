@@ -326,13 +326,16 @@ async def test_profile_memories_injected_into_system_prompt(hpca_home):
         assert "verbose logs" in system["content"]
 
 
-async def test_memories_written_after_startup_reach_the_next_turn(hpca_home):
-    """Memories are shared through the profile file: a note made in another
-    session or another running hpca instance must be in this turn's prompt,
-    not only what was on disk when this instance started."""
+async def test_memories_are_frozen_per_session_and_refresh_at_boundaries(hpca_home):
+    """Redesign Phase 1: the memory snapshot is frozen per session so the
+    system-prompt prefix stays byte-stable for the backend's prefix cache.
+    A note written by another session or instance mid-session does NOT shift
+    the prompt; it is picked up at the next session boundary."""
     from hpca.profiles import Profile
 
-    llm = RecordingLLM([respond_json("ok"), respond_json("ok again")])
+    llm = RecordingLLM(
+        [respond_json("ok"), respond_json("ok again"), respond_json("ok third")]
+    )
     app = HpcaApp(llm=llm)
     async with app.run_test(size=(120, 40)) as pilot:
         await submit_chat(app, pilot, "hello")
@@ -343,12 +346,21 @@ async def test_memories_written_after_startup_reach_the_next_turn(hpca_home):
         profile.add_memory("STAR needs 40G on this cluster.", tier=1)
         profile.save()
 
+        # mid-session the frozen snapshot keeps the prompt stable
+        seen = len(llm.calls)
         await submit_chat(app, pilot, "hello again")
-        # the first turn predates the memory, so any prompt carrying it is
-        # from the second turn (calls include titler traffic; search them all)
+        assert not any(
+            call[0]["role"] == "system" and "STAR needs 40G" in call[0]["content"]
+            for call in llm.calls[seen:]
+        )
+
+        # reopening the session is a boundary: the note is picked up
+        await app.open_session(app.active_session)
+        seen = len(llm.calls)
+        await submit_chat(app, pilot, "and again")
         assert any(
             call[0]["role"] == "system" and "STAR needs 40G" in call[0]["content"]
-            for call in llm.calls
+            for call in llm.calls[seen:]
         )
         # and the tool context the turn carries has it too
         assert "STAR needs 40G" in app._tool_ctx.tier1_text

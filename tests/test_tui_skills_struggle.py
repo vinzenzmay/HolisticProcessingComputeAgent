@@ -177,3 +177,36 @@ class TestStruggleNotes:
             matches = app.warn_about_struggles("please run my snakemake workflow")
             assert len(matches) == 1
             assert app.warn_about_struggles("align a bam file") == []
+
+    async def test_matching_struggle_is_fenced_into_the_model_message(
+        self, hpca_home
+    ):
+        """Redesign Phase 1: the model gets recalled struggle notes as a
+        fenced block on the API copy of the user message; the stored
+        transcript keeps the clean text."""
+        profile = Profile.load("default")
+        profile.add_memory(
+            "Snakemake dry-runs fail here.\nkeywords: snakemake, dry-run",
+            tier=2,
+            kind=STRUGGLE_KIND,
+        )
+        profile.save()
+        llm = RecordingLLM([respond_json("ok")])
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit(app, pilot, "please run my snakemake workflow")
+            user = llm.calls[0][-1]
+            assert user["role"] == "user"
+            assert user["content"] == "please run my snakemake workflow"
+            assert "<memory-context>" in user["api_content"]
+            assert "Snakemake dry-runs fail here." in user["api_content"]
+            assert "keywords:" not in user["api_content"]
+            # the chat transcript shows only the clean message
+            assert not any("<memory-context>" in t for t in app.chat_log_texts())
+
+    async def test_non_matching_request_has_no_sidecar(self, hpca_home):
+        llm = RecordingLLM([respond_json("ok")])
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit(app, pilot, "hello")
+            assert "api_content" not in llm.calls[0][-1]

@@ -24,3 +24,20 @@ class TestOrchestratorPrompt:
 
     def test_environment_facts_contains_time(self):
         assert f"{datetime.now():%Y-%m-%d}" in environment_facts()
+
+    def test_usage_meters_shown_when_given(self):
+        prompt = orchestrator_system_prompt(
+            tier1="Cluster is cubi.",
+            tier2="User prefers R.",
+            tier1_meter="10% — 16/1200 chars",
+            tier2_meter="1% — 14/3200 chars",
+        )
+        assert "Standing site notes [10% — 16/1200 chars]:\nCluster is cubi." in prompt
+        assert (
+            "Learnings and preferences from earlier sessions "
+            "[1% — 14/3200 chars]:\nUser prefers R." in prompt
+        )
+
+    def test_meter_without_tier_text_adds_no_section(self):
+        prompt = orchestrator_system_prompt(tier1_meter="0% — 0/1200 chars")
+        assert "Standing site notes" not in prompt

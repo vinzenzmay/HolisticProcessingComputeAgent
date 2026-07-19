@@ -114,12 +114,16 @@ def orchestrator_system_prompt(
     environment: str = "",
     tier1: str = "",
     tier2: str = "",
+    tier1_meter: str = "",
+    tier2_meter: str = "",
     skills: str = "",
 ) -> str:
     """System prompt for the orchestrator; dynamic facts injected per render.
 
     Tier 1 memories go into *every* agent's prompt, tier 2 only here (§6.1).
     Skills are listed by name/description only; bodies are fetched on demand.
+    The meters show how full each memory tier is — groundwork for the model
+    managing its own memory under a hard budget (redesign Phase 3).
     """
     parts = [
         "You are HPCA, a terminal assistant helping a scientist with data "
@@ -134,8 +138,16 @@ def orchestrator_system_prompt(
     if skills:
         parts.append(f"{SKILLS_GUIDANCE}\n{skills}")
     if tier1:
-        parts.append(f"Standing site notes:\n{tier1}")
+        label = _metered("Standing site notes", tier1_meter)
+        parts.append(f"{label}:\n{tier1}")
     if tier2:
-        parts.append(f"Learnings and preferences from earlier sessions:\n{tier2}")
+        label = _metered(
+            "Learnings and preferences from earlier sessions", tier2_meter
+        )
+        parts.append(f"{label}:\n{tier2}")
     parts.append(environment or environment_facts())
     return "\n\n".join(parts)
+
+
+def _metered(label: str, meter: str) -> str:
+    return f"{label} [{meter}]" if meter else label

@@ -25,6 +25,27 @@ from hpca.config import LLMSettings
 
 Message = dict[str, Any]
 
+# A message may carry an API-only sidecar: recalled memory context (redesign
+# Phase 1) is appended to what the *model* sees without polluting the stored
+# transcript. The checkpointer round-trips the key untouched; only the wire
+# encoding below substitutes it for the content.
+API_CONTENT_KEY = "api_content"
+
+
+def wire_messages(messages: list[Message]) -> list[Message]:
+    """Messages as sent to the backend: sidecar applied, extras dropped.
+
+    Backends vary in how strictly they validate message objects, so only
+    ``role`` and ``content`` go on the wire.
+    """
+    return [
+        {
+            "role": message["role"],
+            "content": message.get(API_CONTENT_KEY) or message["content"],
+        }
+        for message in messages
+    ]
+
 PROBE_SCHEMA = {
     "type": "object",
     "properties": {"ok": {"type": "boolean"}},
@@ -96,7 +117,7 @@ class LLMClient:
             enable_thinking = self._settings.enable_thinking
         payload: dict[str, Any] = {
             "model": self._settings.model,
-            "messages": messages,
+            "messages": wire_messages(messages),
             "chat_template_kwargs": {"enable_thinking": enable_thinking},
         }
         if json_schema is not None:

@@ -33,6 +33,11 @@ from hpca.db import checkpoints_db_path, connect, init_db
 from hpca.jobs import JobRow, JobStore, poll_active
 from hpca.agent.conclude import MemoryProposal, propose_memories
 from hpca.agent.doc_tools import add_ask_docs, add_doc_tools
+from hpca.agent.memory_context import (
+    build_memory_context,
+    compose_api_content,
+    note_line,
+)
 from hpca.agent.prompts import orchestrator_system_prompt
 from hpca.agent.skill_tools import add_skill_tools
 from hpca.agent.titler import propose_title
@@ -60,7 +65,7 @@ from hpca.runner import (
 )
 from hpca.triage import Signature, append_user_signature
 from hpca.sessions import Session, SessionStore
-from hpca.skills import load_skills, summarize_skills
+from hpca.skills import Skill, any_skills, load_skills, summarize_skills
 from hpca.slurm import TERMINAL_STATES as SLURM_TERMINAL_STATES
 from hpca.slurm import SlurmClient
 from hpca.symbols import SymbolIndex
@@ -522,7 +527,7 @@ class HpcaApp(App):
         self._llm = llm
         self._owns_llm = llm is None
         self.slurm = slurm or self._detect_slurm()
-        self.skills = load_skills()
+        self.skills = load_skills(profile)
         if tools is not None:
             self._tools = tools
         else:
@@ -531,7 +536,9 @@ class HpcaApp(App):
             )
             if self.slurm is not None:
                 add_job_tools(self._tools)
-            if self.skills:
+            # Registered when ANY profile has a skill: the active profile
+            # changes per session, but the tool registry does not.
+            if any_skills():
                 add_skill_tools(self._tools)
         self.active_session: Session | None = None
         self._tool_ctx: ToolContext | None = None
@@ -552,6 +559,12 @@ class HpcaApp(App):
         self._shutting_down = False
         self._turn_ctx: ToolContext | None = None  # that turn's tool context
         self._turn_memory: Profile | None = None  # that turn's profile memories
+        self._turn_skills: list[Skill] | None = None  # that turn's skills
+        # Frozen per-session memory views (redesign Phase 1): one snapshot per
+        # profile, reused across turns so the system-prompt prefix stays
+        # byte-stable for the backend's prefix cache. Refreshed on approved
+        # writes and profile edits, never silently mid-session.
+        self._memory_snapshots: dict[str, Profile] = {}
         self._activity = "working"
         self._conn = None
         self._saver_ctx = None
@@ -577,6 +590,7 @@ class HpcaApp(App):
         if self._llm is None:
             self._llm = LLMClient(self.settings.llm)
         self.profile_memory = Profile.load(self.profile)
+        self._memory_snapshots[self.profile] = self.profile_memory
         if self.profile_memory.problems:
             self.notify(
                 "Profile file has problems: "
@@ -658,20 +672,48 @@ class HpcaApp(App):
             return
         self.copy_text(text)
 
+    def _memory_snapshot(self, profile: str) -> Profile:
+        """The frozen memory view for a profile (loaded once, reused across
+        turns). See ``_memory_snapshots`` for why it is not reloaded per turn."""
+        snapshot = self._memory_snapshots.get(profile)
+        if snapshot is None:
+            snapshot = Profile.load(profile)
+            self._memory_snapshots[profile] = snapshot
+        return snapshot
+
+    def _refresh_memory_snapshot(self, profile: str) -> None:
+        """Drop a profile's frozen view; the next turn reloads from disk.
+
+        Called after approved writes and profile edits — the deliberate
+        refresh points where invalidating the backend's prefix cache is
+        worth it."""
+        self._memory_snapshots.pop(profile, None)
+
     def _render_system_prompt(self) -> str:
         """Per-call prompt assembly (§4.3): memories, skills, dynamic facts.
 
         A running turn reads its own session's profile memories, which may
         not be the profile on screen."""
-        memory = self._turn_memory if self._turn_memory is not None else self.profile_memory
+        memory = (
+            self._turn_memory
+            if self._turn_memory is not None
+            else self._memory_snapshot(self.profile)
+        )
+        skills = self._turn_skills if self._turn_skills is not None else self.skills
+        caps = self.settings.memory
+        backend = self.settings.llm.model
         return orchestrator_system_prompt(
-            tier1=memory.tier_text(1),
-            tier2=memory.tier_text(2),
-            skills=summarize_skills(self.skills),
+            tier1=memory.tier_prompt_text(1, active_backend=backend),
+            tier2=memory.tier_prompt_text(2, active_backend=backend),
+            tier1_meter=memory.usage_meter(1, caps.cap_chars(1)),
+            tier2_meter=memory.usage_meter(2, caps.cap_chars(2)),
+            skills=summarize_skills(skills),
         )
 
     def warn_about_struggles(self, text: str) -> list:
-        """§4.4: warn up front when a request matches a past struggle."""
+        """§4.4: warn the *user* up front when a request matches a past
+        struggle. The model gets its own copy as a fenced memory-context
+        block when the turn starts (``_run_agent``)."""
         matches = matching_struggles(self.profile_memory.memories, text)
         for memory in matches:
             first_line = memory.text.splitlines()[0]
@@ -752,14 +794,23 @@ class HpcaApp(App):
         touches — tool context, transcript log — is captured here, not read
         from whatever session happens to be open when the reply lands.
         """
-        # Memories are shared through the profile file: reload so notes made
-        # in another session (or another running instance, or an editor) are
-        # in this turn's prompt. The turn reads its own session's profile —
-        # an approval may resume it while a differently-profiled session is
-        # open on screen.
-        self._turn_memory = Profile.load(session.profile)
+        # The turn reads its own session's profile snapshot — an approval may
+        # resume it while a differently-profiled session is open on screen.
+        # The snapshot is frozen per session (not reloaded per turn) so the
+        # prompt prefix stays cacheable; approved writes refresh it.
+        self._turn_memory = self._memory_snapshot(session.profile)
         if session.profile == self.profile:
             self.profile_memory = self._turn_memory
+        self._turn_skills = load_skills(session.profile)
+        # Recalled struggle notes ride on the API copy of the user message —
+        # the model is warned in-context, the stored transcript stays clean.
+        api_content = None
+        if user_text is not None:
+            matches = matching_struggles(self._turn_memory.memories, user_text)
+            if matches:
+                block = build_memory_context([note_line(m) for m in matches])
+                if block:
+                    api_content = compose_api_content(user_text, block)
         log = open_log(self.settings, session)
         self._busy_turn = session
         self._turn_ctx = self._make_tool_ctx(session, log, memory=self._turn_memory)
@@ -768,7 +819,13 @@ class HpcaApp(App):
             self._tool_ctx = self._turn_ctx
             self.show_working()
         return self.run_worker(
-            self._agent_turn(session, user_text=user_text, resume=resume, log=log),
+            self._agent_turn(
+                session,
+                user_text=user_text,
+                resume=resume,
+                log=log,
+                api_content=api_content,
+            ),
             exclusive=True,
         )
 
@@ -812,6 +869,7 @@ class HpcaApp(App):
         user_text: str | None,
         resume: Command | None,
         log: SessionLog | None,
+        api_content: str | None = None,
     ) -> None:
         try:
             result = await run_turn(
@@ -819,6 +877,7 @@ class HpcaApp(App):
                 session_id=session.session_id,
                 user_text=user_text,
                 resume=resume,
+                api_content=api_content,
             )
         except Exception as e:
             self.hide_working()
@@ -834,6 +893,7 @@ class HpcaApp(App):
             self._busy_turn = None
             self._turn_ctx = None
             self._turn_memory = None
+            self._turn_skills = None
             # Whatever queued up behind this turn starts as soon as this
             # handler unwinds, rather than waiting for the next timer tick.
             self.call_later(self.drain_work)
@@ -967,6 +1027,24 @@ class HpcaApp(App):
             return
         await self._review_proposals(proposals)
 
+    def _memory_write_blocked(self, tier: int, text: str) -> bool:
+        """Hard char budget on writes (redesign Phase 1): a full tier rejects
+        new memories until the user condenses it. Injection never truncates;
+        only growth is stopped."""
+        if tier not in (1, 2):
+            return False
+        cap = self.settings.memory.cap_chars(tier)
+        if not self.profile_memory.would_exceed(tier, text, cap=cap):
+            return False
+        self.notify(
+            f"Tier {tier} is full "
+            f"({self.profile_memory.usage_meter(tier, cap)}) — memory NOT "
+            "saved. Press ctrl+e to condense the profile, then retry.",
+            severity="warning",
+            timeout=12,
+        )
+        return True
+
     async def _review_proposals(self, proposals: list[MemoryProposal]) -> int:
         """One approval dialog per proposal; only approved ones are kept."""
         kept = 0
@@ -975,6 +1053,8 @@ class HpcaApp(App):
                 MemoryProposalScreen(proposal, i, len(proposals))
             )
             if approved:
+                if self._memory_write_blocked(proposal.tier, proposal.text):
+                    continue
                 self.profile_memory.add_memory(
                     proposal.text,
                     tier=proposal.tier,
@@ -984,6 +1064,7 @@ class HpcaApp(App):
                 kept += 1
         if kept:
             self.profile_memory.save()
+            self._refresh_memory_snapshot(self.profile)
         self.notify(f"Kept {kept} of {len(proposals)} proposed memories.")
         self.check_memory_caps()
         return kept
@@ -1006,6 +1087,8 @@ class HpcaApp(App):
         )
         if not approved:
             return False
+        if self._memory_write_blocked(2, proposal.text):
+            return False
         self.profile_memory.add_memory(
             proposal.text,
             tier=2,
@@ -1013,20 +1096,25 @@ class HpcaApp(App):
             kind=STRUGGLE_KIND,
         )
         self.profile_memory.save()
+        self._refresh_memory_snapshot(self.profile)
         self.notify("Struggle note saved to the profile.")
         self.check_memory_caps()
         return True
 
     def check_memory_caps(self) -> list[int]:
-        """§6.4 size warnings; returns the tiers currently over their cap."""
+        """§6.4 size warnings; returns the tiers currently over their cap.
+
+        A tier can only get over cap through hand edits (in-app writes are
+        rejected at the cap), so the fix offered is the external editor."""
+        caps = self.settings.memory
         over = self.profile_memory.over_cap_tiers(
-            tier1_cap=self.settings.memory.tier1_token_cap,
-            tier2_cap=self.settings.memory.tier2_token_cap,
+            tier1_cap=caps.cap_chars(1),
+            tier2_cap=caps.cap_chars(2),
         )
         for tier in over:
+            meter = self.profile_memory.usage_meter(tier, caps.cap_chars(tier))
             self.notify(
-                f"Profile tier {tier} is over its token cap "
-                f"({self.profile_memory.tier_tokens(tier)} tokens) — "
+                f"Profile tier {tier} is over its budget ({meter}) — "
                 "press ctrl+e to edit the profile externally.",
                 severity="warning",
                 timeout=12,
@@ -1047,6 +1135,7 @@ class HpcaApp(App):
             self.notify(f"Cannot suspend for editing: {e}", severity="error")
             return
         self.profile_memory = Profile.load(self.profile)
+        self._refresh_memory_snapshot(self.profile)
         if self.profile_memory.problems:
             self.notify(
                 "Profile problems after edit: "
@@ -1066,6 +1155,8 @@ class HpcaApp(App):
             return
         self.profile = profile
         self.profile_memory = Profile.load(profile)
+        self._memory_snapshots[profile] = self.profile_memory
+        self.skills = load_skills(profile)
         if self.profile_memory.problems:
             self.notify(
                 "Profile file has problems: "
@@ -1102,7 +1193,9 @@ class HpcaApp(App):
             job_log_dir=app_dir() / "job_logs",
             llm=self._llm,
             trash=self.trash,
-            tier1_text=memory.tier_text(1),
+            tier1_text=memory.tier_prompt_text(
+                1, active_backend=self.settings.llm.model
+            ),
             symbols=self.symbol_index,
             rag=self.rag_store,
             embedder=self.embedder,
@@ -1117,6 +1210,11 @@ class HpcaApp(App):
         return ctx
 
     def _activate_session(self, session: Session) -> None:
+        # A session boundary is a deliberate refresh point (redesign Phase 1):
+        # memories written by another session or instance are picked up here,
+        # while WITHIN a session the frozen snapshot keeps the prompt prefix
+        # byte-stable for the backend's prefix cache.
+        self._refresh_memory_snapshot(session.profile)
         self.active_session = session
         self._refresh_session_log()
         self.query_one("#chat-input", ChatInput).display = True
@@ -1774,8 +1872,9 @@ class HpcaApp(App):
 
     def action_manage_profiles(self) -> None:
         def done(_: object) -> None:
-            # a memory edited here may be the active profile's; reload so the
-            # next turn sees it
+            # a memory edited here may be any profile's; drop every frozen
+            # snapshot so the next turn sees the edits
+            self._memory_snapshots.clear()
             self.profile_memory = Profile.load(self.profile)
             self.run_worker(self._reload_sessions(), group="sessions")
 
@@ -1793,6 +1892,7 @@ class HpcaApp(App):
             )
         else:
             self.notify(f"Saved memories for “{name}”.")
+        self._refresh_memory_snapshot(name)
         if name == self.profile:
             self.profile_memory = profile
 
@@ -1828,9 +1928,11 @@ class HpcaApp(App):
     def delete_profile(self, name: str) -> None:
         moved = self.session_store.reassign_profile(name, "default")
         Profile.delete(name)
+        self._refresh_memory_snapshot(name)
         if self.profile == name:  # unlikely, but keep the app coherent
             self.profile = "default"
             self.profile_memory = Profile.load("default")
+            self.skills = load_skills("default")
         self.notify(
             f"Deleted “{name}”" + (f"; {moved} session(s) moved to default" if moved else "")
         )

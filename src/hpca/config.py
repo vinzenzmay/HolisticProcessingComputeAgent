@@ -71,8 +71,27 @@ class SafetySettings(_Section):
 
 
 class MemorySettings(_Section):
+    # Character budgets for injected profile memory (redesign §2). Chars, not
+    # tokens: char counts are model-independent, and ~4 chars ≈ 1 token. The
+    # caps are hard for writes — a full tier rejects new memories until the
+    # user condenses it — but injection never truncates what is in the file.
+    tier1_char_cap: int = 1200
+    tier2_char_cap: int = 3200
+    # Pre-redesign token caps. Honored (×4 chars) when the char caps above are
+    # left at their defaults, so a hand-tuned settings.json keeps working.
     tier1_token_cap: int = 300
     tier2_token_cap: int = 800
+
+    def cap_chars(self, tier: int) -> int:
+        """Effective char budget for a tier, respecting legacy token caps."""
+        char_field, token_field = {
+            1: ("tier1_char_cap", "tier1_token_cap"),
+            2: ("tier2_char_cap", "tier2_token_cap"),
+        }[tier]
+        char_cap = getattr(self, char_field)
+        if char_cap != type(self).model_fields[char_field].default:
+            return char_cap
+        return getattr(self, token_field) * 4
 
 
 ClipboardMode = Literal["auto", "tmux", "screen", "zellij", "osc52", "command", "file"]

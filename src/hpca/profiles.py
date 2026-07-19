@@ -229,14 +229,53 @@ class Profile:
     def tier_text(self, tier: int) -> str:
         return "\n\n".join(m.text for m in self.memories if m.tier == tier)
 
+    def tier_prompt_text(self, tier: int, *, active_backend: str = "") -> str:
+        """The tier as injected into a prompt: memories learned on a different
+        backend are annotated, not dropped — a workaround for one small model
+        often transfers, and the annotation lets the model weigh it."""
+        parts = []
+        for memory in self.memories:
+            if memory.tier != tier:
+                continue
+            text = memory.text
+            if memory.backend and active_backend and memory.backend != active_backend:
+                text = f"(learned on {memory.backend}) {text}"
+            parts.append(text)
+        return "\n\n".join(parts)
+
     def tier_tokens(self, tier: int) -> int:
         return estimate_tokens(self.tier_text(tier))
 
+    def tier_chars(self, tier: int) -> int:
+        return len(self.tier_text(tier))
+
+    def usage_meter(self, tier: int, cap: int) -> str:
+        """Hermes-style usage meter, e.g. ``58% — 693/1200 chars``.
+
+        Character budgets are model-independent, unlike token counts, which
+        depend on whichever tokenizer the active backend uses.
+        """
+        used = self.tier_chars(tier)
+        percent = round(100 * used / cap) if cap else 0
+        return f"{percent}% — {used}/{cap} chars"
+
+    def would_exceed(self, tier: int, text: str, *, cap: int) -> bool:
+        """Whether adding ``text`` to the tier would break its char budget.
+
+        The budget is hard for *writes* (§6.4 redesign): a full tier rejects
+        new memories until the user condenses it. Injection never truncates —
+        what is in the file is what the model sees.
+        """
+        used = self.tier_chars(tier)
+        added = len(text.strip()) + (2 if used else 0)  # joined with "\n\n"
+        return used + added > cap
+
     def over_cap_tiers(self, *, tier1_cap: int, tier2_cap: int) -> list[int]:
+        """Tiers over their character budget (caps are chars, not tokens)."""
         over = []
-        if self.tier_tokens(1) > tier1_cap:
+        if self.tier_chars(1) > tier1_cap:
             over.append(1)
-        if self.tier_tokens(2) > tier2_cap:
+        if self.tier_chars(2) > tier2_cap:
             over.append(2)
         return over
 

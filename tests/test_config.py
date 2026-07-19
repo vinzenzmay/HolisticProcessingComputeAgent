@@ -260,3 +260,29 @@ class TestKnownLLMPorts:
         s.remember_llm_ports(["http://localhost:51941/v1"])
         s.save(tmp_path / "settings.json")
         assert Settings.load(tmp_path / "settings.json").known_llm_ports == [51941]
+
+
+class TestMemoryCharCaps:
+    """Redesign Phase 1: char budgets, with legacy token caps honored."""
+
+    def test_defaults(self):
+        s = Settings()
+        assert s.memory.cap_chars(1) == 1200
+        assert s.memory.cap_chars(2) == 3200
+
+    def test_explicit_char_cap_wins(self):
+        s = Settings()
+        s.memory.tier1_char_cap = 2000
+        assert s.memory.cap_chars(1) == 2000
+
+    def test_legacy_token_cap_honored_when_char_cap_default(self):
+        # a pre-redesign settings.json that raised the token cap keeps working
+        s = Settings()
+        s.memory.tier2_token_cap = 1000
+        assert s.memory.cap_chars(2) == 4000
+
+    def test_explicit_char_cap_beats_legacy_token_cap(self):
+        s = Settings()
+        s.memory.tier2_char_cap = 2400
+        s.memory.tier2_token_cap = 1000
+        assert s.memory.cap_chars(2) == 2400

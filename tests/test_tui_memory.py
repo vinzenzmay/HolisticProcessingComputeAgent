@@ -305,3 +305,22 @@ class TestEditProfileAction:
             assert any(
                 "edited-in-editor" in m.text for m in app.profile_memory.memories
             )
+
+
+class TestHardWriteBudget:
+    """Redesign Phase 1: a full tier rejects new writes; injection never
+    truncates what is already in the file."""
+
+    async def test_full_tier_blocks_new_writes(self, hpca_home):
+        profile = Profile.load("default")
+        profile.add_memory("x" * 3300, tier=2)  # over the 3200-char budget
+        profile.save()
+        app = HpcaApp(llm=FakeLLM([]))
+        async with app.run_test(size=(120, 40)):
+            assert app._memory_write_blocked(2, "a new learning")
+            assert not app._memory_write_blocked(1, "a short site note")
+
+    async def test_tier3_writes_never_blocked(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM([]))
+        async with app.run_test(size=(120, 40)):
+            assert not app._memory_write_blocked(3, "x" * 10000)
