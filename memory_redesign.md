@@ -74,8 +74,14 @@ with fixed JSON schemas.
 
 ## 1. Target memory taxonomy
 
-One set per profile. A profile remains "a named memory namespace", now covering
-all four layers:
+One set per profile. Profiles are entirely user-defined — there are no
+built-in ones beyond `default`, which exists only as the fallback for
+sessions whose profile was deleted. A user creates blank profiles, copies an
+existing one (all memory tiers and its own skills come along; the two then
+diverge, and the copy records `copied_from`), and deletes them, taking their
+memories, retrieval index and skills with them.
+
+A profile remains "a named memory namespace", now covering all four layers:
 
 1. **Curated memory (tier 1 + tier 2)** — always injected, hard char budget,
    human-editable markdown (format unchanged, §6.2). Tier 1 ≤ 1,200 chars
