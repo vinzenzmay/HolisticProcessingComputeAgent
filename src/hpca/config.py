@@ -85,6 +85,14 @@ class MemorySettings(_Section):
     # default: profiles exist to isolate what each context learns and sees
     # (redesign, resolved question 2).
     cross_profile_search: bool = False
+    # Self-review cadence (redesign Phase 4). Reviews run after the reply is
+    # delivered, so they never compete with the user's turn. Counted in user
+    # turns; a struggling turn triggers one immediately regardless.
+    review_interval: int = 8
+    # Whether self-review may propose entirely NEW skills, as opposed to
+    # patches to existing ones. On so the quality can be judged in practice;
+    # set false if a small model's skill drafts prove not worth reviewing.
+    propose_new_skills: bool = True
 
     def cap_chars(self, tier: int) -> int:
         """Effective char budget for a tier, respecting legacy token caps."""

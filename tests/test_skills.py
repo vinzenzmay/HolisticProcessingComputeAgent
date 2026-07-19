@@ -207,3 +207,63 @@ class TestPerProfileSkills:
         assert not any_skills()
         self.write_in("genetics", "b.md", "---\nname: gen-b\n---\nbody")
         assert any_skills()
+
+
+class TestSkillWriting:
+    """Redesign Phase 4: the self-review loop writes skills back."""
+
+    def test_write_and_reload_round_trip(self, hpca_home):
+        from hpca.skills import write_skill
+
+        write_skill(
+            Skill(
+                name="read-qc",
+                description="Run fastqc then multiqc",
+                triggers=["fastqc", "qc"],
+                body="1. fastqc\n2. multiqc",
+            ),
+            "genetics",
+        )
+        loaded = load_skills("genetics")
+        assert len(loaded) == 1
+        assert loaded[0].name == "read-qc"
+        assert loaded[0].description == "Run fastqc then multiqc"
+        assert loaded[0].triggers == ["fastqc", "qc"]
+        assert "multiqc" in loaded[0].body
+
+    def test_write_goes_under_the_profile(self, hpca_home):
+        from hpca.skills import skills_dir, write_skill
+
+        write_skill(Skill("a", "d", [], "body"), "genetics")
+        assert (skills_dir() / "genetics" / "a.md").exists()
+
+    def test_unsafe_names_are_sanitized(self, hpca_home):
+        from hpca.skills import skill_path
+
+        path = skill_path("../../etc/passwd", "genetics")
+        assert path.name == "etc-passwd.md"  # no separators, no leading dots
+        assert path.parent.name == "genetics"
+
+    def test_empty_name_falls_back(self, hpca_home):
+        from hpca.skills import skill_path
+
+        assert skill_path("...", "genetics").name == "skill.md"
+
+    def test_patched_body_appends_under_a_heading(self):
+        from hpca.skills import patched_body
+
+        skill = Skill("a", "d", [], "1. do the thing")
+        patched = patched_body(skill, "check the index first")
+        assert "1. do the thing" in patched  # original steps survive
+        assert "## Corrections" in patched
+        assert "- check the index first" in patched
+
+    def test_second_patch_reuses_the_heading(self):
+        from hpca.skills import patched_body
+
+        skill = Skill("a", "d", [], "1. do the thing")
+        once = patched_body(skill, "first correction")
+        skill.body = once
+        twice = patched_body(skill, "second correction")
+        assert twice.count("## Corrections") == 1
+        assert "- first correction" in twice and "- second correction" in twice

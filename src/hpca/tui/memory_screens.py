@@ -164,3 +164,56 @@ class MemoryBatchScreen(ModalScreen[bool]):
 
     def action_reject(self) -> None:
         self.dismiss(False)
+
+
+class ReflectionScreen(ModalScreen[bool]):
+    """One self-review proposal: a memory, a struggle note, or a skill
+    change (redesign Phase 4). Skill changes show what would be written, so
+    approving a patch never means approving text nobody read."""
+
+    BINDINGS = [
+        Binding("y", "accept", "accept"),
+        Binding("n", "reject", "reject"),
+        Binding("escape", "reject", "reject", priority=True),
+    ]
+
+    DEFAULT_CSS = """
+    ReflectionScreen { align: center middle; }
+    #reflect-dialog {
+        width: 76;
+        height: auto;
+        max-height: 80%;
+        border: heavy $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    #reflect-hint { color: $text-muted; }
+    #reflect-source { color: $text-muted; }
+    """
+
+    def __init__(self, proposal, index: int, total: int) -> None:
+        super().__init__()
+        self._proposal = proposal
+        self._index = index
+        self._total = total
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="reflect-dialog"):
+            yield Static(
+                f"Self-review proposal {self._index}/{self._total} — "
+                f"{self._proposal.describe()}",
+                id="reflect-title",
+            )
+            yield Static(Content(self._proposal.text), id="reflect-text")
+            if self._proposal.keywords:
+                yield Static(
+                    Content("matches: " + ", ".join(self._proposal.keywords)),
+                    id="reflect-source",
+                )
+            yield Static("(y) keep · (n) discard", id="reflect-hint")
+
+    def action_accept(self) -> None:
+        self.dismiss(True)
+
+    def action_reject(self) -> None:
+        self.dismiss(False)

@@ -40,12 +40,12 @@ from hpca.agent.memory_context import (
 )
 from hpca.agent.memory_tools import add_memory_tools
 from hpca.agent.prompts import orchestrator_system_prompt
+from hpca.agent.reflect import Reflection, propose_reflections
 from hpca.agent.skill_tools import add_skill_tools
 from hpca.agent.titler import propose_title
 from hpca.agent.struggle import (
     STRUGGLE_KIND,
     matching_struggles,
-    propose_struggle_note,
     turn_struggled,
 )
 from hpca.editor import resolve_editor
@@ -69,7 +69,14 @@ from hpca.runner import (
 )
 from hpca.triage import Signature, append_user_signature
 from hpca.sessions import Session, SessionStore
-from hpca.skills import Skill, any_skills, load_skills, summarize_skills
+from hpca.skills import (
+    Skill,
+    any_skills,
+    load_skills,
+    patched_body,
+    summarize_skills,
+    write_skill,
+)
 from hpca.slurm import TERMINAL_STATES as SLURM_TERMINAL_STATES
 from hpca.slurm import SlurmClient
 from hpca.symbols import SymbolIndex
@@ -84,7 +91,11 @@ from hpca.memory_ops import (
     apply_batch,
     drift_detected,
 )
-from hpca.tui.memory_screens import MemoryBatchScreen, MemoryProposalScreen
+from hpca.tui.memory_screens import (
+    MemoryBatchScreen,
+    MemoryProposalScreen,
+    ReflectionScreen,
+)
 from hpca.tui.profiles_screen import ProfilePickerScreen, ProfilesScreen
 from hpca.tui.rename_screen import RenameScreen
 from hpca.tui.settings_screen import SettingsScreen
@@ -576,6 +587,8 @@ class HpcaApp(App):
         # byte-stable for the backend's prefix cache. Refreshed on approved
         # writes and profile edits, never silently mid-session.
         self._memory_snapshots: dict[str, Profile] = {}
+        # User turns since the last self-review, per session (redesign P4).
+        self._turns_since_review: dict[str, int] = {}
         self._activity = "working"
         self._conn = None
         self._saver_ctx = None
@@ -930,7 +943,7 @@ class HpcaApp(App):
             )
             return
         if self._is_active_session(session):
-            await self.maybe_propose_struggle_note(result.messages)
+            await self.maybe_review(session, result.messages)
         await self.maybe_title_session(session, result.messages, log=log)
 
     async def maybe_title_session(
@@ -1150,36 +1163,116 @@ class HpcaApp(App):
             report += " (skipped: " + "; ".join(result.skipped) + ")"
         return f"Saved to memory: {report}"
 
-    async def maybe_propose_struggle_note(self, messages: list[dict]) -> bool:
-        """§4.4: after a bad turn, propose a struggle note for approval."""
-        if not turn_struggled(messages):
-            return False
+    def _review_due(self, session: Session, messages: list[dict]) -> bool:
+        """Whether to look back at this stretch now (redesign Phase 4).
+
+        Two triggers: a turn that visibly went wrong (§4.4 — reviewed at once,
+        while the evidence is in context) and a plain counter, so learnings
+        from conversations that went *fine* are captured too. The counter is
+        what the old struggle-only heuristic was missing: a session where the
+        user corrects a preference never trips a failure marker.
+        """
+        session_id = session.session_id
+        count = self._turns_since_review.get(session_id, 0) + 1
+        self._turns_since_review[session_id] = count
+        if turn_struggled(messages):
+            self._turns_since_review[session_id] = 0
+            return True
+        if count >= max(1, self.settings.memory.review_interval):
+            self._turns_since_review[session_id] = 0
+            return True
+        return False
+
+    async def maybe_review(self, session: Session, messages: list[dict]) -> int:
+        """Self-review: propose what this stretch is worth remembering.
+
+        Runs after the reply is delivered, so it never competes with the
+        user's turn. Best-effort throughout — a failed review is invisible.
+        """
+        if not self._review_due(session, messages):
+            return 0
+        memory = self._memory_snapshot(session.profile)
+        skills = load_skills(session.profile)
         try:
-            note = await propose_struggle_note(
-                self._labelled_llm("struggle"), messages
+            proposals = await propose_reflections(
+                self._labelled_llm("review"),
+                messages,
+                tier1=memory.tier_text(1),
+                tier2=memory.tier_text(2),
+                skills=summarize_skills(skills),
+                allow_new_skills=self.settings.memory.propose_new_skills,
             )
         except Exception:
-            return False  # reflection is best-effort; never disrupt the user
-        proposal = MemoryProposal(
-            tier=2, kind=STRUGGLE_KIND, text=note.render()
-        )
-        approved = await self.push_screen_wait(
-            MemoryProposalScreen(proposal, 1, 1)
-        )
-        if not approved:
-            return False
-        if self._memory_write_blocked(2, proposal.text):
-            return False
-        self.profile_memory.add_memory(
-            proposal.text,
-            tier=2,
-            backend=self.settings.llm.model,
-            kind=STRUGGLE_KIND,
-        )
-        self.profile_memory.save()
-        self._refresh_memory_snapshot(self.profile)
-        self.notify("Struggle note saved to the profile.")
-        self.check_memory_caps()
+            return 0  # reflection is best-effort; never disrupt the user
+        if not proposals:
+            return 0
+        kept = 0
+        for index, proposal in enumerate(proposals, start=1):
+            approved = await self.push_screen_wait(
+                ReflectionScreen(proposal, index, len(proposals))
+            )
+            if approved and self._apply_reflection(proposal, session.profile):
+                kept += 1
+        if kept:
+            self.notify(f"Self-review: kept {kept} of {len(proposals)}.")
+            self.check_memory_caps()
+        return kept
+
+    def _apply_reflection(self, proposal: Reflection, profile: str) -> bool:
+        """Persist one approved proposal; returns whether anything was written."""
+        if proposal.kind in ("memory", "struggle"):
+            text = proposal.memory_text()
+            tier = 2 if proposal.kind == "struggle" else proposal.tier
+            if self._memory_write_blocked(tier, text):
+                return False
+            target = Profile.load(profile)  # merge, don't clobber
+            target.add_memory(
+                text,
+                tier=tier,
+                backend=self.settings.llm.model,
+                kind=STRUGGLE_KIND if proposal.kind == "struggle" else "learning",
+            )
+            target.save()
+            self._refresh_memory_snapshot(profile)
+            if profile == self.profile:
+                self.profile_memory = target
+            return True
+        return self._apply_skill_reflection(proposal, profile)
+
+    def _apply_skill_reflection(self, proposal: Reflection, profile: str) -> bool:
+        existing = {s.name: s for s in load_skills(profile)}
+        if proposal.kind == "skill_patch":
+            skill = existing.get(proposal.skill_name)
+            if skill is None:
+                self.notify(
+                    f"No skill named “{proposal.skill_name}” to patch.",
+                    severity="warning",
+                )
+                return False
+            # Patches land in the profile's own copy, never in _shared/: one
+            # profile's correction must not change another's procedure.
+            skill.body = patched_body(skill, proposal.text)
+            write_skill(skill, profile)
+        else:
+            if proposal.skill_name in existing:
+                self.notify(
+                    f"A skill named “{proposal.skill_name}” already exists.",
+                    severity="warning",
+                )
+                return False
+            write_skill(
+                Skill(
+                    name=proposal.skill_name,
+                    description=" ".join(proposal.text.split())[:60],
+                    triggers=proposal.keywords,
+                    body=proposal.text,
+                ),
+                profile,
+            )
+        if profile == self.profile:
+            self.skills = load_skills(profile)
+        if "read_skill" not in self._tools.names():
+            add_skill_tools(self._tools)  # the first skill enables the tool
         return True
 
     def check_memory_caps(self) -> list[int]:

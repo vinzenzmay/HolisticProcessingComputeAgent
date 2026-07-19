@@ -145,6 +145,49 @@ def any_skills(root: Path | None = None) -> bool:
     )
 
 
+def skill_path(name: str, profile: str, *, root: Path | None = None) -> Path:
+    """Where a profile's own copy of a skill lives. Patches always write
+    here, never into ``_shared/``: one profile's correction must not silently
+    change another profile's procedure."""
+    root = root or skills_dir()
+    # Separators become dashes so a name can never escape the profile dir,
+    # and leading dots are stripped so it cannot become a hidden file either.
+    safe = re.sub(r"[^A-Za-z0-9._-]", "-", name).strip("-.") or "skill"
+    return root / profile / f"{safe}.md"
+
+
+def write_skill(
+    skill: Skill, profile: str, *, root: Path | None = None
+) -> Path:
+    """Persist a skill under a profile, front matter included."""
+    path = skill_path(skill.name, profile, root=root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    front = yaml.safe_dump(
+        {
+            "name": skill.name,
+            "description": skill.description,
+            "triggers": skill.triggers,
+        },
+        sort_keys=False,
+    ).strip()
+    path.write_text(f"---\n{front}\n---\n\n{skill.body.strip()}\n")
+    return path
+
+
+def patched_body(skill: Skill, correction: str) -> str:
+    """A skill body with a correction appended under a stable heading.
+
+    Appending rather than rewriting: a small model asked to restate a whole
+    procedure will quietly drop steps it did not think about, and the user
+    approving the patch can only reasonably review what changed.
+    """
+    heading = "## Corrections"
+    body = skill.body.rstrip()
+    if heading in body:
+        return f"{body}\n\n- {correction.strip()}\n"
+    return f"{body}\n\n{heading}\n\n- {correction.strip()}\n"
+
+
 def summarize_skills(skills: list[Skill]) -> str:
     """One line per skill for the system prompt (names + descriptions only)."""
     return "\n".join(
