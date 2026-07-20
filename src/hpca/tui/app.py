@@ -32,7 +32,13 @@ from hpca.agent.tools import ToolRegistry
 from hpca.clipboard import ClipboardManager, CopyResult
 from hpca import curator
 from hpca.config import LLMBackend, Settings, app_dir
-from hpca.db import checkpoints_db_path, connect, init_db
+from hpca.db import (
+    checkpoints_db_path,
+    command_use_counts,
+    connect,
+    init_db,
+    record_command_use,
+)
 from hpca.jobs import JobRow, JobStore, poll_active
 from hpca.agent.conclude import MemoryProposal, propose_memories
 from hpca.agent.doc_tools import add_ask_docs, add_doc_tools
@@ -276,6 +282,24 @@ class ChatInput(TextArea):
         super().__init__(soft_wrap=True, **kwargs)
 
     async def _on_key(self, event) -> None:
+        # While the slash-command menu is open, ↑/↓ move the selection and
+        # tab/enter fast-select it (enter only fills a partial command; a fully
+        # typed one falls through to submit and runs).
+        if self.app.command_menu_active():
+            if event.key in ("up", "down"):
+                event.stop()
+                event.prevent_default()
+                self.app.command_menu_move(-1 if event.key == "up" else 1)
+                return
+            if event.key == "tab":
+                event.stop()
+                event.prevent_default()
+                self.app.command_menu_accept()
+                return
+            if event.key == "enter" and self.app.command_menu_accept():
+                event.stop()
+                event.prevent_default()
+                return
         if event.key == "enter":
             event.stop()
             event.prevent_default()
@@ -646,6 +670,10 @@ class HpcaApp(App):
         self.active_session: Session | None = None
         self._tool_ctx: ToolContext | None = None
         self._chat_entries: list[Entry] = []
+        # Slash-command autocomplete: the currently-shown (name, usage) matches
+        # and which one the ↑/↓ selection is on.
+        self._command_matches: list[tuple[str, str]] = []
+        self._command_index: int = 0
         self._log: SessionLog | None = None
         self._untitled: set[str] = set()  # sessions awaiting their first title
         self._updated: set[str] = set()  # replies that landed while switched away
@@ -935,20 +963,89 @@ class HpcaApp(App):
         self._update_command_menu(event.text_area.text)
 
     def _update_command_menu(self, draft: str) -> None:
-        """List the chat commands above the entry while one is being typed,
-        narrowed as the name grows — so /memorize is discoverable, not lore."""
+        """List the chat commands above the entry while one is being typed:
+        substring match (so "/skill" finds every command with "skill" in it),
+        most-used first, and ↑/↓ selectable (see ChatInput)."""
         menu = self.query_one("#command-menu", Static)
         stripped = draft.lstrip()
         if not stripped.startswith(("/", "\\")):
             menu.display = False
+            self._command_matches = []
             return
         typed = stripped[1:].split(maxsplit=1)[0] if stripped[1:] else ""
-        matches = [usage for name, usage in COMMANDS if name.startswith(typed)]
-        if not matches:  # unknown: show what exists rather than nothing
-            matches = [usage for _, usage in COMMANDS]
-        menu.border_title = "commands"
-        menu.update(Content("\n".join(matches)))
+        matches = self._matching_commands(typed)
+        if not matches:  # typed something that matches no command: show nothing
+            menu.display = False
+            self._command_matches = []
+            return
+        # Keep the highlight on the same command across keystrokes when it is
+        # still in the list; otherwise start at the top (the most-used match).
+        previous = (
+            self._command_matches[self._command_index][0]
+            if 0 <= self._command_index < len(self._command_matches)
+            else None
+        )
+        self._command_matches = matches
+        self._command_index = next(
+            (i for i, (name, _) in enumerate(matches) if name == previous), 0
+        )
+        menu.border_title = "commands  (↑/↓ select · ⇥ complete)"
+        self._render_command_menu()
         menu.display = True
+
+    def _matching_commands(self, typed: str) -> list[tuple[str, str]]:
+        """(name, usage) pairs whose name contains ``typed``, most-used first
+        then in definition order. Empty ``typed`` matches everything."""
+        needle = typed.lower()
+        order = {name: i for i, (name, _) in enumerate(COMMANDS)}
+        counts = self._command_counts()
+        matches = [(n, u) for n, u in COMMANDS if needle in n.lower()]
+        matches.sort(key=lambda nu: (-counts.get(nu[0], 0), order[nu[0]]))
+        return matches
+
+    def _command_counts(self) -> dict[str, int]:
+        if self._conn is None:
+            return {}
+        try:
+            return command_use_counts(self._conn)
+        except Exception:
+            return {}
+
+    def _render_command_menu(self) -> None:
+        menu = self.query_one("#command-menu", Static)
+        lines = [
+            f"{'▶ ' if i == self._command_index else '  '}{usage}"
+            for i, (_, usage) in enumerate(self._command_matches)
+        ]
+        menu.update(Content("\n".join(lines)))
+
+    def command_menu_active(self) -> bool:
+        """Whether the autocomplete menu is showing selectable matches."""
+        return bool(self._command_matches)
+
+    def command_menu_move(self, delta: int) -> None:
+        if not self._command_matches:
+            return
+        self._command_index = (self._command_index + delta) % len(
+            self._command_matches
+        )
+        self._render_command_menu()
+
+    def command_menu_accept(self) -> bool:
+        """Fill the entry with the highlighted command so arguments can be
+        added. Returns False (let Enter submit) when it is already fully typed.
+        """
+        if not self._command_matches:
+            return False
+        name = self._command_matches[self._command_index][0]
+        chat_input = self.query_one("#chat-input", ChatInput)
+        stripped = chat_input.text.lstrip()
+        typed = stripped[1:].split(maxsplit=1)[0] if stripped[1:] else ""
+        if typed == name:
+            return False  # already complete: Enter runs it
+        chat_input.text = f"/{name} "
+        chat_input.move_cursor(chat_input.document.end)
+        return True
 
     def _run_agent(
         self,
@@ -1261,6 +1358,9 @@ class HpcaApp(App):
     def _handle_slash_command(self, text: str) -> None:
         command, _, rest = text[1:].partition(" ")
         rest = rest.strip()
+        if command in {name for name, _ in COMMANDS} and self._conn is not None:
+            # Count recognised commands so the autocomplete lists them by use.
+            record_command_use(self._conn, command)
         if command == "memorize":
             if not rest:
                 self.notify("Usage: /memorize <note>", severity="warning")

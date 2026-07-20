@@ -93,6 +93,12 @@ CREATE TABLE IF NOT EXISTS processes (
     -- again would tell it the same thing twice.
     background INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS command_usage (
+    -- How often each slash command has been run, so the autocomplete menu can
+    -- list the most-used first.
+    name TEXT PRIMARY KEY,
+    count INTEGER NOT NULL DEFAULT 0
+);
 """
 
 # Columns added after the first release. sqlite has no "ADD COLUMN IF NOT
@@ -146,6 +152,24 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+def record_command_use(conn: sqlite3.Connection, name: str) -> None:
+    """Bump a slash command's run count (upsert), for the frequency sort."""
+    conn.execute(
+        "INSERT INTO command_usage (name, count) VALUES (?, 1) "
+        "ON CONFLICT(name) DO UPDATE SET count = count + 1",
+        (name,),
+    )
+    conn.commit()
+
+
+def command_use_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """Every command's run count, name -> count."""
+    return {
+        row["name"]: row["count"]
+        for row in conn.execute("SELECT name, count FROM command_usage")
+    }
 
 
 def init_db(conn: sqlite3.Connection) -> None:
