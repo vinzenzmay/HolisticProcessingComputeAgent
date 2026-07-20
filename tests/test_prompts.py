@@ -18,9 +18,18 @@ class TestOrchestratorPrompt:
         assert "Standing site notes" not in prompt
         assert "Learnings" not in prompt
 
-    def test_dynamic_date_rendered_per_call(self):
+    def test_volatile_date_stays_out_of_the_prefix(self):
+        # The date/time lives at the tail (api_content), never the system
+        # prompt: putting it here invalidated the backend's prefix KV cache
+        # every minute. The prompt must be a stable, cacheable prefix.
         prompt = orchestrator_system_prompt()
-        assert f"{datetime.now():%Y-%m-%d}" in prompt
+        assert f"{datetime.now():%Y-%m-%d}" not in prompt
+        assert "Current date and time" not in prompt
+
+    def test_prefix_is_identical_across_calls(self):
+        # Same inputs must yield byte-identical output so the prefix caches.
+        args = dict(tier1="Cluster is cubi.", tier2="User prefers R.")
+        assert orchestrator_system_prompt(**args) == orchestrator_system_prompt(**args)
 
     def test_environment_facts_contains_time(self):
         assert f"{datetime.now():%Y-%m-%d}" in environment_facts()

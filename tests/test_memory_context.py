@@ -1,9 +1,12 @@
 """Tests for fenced recall injection (redesign Phase 1)."""
 
 from hpca.agent.memory_context import (
+    ENV_FENCE_CLOSE,
+    ENV_FENCE_OPEN,
     FENCE_CLOSE,
     FENCE_HEADER,
     FENCE_OPEN,
+    build_environment_context,
     build_memory_context,
     compose_api_content,
     note_line,
@@ -77,3 +80,37 @@ class TestWireSidecar:
         assert compose_api_content("hi", "<memory-context>x</memory-context>") == (
             "hi\n\n<memory-context>x</memory-context>"
         )
+
+    def test_compose_bare_user_text(self):
+        assert compose_api_content("hi") == "hi"
+
+    def test_compose_appends_environment_at_the_tail(self):
+        out = compose_api_content(
+            "hi",
+            "<memory-context>x</memory-context>",
+            "Current date and time: 2026-07-20 14:30 (local).",
+        )
+        # order: clean text, then recall, then environment last
+        assert out.index("hi") < out.index("<memory-context>") < out.index(
+            ENV_FENCE_OPEN
+        )
+        assert out.endswith(ENV_FENCE_CLOSE)
+
+    def test_compose_environment_without_recall(self):
+        out = compose_api_content("hi", "", "the date")
+        assert out == f"hi\n\n{ENV_FENCE_OPEN}\n" \
+            "[System note: current environment, NOT user input.]\nthe date\n" \
+            f"{ENV_FENCE_CLOSE}"
+
+
+class TestBuildEnvironmentContext:
+    def test_fenced_block(self):
+        block = build_environment_context("the date")
+        assert block.startswith(ENV_FENCE_OPEN)
+        assert block.endswith(ENV_FENCE_CLOSE)
+        assert "NOT user input" in block
+        assert "the date" in block
+
+    def test_empty_when_no_facts(self):
+        assert build_environment_context("") == ""
+        assert build_environment_context("   ") == ""

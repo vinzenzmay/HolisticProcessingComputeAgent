@@ -96,7 +96,14 @@ ENVIRONMENT_TOOL_GUIDANCE = (
 
 
 def environment_facts() -> str:
-    """Dynamic facts, rendered per call — never stored as memories (§4.3)."""
+    """Volatile facts, rendered per turn — never stored as memories (§4.3).
+
+    These ride the *tail* of the turn (the user message's ``api_content``
+    sidecar), NOT the system prompt: the minute-granularity timestamp used to
+    sit at the front of the prompt and invalidated the backend's prefix KV
+    cache for the whole conversation every time the clock ticked over a minute.
+    Keeping volatile content after the stable history preserves the cache.
+    """
     from datetime import datetime
 
     return f"Current date and time: {datetime.now():%Y-%m-%d %H:%M} (local)."
@@ -145,7 +152,6 @@ SKILLS_GUIDANCE = (
 
 def orchestrator_system_prompt(
     *,
-    environment: str = "",
     tier1: str = "",
     tier2: str = "",
     tier1_meter: str = "",
@@ -154,7 +160,12 @@ def orchestrator_system_prompt(
     session_search: bool = False,
     memory_tool: bool = False,
 ) -> str:
-    """System prompt for the orchestrator; dynamic facts injected per render.
+    """System prompt for the orchestrator; the cacheable prompt *prefix*.
+
+    Everything here is stable across a session so the backend's prefix KV
+    cache survives from turn to turn: only memory approvals, a skill change or
+    a mode switch move it. Volatile facts (the date/time) deliberately live at
+    the tail instead — see ``environment_facts``.
 
     Tier 1 memories go into *every* agent's prompt, tier 2 only here (§6.1).
     Skills are listed by name/description only; bodies are fetched on demand.
@@ -185,7 +196,6 @@ def orchestrator_system_prompt(
             "Learnings and preferences from earlier sessions", tier2_meter
         )
         parts.append(f"{label}:\n{tier2}")
-    parts.append(environment or environment_facts())
     return "\n\n".join(parts)
 
 

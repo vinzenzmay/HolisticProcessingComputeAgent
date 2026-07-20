@@ -44,7 +44,7 @@ from hpca.agent.memory_context import (
 )
 from hpca.agent.memory_tools import add_memory_tools
 from hpca.agent.modes import add_plan_tool, kickoff_message, next_mode
-from hpca.agent.prompts import orchestrator_system_prompt
+from hpca.agent.prompts import environment_facts, orchestrator_system_prompt
 from hpca.agent.reflect import Reflection, propose_reflections
 from hpca.agent.skill_tools import add_skill_tools
 from hpca.agent.titler import propose_title
@@ -949,8 +949,10 @@ class HpcaApp(App):
         if session.profile == self.profile:
             self.profile_memory = self._turn_memory
         self._turn_skills = load_skills(session.profile)
-        # Recalled memory rides on the API copy of the user message — the
-        # model is warned in-context, the stored transcript stays clean.
+        # Recalled memory and the volatile date/time both ride on the API copy
+        # of the user message — the model is warned in-context, the stored
+        # transcript stays clean, and (unlike the system prompt) the tail is
+        # where changing content belongs so the cacheable prefix survives.
         api_content = None
         if user_text is not None:
             lines = self._recall_lines(user_text, self._turn_memory, session.profile)
@@ -959,8 +961,9 @@ class HpcaApp(App):
                 max_notes=self.settings.memory.tier3_prefetch_count,
                 max_chars=self.settings.memory.tier3_prefetch_chars,
             )
-            if block:
-                api_content = compose_api_content(user_text, block)
+            api_content = compose_api_content(
+                user_text, block, environment_facts()
+            )
         log = open_log(self.settings, session)
         self._busy_turn = session
         self._turn_ctx = self._make_tool_ctx(session, log, memory=self._turn_memory)

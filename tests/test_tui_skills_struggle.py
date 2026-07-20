@@ -295,12 +295,19 @@ class TestFencedRecall:
             # the chat transcript shows only the clean message
             assert not any("<memory-context>" in t for t in app.chat_log_texts())
 
-    async def test_non_matching_request_has_no_sidecar(self, hpca_home):
+    async def test_non_matching_request_carries_no_memory_block(self, hpca_home):
+        # The sidecar still rides (it carries the volatile environment facts),
+        # but with nothing recalled it must hold no memory-context block.
         llm = RecordingLLM([respond_json("ok")])
         app = HpcaApp(llm=llm)
         async with app.run_test(size=(120, 40)) as pilot:
             await submit(app, pilot, "hello")
-            assert "api_content" not in llm.calls[0][-1]
+            user = llm.calls[0][-1]
+            assert "<memory-context>" not in user.get("api_content", "")
+            assert user["content"] == "hello"
+            # the volatile facts ride the tail, not the cacheable system prefix
+            assert "<environment>" in user["api_content"]
+            assert "Current date and time" not in llm.calls[0][0]["content"]
 
 
 class TestTierThreeRecall:
@@ -337,7 +344,10 @@ class TestTierThreeRecall:
         app = HpcaApp(llm=llm)
         async with app.run_test(size=(120, 40)) as pilot:
             await submit(app, pilot, "what time is it")
-            assert "api_content" not in llm.calls[0][-1]
+            # sidecar carries env facts, but no tier-3 memory was retrieved
+            user = llm.calls[0][-1]
+            assert "Deepvariant" not in user.get("api_content", "")
+            assert "<memory-context>" not in user.get("api_content", "")
 
     async def test_recall_is_visible_in_the_transcript(self, hpca_home):
         self.write_tier3("Deepvariant needs a GPU partition here.")

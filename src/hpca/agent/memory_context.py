@@ -20,6 +20,14 @@ FENCE_HEADER = (
     "NOT new user input. Treat it as reference data from past sessions.]"
 )
 
+# Volatile facts (date/time) ride the tail of the user message, not the system
+# prompt, so the cacheable prefix stays byte-identical across turns. Fenced and
+# labelled for the same reason the memory block is: a small model otherwise
+# reads a bare "Current date and time: ..." as something the user just typed.
+ENV_FENCE_OPEN = "<environment>"
+ENV_FENCE_CLOSE = "</environment>"
+ENV_HEADER = "[System note: current environment, NOT user input.]"
+
 # Tight by design: this rides on *every* matching user message of a 27B/35B
 # context, so it must stay a hint, not a payload.
 MAX_NOTES = 2
@@ -70,5 +78,27 @@ def build_memory_context(
     return "\n".join([FENCE_OPEN, FENCE_HEADER, *kept, FENCE_CLOSE])
 
 
-def compose_api_content(user_text: str, context_block: str) -> str:
-    return f"{user_text}\n\n{context_block}"
+def build_environment_context(environment: str) -> str:
+    """The fenced environment block, or empty when there are no facts."""
+    if not environment.strip():
+        return ""
+    return "\n".join([ENV_FENCE_OPEN, ENV_HEADER, environment, ENV_FENCE_CLOSE])
+
+
+def compose_api_content(
+    user_text: str, context_block: str = "", environment: str = ""
+) -> str:
+    """The user message as the model sees it: clean text, then recalled memory,
+    then volatile environment facts.
+
+    Recall and environment both ride this sidecar (``hpca.llm.wire_messages``)
+    so they land *after* the stable history and never disturb the cacheable
+    prompt prefix. The stored transcript keeps only ``user_text``.
+    """
+    parts = [user_text]
+    if context_block:
+        parts.append(context_block)
+    env_block = build_environment_context(environment)
+    if env_block:
+        parts.append(env_block)
+    return "\n\n".join(parts)
