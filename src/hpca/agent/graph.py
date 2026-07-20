@@ -42,7 +42,10 @@ from hpca.agent.prompts import orchestrator_system_prompt
 from hpca.agent.tools import ToolRegistry
 from hpca.llm import Message
 
-MAX_TOOL_ROUNDS = 30  # default; overridable per build (llm.max_tool_rounds)
+# Fallback per-turn tool budget for callers that do not pass one. The app
+# passes llm.max_tool_rounds, whose default is -1 (no cap); a non-positive
+# value here means the same — the agent works until it is done.
+MAX_TOOL_ROUNDS = 30
 # Plan mode never ends a turn on a bare chat reply; it feeds the reply back and
 # lets the model try again. Bounded so a model that only ever narrates cannot
 # loop forever — after this many nudges the turn ends with whatever it said.
@@ -147,10 +150,11 @@ def build_graph(
 
     async def orchestrator(state: AgentState) -> dict:
         rounds = state.get("tool_rounds", 0)
-        if rounds >= max_tool_rounds:
+        if max_tool_rounds > 0 and rounds >= max_tool_rounds:
             # Budget spent: don't throw away what the tools found. One last
             # call with NO tools forces the model to answer from the results
             # it already has (it often has the answer and just kept digging).
+            # A non-positive budget means no cap — this branch never fires.
             return await _summarise_and_stop(state)
         compaction = await _maybe_compact(state)
         if compaction:

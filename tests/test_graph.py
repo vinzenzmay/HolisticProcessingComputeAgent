@@ -139,6 +139,21 @@ class TestToolLoop:
         assert result.interrupt is None
         assert len(llm.calls) == 3 + 1  # 3 tool rounds, then the summary
 
+    async def test_non_positive_budget_means_no_cap(self, tools):
+        # -1 (the app default) never triggers the summarise-and-stop path:
+        # the agent keeps calling tools until it answers, past 30 rounds.
+        rounds = 50
+        llm = FakeLLM(
+            [tool_json("echo", text="x")] * rounds + [respond_json("finally done")]
+        )
+        graph = build_graph(
+            llm=llm, tools=tools, checkpointer=InMemorySaver(), max_tool_rounds=-1
+        )
+        result = await run_turn(graph, session_id="s1", user_text="dig deep")
+        assert result.interrupt is None
+        assert result.reply == "finally done"
+        assert len(llm.calls) == rounds + 1  # all tool rounds ran, then the answer
+
     async def test_summary_falling_over_still_stops_cleanly(self, tools):
         # if even the summary call cannot produce a valid decision, the turn
         # ends with a plain message rather than looping or raising
