@@ -9,9 +9,11 @@ A mode is a per-session dial on how much the agent may do unsupervised:
   asking; only genuinely destructive operations (§5.3) still gate.
 * ``full-auto`` — auto with the destructive gate off too: nothing pauses
   for approval. The trash/backup layer (§5.3 recovery) is the only net.
-* ``plan`` — nothing executes. Script tools are withdrawn from the registry
-  (deterministic, not prompt-trust), look-around commands gate like manual,
-  and the model maintains a checklist via the ``update_plan`` tool. The plan
+* ``plan`` — nothing is built or submitted. Script tools are withdrawn from
+  the registry (deterministic, not prompt-trust); the one look-around command
+  that stays (run_bash) runs unattended unless its script would destroy
+  something, in which case the destructive gate (§5.3) still asks. The model
+  maintains a checklist via the ``update_plan`` tool. The plan
   lives in the graph state, so it survives restarts with the checkpoint and
   is re-injected into the system prompt every round — a prompt-only plan
   mode is forgotten as soon as compaction folds the instruction away.
@@ -34,10 +36,13 @@ MODES = ("manual", "auto", "full-auto", "plan")
 
 # Tools that execute something on the system. In manual mode each call gates;
 # in plan mode they are withdrawn entirely — except run_bash, the bounded
-# look-around tool, which stays available but gates so the plan can still be
-# grounded in what is actually on disk. create_script only writes into the
-# scripts dir and is syntax-checked, so manual mode lets it through and gates
-# the run instead — the approval then shows the finished script.
+# look-around tool, which stays available so the plan can be grounded in what
+# is actually on disk. run_bash no longer gates for every call in plan mode;
+# it falls back to the destructive-op gate (§5.3), so only a genuinely
+# destructive look-around command pauses for approval. create_script only
+# writes into the scripts dir and is syntax-checked, so manual mode lets it
+# through and gates the run instead — the approval then shows the finished
+# script.
 EXECUTION_TOOLS = frozenset({"run_script", "start_script", "run_bash", "submit_job"})
 PLAN_BLOCKED_TOOLS = frozenset(
     {"create_script", "run_script", "start_script", "submit_job"}
@@ -60,8 +65,14 @@ def next_mode(mode: str) -> str:
 
 
 def requires_execution_approval(mode: str | None, tool_name: str) -> bool:
-    """Whether this mode gates the call beyond the destructive-op gate."""
-    return mode in ("manual", "plan") and tool_name in EXECUTION_TOOLS
+    """Whether this mode shows every execution tool for approval first.
+
+    Only manual mode does. Plan mode used to gate here too, but that made the
+    user approve every benign look-around; plan mode now relies solely on the
+    destructive-op gate (§5.3), which run_bash trips only when its script would
+    actually destroy something.
+    """
+    return mode == "manual" and tool_name in EXECUTION_TOOLS
 
 
 def destructive_approval_required(mode: str | None) -> bool:
@@ -135,11 +146,13 @@ FULL_AUTO_MODE_GUIDANCE = (
 )
 
 PLAN_MODE_GUIDANCE = (
-    "Plan mode is on: the user wants a plan first — nothing is executed "
-    "yet. You MUST NOT run scripts or change anything; script tools are "
-    "disabled, and a look-around command (run_bash) runs only with the "
-    "user's explicit approval. Investigate what the plan needs by CALLING "
-    "TOOLS — read files, check docs, look around. Do NOT narrate what you "
+    "Plan mode is on: the user wants a plan first — nothing is built or "
+    "submitted yet. You MUST NOT change anything; the script tools are "
+    "disabled. Look-around commands (run_bash) run freely to ground the "
+    "plan — only a command that would destroy something pauses for the "
+    "user's approval, and planning should not need one. Investigate what "
+    "the plan needs by CALLING TOOLS — read files, check docs, look "
+    "around. Do NOT narrate what you "
     "are about to do, and do NOT end your turn with a chat message: in plan "
     "mode a bare reply does not hand anything to the user, it is ignored and "
     "you are asked to keep going. When the plan is ready — OR when you need "

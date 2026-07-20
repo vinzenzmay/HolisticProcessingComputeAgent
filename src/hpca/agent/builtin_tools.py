@@ -14,6 +14,7 @@ graph — the message text is written for the model to act on.
 
 from __future__ import annotations
 
+import re
 import sys
 import time
 from typing import Literal
@@ -283,6 +284,78 @@ class RunBashParams(BaseModel):
     )
 
 
+# ----------------------------------------------------- run_bash destructiveness
+# run_bash runs arbitrary bash, so — unlike the file tools — its destructiveness
+# lives in the script text, not in structured arguments. This is a best-effort
+# heuristic that lets a genuinely destructive look-around command trip the §5.3
+# gate (so plan/auto mode still pause on it) while benign look-around runs
+# unattended. It is deliberately NOT airtight: the trash/backup layer is the
+# real net. It matches only the *leading* command of each `;`/`|`/`&`-separated
+# segment, so a path, pattern, or comment merely mentioning `rm` does not trip
+# it. Like the other is_destructive_call predicates it must stay pure and
+# deterministic — the graph re-runs it when a parked turn resumes.
+DESTRUCTIVE_COMMANDS = frozenset(
+    {
+        "rm", "rmdir", "dd", "mkfs", "shred", "truncate", "fdisk",
+        "mkswap", "wipefs", "chmod", "chown", "mv", "scancel",
+    }
+)
+# Words that stand in front of the real command without being it.
+_COMMAND_WRAPPERS = frozenset(
+    {"sudo", "command", "nohup", "time", "env", "exec", "xargs", "nice", "ionice"}
+)
+_SEGMENT_SPLIT = re.compile(r"[;&|\n]+")  # command separators (|, ||, &&, ;, &)
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")  # leading VAR=val
+
+
+def _segment_command(segment: str) -> str:
+    """The command a single shell segment would run, or '' if none.
+
+    Leading ``VAR=val`` assignments and wrapper words (``sudo``, ``xargs``, …)
+    are skipped so ``find . | sudo rm`` resolves to ``rm``.
+    """
+    for token in segment.split():
+        if _ASSIGNMENT.match(token):
+            continue
+        base = token.rsplit("/", 1)[-1]  # /bin/rm -> rm
+        if base in _COMMAND_WRAPPERS:
+            continue
+        return base
+    return ""
+
+
+def _bash_commands(content_lines: list[str]) -> list[str]:
+    commands: list[str] = []
+    for raw in content_lines:
+        line = raw.split("#", 1)[0]  # drop inline comments (heuristic)
+        for segment in _SEGMENT_SPLIT.split(line):
+            cmd = _segment_command(segment)
+            if cmd:
+                commands.append(cmd)
+    return commands
+
+
+def _bash_flagged(content_lines: list[str]) -> list[str]:
+    return sorted(
+        {
+            cmd
+            for cmd in _bash_commands(content_lines)
+            if cmd in DESTRUCTIVE_COMMANDS or cmd.startswith("mkfs.")
+        }
+    )
+
+
+def _bash_is_destructive(args: RunBashParams, ctx: object = None) -> bool:
+    return bool(_bash_flagged(args.content_lines))
+
+
+def _describe_bash(args: RunBashParams, ctx: object = None) -> str:
+    flagged = _bash_flagged(args.content_lines)
+    if not flagged:
+        return ""
+    return "Flagged command(s): " + ", ".join(flagged)
+
+
 async def run_bash(args: RunBashParams, ctx: ToolContext) -> str:
     """Write a throwaway bash script, syntax-check it, run it, wait, and return
     its output — all in one call.
@@ -372,6 +445,8 @@ def default_tool_registry() -> ToolRegistry:
             ),
             params=RunBashParams,
             handler=run_bash,
+            is_destructive_call=_bash_is_destructive,
+            describe_call=_describe_bash,
         )
     )
     registry.register(

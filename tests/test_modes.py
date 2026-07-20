@@ -7,6 +7,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from hpca.agent.builtin_tools import _bash_is_destructive
 from hpca.agent.graph import MAX_PLAN_NUDGES, build_graph, run_turn
 from hpca.agent.modes import (
     EXECUTION_TOOLS,
@@ -77,6 +78,8 @@ def tools():
             description="Run a bash script",
             params=BashParams,
             handler=bash_handler,
+            # Mirror production wiring so mode tests exercise the real gate.
+            is_destructive_call=_bash_is_destructive,
         )
     )
     registry.register(
@@ -117,7 +120,9 @@ class TestHelpers:
     def test_execution_approval_by_mode(self):
         for name in EXECUTION_TOOLS:
             assert requires_execution_approval("manual", name)
-            assert requires_execution_approval("plan", name)
+            # plan no longer blanket-gates execution tools: it leans on the
+            # destructive gate instead, so benign look-around runs unattended.
+            assert not requires_execution_approval("plan", name)
             assert not requires_execution_approval("auto", name)
             assert not requires_execution_approval("full-auto", name)
             assert not requires_execution_approval(None, name)
@@ -131,7 +136,7 @@ class TestHelpers:
     def test_plan_mode_withdraws_execution_tools(self, tools):
         offered = tools_for_mode(tools, "plan")
         assert "run_script" not in offered.names()
-        assert "run_bash" in offered.names()  # look-around stays, but gated
+        assert "run_bash" in offered.names()  # look-around stays available
         # planning ends through present_plan; update_plan is execution-phase
         assert "present_plan" in offered.names()
         assert "update_plan" not in offered.names()
@@ -431,12 +436,28 @@ class TestPlanMode:
         assert result.reply == "done"
         assert len(llm.calls) == 1  # no nudge outside plan mode
 
-    async def test_look_around_gates_in_plan_mode(self, tools):
-        llm = FakeLLM([tool_json("run_bash", content_lines=["ls"])])
+    async def test_benign_look_around_runs_unattended_in_plan_mode(self, tools):
+        # A read-only look-around no longer gates in plan mode — it just runs,
+        # and the turn ends normally when the model presents the plan.
+        llm = FakeLLM(
+            [
+                tool_json("run_bash", content_lines=["ls"]),
+                tool_json("present_plan", steps=[{"text": "s", "done": False}]),
+            ]
+        )
+        graph = make_graph(llm, tools, "plan")
+        result = await run_turn(graph, session_id="s1", user_text="plan it")
+        assert result.interrupt is None
+        assert any("run_bash: ran" in m["content"] for m in result.messages)
+
+    async def test_destructive_look_around_gates_in_plan_mode(self, tools):
+        # A destructive one-shot still pauses — via the destructive gate now,
+        # not the execution gate.
+        llm = FakeLLM([tool_json("run_bash", content_lines=["rm -rf /data/x"])])
         graph = make_graph(llm, tools, "plan")
         result = await run_turn(graph, session_id="s1", user_text="plan it")
         assert result.interrupt is not None
-        assert result.interrupt["kind"] == "execution"
+        assert result.interrupt["kind"] == "destructive"
 
     def _peek_tool(self, tools):
         async def peek(args, ctx):

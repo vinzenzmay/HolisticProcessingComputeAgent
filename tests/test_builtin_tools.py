@@ -171,7 +171,9 @@ class TestRegistryShape:
             "list_paths",
         }
 
-    def test_no_tool_is_destructive_yet(self, tools):
+    def test_no_tool_is_unconditionally_destructive(self, tools):
+        # run_bash gates conditionally (see TestRunBashDestructiveGate); no
+        # builtin is destructive on every call.
         assert all(not t.destructive for t in tools)
 
 
@@ -369,6 +371,54 @@ class TestRunBash:
         # no bash_* keys clutter the registry the model reasons over
         assert not any(k.startswith("bash_") for k in ctx.registry.list())
         assert ctx.runner.list()[0].state == "finished"
+
+
+class TestRunBashDestructiveGate:
+    """run_bash trips the §5.3 destructive gate when — and only when — its
+    script's leading command would destroy something. This lets plan/auto mode
+    run benign look-around unattended while still pausing on `rm -rf`."""
+
+    def gates(self, tools, content_lines):
+        tool = tools.get("run_bash")
+        args = tool.params.model_validate({"content_lines": content_lines})
+        return tool.gates(args, None)
+
+    @pytest.mark.parametrize(
+        "lines",
+        [
+            ["ls -la"],
+            ["find / -name '*.rm' 2>/dev/null"],  # rm only in a pattern
+            ["# rm this later"],  # rm only in a comment
+            ["samtools view x.bam | head"],
+            ["echo 'rm is dangerous'"],  # rm inside a string, not a command
+            ["grep -r rm ."],  # rm is an argument, not the command
+        ],
+    )
+    def test_benign_look_around_does_not_gate(self, tools, lines):
+        assert not self.gates(tools, lines)
+
+    @pytest.mark.parametrize(
+        "lines",
+        [
+            ["rm -rf /data/x"],
+            ["dd if=/dev/zero of=/data/x"],
+            ["/bin/rm x"],  # absolute path resolves to rm
+            ["scancel 123"],
+            ["mkfs.ext4 /dev/sdb1"],
+            ["sudo shred -u secret"],  # wrapper skipped -> shred
+            ["find . -name '*.tmp' | xargs rm"],  # destructive tail of a pipe
+            ["echo hi", "truncate -s 0 log"],  # a later line
+            ["DEBUG=1 chmod 000 file"],  # leading assignment skipped -> chmod
+        ],
+    )
+    def test_destructive_commands_gate(self, tools, lines):
+        assert self.gates(tools, lines)
+
+    def test_describe_names_the_flagged_command(self, tools):
+        tool = tools.get("run_bash")
+        args = tool.params.model_validate({"content_lines": ["rm -rf x", "dd if=a"]})
+        details = tool.describe_call(args, None)
+        assert "rm" in details and "dd" in details
 
 
 class TestBashFailFast:
