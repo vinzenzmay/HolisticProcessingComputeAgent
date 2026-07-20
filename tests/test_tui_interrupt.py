@@ -7,7 +7,14 @@ import pytest
 from textual.widgets import Static
 
 from hpca.llm import ChatResponse
-from hpca.tui.app import ESC_INTERRUPT_TICKS, ChatInput, HpcaApp
+from hpca.tui.app import (
+    ESC_IDLE_FACTOR,
+    ESC_IDLE_INITIAL,
+    ESC_IDLE_MIN,
+    ESC_INTERRUPT_TICKS,
+    ChatInput,
+    HpcaApp,
+)
 
 
 def is_title_request(json_schema):
@@ -113,3 +120,31 @@ class TestInterrupt:
             assert app._interrupt_worker is None  # nothing fired
             assert not app.query_one("#esc-progress", Static).display
             app._llm.release.set()
+
+
+class TestReleaseWatchdog:
+    """How fast the progress bar clears after esc is let go. Terminals give no
+    key-release, so the watchdog adapts to the measured key-repeat interval."""
+
+    def test_waits_the_full_initial_delay_before_a_repeat_is_seen(self):
+        app = HpcaApp(llm=BlockingLLM())
+        assert app._esc_gap is None
+        # Nothing measured yet: must survive the OS's long initial repeat delay.
+        assert app._esc_release_idle() == ESC_IDLE_INITIAL
+
+    def test_fast_repeat_clears_quickly(self):
+        app = HpcaApp(llm=BlockingLLM())
+        app._esc_gap = 0.03  # ~33 repeats/sec, a typical terminal
+        idle = app._esc_release_idle()
+        assert idle == ESC_IDLE_MIN  # floored, far below the old 0.75s lag
+        assert idle < ESC_IDLE_INITIAL
+
+    def test_moderate_repeat_scales_with_a_margin(self):
+        app = HpcaApp(llm=BlockingLLM())
+        app._esc_gap = 0.08
+        assert app._esc_release_idle() == pytest.approx(0.08 * ESC_IDLE_FACTOR)
+
+    def test_slow_repeat_is_capped_so_a_hold_is_never_cut_off(self):
+        app = HpcaApp(llm=BlockingLLM())
+        app._esc_gap = 0.4  # a slow-repeat config; interval < cap keeps holds alive
+        assert app._esc_release_idle() == ESC_IDLE_INITIAL

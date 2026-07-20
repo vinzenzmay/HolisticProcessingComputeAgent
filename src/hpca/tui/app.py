@@ -167,9 +167,15 @@ ESC_INTERRUPT_SECONDS = 3.0
 ESC_TICK_SECONDS = 0.05
 ESC_INTERRUPT_TICKS = int(ESC_INTERRUPT_SECONDS / ESC_TICK_SECONDS)
 # Terminals send no key-release, so a held esc is inferred from its repeat
-# events; if none arrive for this long the hold is treated as released. Longer
-# than a typical key-repeat delay so the first repeat still lands in time.
-ESC_IDLE_SECONDS = 0.75
+# events; if none arrive for this long the hold is treated as released. The gap
+# before the FIRST repeat is the OS's initial key-repeat delay (long, up to
+# ~0.5s), so until a repeat lands we must wait ESC_IDLE_INITIAL. But once
+# repeats are flowing they arrive fast and steadily, so we measure that interval
+# and drop to a much shorter watchdog — that is what clears the bar promptly on
+# release instead of lingering the full initial delay.
+ESC_IDLE_INITIAL = 0.75
+ESC_IDLE_MIN = 0.12  # floor once measured: quick release, still tolerant of jitter
+ESC_IDLE_FACTOR = 2.5  # margin over the measured repeat interval, so a hold survives
 ESC_BAR_WIDTH = 24
 CHAT_TITLES = {
     "user": "you",
@@ -730,6 +736,10 @@ class HpcaApp(App):
         self._esc_timer = None
         self._esc_idle = None
         self._esc_ticks = 0
+        # Timing to learn the terminal's key-repeat interval (see ESC_IDLE_*):
+        # the last esc-event time and the smallest gap seen between events.
+        self._esc_last: float | None = None
+        self._esc_gap: float | None = None
         # Work waiting for the orchestrator: messages the user typed while a
         # turn was running, and background completions reporting in. Exactly
         # one turn runs at a time — two on one thread_id would interleave
@@ -1121,17 +1131,36 @@ class HpcaApp(App):
         from esc auto-repeat; each event refreshes the release watchdog."""
         if not self._can_interrupt():
             return False
+        now = monotonic()
         if self._esc_timer is None:
             self._esc_ticks = 0
+            self._esc_gap = None
             self._render_esc_bar()
             self.query_one("#esc-progress", Static).display = True
             self._esc_timer = self.set_interval(
                 ESC_TICK_SECONDS, self._advance_esc_hold
             )
+        elif self._esc_last is not None:
+            # The first gap is the OS's initial repeat delay; steady repeats are
+            # shorter. Track the smallest so we settle on the true interval.
+            gap = now - self._esc_last
+            self._esc_gap = gap if self._esc_gap is None else min(self._esc_gap, gap)
+        self._esc_last = now
         if self._esc_idle is not None:
             self._esc_idle.stop()
-        self._esc_idle = self.set_timer(ESC_IDLE_SECONDS, self._cancel_esc_hold)
+        self._esc_idle = self.set_timer(self._esc_release_idle(), self._cancel_esc_hold)
         return True
+
+    def _esc_release_idle(self) -> float:
+        """Seconds of esc-event silence that count as a release. Before any
+        repeat has landed we cannot tell a slow initial-delay hold from a
+        release, so we wait ESC_IDLE_INITIAL; once we have measured the steady
+        repeat interval we clear the bar a small margin after it — fast for the
+        common quick-repeat terminal, but still long enough that a genuine hold
+        on a slow-repeat terminal is not cut off."""
+        if self._esc_gap is None:
+            return ESC_IDLE_INITIAL
+        return max(ESC_IDLE_MIN, min(ESC_IDLE_INITIAL, self._esc_gap * ESC_IDLE_FACTOR))
 
     def _advance_esc_hold(self) -> None:
         self._esc_ticks += 1
@@ -1156,6 +1185,8 @@ class HpcaApp(App):
             self._esc_idle.stop()
             self._esc_idle = None
         self._esc_ticks = 0
+        self._esc_last = None
+        self._esc_gap = None
         found = self.query("#esc-progress")
         if found:
             found.first(Static).display = False
