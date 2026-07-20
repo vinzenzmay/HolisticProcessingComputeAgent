@@ -7,16 +7,18 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-from hpca.agent.graph import build_graph, run_turn
+from hpca.agent.graph import MAX_PLAN_NUDGES, build_graph, run_turn
 from hpca.agent.modes import (
     EXECUTION_TOOLS,
     MODES,
+    PresentPlanParams,
     add_plan_tool,
     destructive_approval_required,
     kickoff_message,
     mode_prompt_suffix,
     next_mode,
     parse_checklist,
+    present_plan_reply,
     render_checklist,
     requires_execution_approval,
     skipped_message,
@@ -130,13 +132,29 @@ class TestHelpers:
         offered = tools_for_mode(tools, "plan")
         assert "run_script" not in offered.names()
         assert "run_bash" in offered.names()  # look-around stays, but gated
-        assert "update_plan" in offered.names()
+        # planning ends through present_plan; update_plan is execution-phase
+        assert "present_plan" in offered.names()
+        assert "update_plan" not in offered.names()
 
-    def test_other_modes_keep_the_registry(self, tools):
-        assert tools_for_mode(tools, "manual") is tools
-        assert tools_for_mode(tools, "auto") is tools
-        assert tools_for_mode(tools, "full-auto") is tools
-        assert tools_for_mode(tools, None) is tools
+    def test_other_modes_offer_update_plan_not_present_plan(self, tools):
+        for mode in ("manual", "auto", "full-auto", None):
+            offered = tools_for_mode(tools, mode)
+            assert "present_plan" not in offered.names()
+            assert "update_plan" in offered.names()
+            assert "run_script" in offered.names()
+
+    def test_a_registry_without_plan_tools_is_returned_unchanged(self):
+        bare = ToolRegistry()
+        bare.register(
+            Tool(
+                name="run_bash",
+                description="Run a bash script",
+                params=BashParams,
+                handler=bash_handler,
+            )
+        )
+        assert tools_for_mode(bare, "auto") is bare
+        assert tools_for_mode(bare, "plan") is bare
 
     def test_checklist_round_trip(self):
         steps = [
@@ -176,6 +194,27 @@ class TestHelpers:
 
     def test_kickoff_names_the_mode(self):
         assert "auto mode" in kickoff_message("auto")
+
+    def test_present_plan_needs_a_step_or_a_question(self):
+        with pytest.raises(ValueError):
+            PresentPlanParams()
+        # either alone is enough
+        assert PresentPlanParams(steps=[{"text": "s", "done": False}])
+        assert PresentPlanParams(open_questions=["q"])
+
+    def test_present_plan_reply_carries_summary_and_questions(self):
+        args = PresentPlanParams(
+            steps=[{"text": "s", "done": False}],
+            summary="my plan",
+            open_questions=["which build?"],
+        )
+        text = present_plan_reply(args)
+        assert "my plan" in text
+        assert "which build?" in text
+
+    def test_present_plan_reply_has_a_default_when_no_summary(self):
+        args = PresentPlanParams(steps=[{"text": "s", "done": False}])
+        assert present_plan_reply(args).strip()
 
 
 class TestManualMode:
@@ -286,43 +325,111 @@ class TestFullAutoMode:
 
 
 class TestPlanMode:
-    async def test_blocked_tools_are_not_offered(self, tools):
-        llm = FakeLLM([respond_json()])
+    async def test_planning_offers_present_plan_not_execution_or_update(self, tools):
+        # present_plan is terminal, so one decision is enough to inspect the
+        # offered tool listing without the nudge loop needing more outputs.
+        llm = FakeLLM(
+            [tool_json("present_plan", steps=[{"text": "s", "done": False}])]
+        )
         graph = make_graph(llm, tools, "plan")
         await run_turn(graph, session_id="s1", user_text="plan something")
         # the tool listing (not the guidance prose) is what the model can call
-        assert '"tool": "run_script"' not in system_text(llm, 0)
-        assert '"tool": "update_plan"' in system_text(llm, 0)
+        text = system_text(llm, 0)
+        assert '"tool": "run_script"' not in text
+        assert '"tool": "present_plan"' in text
+        assert '"tool": "update_plan"' not in text  # execution-phase only
 
-    async def test_update_plan_lands_in_state_and_prompt(self, tools):
+    async def test_present_plan_stores_the_checklist_and_ends_the_turn(self, tools):
         steps = [
             {"text": "find inputs", "done": False},
             {"text": "write script", "done": False},
         ]
         llm = FakeLLM(
-            [tool_json("update_plan", steps=steps), respond_json("here is the plan")]
+            [tool_json("present_plan", steps=steps, summary="here is the plan")]
         )
         graph = make_graph(llm, tools, "plan")
         result = await run_turn(graph, session_id="s1", user_text="plan the run")
         assert result.plan == steps
-        # the next decision after update_plan sees the checklist re-injected
-        assert "Current plan checklist" in system_text(llm, 1)
-        assert "[ ] find inputs" in system_text(llm, 1)
+        assert result.reply == "here is the plan"
+        assert result.interrupt is None
+        assert len(llm.calls) == 1  # present_plan ends the turn in one decision
+
+    async def test_present_plan_with_only_questions_asks_without_a_plan(self, tools):
+        llm = FakeLLM(
+            [tool_json("present_plan", open_questions=["Which reference build?"])]
+        )
+        graph = make_graph(llm, tools, "plan")
+        result = await run_turn(graph, session_id="s1", user_text="plan it")
+        assert result.plan is None  # no checklist yet: nothing to approve
+        assert "Which reference build?" in result.reply
 
     async def test_plan_survives_into_the_next_turn(self, tools):
         steps = [{"text": "only step", "done": False}]
         llm = FakeLLM(
             [
-                tool_json("update_plan", steps=steps),
-                respond_json("planned"),
-                respond_json("still here"),
+                tool_json("present_plan", steps=steps, summary="planned"),
+                tool_json("present_plan", steps=steps, summary="still here"),
             ]
         )
         graph = make_graph(llm, tools, "plan")
         await run_turn(graph, session_id="s1", user_text="plan it")
         result = await run_turn(graph, session_id="s1", user_text="thoughts?")
         assert result.plan == steps
-        assert "[ ] only step" in system_text(llm, 2)
+        # the next turn's first decision sees the stored checklist re-injected
+        assert "[ ] only step" in system_text(llm, 1)
+
+    async def test_bare_reply_is_nudged_then_the_action_is_taken(self, tools):
+        # A narration-only reply must not end the plan turn: the model is
+        # nudged and, on retry, takes the action it only described.
+        seen = []
+
+        async def peek_handler(args, ctx):
+            seen.append(args.registry_key)
+            return "peeked"
+
+        tools.register(
+            Tool(
+                name="peek",
+                description="Look at something (no side effects)",
+                params=KeyParams,
+                handler=peek_handler,
+            )
+        )
+        llm = FakeLLM(
+            [
+                respond_json("Let me check the sniffles config first."),
+                tool_json("peek", registry_key="sniffles"),
+                tool_json("present_plan", steps=[{"text": "run it", "done": False}]),
+            ]
+        )
+        graph = make_graph(llm, tools, "plan")
+        result = await run_turn(graph, session_id="s1", user_text="plan it")
+        assert seen == ["sniffles"]  # the described action actually ran
+        assert result.plan == [{"text": "run it", "done": False}]
+        # the fumbled narration is fed back as a nudge, never persisted
+        assert any(
+            "[continue]" in m["content"] for m in llm.calls[1]["messages"]
+        )
+        assert not any(
+            "Let me check the sniffles config" in m["content"]
+            for m in result.messages
+        )
+
+    async def test_nudge_gives_up_after_the_budget(self, tools):
+        # A model that only ever narrates cannot hang the turn: after the
+        # nudge budget it ends with whatever it last said.
+        llm = FakeLLM([respond_json("a"), respond_json("b"), respond_json("c")])
+        graph = make_graph(llm, tools, "plan")
+        result = await run_turn(graph, session_id="s1", user_text="plan it")
+        assert len(llm.calls) == MAX_PLAN_NUDGES + 1
+        assert result.reply == "c"
+
+    async def test_bare_reply_ends_the_turn_outside_plan_mode(self, tools):
+        llm = FakeLLM([respond_json("done")])
+        graph = make_graph(llm, tools, "auto")
+        result = await run_turn(graph, session_id="s1", user_text="go")
+        assert result.reply == "done"
+        assert len(llm.calls) == 1  # no nudge outside plan mode
 
     async def test_look_around_gates_in_plan_mode(self, tools):
         llm = FakeLLM([tool_json("run_bash", content_lines=["ls"])])
@@ -330,6 +437,62 @@ class TestPlanMode:
         result = await run_turn(graph, session_id="s1", user_text="plan it")
         assert result.interrupt is not None
         assert result.interrupt["kind"] == "execution"
+
+    def _peek_tool(self, tools):
+        async def peek(args, ctx):
+            return "ok"
+
+        tools.register(
+            Tool(
+                name="peek",
+                description="Look at something (no side effects)",
+                params=KeyParams,
+                handler=peek,
+            )
+        )
+
+    async def test_budget_exhaustion_forces_the_plan_handoff(self, tools):
+        # Out of look-around budget mid-planning: the turn ends by presenting
+        # the plan, not by trailing off in chat (the "30 steps" failure).
+        self._peek_tool(tools)
+        steps = [{"text": "run sawfish", "done": False}]
+        llm = FakeLLM(
+            [tool_json("peek", registry_key="x")] * 2
+            + [tool_json("present_plan", steps=steps, summary="best plan for now")]
+        )
+        graph = build_graph(
+            llm=llm,
+            tools=tools,
+            checkpointer=InMemorySaver(),
+            mode_fn=lambda: "plan",
+            max_tool_rounds=2,
+        )
+        result = await run_turn(graph, session_id="s1", user_text="plan it")
+        assert result.plan == steps
+        assert result.reply == "best plan for now"
+        # the budget call offered present_plan (not an empty registry)
+        combined = " ".join(m["content"] for m in llm.calls[-1]["messages"])
+        assert '"tool": "present_plan"' in combined
+        assert "look-around steps" in combined
+
+    async def test_budget_exhaustion_still_ends_if_the_model_will_not_present(
+        self, tools
+    ):
+        self._peek_tool(tools)
+        llm = FakeLLM(
+            [tool_json("peek", registry_key="x")] * 2
+            + [respond_json("here is what I found")]
+        )
+        graph = build_graph(
+            llm=llm,
+            tools=tools,
+            checkpointer=InMemorySaver(),
+            mode_fn=lambda: "plan",
+            max_tool_rounds=2,
+        )
+        result = await run_turn(graph, session_id="s1", user_text="plan it")
+        assert result.reply == "here is what I found"
+        assert result.plan is None
 
 
 class TestPersistence:

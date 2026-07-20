@@ -208,8 +208,11 @@ class TestPlanFlow:
         app = HpcaApp(
             llm=FakeLLM(
                 [
-                    tool_json("update_plan", steps=self.STEPS),
-                    respond_json("here is my plan"),
+                    # present_plan both records the checklist and ends the
+                    # planning turn, so the handoff dialog opens (§3.5).
+                    tool_json(
+                        "present_plan", steps=self.STEPS, summary="here is my plan"
+                    ),
                     *extra_outputs,
                 ]
             )

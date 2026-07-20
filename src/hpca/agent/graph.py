@@ -25,11 +25,14 @@ from hpca.agent import compact
 from hpca.agent.middleware import (
     DecisionError,
     DirectResponse,
+    ToolCall,
     decide,
 )
 from hpca.agent.modes import (
+    PLAN_CONTINUE_NUDGE,
     destructive_approval_required,
     mode_prompt_suffix,
+    present_plan_reply,
     requires_execution_approval,
     script_preview,
     skipped_message,
@@ -40,6 +43,10 @@ from hpca.agent.tools import ToolRegistry
 from hpca.llm import Message
 
 MAX_TOOL_ROUNDS = 30  # default; overridable per build (llm.max_tool_rounds)
+# Plan mode never ends a turn on a bare chat reply; it feeds the reply back and
+# lets the model try again. Bounded so a model that only ever narrates cannot
+# loop forever — after this many nudges the turn ends with whatever it said.
+MAX_PLAN_NUDGES = 2
 
 
 def _append(left: list, right: list) -> list:
@@ -153,31 +160,48 @@ def build_graph(
         # the model is never shown is one it cannot call (§3.5).
         active_tools = tools_for_mode(tools, mode)
         system: Message = {"role": "system", "content": _system_text(state, mode)}
-        report("LLM processing")
-        try:
-            decision = await decide(
-                llm,
-                [system] + _view(state),
-                active_tools,
-                max_retries=max_retries,
-            )
-        except DecisionError as e:
-            return _final(f"I failed to produce a valid action: {e}") | compaction
-        report_usage(decision.usage)
-        # This decision produces the next message, whether it is the answer
-        # below or the tool result execute_tool appends.
-        thinking = _thinking(state, decision.reasoning)
-        if isinstance(decision, DirectResponse):
-            return _final(decision.text) | thinking | compaction
-        return {
-            "pending_tool": {
-                "tool": decision.tool.name,
-                "arguments": decision.arguments.model_dump(),
-            },
-            "tool_rounds": rounds + 1,
-            **thinking,
-            **compaction,
-        }
+        # In plan mode a turn ends only through present_plan (handled below).
+        # A bare chat reply is almost always the model announcing its next
+        # step instead of taking it, so feed it back with a nudge and let it
+        # retry — bounded, and the fumbled narration is never persisted, the
+        # same shape as decide()'s validation-retry. Other modes never nudge.
+        nudges: list[Message] = []
+        for attempt in range(MAX_PLAN_NUDGES + 1):
+            report("LLM processing")
+            try:
+                decision = await decide(
+                    llm,
+                    [system] + _view(state) + nudges,
+                    active_tools,
+                    max_retries=max_retries,
+                )
+            except DecisionError as e:
+                return _final(f"I failed to produce a valid action: {e}") | compaction
+            report_usage(decision.usage)
+            # This decision produces the next message, whether it is the answer
+            # below or the tool result execute_tool appends.
+            thinking = _thinking(state, decision.reasoning)
+            if isinstance(decision, DirectResponse):
+                if mode == "plan" and attempt < MAX_PLAN_NUDGES:
+                    nudges = nudges + [
+                        {"role": "assistant", "content": decision.text},
+                        {"role": "user", "content": PLAN_CONTINUE_NUDGE},
+                    ]
+                    continue
+                return _final(decision.text) | thinking | compaction
+            if decision.tool.name == "present_plan":
+                # The explicit end of a planning turn: record the checklist and
+                # answer with the plan; the TUI then offers it for approval.
+                return _present_plan(decision.arguments) | thinking | compaction
+            return {
+                "pending_tool": {
+                    "tool": decision.tool.name,
+                    "arguments": decision.arguments.model_dump(),
+                },
+                "tool_rounds": rounds + 1,
+                **thinking,
+                **compaction,
+            }
 
     async def execute_tool(state: AgentState) -> dict:
         pending = state["pending_tool"]
@@ -264,6 +288,48 @@ def build_graph(
         compaction = await _maybe_compact(state)
         if compaction:
             state = {**state, **compaction}
+        mode = current_mode()
+        system: Message = {"role": "system", "content": _system_text(state, mode)}
+        # Plan mode never trails off in chat, not even out of budget: hand the
+        # plan over instead. Offer only present_plan so the model finishes the
+        # turn the one way it should — the best plan it has now, unknowns as
+        # open questions — and the TUI still gets a checklist to approve.
+        if mode == "plan" and "present_plan" in tools.names():
+            note = {
+                "role": "user",
+                "content": (
+                    f"[tool budget: you have used all {max_tool_rounds} "
+                    "look-around steps this turn]\nStop investigating and hand "
+                    "the plan over now: call present_plan with the best "
+                    "checklist you can from what you have already found, and "
+                    "put anything still uncertain in open_questions. Do not ask "
+                    "to read more."
+                ),
+            }
+            report("LLM processing")
+            try:
+                decision = await decide(
+                    llm,
+                    [system] + _view(state) + [note],
+                    tools.subset(["present_plan"]),
+                    max_retries=max_retries,
+                )
+            except DecisionError:
+                return _final(
+                    f"I used all {max_tool_rounds} look-around steps this turn "
+                    "without finishing the plan. Tell me how to proceed."
+                ) | compaction
+            report_usage(decision.usage)
+            thinking = _thinking(state, decision.reasoning)
+            if isinstance(decision, ToolCall) and decision.tool.name == "present_plan":
+                return _present_plan(decision.arguments) | thinking | compaction
+            text = (
+                decision.text
+                if isinstance(decision, DirectResponse)
+                else f"I used all {max_tool_rounds} look-around steps. Tell me "
+                "how to proceed."
+            )
+            return _final(text) | thinking | compaction
         budget_note = {
             "role": "user",
             "content": (
@@ -273,10 +339,6 @@ def build_graph(
                 "the finding if you have it, or say plainly what is still "
                 "missing and what single next step would get it."
             ),
-        }
-        system: Message = {
-            "role": "system",
-            "content": _system_text(state, current_mode()),
         }
         report("LLM processing")
         try:
@@ -304,6 +366,18 @@ def build_graph(
             "pending_tool": None,
             "tool_rounds": 0,
         }
+
+    def _present_plan(args: Any) -> dict:
+        """End a planning turn on an explicit present_plan call: answer with
+        the plan and store the checklist so the TUI hands it over (§3.5).
+
+        Empty steps (a plan-blocking question with no checklist yet) leave any
+        earlier plan untouched — only a real checklist replaces it.
+        """
+        update = _final(present_plan_reply(args))
+        if args.steps:
+            update["plan"] = [step.model_dump() for step in args.steps]
+        return update
 
     def _tool_message(content: str) -> dict:
         # Tool results use the user role: vLLM/Qwen templates reject

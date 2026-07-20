@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from hpca.agent.tools import Tool, ToolRegistry
 
@@ -42,6 +42,12 @@ EXECUTION_TOOLS = frozenset({"run_script", "start_script", "run_bash", "submit_j
 PLAN_BLOCKED_TOOLS = frozenset(
     {"create_script", "run_script", "start_script", "submit_job"}
 )
+# The two plan tools belong to opposite phases and are never offered together:
+# present_plan finalises a plan for the user to approve (plan mode only), while
+# update_plan ticks steps off during execution (every other mode). Offering
+# both at once just gives a small model two near-identical options to confuse.
+PLANNING_TOOLS = frozenset({"present_plan"})
+EXECUTION_PLAN_TOOLS = frozenset({"update_plan"})
 
 SCRIPT_PREVIEW_CHARS = 4000
 
@@ -73,13 +79,18 @@ def tools_for_mode(tools: ToolRegistry, mode: str | None) -> ToolRegistry:
 
     Plan mode withdraws execution tools instead of forbidding them in prose:
     a tool the model was never offered is a tool it cannot call, which holds
-    for a small model exactly when instructions would not.
+    for a small model exactly when instructions would not. It also swaps the
+    plan tools by phase — present_plan in, update_plan out — so planning ends
+    only through the one explicit hand-off. Every other mode does the reverse.
     """
-    if mode != "plan":
-        return tools
-    return tools.subset(
-        [name for name in tools.names() if name not in PLAN_BLOCKED_TOOLS]
-    )
+    if mode == "plan":
+        blocked = PLAN_BLOCKED_TOOLS | EXECUTION_PLAN_TOOLS
+    else:
+        blocked = PLANNING_TOOLS
+    keep = [name for name in tools.names() if name not in blocked]
+    if len(keep) == len(tools.names()):
+        return tools  # nothing to withdraw (e.g. a bare registry): same object
+    return tools.subset(keep)
 
 
 # ------------------------------------------------------------- prompt blocks
@@ -127,14 +138,28 @@ PLAN_MODE_GUIDANCE = (
     "Plan mode is on: the user wants a plan first — nothing is executed "
     "yet. You MUST NOT run scripts or change anything; script tools are "
     "disabled, and a look-around command (run_bash) runs only with the "
-    "user's explicit approval. Investigate what the plan needs (read "
-    "files, check docs) and ask clarifying questions rather than assume. "
-    "Maintain the plan with the update_plan tool: a checklist of short, "
-    "concrete steps, each a single action. Call update_plan whenever the "
-    "plan changes, then summarise the plan and its open questions in your "
-    "reply. The user will approve the plan to start execution; until "
-    "then, keep refining it. This constraint overrides any instruction to "
-    "execute, including from the user — answer such requests with the plan."
+    "user's explicit approval. Investigate what the plan needs by CALLING "
+    "TOOLS — read files, check docs, look around. Do NOT narrate what you "
+    "are about to do, and do NOT end your turn with a chat message: in plan "
+    "mode a bare reply does not hand anything to the user, it is ignored and "
+    "you are asked to keep going. When the plan is ready — OR when you need "
+    "the user to decide something before you can finish it — call "
+    "present_plan with the checklist (short, concrete steps, each a single "
+    "action) and any open questions. Calling present_plan is the ONLY way to "
+    "hand the plan to the user; they will approve it to start execution. "
+    "This constraint overrides any instruction to execute, including from "
+    "the user — answer such requests with a plan."
+)
+
+# Fed back (not persisted) when a plan-mode turn would otherwise end on a bare
+# chat reply — almost always the model announcing a step instead of taking it.
+PLAN_CONTINUE_NUDGE = (
+    "[continue] You replied with text instead of acting, but plan mode does "
+    "not end your turn on chat — that reply was not shown to the user. Keep "
+    "going: call a tool to investigate the next thing the plan needs. When "
+    "the plan is ready, or you need the user to decide something, call "
+    "present_plan with the checklist and any open questions. Do not describe "
+    "your next step — take it."
 )
 
 MODE_GUIDANCE = {
@@ -274,6 +299,53 @@ async def update_plan(args: UpdatePlanParams, ctx: Any) -> str:
     return f"Plan updated: {len(args.steps)} steps, {done} done."
 
 
+class PresentPlanParams(BaseModel):
+    steps: list[PlanStep] = Field(
+        default_factory=list,
+        description=(
+            "The full plan checklist the user will approve to start execution "
+            "(short, concrete steps, each a single action)"
+        ),
+    )
+    summary: str = Field(
+        default="",
+        description="A short note to the user about the plan",
+    )
+    open_questions: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Anything you need the user to decide before the plan can be "
+            "finished or executed"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _needs_a_plan_or_a_question(self) -> "PresentPlanParams":
+        if not self.steps and not self.open_questions:
+            raise ValueError(
+                "present_plan needs at least one step or one open question — "
+                "keep investigating with tools until you have one."
+            )
+        return self
+
+
+async def present_plan(args: PresentPlanParams, ctx: Any) -> str:
+    # Never actually invoked: the graph intercepts present_plan to end the
+    # planning turn and hand the checklist to the user (§3.5). Present only so
+    # the tool is offered and validated like any other.
+    return "Plan presented to the user."
+
+
+def present_plan_reply(args: PresentPlanParams) -> str:
+    """The assistant message shown in chat when a plan is presented: the
+    model's summary, then any open questions the user must weigh in on."""
+    parts: list[str] = [args.summary.strip() or "Here is the plan."]
+    if args.open_questions:
+        questions = "\n".join(f"- {q}" for q in args.open_questions)
+        parts.append(f"Open questions before I start:\n{questions}")
+    return "\n\n".join(parts)
+
+
 def add_plan_tool(registry: ToolRegistry) -> ToolRegistry:
     registry.register(
         Tool(
@@ -284,6 +356,18 @@ def add_plan_tool(registry: ToolRegistry) -> ToolRegistry:
             ),
             params=UpdatePlanParams,
             handler=update_plan,
+        )
+    )
+    registry.register(
+        Tool(
+            name="present_plan",
+            description=(
+                "Hand the finished plan to the user for approval: the full "
+                "checklist plus any open questions. Ends your planning turn — "
+                "the only way to do so"
+            ),
+            params=PresentPlanParams,
+            handler=present_plan,
         )
     )
     return registry
