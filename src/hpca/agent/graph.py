@@ -86,7 +86,7 @@ def build_graph(
     # (tests, bare graphs): behaves exactly like before.
     current_mode = mode_fn or (lambda: None)
     # A turn is silent for seconds or minutes; this is what the TUI's spinner
-    # names, so a wait is legible as thinking or as a particular
+    # names, so a wait is legible as the LLM processing or as a particular
     # tool running.
     report = on_activity or (lambda activity: None)
     window = max_model_len or (lambda: None)
@@ -153,7 +153,7 @@ def build_graph(
         # the model is never shown is one it cannot call (§3.5).
         active_tools = tools_for_mode(tools, mode)
         system: Message = {"role": "system", "content": _system_text(state, mode)}
-        report("thinking")
+        report("LLM processing")
         try:
             decision = await decide(
                 llm,
@@ -278,7 +278,7 @@ def build_graph(
             "role": "system",
             "content": _system_text(state, current_mode()),
         }
-        report("thinking")
+        report("LLM processing")
         try:
             decision = await decide(
                 llm,

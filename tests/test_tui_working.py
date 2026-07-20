@@ -151,7 +151,7 @@ class TestSpinnerLifecycle:
 
 
 class TestSpinnerText:
-    async def test_it_says_the_model_is_thinking(self, hpca_home):
+    async def test_it_says_the_llm_is_processing(self, hpca_home):
         llm = SlowLLM([respond_json("ok")])
         app = HpcaApp(llm=llm)
         async with app.run_test(size=(120, 40)) as pilot:
@@ -159,11 +159,11 @@ class TestSpinnerText:
             spinner = await wait_for_spinner(app, pilot)
             for _ in range(20):  # the graph reports as it starts the call
                 await pilot.pause()
-                if spinner.activity == "thinking":
+                if spinner.activity == "LLM processing":
                     break
                 await asyncio.sleep(0.01)
-            assert spinner.activity == "thinking"
-            assert "thinking…" in str(spinner.content)
+            assert spinner.activity == "LLM processing"
+            assert "LLM processing…" in str(spinner.content)
             llm.released.set()
             await app.workers.wait_for_complete()
 
@@ -206,7 +206,7 @@ class TestSpinnerText:
             await send(app, pilot)
             await app.workers.wait_for_complete()
             await pilot.pause()
-            assert seen[:3] == ["thinking", "running list_dir", "thinking"]
+            assert seen[:3] == ["LLM processing", "running list_dir", "LLM processing"]
 
     async def test_frames_advance_and_the_step_is_timed(self, hpca_home):
         llm = SlowLLM([respond_json("ok")])
@@ -226,7 +226,7 @@ class TestSpinnerText:
             await app.workers.wait_for_complete()
 
     async def test_a_new_step_restarts_the_clock(self, hpca_home):
-        spinner = WorkingIndicator("thinking")
+        spinner = WorkingIndicator("LLM processing")
         spinner._started -= 30  # as if it had been thinking for half a minute
         assert spinner.elapsed >= 30
         spinner.set_activity("running list_dir")
@@ -234,7 +234,7 @@ class TestSpinnerText:
         assert spinner.activity == "running list_dir"
 
     async def test_repeating_the_same_step_does_not_restart_the_clock(self, hpca_home):
-        spinner = WorkingIndicator("thinking")
+        spinner = WorkingIndicator("LLM processing")
         spinner._started -= 30
-        spinner.set_activity("thinking")
+        spinner.set_activity("LLM processing")
         assert spinner.elapsed >= 30
