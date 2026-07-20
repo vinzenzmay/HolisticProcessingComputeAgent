@@ -22,13 +22,25 @@ class Session:
     # Interaction mode (§3.5): manual | auto | full-auto | plan;
     # "" = configured default.
     mode: str = ""
+    # The LLM this session talks to, as the JSON of an LLMBackend (model,
+    # base_url, api_key, …). Chosen when the session is created; "" means fall
+    # back to the app's bootstrap client. Stored on the session so the choice
+    # survives even if that backend is later removed from the catalog.
+    backend: str = ""
 
 
 class SessionStore:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
-    def create(self, *, profile: str, title: str = "untitled", mode: str = "") -> Session:
+    def create(
+        self,
+        *,
+        profile: str,
+        title: str = "untitled",
+        mode: str = "",
+        backend: str = "",
+    ) -> Session:
         session = Session(
             session_id=str(uuid.uuid4()),
             profile=profile,
@@ -36,11 +48,12 @@ class SessionStore:
             created_at=datetime.now(timezone.utc).isoformat(),
             checkpoint_ref="",
             mode=mode,
+            backend=backend,
         )
         session.checkpoint_ref = session.session_id
         self._conn.execute(
             "INSERT INTO sessions (session_id, profile, title, created_at, "
-            "checkpoint_ref, mode) VALUES (?, ?, ?, ?, ?, ?)",
+            "checkpoint_ref, mode, backend) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 session.session_id,
                 session.profile,
@@ -48,6 +61,7 @@ class SessionStore:
                 session.created_at,
                 session.checkpoint_ref,
                 session.mode,
+                session.backend,
             ),
         )
         self._conn.commit()
@@ -56,6 +70,13 @@ class SessionStore:
     def set_mode(self, session_id: str, mode: str) -> None:
         self._conn.execute(
             "UPDATE sessions SET mode = ? WHERE session_id = ?", (mode, session_id)
+        )
+        self._conn.commit()
+
+    def set_backend(self, session_id: str, backend: str) -> None:
+        self._conn.execute(
+            "UPDATE sessions SET backend = ? WHERE session_id = ?",
+            (backend, session_id),
         )
         self._conn.commit()
 
@@ -134,4 +155,5 @@ class SessionStore:
             created_at=row["created_at"],
             checkpoint_ref=row["checkpoint_ref"],
             mode=row["mode"] if "mode" in row.keys() else "",
+            backend=row["backend"] if "backend" in row.keys() else "",
         )

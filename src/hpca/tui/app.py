@@ -37,7 +37,7 @@ from hpca.agent.job_tools import add_job_tools
 from hpca.agent.tools import ToolRegistry
 from hpca.clipboard import ClipboardManager, CopyResult
 from hpca import curator
-from hpca.config import LLMBackend, Settings, app_dir
+from hpca.config import LLMBackend, Settings, app_dir, llm_settings_for
 from hpca.db import (
     checkpoints_db_path,
     command_use_counts,
@@ -687,6 +687,10 @@ class HpcaApp(App):
         self.profile = profile
         self._llm = llm
         self._owns_llm = llm is None
+        # Per-session LLM clients, built lazily from each session's stored
+        # backend and keyed by base_url||model so sessions on the same backend
+        # share one. Closed en masse on unmount.
+        self._session_clients: dict[str, LLMClient] = {}
         self.slurm = slurm or self._detect_slurm()
         self.skills = load_skills(profile)
         if tools is not None:
@@ -846,6 +850,8 @@ class HpcaApp(App):
             await self.embedder.close()
         if self._owns_llm and self._llm is not None:
             await self._llm.close()
+        for client in self._session_clients.values():
+            await client.close()
 
     # ------------------------------------------------------------- clipboard
 
@@ -913,7 +919,7 @@ class HpcaApp(App):
         )
         skills = self._turn_skills if self._turn_skills is not None else self.skills
         caps = self.settings.memory
-        backend = self.settings.llm.model
+        backend = self._active_model()
         return orchestrator_system_prompt(
             tier1=memory.tier_prompt_text(1, active_backend=backend),
             tier2=memory.tier_prompt_text(2, active_backend=backend),
@@ -942,7 +948,7 @@ class HpcaApp(App):
                 hits = index.search(
                     user_text,
                     profile=profile,
-                    active_backend=self.settings.llm.model,
+                    active_backend=self._active_model(),
                     limit=self.settings.memory.tier3_prefetch_count,
                 )
             except Exception:
@@ -1708,7 +1714,7 @@ class HpcaApp(App):
                 self.profile_memory.add_memory(
                     proposal.text,
                     tier=proposal.tier,
-                    backend=self.settings.llm.model,
+                    backend=self._active_model(),
                     kind=proposal.kind,
                 )
                 kept += 1
@@ -1734,7 +1740,7 @@ class HpcaApp(App):
             result = apply_batch(
                 loaded,
                 operations,
-                backend=self.settings.llm.model,
+                backend=self._active_model(),
                 caps=caps,
             )
         except MemoryOpError as e:
@@ -1854,7 +1860,7 @@ class HpcaApp(App):
             target.add_memory(
                 text,
                 tier=tier,
-                backend=self.settings.llm.model,
+                backend=self._active_model(),
                 kind=STRUGGLE_KIND if proposal.kind == "struggle" else "learning",
             )
             target.save()
@@ -2021,7 +2027,7 @@ class HpcaApp(App):
             llm=self._llm,
             trash=self.trash,
             tier1_text=memory.tier_prompt_text(
-                1, active_backend=self.settings.llm.model
+                1, active_backend=self._active_model()
             ),
             symbols=self.symbol_index,
             rag=self.rag_store,
@@ -2050,11 +2056,14 @@ class HpcaApp(App):
         self._refresh_session_log()
         self.query_one("#chat-input", ChatInput).display = True
         self._refresh_mode_bar()
+        # The top bar and context meter follow the opened session's LLM.
+        self._refresh_top_bar()
+        self._refresh_context_bar()
         if self._log is not None:
             self._log.write(
                 "session opened",
                 f"{session.session_id} · profile {self.profile} · "
-                f"model {self.settings.llm.model}",
+                f"model {self._active_model()}",
             )
 
     def _refresh_session_log(self) -> None:
@@ -2076,32 +2085,74 @@ class HpcaApp(App):
         return LoggedLLM(self._llm, sink, label=lambda: f"subagent:{label}")
 
     def pick_profile_for_new_session(self) -> None:
-        """Every new session starts by choosing its profile (or creating one)."""
+        """Every new session starts by choosing its profile (or creating one),
+        then the LLM it will talk to."""
 
         def chosen(profile: str | None) -> None:
             if profile is not None:
-                self.run_worker(
-                    self.start_new_session(profile=profile), group="sessions"
-                )
+                self._pick_llm_for_new_session(profile)
 
         self.push_screen(ProfilePickerScreen(current=self.profile), chosen)
 
-    async def start_new_session(self, profile: str | None = None) -> None:
-        """Open an empty session under the given profile and start typing.
+    def _pick_llm_for_new_session(self, profile: str) -> None:
+        """Choose the LLM the new session uses. With no configured backends
+        there is nothing to pick, so fall back to the bootstrap client."""
+        backends = list(self.settings.backends)
+        if not backends:
+            self.run_worker(
+                self.start_new_session(profile=profile), group="sessions"
+            )
+            return
 
-        An untouched session is reused (and retagged to the chosen profile)
-        rather than piling up empty rows when "(new session)" is entered
-        repeatedly.
+        def chosen(backend: LLMBackend | None) -> None:
+            if backend is None:
+                return  # cancelled the LLM pick: no session is created
+            self.run_worker(
+                self.start_new_session(
+                    profile=profile, backend=backend.model_dump_json()
+                ),
+                group="sessions",
+            )
+
+        self.push_screen(
+            SwitchLLMScreen(
+                backends,
+                self.settings.is_active,
+                title="LLM for the new session",
+            ),
+            chosen,
+        )
+
+    async def start_new_session(
+        self, profile: str | None = None, *, backend: str = ""
+    ) -> None:
+        """Open an empty session under the given profile and LLM, and start
+        typing.
+
+        An untouched session is reused (retagged to the chosen profile and
+        backend) rather than piling up empty rows when "(new session)" is
+        entered repeatedly.
         """
         profile = profile or self.profile
         self._set_working_profile(profile)
         if self._is_untouched(self.active_session):
+            changed = False
             if self.active_session.profile != profile:
                 self.session_store.set_profile(
                     self.active_session.session_id, profile
                 )
                 self.active_session.profile = profile
+                changed = True
+            if backend and self.active_session.backend != backend:
+                self.session_store.set_backend(
+                    self.active_session.session_id, backend
+                )
+                self.active_session.backend = backend
+                changed = True
+            if changed:
                 self._refresh_session_log()
+                self._refresh_top_bar()
+                self._refresh_context_bar()
                 await self._reload_sessions()
         else:
             self._activate_session(
@@ -2109,6 +2160,7 @@ class HpcaApp(App):
                     profile=profile,
                     title=UNTITLED_SESSION,
                     mode=self.settings.agent.default_mode,
+                    backend=backend,
                 )
             )
             await self._set_chat_messages([])
@@ -2729,7 +2781,8 @@ class HpcaApp(App):
         if action in ("manage_llms", "confirm_quit", "manage_profiles"):
             return on_sessions
         if action == "switch_llm":
-            return in_chat
+            # Switches the open session's LLM, so it needs one.
+            return in_chat and self.active_session is not None
         if action == "cycle_mode":
             # Mode is a per-session dial; without a session there is nothing
             # to switch. Only from the chat column — on the sessions and
@@ -2898,6 +2951,9 @@ class HpcaApp(App):
         )
 
     def action_switch_llm(self) -> None:
+        """Change which LLM the OPEN session talks to (§ per-session LLM)."""
+        if self.active_session is None:
+            return
         if not self.settings.backends:
             self.notify(
                 "No backends configured yet — press (m) to discover and add some.",
@@ -2910,23 +2966,40 @@ class HpcaApp(App):
                 self.switch_backend(backend)
 
         self.push_screen(
-            SwitchLLMScreen(list(self.settings.backends), self.settings.is_active),
+            SwitchLLMScreen(
+                list(self.settings.backends),
+                self._marks_session_backend,
+                title="Switch this session's LLM",
+            ),
             apply,
         )
 
+    def _marks_session_backend(self, backend: LLMBackend) -> bool:
+        """Whether ``backend`` is the open session's current LLM (the ★)."""
+        active = self._active_backend()
+        if active is None:
+            return self.settings.is_active(backend)
+        return (
+            active.base_url == backend.base_url and active.model == backend.model
+        )
+
     def switch_backend(self, backend: LLMBackend) -> None:
-        """Make a configured backend the active one, now and on next start."""
+        """Point the open session at a different configured backend."""
         if self._busy_turn is not None:
             self.notify(
                 "The agent is mid-reply — switch backends once it finishes.",
                 severity="warning",
             )
             return
-        self.settings.activate_backend(backend)
-        self.settings.save()
-        self._replace_llm()
+        if self.active_session is None:
+            return
+        blob = backend.model_dump_json()
+        self.session_store.set_backend(self.active_session.session_id, blob)
+        self.active_session.backend = blob
         self._refresh_top_bar()
-        self.notify(f"Switched to {backend.model}")
+        self._refresh_context_bar()
+        self._refresh_session_log()  # rebind the tool context to the new client
+        self.notify(f"This session now uses {backend.model}")
 
     def reload_llm(self) -> None:
         """Rebuild the client so edited LLM settings apply to the next turn.
@@ -2964,7 +3037,9 @@ class HpcaApp(App):
 
     def _rebuild_graph(self) -> None:
         self.graph = build_graph(
-            llm=self._llm,
+            # Per-session LLM: the turn resolves its client from whichever
+            # session is running (busy turn), so no rebuild is needed on switch.
+            llm=lambda: self._client_for(self._busy_turn or self.active_session),
             tools=self._tools,
             checkpointer=self._checkpointer,
             # a running turn keeps its own context however the UI moves on
@@ -2979,14 +3054,53 @@ class HpcaApp(App):
             mode_fn=self._turn_mode,
         )
 
-    def _active_max_model_len(self) -> int | None:
-        """The active backend's context window.
+    # --------------------------------------------------- per-session LLM
 
-        Preferred source is what the backend told us on connect (it knows how
-        it was launched); the catalog entry is the fallback for a backend that
-        does not advertise it. Without either, compaction stays off — better
+    def _backend_of(self, session: Session | None) -> LLMBackend | None:
+        """The LLMBackend a session talks to, parsed from its stored JSON, or
+        None to mean the bootstrap client."""
+        if session is None or not session.backend:
+            return None
+        try:
+            return LLMBackend.model_validate_json(session.backend)
+        except Exception:
+            return None
+
+    def _client_for(self, session: Session | None) -> LLMClient:
+        """The LLM client for a session: its own backend's client (built and
+        cached on first use), or the bootstrap client when it has none."""
+        backend = self._backend_of(session)
+        if backend is None:
+            return self._llm
+        key = f"{backend.base_url}||{backend.model}"
+        client = self._session_clients.get(key)
+        if client is None:
+            client = LLMClient(llm_settings_for(backend, self.settings.llm))
+            self._session_clients[key] = client
+        return client
+
+    def _reads_session(self) -> Session | None:
+        """Whose LLM the display/tagging should reflect right now: the running
+        turn if there is one, else the session on screen."""
+        return self._busy_turn or self.active_session
+
+    def _active_backend(self) -> LLMBackend | None:
+        return self._backend_of(self._reads_session())
+
+    def _active_model(self) -> str:
+        """The model name to show/tag with: the current session's, else the
+        bootstrap model."""
+        backend = self._active_backend()
+        return backend.model if backend is not None else self.settings.llm.model
+
+    def _active_max_model_len(self) -> int | None:
+        """The current session's context window, from its backend (or the
+        bootstrap discovery). Without either, compaction stays off — better
         than guessing a window and folding history needlessly.
         """
+        backend = self._active_backend()
+        if backend is not None:
+            return backend.max_model_len
         if self._discovered_window is not None:
             return self._discovered_window
         for backend in self.settings.backends:
@@ -3081,5 +3195,5 @@ class HpcaApp(App):
 
     def _refresh_top_bar(self) -> None:
         self.query_one(TopBar).update_info(
-            profile=self.profile, model=self.settings.llm.model
+            profile=self.profile, model=self._active_model()
         )

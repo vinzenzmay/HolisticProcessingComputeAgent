@@ -282,6 +282,23 @@ class TestPersistence:
             assert "remember me" in contents
 
 
+class TestPerSessionLLM:
+    async def test_llm_can_be_a_per_turn_provider(self, tools):
+        # build_graph accepts llm as a callable, resolved at each decision — so
+        # a turn uses whichever client the provider hands back (per session).
+        a = FakeLLM([respond_json("from A")])
+        b = FakeLLM([respond_json("from B")])
+        current = {"llm": a}
+        graph = build_graph(
+            llm=lambda: current["llm"], tools=tools, checkpointer=InMemorySaver()
+        )
+        r1 = await run_turn(graph, session_id="s1", user_text="hi")
+        assert r1.reply == "from A"
+        current["llm"] = b
+        r2 = await run_turn(graph, session_id="s2", user_text="hi")
+        assert r2.reply == "from B"
+
+
 class TestRollback:
     """Interrupt support: drop an aborted turn's messages from the thread."""
 

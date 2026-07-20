@@ -83,15 +83,16 @@ class DiscoveredList(ListView):
 class ConfiguredList(ListView):
     """Right panel; set-default, remove and thinking only offered on an entry."""
 
+    # No "set default" — the LLM is chosen per session (at creation, or ctrl+l);
+    # this panel only adds/removes catalog entries and toggles their thinking.
     BINDINGS = [
         Binding("escape", "close", "back", show=True),
-        Binding("enter", "select_cursor", "set default", show=True),
         Binding("t", "toggle_thinking", "toggle thinking mode", show=True),
         Binding("r", "remove_llm", "remove llm", show=True),
     ]
 
     def check_action(self, action: str, parameters) -> bool | None:
-        if action in ("select_cursor", "remove_llm", "toggle_thinking"):
+        if action in ("remove_llm", "toggle_thinking"):
             return self.highlighted_child is not None
         return True
 
@@ -250,14 +251,13 @@ class ManageLLMsScreen(Screen):
                 marker, css = "● connected", "llm-connected"
             else:
                 marker, css = "○ disconnected", "llm-disconnected"
-            star = " ★" if self.app.settings.is_active(backend) else ""
             thinking = " │ ◆ thinking" if backend.enable_thinking else ""
             # Two lines: the name, then its state. On one line the state fell
             # off the right edge of the panel, which is where the markers live.
             item = ListItem(
                 Label(
                     Content(
-                        f"{backend.model}{star}\n"
+                        f"{backend.model}\n"
                         f"{marker}{thinking} │ {backend_details(backend)}"
                     ),
                     classes=css,
@@ -285,13 +285,11 @@ class ManageLLMsScreen(Screen):
 
     @on(ListView.Selected)
     async def _on_selected(self, event: ListView.Selected) -> None:
+        # Only the left panel acts on enter (add to catalog). The right panel's
+        # entries are managed by (t)/(r); there is no "set default" any more.
         discovered = getattr(event.item, "data_discovered", None)
-        configured = getattr(event.item, "data_configured", None)
         if discovered is not None:
             await self._add_backend(discovered)
-        elif configured is not None:
-            self.app.switch_backend(configured)
-            await self.refresh_configured()
 
     async def _add_backend(self, discovered: DiscoveredBackend) -> None:
         self.app.settings.backends.append(

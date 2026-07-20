@@ -165,6 +165,18 @@ class LLMBackend(_Section):
     enable_thinking: bool = False
 
 
+def llm_settings_for(backend: LLMBackend, base: LLMSettings) -> LLMSettings:
+    """The LLMSettings for a client talking to ``backend``: the backend's
+    connection fields over the base's client behavior (retries, timeout,
+    constrained decoding, tool budget). Used for per-session clients."""
+    settings = base.model_copy(deep=True)
+    settings.base_url = backend.base_url
+    settings.model = backend.model
+    settings.api_key = backend.api_key
+    settings.enable_thinking = backend.enable_thinking
+    return settings
+
+
 class Settings(_Section):
     llm: LLMSettings = LLMSettings()
     agent: AgentSettings = AgentSettings()

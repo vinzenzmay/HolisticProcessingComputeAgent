@@ -32,16 +32,23 @@ class SwitchLLMScreen(ModalScreen[LLMBackend | None]):
     #switch-hint { color: $text-muted; }
     """
 
-    def __init__(self, backends: list[LLMBackend], active_marker) -> None:
+    def __init__(
+        self,
+        backends: list[LLMBackend],
+        active_marker,
+        *,
+        title: str = "Switch LLM backend",
+    ) -> None:
         super().__init__()
         self._backends = backends
         self._is_active = active_marker
+        self._title = title
 
     def compose(self) -> ComposeResult:
         with Vertical(id="switch-dialog"):
-            yield Static("Switch LLM backend", id="switch-title")
+            yield Static(self._title, id="switch-title")
             yield ListView(id="switch-list")
-            yield Static("(enter) switch · (esc) cancel", id="switch-hint")
+            yield Static("(esc) cancel · (enter) choose", id="switch-hint")
 
     async def on_mount(self) -> None:
         switch_list = self.query_one("#switch-list", ListView)

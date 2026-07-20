@@ -506,6 +506,18 @@ class TestPersistence:
         assert store.get(session.session_id).mode == "plan"
         conn.close()
 
+    def test_session_backend_round_trip(self, tmp_path):
+        conn = connect(tmp_path / "hpca.db")
+        init_db(conn)
+        store = SessionStore(conn)
+        blob = '{"model": "qwen", "base_url": "http://x/v1"}'
+        session = store.create(profile="default", backend=blob)
+        assert store.get(session.session_id).backend == blob
+        assert store.create(profile="default").backend == ""  # default
+        store.set_backend(session.session_id, "")
+        assert store.get(session.session_id).backend == ""
+        conn.close()
+
     def test_default_mode_defaults_to_manual(self):
         assert Settings().agent.default_mode == "manual"
 

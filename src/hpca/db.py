@@ -42,7 +42,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- Interaction mode (§3.5): manual | auto | full-auto | plan. Empty string means
     -- "use the configured default", so changing the default in settings
     -- reaches sessions that were never explicitly switched.
-    mode TEXT NOT NULL DEFAULT ''
+    mode TEXT NOT NULL DEFAULT '',
+    -- The LLM this session uses, as an LLMBackend JSON blob; '' falls back to
+    -- the app's bootstrap client. Chosen at session creation.
+    backend TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS path_registry (
     profile TEXT NOT NULL,
@@ -108,6 +111,7 @@ ADDED_COLUMNS = [
     ("processes", "notified", "INTEGER NOT NULL DEFAULT 0"),
     ("processes", "background", "INTEGER NOT NULL DEFAULT 0"),
     ("sessions", "mode", "TEXT NOT NULL DEFAULT ''"),
+    ("sessions", "backend", "TEXT NOT NULL DEFAULT ''"),
 ]
 
 # Episodic search index (redesign Phase 2): an external-content FTS5 table

@@ -179,7 +179,11 @@ class TestManageScreen:
             assert "● connected" in qwen_line
             assert "○ disconnected" in mini_line
 
-    async def test_enter_on_right_sets_default(self, hpca_home, fake_discovery):
+    async def test_enter_on_right_does_not_set_a_default(
+        self, hpca_home, fake_discovery
+    ):
+        # The LLM is chosen per session now; the configured panel has no
+        # "set default" — enter on it does nothing and marks no ★.
         settings = Settings()
         settings.backends = [
             LLMBackend(model=QWEN.model, base_url=QWEN.base_url, max_model_len=192000)
@@ -195,11 +199,10 @@ class TestManageScreen:
             right.index = 0
             await pilot.press("enter")
             await pilot.pause()
-            assert app.settings.llm.model == QWEN.model
-            assert app.settings.llm.base_url == QWEN.base_url
-            assert Settings.load().llm.model == QWEN.model
+            # the bootstrap default is untouched, and nothing is starred
+            assert app.settings.llm.model == "qwen3-6b"
             labels = [str(i.query_one("Label").content) for i in right.children]
-            assert any("★" in t for t in labels)
+            assert not any("★" in t for t in labels)
 
     async def test_r_removes_configured(self, hpca_home, fake_discovery):
         settings = Settings()
@@ -297,8 +300,10 @@ class TestManageScreen:
             left = app.screen.query_one("#llm-discovered", ListView)
             right = app.screen.query_one("#llm-configured", ListView)
             assert left.check_action("select_cursor", ()) is True  # add llm to list
-            assert right.check_action("select_cursor", ()) is False  # nothing there
+            # the right panel no longer has a "set default" enter action; its
+            # per-entry actions are inert with nothing highlighted
             assert right.check_action("remove_llm", ()) is False
+            assert right.check_action("toggle_thinking", ()) is False
 
     async def test_escape_closes(self, hpca_home, fake_discovery):
         app = HpcaApp(llm=FakeLLM())
@@ -382,14 +387,17 @@ class TestSwitcher:
             await pilot.press("ctrl+l")
             await pilot.pause()
             assert not isinstance(app.screen, SwitchLLMScreen)
-            app._focus_column("chat")
+            await app.start_new_session()  # switching needs a session to switch
             await pilot.pause()
+            assert app.focused_column_id == "chat"
             assert app.check_action("switch_llm", ()) is True
             await pilot.press("ctrl+l")
             await pilot.pause()
             assert isinstance(app.screen, SwitchLLMScreen)
 
-    async def test_switch_updates_llm_and_topbar(self, hpca_home, fake_discovery):
+    async def test_switch_sets_the_sessions_backend_and_topbar(
+        self, hpca_home, fake_discovery
+    ):
         settings = Settings()
         settings.backends = [
             LLMBackend(model=QWEN.model, base_url=QWEN.base_url, max_model_len=192000)
@@ -397,19 +405,18 @@ class TestSwitcher:
         settings.save()
         app = HpcaApp(llm=FakeLLM())
         async with app.run_test(size=(120, 40)) as pilot:
-            old_graph = app.graph
-            app._focus_column("chat")
+            await app.start_new_session()
+            await pilot.pause()
             await pilot.press("ctrl+l")
             assert isinstance(app.screen, SwitchLLMScreen)
             await pilot.press("enter")
-            await app.workers.wait_for_complete()
             await pilot.pause()
-            assert app.settings.llm.model == QWEN.model
-            assert app.graph is not old_graph
+            # the session (not the global default) now points at QWEN
+            assert QWEN.model in app.active_session.backend
+            assert app.settings.llm.model == "qwen3-6b"  # bootstrap untouched
             from hpca.tui.app import TopBar
 
             assert QWEN.model in app.query_one(TopBar).render_text()
-            assert Settings.load().llm.model == QWEN.model
 
     async def test_switch_escape_changes_nothing(self, hpca_home, fake_discovery):
         settings = Settings()
@@ -609,6 +616,8 @@ class TestThinkingToggle:
     async def test_thinking_follows_the_backend_when_switching(
         self, hpca_home, fake_discovery
     ):
+        # A session's client carries its backend's thinking setting: switching
+        # the session's backend gives it a client with that backend's thinking.
         settings = Settings()
         settings.backends = [
             LLMBackend(model=QWEN.model, base_url=QWEN.base_url, enable_thinking=True),
@@ -617,10 +626,14 @@ class TestThinkingToggle:
         settings.save()
         app = HpcaApp()
         async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            await pilot.pause()
             app.switch_backend(app.settings.backends[0])
-            assert app.settings.llm.enable_thinking is True
+            client = app._client_for(app.active_session)
+            assert client._settings.enable_thinking is True
             app.switch_backend(app.settings.backends[1])
-            assert app.settings.llm.enable_thinking is False
+            client = app._client_for(app.active_session)
+            assert client._settings.enable_thinking is False
             await pilot.pause()
 
     async def test_toggle_is_inert_without_a_configured_entry(

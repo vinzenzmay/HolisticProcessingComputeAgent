@@ -99,6 +99,13 @@ def build_graph(
     mode_fn: Callable[[], str | None] | None = None,
 ):
     render_system_prompt = system_prompt_fn or orchestrator_system_prompt
+
+    def client():
+        """The LLM client to use right now. ``llm`` may be a value (one client
+        for the whole graph) or a callable provider (per-session selection,
+        resolved per decision from whichever turn is running) — mirrors ctx."""
+        return llm() if callable(llm) else llm
+
     # The session's interaction mode (§3.5), read per round so a mid-session
     # switch takes effect on the very next decision. None = no mode feature
     # (tests, bare graphs): behaves exactly like before.
@@ -144,7 +151,7 @@ def build_graph(
         # the early session forward instead of forgetting it.
         to_summarize = ([previous] if previous else []) + older
         try:
-            summary = await compact.summarize(llm, to_summarize)
+            summary = await compact.summarize(client(), to_summarize)
         except Exception:
             # Best-effort: an oversized prompt is still better than a turn
             # that cannot run at all.
@@ -182,7 +189,7 @@ def build_graph(
             report("LLM processing")
             try:
                 decision = await decide(
-                    llm,
+                    client(),
                     [system] + _view(state) + nudges,
                     active_tools,
                     max_retries=max_retries,
@@ -321,7 +328,7 @@ def build_graph(
             report("LLM processing")
             try:
                 decision = await decide(
-                    llm,
+                    client(),
                     [system] + _view(state) + [note],
                     tools.subset(["present_plan"]),
                     max_retries=max_retries,
@@ -355,7 +362,7 @@ def build_graph(
         report("LLM processing")
         try:
             decision = await decide(
-                llm,
+                client(),
                 [system] + _view(state) + [budget_note],
                 ToolRegistry(),  # no tools: respond-only
                 max_retries=max_retries,
