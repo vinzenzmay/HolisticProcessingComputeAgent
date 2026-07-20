@@ -52,7 +52,15 @@ MAX_TOOL_ROUNDS = 30
 MAX_PLAN_NUDGES = 2
 
 
-def _append(left: list, right: list) -> list:
+# Sentinel for rolling an interrupted turn out of the thread: the messages
+# reducer is append-only, so an update cannot otherwise shrink the history.
+# ``aupdate_state(config, {"messages": {TRUNCATE_TO: n}})`` keeps the first n.
+TRUNCATE_TO = "__truncate_to__"
+
+
+def _append(left: list, right) -> list:
+    if isinstance(right, dict) and TRUNCATE_TO in right:
+        return left[: right[TRUNCATE_TO]]
     return left + right
 
 
@@ -433,6 +441,28 @@ async def deliver_event(graph, *, session_id: str, text: str) -> None:
     """
     config = {"configurable": {"thread_id": session_id}}
     await graph.aupdate_state(config, {"messages": [{"role": "user", "content": text}]})
+
+
+async def thread_message_count(graph, *, session_id: str) -> int:
+    """How many messages the thread holds right now (the point to roll back to
+    before a turn appends to it)."""
+    config = {"configurable": {"thread_id": session_id}}
+    snapshot = await graph.aget_state(config)
+    return len((snapshot.values or {}).get("messages", []))
+
+
+async def rollback_thread(graph, *, session_id: str, keep: int) -> list[Message]:
+    """Drop everything a turn appended, keeping the first ``keep`` messages.
+
+    Used when the user aborts a turn mid-flight (§ interrupt): the interrupted
+    user message and any partial tool traffic must leave the thread so the
+    re-edited prompt starts from a clean history. Returns the surviving
+    messages. Relies on the TRUNCATE_TO sentinel the messages reducer honours.
+    """
+    config = {"configurable": {"thread_id": session_id}}
+    await graph.aupdate_state(config, {"messages": {TRUNCATE_TO: keep}})
+    snapshot = await graph.aget_state(config)
+    return list((snapshot.values or {}).get("messages", []))
 
 
 async def run_turn(

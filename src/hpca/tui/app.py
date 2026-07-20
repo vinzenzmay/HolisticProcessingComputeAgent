@@ -26,7 +26,13 @@ from hpca.agent.builtin_tools import default_tool_registry
 from hpca.agent.context import ToolContext
 from hpca.agent.file_tools import add_file_tools
 from hpca.agent.explainer import explain_process_failure
-from hpca.agent.graph import build_graph, deliver_event, run_turn
+from hpca.agent.graph import (
+    build_graph,
+    deliver_event,
+    rollback_thread,
+    run_turn,
+    thread_message_count,
+)
 from hpca.agent.job_tools import add_job_tools
 from hpca.agent.tools import ToolRegistry
 from hpca.clipboard import ClipboardManager, CopyResult
@@ -151,6 +157,20 @@ def format_started(started_at: str) -> str:
     return moment.strftime("%m-%d %H:%M")
 SESSION_TITLE_MAX = 40
 UNTITLED_SESSION = "untitled"  # placeholder until the first message names it
+
+# Interrupt-while-waiting-for-the-LLM (§ interrupt): hold esc for this long in
+# the chat window to abort the in-flight request and re-edit the last message.
+# The activity string the graph reports while parked on the model — the one
+# phase the interrupt is armed in.
+LLM_WAIT_ACTIVITY = "LLM processing"
+ESC_INTERRUPT_SECONDS = 3.0
+ESC_TICK_SECONDS = 0.05
+ESC_INTERRUPT_TICKS = int(ESC_INTERRUPT_SECONDS / ESC_TICK_SECONDS)
+# Terminals send no key-release, so a held esc is inferred from its repeat
+# events; if none arrive for this long the hold is treated as released. Longer
+# than a typical key-repeat delay so the first repeat still lands in time.
+ESC_IDLE_SECONDS = 0.75
+ESC_BAR_WIDTH = 24
 CHAT_TITLES = {
     "user": "you",
     "assistant": "agent",
@@ -300,6 +320,12 @@ class ChatInput(TextArea):
                 event.stop()
                 event.prevent_default()
                 return
+        if event.key == "escape" and self.app.handle_esc_hold():
+            # Held esc interrupts the model while it is thinking; consumed only
+            # while that is possible, so a plain esc is otherwise free.
+            event.stop()
+            event.prevent_default()
+            return
         if event.key == "enter":
             event.stop()
             event.prevent_default()
@@ -465,6 +491,11 @@ class ChatPanel(ColumnPanel):
         mode_bar = ModeBar(id="mode-bar")
         mode_bar.display = False
         yield mode_bar
+        # Fills over 3s while esc is held to interrupt the model; hidden
+        # otherwise. Right above the entry, where the eye already is.
+        esc_bar = Static(id="esc-progress")
+        esc_bar.display = False
+        yield esc_bar
         chat_input = ChatInput(placeholder="Message the agent…", id="chat-input")
         chat_input.display = False
         yield chat_input
@@ -604,6 +635,11 @@ class HpcaApp(App):
         color: $text-muted;
         padding: 0 1;
     }
+    #esc-progress {
+        height: 1;
+        color: $warning;
+        padding: 0 1;
+    }
     /* A reply landed in a session the user has left: frame it, never
        force it open. Cleared when the session is opened. */
     #sessions-list > ListItem.session-updated {
@@ -678,6 +714,18 @@ class HpcaApp(App):
         self._untitled: set[str] = set()  # sessions awaiting their first title
         self._updated: set[str] = set()  # replies that landed while switched away
         self._busy_turn: Session | None = None  # the one turn in flight, if any
+        self._turn_worker = None  # handle to the in-flight turn, for cancelling
+        self._interrupt_worker = None  # the rollback worker after a 3s hold
+        # Interrupt bookkeeping for the in-flight turn: the message count to
+        # roll back to, and the user's text to hand back for editing. Set only
+        # for a fresh user message (not a resume/event), which is what "adjust
+        # the last prompt" means.
+        self._interrupt_keep: int | None = None
+        self._interrupt_text: str | None = None
+        # esc-hold state: the ticking timer, the release watchdog, and progress.
+        self._esc_timer = None
+        self._esc_idle = None
+        self._esc_ticks = 0
         # Work waiting for the orchestrator: messages the user typed while a
         # turn was running, and background completions reporting in. Exactly
         # one turn runs at a time — two on one thread_id would interleave
@@ -1047,6 +1095,108 @@ class HpcaApp(App):
         chat_input.move_cursor(chat_input.document.end)
         return True
 
+    # ------------------------------------------------- interrupt the model
+
+    def _can_interrupt(self) -> bool:
+        """Only while the active session's own user turn is parked on the LLM —
+        the one phase where telling the backend to stop makes sense, and the
+        only case with a prompt to hand back."""
+        return (
+            self._activity == LLM_WAIT_ACTIVITY
+            and self._busy_turn is not None
+            and self._interrupt_text is not None
+            and self._interrupt_keep is not None
+            and self._is_active_session(self._busy_turn)
+        )
+
+    def handle_esc_hold(self) -> bool:
+        """One esc key event in the chat entry. Returns whether it was consumed
+        (it is, only while an interrupt is possible). The 3s hold is inferred
+        from esc auto-repeat; each event refreshes the release watchdog."""
+        if not self._can_interrupt():
+            return False
+        if self._esc_timer is None:
+            self._esc_ticks = 0
+            self._render_esc_bar()
+            self.query_one("#esc-progress", Static).display = True
+            self._esc_timer = self.set_interval(
+                ESC_TICK_SECONDS, self._advance_esc_hold
+            )
+        if self._esc_idle is not None:
+            self._esc_idle.stop()
+        self._esc_idle = self.set_timer(ESC_IDLE_SECONDS, self._cancel_esc_hold)
+        return True
+
+    def _advance_esc_hold(self) -> None:
+        self._esc_ticks += 1
+        self._render_esc_bar()
+        if self._esc_ticks >= ESC_INTERRUPT_TICKS:
+            self._fire_interrupt()
+
+    def _render_esc_bar(self) -> None:
+        found = self.query("#esc-progress")
+        if not found:
+            return
+        filled = min(ESC_BAR_WIDTH, self._esc_ticks * ESC_BAR_WIDTH // ESC_INTERRUPT_TICKS)
+        bar = "█" * filled + "░" * (ESC_BAR_WIDTH - filled)
+        found.first(Static).update(Content(f"hold esc to interrupt  {bar}"))
+
+    def _cancel_esc_hold(self) -> None:
+        """esc released (or the turn ended) before 3s — no interrupt."""
+        if self._esc_timer is not None:
+            self._esc_timer.stop()
+            self._esc_timer = None
+        if self._esc_idle is not None:
+            self._esc_idle.stop()
+            self._esc_idle = None
+        self._esc_ticks = 0
+        found = self.query("#esc-progress")
+        if found:
+            found.first(Static).display = False
+
+    def _fire_interrupt(self) -> None:
+        """The 3s hold completed: capture what the interrupt needs, stop the
+        hold UI, and roll the turn back off the main loop."""
+        session = self._busy_turn
+        keep = self._interrupt_keep
+        text = self._interrupt_text
+        worker = self._turn_worker
+        self._cancel_esc_hold()
+        if session is None or keep is None or text is None:
+            return
+        self._interrupt_worker = self.run_worker(
+            self._interrupt_turn(session, keep, text, worker), group="interrupt"
+        )
+
+    async def _interrupt_turn(self, session, keep, text, worker) -> None:
+        """Abort the in-flight request, drop the aborted turn from the thread,
+        and hand the message back to the entry for editing."""
+        if worker is not None:
+            worker.cancel()
+            try:
+                await worker.wait()  # let the cancellation unwind before we edit
+            except (Exception, asyncio.CancelledError):
+                pass
+        self._busy_turn = None
+        self.hide_working()
+        try:
+            surviving = await rollback_thread(
+                self.graph, session_id=session.session_id, keep=keep
+            )
+        except Exception as e:
+            self.notify(f"Interrupt cleanup failed: {e}", severity="error")
+            surviving = None
+        if self._is_active_session(session) and surviving is not None:
+            await self._set_chat_messages(surviving)
+        found = self.query("#chat-input")
+        if found:  # absent only if the screen is tearing down
+            chat_input = found.first(ChatInput)
+            chat_input.text = text
+            chat_input.move_cursor(chat_input.document.end)
+            self.focus_chat_input()
+            self.notify("Interrupted — edit your message and send again.")
+        self.call_later(self.drain_work)
+
     def _run_agent(
         self,
         session: Session,
@@ -1084,12 +1234,16 @@ class HpcaApp(App):
             )
         log = open_log(self.settings, session)
         self._busy_turn = session
+        # A fresh user message can be interrupted and re-edited (§ interrupt);
+        # a resume/event has no prompt to hand back, so it arms nothing.
+        self._interrupt_text = user_text
+        self._interrupt_keep = None  # filled once we know the pre-turn count
         self._turn_ctx = self._make_tool_ctx(session, log, memory=self._turn_memory)
         if self._is_active_session(session):
             # the UI's context (process list, registry) stays the turn's twin
             self._tool_ctx = self._turn_ctx
             self.show_working()
-        return self.run_worker(
+        self._turn_worker = self.run_worker(
             self._agent_turn(
                 session,
                 user_text=user_text,
@@ -1099,6 +1253,7 @@ class HpcaApp(App):
             ),
             exclusive=True,
         )
+        return self._turn_worker
 
     def _chat_list(self) -> ListView | None:
         """The chat column, or None once the screen is gone.
@@ -1142,6 +1297,15 @@ class HpcaApp(App):
         log: SessionLog | None,
         api_content: str | None = None,
     ) -> None:
+        # The point to roll the thread back to if this turn is interrupted:
+        # captured before run_turn appends the user message (§ interrupt).
+        if user_text is not None:
+            try:
+                self._interrupt_keep = await thread_message_count(
+                    self.graph, session_id=session.session_id
+                )
+            except Exception:
+                self._interrupt_keep = None
         try:
             result = await run_turn(
                 self.graph,
@@ -1162,6 +1326,10 @@ class HpcaApp(App):
             return
         finally:
             self._busy_turn = None
+            self._turn_worker = None
+            self._interrupt_keep = None
+            self._interrupt_text = None
+            self._cancel_esc_hold()  # a turn that ends drops any pending hold
             self._turn_ctx = None
             self._turn_memory = None
             self._turn_skills = None

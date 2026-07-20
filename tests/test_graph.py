@@ -282,6 +282,43 @@ class TestPersistence:
             assert "remember me" in contents
 
 
+class TestRollback:
+    """Interrupt support: drop an aborted turn's messages from the thread."""
+
+    async def test_rollback_truncates_to_keep(self, tools):
+        from hpca.agent.graph import (
+            rollback_thread,
+            thread_message_count,
+        )
+
+        # two completed turns -> 4 messages (user, answer, user, answer)
+        llm = FakeLLM([respond_json("a1"), respond_json("a2")])
+        graph = make_graph(llm, tools)
+        await run_turn(graph, session_id="s1", user_text="q1")
+        keep = await thread_message_count(graph, session_id="s1")  # 2 so far
+        await run_turn(graph, session_id="s1", user_text="q2")
+        assert await thread_message_count(graph, session_id="s1") == 4
+
+        surviving = await rollback_thread(graph, session_id="s1", keep=keep)
+        assert [m["content"] for m in surviving] == ["q1", "a1"]
+        # and it sticks: a later read sees the truncated thread
+        assert await thread_message_count(graph, session_id="s1") == 2
+
+    async def test_rollback_then_next_turn_has_clean_history(self, tools):
+        from hpca.agent.graph import rollback_thread, thread_message_count
+
+        llm = FakeLLM([respond_json("first"), respond_json("second")])
+        graph = make_graph(llm, tools)
+        keep = await thread_message_count(graph, session_id="s1")  # 0
+        await run_turn(graph, session_id="s1", user_text="oops typo")
+        await rollback_thread(graph, session_id="s1", keep=keep)
+        # the re-edited prompt runs against an empty history
+        await run_turn(graph, session_id="s1", user_text="corrected")
+        sent = [m["content"] for m in llm.calls[-1]["messages"]]
+        assert "corrected" in sent
+        assert "oops typo" not in sent
+
+
 class TestDecisionFailure:
     async def test_exhausted_retries_surface_to_user(self, tools):
         llm = FakeLLM(["garbage"] * 10)
