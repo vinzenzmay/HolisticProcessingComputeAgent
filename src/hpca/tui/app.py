@@ -43,6 +43,7 @@ from hpca.agent.memory_context import (
     retrieved_line,
 )
 from hpca.agent.memory_tools import add_memory_tools
+from hpca.agent.modes import add_plan_tool, kickoff_message, next_mode
 from hpca.agent.prompts import orchestrator_system_prompt
 from hpca.agent.reflect import Reflection, propose_reflections
 from hpca.agent.skill_tools import add_skill_tools
@@ -97,6 +98,7 @@ from hpca.tui.confirm_screen import ConfirmScreen
 from hpca.tui.context_bar import ContextBar
 from hpca.tui.inspect_screen import InspectScreen, format_job, format_process
 from hpca.tui.manage_llms import ManageLLMsScreen
+from hpca.tui.mode_bar import ModeBar
 from hpca.memory_index import MemoryIndex
 from hpca.memory_ops import (
     MemoryOp,
@@ -109,6 +111,7 @@ from hpca.tui.memory_screens import (
     MemoryProposalScreen,
     ReflectionScreen,
 )
+from hpca.tui.plan_screen import PlanScreen
 from hpca.tui.profiles_screen import ProfilePickerScreen, ProfilesScreen
 from hpca.tui.rename_screen import RenameScreen
 from hpca.tui.settings_screen import SettingsScreen
@@ -425,6 +428,11 @@ class ChatPanel(ColumnPanel):
         menu = Static(id="command-menu")
         menu.display = False
         yield menu
+        # The mode line sits directly above the entry, visible exactly when
+        # the entry is: mode is a per-session property (§3.5).
+        mode_bar = ModeBar(id="mode-bar")
+        mode_bar.display = False
+        yield mode_bar
         chat_input = ChatInput(placeholder="Message the agent…", id="chat-input")
         chat_input.display = False
         yield chat_input
@@ -574,6 +582,11 @@ class HpcaApp(App):
         Binding("a", "manage_profiles", "profiles & learnings"),
         Binding("ctrl+l", "switch_llm", "switch llm"),
         Binding("ctrl+e", "edit_profile", "edit profile", show=False),
+        # Priority so it also fires while the chat entry is focused. ctrl+m is
+        # bound as asked, but most terminals send it as Enter (carriage
+        # return), so shift+tab is the binding that works everywhere.
+        Binding("shift+tab", "cycle_mode", "agent mode", priority=True),
+        Binding("ctrl+m", "cycle_mode", "agent mode", show=False),
         # Not priority: (q) must reach the chat entry as a letter. Offered
         # only on the sessions column, where no typing happens (check_action).
         Binding("q", "confirm_quit", "quit"),
@@ -608,6 +621,7 @@ class HpcaApp(App):
             if any_skills():
                 add_skill_tools(self._tools)
             add_memory_tools(self._tools)
+            add_plan_tool(self._tools)
         self.active_session: Session | None = None
         self._tool_ctx: ToolContext | None = None
         self._chat_entries: list[Entry] = []
@@ -1043,14 +1057,28 @@ class HpcaApp(App):
             # them back — frame its row in the list instead.
             self._mark_session_updated(session)
         if result.interrupt is not None:
-            # Parked on a destructive-op approval: the turn cannot move
-            # without an answer, so ask even if another session is open.
+            # Parked on an approval (destructive op, or a gated execution in
+            # manual/plan mode): the turn cannot move without an answer, so
+            # ask even if another session is open.
             self._awaiting_approval.add(session.session_id)
             self.push_screen(
                 ApprovalScreen(result.interrupt),
                 lambda approved: self._on_approval(session, approved),
             )
             return
+        if (
+            result.plan
+            and self._mode_of(session) == "plan"
+            and self._is_active_session(session)
+        ):
+            # A plan-mode turn ended with a checklist: hand it to the user
+            # to adjust and decide how to continue (§3.5). Never forced on a
+            # session the user has switched away from — the plan waits in
+            # the chat and the state.
+            self.push_screen(
+                PlanScreen(result.plan),
+                lambda outcome: self._on_plan_decision(session, outcome),
+            )
         if self._is_active_session(session):
             # Context dropped by compaction first: it is gone from the
             # model's view and this is the last chance to keep anything.
@@ -1122,6 +1150,87 @@ class HpcaApp(App):
         # switched sessions while the approval dialog was up.
         self._awaiting_approval.discard(session.session_id)
         self._run_agent(session, resume=Command(resume={"approved": bool(approved)}))
+
+    # ------------------------------------------------------------ agent modes
+
+    def _mode_of(self, session: Session | None) -> str:
+        """A session's interaction mode (§3.5); the configured default when
+        the session never chose one (or there is no session)."""
+        if session is None:
+            return self.settings.agent.default_mode
+        return session.mode or self.settings.agent.default_mode
+
+    def _turn_mode(self) -> str:
+        """The mode the graph obeys this round — for the turn in flight if
+        there is one, else the open session. Read fresh from the store so
+        cycling the mode mid-turn applies to the very next round instead of
+        a stale Session copy."""
+        session = (
+            self._busy_turn if self._busy_turn is not None else self.active_session
+        )
+        if session is None:
+            return self.settings.agent.default_mode
+        fresh = self.session_store.get(session.session_id)
+        return self._mode_of(fresh if fresh is not None else session)
+
+    def action_cycle_mode(self) -> None:
+        session = self.active_session
+        if session is None:
+            return
+        mode = next_mode(self._mode_of(session))
+        session.mode = mode
+        self.session_store.set_mode(session.session_id, mode)
+        self._refresh_mode_bar()
+
+    def _mode_bar(self) -> ModeBar | None:
+        found = self.query("#mode-bar")
+        return found.first(ModeBar) if found else None
+
+    def _refresh_mode_bar(self) -> None:
+        """The mode line above the entry: shown with a session, hidden without."""
+        bar = self._mode_bar()
+        if bar is None:
+            return
+        if self.active_session is None:
+            bar.display = False
+            return
+        bar.display = True
+        bar.set_mode(self._mode_of(self.active_session))
+
+    def _on_plan_decision(self, session: Session, outcome) -> None:
+        """The user's verdict on a proposed plan (§3.5).
+
+        ``None`` = keep planning — nothing changes, feedback is typed in
+        chat. Otherwise switch the session to the chosen mode, store the
+        (possibly edited) checklist in the thread state, and kick off
+        execution as an event turn.
+        """
+        if not outcome:
+            return
+        mode, steps = outcome
+        session.mode = mode
+        self.session_store.set_mode(session.session_id, mode)
+        if self._is_active_session(session):
+            self.active_session.mode = mode
+            self._refresh_mode_bar()
+        self.run_worker(self._start_plan_execution(session, mode, steps))
+
+    async def _start_plan_execution(
+        self, session: Session, mode: str, steps: list[dict]
+    ) -> None:
+        # The user may have edited the checklist in the dialog; what they
+        # approved is what the state must hold before execution starts.
+        await self.graph.aupdate_state(
+            {"configurable": {"thread_id": session.session_id}}, {"plan": steps}
+        )
+        self._pending_work.append(
+            PendingWork(
+                session_id=session.session_id,
+                text=kickoff_message(mode),
+                kind="event",
+            )
+        )
+        await self.drain_work()
 
     # ---------------------------------------------------------------- memory
 
@@ -1567,6 +1676,7 @@ class HpcaApp(App):
         self.active_session = session
         self._refresh_session_log()
         self.query_one("#chat-input", ChatInput).display = True
+        self._refresh_mode_bar()
         if self._log is not None:
             self._log.write(
                 "session opened",
@@ -1622,7 +1732,11 @@ class HpcaApp(App):
                 await self._reload_sessions()
         else:
             self._activate_session(
-                self.session_store.create(profile=profile, title=UNTITLED_SESSION)
+                self.session_store.create(
+                    profile=profile,
+                    title=UNTITLED_SESSION,
+                    mode=self.settings.agent.default_mode,
+                )
             )
             await self._set_chat_messages([])
             self._context_used = 0
@@ -1786,9 +1900,13 @@ class HpcaApp(App):
             bar.reset()
         await self._set_chat_messages([])
         self.query_one("#chat-input", ChatInput).display = False
+        self._refresh_mode_bar()
         self._focus_column("sessions")
 
     async def open_session(self, session: Session) -> None:
+        # The list row's Session may predate a mode switch; the store is
+        # current.
+        session = self.session_store.get(session.session_id) or session
         self._set_working_profile(session.profile)
         self._activate_session(session)
         snapshot = await self.graph.aget_state(
@@ -2239,6 +2357,10 @@ class HpcaApp(App):
             return on_sessions
         if action == "switch_llm":
             return in_chat
+        if action == "cycle_mode":
+            # Mode is a per-session dial; without a session there is nothing
+            # to switch. Disabled on modals so shift+tab keeps moving focus.
+            return on_main_screen and self.active_session is not None
         if action == "open_settings":
             return not in_chat
         if action == "quit":
@@ -2475,6 +2597,7 @@ class HpcaApp(App):
             max_model_len=self._active_max_model_len,
             on_evict=self._extract_before_eviction,
             on_usage=self._on_usage,
+            mode_fn=self._turn_mode,
         )
 
     def _active_max_model_len(self) -> int | None:

@@ -38,7 +38,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     profile TEXT NOT NULL,
     title TEXT,
     created_at TEXT,
-    checkpoint_ref TEXT
+    checkpoint_ref TEXT,
+    -- Interaction mode (§3.5): manual | auto | full-auto | plan. Empty string means
+    -- "use the configured default", so changing the default in settings
+    -- reaches sessions that were never explicitly switched.
+    mode TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS path_registry (
     profile TEXT NOT NULL,
@@ -97,6 +101,7 @@ CREATE TABLE IF NOT EXISTS processes (
 ADDED_COLUMNS = [
     ("processes", "notified", "INTEGER NOT NULL DEFAULT 0"),
     ("processes", "background", "INTEGER NOT NULL DEFAULT 0"),
+    ("sessions", "mode", "TEXT NOT NULL DEFAULT ''"),
 ]
 
 # Episodic search index (redesign Phase 2): an external-content FTS5 table

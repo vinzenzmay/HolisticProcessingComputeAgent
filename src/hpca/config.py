@@ -60,6 +60,19 @@ class LLMSettings(_Section):
     max_tool_rounds: int = 30
 
 
+class AgentSettings(_Section):
+    """Interaction modes (§3.5): how much the agent may do unsupervised.
+
+    ``default_mode`` is what a new session starts in (and what sessions
+    that were never explicitly switched use): ``manual`` shows every script
+    to the user before it runs, ``auto`` works until the task is done,
+    ``full-auto`` additionally waives the destructive-op approvals, and
+    ``plan`` drafts a checklist and executes nothing.
+    """
+
+    default_mode: Literal["manual", "auto", "full-auto", "plan"] = "manual"
+
+
 class ClusterSettings(_Section):
     submit_host: str | None = None
     job_poll_seconds: int = 30
@@ -154,6 +167,7 @@ class LLMBackend(_Section):
 
 class Settings(_Section):
     llm: LLMSettings = LLMSettings()
+    agent: AgentSettings = AgentSettings()
     backends: list[LLMBackend] = []
     known_llm_ports: list[int] = []
     cluster: ClusterSettings = ClusterSettings()

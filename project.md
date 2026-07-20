@@ -19,7 +19,9 @@ sessions, and supervise running sub-processes and cluster jobs.
 3. **Retry loops with validation feedback.** Malformed or semantically invalid tool
    calls are caught by pydantic validation; the error message is fed back to the model
    for a bounded number of retries.
-4. **Human-in-the-loop for anything destructive.** Always. No exceptions.
+4. **Human-in-the-loop for anything destructive.** Always. The sole opt-out
+   is the explicitly user-chosen full-auto mode (§3.5), where the recovery
+   layer (§5.3) remains the safety net.
 5. **Grounded answers over recall.** Technical claims about tools, APIs, and flags
    come from indexed docs/source via the doc-researcher subagent, or are explicitly
    marked as ungrounded; generated scripts are verified against the same index
@@ -152,6 +154,49 @@ Settings block:
 `mode`: `auto | tmux | screen | zellij | osc52 | command | file` — the pre-baked
 switches. `command` (e.g. `"xclip -selection clipboard"`, `"wl-copy"`) covers exotic
 setups: content is piped to the command's stdin.
+
+### 3.5 Agent modes (manual / auto / plan)
+
+Each session has an interaction mode, indicated on a single line directly above
+the chat entry and cycled with **shift+tab** (ctrl+m is bound as well, but most
+terminals deliver it as Enter, so it only works under keyboard protocols that
+can tell them apart). The mode is stored per session (`sessions.mode`, empty =
+the `agent.default_mode` setting, default `manual`) and read fresh every graph
+round, so switching applies immediately — even to a turn already in flight.
+
+* **manual** — every execution tool call (`run_script`, `start_script`,
+  `run_bash`, `submit_job`) pauses at the same `interrupt()` gate as
+  destructive operations; the approval modal shows the actual script text and
+  offers *run script* / *skip script*. A skip is fed back to the model as a
+  SKIPPED tool result that forbids retrying, rephrasing, or reaching the same
+  outcome another way (bare denials make small models re-propose the same
+  command).
+* **auto** — structurally today's behaviour (only the §5.3 destructive gate),
+  plus a prompt block telling the model that no confirmation will ever arrive,
+  so it must work to completion instead of narrating and waiting for "do it".
+* **full-auto** (shown as "full auto") — auto with the §5.3 destructive gate
+  waived as well: nothing pauses for approval. This is the one deliberate,
+  user-chosen exception to guiding constraint 4 ("human-in-the-loop for
+  anything destructive"); the §5.3 recovery layer (hardlink trash, copy
+  backups, TTL restore) still stands behind every deletion and overwrite,
+  and the prompt tells the model to verify paths itself and to list every
+  destructive action in its final report.
+* **plan** — nothing executes. Enforcement is structural, not prompt-trust:
+  script tools are withdrawn from the registry offered to `decide()` (a tool
+  never offered cannot be called), and `run_bash` — kept so the plan can be
+  grounded in what is actually on disk — gates like manual. The model
+  maintains a checklist through an `update_plan` tool; the checklist lives in
+  the checkpointed graph state (`AgentState.plan`) and is re-injected into the
+  system prompt every round, so it survives restarts and context compaction.
+  When a plan-mode turn ends with a plan, a modal shows the editable checklist
+  and offers: execute on auto, execute step-by-step (manual), or keep
+  planning. Approval switches the session's mode and starts execution with a
+  `[plan approved]` event turn; during execution the plan stays in the prompt
+  and the model checks steps off via `update_plan`.
+
+Mode guidance is appended to the system prompt per render (§4.3), never stored,
+and the per-mode gating decision is made in the graph's `execute_tool` node —
+the same machinery as the destructive gate, with a different question.
 
 ## 4. Agent design
 

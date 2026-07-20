@@ -27,6 +27,14 @@ from hpca.agent.middleware import (
     DirectResponse,
     decide,
 )
+from hpca.agent.modes import (
+    destructive_approval_required,
+    mode_prompt_suffix,
+    requires_execution_approval,
+    script_preview,
+    skipped_message,
+    tools_for_mode,
+)
 from hpca.agent.prompts import orchestrator_system_prompt
 from hpca.agent.tools import ToolRegistry
 from hpca.llm import Message
@@ -46,6 +54,10 @@ class AgentState(TypedDict, total=False):
     thinking: Annotated[list[dict], _append]
     pending_tool: dict | None
     tool_rounds: int
+    # The plan-mode checklist (§3.5): list of {"text": str, "done": bool}.
+    # Checkpointed with the thread, re-injected into the system prompt every
+    # round, replaced wholesale by each update_plan call.
+    plan: list[dict] | None
     # Compaction (redesign Phase 6): {"upto": int, "summary": Message}. The
     # stored history is never rewritten — the transcript keeps everything and
     # only the view sent to the model is folded, so compaction can never lose
@@ -66,10 +78,16 @@ def build_graph(
     max_model_len: Callable[[], int | None] | None = None,
     on_evict: Callable[[list[Message]], Any] | None = None,
     on_usage: Callable[[dict], None] | None = None,
+    mode_fn: Callable[[], str | None] | None = None,
 ):
     render_system_prompt = system_prompt_fn or orchestrator_system_prompt
+    # The session's interaction mode (§3.5), read per round so a mid-session
+    # switch takes effect on the very next decision. None = no mode feature
+    # (tests, bare graphs): behaves exactly like before.
+    current_mode = mode_fn or (lambda: None)
     # A turn is silent for seconds or minutes; this is what the TUI's spinner
-    # names, so a wait is legible as thinking or as a particular tool running.
+    # names, so a wait is legible as thinking or as a particular
+    # tool running.
     report = on_activity or (lambda activity: None)
     window = max_model_len or (lambda: None)
     # The backend's own token count for each decision — what the context
@@ -130,13 +148,17 @@ def build_graph(
         compaction = await _maybe_compact(state)
         if compaction:
             state = {**state, **compaction}
-        system: Message = {"role": "system", "content": render_system_prompt()}
+        mode = current_mode()
+        # Plan mode withdraws execution tools from the offer itself — a tool
+        # the model is never shown is one it cannot call (§3.5).
+        active_tools = tools_for_mode(tools, mode)
+        system: Message = {"role": "system", "content": _system_text(state, mode)}
         report("thinking")
         try:
             decision = await decide(
                 llm,
                 [system] + _view(state),
-                tools,
+                active_tools,
                 max_retries=max_retries,
             )
         except DecisionError as e:
@@ -167,12 +189,25 @@ def build_graph(
         if context is not None:
             # so a tool's own model calls are logged under its name
             context.current_tool = tool.name
-        if tool.gates(arguments, context):
+        mode = current_mode()
+        # Full-auto is the one mode that waives the destructive gate (§3.5);
+        # every other mode keeps §5.3's "always ask".
+        destructive = tool.gates(arguments, context) and destructive_approval_required(
+            mode
+        )
+        # Manual and plan modes gate execution tools too (§3.5) — same
+        # interrupt/resume machinery, a different question to the user.
+        execution = not destructive and requires_execution_approval(mode, tool.name)
+        if destructive or execution:
             payload = {
                 "tool": tool.name,
                 "arguments": pending["arguments"],
                 "description": tool.description,
+                "kind": "destructive" if destructive else "execution",
             }
+            preview = script_preview(tool.name, pending["arguments"], context)
+            if preview:
+                payload["script"] = preview
             if tool.describe_call is not None:
                 payload["details"] = tool.describe_call(arguments, context)
             verdict = interrupt(payload)
@@ -182,6 +217,8 @@ def build_graph(
                 else bool(verdict)
             )
             if not approved:
+                if execution:
+                    return _tool_message(skipped_message(tool.name))
                 return _tool_message(
                     f"[tool result] {tool.name}: DENIED by the user — "
                     "the operation was not executed."
@@ -190,8 +227,21 @@ def build_graph(
             output = await tool.handler(arguments, context)
             content = f"[tool result] {tool.name}: {output}"
         except Exception as e:  # surfaced to the model, never crashes the graph
-            content = f"[tool error] {tool.name}: {type(e).__name__}: {e}"
-        return _tool_message(content)
+            return _tool_message(f"[tool error] {tool.name}: {type(e).__name__}: {e}")
+        update = _tool_message(content)
+        if tool.name == "update_plan":
+            # The checklist lives in the checkpointed state, not in the tool:
+            # that is what makes it survive restarts and prompt re-injection.
+            update["plan"] = [step.model_dump() for step in arguments.steps]
+        return update
+
+    def _system_text(state: AgentState, mode: str | None) -> str:
+        """This round's system prompt: the app's render plus the mode rules
+        and the current plan. Appended per round, never only once, so the
+        constraint survives compaction and mode switches apply immediately."""
+        text = render_system_prompt()
+        suffix = mode_prompt_suffix(mode, state.get("plan"))
+        return f"{text}\n\n{suffix}" if suffix else text
 
     def _thinking(state: AgentState, reasoning: str) -> dict:
         if not reasoning.strip():
@@ -224,7 +274,10 @@ def build_graph(
                 "missing and what single next step would get it."
             ),
         }
-        system: Message = {"role": "system", "content": render_system_prompt()}
+        system: Message = {
+            "role": "system",
+            "content": _system_text(state, current_mode()),
+        }
         report("thinking")
         try:
             decision = await decide(
@@ -279,6 +332,8 @@ class TurnResult:
     interrupt: dict | None
     messages: list[Message] = field(default_factory=list)
     thinking: list[dict] = field(default_factory=list)
+    # The plan checklist as of the end of this turn (None when none exists).
+    plan: list[dict] | None = None
     # Index of the first message this turn appended: everything from here on
     # is new, which is what the session log needs and history does not.
     first_new: int = 0
@@ -334,12 +389,14 @@ async def run_turn(
     messages = result.get("messages", [])
     thinking = result.get("thinking", [])
     interrupts = result.get("__interrupt__") or []
+    plan = result.get("plan")
     if interrupts:
         return TurnResult(
             reply=None,
             interrupt=interrupts[0].value,
             messages=messages,
             thinking=thinking,
+            plan=plan,
             first_new=first_new,
         )
     reply = next(
@@ -350,5 +407,6 @@ async def run_turn(
         interrupt=None,
         messages=messages,
         thinking=thinking,
+        plan=plan,
         first_new=first_new,
     )

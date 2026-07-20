@@ -22,6 +22,29 @@ hpca
 Configuration lives at `~/.HolisticProcessingComputeAgent/settings.json` and can be
 edited from the in-app settings menu (`s`).
 
+## Agent modes
+
+Each session runs in one of three modes, shown on the line right above the chat
+entry and cycled with `shift+tab` (`ctrl+m` also works in terminals whose
+keyboard protocol can distinguish it from Enter — most cannot):
+
+* **manual** — every script or command the agent wants to run is shown to you
+  first; `y` runs it, `n` skips it (the agent is told you declined and will not
+  retry it).
+* **auto** — the agent works until the task is done without asking for
+  confirmation. Destructive operations (delete, overwrite, kill, cancel) still
+  require your approval.
+* **full auto** — auto without the destructive-operation approvals: nothing
+  pauses, nothing asks. The trash/backup layer still backs deletions and
+  overwrites of small files, but this mode is otherwise on your own risk.
+* **plan** — the agent executes nothing and instead drafts a checklist
+  (look-around commands each ask first). When a plan is ready, a dialog lets you
+  edit the checklist and hand it over for execution — on auto (`ctrl+r`) or
+  step-by-step under manual approval (`ctrl+s`) — or keep refining it (`esc`).
+
+New sessions start in `agent.default_mode` (settings, default `manual`); each
+session remembers its own mode across restarts.
+
 ## Clipboard under tmux
 
 For the system-clipboard path (OSC 52) to work inside tmux you need one of:

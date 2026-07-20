@@ -19,34 +19,45 @@ class Session:
     title: str
     created_at: str
     checkpoint_ref: str
+    # Interaction mode (§3.5): manual | auto | full-auto | plan;
+    # "" = configured default.
+    mode: str = ""
 
 
 class SessionStore:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
-    def create(self, *, profile: str, title: str = "untitled") -> Session:
+    def create(self, *, profile: str, title: str = "untitled", mode: str = "") -> Session:
         session = Session(
             session_id=str(uuid.uuid4()),
             profile=profile,
             title=title,
             created_at=datetime.now(timezone.utc).isoformat(),
             checkpoint_ref="",
+            mode=mode,
         )
         session.checkpoint_ref = session.session_id
         self._conn.execute(
             "INSERT INTO sessions (session_id, profile, title, created_at, "
-            "checkpoint_ref) VALUES (?, ?, ?, ?, ?)",
+            "checkpoint_ref, mode) VALUES (?, ?, ?, ?, ?, ?)",
             (
                 session.session_id,
                 session.profile,
                 session.title,
                 session.created_at,
                 session.checkpoint_ref,
+                session.mode,
             ),
         )
         self._conn.commit()
         return session
+
+    def set_mode(self, session_id: str, mode: str) -> None:
+        self._conn.execute(
+            "UPDATE sessions SET mode = ? WHERE session_id = ?", (mode, session_id)
+        )
+        self._conn.commit()
 
     def list(self, *, profile: str) -> list[Session]:
         rows = self._conn.execute(
@@ -122,4 +133,5 @@ class SessionStore:
             title=row["title"],
             created_at=row["created_at"],
             checkpoint_ref=row["checkpoint_ref"],
+            mode=row["mode"] if "mode" in row.keys() else "",
         )

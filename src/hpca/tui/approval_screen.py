@@ -1,6 +1,12 @@
-"""HITL confirmation modal for destructive operations (§5.3).
+"""HITL confirmation modal for gated operations (§5.3, §3.5).
 
-Shows the exact operation the agent wants to perform; dismisses with a bool.
+Two kinds of gate share this screen, told apart by ``payload["kind"]``:
+
+* ``destructive`` — the always-on gate for destructive operations.
+* ``execution`` — manual/plan mode showing a script or command before it
+  runs; the user decides on the actual script text, not on a JSON blob.
+
+Dismisses with a bool either way; the graph resumes with it.
 """
 
 from __future__ import annotations
@@ -9,7 +15,7 @@ import json
 
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import Vertical, VerticalScroll
 from textual.content import Content
 from textual.screen import ModalScreen
 from textual.widgets import Static
@@ -34,9 +40,22 @@ class ApprovalScreen(ModalScreen[bool]):
         background: $surface;
         padding: 1 2;
     }
+    ApprovalScreen.execution #approval-dialog {
+        border: heavy $warning;
+    }
     #approval-title {
         text-style: bold;
         color: $error;
+    }
+    ApprovalScreen.execution #approval-title {
+        color: $warning;
+    }
+    #approval-script {
+        height: auto;
+        max-height: 16;
+        border: round $panel;
+        padding: 0 1;
+        margin: 1 0;
     }
     #approval-hint {
         color: $text-muted;
@@ -46,13 +65,34 @@ class ApprovalScreen(ModalScreen[bool]):
     def __init__(self, payload: dict) -> None:
         super().__init__()
         self._payload = payload
+        if self.kind == "execution":
+            self.add_class("execution")
+
+    @property
+    def kind(self) -> str:
+        return self._payload.get("kind", "destructive")
+
+    def title_text(self) -> str:
+        if self.kind == "execution":
+            return f"Run this — {self._payload.get('tool')}?"
+        return "Destructive operation — approve?"
+
+    def hint_text(self) -> str:
+        if self.kind == "execution":
+            return "(y) run script · (n) skip script"
+        return "(y) approve · (n) deny"
 
     def details_text(self) -> str:
-        text = (
-            f"Tool: {self._payload.get('tool')}\n"
-            f"Arguments: {json.dumps(self._payload.get('arguments'), indent=2)}\n"
-            f"{self._payload.get('description', '')}"
-        )
+        text = f"Tool: {self._payload.get('tool')}"
+        # With a script shown below, the raw arguments would repeat it as a
+        # JSON blob; without one they are all there is to judge the call by.
+        if not self._payload.get("script"):
+            text += (
+                f"\nArguments: {json.dumps(self._payload.get('arguments'), indent=2)}"
+            )
+        description = self._payload.get("description", "")
+        if description:
+            text += f"\n{description}"
         details = self._payload.get("details")
         if details:  # resolved real paths (§5.3)
             text += f"\n\n{details}"
@@ -60,9 +100,13 @@ class ApprovalScreen(ModalScreen[bool]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="approval-dialog"):
-            yield Static("Destructive operation — approve?", id="approval-title")
+            yield Static(self.title_text(), id="approval-title")
             yield Static(Content(self.details_text()), id="approval-details")
-            yield Static("(y) approve · (n) deny", id="approval-hint")
+            script = self._payload.get("script")
+            if script:
+                with VerticalScroll(id="approval-script"):
+                    yield Static(Content(script))
+            yield Static(self.hint_text(), id="approval-hint")
 
     def action_approve(self) -> None:
         self.dismiss(True)
