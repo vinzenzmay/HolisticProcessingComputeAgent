@@ -2362,8 +2362,9 @@ class HpcaApp(App):
             return in_chat
         if action == "cycle_mode":
             # Mode is a per-session dial; without a session there is nothing
-            # to switch. Disabled on modals so shift+tab keeps moving focus.
-            return on_main_screen and self.active_session is not None
+            # to switch. Only from the chat column — on the sessions and
+            # processes columns (and on modals) shift+tab keeps moving focus.
+            return in_chat and self.active_session is not None
         if action == "open_settings":
             return not in_chat
         if action == "quit":

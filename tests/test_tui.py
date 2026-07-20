@@ -140,6 +140,41 @@ class TestNewSession:
             assert len(app.session_store.list(profile="default")) == 1
 
 
+class TestAgentModeSwitching:
+    """shift+tab cycles the agent mode, but only from the chat column —
+    the sessions and processes columns leave the mode alone."""
+
+    async def test_shift_tab_cycles_mode_from_the_chat_column(self, hpca_home):
+        app = HpcaApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await new_session_via_picker(app, pilot)  # -> chat entry focused
+            assert app.focused_column_id == "chat"
+            assert app._mode_of(app.active_session) == "manual"
+            assert app.check_action("cycle_mode", ()) is True
+            await pilot.press("shift+tab")
+            assert app._mode_of(app.active_session) == "auto"
+
+    async def test_mode_switch_is_unavailable_off_the_chat_column(self, hpca_home):
+        app = HpcaApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await new_session_via_picker(app, pilot)  # a session now exists
+            start = app._mode_of(app.active_session)
+
+            app._focus_column("sessions")
+            await pilot.pause()
+            assert app.focused_column_id == "sessions"
+            assert app.check_action("cycle_mode", ()) is False
+            await pilot.press("shift+tab")
+            assert app._mode_of(app.active_session) == start
+
+            app._focus_column("processes")
+            await pilot.pause()
+            assert app.focused_column_id == "processes"
+            assert app.check_action("cycle_mode", ()) is False
+            await pilot.press("shift+tab")
+            assert app._mode_of(app.active_session) == start
+
+
 class TestChatEntryNavigation:
     async def test_arrow_keys_leave_the_entry_only_at_its_edges(self, hpca_home):
         app = HpcaApp()
