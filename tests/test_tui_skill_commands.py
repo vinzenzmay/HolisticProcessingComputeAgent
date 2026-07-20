@@ -63,7 +63,12 @@ async def create_skill(app, pilot, name, description, body):
     app.screen.query_one("#skill-name", Input).value = name
     app.screen.query_one("#skill-description", Input).value = description
     app.screen.query_one("#skill-body", TextArea).text = body
-    await pilot.press("ctrl+s")
+    await pilot.press("escape")  # save is resolved on escape
+    await pilot.pause()
+    from hpca.tui.confirm_screen import ConfirmScreen
+
+    if isinstance(app.screen, ConfirmScreen):
+        await pilot.press("y")  # "Save skill?" -> yes
     await app.workers.wait_for_complete()
     await pilot.pause()
 
@@ -103,7 +108,7 @@ class TestSkillCreator:
         async with app.run_test(size=(120, 40)) as pilot:
             await submit(app, pilot, "/skill-creator")
             app.screen.query_one("#skill-body", TextArea).text = "some body"
-            await pilot.press("ctrl+s")
+            await pilot.press("escape")  # body but no name
             await pilot.pause()
             assert isinstance(app.screen, SkillCreatorScreen)  # not dismissed
             assert load_own_skills(app.profile) == []

@@ -219,6 +219,9 @@ class SessionsList(ListView):
     """Left column; renaming applies to a session, not to "(new session)"."""
 
     BINDINGS = [
+        # (q) quit first so the footer shows it leftmost (§ esc/quit ordering);
+        # the app-level (q) is what handles it, this just orders the display.
+        Binding("q", "confirm_quit", "quit"),
         Binding("r", "rename_session", "rename"),
         Binding("t", "retitle_session", "ask llm for a title"),
         Binding("d", "delete_session", "delete session"),
@@ -471,6 +474,11 @@ class ProcessesPanel(ColumnPanel):
 
 class HpcaApp(App):
     TITLE = "HPCA"
+    # Textual's command palette moves off ctrl+p (reserved — see the hotkey note
+    # above BINDINGS) to a bare "p". check_action gates it to the sessions
+    # column, the one place no typing happens, so "p" falls through as a letter
+    # everywhere else.
+    COMMAND_PALETTE_BINDING = "p"
 
     CSS = """
     #top-bar {
@@ -579,7 +587,18 @@ class HpcaApp(App):
     }
     """
 
+    # RESERVED HOTKEYS — do NOT bind these anywhere in the TUI (they are eaten
+    # or made unreliable by terminals, zellij/tmux, or the flow-control layer):
+    #   ctrl+[q p t n h s o g]  and  alt+[n f  ← ↑ → ↓  + -]
+    # ctrl+s is terminal XOFF (freezes output), ctrl+q is XON/zellij, ctrl+p is
+    # a common multiplexer prefix. Prefer bare letters (gated via check_action to
+    # a non-typing column) or safe ctrl combos (l, e, r, …). Keep this list in
+    # sync with the note in project.md.
     BINDINGS = [
+        # (q) quit first, so the footer shows it leftmost (§ esc/quit ordering).
+        # Not priority: (q) must reach the chat entry as a letter. Offered only
+        # on the sessions column, where no typing happens (check_action).
+        Binding("q", "confirm_quit", "quit"),
         Binding("left", "focus_column(-1)", "◀ column", show=False),
         Binding("right", "focus_column(1)", "column ▶", show=False),
         Binding("c", "open_settings", "config editor"),
@@ -592,9 +611,6 @@ class HpcaApp(App):
         # return), so shift+tab is the binding that works everywhere.
         Binding("shift+tab", "cycle_mode", "agent mode", priority=True),
         Binding("ctrl+m", "cycle_mode", "agent mode", show=False),
-        # Not priority: (q) must reach the chat entry as a letter. Offered
-        # only on the sessions column, where no typing happens (check_action).
-        Binding("q", "confirm_quit", "quit"),
     ]
 
     def __init__(
@@ -2453,6 +2469,11 @@ class HpcaApp(App):
             return in_chat and self.active_session is not None
         if action == "open_settings":
             return not in_chat
+        if action == "command_palette":
+            # Rebound from ctrl+p to bare "p" (COMMAND_PALETTE_BINDING). Only on
+            # the sessions column, where no typing happens; elsewhere "p" must
+            # reach the widget (the chat entry) as a letter.
+            return on_sessions
         if action == "quit":
             # Textual's own ctrl+q. Quitting goes through (q) on the sessions
             # column, which confirms first — and ctrl+q belongs to zellij.

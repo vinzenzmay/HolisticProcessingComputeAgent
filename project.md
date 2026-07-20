@@ -90,6 +90,19 @@ Terminals in 2026 are assumed wider than 80 columns
   * *Sub-process (right column):* `(i)` inspect (open logs/status view),
     `(k)` kill (with confirmation), `(a)` ask — spawn a Q&A subagent about this
     sub-process.
+
+**Reserved hotkeys — never bind these** (they are eaten or made unreliable by the
+terminal, by zellij/tmux, or by the flow-control layer, so a future UI addition
+must avoid them):
+
+* `ctrl` + `q p t n h s o g` — `ctrl+s`/`ctrl+q` are terminal flow control
+  (XOFF/XON: `ctrl+s` *freezes* output), and `ctrl+p`/`ctrl+t`/… are common
+  multiplexer/zellij prefixes.
+* `alt` + `n f`, the arrow keys, `+`, `-` — commonly grabbed by zellij/tmux.
+
+Prefer a bare letter gated (via `check_action`) to a non-typing column, or a safe
+`ctrl` combo (`ctrl+l`, `ctrl+e`, `ctrl+r`, …). Keep this list in sync with the
+`RESERVED HOTKEYS` comment above `HpcaApp.BINDINGS`.
 * **Config editor** `(c)`: edit the settings JSON, persisted to
   `~/.HolisticProcessingComputeAgent/settings.json`.
 * **Profiles & learnings** `(a)`: manage profiles and their tier-1 memories.

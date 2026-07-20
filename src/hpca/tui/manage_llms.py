@@ -68,6 +68,9 @@ class DiscoveredList(ListView):
     """Left panel; its bindings appear in the footer only when focused."""
 
     BINDINGS = [
+        # esc first so "back" shows leftmost (§ esc/quit ordering); the screen's
+        # escape binding handles it, this just orders the footer display.
+        Binding("escape", "close", "back", show=True),
         Binding("enter", "select_cursor", "add llm to list", show=True),
     ]
 
@@ -81,6 +84,7 @@ class ConfiguredList(ListView):
     """Right panel; set-default, remove and thinking only offered on an entry."""
 
     BINDINGS = [
+        Binding("escape", "close", "back", show=True),
         Binding("enter", "select_cursor", "set default", show=True),
         Binding("t", "toggle_thinking", "toggle thinking mode", show=True),
         Binding("r", "remove_llm", "remove llm", show=True),

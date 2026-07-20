@@ -17,10 +17,10 @@ class TierSelectScreen(ModalScreen[int | None]):
     """`\\memorize`: pick the tier for the new memory; default is tier 2."""
 
     BINDINGS = [
+        Binding("escape", "cancel", "cancel", priority=True),
         Binding("1", "pick(1)", "tier 1"),
         Binding("2", "pick(2)", "tier 2"),
         Binding("enter", "pick(2)", "tier 2 (default)", priority=True),
-        Binding("escape", "cancel", "cancel", priority=True),
     ]
 
     DEFAULT_CSS = """
@@ -44,8 +44,8 @@ class TierSelectScreen(ModalScreen[int | None]):
             yield Static("Memorize into which tier?", id="tier-title")
             yield Static(Content(self._text), id="tier-text")
             yield Static(
-                "(1) global standing note · (2) profile memory [default] · "
-                "(esc) cancel",
+                "(esc) cancel · (1) global standing note · "
+                "(2) profile memory [default]",
                 id="tier-hint",
             )
 

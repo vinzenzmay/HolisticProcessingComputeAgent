@@ -7,6 +7,7 @@ from textual.widgets import Footer, ListView, TextArea
 
 from hpca.config import Settings
 from hpca.tui.app import ChatInput, ColumnPanel, HpcaApp, TopBar
+from hpca.tui.confirm_screen import ConfirmScreen
 from hpca.tui.settings_screen import SettingsScreen
 
 
@@ -140,6 +141,30 @@ class TestNewSession:
             assert len(app.session_store.list(profile="default")) == 1
 
 
+class TestCommandPalette:
+    """The palette is rebound from ctrl+p to bare 'p', and only from the
+    sessions column — elsewhere 'p' is a letter (e.g. typed into chat)."""
+
+    def test_palette_binding_is_p(self):
+        assert HpcaApp.COMMAND_PALETTE_BINDING == "p"
+
+    async def test_palette_only_from_the_sessions_column(self, hpca_home):
+        app = HpcaApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            assert app.focused_column_id == "sessions"
+            assert app.check_action("command_palette", ()) is True
+            await new_session_via_picker(app, pilot)  # -> chat entry focused
+            assert app.focused_column_id == "chat"
+            assert app.check_action("command_palette", ()) is False
+
+    async def test_p_types_into_chat_instead_of_opening_the_palette(self, hpca_home):
+        app = HpcaApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await new_session_via_picker(app, pilot)
+            await pilot.press("p")
+            assert app.query_one("#chat-input", ChatInput).text == "p"
+
+
 class TestAgentModeSwitching:
     """shift+tab cycles the agent mode, but only from the chat column —
     the sessions and processes columns leave the mode alone."""
@@ -242,7 +267,7 @@ class TestConfigEditorModal:
             data = json.loads(editor.text)
             assert data["llm"]["model"] == "qwen3-6b"
 
-    async def test_save_persists_and_updates_app(self, hpca_home):
+    async def test_escape_with_changes_asks_then_saves_on_yes(self, hpca_home):
         app = HpcaApp()
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("c")
@@ -250,7 +275,10 @@ class TestConfigEditorModal:
             data = json.loads(editor.text)
             data["llm"]["model"] = "new-model"
             editor.text = json.dumps(data)
-            await pilot.press("ctrl+s")
+            await pilot.press("escape")  # unsaved changes -> "Keep changes?"
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmScreen)
+            await pilot.press("y")
             await pilot.pause()
             # modal closed, file written, app state updated
             assert not isinstance(app.screen, SettingsScreen)
@@ -259,13 +287,30 @@ class TestConfigEditorModal:
             assert app.settings.llm.model == "new-model"
             assert "new-model" in app.query_one(TopBar).render_text()
 
+    async def test_escape_with_changes_discards_on_no(self, hpca_home):
+        app = HpcaApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("c")
+            editor = app.screen.query_one(TextArea)
+            data = json.loads(editor.text)
+            data["llm"]["model"] = "unwanted"
+            editor.text = json.dumps(data)
+            await pilot.press("escape")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmScreen)
+            await pilot.press("n")
+            await pilot.pause()
+            assert not isinstance(app.screen, SettingsScreen)
+            assert not (hpca_home / "settings.json").exists()
+            assert app.settings.llm.model == "qwen3-6b"
+
     async def test_invalid_json_shows_error_and_stays_open(self, hpca_home):
         app = HpcaApp()
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("c")
             editor = app.screen.query_one(TextArea)
             editor.text = "{broken"
-            await pilot.press("ctrl+s")
+            await pilot.press("escape")  # cannot save invalid; stays open
             await pilot.pause()
             assert isinstance(app.screen, SettingsScreen)
             error = app.screen.query_one("#settings-error")
@@ -280,7 +325,7 @@ class TestConfigEditorModal:
             data = json.loads(editor.text)
             data["clipboard"]["mode"] = "telepathy"
             editor.text = json.dumps(data)
-            await pilot.press("ctrl+s")
+            await pilot.press("escape")
             await pilot.pause()
             assert isinstance(app.screen, SettingsScreen)
             assert not (hpca_home / "settings.json").exists()

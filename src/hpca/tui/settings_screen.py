@@ -22,10 +22,9 @@ from hpca.config import Settings
 
 
 class SettingsScreen(ModalScreen[Settings | None]):
-    BINDINGS = [
-        Binding("escape", "cancel", "cancel", priority=True),
-        Binding("ctrl+s", "save", "save", priority=True),
-    ]
+    # Save is resolved on escape ("Keep changes? y/n"), mirroring the profile
+    # memory editor — there is no ctrl+s (a reserved hotkey: terminal XOFF).
+    BINDINGS = [Binding("escape", "close", "back", priority=True)]
 
     DEFAULT_CSS = """
     SettingsScreen {
@@ -54,30 +53,45 @@ class SettingsScreen(ModalScreen[Settings | None]):
 
     def __init__(self, settings: Settings) -> None:
         super().__init__()
-        self._settings = settings
+        self._original = settings.model_dump_json(indent=2)
 
     def compose(self) -> ComposeResult:
         with Vertical(id="settings-dialog"):
-            yield Static("Config editor — ctrl+s save · esc cancel", id="settings-title")
-            yield TextArea(
-                self._settings.model_dump_json(indent=2), id="settings-editor"
+            yield Static(
+                "Config editor — esc: back (asks to keep changes)",
+                id="settings-title",
             )
+            yield TextArea(self._original, id="settings-editor")
             yield Static("", id="settings-error")
 
-    def action_cancel(self) -> None:
-        self.dismiss(None)
+    def on_mount(self) -> None:
+        self.query_one("#settings-editor", TextArea).focus()
 
-    def action_save(self) -> None:
-        text = self.query_one(TextArea).text
+    def _validate(self, text: str) -> Settings | None:
+        """Parse+validate the edited JSON, showing the reason on failure."""
         error = self.query_one("#settings-error", Static)
         try:
             data = json.loads(text)
         except json.JSONDecodeError as e:
             error.update(Content(f"Malformed JSON: {e}"))
-            return
+            return None
         try:
-            new_settings = Settings.model_validate(data)
+            return Settings.model_validate(data)
         except ValidationError as e:
             error.update(Content(f"Invalid settings: {e}"))
+            return None
+
+    def action_close(self) -> None:
+        text = self.query_one("#settings-editor", TextArea).text
+        if text == self._original:
+            self.dismiss(None)  # nothing changed; no need to ask
             return
-        self.dismiss(new_settings)
+        new_settings = self._validate(text)
+        if new_settings is None:
+            return  # invalid: keep editing rather than lose the work
+        from hpca.tui.confirm_screen import ConfirmScreen
+
+        def verdict(keep: bool | None) -> None:
+            self.dismiss(new_settings if keep else None)
+
+        self.app.push_screen(ConfirmScreen("Keep changes?"), verdict)

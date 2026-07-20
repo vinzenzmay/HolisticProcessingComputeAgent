@@ -38,7 +38,7 @@ class RenameScreen(ModalScreen[str | None]):
         with Vertical(id="rename-dialog"):
             yield Static(self._label, id="rename-label")
             yield Input(value=self._title, id="rename-input")
-            yield Static("(enter) save · (escape) cancel", id="rename-hint")
+            yield Static("(escape) cancel · (enter) save", id="rename-hint")
 
     def on_mount(self) -> None:
         name = self.query_one("#rename-input", Input)

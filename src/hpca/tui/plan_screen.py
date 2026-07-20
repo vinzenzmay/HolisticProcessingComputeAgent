@@ -21,10 +21,12 @@ PlanDecision = tuple[str, list[dict]] | None
 
 
 class PlanScreen(ModalScreen[PlanDecision]):
+    # esc first (shown leftmost). Execute keys avoid ctrl+s (reserved hotkey:
+    # terminal XOFF) — step-by-step is ctrl+e.
     BINDINGS = [
-        Binding("ctrl+r", "execute_auto", "run on auto", priority=True),
-        Binding("ctrl+s", "execute_manual", "run step-by-step", priority=True),
         Binding("escape", "keep", "keep planning", priority=True),
+        Binding("ctrl+r", "execute_auto", "run on auto", priority=True),
+        Binding("ctrl+e", "execute_manual", "run step-by-step", priority=True),
     ]
 
     DEFAULT_CSS = """
@@ -63,8 +65,8 @@ class PlanScreen(ModalScreen[PlanDecision]):
             yield TextArea(render_checklist(self._steps), id="plan-editor")
             yield Static(
                 "Edit freely ([x] marks a step done), then:\n"
-                "ctrl+r  execute on auto · ctrl+s  execute step-by-step "
-                "(each script asks first) · esc  keep planning",
+                "esc  keep planning · ctrl+r  execute on auto · "
+                "ctrl+e  execute step-by-step (each script asks first)",
                 id="plan-hint",
             )
 

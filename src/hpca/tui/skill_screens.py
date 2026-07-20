@@ -27,10 +27,9 @@ class SkillCreatorScreen(ModalScreen[Skill | None]):
     bottom (name → description → body), tab moves between them.
     """
 
-    BINDINGS = [
-        Binding("ctrl+s", "save", "save", priority=True),
-        Binding("escape", "cancel", "cancel", priority=True),
-    ]
+    # Save is resolved on escape ("Save skill? y/n") — no ctrl+s (reserved
+    # hotkey: terminal XOFF). esc first so the footer shows it leftmost.
+    BINDINGS = [Binding("escape", "close", "back", priority=True)]
 
     DEFAULT_CSS = """
     SkillCreatorScreen { align: center middle; }
@@ -61,17 +60,20 @@ class SkillCreatorScreen(ModalScreen[Skill | None]):
             yield Static("body (the procedure)", classes="skill-field-label")
             yield TextArea(id="skill-body")
             yield Static(
-                "(ctrl+s) save · (esc) cancel · (tab) next field",
+                "(esc) save & close (asks first) · (tab) next field",
                 id="skill-hint",
             )
 
     def on_mount(self) -> None:
         self.query_one("#skill-name", Input).focus()
 
-    def action_save(self) -> None:
+    def action_close(self) -> None:
         name = self.query_one("#skill-name", Input).value.strip()
         description = self.query_one("#skill-description", Input).value.strip()
         body = self.query_one("#skill-body", TextArea).text.strip()
+        if not name and not description and not body:
+            self.dismiss(None)  # nothing entered; nothing to save
+            return
         if not name:
             self.notify("A skill needs a name.", severity="warning")
             self.query_one("#skill-name", Input).focus()
@@ -80,12 +82,14 @@ class SkillCreatorScreen(ModalScreen[Skill | None]):
             self.notify("A skill needs a body (the procedure).", severity="warning")
             self.query_one("#skill-body", TextArea).focus()
             return
-        self.dismiss(
-            Skill(name=name, description=description, triggers=[], body=body)
-        )
+        from hpca.tui.confirm_screen import ConfirmScreen
 
-    def action_cancel(self) -> None:
-        self.dismiss(None)
+        skill = Skill(name=name, description=description, triggers=[], body=body)
+
+        def verdict(keep: bool | None) -> None:
+            self.dismiss(skill if keep else None)
+
+        self.app.push_screen(ConfirmScreen(f"Save skill “{name}”?"), verdict)
 
 
 class SkillPickerScreen(ModalScreen[Skill | None]):
@@ -117,7 +121,7 @@ class SkillPickerScreen(ModalScreen[Skill | None]):
             yield Static("Remove which skill?", id="skill-picker-title")
             with VerticalScroll():
                 yield ListView(id="skill-picker-list")
-            yield Static("(enter) remove · (esc) cancel", id="skill-picker-hint")
+            yield Static("(esc) cancel · (enter) remove", id="skill-picker-hint")
 
     def on_mount(self) -> None:
         picker = self.query_one("#skill-picker-list", ListView)

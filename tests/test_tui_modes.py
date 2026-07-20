@@ -241,7 +241,7 @@ class TestPlanFlow:
         async with app.run_test(size=(120, 40)) as pilot:
             await submit_chat(app, pilot, "help me convert a BAM")
             assert isinstance(app.screen, PlanScreen)
-            await pilot.press("ctrl+s")  # execute step-by-step (manual)
+            await pilot.press("ctrl+e")  # execute step-by-step (manual)
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert app.active_session.mode == "manual"

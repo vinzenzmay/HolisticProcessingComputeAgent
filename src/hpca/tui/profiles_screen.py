@@ -42,6 +42,9 @@ class ProfilesList(ListView):
     cannot be deleted."""
 
     BINDINGS = [
+        # esc first so the footer shows "back" leftmost (§ esc/quit ordering);
+        # the screen's own escape binding handles it, this orders the display.
+        Binding("escape", "close", "back", show=True),
         Binding("enter", "select_cursor", "edit / create", show=True),
         Binding("c", "copy_profile", "copy profile", show=True),
         Binding("d", "delete_profile", "delete profile", show=True),
@@ -289,7 +292,7 @@ class ProfilePickerScreen(ModalScreen[str | None]):
         with Vertical(id="picker-dialog"):
             yield Static("Profile for the new session", id="picker-title")
             yield ListView(id="picker-list")
-            yield Static("(enter) choose · (esc) cancel", id="picker-hint")
+            yield Static("(esc) cancel · (enter) choose", id="picker-hint")
 
     def on_mount(self) -> None:
         picker = self.query_one("#picker-list", ListView)
