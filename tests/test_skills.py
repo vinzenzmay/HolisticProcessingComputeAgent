@@ -2,7 +2,13 @@
 
 import pytest
 
-from hpca.skills import Skill, load_skills, skills_dir, summarize_skills
+from hpca.skills import (
+    SHARED_SKILLS_DIR,
+    Skill,
+    load_skills,
+    skills_dir,
+    summarize_skills,
+)
 
 
 @pytest.fixture
@@ -87,6 +93,44 @@ class TestLoadSkills:
     def test_string_triggers_normalized(self, hpca_home):
         write_skill("s.md", "---\nname: s\ntriggers: bam\n---\nbody\n")
         assert load_skills()[0].triggers == ["bam"]
+
+
+class TestOwnSkills:
+    """The profile's own skills — what /skill-remove may delete, as opposed to
+    shared (_shared/) or legacy flat skills, which one profile must not remove."""
+
+    def test_own_skills_are_only_the_profiles_own_dir(self, hpca_home):
+        from hpca.skills import load_own_skills, write_skill as write
+
+        write(Skill(name="mine", description="", triggers=[], body="b"), "default")
+        # a shared skill and a legacy flat skill are visible but not "own"
+        (skills_dir() / SHARED_SKILLS_DIR).mkdir(parents=True, exist_ok=True)
+        (skills_dir() / SHARED_SKILLS_DIR / "shared.md").write_text(
+            "---\nname: shared\n---\nb\n"
+        )
+        (skills_dir() / "legacy.md").write_text("---\nname: legacy\n---\nb\n")
+        assert [s.name for s in load_own_skills("default")] == ["mine"]
+        # all three are still visible to the profile
+        assert {s.name for s in load_skills("default")} == {
+            "mine",
+            "shared",
+            "legacy",
+        }
+
+    def test_delete_own_skill_removes_the_file(self, hpca_home):
+        from hpca.skills import delete_own_skill, load_own_skills
+        from hpca.skills import write_skill as write
+
+        write(Skill(name="mine", description="d", triggers=[], body="b"), "default")
+        skill = load_own_skills("default")[0]
+        assert delete_own_skill(skill, "default") is True
+        assert load_own_skills("default") == []
+
+    def test_delete_own_skill_when_missing_returns_false(self, hpca_home):
+        from hpca.skills import delete_own_skill
+
+        ghost = Skill(name="ghost", description="", triggers=[], body="b", source="ghost.md")
+        assert delete_own_skill(ghost, "default") is False
 
 
 class TestMatching:

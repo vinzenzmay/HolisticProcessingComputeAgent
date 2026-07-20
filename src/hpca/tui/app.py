@@ -83,7 +83,9 @@ from hpca.skills import (
     Skill,
     any_skills,
     copy_profile_skills,
+    delete_own_skill,
     delete_profile_skills,
+    load_own_skills,
     load_skills,
     patched_body,
     summarize_skills,
@@ -166,6 +168,9 @@ class PendingWork:
 COMMANDS = (
     ("memorize", "/memorize <note> — form memories from the note and this conversation"),
     ("conclude", "/conclude — propose memories from this conversation"),
+    ("skill-creator", "/skill-creator — add a skill (name, description, body) to this profile"),
+    ("skills-list", "/skills-list — list this profile's skills"),
+    ("skill-remove", "/skill-remove — remove one of this profile's skills"),
 )
 LOG_KINDS = {
     "user": "user",
@@ -1250,8 +1255,89 @@ class HpcaApp(App):
                 self.notify("No active session to conclude.", severity="warning")
                 return
             self.run_worker(self._conclude_worker(), exclusive=True)
+        elif command == "skill-creator":
+            self.run_worker(self._skill_creator_worker(), exclusive=True)
+        elif command == "skills-list":
+            self._show_skills_list()
+        elif command == "skill-remove":
+            self.run_worker(self._skill_remove_worker(), exclusive=True)
         else:
             self.notify(f"Unknown command: /{command}", severity="warning")
+
+    # ------------------------------------------------------------- skills (§5.1)
+
+    async def _skill_creator_worker(self) -> None:
+        """/skill-creator: collect a skill in a form and write it to the active
+        profile. New skills belong to whichever profile is on screen."""
+        from hpca.tui.skill_screens import SkillCreatorScreen
+
+        skill = await self.push_screen_wait(SkillCreatorScreen())
+        if skill is None:
+            return
+        if skill.name in {s.name for s in load_own_skills(self.profile)}:
+            self.notify(
+                f"A skill named “{skill.name}” already exists in this profile.",
+                severity="warning",
+            )
+            return
+        write_skill(skill, self.profile)
+        self._refresh_skills()
+        self.notify(f"Added skill “{skill.name}” to profile “{self.profile}”.")
+
+    def _show_skills_list(self) -> None:
+        """/skills-list: a read-only view of every skill the profile can see,
+        marking which are the profile's own (removable) versus shared."""
+        visible = load_skills(self.profile)
+        if not visible:
+            self.notify(
+                f"No skills for profile “{self.profile}”. Add one with "
+                "/skill-creator.",
+            )
+            return
+        own = {s.name for s in load_own_skills(self.profile)}
+        lines = []
+        for skill in visible:
+            tag = "" if skill.name in own else "  (shared)"
+            lines.append(f"• {skill.name}{tag}")
+            if skill.description:
+                lines.append(f"    {skill.description}")
+        self.push_screen(
+            InspectScreen(f"Skills · profile “{self.profile}”", "\n".join(lines))
+        )
+
+    async def _skill_remove_worker(self) -> None:
+        """/skill-remove: pick one of the profile's own skills and delete it.
+        Shared and legacy skills are not offered — removing one would change
+        every other profile that sees it."""
+        from hpca.tui.skill_screens import SkillPickerScreen
+
+        own = load_own_skills(self.profile)
+        if not own:
+            self.notify(
+                f"Profile “{self.profile}” has no skills of its own to remove.",
+            )
+            return
+        skill = await self.push_screen_wait(SkillPickerScreen(own))
+        if skill is None:
+            return
+        confirmed = await self.push_screen_wait(
+            ConfirmScreen(f"Remove skill “{skill.name}” from “{self.profile}”?")
+        )
+        if not confirmed:
+            return
+        if delete_own_skill(skill, self.profile):
+            self._refresh_skills()
+            self.notify(f"Removed skill “{skill.name}”.")
+        else:
+            self.notify(f"Could not remove “{skill.name}”.", severity="warning")
+
+    def _refresh_skills(self) -> None:
+        """Make a skill change visible without a graph rebuild: the on-screen
+        profile's list feeds the next turn's prompt, and the first-ever skill
+        enables the read_skill tool (the registry is shared, mutated in place)."""
+        self.skills = load_skills(self.profile)
+        if any_skills() and "read_skill" not in self._tools.names():
+            add_skill_tools(self._tools)
 
     async def _memorize_worker(self, note: str) -> None:
         """/memorize <note>: the model turns the note plus the conversation so

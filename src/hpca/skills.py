@@ -133,6 +133,31 @@ def load_skills(profile: str | None = None, *, root: Path | None = None) -> list
     return sorted(by_name.values(), key=lambda s: s.name)
 
 
+def load_own_skills(profile: str, *, root: Path | None = None) -> list[Skill]:
+    """Only the skills in the profile's OWN directory — not ``_shared/`` and
+    not the legacy flat files. This is the set the user may remove: deleting a
+    shared procedure from one profile would silently change every other."""
+    root = root or skills_dir()
+    return sorted(_load_dir(root / profile), key=lambda s: s.name)
+
+
+def delete_own_skill(skill: Skill, profile: str, *, root: Path | None = None) -> bool:
+    """Remove one of a profile's own skill files. Returns whether it existed.
+
+    Deletes by the file the skill was loaded from (``skill.source``), so it
+    works even when a hand-edited file's name differs from its front-matter
+    name. Never touches ``_shared/`` or legacy files (they live elsewhere).
+    """
+    root = root or skills_dir()
+    if not skill.source:
+        return False
+    path = root / profile / skill.source
+    if path.exists() and path.is_file():
+        path.unlink()
+        return True
+    return False
+
+
 def any_skills(root: Path | None = None) -> bool:
     """Whether any profile has any skill at all — decides if the skill tools
     are registered, since the active profile can change per session."""
