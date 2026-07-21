@@ -2,9 +2,10 @@
 remove. Skills are per-profile procedure files; the app owns writing/deleting.
 
 ``SkillCreatorScreen`` collects a new skill in one form — name, description,
-then body, top to bottom — and dismisses a built ``Skill`` (or ``None``).
-``SkillPickerScreen`` lists a profile's own skills and dismisses the chosen
-one for removal.
+level, then body, top to bottom — and dismisses a ``(Skill, level)`` pair (or
+``None``). The level chooses where the skill is stored: global (every
+profile), profile (this one), or project (this directory). ``SkillPickerScreen``
+lists the removable skills and dismisses the chosen one for removal.
 """
 
 from __future__ import annotations
@@ -15,16 +16,33 @@ from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
 from textual.content import Content
 from textual.screen import ModalScreen
-from textual.widgets import Input, Label, ListItem, ListView, Static, TextArea
+from textual.widgets import (
+    Input,
+    Label,
+    ListItem,
+    ListView,
+    RadioButton,
+    RadioSet,
+    Static,
+    TextArea,
+)
 
-from hpca.skills import Skill
+from hpca.skills import Skill, SkillLevel
+
+# RadioButton id -> level, so the selection maps back to a stored location.
+_LEVEL_BY_ID: dict[str, SkillLevel] = {
+    "level-global": "global",
+    "level-profile": "profile",
+    "level-project": "project",
+}
 
 
-class SkillCreatorScreen(ModalScreen[Skill | None]):
-    """Create a skill: name, description, body. ctrl+s saves, escape cancels.
+class SkillCreatorScreen(ModalScreen["tuple[Skill, SkillLevel] | None"]):
+    """Create a skill: name, description, level, body. escape saves (asks
+    first), escape on an empty form cancels.
 
-    A single form rather than three pop-ups — the fields are filled top to
-    bottom (name → description → body), tab moves between them.
+    A single form rather than several pop-ups — the fields are filled top to
+    bottom (name → description → level → body), tab moves between them.
     """
 
     # Save is resolved on escape ("Save skill? y/n") — no ctrl+s (reserved
@@ -43,6 +61,7 @@ class SkillCreatorScreen(ModalScreen[Skill | None]):
     }
     #skill-title { text-style: bold; color: $accent; }
     #skill-body { height: auto; max-height: 18; margin: 1 0 0 0; }
+    #skill-level { height: auto; border: none; background: $surface; }
     .skill-field-label { color: $text-muted; margin: 1 0 0 0; }
     #skill-hint { color: $text-muted; margin: 1 0 0 0; }
     """
@@ -57,6 +76,16 @@ class SkillCreatorScreen(ModalScreen[Skill | None]):
                 placeholder="one line — when should the agent use this?",
                 id="skill-description",
             )
+            yield Static("level (where it lives)", classes="skill-field-label")
+            with RadioSet(id="skill-level"):
+                yield RadioButton("global — every profile", id="level-global")
+                # Default to the historical behaviour: this profile only.
+                yield RadioButton(
+                    "profile — this profile only", id="level-profile", value=True
+                )
+                yield RadioButton(
+                    "project — this directory only", id="level-project"
+                )
             yield Static("body (the procedure)", classes="skill-field-label")
             yield TextArea(id="skill-body")
             yield Static(
@@ -66,6 +95,12 @@ class SkillCreatorScreen(ModalScreen[Skill | None]):
 
     def on_mount(self) -> None:
         self.query_one("#skill-name", Input).focus()
+
+    def _selected_level(self) -> SkillLevel:
+        pressed = self.query_one("#skill-level", RadioSet).pressed_button
+        if pressed is None:
+            return "profile"
+        return _LEVEL_BY_ID.get(pressed.id or "", "profile")
 
     def action_close(self) -> None:
         name = self.query_one("#skill-name", Input).value.strip()
@@ -85,9 +120,10 @@ class SkillCreatorScreen(ModalScreen[Skill | None]):
         from hpca.tui.confirm_screen import ConfirmScreen
 
         skill = Skill(name=name, description=description, triggers=[], body=body)
+        level = self._selected_level()
 
         def verdict(keep: bool | None) -> None:
-            self.dismiss(skill if keep else None)
+            self.dismiss((skill, level) if keep else None)
 
         self.app.push_screen(ConfirmScreen(f"Save skill “{name}”?"), verdict)
 

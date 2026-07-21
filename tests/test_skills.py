@@ -313,6 +313,143 @@ class TestSkillWriting:
         assert "- first correction" in twice and "- second correction" in twice
 
 
+class TestSkillLevels:
+    """Three explicit levels: global (``_shared/``), profile, and project
+    (``<cwd>/.hpca/skills``). Precedence on a collision: project > profile >
+    global."""
+
+    def test_project_skills_dir_convention(self, tmp_path):
+        from hpca.skills import project_skills_dir
+
+        assert project_skills_dir(tmp_path) == tmp_path / ".hpca" / "skills"
+
+    def test_write_lands_at_the_chosen_level(self, hpca_home, tmp_path):
+        from hpca.skills import (
+            SHARED_SKILLS_DIR,
+            project_skills_dir,
+            skills_dir,
+            write_skill,
+        )
+
+        write_skill(Skill("g", "d", [], "b"), "genetics", level="global")
+        write_skill(Skill("p", "d", [], "b"), "genetics", level="profile")
+        write_skill(
+            Skill("j", "d", [], "b"),
+            "genetics",
+            level="project",
+            project_root=tmp_path,
+        )
+        assert (skills_dir() / SHARED_SKILLS_DIR / "g.md").exists()
+        assert (skills_dir() / "genetics" / "p.md").exists()
+        assert (project_skills_dir(tmp_path) / "j.md").exists()
+
+    def test_default_level_is_profile(self, hpca_home):
+        from hpca.skills import skills_dir, write_skill
+
+        write_skill(Skill("p", "d", [], "b"), "genetics")
+        assert (skills_dir() / "genetics" / "p.md").exists()
+
+    def test_project_skills_visible_with_project_root(self, hpca_home, tmp_path):
+        from hpca.skills import write_skill
+
+        write_skill(
+            Skill("proj", "d", [], "b"),
+            "genetics",
+            level="project",
+            project_root=tmp_path,
+        )
+        names = [s.name for s in load_skills("genetics", project_root=tmp_path)]
+        assert names == ["proj"]
+
+    def test_project_hidden_from_other_directories(self, hpca_home, tmp_path):
+        from hpca.skills import write_skill
+
+        write_skill(
+            Skill("proj", "d", [], "b"),
+            "genetics",
+            level="project",
+            project_root=tmp_path,
+        )
+        elsewhere = tmp_path / "elsewhere"
+        assert load_skills("genetics", project_root=elsewhere) == []
+
+    def test_project_wins_profile_wins_global(self, hpca_home, tmp_path):
+        from hpca.skills import write_skill
+
+        write_skill(Skill("align", "d", [], "global body"), "genetics", level="global")
+        write_skill(Skill("align", "d", [], "profile body"), "genetics", level="profile")
+        write_skill(
+            Skill("align", "d", [], "project body"),
+            "genetics",
+            level="project",
+            project_root=tmp_path,
+        )
+        skills = load_skills("genetics", project_root=tmp_path)
+        assert len(skills) == 1
+        assert skills[0].body == "project body"
+
+    def test_profile_wins_over_global(self, hpca_home, tmp_path):
+        from hpca.skills import write_skill
+
+        write_skill(Skill("align", "d", [], "global body"), "genetics", level="global")
+        write_skill(Skill("align", "d", [], "profile body"), "genetics", level="profile")
+        skills = load_skills("genetics", project_root=tmp_path)
+        assert skills[0].body == "profile body"
+
+    def test_global_is_shared_across_profiles(self, hpca_home, tmp_path):
+        from hpca.skills import write_skill
+
+        write_skill(Skill("common", "d", [], "b"), "genetics", level="global")
+        names = [s.name for s in load_skills("hpc-admin", project_root=tmp_path)]
+        assert names == ["common"]
+
+    def test_load_project_skills_lists_only_project(self, hpca_home, tmp_path):
+        from hpca.skills import load_project_skills, write_skill
+
+        write_skill(Skill("mine", "d", [], "b"), "genetics")  # profile level
+        write_skill(
+            Skill("proj", "d", [], "b"),
+            "genetics",
+            level="project",
+            project_root=tmp_path,
+        )
+        assert [s.name for s in load_project_skills(project_root=tmp_path)] == ["proj"]
+
+    def test_delete_removes_a_project_skill(self, hpca_home, tmp_path):
+        from hpca.skills import delete_own_skill, load_project_skills, write_skill
+
+        write_skill(
+            Skill("proj", "d", [], "b"),
+            "genetics",
+            level="project",
+            project_root=tmp_path,
+        )
+        skill = load_project_skills(project_root=tmp_path)[0]
+        assert delete_own_skill(skill, "genetics", project_root=tmp_path) is True
+        assert load_project_skills(project_root=tmp_path) == []
+
+    def test_any_skills_includes_project(self, hpca_home, tmp_path):
+        from hpca.skills import any_skills, write_skill
+
+        assert not any_skills(project_root=tmp_path)
+        write_skill(
+            Skill("proj", "d", [], "b"),
+            "genetics",
+            level="project",
+            project_root=tmp_path,
+        )
+        assert any_skills(project_root=tmp_path)
+
+    def test_project_skill_path_is_sanitized_and_hidden(self, hpca_home, tmp_path):
+        from hpca.skills import project_skills_dir, skill_path
+
+        path = skill_path(
+            "../../etc/passwd", "genetics", level="project", project_root=tmp_path
+        )
+        assert path.name == "etc-passwd.md"
+        assert path.parent == project_skills_dir(tmp_path)
+
+
 class TestProfileSkillLifecycle:
     """Skills follow their profile when it is copied or deleted."""
 
