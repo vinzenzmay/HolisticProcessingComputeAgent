@@ -202,7 +202,8 @@ class TestSpinnerText:
         app = HpcaApp(llm=llm, tools=tools())
         async with app.run_test(size=(120, 40)) as pilot:
             seen = []
-            app.report_activity = seen.append
+            # report_activity is now (session_id, activity); record the activity
+            app.report_activity = lambda session_id, activity: seen.append(activity)
             await send(app, pilot)
             await app.workers.wait_for_complete()
             await pilot.pause()

@@ -1,8 +1,9 @@
 """Typing while a turn runs (§3). Messages queue instead of being refused.
 
-Exactly one turn still runs at a time — two on one thread_id would interleave
-checkpoint writes — so this is about never blocking the user's input, not
-about running turns in parallel.
+A session serialises its own turns — two on one thread_id would interleave
+checkpoint writes — so a second message for a busy session queues for it. This
+is about never blocking the user's input; turns on *different* sessions run
+concurrently (see test_tui_concurrent_turns.py).
 """
 
 import asyncio
@@ -65,7 +66,8 @@ class TestQueueing:
         async with app.run_test() as pilot:
             await app.start_new_session()
             await send(app, pilot, "first")
-            assert app._busy_turn is not None  # the turn is held open
+            # this session's turn is held open
+            assert app.active_session.session_id in app._turns
 
             await send(app, pilot, "second")
             assert app.queued_texts_for(app.active_session.session_id) == ["second"]
@@ -99,19 +101,22 @@ class TestQueueing:
             llm.gate.set()
             await app.workers.wait_for_complete()
 
-    async def test_only_one_turn_runs_at_a_time(self, hpca_home):
-        """The queue exists because two turns on one thread would interleave
-        checkpoint writes."""
+    async def test_only_one_turn_per_session_runs_at_a_time(self, hpca_home):
+        """A session serialises its own turns: two on one thread would
+        interleave checkpoint writes, so extra messages queue for THAT session
+        rather than starting a second thread on it."""
         llm = SlowLLM()
         app = HpcaApp(llm=llm)
         async with app.run_test() as pilot:
             await app.start_new_session()
+            session = app.active_session
             await send(app, pilot, "first")
             await send(app, pilot, "second")
             await send(app, pilot, "third")
-            # one running, two waiting — never three threads in flight
-            assert app._busy_turn is not None
-            assert len(app._pending_work) == 2
+            # one turn running for this session, two waiting for it — never a
+            # second thread in flight on the same session
+            assert list(app._turns) == [session.session_id]
+            assert app.queued_texts_for(session.session_id) == ["second", "third"]
             assert llm.seen_user_texts == ["first"]
             llm.gate.set()
             await app.workers.wait_for_complete()
@@ -126,7 +131,7 @@ class TestQueueing:
             llm.gate.set()
             for _ in range(40):
                 await pilot.pause()
-                if not app._pending_work and app._busy_turn is None:
+                if not app._pending_work and not app._turns:
                     break
             await app.workers.wait_for_complete()
             await pilot.pause()

@@ -122,12 +122,17 @@ class TestEventDelivery:
             )
             await app._tool_ctx.runner.wait(record.pid)
 
-            app._busy_turn = app.active_session  # pretend a turn is running
+            # pretend this session has a turn running: its event must buffer
+            from hpca.tui.app import TurnState
+
+            app._turns[app.active_session.session_id] = TurnState(
+                session=app.active_session
+            )
             await app.watch_processes()
             await pilot.pause()
             assert len(app._pending_work) == 1  # buffered, not delivered
 
-            app._busy_turn = None
+            app._turns.clear()
             await app.drain_work()
             await app.workers.wait_for_complete()
             await pilot.pause()

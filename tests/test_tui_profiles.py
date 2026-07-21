@@ -231,7 +231,10 @@ class TestDeleteGuards:
         app = HpcaApp(llm=FakeLLM())
         async with app.run_test(size=(120, 40)) as pilot:
             busy = app.session_store.create(profile="alpha", title="busy")
-            app._busy_turn = busy  # a turn on an alpha session is in flight
+            from hpca.tui.app import TurnState
+
+            # a turn on an alpha session is in flight
+            app._turns[busy.session_id] = TurnState(session=busy)
             assert app.profile_delete_blocker("alpha") is not None
             assert "reply in progress" in app.profile_delete_blocker("alpha")
 

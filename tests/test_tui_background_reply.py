@@ -203,16 +203,18 @@ class TestBackgroundReply:
 
 
 class TestBusyGuard:
-    async def test_sending_elsewhere_while_busy_is_queued_not_refused(
+    async def test_sending_elsewhere_while_busy_runs_concurrently(
         self, hpca_home
     ):
-        """Typing is never blocked: a message sent mid-turn is accepted and
-        waits its turn, rather than being bounced back into the input."""
-        llm = GatedLLM([respond_json("the answer for A")])
+        """Typing is never blocked, and a different session is not held behind
+        another's turn: a message sent to B while A is busy starts B's own turn
+        concurrently rather than queuing for A."""
+        llm = GatedLLM([respond_json("the answer for A"), respond_json("B's answer")])
         app = HpcaApp(llm=llm)
         async with app.run_test(size=(120, 40)) as pilot:
             await app.start_new_session()
             await pilot.pause()
+            session_a = app.active_session
             await submit(app, pilot, "question in A")
             await app.start_new_session()
             session_b = app.active_session
@@ -221,7 +223,10 @@ class TestBusyGuard:
             await submit(app, pilot, "question in B")
             chat_input = app.query_one("#chat-input", ChatInput)
             assert chat_input.text == ""  # accepted, so the field is free again
-            assert app.queued_texts_for(session_b.session_id) == ["question in B"]
+            # B is not queued behind A — its own turn is in flight, alongside A's
+            assert app.queued_texts_for(session_b.session_id) == []
+            assert session_b.session_id in app._turns
+            assert session_a.session_id in app._turns
             llm.released.set()
             await settle(app, pilot)
 
