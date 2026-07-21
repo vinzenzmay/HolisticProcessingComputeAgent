@@ -116,13 +116,19 @@ class TestSkillCreator:
             await create_skill(app, pilot, "grilling", "d", GRILL_BODY)
             assert "read_skill" in app._tools.names()
 
-    async def test_new_skill_is_in_the_next_system_prompt(self, hpca_home):
+    async def test_skill_list_stays_out_of_the_system_prompt(self, hpca_home):
         app = HpcaApp(llm=FakeLLM())
         async with app.run_test(size=(120, 40)) as pilot:
+            # No skills yet: no skills note in the prompt at all.
+            assert "read_skill" not in app._render_system_prompt()
             await create_skill(app, pilot, "grilling", "Stress-test a plan", GRILL_BODY)
-            # what the model is told about — surfaced in every mode, planning
-            # included (the mode suffix is appended to this base prompt)
-            assert "grilling" in app._render_system_prompt()
+            prompt = app._render_system_prompt()
+            # The skill exists but is never enumerated in the prompt — neither
+            # its name nor its description. Only a note that skills exist and
+            # how to fetch one (read_skill).
+            assert "grilling" not in prompt
+            assert "Stress-test a plan" not in prompt
+            assert "read_skill" in prompt
 
     async def test_empty_name_is_rejected(self, hpca_home):
         app = HpcaApp(llm=FakeLLM())
@@ -187,6 +193,60 @@ class TestSkillLevelSelection:
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert load_project_skills(project_root=hpca_home) == []
+
+
+def _user_message(messages):
+    """The user message the model was handed, sidecar and all."""
+    return next(m for m in reversed(messages) if m["role"] == "user")
+
+
+class TestSkillSlashInvocation:
+    """Typing "/<skill> …" runs a normal turn with that skill's procedure
+    forced into the model's copy of the message (not the stored transcript)."""
+
+    async def test_skill_shows_in_the_command_menu(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await create_skill(app, pilot, "grilling", "Stress-test a plan", GRILL_BODY)
+            names = [name for name, _ in app._matching_commands("grill")]
+            assert "grilling" in names
+            # empty needle lists everything, skills included
+            assert "grilling" in [n for n, _ in app._matching_commands("")]
+
+    async def test_builtin_command_wins_a_name_clash(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await create_skill(app, pilot, "skills-list", "shadowed", GRILL_BODY)
+            # The built-in /skills-list is not treated as a skill invocation.
+            assert app._slash_skill("/skills-list") is None
+            # …and it appears once in the menu, not twice.
+            assert [n for n, _ in app._matching_commands("skills-list")] == [
+                "skills-list"
+            ]
+
+    async def test_invoking_a_skill_forces_its_procedure(self, hpca_home):
+        llm = FakeLLM(outputs=[respond_json("grilled")])
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await create_skill(app, pilot, "grilling", "Stress-test a plan", GRILL_BODY)
+            await submit(app, pilot, "/grilling review my plan")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            user = _user_message(llm.calls[-1])
+            # Transcript keeps the raw command; the model sees the request plus
+            # the skill body on the sidecar, without the "/grilling" prefix.
+            assert user["content"] == "/grilling review my plan"
+            assert "Interview me relentlessly" in user["api_content"]
+            assert "review my plan" in user["api_content"]
+            assert not user["api_content"].startswith("/grilling")
+
+    async def test_unknown_slash_is_still_an_error(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit(app, pilot, "/nope do a thing")
+            await pilot.pause()
+            # Not a skill and not a built-in: no turn started, no crash.
+            assert app._slash_skill("/nope do a thing") is None
 
 
 class TestSkillsList:

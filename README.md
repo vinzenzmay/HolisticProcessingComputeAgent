@@ -54,7 +54,8 @@ processes and cluster jobs (right). A few of the top-level keys:
 | `shift+tab` | cycle the agent mode (see below) |
 | `q` | quit (from the sessions column) |
 
-Typing `/` (or `\`) in the chat entry lists the available slash commands.
+Typing `/` (or `\`) in the chat entry lists the available slash commands and
+your skills (invoke a skill with `/<skill>`; see *Skills* below).
 
 ## Features
 
@@ -136,9 +137,11 @@ session remembers its own mode across restarts.
 Skills are user-defined procedure files — markdown (with optional YAML front
 matter) or YAML — that tell the agent how to handle a specific kind of task. Each
 skill has a `name`, a one-line `description`, optional `triggers`, and a `body`
-(the procedure itself). Only the name and description are surfaced to the model in
-its system prompt; the full body is fetched on demand via the `read_skill` tool,
-keeping the prompt small.
+(the procedure itself). The skill list is deliberately **not** put in the model's
+prompt (no matter how many you define, the prompt cost stays flat): the system
+prompt carries only a one-line note that skills exist and how to fetch one. A
+skill's body reaches the model only when it is actually needed — see *Use a
+skill* below.
 
 ### Where skills live (levels)
 
@@ -164,10 +167,21 @@ body).
 
 ### Use a skill
 
-You don't invoke skills directly. Their names and descriptions are always in the
-agent's prompt; when a task matches, the agent calls `read_skill` to load the full
-procedure and follows it. Run `/skills-list` to see every skill the current
-profile can see, tagged with the level each one resolves to.
+There are two ways a skill runs, cheapest first:
+
+* **Invoke it yourself** — type `/<skill>` (optionally with a prompt, e.g.
+  `/grill-me review my sbatch script`). Skills show up in the same `/` menu as the
+  built-in commands (↑/↓ to select, `⇥` to complete), and the skill's full
+  procedure is handed to the model inline for that turn. This is the direct,
+  predictable path. Only single-token skill names are reachable this way (the
+  parser splits on the first space), and a built-in command wins a name clash.
+* **Let the agent reach for it** — the model is told skills exist and can call the
+  `read_skill` tool on its own when a request seems to match one (passing any name
+  returns the available skills). Nothing is invoked automatically without either
+  your `/<skill>` or the model deciding to load one.
+
+Run `/skills-list` to see every skill the current profile can see, tagged with the
+level each one resolves to.
 
 ### Remove a skill
 

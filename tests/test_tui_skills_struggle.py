@@ -95,7 +95,7 @@ async def submit(app, pilot, text, *, expect_modal=False):
 
 
 class TestSkills:
-    async def test_skills_listed_in_prompt_and_tool_registered(self, hpca_home):
+    async def test_skills_not_listed_in_prompt_but_tool_registered(self, hpca_home):
         write_skill_file(SKILL)
         llm = RecordingLLM([respond_json("ok")])
         app = HpcaApp(llm=llm)
@@ -103,9 +103,13 @@ class TestSkills:
             assert "read_skill" in app._tools.names()
             await submit(app, pilot, "hello")
             system = llm.calls[0][0]["content"]
-            assert "bam-subset: Subset a BAM file by region" in system
-            # only the summary, never the body (§ prompt budget)
+            # The list is kept out of the prompt: neither the skill's name nor
+            # its description nor its body appears. Only a note that skills
+            # exist and how to fetch one on demand (read_skill).
+            assert "bam-subset" not in system
+            assert "Subset a BAM file by region" not in system
             assert "samtools view" not in system
+            assert "read_skill" in system
 
     async def test_read_skill_returns_body(self, hpca_home):
         write_skill_file(SKILL)

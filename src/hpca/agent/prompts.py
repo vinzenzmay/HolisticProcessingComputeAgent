@@ -147,16 +147,37 @@ MEMORY_GUIDANCE = (
 
 SKILLS_GUIDANCE = (
     "The user has defined skills: written procedures for specific tasks. "
-    "When a request matches one, call read_skill to get the procedure and "
-    "follow it. Available skills:"
+    "The list is kept out of this prompt to stay small — you are not shown "
+    "the names. When a request seems to call for a skill, call read_skill "
+    "(passing any name returns the available skills) and follow the procedure "
+    "it gives back. When the user invokes one directly with \"/<skill>\", its "
+    "procedure is handed to you inline; follow that."
 )
+
+
+def build_skill_directive(name: str, description: str, body: str) -> str:
+    """Directive placed on the API copy of a user message when the user
+    invoked a skill by name (typed ``/<skill>``).
+
+    Unlike the on-demand read_skill path, an explicit invocation drops the full
+    procedure straight into the turn so a small model follows it without a tool
+    round-trip. Rides the sidecar (``compose_api_content``) so the transcript
+    keeps the clean ``/<skill> …`` the user typed.
+    """
+    head = f"The user invoked the skill {name!r} directly."
+    if description:
+        head += f" ({description})"
+    body = body.strip()
+    if not body:
+        return f"{head} Follow that skill for this request."
+    return f"{head} Follow its procedure for this request:\n\n{body}"
 
 
 def orchestrator_system_prompt(
     *,
     system_prompt_memories: str = "",
     memory_meter: str = "",
-    skills: str = "",
+    has_skills: bool = False,
     session_search: bool = False,
     memory_tool: bool = False,
 ) -> str:
@@ -167,9 +188,11 @@ def orchestrator_system_prompt(
     a mode switch move it. Volatile facts (the date/time) deliberately live at
     the tail instead — see ``environment_facts``.
 
-    Skills are listed by name/description only; bodies are fetched on demand.
-    The meter shows how full the system-prompt memory scope is against its
-    token budget.
+    Skills are *not* listed here — only a one-line note that they exist and how
+    to fetch one (``read_skill``), so the prompt stays small no matter how many
+    the user has defined. Bodies reach the model on demand, or inline when the
+    user invokes ``/<skill>``. The meter shows how full the system-prompt
+    memory scope is against its token budget.
     """
     parts = [
         "You are HPCA, a terminal assistant helping a scientist with data "
@@ -185,8 +208,8 @@ def orchestrator_system_prompt(
         parts.append(SESSION_SEARCH_GUIDANCE)
     if memory_tool:
         parts.append(MEMORY_GUIDANCE)
-    if skills:
-        parts.append(f"{SKILLS_GUIDANCE}\n{skills}")
+    if has_skills:
+        parts.append(SKILLS_GUIDANCE)
     if system_prompt_memories:
         label = _metered("Memory (site facts, preferences, learnings)", memory_meter)
         parts.append(f"{label}:\n{system_prompt_memories}")
