@@ -9,7 +9,7 @@ from textual.widgets import ListView, Static
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.config import Settings
 from hpca.llm import ChatResponse
-from hpca.tui.app import ChatInput, HpcaApp, ThinkingBox
+from hpca.tui.app import ChatInput, HpcaApp, StepBox, ThinkingBox
 
 
 def is_title_request(json_schema):
@@ -130,7 +130,7 @@ class TestThinkingBox:
             # collapsed: the working is summarised, not spelled out
             assert "I should ask the docs" not in rendered
 
-    async def test_enter_expands_and_collapses_again(self, hpca_home):
+    async def test_enter_expands_into_collapsible_steps(self, hpca_home):
         app = HpcaApp(
             llm=FakeLLM([respond_json("42")], reasoning=["Simple arithmetic."]),
         )
@@ -142,13 +142,77 @@ class TestThinkingBox:
             chat_list.index = 1  # the thinking box between question and answer
             await pilot.press("enter")
             await pilot.pause()
+            # Expanding reveals the parts as their own collapsed rows, not as
+            # inline text on the box itself.
             assert not box.collapsed
-            assert "Simple arithmetic." in str(box.content)
             assert "enter to collapse" in str(box.content)
+            assert "Simple arithmetic." not in str(box.content)
+            step = app.query_one(StepBox)
+            assert not step.expanded  # revealed collapsed
+            assert "reasoning" in str(step.content)
+            assert "Simple arithmetic." not in str(step.content)
+
+            # The step is the next row down; enter opens it individually.
+            await pilot.press("down")
+            assert chat_list.index == 2
+            await pilot.press("enter")
+            await pilot.pause()
+            assert step.expanded
+            assert "Simple arithmetic." in str(step.content)
+
+            # Collapsing the box removes its step rows again.
+            chat_list.index = 1
             await pilot.press("enter")
             await pilot.pause()
             assert box.collapsed
-            assert "Simple arithmetic." not in str(box.content)
+            assert list(app.query(StepBox)) == []
+
+    async def test_parts_are_individually_navigable_and_hold_the_highlight(
+        self, hpca_home
+    ):
+        # A turn with reasoning, a tool step, then more reasoning: three parts.
+        app = HpcaApp(
+            llm=FakeLLM(
+                [
+                    tool_json("ask_docs", question="what is a BAM?"),
+                    "binary alignment map",
+                    respond_json("done"),
+                ],
+                reasoning=["First thought.", "", "Second thought."],
+            ),
+            tools=subagent_tools(),
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "explain BAMs")
+            chat_list = app.query_one("#chat-list", ListView)
+            chat_list.focus()
+            chat_list.index = 1  # the thinking box
+            await pilot.press("enter")  # expand
+            await pilot.pause()
+
+            steps = list(app.query(StepBox))
+            assert [s._step.label() for s in steps] == [
+                "reasoning", "ask_docs", "reasoning"
+            ]
+            assert all(not s.expanded for s in steps)  # each revealed collapsed
+            assert chat_list.index == 1  # highlight kept on the box
+
+            # Open the middle step (the tool) individually; the others stay shut.
+            await pilot.press("down")  # first reasoning
+            await pilot.press("down")  # the ask_docs step
+            assert chat_list.index == 3
+            await pilot.press("enter")
+            await pilot.pause()
+            assert steps[1].expanded and not steps[0].expanded and not steps[2].expanded
+            assert "binary alignment map" in str(steps[1].content)
+            assert chat_list.index == 3  # still on the same step
+
+            # Collapse the box: every step row goes away, highlight back on it.
+            chat_list.index = 1
+            await pilot.press("enter")
+            await pilot.pause()
+            assert list(app.query(StepBox)) == []
+            assert chat_list.index == 1
 
     async def test_no_thinking_no_box(self, hpca_home):
         app = HpcaApp(llm=FakeLLM([respond_json("hi")]))
@@ -166,9 +230,14 @@ class TestThinkingBox:
             assert list(app.query(ThinkingBox)) == []
             await app.open_session(session)
             await pilot.pause()
-            box = app.query_one(ThinkingBox)
-            box.toggle()
-            assert "Thought hard." in str(box.content)
+            chat_list = app.query_one("#chat-list", ListView)
+            chat_list.focus()
+            chat_list.index = 1  # the thinking box
+            await pilot.press("enter")  # expand it
+            await pilot.press("down")  # onto the reasoning step
+            await pilot.press("enter")  # open the step
+            await pilot.pause()
+            assert "Thought hard." in str(app.query_one(StepBox).content)
 
 
 class TestEntryStyling:

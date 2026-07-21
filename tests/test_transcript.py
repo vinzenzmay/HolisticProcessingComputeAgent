@@ -70,6 +70,39 @@ class TestGrouping:
         assert kinds(build_entries(messages, [])) == ["user", "assistant"]
 
 
+class TestParts:
+    """The thinking entry keeps its parts ordered and labelled, so an expanded
+    box can show each as its own collapsible element."""
+
+    def test_parts_preserve_order_and_kind(self):
+        thinking = [
+            {"after": 1, "reasoning": "I should list the directory first."},
+            {"after": 2, "reasoning": "Now I can answer."},
+        ]
+        box = build_entries([USER_MSG, STEP, ANSWER], thinking)[1]
+        assert [p.kind for p in box.parts] == ["reasoning", "step", "reasoning"]
+        assert box.parts[0].text == "I should list the directory first."
+        assert box.parts[1].text == STEP["content"]
+        assert box.parts[2].text == "Now I can answer."
+
+    def test_step_label_is_the_tool_name(self):
+        box = build_entries([USER_MSG, STEP, STEP2, ANSWER], [])[1]
+        assert box.parts[0].label() == "list_dir"
+        # a tool error is labelled as such
+        assert box.parts[1].label() == "read_file (error)"
+
+    def test_reasoning_part_labels_as_reasoning(self):
+        box = build_entries([USER_MSG, ANSWER], [{"after": 1, "reasoning": "hm"}])[1]
+        assert box.parts[0].label() == "reasoning"
+
+    def test_parts_and_folded_text_agree(self):
+        # the log still writes one block; the parts are the same content, split
+        box = build_entries([USER_MSG, STEP, ANSWER], [])[1]
+        assert len(box.parts) == box.steps
+        for part in box.parts:
+            assert part.text.strip() in box.text
+
+
 class TestTail:
     def test_start_selects_one_turn_keeping_absolute_anchors(self):
         messages = [USER_MSG, ANSWER, USER_MSG, STEP, ANSWER]
