@@ -29,7 +29,7 @@ from hpca.agent.middleware import (
     decide,
 )
 from hpca.agent.modes import (
-    PLAN_CONTINUE_NUDGE,
+    continue_nudge_for,
     destructive_approval_required,
     mode_prompt_suffix,
     present_plan_reply,
@@ -46,10 +46,12 @@ from hpca.llm import Message
 # passes llm.max_tool_rounds, whose default is -1 (no cap); a non-positive
 # value here means the same — the agent works until it is done.
 MAX_TOOL_ROUNDS = 30
-# Plan mode never ends a turn on a bare chat reply; it feeds the reply back and
-# lets the model try again. Bounded so a model that only ever narrates cannot
-# loop forever — after this many nudges the turn ends with whatever it said.
-MAX_PLAN_NUDGES = 2
+# A turn never ends on a bare chat reply that only narrates the next step: the
+# reply is fed back with a nudge and the model tries again (see
+# continue_nudge_for — plan mode nudges any chat reply, other modes only a
+# deferred action). Bounded so a model that only ever narrates cannot loop
+# forever — after this many nudges the turn ends with whatever it said.
+MAX_CONTINUE_NUDGES = 2
 
 
 # Sentinel for rolling an interrupted turn out of the thread: the messages
@@ -179,13 +181,14 @@ def build_graph(
         # the model is never shown is one it cannot call (§3.5).
         active_tools = tools_for_mode(tools, mode)
         system: Message = {"role": "system", "content": _system_text(state, mode)}
-        # In plan mode a turn ends only through present_plan (handled below).
-        # A bare chat reply is almost always the model announcing its next
-        # step instead of taking it, so feed it back with a nudge and let it
-        # retry — bounded, and the fumbled narration is never persisted, the
-        # same shape as decide()'s validation-retry. Other modes never nudge.
+        # A bare chat reply that only announces the next step ("Let me dig into
+        # the source…") is the model narrating instead of acting, so feed it
+        # back with a nudge and let it retry — in every mode (plan mode nudges
+        # any chat reply, other modes only a deferred action; see
+        # continue_nudge_for). Bounded, and the fumbled narration is never
+        # persisted — the same shape as decide()'s validation-retry.
         nudges: list[Message] = []
-        for attempt in range(MAX_PLAN_NUDGES + 1):
+        for attempt in range(MAX_CONTINUE_NUDGES + 1):
             report("LLM processing")
             try:
                 decision = await decide(
@@ -201,10 +204,15 @@ def build_graph(
             # below or the tool result execute_tool appends.
             thinking = _thinking(state, decision.reasoning)
             if isinstance(decision, DirectResponse):
-                if mode == "plan" and attempt < MAX_PLAN_NUDGES:
+                nudge = (
+                    continue_nudge_for(mode, decision.text)
+                    if attempt < MAX_CONTINUE_NUDGES
+                    else None
+                )
+                if nudge is not None:
                     nudges = nudges + [
                         {"role": "assistant", "content": decision.text},
-                        {"role": "user", "content": PLAN_CONTINUE_NUDGE},
+                        {"role": "user", "content": nudge},
                     ]
                     continue
                 return _final(decision.text) | thinking | compaction
