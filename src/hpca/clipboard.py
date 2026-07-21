@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,6 +30,7 @@ SCREEN_DCS_PAYLOAD = 768  # screen truncates long DCS blocks; chunk below that
 
 Emit = Callable[[str], None]
 Run = Callable[..., tuple[bool, str]]
+Which = Callable[[str], str | None]
 
 
 def detect_multiplexer(env: Mapping[str, str]) -> str | None:
@@ -43,6 +45,45 @@ def detect_multiplexer(env: Mapping[str, str]) -> str | None:
         return "screen"
     if env.get("ZELLIJ") is not None:
         return "zellij"
+    return None
+
+
+def is_ssh(env: Mapping[str, str]) -> bool:
+    """Whether this process is on the far end of an SSH connection.
+
+    A "local" clipboard tool (``wl-copy``/``xclip``) would copy to *this*
+    machine — useless over SSH, where OSC 52 back to the user's own terminal
+    is the only channel that reaches their clipboard.
+    """
+    return bool(env.get("SSH_CONNECTION") or env.get("SSH_TTY") or env.get("SSH_CLIENT"))
+
+
+def _local_gui(env: Mapping[str, str]) -> bool:
+    """A local graphical session — Wayland or X11 — not reached over SSH.
+
+    This is exactly the case where a terminal like GNOME Terminal (VTE) may
+    silently drop OSC 52, so a native clipboard tool is worth reaching for.
+    """
+    return bool((env.get("WAYLAND_DISPLAY") or env.get("DISPLAY")) and not is_ssh(env))
+
+
+def local_clipboard_argv(env: Mapping[str, str], which: Which) -> list[str] | None:
+    """The command that writes the system clipboard on this local GUI session.
+
+    Wayland is preferred (``wl-copy``); a Wayland session almost always also
+    exposes XWayland (``$DISPLAY``), so ``xclip``/``xsel`` are the fallback.
+    Returns ``None`` over SSH, on a headless session, or when no tool is
+    installed — the caller then leans on OSC 52 or the file fallback.
+    """
+    if not _local_gui(env):
+        return None
+    if env.get("WAYLAND_DISPLAY") and which("wl-copy"):
+        return ["wl-copy"]
+    if env.get("DISPLAY"):
+        if which("xclip"):
+            return ["xclip", "-selection", "clipboard", "-i"]
+        if which("xsel"):
+            return ["xsel", "--clipboard", "--input"]
     return None
 
 
@@ -95,10 +136,12 @@ class ClipboardManager:
         run: Run | None = None,
         env: Mapping[str, str] | None = None,
         fallback_dir: Path | None = None,
+        which: Which | None = None,
     ) -> None:
         self._settings = settings
         self._emit = emit
         self._run = run or _default_run
+        self._which = which or shutil.which
         if env is None:
             import os
 
@@ -121,7 +164,21 @@ class ClipboardManager:
         else:
             self._copy_via_osc52_tiers(mode, text, result, notes)
 
-        needs_file = mode == "file" or not result.methods or "oversized" in notes
+        # In auto mode, a local GUI session gets a native clipboard tool too:
+        # it is the only channel that reaches the clipboard on terminals (GNOME
+        # Terminal) that ignore OSC 52. When there is no such tool, OSC 52 may
+        # have been silently dropped, so its "success" is not to be trusted.
+        osc52_unreliable = False
+        if self._settings.mode == "auto":
+            osc52_unreliable = self._copy_via_local_command(text, result, notes)
+
+        reliable = any(method != "osc52" for method in result.methods)
+        needs_file = (
+            mode == "file"
+            or not result.methods
+            or "oversized" in notes
+            or (osc52_unreliable and not reliable)
+        )
         if needs_file:
             try:
                 self._fallback_dir.mkdir(parents=True, exist_ok=True)
@@ -148,6 +205,31 @@ class ClipboardManager:
             result.methods.append("command")
         else:
             notes.append(f"clipboard command failed: {command}")
+
+    def _copy_via_local_command(
+        self, text: str, result: CopyResult, notes: list[str]
+    ) -> bool:
+        """Drive a native clipboard tool on a local GUI session.
+
+        Returns whether OSC 52 should be treated as unreliable — true only when
+        this is a local GUI session with no clipboard tool installed, the case
+        where a terminal like GNOME's may have swallowed the OSC 52 write.
+        """
+        argv = local_clipboard_argv(self._env, self._which)
+        if argv is not None:
+            ok, _ = self._run(argv, text)
+            if ok:
+                result.methods.append(Path(argv[0]).name)
+            else:
+                notes.append(f"{argv[0]} failed")
+            return False
+        if _local_gui(self._env):
+            notes.append(
+                "no local clipboard tool found; this terminal may ignore OSC 52 "
+                "(GNOME Terminal does) — install wl-clipboard (Wayland) or xclip (X11)"
+            )
+            return True
+        return False
 
     def _copy_via_osc52_tiers(
         self, mode: str, text: str, result: CopyResult, notes: list[str]

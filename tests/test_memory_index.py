@@ -117,6 +117,31 @@ class TestSearch:
         assert len(index.search("bam", profile="default")) == 1
 
 
+class TestBuiltinMemories:
+    """Shipped memories are searchable from any profile, without reindexing."""
+
+    def test_terminal_help_recalled_on_a_fresh_profile(self, index):
+        hits = index.search("how do I copy text to the clipboard", profile="default")
+        assert any("OSC 52" in h.text for h in hits)
+
+    def test_recalled_from_an_unrelated_profile(self, index):
+        # A profile that was never reindexed still gets the built-in note.
+        hits = index.search("paste not working in the terminal", profile="genetics")
+        assert any("GNOME Terminal" in h.text for h in hits)
+
+    def test_gnome_and_multiplexer_keywords_match(self, index):
+        assert index.search("tmux clipboard gnome", profile="default")
+        assert index.search("screen copy ubuntu terminal", profile="default")
+
+    def test_irrelevant_query_does_not_recall_builtin(self, index):
+        assert index.search("deepvariant joint genotyping", profile="default") == []
+
+    def test_builtin_survives_profile_reindex(self, index):
+        index.reindex(profile_with(("Snakemake dry-runs fail.", 3)))
+        hits = index.search("copy paste clipboard terminal", profile="default")
+        assert any("wl-clipboard" in h.text for h in hits)
+
+
 class TestDemote:
     def test_moves_to_tier3(self):
         profile = profile_with(("situational thing", 2))

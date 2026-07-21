@@ -7,6 +7,8 @@ import pytest
 from hpca.clipboard import (
     ClipboardManager,
     detect_multiplexer,
+    is_ssh,
+    local_clipboard_argv,
     osc52_sequence,
     screen_dcs_chunks,
     tmux_passthrough,
@@ -84,10 +86,21 @@ class FakeIO:
         return self.responses.get(tuple(argv), (True, ""))
 
 
-def make_manager(io: FakeIO, env: dict, tmp_path, **settings_kwargs):
+def fake_which(*present):
+    """A shutil.which stand-in: names in ``present`` resolve, others don't."""
+    have = set(present)
+    return lambda name: f"/usr/bin/{name}" if name in have else None
+
+
+def make_manager(io: FakeIO, env: dict, tmp_path, which=None, **settings_kwargs):
     settings = ClipboardSettings(**settings_kwargs)
     return ClipboardManager(
-        settings, emit=io.emit, run=io.run, env=env, fallback_dir=tmp_path
+        settings,
+        emit=io.emit,
+        run=io.run,
+        env=env,
+        fallback_dir=tmp_path,
+        which=which or fake_which(),  # nothing installed unless a test says so
     )
 
 
@@ -212,3 +225,105 @@ class TestExplicitModes:
         result = mgr.copy("hello")
         assert (["tmux", "load-buffer", "-"], "hello") in io.commands
         assert result.ok
+
+
+class TestIsSsh:
+    def test_ssh_connection(self):
+        assert is_ssh({"SSH_CONNECTION": "10.0.0.1 22 10.0.0.2 22"})
+
+    def test_ssh_tty(self):
+        assert is_ssh({"SSH_TTY": "/dev/pts/3"})
+
+    def test_local(self):
+        assert not is_ssh({"WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0"})
+
+
+class TestLocalClipboardArgv:
+    def test_wayland_prefers_wl_copy(self):
+        env = {"WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0"}
+        assert local_clipboard_argv(env, fake_which("wl-copy", "xclip")) == ["wl-copy"]
+
+    def test_wayland_falls_through_to_xclip_when_no_wl_copy(self):
+        # A Wayland session almost always has XWayland ($DISPLAY) too.
+        env = {"WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0"}
+        assert local_clipboard_argv(env, fake_which("xclip")) == [
+            "xclip",
+            "-selection",
+            "clipboard",
+            "-i",
+        ]
+
+    def test_x11_xsel_fallback(self):
+        env = {"DISPLAY": ":0"}
+        assert local_clipboard_argv(env, fake_which("xsel")) == [
+            "xsel",
+            "--clipboard",
+            "--input",
+        ]
+
+    def test_ssh_never_uses_local_tool(self):
+        env = {"DISPLAY": ":0", "SSH_CONNECTION": "x"}
+        assert local_clipboard_argv(env, fake_which("wl-copy", "xclip")) is None
+
+    def test_no_display_returns_none(self):
+        assert local_clipboard_argv({}, fake_which("xclip")) is None
+
+    def test_display_but_no_tool_installed(self):
+        assert local_clipboard_argv({"DISPLAY": ":0"}, fake_which()) is None
+
+
+class TestAutoLocalClipboardTier:
+    """§3.4: on a *local* GUI session, ``auto`` also drives a native clipboard
+    tool — the reliable path on terminals (GNOME) that silently drop OSC 52."""
+
+    def test_local_wayland_runs_wl_copy_alongside_osc52(self, tmp_path):
+        io = FakeIO()
+        env = {"WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0"}
+        mgr = make_manager(io, env, tmp_path, which=fake_which("wl-copy"))
+        result = mgr.copy("hello")
+        assert osc52_sequence("hello") in io.emitted
+        assert (["wl-copy"], "hello") in io.commands
+        assert "wl-copy" in result.methods
+        assert result.file is None  # a reliable tier landed; no file needed
+
+    def test_local_gui_without_tool_warns_and_writes_file(self, tmp_path):
+        io = FakeIO()
+        env = {"WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0"}
+        mgr = make_manager(io, env, tmp_path, which=fake_which())  # nothing installed
+        result = mgr.copy("hello")
+        # OSC 52 is still emitted, but it may be ignored here, so back it up.
+        assert osc52_sequence("hello") in io.emitted
+        assert result.file is not None
+        assert result.file.read_text() == "hello"
+        assert "file" in result.methods
+        assert "wl-clipboard" in result.message or "xclip" in result.message
+
+    def test_ssh_session_does_not_run_local_tool(self, tmp_path):
+        io = FakeIO()
+        env = {"DISPLAY": ":0", "SSH_CONNECTION": "x", "WAYLAND_DISPLAY": "wayland-0"}
+        mgr = make_manager(io, env, tmp_path, which=fake_which("wl-copy"))
+        result = mgr.copy("hello")
+        assert io.commands == []  # OSC 52 is the right channel over SSH
+        assert result.file is None  # osc52 is legitimate here, not "unreliable"
+        assert result.methods == ["osc52"]
+
+    def test_explicit_osc52_mode_skips_native_tool(self, tmp_path):
+        io = FakeIO()
+        env = {"WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0"}
+        mgr = make_manager(
+            io, env, tmp_path, which=fake_which("wl-copy"), mode="osc52"
+        )
+        result = mgr.copy("hello")
+        assert io.commands == []  # the user forced OSC 52; respect it
+        assert result.methods == ["osc52"]
+
+    def test_local_tmux_still_reaches_native_clipboard(self, tmp_path):
+        # GNOME + tmux, locally: the native tool is the reliable path.
+        io = FakeIO(
+            responses={("tmux", "show", "-gv", "set-clipboard"): (True, "off\n")}
+        )
+        env = {"TMUX": "x", "WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0"}
+        mgr = make_manager(io, env, tmp_path, which=fake_which("wl-copy"))
+        result = mgr.copy("hello")
+        assert (["wl-copy"], "hello") in io.commands
+        assert "wl-copy" in result.methods
