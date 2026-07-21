@@ -73,6 +73,27 @@ async def create_skill(app, pilot, name, description, body):
     await pilot.pause()
 
 
+async def create_skill_at_level(app, pilot, name, description, body, level):
+    """Like ``create_skill`` but pick a level (global / profile / project)."""
+    from textual.widgets import RadioButton
+
+    await submit(app, pilot, "/skill-creator")
+    assert isinstance(app.screen, SkillCreatorScreen)
+    app.screen.query_one("#skill-name", Input).value = name
+    app.screen.query_one("#skill-description", Input).value = description
+    app.screen.query_one("#skill-body", TextArea).text = body
+    app.screen.query_one(f"#level-{level}", RadioButton).value = True
+    await pilot.pause()
+    await pilot.press("escape")  # save is resolved on escape
+    await pilot.pause()
+    from hpca.tui.confirm_screen import ConfirmScreen
+
+    if isinstance(app.screen, ConfirmScreen):
+        await pilot.press("y")  # "Save skill?" -> yes
+    await app.workers.wait_for_complete()
+    await pilot.pause()
+
+
 GRILL_BODY = "Interview me relentlessly about every aspect of this plan."
 
 
@@ -119,6 +140,53 @@ class TestSkillCreator:
             await create_skill(app, pilot, "grilling", "d", GRILL_BODY)
             await create_skill(app, pilot, "grilling", "again", "other body")
             assert len(load_own_skills(app.profile)) == 1
+
+
+class TestSkillLevelSelection:
+    """The creator lets the user pick where a new skill lives."""
+
+    async def test_global_skill_is_visible_but_not_own(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await create_skill_at_level(
+                app, pilot, "shared-one", "For everyone", GRILL_BODY, "global"
+            )
+            # Global skills are not the profile's "own" (not removable per-profile)
+            assert load_own_skills(app.profile) == []
+            # …but every profile can see them.
+            assert "shared-one" in [s.name for s in load_skills(app.profile)]
+
+    async def test_project_skill_lands_in_cwd(self, hpca_home, monkeypatch):
+        monkeypatch.chdir(hpca_home)  # keep the project dir inside tmp_path
+        from hpca.skills import load_project_skills
+
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await create_skill_at_level(
+                app, pilot, "proj-one", "Here only", GRILL_BODY, "project"
+            )
+            assert [
+                s.name for s in load_project_skills(project_root=hpca_home)
+            ] == ["proj-one"]
+            assert load_own_skills(app.profile) == []
+
+    async def test_project_skill_is_removable(self, hpca_home, monkeypatch):
+        monkeypatch.chdir(hpca_home)
+        from hpca.skills import load_project_skills
+
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await create_skill_at_level(
+                app, pilot, "proj-one", "d", GRILL_BODY, "project"
+            )
+            await submit(app, pilot, "/skill-remove")
+            assert isinstance(app.screen, SkillPickerScreen)
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("y")  # confirm removal
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert load_project_skills(project_root=hpca_home) == []
 
 
 class TestSkillsList:

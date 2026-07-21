@@ -1,15 +1,24 @@
 """User-defined skills (§5.1): procedure files loaded per profile.
 
-Markdown or YAML files under ``<app_dir>/skills/`` describing how the agent
-should handle specific tasks. Like profiles (§6.2), these are hand-edited, so
-parsing is lenient: a file without front matter is still a skill (its filename
-is the name, its text the body), and a broken header reports a problem rather
-than vanishing.
+Markdown or YAML files describing how the agent should handle specific tasks.
+Like profiles (§6.2), these are hand-edited, so parsing is lenient: a file
+without front matter is still a skill (its filename is the name, its text the
+body), and a broken header reports a problem rather than vanishing.
 
-Layout (redesign Phase 1): ``skills/_shared/`` holds skills for every
-profile, ``skills/<profile>/`` the profile's own; files directly in
-``skills/`` are the legacy flat layout and count as shared. On a name
-collision the profile's own skill wins.
+Three *levels* decide where a skill lives and who sees it:
+
+- **global** — every profile. Stored under ``<app_dir>/skills/_shared/``.
+  This is the original "shared" concept, surfaced to the user as "global".
+  (Files directly in ``<app_dir>/skills/`` are the legacy flat layout and are
+  treated as global too.)
+- **profile** — the current profile only. Stored under
+  ``<app_dir>/skills/<profile>/``.
+- **project** — tied to the directory the agent is run from. Stored under a
+  hidden ``<cwd>/.hpca/skills/`` and only visible while running there. The
+  project root is threaded explicitly (``project_root``) so it stays testable.
+
+On a name collision the most specific level wins: **project > profile >
+global** (legacy flat files rank with global).
 
 Skills are *surfaced* to the model as a short list in the system prompt; the
 full body is fetched on demand via ``read_skill``, keeping the prompt small.
@@ -20,6 +29,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import yaml
 
@@ -27,10 +37,26 @@ from hpca.config import app_dir
 
 SKILL_SUFFIXES = {".md", ".yaml", ".yml"}
 SHARED_SKILLS_DIR = "_shared"
+# Project skills hide under this dir in the working directory, so a repo can
+# carry its own procedures without them leaking into other projects.
+PROJECT_SKILLS_SUBDIR = ".hpca/skills"
+
+# Where a newly-created (or written-back) skill is stored. "global" maps to the
+# existing ``_shared/`` location for backward compatibility.
+SkillLevel = Literal["global", "profile", "project"]
 
 
 def skills_dir() -> Path:
     return app_dir() / "skills"
+
+
+def project_skills_dir(project_root: Path | None = None) -> Path:
+    """Skills tied to the working directory, under ``<cwd>/.hpca/skills``.
+
+    ``project_root`` defaults to the current working directory so it can be
+    pinned to a ``tmp_path`` in tests, matching how ``root`` is injected.
+    """
+    return (project_root or Path.cwd()) / ".hpca" / "skills"
 
 
 @dataclass
@@ -119,13 +145,21 @@ def _load_dir(directory: Path) -> list[Skill]:
     return skills
 
 
-def load_skills(profile: str | None = None, *, root: Path | None = None) -> list[Skill]:
-    """Skills visible to one profile: legacy flat files, ``_shared/``, then
-    the profile's own directory — later sources win on a name collision."""
+def load_skills(
+    profile: str | None = None,
+    *,
+    root: Path | None = None,
+    project_root: Path | None = None,
+) -> list[Skill]:
+    """Skills visible to one profile: legacy flat files, ``_shared/`` (global),
+    the profile's own directory, then the project's ``.hpca/skills`` — later
+    sources win on a name collision, so precedence is project > profile >
+    global."""
     root = root or skills_dir()
     directories = [root, root / SHARED_SKILLS_DIR]
     if profile:
         directories.append(root / profile)
+    directories.append(project_skills_dir(project_root))
     by_name: dict[str, Skill] = {}
     for directory in directories:
         for skill in _load_dir(directory):
@@ -141,51 +175,94 @@ def load_own_skills(profile: str, *, root: Path | None = None) -> list[Skill]:
     return sorted(_load_dir(root / profile), key=lambda s: s.name)
 
 
-def delete_own_skill(skill: Skill, profile: str, *, root: Path | None = None) -> bool:
-    """Remove one of a profile's own skill files. Returns whether it existed.
+def load_project_skills(*, project_root: Path | None = None) -> list[Skill]:
+    """The project-level skills under ``<cwd>/.hpca/skills``. Removable like a
+    profile's own (they belong to this directory, not to other profiles)."""
+    return sorted(
+        _load_dir(project_skills_dir(project_root)), key=lambda s: s.name
+    )
+
+
+def delete_own_skill(
+    skill: Skill,
+    profile: str,
+    *,
+    root: Path | None = None,
+    project_root: Path | None = None,
+) -> bool:
+    """Remove one profile- or project-level skill file. Returns whether it
+    existed.
 
     Deletes by the file the skill was loaded from (``skill.source``), so it
     works even when a hand-edited file's name differs from its front-matter
-    name. Never touches ``_shared/`` or legacy files (they live elsewhere).
+    name. Never touches ``_shared/`` (global) or legacy flat files: removing
+    one would silently change every other profile that sees it.
     """
     root = root or skills_dir()
     if not skill.source:
         return False
-    path = root / profile / skill.source
-    if path.exists() and path.is_file():
-        path.unlink()
-        return True
+    # Profile dir first, then the project dir — the two removable levels.
+    for path in (
+        root / profile / skill.source,
+        project_skills_dir(project_root) / skill.source,
+    ):
+        if path.exists() and path.is_file():
+            path.unlink()
+            return True
     return False
 
 
-def any_skills(root: Path | None = None) -> bool:
-    """Whether any profile has any skill at all — decides if the skill tools
-    are registered, since the active profile can change per session."""
+def any_skills(
+    root: Path | None = None, *, project_root: Path | None = None
+) -> bool:
+    """Whether any skill exists anywhere reachable — decides if the skill tools
+    are registered, since the active profile (and cwd) can change per session.
+    Includes project skills so a project-only setup still enables the tool."""
     root = root or skills_dir()
-    if not root.exists():
-        return False
-    return any(
-        path.suffix.lower() in SKILL_SUFFIXES and path.is_file()
-        for path in root.rglob("*")
-    )
+
+    def has_skill(directory: Path) -> bool:
+        return directory.exists() and any(
+            path.suffix.lower() in SKILL_SUFFIXES and path.is_file()
+            for path in directory.rglob("*")
+        )
+
+    return has_skill(root) or has_skill(project_skills_dir(project_root))
 
 
-def skill_path(name: str, profile: str, *, root: Path | None = None) -> Path:
-    """Where a profile's own copy of a skill lives. Patches always write
-    here, never into ``_shared/``: one profile's correction must not silently
-    change another profile's procedure."""
+def skill_path(
+    name: str,
+    profile: str,
+    *,
+    root: Path | None = None,
+    level: SkillLevel = "profile",
+    project_root: Path | None = None,
+) -> Path:
+    """Where a skill file lives for the chosen level. Defaults to the profile's
+    own directory (where self-review patches always land, so one profile's
+    correction never changes another's procedure)."""
     root = root or skills_dir()
-    # Separators become dashes so a name can never escape the profile dir,
-    # and leading dots are stripped so it cannot become a hidden file either.
+    # Separators become dashes so a name can never escape its dir, and leading
+    # dots are stripped so it cannot become a hidden file either.
     safe = re.sub(r"[^A-Za-z0-9._-]", "-", name).strip("-.") or "skill"
+    if level == "global":
+        return root / SHARED_SKILLS_DIR / f"{safe}.md"
+    if level == "project":
+        return project_skills_dir(project_root) / f"{safe}.md"
     return root / profile / f"{safe}.md"
 
 
 def write_skill(
-    skill: Skill, profile: str, *, root: Path | None = None
+    skill: Skill,
+    profile: str,
+    *,
+    root: Path | None = None,
+    level: SkillLevel = "profile",
+    project_root: Path | None = None,
 ) -> Path:
-    """Persist a skill under a profile, front matter included."""
-    path = skill_path(skill.name, profile, root=root)
+    """Persist a skill at the chosen level, front matter included."""
+    path = skill_path(
+        skill.name, profile, root=root, level=level, project_root=project_root
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     front = yaml.safe_dump(
         {

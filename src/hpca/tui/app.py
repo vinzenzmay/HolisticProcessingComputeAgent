@@ -7,6 +7,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from os import environ as os_environ
+from pathlib import Path
 from time import monotonic, time
 from typing import Any
 
@@ -98,8 +99,10 @@ from hpca.skills import (
     delete_own_skill,
     delete_profile_skills,
     load_own_skills,
+    load_project_skills,
     load_skills,
     patched_body,
+    skill_path,
     summarize_skills,
     write_skill,
 )
@@ -1505,37 +1508,58 @@ class HpcaApp(App):
     # ------------------------------------------------------------- skills (§5.1)
 
     async def _skill_creator_worker(self) -> None:
-        """/skill-creator: collect a skill in a form and write it to the active
-        profile. New skills belong to whichever profile is on screen."""
+        """/skill-creator: collect a skill in a form and write it at the level
+        the user chose — global (every profile), profile (the one on screen),
+        or project (the working directory)."""
         from hpca.tui.skill_screens import SkillCreatorScreen
 
-        skill = await self.push_screen_wait(SkillCreatorScreen())
-        if skill is None:
+        result = await self.push_screen_wait(SkillCreatorScreen())
+        if result is None:
             return
-        if skill.name in {s.name for s in load_own_skills(self.profile)}:
+        skill, level = result
+        project_root = Path.cwd()
+        # Refuse only when this exact level already has that skill; the same
+        # name may live at another level, where precedence keeps them distinct.
+        target = skill_path(
+            skill.name, self.profile, level=level, project_root=project_root
+        )
+        if target.exists():
             self.notify(
-                f"A skill named “{skill.name}” already exists in this profile.",
+                f"A skill named “{skill.name}” already exists at the "
+                f"{level} level.",
                 severity="warning",
             )
             return
-        write_skill(skill, self.profile)
+        write_skill(skill, self.profile, level=level, project_root=project_root)
         self._refresh_skills()
-        self.notify(f"Added skill “{skill.name}” to profile “{self.profile}”.")
+        where = {
+            "global": "all profiles",
+            "profile": f"profile “{self.profile}”",
+            "project": "this project",
+        }[level]
+        self.notify(f"Added skill “{skill.name}” for {where}.")
 
     def _show_skills_list(self) -> None:
         """/skills-list: a read-only view of every skill the profile can see,
-        marking which are the profile's own (removable) versus shared."""
-        visible = load_skills(self.profile)
+        marking which level each resolves to (project > profile > global)."""
+        project_root = Path.cwd()
+        visible = load_skills(self.profile, project_root=project_root)
         if not visible:
             self.notify(
                 f"No skills for profile “{self.profile}”. Add one with "
                 "/skill-creator.",
             )
             return
-        own = {s.name for s in load_own_skills(self.profile)}
+        project_names = {s.name for s in load_project_skills(project_root=project_root)}
+        own_names = {s.name for s in load_own_skills(self.profile)}
         lines = []
         for skill in visible:
-            tag = "" if skill.name in own else "  (shared)"
+            if skill.name in project_names:
+                tag = "  (project)"
+            elif skill.name in own_names:
+                tag = ""  # the profile's own — removable, no tag
+            else:
+                tag = "  (global)"
             lines.append(f"• {skill.name}{tag}")
             if skill.description:
                 lines.append(f"    {skill.description}")
@@ -1544,26 +1568,34 @@ class HpcaApp(App):
         )
 
     async def _skill_remove_worker(self) -> None:
-        """/skill-remove: pick one of the profile's own skills and delete it.
-        Shared and legacy skills are not offered — removing one would change
-        every other profile that sees it."""
+        """/skill-remove: pick one of the profile's own or project skills and
+        delete it. Global (_shared) and legacy skills are not offered —
+        removing one would change every other profile that sees it."""
         from hpca.tui.skill_screens import SkillPickerScreen
 
-        own = load_own_skills(self.profile)
-        if not own:
+        project_root = Path.cwd()
+        # Removable = the profile's own plus this project's own. On a name
+        # collision the project skill shadows the profile one, matching load
+        # precedence, so offer that one.
+        by_name = {s.name: s for s in load_own_skills(self.profile)}
+        by_name.update(
+            {s.name: s for s in load_project_skills(project_root=project_root)}
+        )
+        removable = sorted(by_name.values(), key=lambda s: s.name)
+        if not removable:
             self.notify(
                 f"Profile “{self.profile}” has no skills of its own to remove.",
             )
             return
-        skill = await self.push_screen_wait(SkillPickerScreen(own))
+        skill = await self.push_screen_wait(SkillPickerScreen(removable))
         if skill is None:
             return
         confirmed = await self.push_screen_wait(
-            ConfirmScreen(f"Remove skill “{skill.name}” from “{self.profile}”?")
+            ConfirmScreen(f"Remove skill “{skill.name}”?")
         )
         if not confirmed:
             return
-        if delete_own_skill(skill, self.profile):
+        if delete_own_skill(skill, self.profile, project_root=project_root):
             self._refresh_skills()
             self.notify(f"Removed skill “{skill.name}”.")
         else:
@@ -1573,8 +1605,12 @@ class HpcaApp(App):
         """Make a skill change visible without a graph rebuild: the on-screen
         profile's list feeds the next turn's prompt, and the first-ever skill
         enables the read_skill tool (the registry is shared, mutated in place)."""
-        self.skills = load_skills(self.profile)
-        if any_skills() and "read_skill" not in self._tools.names():
+        project_root = Path.cwd()
+        self.skills = load_skills(self.profile, project_root=project_root)
+        if (
+            any_skills(project_root=project_root)
+            and "read_skill" not in self._tools.names()
+        ):
             add_skill_tools(self._tools)
 
     async def _memorize_worker(self, note: str) -> None:
