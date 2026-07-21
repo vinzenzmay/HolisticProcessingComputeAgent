@@ -1,15 +1,14 @@
-"""Memory tools: episodic recall (Phase 2) and curated memory edits (Phase 3).
+"""Memory tools: episodic recall and deferred memory flagging.
 
 ``session_search`` costs no model call: FTS5 BM25 over persisted
 user/assistant messages. Discovery mode returns Hermes-style bookends
 (goal → match → resolution) per hit; read mode pages through one session.
 
-``memory`` lets the agent propose edits to the profile's curated tiers the
-moment a user states a preference or correction, instead of waiting for
-``/conclude``. Unlike Hermes, which lets the model write directly, every
-batch here goes through the approval dialog — a 27B is not trusted to
-maintain its own memory unsupervised — and the tool result reports what the
-user actually approved.
+``memory`` lets the agent *flag* durable facts the moment a user states a
+preference or correction. Nothing is written when the tool is called: the
+flagged edits are queued and surfaced for the user to approve together at the
+next ``/conclude``. Memory is only ever generated when the user asks for it —
+the agent proposes, it never commits.
 """
 
 from __future__ import annotations
@@ -20,6 +19,7 @@ from hpca.agent.context import ToolContext
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.episodic import MESSAGE_CHARS, EpisodicStore
 from hpca.memory_ops import MemoryOp
+from hpca.profiles import MemoryScope
 
 RESULT_BUDGET = 2500
 
@@ -104,24 +104,25 @@ async def session_search(args: SessionSearchParams, ctx: ToolContext) -> str:
 
 
 MEMORY_DESCRIPTION = (
-    "Save durable facts to this profile's memory. Tier 1 (stable site facts: "
-    "cluster, scheduler, filesystem layout) and tier 2 (learnings, user "
-    "preferences, workarounds) are injected into every future session; tier 3 "
-    "is retrieved only when a request matches it, so situational notes belong "
-    "there. Make ALL changes in ONE call via the operations array: the batch "
-    "is applied together and the size budget is checked only on the final "
-    "result, so one call can free room AND use it. When a tier is full, "
-    "prefer demoting situational entries to tier 3 over removing them. "
-    "Address an existing entry by a short unique substring of its text. The "
-    "user approves every change."
+    "Flag durable facts worth keeping in this profile's memory. Nothing is "
+    "saved now: what you flag is collected and reviewed together when the user "
+    "runs /conclude, and the user approves every entry then. Choose a scope: "
+    "'system-prompt' for something worth putting in front of the assistant on "
+    "every future turn (a stable site fact, a lasting preference, a "
+    "correction) — kept small, so reserve it for what is always relevant; "
+    "'rag' for a situational, one-topic learning recalled only when a later "
+    "request resembles it. Put ALL changes in ONE call via the operations "
+    "array. Address an existing entry by a short unique substring of its text; "
+    "use 'demote' to move a system-prompt entry to rag."
 )
 
 
 class MemoryOperation(BaseModel):
     op: str = Field(description="add, replace, remove, or demote")
-    tier: int = Field(
-        default=2,
-        description="1 site facts, 2 learnings, 3 situational (retrieved only)",
+    scope: str = Field(
+        default="system-prompt",
+        description="system-prompt (injected every turn) or rag (retrieved "
+        "only when relevant)",
     )
     match: str = Field(
         default="",
@@ -132,20 +133,32 @@ class MemoryOperation(BaseModel):
 
 class MemoryParams(BaseModel):
     operations: list[MemoryOperation] = Field(
-        description="The changes to apply together"
+        description="The changes to flag together"
     )
 
 
+def _scope_of(raw: str) -> MemoryScope:
+    try:
+        return MemoryScope(raw.strip().lower())
+    except ValueError:
+        return MemoryScope.SYSTEM_PROMPT
+
+
 async def memory(args: MemoryParams, ctx: ToolContext) -> str:
-    """The write itself happens in the TUI, which owns the approval dialog and
-    the profile file; the tool only validates and hands the batch over."""
-    if ctx.propose_memory_edits is None:
-        return "Memory editing is not available in this context."
+    """Flag a memory batch for review at the next /conclude. The tool never
+    writes: it queues the proposal and reports that it was noted."""
+    if ctx.queue_memory_edits is None:
+        return "Memory flagging is not available in this context."
     operations = [
-        MemoryOp(op=o.op.strip().lower(), tier=o.tier, match=o.match, text=o.text)
+        MemoryOp(
+            op=o.op.strip().lower(),
+            scope=_scope_of(o.scope),
+            match=o.match,
+            text=o.text,
+        )
         for o in args.operations
     ]
-    return await ctx.propose_memory_edits(operations)
+    return ctx.queue_memory_edits(operations)
 
 
 def add_memory_tools(registry: ToolRegistry) -> ToolRegistry:

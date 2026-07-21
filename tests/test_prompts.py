@@ -5,18 +5,20 @@ from datetime import datetime
 from hpca.agent.prompts import environment_facts, orchestrator_system_prompt
 
 
+MEMORY_LABEL = "Memory (site facts, preferences, learnings)"
+
+
 class TestOrchestratorPrompt:
-    def test_tiers_injected_with_labels(self):
+    def test_memories_injected_under_the_merged_label(self):
         prompt = orchestrator_system_prompt(
-            tier1="Cluster is cubi.", tier2="User prefers R over Python."
+            system_prompt_memories="Cluster is cubi.\n\nUser prefers R over Python."
         )
-        assert "Standing site notes:\nCluster is cubi." in prompt
+        assert f"{MEMORY_LABEL}:\nCluster is cubi." in prompt
         assert "User prefers R over Python." in prompt
 
-    def test_empty_tiers_add_no_sections(self):
+    def test_empty_memories_add_no_section(self):
         prompt = orchestrator_system_prompt()
-        assert "Standing site notes" not in prompt
-        assert "Learnings" not in prompt
+        assert MEMORY_LABEL not in prompt
 
     def test_volatile_date_stays_out_of_the_prefix(self):
         # The date/time lives at the tail (api_content), never the system
@@ -28,28 +30,24 @@ class TestOrchestratorPrompt:
 
     def test_prefix_is_identical_across_calls(self):
         # Same inputs must yield byte-identical output so the prefix caches.
-        args = dict(tier1="Cluster is cubi.", tier2="User prefers R.")
+        args = dict(system_prompt_memories="Cluster is cubi.\n\nUser prefers R.")
         assert orchestrator_system_prompt(**args) == orchestrator_system_prompt(**args)
 
     def test_environment_facts_contains_time(self):
         assert f"{datetime.now():%Y-%m-%d}" in environment_facts()
 
-    def test_usage_meters_shown_when_given(self):
+    def test_usage_meter_shown_when_given(self):
         prompt = orchestrator_system_prompt(
-            tier1="Cluster is cubi.",
-            tier2="User prefers R.",
-            tier1_meter="10% — 16/1200 chars",
-            tier2_meter="1% — 14/3200 chars",
+            system_prompt_memories="Cluster is cubi.",
+            memory_meter="58% — 1392/2400 tokens",
         )
-        assert "Standing site notes [10% — 16/1200 chars]:\nCluster is cubi." in prompt
         assert (
-            "Learnings and preferences from earlier sessions "
-            "[1% — 14/3200 chars]:\nUser prefers R." in prompt
+            f"{MEMORY_LABEL} [58% — 1392/2400 tokens]:\nCluster is cubi." in prompt
         )
 
-    def test_meter_without_tier_text_adds_no_section(self):
-        prompt = orchestrator_system_prompt(tier1_meter="0% — 0/1200 chars")
-        assert "Standing site notes" not in prompt
+    def test_meter_without_memory_text_adds_no_section(self):
+        prompt = orchestrator_system_prompt(memory_meter="0% — 0/2400 tokens")
+        assert MEMORY_LABEL not in prompt
 
     def test_session_search_guidance_only_when_tool_present(self):
         assert "session_search" not in orchestrator_system_prompt()

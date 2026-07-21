@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Callable
 
 from hpca.config import Settings
 from hpca.embeddings import EmbeddingClient
@@ -33,13 +33,13 @@ class ToolContext:
     llm: object | None = None  # for tools that run their own firewalled LLM call
     current_tool: str = ""  # set by the graph; names sub-agent calls in the log
     trash: TrashManager | None = None
-    tier1_text: str = ""  # standing notes for subagent-style tool calls (§6.1)
     symbols: SymbolIndex | None = None
     rag: RagStore | None = None
-    episodic: EpisodicStore | None = None  # past-session recall (redesign P2)
-    # Hands a proposed memory batch to the TUI, which owns the approval
-    # dialog and the profile file; returns what the user approved (P3).
-    propose_memory_edits: Callable[[list], Awaitable[str]] | None = None
+    episodic: EpisodicStore | None = None  # past-session recall
+    # Queues a proposed memory batch for review at the next /conclude. The
+    # agent may flag facts mid-conversation, but nothing is written until the
+    # user concludes the session; returns a confirmation for the tool result.
+    queue_memory_edits: Callable[[list], str] | None = None
     embedder: EmbeddingClient | None = None
     skills: list[Skill] = field(default_factory=list)
     # Commands whose docs could not be fetched; probed at most once per session

@@ -1,11 +1,17 @@
-"""Agent profiles: two-tier memory in human-editable markdown (§6).
+"""Agent profiles: two-scope memory in human-editable markdown (§6).
 
-Format: YAML front matter, then ``## [tier1]`` / ``## [tier2]`` headings with
-one memory per block, each optionally preceded by an inline metadata comment
-``<!-- backend: qwen3-6b, created: 2026-07-16, kind: struggle -->``. Users
-edit these files in vim/nano (§6.4), so the parser is lenient: anything it
-cannot interpret becomes a ``problems`` entry, never an exception. Tier 3 is
-accepted by the format but not injected anywhere yet (deferred, §6.1).
+Format: YAML front matter, then ``## [system-prompt]`` / ``## [rag]`` headings
+with one memory per block, each optionally preceded by an inline metadata comment
+``<!-- backend: qwen3-6b, created: 2026-07-16, kind: struggle -->``. Users edit
+these files in vim/nano (§6.4), so the parser is lenient: anything it cannot
+interpret becomes a ``problems`` entry, never an exception.
+
+Two scopes, and only two:
+
+* **system-prompt** — injected into the orchestrator prompt every turn, so it is
+  held to a hard token budget (a full scope rejects new writes until condensed).
+* **rag** — retrieved only when a request matches it (see :mod:`hpca.memory_index`);
+  unbounded, because it costs nothing until recalled.
 """
 
 from __future__ import annotations
@@ -13,6 +19,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import date
+from enum import Enum
 from pathlib import Path
 
 import yaml
@@ -22,7 +29,15 @@ from hpca.config import app_dir
 DEFAULT_PROFILE = "default"
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]*$")
 
-TIER_HEADING_RE = re.compile(r"^##\s*\[tier([123])\]\s*$")
+
+class MemoryScope(str, Enum):
+    """Where a memory lives, and therefore how it reaches the model."""
+
+    SYSTEM_PROMPT = "system-prompt"
+    RAG = "rag"
+
+
+SCOPE_HEADING_RE = re.compile(r"^##\s*\[(system-prompt|rag)\]\s*$")
 HEADING_RE = re.compile(r"^##\s+")
 META_RE = re.compile(r"^<!--\s*(.*?)\s*-->\s*$")
 
@@ -32,7 +47,12 @@ def profiles_dir() -> Path:
 
 
 def estimate_tokens(text: str) -> int:
-    """Soft token estimate (§6.4): tiktoken when available, else chars/4."""
+    """Token count for the memory budget: tiktoken when available, else chars/4.
+
+    tiktoken's ``cl100k_base`` is not the active backend's exact tokenizer, so
+    this is a close estimate rather than an exact count — deterministic and
+    dependency-light, which is what a write-time budget check needs.
+    """
     if not text:
         return 0
     try:
@@ -46,7 +66,7 @@ def estimate_tokens(text: str) -> int:
 @dataclass
 class Memory:
     text: str
-    tier: int
+    scope: MemoryScope
     backend: str = ""
     created: str = ""
     kind: str = ""
@@ -114,12 +134,12 @@ class Profile:
     def duplicate(cls, source: str, new_name: str) -> "Profile":
         """A copy of ``source`` under ``new_name``, free to diverge from it.
 
-        Everything the profile has *learned* comes along — all memory tiers,
-        struggle notes, the lot — because the point of a copy is to start
-        specialised work from an established base rather than from nothing.
-        Sessions do not: they belong to the conversations that happened, not
-        to the knowledge that came out of them. Skills are copied by the
-        caller (``skills.copy_profile_skills``), which owns that directory.
+        Everything the profile has *learned* comes along — both scopes, struggle
+        notes, the lot — because the point of a copy is to start specialised work
+        from an established base rather than from nothing. Sessions do not: they
+        belong to the conversations that happened, not to the knowledge that came
+        out of them. Skills are copied by the caller
+        (``skills.copy_profile_skills``), which owns that directory.
 
         The copy records where it came from, so two profiles that share a
         base can still be told apart from two that merely resemble each other.
@@ -171,18 +191,18 @@ class Profile:
         elif text.strip():
             profile.problems.append("Missing YAML front matter")
 
-        tier: int | None = None
+        scope: MemoryScope | None = None
         block_meta: dict[str, str] = {}
         block_lines: list[str] = []
 
         def flush() -> None:
             nonlocal block_meta, block_lines
             body = "\n".join(block_lines).strip()
-            if body and tier is not None:
+            if body and scope is not None:
                 profile.memories.append(
                     Memory(
                         text=body,
-                        tier=tier,
+                        scope=scope,
                         backend=block_meta.get("backend", ""),
                         created=block_meta.get("created", ""),
                         kind=block_meta.get("kind", ""),
@@ -191,16 +211,17 @@ class Profile:
             block_meta, block_lines = {}, []
 
         for line in lines[index:]:
-            tier_match = TIER_HEADING_RE.match(line)
-            if tier_match:
+            scope_match = SCOPE_HEADING_RE.match(line)
+            if scope_match:
                 flush()
-                tier = int(tier_match.group(1))
+                scope = MemoryScope(scope_match.group(1))
                 continue
             if HEADING_RE.match(line):
                 flush()
-                tier = None
+                scope = None
                 profile.problems.append(
-                    f"Unknown heading ignored (use ## [tier1|tier2]): {line.strip()}"
+                    "Unknown heading ignored (use ## [system-prompt|rag]): "
+                    f"{line.strip()}"
                 )
                 continue
             meta_match = META_RE.match(line)
@@ -225,11 +246,11 @@ class Profile:
             meta["copied_on"] = self.copied_on
         front = yaml.safe_dump(meta, sort_keys=False).strip()
         parts = ["---", front, "---"]
-        for tier in (1, 2, 3):
-            memories = [m for m in self.memories if m.tier == tier]
-            if tier == 3 and not memories:
-                continue  # deferred tier: only written if something is in it
-            parts += ["", f"## [tier{tier}]"]
+        for scope in (MemoryScope.SYSTEM_PROMPT, MemoryScope.RAG):
+            memories = [m for m in self.memories if m.scope == scope]
+            if scope is MemoryScope.RAG and not memories:
+                continue  # retrieved scope: only written if something is in it
+            parts += ["", f"## [{scope.value}]"]
             for memory in memories:
                 meta_bits = [
                     f"{key}: {value}"
@@ -249,11 +270,16 @@ class Profile:
     # ------------------------------------------------------------- memories
 
     def add_memory(
-        self, text: str, *, tier: int, backend: str = "", kind: str = ""
+        self,
+        text: str,
+        *,
+        scope: MemoryScope,
+        backend: str = "",
+        kind: str = "",
     ) -> Memory:
         memory = Memory(
             text=text.strip(),
-            tier=tier,
+            scope=scope,
             backend=backend,
             created=date.today().isoformat(),
             kind=kind,
@@ -261,16 +287,16 @@ class Profile:
         self.memories.append(memory)
         return memory
 
-    def tier_text(self, tier: int) -> str:
-        return "\n\n".join(m.text for m in self.memories if m.tier == tier)
+    def scope_text(self, scope: MemoryScope) -> str:
+        return "\n\n".join(m.text for m in self.memories if m.scope == scope)
 
-    def tier_prompt_text(self, tier: int, *, active_backend: str = "") -> str:
-        """The tier as injected into a prompt: memories learned on a different
+    def system_prompt_text(self, *, active_backend: str = "") -> str:
+        """The system-prompt scope as injected: memories learned on a different
         backend are annotated, not dropped — a workaround for one small model
         often transfers, and the annotation lets the model weigh it."""
         parts = []
         for memory in self.memories:
-            if memory.tier != tier:
+            if memory.scope is not MemoryScope.SYSTEM_PROMPT:
                 continue
             text = memory.text
             if memory.backend and active_backend and memory.backend != active_backend:
@@ -278,41 +304,33 @@ class Profile:
             parts.append(text)
         return "\n\n".join(parts)
 
-    def tier_tokens(self, tier: int) -> int:
-        return estimate_tokens(self.tier_text(tier))
+    def system_prompt_tokens(self) -> int:
+        return estimate_tokens(self.scope_text(MemoryScope.SYSTEM_PROMPT))
 
-    def tier_chars(self, tier: int) -> int:
-        return len(self.tier_text(tier))
-
-    def usage_meter(self, tier: int, cap: int) -> str:
-        """Hermes-style usage meter, e.g. ``58% — 693/1200 chars``.
-
-        Character budgets are model-independent, unlike token counts, which
-        depend on whichever tokenizer the active backend uses.
-        """
-        used = self.tier_chars(tier)
+    def usage_meter(self, cap: int) -> str:
+        """Hermes-style usage meter for the budgeted scope,
+        e.g. ``58% — 1392/2400 tokens``."""
+        used = self.system_prompt_tokens()
         percent = round(100 * used / cap) if cap else 0
-        return f"{percent}% — {used}/{cap} chars"
+        return f"{percent}% — {used}/{cap} tokens"
 
-    def would_exceed(self, tier: int, text: str, *, cap: int) -> bool:
-        """Whether adding ``text`` to the tier would break its char budget.
+    def would_exceed(self, text: str, *, cap: int) -> bool:
+        """Whether adding ``text`` to the system-prompt scope breaks its budget.
 
-        The budget is hard for *writes* (§6.4 redesign): a full tier rejects
+        The budget is hard for *writes* (§6.4 redesign): a full scope rejects
         new memories until the user condenses it. Injection never truncates —
-        what is in the file is what the model sees.
+        what is in the file is what the model sees. RAG has no budget, so this
+        only concerns the system-prompt scope.
         """
-        used = self.tier_chars(tier)
-        added = len(text.strip()) + (2 if used else 0)  # joined with "\n\n"
-        return used + added > cap
+        current = self.scope_text(MemoryScope.SYSTEM_PROMPT)
+        addition = text.strip()
+        combined = f"{current}\n\n{addition}" if current else addition
+        return estimate_tokens(combined) > cap
 
-    def over_cap_tiers(self, *, tier1_cap: int, tier2_cap: int) -> list[int]:
-        """Tiers over their character budget (caps are chars, not tokens)."""
-        over = []
-        if self.tier_chars(1) > tier1_cap:
-            over.append(1)
-        if self.tier_chars(2) > tier2_cap:
-            over.append(2)
-        return over
+    def over_budget(self, cap: int) -> bool:
+        """Whether the system-prompt scope is over its token budget (only
+        reachable through a hand edit; in-app writes are rejected at the cap)."""
+        return self.system_prompt_tokens() > cap
 
 
 def _parse_meta(text: str) -> dict[str, str]:

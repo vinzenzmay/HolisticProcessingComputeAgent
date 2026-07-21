@@ -1,7 +1,7 @@
-"""Fenced recall injection (redesign Phase 1, Hermes-style).
+"""Fenced recall injection (Hermes-style).
 
-Recalled memory — struggle notes now, tier-3 prefetch later — reaches the
-model as a fenced block appended to the API copy of the user's message (the
+Recalled memory — struggle notes and RAG prefetch — reaches the model as a
+fenced block appended to the API copy of the user's message (the
 ``api_content`` sidecar, see ``hpca.llm.wire_messages``). The stored
 transcript keeps the clean text. The fence marks the block as reference data:
 a small model otherwise mistakes recalled notes for new instructions.
@@ -55,7 +55,7 @@ def note_line(memory: Memory) -> str:
 
 
 def retrieved_line(hit) -> str:
-    """One retrieved tier-3 memory (redesign Phase 5)."""
+    """One retrieved RAG memory."""
     provenance = _provenance(hit.created, hit.backend)
     label = "Past struggle" if hit.kind == "struggle" else "Recalled"
     prefix = f"{label} ({provenance}): " if provenance else f"{label}: "

@@ -8,9 +8,9 @@ from textual.widgets import ListView
 
 from hpca.editor import resolve_editor
 from hpca.llm import ChatResponse
-from hpca.profiles import Profile
+from hpca.profiles import MemoryScope, Profile
 from hpca.tui.app import ChatInput, HpcaApp, UNTITLED_SESSION
-from hpca.tui.memory_screens import MemoryProposalScreen
+from hpca.tui.memory_screens import MemoryProposalScreen, ReflectionScreen
 
 
 def is_title_request(json_schema):
@@ -70,7 +70,7 @@ async def type_and_submit(app, pilot, text):
 
 
 MEMORIZE_REPLY = proposals_json(
-    {"tier": 1, "kind": "fact", "text": "STAR needs 40G on this cluster."}
+    {"scope": "system-prompt", "kind": "fact", "text": "STAR needs 40G on this cluster."}
 )
 
 
@@ -91,7 +91,8 @@ class TestMemorize:
             saved = Profile.load("default").memories
             assert len(saved) == 1
             assert saved[0].text == "STAR needs 40G on this cluster."
-            assert saved[0].tier == 1  # the model chose the tier, not a picker
+            # the model chose the scope, not a picker
+            assert saved[0].scope is MemoryScope.SYSTEM_PROMPT
 
     async def test_the_note_and_the_conversation_reach_the_model(self, hpca_home):
         llm = RecordingLLM([respond_json("ok"), MEMORIZE_REPLY])
@@ -214,13 +215,16 @@ class TestCommandMenu:
 
 
 class TestConclude:
+    """/conclude runs a full self-review of the conversation — memories,
+    struggle notes and skills — each approved via the reflection dialog."""
+
     async def test_approve_and_reject_proposals(self, hpca_home):
         llm = FakeLLM(
             [
                 respond_json("hi"),
                 proposals_json(
-                    {"tier": 2, "kind": "learning", "text": "STAR needs 40G."},
-                    {"tier": 1, "kind": "fact", "text": "Cluster is cubi."},
+                    {"kind": "memory", "scope": "system-prompt", "text": "STAR needs 40G."},
+                    {"kind": "memory", "scope": "rag", "text": "Cluster is cubi."},
                 ),
             ]
         )
@@ -230,39 +234,40 @@ class TestConclude:
             await app.workers.wait_for_complete()
             await type_and_submit(app, pilot, r"\conclude")
             await pilot.pause()
-            assert isinstance(app.screen, MemoryProposalScreen)
+            assert isinstance(app.screen, ReflectionScreen)
             await pilot.press("y")  # keep the first
             await pilot.pause()
-            assert isinstance(app.screen, MemoryProposalScreen)
+            assert isinstance(app.screen, ReflectionScreen)
             await pilot.press("n")  # discard the second
             await app.workers.wait_for_complete()
             await pilot.pause()
             loaded = Profile.load("default")
             assert len(loaded.memories) == 1
             assert loaded.memories[0].text == "STAR needs 40G."
-            assert loaded.memories[0].tier == 2
+            assert loaded.memories[0].scope is MemoryScope.SYSTEM_PROMPT
             assert loaded.memories[0].kind == "learning"
 
-    async def test_conclude_without_session_warns(self, hpca_home):
+    async def test_conclude_without_a_conversation_warns(self, hpca_home):
         app = HpcaApp(llm=FakeLLM([]))
         async with app.run_test(size=(120, 40)) as pilot:
             await type_and_submit(app, pilot, r"\conclude")
+            await pilot.pause()
             assert Profile.load("default").memories == []
 
 
 class TestMemoryCaps:
     async def test_over_cap_reported(self, hpca_home):
         profile = Profile.load("default")
-        profile.add_memory("x" * 8000, tier=2)  # far over the 800-token cap
+        profile.add_memory("x " * 6000, scope=MemoryScope.SYSTEM_PROMPT)  # over 2400 tokens
         profile.save()
         app = HpcaApp(llm=FakeLLM([]))
         async with app.run_test(size=(120, 40)):
-            assert app.check_memory_caps() == [2]
+            assert app.check_memory_caps() is True
 
     async def test_under_cap_quiet(self, hpca_home):
         app = HpcaApp(llm=FakeLLM([]))
         async with app.run_test(size=(120, 40)):
-            assert app.check_memory_caps() == []
+            assert app.check_memory_caps() is False
 
 
 class TestResolveEditor:
@@ -308,22 +313,28 @@ class TestEditProfileAction:
 
 
 class TestHardWriteBudget:
-    """Redesign Phase 1: a full tier rejects new writes; injection never
-    truncates what is already in the file."""
+    """A full system-prompt scope rejects new writes; injection never
+    truncates what is already in the file. RAG has no budget."""
 
-    async def test_full_tier_blocks_new_writes(self, hpca_home):
+    async def test_full_scope_blocks_new_writes(self, hpca_home):
         profile = Profile.load("default")
-        profile.add_memory("x" * 3300, tier=2)  # over the 3200-char budget
+        profile.add_memory("x " * 6000, scope=MemoryScope.SYSTEM_PROMPT)  # over 2400 tokens
         profile.save()
         app = HpcaApp(llm=FakeLLM([]))
         async with app.run_test(size=(120, 40)):
-            assert app._memory_write_blocked(2, "a new learning")
-            assert not app._memory_write_blocked(1, "a short site note")
+            assert app._memory_write_blocked(MemoryScope.SYSTEM_PROMPT, "a new learning")
 
-    async def test_tier3_writes_never_blocked(self, hpca_home):
+    async def test_room_available_allows_write(self, hpca_home):
         app = HpcaApp(llm=FakeLLM([]))
         async with app.run_test(size=(120, 40)):
-            assert not app._memory_write_blocked(3, "x" * 10000)
+            assert not app._memory_write_blocked(
+                MemoryScope.SYSTEM_PROMPT, "a short site note"
+            )
+
+    async def test_rag_writes_never_blocked(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM([]))
+        async with app.run_test(size=(120, 40)):
+            assert not app._memory_write_blocked(MemoryScope.RAG, "x" * 10000)
 
 
 class TestCuratorWiring:
@@ -334,11 +345,11 @@ class TestCuratorWiring:
         from datetime import date, timedelta
 
         profile = Profile.load("default")
-        memory = profile.add_memory("an old struggle note", tier=3)
+        memory = profile.add_memory("an old struggle note", scope=MemoryScope.RAG)
         memory.created = (date.today() - timedelta(days=200)).isoformat()
         profile.save()
 
-    async def test_startup_archives_old_tier3(self, hpca_home):
+    async def test_startup_archives_old_rag(self, hpca_home):
         from hpca import curator
 
         self.old_note()

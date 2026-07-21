@@ -6,7 +6,7 @@ import pytest
 from textual.widgets import Input, ListView, TextArea
 
 from hpca.llm import ChatResponse
-from hpca.profiles import Profile
+from hpca.profiles import MemoryScope, Profile
 from hpca.tui.app import HpcaApp
 from hpca.tui.confirm_screen import ConfirmScreen
 from hpca.tui.profiles_screen import MemoryEditorScreen, ProfilesScreen
@@ -85,7 +85,7 @@ class TestOpening:
 class TestEditMemories:
     async def test_enter_opens_the_memories_and_keeps_edits(self, hpca_home):
         profile = Profile.load("default")
-        profile.add_memory("The cluster is cubi.", tier=1)
+        profile.add_memory("The cluster is cubi.", scope=MemoryScope.SYSTEM_PROMPT)
         profile.save()
         app = HpcaApp(llm=FakeLLM())
         async with app.run_test(size=(120, 40)) as pilot:
@@ -109,7 +109,7 @@ class TestEditMemories:
 
     async def test_declining_keep_discards_edits(self, hpca_home):
         profile = Profile.load("default")
-        profile.add_memory("original memory", tier=1)
+        profile.add_memory("original memory", scope=MemoryScope.SYSTEM_PROMPT)
         profile.save()
         app = HpcaApp(llm=FakeLLM())
         async with app.run_test(size=(120, 40)) as pilot:
@@ -147,11 +147,15 @@ class TestEditMemories:
             await pilot.press("enter")
             await pilot.pause()
             editor = app.screen.query_one("#memory-editor", TextArea)
-            editor.text = editor.text.rstrip() + "\n\n## [tier1]\n\nSTAR needs 40G.\n"
+            editor.text = (
+                editor.text.rstrip() + "\n\n## [system-prompt]\n\nSTAR needs 40G.\n"
+            )
             await pilot.press("escape")
             await pilot.press("y")
             await pilot.pause()
-            assert "STAR needs 40G." in app.profile_memory.tier_text(1)
+            assert "STAR needs 40G." in app.profile_memory.scope_text(
+                MemoryScope.SYSTEM_PROMPT
+            )
 
 
 class TestAddProfile:
@@ -308,7 +312,9 @@ class TestSessionProfilePicker:
 
     async def test_the_chosen_profiles_memories_reach_the_prompt(self, hpca_home):
         alpha = Profile.create("alpha")
-        alpha.add_memory("Alpha-only fact: use scratch volume B.", tier=1)
+        alpha.add_memory(
+            "Alpha-only fact: use scratch volume B.", scope=MemoryScope.SYSTEM_PROMPT
+        )
         alpha.save()
         llm = RecordingLLM([respond_json("ok")])
         app = HpcaApp(llm=llm)
@@ -343,7 +349,7 @@ class TestSessionProfilePicker:
 
     async def test_opening_a_session_switches_to_its_profile(self, hpca_home):
         alpha = Profile.create("alpha")
-        alpha.add_memory("Alpha-only fact.", tier=1)
+        alpha.add_memory("Alpha-only fact.", scope=MemoryScope.SYSTEM_PROMPT)
         alpha.save()
         app = HpcaApp(llm=FakeLLM())
         async with app.run_test(size=(120, 40)) as pilot:
@@ -351,7 +357,9 @@ class TestSessionProfilePicker:
             await app.open_session(session)
             await pilot.pause()
             assert app.profile == "alpha"
-            assert "Alpha-only fact." in app.profile_memory.tier_text(1)
+            assert "Alpha-only fact." in app.profile_memory.scope_text(
+                MemoryScope.SYSTEM_PROMPT
+            )
 
     async def test_creating_a_profile_inside_the_picker_uses_it(self, hpca_home):
         from hpca.tui.profiles_screen import ProfilePickerScreen
@@ -394,8 +402,8 @@ class TestCopyProfile:
 
     def base_with_memories(self, name="base"):
         profile = Profile.create(name)
-        profile.add_memory("Cluster is cubi.", tier=1)
-        profile.add_memory("The user prefers R.", tier=2)
+        profile.add_memory("Cluster is cubi.", scope=MemoryScope.SYSTEM_PROMPT)
+        profile.add_memory("The user prefers R.", scope=MemoryScope.SYSTEM_PROMPT)
         profile.save()
         return profile
 
@@ -440,7 +448,7 @@ class TestCopyProfile:
             await self.copy_via_ui(app, pilot, "base", "variants")
 
             copy = Profile.load("variants")
-            copy.add_memory("Deepvariant needs a GPU.", tier=2)
+            copy.add_memory("Deepvariant needs a GPU.", scope=MemoryScope.SYSTEM_PROMPT)
             copy.save()
 
             base_texts = [m.text for m in Profile.load("base").memories]

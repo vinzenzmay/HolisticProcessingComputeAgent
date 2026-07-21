@@ -36,13 +36,10 @@ async def research(
     question: str,
     ctx: ToolContext,
     *,
-    tier1: str = "",
     max_rounds: int = MAX_ROUNDS,
 ) -> str:
     tools = _research_tools()
     system = RESEARCHER_SYSTEM
-    if tier1:
-        system += f"\n\nStanding site notes:\n{tier1}"
     conversation = [
         {"role": "system", "content": system},
         {"role": "user", "content": question},

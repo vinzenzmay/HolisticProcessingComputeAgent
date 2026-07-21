@@ -11,6 +11,7 @@ from hpca.agent.reflect import (
     propose_reflections,
 )
 from hpca.llm import ChatResponse
+from hpca.profiles import MemoryScope
 
 
 class FakeLLM:
@@ -59,13 +60,21 @@ class TestDigest:
 class TestProposals:
     async def test_memory_proposal(self):
         llm = FakeLLM(
-            [reply({"kind": "memory", "tier": 2, "text": "The user prefers R."})]
+            [
+                reply(
+                    {
+                        "kind": "memory",
+                        "scope": "system-prompt",
+                        "text": "The user prefers R.",
+                    }
+                )
+            ]
         )
         proposals = await propose_reflections(llm, MESSAGES)
         assert len(proposals) == 1
         assert proposals[0].kind == "memory"
-        assert proposals[0].tier == 2
-        assert proposals[0].describe() == "tier 2 memory"
+        assert proposals[0].scope == MemoryScope.SYSTEM_PROMPT
+        assert proposals[0].describe() == "system-prompt memory"
 
     async def test_struggle_proposal_renders_keywords(self):
         llm = FakeLLM(
@@ -87,7 +96,9 @@ class TestProposals:
         assert await propose_reflections(llm, MESSAGES) == []
 
     async def test_empty_text_dropped(self):
-        llm = FakeLLM([reply({"kind": "memory", "tier": 2, "text": "   "})])
+        llm = FakeLLM(
+            [reply({"kind": "memory", "scope": "system-prompt", "text": "   "})]
+        )
         assert await propose_reflections(llm, MESSAGES) == []
 
     async def test_skill_proposal_without_name_dropped(self):
@@ -111,7 +122,12 @@ class TestProposals:
 
     async def test_retries_on_invalid_json(self):
         llm = FakeLLM(
-            ["not json", reply({"kind": "memory", "tier": 1, "text": "cubi"})]
+            [
+                "not json",
+                reply(
+                    {"kind": "memory", "scope": "system-prompt", "text": "cubi"}
+                ),
+            ]
         )
         proposals = await propose_reflections(llm, MESSAGES)
         assert proposals[0].text == "cubi"
@@ -155,7 +171,9 @@ class TestPromptContents:
         assert await propose_reflections(llm, MESSAGES, allow_new_skills=False) == []
 
     async def test_known_memories_passed_to_avoid_duplicates(self):
-        system = await self._system(tier1="Cluster is cubi.", tier2="Prefers R.")
+        system = await self._system(
+            system_prompt_memories="Cluster is cubi.\nPrefers R."
+        )
         assert "do NOT propose these again" in system
         assert "Cluster is cubi." in system
         assert "Prefers R." in system
@@ -208,39 +226,39 @@ class TestWholeSpanDigest:
         assert "msg0" in sent
 
 
-class TestTierThreeDeduplication:
-    """Found in a live run against Qwen3.6-27B: a retrieved tier-3 note is in
+class TestRagDeduplication:
+    """Found in a live run against Qwen3.6-27B: a retrieved RAG note is in
     the conversation when the reviewer reads it, so unless it is listed as
-    known the reviewer re-proposes it — for tier 1 or 2, promoting a
-    situational note into the always-injected budget tier 3 keeps it out of."""
+    known the reviewer re-proposes it — as system-prompt, promoting a
+    situational note into the always-injected budget RAG keeps it out of."""
 
-    async def test_tier3_listed_as_known(self):
+    async def test_rag_listed_as_known(self):
         llm = FakeLLM([reply()])
         await propose_reflections(
-            llm, MESSAGES, tier3="DeepVariant needs the gpu partition."
+            llm, MESSAGES, rag_memories="DeepVariant needs the gpu partition."
         )
         system = llm.calls[0]["messages"][0]["content"]
         assert "do NOT propose these again" in system
         assert "DeepVariant needs the gpu partition." in system
 
-    async def test_all_three_tiers_listed(self):
+    async def test_both_scopes_listed(self):
         llm = FakeLLM([reply()])
         await propose_reflections(
-            llm, MESSAGES, tier1="one", tier2="two", tier3="three"
+            llm, MESSAGES, system_prompt_memories="one\ntwo", rag_memories="three"
         )
         system = llm.calls[0]["messages"][0]["content"]
         assert "one" in system and "two" in system and "three" in system
 
-    async def test_large_tier3_is_capped(self):
+    async def test_large_rag_is_capped(self):
         llm = FakeLLM([reply()])
-        await propose_reflections(llm, MESSAGES, tier3="x" * 50_000)
+        await propose_reflections(llm, MESSAGES, rag_memories="x" * 50_000)
         system = llm.calls[0]["messages"][0]["content"]
-        assert len(system) < 12_000  # bounded, not the whole tier
+        assert len(system) < 12_000  # bounded, not the whole scope
 
     async def test_cap_keeps_the_most_recent_entries(self):
         llm = FakeLLM([reply()])
-        tier3 = "\n\n".join(f"note number {i}" for i in range(500))
-        await propose_reflections(llm, MESSAGES, tier3=tier3)
+        rag = "\n\n".join(f"note number {i}" for i in range(500))
+        await propose_reflections(llm, MESSAGES, rag_memories=rag)
         system = llm.calls[0]["messages"][0]["content"]
         assert "note number 499" in system  # newest kept
         assert "note number 0\n" not in system  # oldest dropped

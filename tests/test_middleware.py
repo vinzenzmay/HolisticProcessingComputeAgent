@@ -302,7 +302,7 @@ class TestNestedToolSchemas:
         )
         item = branch["properties"]["arguments"]["properties"]["operations"]["items"]
         assert item["type"] == "object"
-        assert set(item["properties"]) == {"op", "tier", "match", "text"}
+        assert set(item["properties"]) == {"op", "scope", "match", "text"}
 
     def test_example_shows_the_nested_shape_not_a_placeholder(self):
         """Shown `"operations": "<the changes>"` a small model writes exactly
@@ -313,7 +313,7 @@ class TestNestedToolSchemas:
             line[line.index('"arguments": ') + len('"arguments": ') : line.rindex("}} —") + 1]
         )
         assert isinstance(arguments["operations"], list)
-        assert set(arguments["operations"][0]) == {"op", "tier", "match", "text"}
+        assert set(arguments["operations"][0]) == {"op", "scope", "match", "text"}
 
 
 class TestInlineRefs:

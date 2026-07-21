@@ -12,11 +12,11 @@ from hpca.agent.memory_context import (
     note_line,
 )
 from hpca.llm import wire_messages
-from hpca.profiles import Memory
+from hpca.profiles import Memory, MemoryScope
 
 
 def struggle(text, **kwargs):
-    return Memory(text=text, tier=2, kind="struggle", **kwargs)
+    return Memory(text=text, scope=MemoryScope.SYSTEM_PROMPT, kind="struggle", **kwargs)
 
 
 class TestNoteLine:

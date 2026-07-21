@@ -128,18 +128,20 @@ SESSION_SEARCH_GUIDANCE = (
 # actually asking for now — a failure mode small models are especially prone
 # to, since they weight instructions in context over the current request.
 MEMORY_GUIDANCE = (
-    "You have memory that persists across sessions, and the memory tool "
-    "writes to it. Save proactively when the user states a preference, "
+    "You have memory that persists across sessions. You cannot write it "
+    "directly: use the memory tool to FLAG durable facts as you notice them, "
+    "and they are collected for the user to review together when the session "
+    "is concluded. Flag proactively when the user states a preference, "
     "corrects you, or tells you a durable fact about this site — the best "
     "memory is one that stops the user having to repeat themselves. "
     "Priority: corrections and preferences first, then site facts, then "
     "workarounds. Write memories as declarative FACTS, not instructions to "
     "yourself: “the user prefers R over Python” is right, “always answer in "
     "R” is wrong — an instruction gets re-read as a standing order in a "
-    "later session and overrides what is being asked then. Do NOT save task "
+    "later session and overrides what is being asked then. Do NOT flag task "
     "progress, what you did this session, file names, job ids, or anything "
     "that will be stale in a week; past sessions are searchable instead. "
-    "The user approves every write, so propose rather than agonize."
+    "Flag rather than agonize — the user has the final say at /conclude."
 )
 
 
@@ -152,10 +154,8 @@ SKILLS_GUIDANCE = (
 
 def orchestrator_system_prompt(
     *,
-    tier1: str = "",
-    tier2: str = "",
-    tier1_meter: str = "",
-    tier2_meter: str = "",
+    system_prompt_memories: str = "",
+    memory_meter: str = "",
     skills: str = "",
     session_search: bool = False,
     memory_tool: bool = False,
@@ -167,10 +167,9 @@ def orchestrator_system_prompt(
     a mode switch move it. Volatile facts (the date/time) deliberately live at
     the tail instead — see ``environment_facts``.
 
-    Tier 1 memories go into *every* agent's prompt, tier 2 only here (§6.1).
     Skills are listed by name/description only; bodies are fetched on demand.
-    The meters show how full each memory tier is — groundwork for the model
-    managing its own memory under a hard budget (redesign Phase 3).
+    The meter shows how full the system-prompt memory scope is against its
+    token budget.
     """
     parts = [
         "You are HPCA, a terminal assistant helping a scientist with data "
@@ -188,14 +187,9 @@ def orchestrator_system_prompt(
         parts.append(MEMORY_GUIDANCE)
     if skills:
         parts.append(f"{SKILLS_GUIDANCE}\n{skills}")
-    if tier1:
-        label = _metered("Standing site notes", tier1_meter)
-        parts.append(f"{label}:\n{tier1}")
-    if tier2:
-        label = _metered(
-            "Learnings and preferences from earlier sessions", tier2_meter
-        )
-        parts.append(f"{label}:\n{tier2}")
+    if system_prompt_memories:
+        label = _metered("Memory (site facts, preferences, learnings)", memory_meter)
+        parts.append(f"{label}:\n{system_prompt_memories}")
     return "\n\n".join(parts)
 
 

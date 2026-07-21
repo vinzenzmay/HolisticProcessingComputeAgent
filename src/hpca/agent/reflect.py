@@ -30,15 +30,16 @@ from typing import Literal
 from pydantic import BaseModel, ValidationError
 
 from hpca.llm import Message
+from hpca.profiles import MemoryScope
 
 MAX_TRANSCRIPT_MESSAGES = 24  # verbatim tail; older turns are digested
 MAX_MESSAGE_CHARS = 400
 MAX_DIGEST_MESSAGES = 40
 MAX_PROPOSALS = 4
 REFLECT_MAX_RETRIES = 1
-# Tier 3 is unbounded by design, but the review prompt is not: enough of it
+# RAG is unbounded by design, but the review prompt is not: enough of it
 # to stop the obvious re-proposals without swamping a 27B's attention.
-KNOWN_TIER3_CHARS = 2000
+KNOWN_RAG_CHARS = 2000
 
 # Adapted from Hermes' _SKILL_REVIEW_PROMPT. Every "do not capture" line is a
 # real self-poisoning mode: a small model that writes "browser tools do not
@@ -65,13 +66,17 @@ SYSTEM_PROMPT = (
     "an HPC assistant, and decide what — if anything — is worth keeping for "
     "future sessions.\n\n"
     "Propose only what will still be true and useful weeks from now:\n"
-    "- memory (tier 1): stable facts about this site — cluster, scheduler, "
-    "filesystem layout, module system, site policy.\n"
-    "- memory (tier 2): user preferences, corrections the user made, and "
-    "workarounds that proved necessary on this backend.\n"
+    "- memory (system-prompt): something worth putting in front of the "
+    "assistant on EVERY future turn — a stable site fact (cluster, scheduler, "
+    "filesystem layout, module system, policy), a lasting user preference, or "
+    "a correction the user made. Kept small, so reserve it for what is always "
+    "relevant.\n"
+    "- memory (rag): a situational, one-topic learning worth keeping but not "
+    "worth carrying every turn — recalled only when a later request resembles "
+    "it.\n"
     "- struggle: a difficulty worth warning about next time, in 1-2 "
     "sentences, with 2-5 keywords naming the tools, formats or operations "
-    "that identify a similar future task.\n"
+    "that identify a similar future task (stored as rag).\n"
     "- skill_patch: a correction to a skill that was followed and turned out "
     "wrong, missing a step, or outdated. Give the skill's name and the "
     "correction.\n\n"
@@ -103,7 +108,7 @@ REFLECTION_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "kind": {"enum": KINDS},
-                    "tier": {"enum": [1, 2]},
+                    "scope": {"enum": ["system-prompt", "rag"]},
                     "text": {"type": "string"},
                     "keywords": {
                         "type": "array",
@@ -125,9 +130,15 @@ REFLECTION_SCHEMA = {
 class Reflection(BaseModel):
     kind: Literal["memory", "struggle", "skill_patch", "skill_new"]
     text: str
-    tier: Literal[1, 2] = 2
+    scope: MemoryScope = MemoryScope.SYSTEM_PROMPT
     keywords: list[str] = []
     skill_name: str = ""
+
+    def target_scope(self) -> MemoryScope:
+        """Where this proposal is stored. Struggle notes are always RAG — they
+        are situational by nature; the model's scope choice only applies to a
+        plain ``memory`` proposal."""
+        return MemoryScope.RAG if self.kind == "struggle" else self.scope
 
     def memory_text(self) -> str:
         """Storage form. Struggle notes carry a matchable keyword line."""
@@ -137,7 +148,7 @@ class Reflection(BaseModel):
 
     def describe(self) -> str:
         if self.kind == "memory":
-            return f"tier {self.tier} memory"
+            return f"{self.scope.value} memory"
         if self.kind == "struggle":
             return "struggle note"
         if self.kind == "skill_patch":
@@ -206,9 +217,8 @@ async def propose_reflections(
     llm,
     messages: list[Message],
     *,
-    tier1: str = "",
-    tier2: str = "",
-    tier3: str = "",
+    system_prompt_memories: str = "",
+    rag_memories: str = "",
     skills: str = "",
     allow_new_skills: bool = True,
     span: str = "recent",
@@ -216,17 +226,19 @@ async def propose_reflections(
 ) -> list[Reflection]:
     """What this stretch of conversation is worth remembering, if anything.
 
-    All three tiers are listed as already-known. Tier 3 especially: a
-    retrieved note is *in the conversation* when the reviewer reads it, so
-    without this the reviewer re-proposes what it just saw — and proposes it
-    for tier 1 or 2, promoting a situational note into the always-injected
-    budget that tier 3 exists to keep it out of.
+    Both scopes are listed as already-known. RAG especially: a retrieved note
+    is *in the conversation* when the reviewer reads it, so without this the
+    reviewer re-proposes what it just saw — and proposes it as system-prompt,
+    promoting a situational note into the always-injected budget that RAG
+    exists to keep it out of.
     """
     system = SYSTEM_PROMPT
     if allow_new_skills:
         system += SKILL_CREATION_CLAUSE
     known = "\n\n".join(
-        part for part in (tier1, tier2, _cap(tier3, KNOWN_TIER3_CHARS)) if part
+        part
+        for part in (system_prompt_memories, _cap(rag_memories, KNOWN_RAG_CHARS))
+        if part
     )
     if known:
         system += (

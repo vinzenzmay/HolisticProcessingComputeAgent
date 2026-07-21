@@ -155,7 +155,6 @@ async def explain_process_failure(
     name: str,
     exit_code: int | None,
     candidates,
-    tier1: str = "",
     max_retries: int = EXPLAIN_MAX_RETRIES,
 ) -> ProcessExplanation:
     """Pick the causing line out of scored candidates (§5.5 tier 3).
@@ -167,8 +166,6 @@ async def explain_process_failure(
     which of five error-ish lines actually stopped the run.
     """
     system = PROCESS_SYSTEM_PROMPT
-    if tier1:
-        system += f"\n\nStanding site notes:\n{tier1}"
     conversation = [
         {"role": "system", "content": system},
         {"role": "user", "content": format_candidates(name, exit_code, candidates)},
@@ -210,12 +207,9 @@ async def explain_failure(
     llm,
     report: TriageReport,
     *,
-    tier1: str = "",
     max_retries: int = EXPLAIN_MAX_RETRIES,
 ) -> FailureExplanation:
     system = SYSTEM_PROMPT
-    if tier1:  # tier 1 standing notes go into every agent's prompt (§6.1)
-        system += f"\n\nStanding site notes:\n{tier1}"
     conversation = [
         {"role": "system", "content": system},
         {"role": "user", "content": format_report(report)},
