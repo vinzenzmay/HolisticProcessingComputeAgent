@@ -87,9 +87,12 @@ Terminals in 2026 are assumed wider than 80 columns
   * *Session (left column):* open into the center chat window.
   * *Chat message (center):* `(b)` go back in conversation to this point,
     `(c)` copy content to clipboard.
-  * *Sub-process (right column):* `(i)` inspect (open logs/status view),
-    `(k)` kill (with confirmation), `(a)` ask — spawn a Q&A subagent about this
-    sub-process.
+  * *Sub-process / job (right column):* **Enter** inspects (opens the
+    logs/status view), `(k)` kills the selected local process (with
+    confirmation). (The design once envisaged an `(a)` "ask a Q&A subagent about
+    this process" action; that is not implemented — failure explanation is done
+    automatically by the triage pipeline in §5.5, not on demand from this
+    column.)
 
 **Reserved hotkeys — never bind these** (they are eaten or made unreliable by the
 terminal, by zellij/tmux, or by the flow-control layer, so a future UI addition
@@ -105,7 +108,7 @@ Prefer a bare letter gated (via `check_action`) to a non-typing column, or a saf
 `RESERVED HOTKEYS` comment above `HpcaApp.BINDINGS`.
 * **Config editor** `(c)`: edit the settings JSON, persisted to
   `~/.HolisticProcessingComputeAgent/settings.json`.
-* **Profiles & learnings** `(a)`: manage profiles and their tier-1 memories.
+* **Profiles & learnings** `(a)`: manage profiles and their memories (see §6).
 * **Chat commands** (typing `/` or `\` lists them):
   * `/memorize [NOTE]` — the agent forms memories from NOTE plus the conversation
     so far and proposes them for approval (see §6).
@@ -179,8 +182,10 @@ round, so switching applies immediately — even to a turn already in flight.
 
 * **manual** — every execution tool call (`run_script`, `start_script`,
   `run_bash`, `submit_job`) pauses at the same `interrupt()` gate as
-  destructive operations; the approval modal shows the actual script text and
-  offers *run script* / *skip script*. A skip is fed back to the model as a
+  destructive operations; an inline approval bar at the foot of the chat column
+  (`DecisionBar`, deliberately non-modal so the other columns and sessions stay
+  visible) shows the actual script text and offers *run script* / *skip
+  script*. A skip is fed back to the model as a
   SKIPPED tool result that forbids retrying, rephrasing, or reaching the same
   outcome another way (bare denials make small models re-propose the same
   command).
@@ -196,14 +201,17 @@ round, so switching applies immediately — even to a turn already in flight.
   destructive action in its final report.
 * **plan** — nothing executes. Enforcement is structural, not prompt-trust:
   script tools are withdrawn from the registry offered to `decide()` (a tool
-  never offered cannot be called), and `run_bash` — kept so the plan can be
-  grounded in what is actually on disk — gates like manual. The model
-  maintains a checklist through an `update_plan` tool; the checklist lives in
-  the checkpointed graph state (`AgentState.plan`) and is re-injected into the
+  never offered cannot be called). `run_bash` is kept so the plan can be
+  grounded in what is actually on disk; it runs unattended (only the §5.3
+  destructive gate still applies) rather than pausing for approval like manual —
+  look-around commands are cheap and gating each one made planning tedious. The
+  model maintains a checklist through an `update_plan` tool; the checklist lives
+  in the checkpointed graph state (`AgentState.plan`) and is re-injected into the
   system prompt every round, so it survives restarts and context compaction.
-  When a plan-mode turn ends with a plan, a modal shows the editable checklist
-  and offers: execute on auto, execute step-by-step (manual), or keep
-  planning. Approval switches the session's mode and starts execution with a
+  When a plan-mode turn ends with a plan, the same inline decision bar shows the
+  editable checklist and offers: execute on auto (`ctrl+r`), execute
+  step-by-step under manual approval (`ctrl+e`), or keep planning (`esc`).
+  Approval switches the session's mode and starts execution with a
   `[plan approved]` event turn; during execution the plan stays in the prompt
   and the model checks steps off via `update_plan`.
 
@@ -227,34 +235,55 @@ LangGraph provides exactly the primitives required here:
 
 ### 4.2 Orchestrator and subagents
 
-One **orchestrating agent** routes work to specialized **subagents**. Each subagent
-gets a minimal system prompt and only its own tools:
+One **orchestrating agent** does the work, delegating a couple of narrowly-scoped
+jobs to firewalled sub-loops. Each sub-loop gets a minimal system prompt and only
+its own tools:
 
-| Subagent | Purpose | Tools (max ~5) |
+| Sub-loop | Purpose | Tools |
 |---|---|---|
-| script-writer | create/edit bash, Python, R, snakemake scripts | `create_script`, `read_file`, `search_docs` |
-| job-runner | submit & manage cluster jobs and local runs | `start_script`, `submit_job`, `job_status`, `cancel_job` |
-| log-explainer | diagnose failing/finished jobs from triaged logs | `get_job_report`, `read_log_excerpt` |
 | doc-researcher | answer technical questions & verify API usage against man pages, docs, source (RAG) | `search_docs`, `lookup_symbol`, `read_manpage`, `read_source` |
-| process-QA | the `(a) ask` action in the right column | `get_process_info`, `read_log_excerpt` |
+| log-explainer | diagnose failing/finished jobs from triaged logs | (fed a structured triage report; no tools) |
 
-The orchestrator itself has: route-to-subagent, `list_paths` (registry), memory tools
-(§6), and direct answers for trivial conversational queries only (see the grounded
-answering policy below).
+**Implementation note (design vs. code).** The original design imagined a
+router node dispatching to five distinct subagents (script-writer, job-runner,
+log-explainer, doc-researcher, process-QA), each a separate agent. That router
+was **not** built. What ships instead is a single orchestrator LangGraph loop
+(`orchestrator` + `execute_tool` nodes) holding the whole tool registry, plus
+**two** firewalled sub-loops that are invoked *as tools*, not routed to:
+**doc-researcher** (reached via the `ask_docs` tool, `researcher.py`) and
+**log-explainer** (run inside `get_job_report`, `explainer.py`). The
+would-be script-writer, job-runner and process-QA "subagents" are simply regular
+tools on the one orchestrator (`create_script`, `submit_job`, …). The
+context-firewall contract below still holds for the two real sub-loops: raw
+retrieval and raw logs never enter the orchestrator's context.
 
-**Grounded answering policy.** Small models hallucinate API details, so technical
-questions are never answered from model weights. Any query that names an *external*
-program, library, API/function, file format, or error message is routed to the
-doc-researcher; the orchestrator answers directly only for trivial conversational
-turns. The policy explicitly does **not** cover the agent's own tools: their
-schemas are already in its prompt, so researching them before a call is pure
-overhead and is forbidden. The hallucination risk lives in the command-line
-programs the agent drives from generated scripts, not in its own toolbox. Doc-researcher answers must carry citations (source + section). If retrieval
-finds nothing relevant, the answer is explicitly marked
-`[ungrounded — not in indexed docs]` so the user always knows which kind of answer
-they are reading. Accepted cost: a technical question takes ≥2 model calls
-(routing + grounded answering); on a small local model that latency is the right
-trade against confidently wrong flags on cluster CLIs.
+The orchestrator itself holds the full tool registry — file/script/job/doc/memory
+tools plus `list_paths` (registry) — and answers directly only for trivial
+conversational queries (see the grounded answering policy below).
+
+**Grounded answering policy.** Small models hallucinate API details, so the agent
+is steered away from answering technical questions from model weights. The policy
+is that any query naming an *external* program, library, API/function, file
+format, or error message should go to the doc-researcher, and the orchestrator
+answers directly only for trivial conversational turns. It explicitly does **not**
+cover the agent's own tools: their schemas are already in its prompt, so
+researching them before a call is pure overhead and is forbidden. The
+hallucination risk lives in the command-line programs the agent drives from
+generated scripts, not in its own toolbox. Doc-researcher answers are asked to
+carry citations (source + section), and to mark an answer
+`[ungrounded — not in indexed docs]` when retrieval finds nothing relevant.
+
+**Enforcement is prompt-steered, not deterministic (design vs. code).** There is
+no router node that inspects a query and *forces* the doc-researcher route:
+"routing" happens only when the orchestrator chooses to call the `ask_docs` tool,
+guided by prompt text (`GROUNDED_ANSWERING_GUIDANCE`). Likewise the citation
+requirement and the `[ungrounded …]` marker are instructions to the sub-model, not
+code-enforced backstops — the doc-researcher returns its text verbatim, with no
+check that a citation is present or that the marker was added on empty retrieval.
+(The log/process explainers *do* have a deterministic quote-or-admit backstop; the
+doc-researcher does not.) So the policy is real but only as reliable as the small
+model's compliance. Accepted cost: a technical question still takes ≥2 model calls
+(the orchestrator turn plus the grounded sub-loop).
 
 **Context firewall (subagent I/O contract).** Every subagent call follows a fixed
 contract: the caller passes a focused question plus optional context references
@@ -274,9 +303,14 @@ the orchestrator's or another subagent's context.
   errors out on unknown keys (error fed back for retry). New paths discovered by
   tools (e.g. output of a job) are auto-registered and announced to the model as
   their key. The model never has to reproduce a literal path correctly.
-* **Output size control:** no raw tool output above a token budget ever reaches the
-  model. Long outputs are stored to disk, summarized deterministically (head/tail +
-  signature extraction), and referenced by path-registry key.
+* **Output size control:** long tool outputs are kept small before they reach the
+  model. *As built,* this is per-tool truncation rather than a single generic
+  middleware layer: `read_file` returns head/tail, `read_manpage`/`read_source`
+  are bounded, and `run_script`/`run_bash` clip each stream to a tail and point at
+  the full log file (which is registered by key). There is **no** universal
+  "nothing above N tokens ever passes" guard in `execute_tool`, so a tool that
+  returns a large string directly (e.g. several full `search_docs` chunks) is not
+  spilled to disk and summarized — a known gap versus this design.
 * **Dry-run & verification gates:** see §5.2.
 * **Destructive-op gate:** see §5.3.
 * **Prompt assembly:** system prompts are rendered per call; current date/time and
@@ -286,10 +320,11 @@ the orchestrator's or another subagent's context.
 
 If the agent fails at or struggles with a task (e.g. exhausts retries, user aborts,
 job repeatedly fails), the orchestrator characterizes the problem in 1–2 sentences and
-proposes a "struggle note" for the profile memory (user approves). On future similar
-tasks — detected by simple keyword/tag match against struggle notes injected via
-tier 2 — the agent warns the user up front ("I have struggled with X before") and
-lets the user decide whether to attempt it anyway.
+proposes a "struggle note" for the profile memory (user approves; stored in the
+`rag` scope, §6.1). On future similar tasks — detected by a simple whole-word
+keyword match against the profile's struggle notes — the agent warns the user up
+front ("I have struggled with X before") and lets the user decide whether to
+attempt it anyway.
 
 ## 5. Tools & safety harnesses
 
@@ -304,24 +339,35 @@ Core tools:
 
 * `create_script(kind: bash|python|R|snakemake, registry_key, content)` — writes the
   script, immediately syntax-checks it (§5.2), registers the path.
-* `start_script(registry_key, args)` — runs locally as a tracked subprocess
-  (appears in the right column), stdout/stderr captured to files and registered.
-* `submit_job(kind: sbatch|snakemake, registry_key, args)` — submits to the cluster,
-  records job ID and *all* log paths in the job DB (§5.4), starts periodic tracking.
+* `run_script(registry_key, args)` / `run_bash(content)` — run *and block*,
+  returning captured output as the tool result; `run_bash` writes a throwaway
+  script, `bash -n`-checks it, and runs it through the same tracked runner (it is
+  not a free-form shell — see below). These are the built-in execution tools
+  beyond the §5.1 "core" list.
+* `start_script(registry_key, args)` — runs locally as a tracked **background**
+  subprocess (appears in the right column), stdout/stderr captured to files and
+  registered; its completion is delivered back into the conversation (§5.4).
+* `submit_job(registry_key, args)` — submits an sbatch script to the cluster,
+  records the job ID and log paths in the job DB (§5.4), starts periodic tracking.
+  *(The design imagined a `kind: sbatch|snakemake` switch; only the sbatch path is
+  implemented — a snakemake-cluster submission tool does not exist yet.)*
 * `job_status(job_id)` / `get_job_report(job_id)` — structured status / triaged
   failure report (§5.5).
 * `cancel_job(job_id)` — HITL-gated.
 * `search_docs(query)`, `lookup_symbol(name, kind)`, `read_manpage(name)`,
-  `read_source(registry_key, range)` — retrieval over man pages, tool documentation,
-  and source code (§5.6): `lookup_symbol` is the exact-match path used by the
-  verification gate (§5.2), `search_docs` the embedding path for prose questions.
-* File operations (`move`, `copy`, `delete`, `read_file`, `list_dir`) — destructive
-  ones gated per §5.3.
+  `read_source(registry_key, range)`, `index_docs(...)`, `ask_docs(question)` —
+  retrieval over man pages, tool documentation, and source code (§5.6):
+  `lookup_symbol` is the exact-match path used by the verification gate (§5.2),
+  `search_docs` the embedding path for prose questions, `ask_docs` the firewalled
+  doc-researcher sub-loop (§4.2).
+* File operations (`move_file`, `copy_file`, `delete_file`, `read_file`) — destructive
+  ones gated per §5.3. There is **no** `list_dir` tool: registry keys are listed by
+  `list_paths`, and directory contents are read via `run_bash`.
 
 All subprocess execution goes through **one internal runner** (timeouts, output
 capture, cwd tracking, env control). There is deliberately **no free-form shell tool
-in v1**: every terminal operation is funneled through typed tools. (A guarded
-`run_shell` can be added later as its own subagent tool if needed.)
+in v1**: even `run_bash` funnels through a syntax-checked throwaway script and the
+tracked runner, so every terminal operation stays typed and captured.
 
 ### 5.2 Dry-run & verification middleware (mandatory, automatic)
 
@@ -336,8 +382,9 @@ execution, using native mechanisms — no LLM involved:
 | snakemake workflow | `snakemake -n` (dry run) |
 | sbatch submission | `sbatch --test-only` |
 
-Failures are parsed and fed back to the script-writer subagent as structured errors
-for a fix-and-retry loop (bounded).
+Missing checker binaries are reported as `skipped`, never a hard failure. Failures
+are parsed and fed back to the model as structured errors for a bounded
+fix-and-retry loop.
 
 **Semantic verification gate (code-vs-docs).** Syntax checks miss the small model's
 dominant failure mode: plausible-but-wrong API usage — invented CLI flags,
@@ -355,19 +402,22 @@ against the indexed documentation and source (§5.6):
    look a tool up, because under instruction load a small model reliably decides
    not to. A parse yielding too few flags counts as a failed probe and leaves the
    command unindexed — a half-parsed flag list would turn correct scripts into
-   gate failures. Probes are bounded and cached per session. Only *packaged*
-   software is ever executed: a command resolving into a `bin/` directory
-   implements `--help` by convention, whereas a script in the user's own tree is
-   their code and may ignore `--help` and simply run — which would execute it
-   before the §5.3 approval gate saw the script that calls it. User scripts and
-   destructive commands stay unindexed (a warning), though man pages are still
-   read for them, since fetching one never runs anything.
+   gate failures. Probes are bounded and cached per session. What may be executed
+   for its `--help` is decided by `safe_to_execute`: a small `NEVER_EXECUTE`
+   denylist of destructive commands, and anything resolving inside the agent's own
+   `scripts_dir` (the model's generated code, which must not run before the §5.3
+   gate sees it), are refused — everything else is probed. *(The original design
+   gated this on a command resolving into a `bin/` directory; that heuristic was
+   found wrong and replaced by the denylist + own-scripts rule, though the safety
+   intent — never run the agent's own scripts early — is preserved.)* Man pages are
+   still read for refused commands, since fetching one never runs anything.
 1. **Deterministic extraction** of used APIs: Python via `ast` (imports, calls,
-   keyword names), bash and snakemake `shell:` blocks via command tokenization
-   (command + flags), R best-effort (`library()`, `pkg::fn` calls). Wrapper
+   keyword names), and bash via command tokenization (command + flags). Wrapper
    prefixes (`conda run -n env …`, `time`, `nohup`) are unwrapped and absolute
    paths reduced to their basename, so flags are attributed to the program that
-   owns them rather than to the wrapper.
+   owns them rather than to the wrapper. *(R and snakemake `shell:` extraction were
+   designed but are not yet implemented — the extractor returns nothing for them,
+   so those scripts pass the semantic gate on syntax alone.)*
 2. **Exact lookup, not embeddings:** extracted symbols are checked against the
    symbol table (§5.6) — CLI flags against the learned flag set, functions and
    kwargs against indexed signatures. Flag matching allows attached values and
@@ -375,9 +425,10 @@ against the indexed documentation and source (§5.6):
    blocking a valid command costs far more than passing a malformed value through
    to the tool's own error message.
 3. Mechanical mismatches (flag absent from the man page, kwarg absent from the
-   signature) are flagged by code alone. Only fuzzy cases (ambiguous parse,
-   partial match) go to the doc-researcher as a focused judgment call: "code calls
-   `X(a=…, b=…)`; indexed signature is `X(a, c)` — mismatch?"
+   signature) are flagged by code alone. *(The design also routed fuzzy cases —
+   ambiguous parse, partial match — to the doc-researcher for a judgment call;
+   that escalation is not implemented: as built, mismatches are decided entirely
+   in code, with no model-in-the-loop for borderline cases.)*
 4. The result is a structured per-symbol report `confirmed | mismatch |
    not_indexed`. Mismatches feed the same bounded fix-and-retry loop as syntax
    failures. `not_indexed` surfaces as a visible warning to the user, never a hard
@@ -401,14 +452,21 @@ gate (§5.3) or actual submission proceed.
   * *Content-overwriting operations* (in-place edits, overwrites): make a real copy
     first (this is the rarer case).
   * Trash entries carry a TTL (`trash_ttl_days`, default 7) and are cleaned up on
-    app start; a `restore` action is offered in the inspect view.
+    app start. *(`TrashManager.restore()`/`.list()` exist and are unit-tested, but
+    are not yet surfaced anywhere in the TUI — the "restore from the inspect view"
+    action is not wired up, so recovery is currently a library capability rather
+    than a user-facing button.)*
 * Files ≥ 1 GB: no automatic backup (quota!), but the confirmation modal states this
   explicitly.
 
 ### 5.4 Job tracking: sqlite DB
 
 One sqlite database at `~/.HolisticProcessingComputeAgent/hpca.db` (WAL mode). It is
-the backbone of the right column, of `job_status`, and of log triage.
+the backbone of the right column, of `job_status`, and of log triage. *(LangGraph
+conversation checkpoints deliberately live in a **separate** `checkpoints.db`, not
+in `hpca.db`, to keep the checkpointer's heavy writes off the app's own tables. The
+shipped schema also carries a few additive columns/tables beyond the minimum below
+— e.g. `sessions.mode`/`backend`, a `symbols` table, a message store.)*
 
 Tables (minimum):
 
@@ -423,16 +481,21 @@ processes(pid, session_id, cmd, state, stdout_path, stderr_path, started_at,
           notified, background)
 ```
 
-A background asyncio task polls `squeue`/`sacct` (interval `job_poll_seconds`,
+A background asyncio task polls the cluster (interval `job_poll_seconds`,
 default 30) and updates states; a sibling timer polls the `processes` table for
-local subprocesses that have ended.
+local subprocesses that have ended. *(As built, cluster polling uses `sacct`
+exclusively — `sacct --parsable2` — not `squeue`; `sacct` covers both running and
+finished jobs, so the live-queue path was dropped.)*
 
 **Completion reaches the agent, not just the user.** A turn ends when the model
 answers, and nothing else starts one — so "I'll check on it in a moment" was a
 promise the runtime could not keep, and a background script could fail silently
 until the user noticed. Terminal transitions are therefore delivered *into the
-conversation*: the change is formatted with its exit code and a log tail and
-appended to the session's LangGraph thread as new input. Reacting immediately is
+conversation*: the change is appended to the session's LangGraph thread as new
+input. For a local background process the event carries its exit code and a log
+tail (and any triage finding); the cluster-job event is currently terser — it
+announces the new state and points at the logs, without an exit code or tail
+inlined. Reacting immediately is
 `run_turn` on that thread (the agent speaks unprompted); deferring is
 `aupdate_state`, which leaves the message in checkpointed history for the next
 turn at no model cost. Both are the same primitive — new input on an existing
@@ -513,74 +576,96 @@ precisely when it matters. Indexing builds **two** structures:
    `lookup_symbol` query. "Does `samtools view -e` exist?" is an exact-match
    question; embeddings are the wrong tool for it. Requires no embedding model, so
    it works in a slim base install.
-2. **Vector store (semantic retrieval)** — `chromadb` in embedded mode **or**
-   `sqlite-vec`, queried by `search_docs` for prose questions ("how do I subset a
-   BAM by region?"). Embeddings come from the LLM backend's embedding endpoint if
-   it serves one (vLLM and llama.cpp-server do; keeps the agent itself free of
-   local ML dependencies and GPU-vendor concerns), else from a local
-   `sentence-transformers` model as an optional install.
+2. **Vector store (semantic retrieval)** — `sqlite-vec` (one file, embedded,
+   dimension fixed by the first insert), queried by `search_docs` for prose
+   questions ("how do I subset a BAM by region?"). Embeddings come from the LLM
+   backend's embedding endpoint (vLLM and llama.cpp-server serve one; keeps the
+   agent itself free of local ML dependencies and GPU-vendor concerns).
 
-## 6. Agent profiles & memory (two-tier model)
+   *(Design vs. code: the doc originally offered `chromadb` **or** `sqlite-vec`
+   and a local `sentence-transformers` fallback when no embedding endpoint is
+   available. Neither shipped — the store is `sqlite-vec` only (the `rag.store`
+   config switch is currently inert), and there is no local embedding fallback: if
+   the backend serves no embedding endpoint, `search_docs`/indexing return an error
+   rather than falling back. `sentence-transformers` is not a dependency; the
+   default `rag.embedding` value is a model **name** sent to the remote endpoint,
+   not a locally-loaded model.)*
+
+## 6. Agent profiles & memory (two-scope model)
 
 An **agent profile** is a per-user, named memory document recording what the agent
 has learned, and on which LLM backend each learning was made (small models differ —
 a workaround for one backend may not apply to another). On session start the user
-picks an existing profile or creates a new one.
+picks an existing profile or creates a new one (managed from the `a` screen).
 
-### 6.1 Tiers
+> **Design vs. code.** This section originally described a **tier1 / tier2** split
+> (plus a deferred tier 3). The shipped implementation collapsed that into **two
+> scopes** — `system-prompt` and `rag` — and this section has been rewritten to
+> match the code. (A now-stale `memory_redesign.md` at the repo root captures an
+> intermediate design with *character* budgets; the code moved past it to a single
+> *token* budget on one injected scope.)
 
-* **Tier 1 — global standing notes.** Injected into **every system prompt of every
-  agent** (orchestrator and subagents). Only *stable*, universally useful facts:
-  what cluster this is, scheduler, filesystem layout, module system quirks, site
-  policies. Hard cap enforced (default 300 tokens). *Not* for time/date — those are
-  injected dynamically at prompt render time (§4.3).
-* **Tier 2 — profile memories.** Injected into the **orchestrator's** system prompt
-  only: task learnings, user preferences, struggle notes (§4.4), backend-specific
-  workarounds (tagged with the backend). Cap default 800 tokens.
+### 6.1 Scopes
 
-A third, RAG-retrieved tier was considered and deliberately **deferred** to keep v1
-simple; the storage format below is chosen so it can be added later without
-migration (a `tier: 3` value is simply not used yet).
+* **`system-prompt` — injected memory.** The entries injected verbatim into the
+  **orchestrator's** system prompt each turn: stable facts about the cluster and
+  filesystem, user preferences, backend-specific workarounds (tagged with the
+  backend). A single hard **write** budget applies (`memory.system_prompt_token_cap`,
+  default **2400** tokens): a full scope refuses new memories until the user
+  condenses it, but injection itself never truncates the file. Subagents/sub-loops
+  get their own minimal prompts and are **not** given this memory. Time/date facts
+  are never stored here — they are injected dynamically at render time (§4.3).
+* **`rag` — retrieved memory.** Not injected wholesale; only the entries matching
+  the current request are pulled in, within a per-turn prefetch budget
+  (`rag_prefetch_chars` 800, `rag_prefetch_count` 3). Task learnings and struggle
+  notes (§4.4) live here. A background **curator** ages `rag` entries out to a
+  `<profile>.archive.md` (never deletes) so retrieval quality does not decay as
+  notes accumulate (`curator_*_days` settings).
 
 ### 6.2 Storage format
 
 Human-editable markdown per profile at
 `~/.HolisticProcessingComputeAgent/profiles/<name>.md`: YAML front-matter for
-metadata (profile name, created, default backend), then one memory per block under
-`## [tier1]` / `## [tier2]` headings, each block with a small inline metadata line
+metadata, then one memory per block under `## [system-prompt]` / `## [rag]`
+headings, each block with a small inline metadata line
 (`<!-- backend: qwen3-6b, created: 2026-07-16, kind: struggle -->`). Markdown, not
 JSON, because users will edit this in vim/nano (§6.4) and it must survive hand edits;
-the parser must be lenient and report problems clearly.
+the parser is lenient and reports problems clearly (unknown headings become
+`problems` rather than raising).
 
 ### 6.3 Writing memories
 
 * `/memorize [NOTE]` — the model forms durable memories from NOTE and the
-  conversation so far; each is proposed for approval (choosing its own tier).
-* `\conclude` — the orchestrator analyses the conversation and **proposes** memory
-  blocks; a modal shows the proposals; the user approves/edits/rejects each
+  conversation so far; each is proposed for approval (choosing its own scope).
+* `/conclude` (also `\conclude`) — the orchestrator analyses the conversation and
+  **proposes** memory blocks; the approval screen shows each for **approve/reject**
   (HITL, consistent with §5.3 — a small model writes these, so review is essential).
-* Struggle notes (§4.4) follow the `\conclude` approval path.
+  Editing a proposal's text is done in the separate profile editor rather than
+  inline in the approval screen.
+* Struggle notes (§4.4) follow the same proposal/approval path and are stored in the
+  `rag` scope.
 
 ### 6.4 Size warnings & manual cleanup
 
-Token counts per tier are tracked (tokenizer of the backend if exposed via
-`/tokenize`, `tiktoken` as fallback, chars/4 as last resort — this is a soft limit).
-When a tier exceeds its cap, a persistent notification offers, in hotkey-bar style:
+The injected `system-prompt` scope's token count is tracked against its cap
+(`tiktoken` when available, chars/4 as the last-resort fallback — there is no
+backend `/tokenize` call in the shipped code). When a write would exceed the cap it
+is blocked with a notification prompting the user to condense; the `rag` scope is
+not metered. Cleanup paths:
 
-* **(e) edit externally** — via Textual's `App.suspend()`: restore the terminal,
-  `subprocess.call([editor, profile_path])`, reinstate the TUI on exit. Editor
-  resolution: settings override → `$VISUAL` → `$EDITOR` → `nano`. Works inside
-  tmux/screen/zellij. On return: re-parse, validate, report problems; the user can
-  move memories between tiers simply by moving blocks between headings.
-* **(s) summarize with LLM** — the model drafts a condensed version into a *proposal
-  file*, then the same external editor opens for the user to approve/adjust
-  (never auto-applied).
-* **(d) defer** — dismiss until next threshold crossing or app start.
+* **Edit externally** — via Textual's `App.suspend()`: restore the terminal, open
+  `$VISUAL`/`$EDITOR`/`nano` on the profile file, reinstate the TUI on exit. On
+  return the file is re-parsed and validated; the user can move a memory between
+  scopes simply by moving its block between the two headings.
+* **Condense with the LLM** — the model drafts a shorter version for approval,
+  never auto-applied.
+* **Demote** — an op that moves a `system-prompt` entry into `rag` to free the
+  injected budget without losing the note.
 
 ## 7. Configuration
 
-`~/.HolisticProcessingComputeAgent/settings.json`, editable via the top-bar settings
-menu and by hand. Sketch:
+`~/.HolisticProcessingComputeAgent/settings.json`, editable via the in-app config
+editor (`c`) and by hand. Sketch:
 
 ```json
 {
@@ -600,13 +685,19 @@ menu and by hand. Sketch:
     "backup_limit_gb": 1,
     "trash_ttl_days": 7
   },
+  "agent": { "default_mode": "manual" },
   "memory": {
-    "tier1_token_cap": 300,
-    "tier2_token_cap": 800
+    "system_prompt_token_cap": 2400,
+    "rag_prefetch_chars": 800,
+    "rag_prefetch_count": 3
   },
   "clipboard": { "mode": "auto", "command": null, "osc52_limit_kb": 74 },
   "editor": null,
-  "rag": { "store": "chromadb", "embedding": "sentence-transformers/all-MiniLM-L6-v2" }
+  "rag": {
+    "store": "sqlite-vec",
+    "embedding": "sentence-transformers/all-MiniLM-L6-v2",
+    "embedding_base_url": "http://localhost:51943/v1"
+  }
 }
 ```
 
@@ -621,11 +712,12 @@ Constraints: no root, no daemons, installable into a venv/conda env on the clust
   SSH tunnel
 * `pydantic` — tool schemas & validation-driven retries
 * `sqlite3` (stdlib) — job DB, sessions, path registry; LangGraph sqlite checkpointer
-* `chromadb` (embedded) **or** `sqlite-vec` — RAG store
-* `sentence-transformers` — embeddings (optional if backend provides an embedding
-  endpoint)
+  (`langgraph-checkpoint-sqlite`)
+* `sqlite-vec` — RAG vector store (the only store shipped; `chromadb` was dropped)
 * `pyyaml` — signature library, skills, front-matter
-* `tiktoken` — token estimates (soft limits)
+* embeddings — from the LLM backend's `/v1/embeddings` endpoint; there is **no**
+  bundled `sentence-transformers` local fallback in the shipped code
+* `tiktoken` — optional; token estimates fall back to chars/4 when it is absent
 
 Explicitly avoided: anything requiring a service daemon, X11 clipboard tools as a
 hard dependency, LangChain `AgentExecutor`.
@@ -641,13 +733,13 @@ hard dependency, LangChain `AgentExecutor`.
 4. **LangGraph core:** orchestrator, checkpointed sessions (left column live),
    pydantic validation + retry middleware, path registry.
 5. **Runner + tools:** internal subprocess runner, `create_script`/`start_script`
-   with dry-run gate, right-column process list with (i)/(k)/(a).
+   with dry-run gate, right-column process list (Enter inspects, `k` kills).
 6. **Slurm layer:** job DB, `submit_job`/`job_status`/`cancel_job`, background
    poller, log collection.
 7. **Log triage:** signature library + report generator + log-explainer subagent.
 8. **Safety layer:** destructive-op interrupts, hardlink trash, restore, TTL cleanup.
-9. **Profiles & memory:** two-tier storage, `\memorize`, `\conclude` with approval
-   modal, size warnings, `App.suspend()` editor round-trip.
+9. **Profiles & memory:** two-scope storage (`system-prompt`/`rag`), `/memorize`,
+   `/conclude` with approve/reject, size warnings, `App.suspend()` editor round-trip.
 10. **Symbol index & verification gate:** man-page/source indexing into the sqlite
     symbol table, `lookup_symbol`/`read_manpage`/`read_source`, doc-researcher
     subagent (exact-lookup mode), semantic code-vs-docs gate wired into §5.2. No

@@ -9,22 +9,108 @@ See [project.md](project.md) for the full design document.
 
 ## Install
 
+HPCA is a Python package (requires Python ≥ 3.11) with a single console script,
+`hpca`. Install it into a virtual environment with either `uv` or `pixi`.
+
+### With uv
+
 ```bash
-uv venv && uv pip install -e '.[dev]'
+uv venv
+uv pip install -e '.[dev]'   # drop [dev] to skip the test dependencies
 ```
+
+### With pixi
+
+```bash
+pixi install            # base environment
+pixi install -e dev     # environment including the test dependencies
+```
+
+This installs the `hpca` entry point (defined in [pyproject.toml](pyproject.toml)).
+Semantic doc search (RAG) uses your LLM backend's `/v1/embeddings` endpoint — no
+local embedding model is bundled, so that feature needs a backend that serves
+embeddings.
 
 ## Run
 
 ```bash
-hpca
+hpca            # or: python -m hpca
 ```
 
 Configuration lives at `~/.HolisticProcessingComputeAgent/settings.json` and can be
-edited from the in-app settings menu (`s`).
+edited from the in-app config editor — press `c` while the sessions column is
+focused. The same directory holds the job database (`hpca.db`), agent profiles,
+skills, and the deletion trash.
+
+The TUI is a three-column layout — sessions (left), chat (middle), running
+processes and cluster jobs (right). A few of the top-level keys:
+
+| Key | Action |
+|---|---|
+| `c` | open the config editor |
+| `m` | manage LLM backends |
+| `a` | manage profiles & learnings (memories) |
+| `ctrl+l` | switch the LLM backend for the current session |
+| `shift+tab` | cycle the agent mode (see below) |
+| `q` | quit (from the sessions column) |
+
+Typing `/` (or `\`) in the chat entry lists the available slash commands.
+
+## Features
+
+* **Three-column TUI** — sessions on the left, the chat with the agent in the
+  middle, and live local sub-processes and Slurm jobs on the right. Built on
+  [Textual](https://textual.textualize.io/).
+* **Concurrent per-session turns** — each session runs its own agent turn
+  independently, with a per-session model line, working indicator, and context
+  meter, so one session can be busy while you work in another.
+* **Agent modes** — `manual`, `auto`, `full auto`, and `plan` control how much
+  the agent does on its own versus asking first (see *Agent modes* below).
+* **Single orchestrator + firewalled sub-loops** — one orchestrating agent holds
+  the full tool registry and delegates two narrowly-scoped jobs to context-isolated
+  sub-loops: a **doc-researcher** (RAG questions, via the `ask_docs` tool) and a
+  **log-explainer** (failure diagnosis, inside `get_job_report`). Their raw
+  retrieval and raw logs never enter the orchestrator's context.
+* **Typed tool suite, no free-form shell** — every action (create/run scripts,
+  submit/track jobs, file operations, doc lookups) goes through a typed,
+  schema-validated tool and a single internal runner; even `run_bash` funnels
+  through a syntax-checked throwaway script rather than a raw shell.
+* **Dry-run & verification gates** — scripts and job submissions are syntax-checked
+  natively (`bash -n`, `py_compile`, `snakemake -n`, `sbatch --test-only`) and then
+  passed through a mostly-deterministic gate that checks CLI flags and API usage
+  against indexed man pages, `--help` output, and source, before anything runs.
+* **Destructive-operation safety net** — deletes, overwrites, kills, and cancels
+  require explicit confirmation, and small files are hardlinked into a timestamped
+  trash directory (with a TTL, cleaned on start) before being removed.
+* **Job tracking** — a background poller watches cluster jobs (via `sacct`) and
+  local subprocesses, records everything in an sqlite DB, and delivers terminal
+  outcomes back into the conversation so the agent can react (a finished local
+  process arrives with its exit code and a log tail; a cluster-job event announces
+  the new state and points at the logs).
+* **Log triage** — instead of dumping raw multi-MB logs at the model, a triage
+  pipeline matches a user-extensible signature library, scores keyword candidates,
+  and hands a compact structured report to the log-explainer, which explains why a
+  job failed, its state, a suggested fix, and a finickiness estimate.
+* **Grounded (RAG) answering** — the agent is steered to answer technical questions
+  about external programs and APIs against indexed docs, man pages, and source
+  rather than from model weights, routing them to the doc-researcher, which is
+  asked to cite its sources and to mark answers it could not ground. (This policy
+  is prompt-driven guidance to the model, not a hard code-enforced guarantee.)
+* **Profiles & memory** — per-user profiles record durable learnings and
+  preferences across two scopes: `system-prompt` memories injected into the
+  orchestrator's prompt (under a token budget) and `rag` memories retrieved only
+  when they match the current request. Memories are proposed for your approval via
+  `/memorize` and `/conclude` and stored as hand-editable markdown.
+* **Skills** — user-defined procedure files the agent follows for specific tasks
+  (see *Skills* below).
+* **Configurable LLM backends** — talk to any OpenAI-compatible endpoint (vLLM,
+  llama.cpp-server, …); manage backends and switch per session from the TUI.
+* **Clipboard that works under tmux** — system-clipboard copy via OSC 52 with a
+  tmux paste-buffer fallback (see *Clipboard under tmux* below).
 
 ## Agent modes
 
-Each session runs in one of three modes, shown on the line right above the chat
+Each session runs in one of four modes, shown on the line right above the chat
 entry and cycled with `shift+tab` (`ctrl+m` also works in terminals whose
 keyboard protocol can distinguish it from Enter — most cannot):
 
@@ -40,10 +126,55 @@ keyboard protocol can distinguish it from Enter — most cannot):
 * **plan** — the agent executes nothing and instead drafts a checklist
   (look-around commands each ask first). When a plan is ready, a dialog lets you
   edit the checklist and hand it over for execution — on auto (`ctrl+r`) or
-  step-by-step under manual approval (`ctrl+s`) — or keep refining it (`esc`).
+  step-by-step under manual approval (`ctrl+e`) — or keep refining it (`esc`).
 
 New sessions start in `agent.default_mode` (settings, default `manual`); each
 session remembers its own mode across restarts.
+
+## Skills
+
+Skills are user-defined procedure files — markdown (with optional YAML front
+matter) or YAML — that tell the agent how to handle a specific kind of task. Each
+skill has a `name`, a one-line `description`, optional `triggers`, and a `body`
+(the procedure itself). Only the name and description are surfaced to the model in
+its system prompt; the full body is fetched on demand via the `read_skill` tool,
+keeping the prompt small.
+
+### Where skills live (levels)
+
+A skill is stored at one of three levels, which decides who sees it. On a name
+collision the most specific level wins (**project > profile > global**):
+
+* **global** — visible to every profile. Stored under
+  `~/.HolisticProcessingComputeAgent/skills/_shared/`.
+* **profile** — the current profile only. Stored under
+  `~/.HolisticProcessingComputeAgent/skills/<profile>/`.
+* **project** — tied to the directory you launch `hpca` from, and only visible
+  while running there. Stored under a hidden `.hpca/skills/` in that directory, so
+  a repo can carry its own procedures without them leaking into other projects.
+
+### Create a skill
+
+Run `/skill-creator` in the chat entry. A form collects the name, description,
+level, and body (tab moves between fields); `esc` saves after a confirmation, or
+cancels an empty form. You can also create skill files by hand — drop a `.md`,
+`.yaml`, or `.yml` file into the appropriate directory above. A file without front
+matter is still a valid skill (its filename becomes the name and its text the
+body).
+
+### Use a skill
+
+You don't invoke skills directly. Their names and descriptions are always in the
+agent's prompt; when a task matches, the agent calls `read_skill` to load the full
+procedure and follows it. Run `/skills-list` to see every skill the current
+profile can see, tagged with the level each one resolves to.
+
+### Remove a skill
+
+Run `/skill-remove` and pick from the list. Only removable skills are offered —
+the current profile's own skills and this project's skills. Global (`_shared`)
+skills are intentionally not offered, since removing one would silently change
+every other profile that sees it; delete those by removing the file directly.
 
 ## Clipboard under tmux
 
@@ -60,5 +191,5 @@ The tmux paste-buffer fallback (`prefix + ]`) works regardless of these settings
 ## Development
 
 ```bash
-uv run pytest
+uv run pytest        # or: pixi run -e dev pytest
 ```
