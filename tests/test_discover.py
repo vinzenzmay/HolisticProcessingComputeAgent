@@ -80,6 +80,44 @@ class TestProbeEndpoint:
         assert [b.model for b in backends] == ["a", "b"]
         assert backends[1].max_model_len == 256
 
+    async def test_bearer_header_sent_when_key_given(self):
+        seen = {}
+
+        def handler(request):
+            seen["auth"] = request.headers.get("Authorization")
+            return httpx.Response(200, json=VLLM_MODELS)
+
+        backends = await probe_endpoint(
+            "http://localhost:51941/v1",
+            api_key="sekrit",
+            transport=httpx.MockTransport(handler),
+        )
+        assert seen["auth"] == "Bearer sekrit"
+        assert backends[0].model == "Qwen/Qwen3.6-27B-FP8"
+
+    async def test_no_bearer_header_without_key(self):
+        seen = {}
+
+        def handler(request):
+            seen["auth"] = request.headers.get("Authorization")
+            return httpx.Response(200, json=VLLM_MODELS)
+
+        await probe_endpoint(
+            "http://localhost:1/v1", transport=httpx.MockTransport(handler)
+        )
+        assert seen["auth"] is None
+
+    async def test_401_with_key_still_marks_needs_key(self):
+        # A 401 even after sending the key means the key was rejected; the
+        # caller reads the needs_key result as "that key didn't work".
+        backends = await probe_endpoint(
+            "http://localhost:1/v1",
+            api_key="wrong",
+            transport=make_probe({"error": "unauthorized"}, status=401),
+        )
+        assert len(backends) == 1
+        assert backends[0].needs_key is True
+
 
 @pytest.fixture
 def live_stub():
@@ -127,6 +165,41 @@ class TestIsReachable:
 
     async def test_unreachable(self):
         assert await is_reachable("http://127.0.0.1:47/v1") is False
+
+    async def test_keyed_reachable_only_on_200(self):
+        ok = make_probe(VLLM_MODELS, status=200)
+        assert await is_reachable(
+            "http://localhost:1/v1", api_key="k", transport=ok
+        ) is True
+
+    async def test_keyed_401_is_not_reachable(self):
+        # With a key supplied, a 401 means the key is bad — mark disconnected
+        # rather than the misleading "connected" the unkeyed path would show.
+        rejected = make_probe({"error": "unauthorized"}, status=401)
+        assert await is_reachable(
+            "http://localhost:1/v1", api_key="k", transport=rejected
+        ) is False
+
+    async def test_unkeyed_401_still_reachable(self):
+        # An unkeyed backend answering 401 is "up but needs a key" — reachable.
+        rejected = make_probe({"error": "unauthorized"}, status=401)
+        assert await is_reachable(
+            "http://localhost:1/v1", transport=rejected
+        ) is True
+
+    async def test_keyed_sends_bearer(self):
+        seen = {}
+
+        def handler(request):
+            seen["auth"] = request.headers.get("Authorization")
+            return httpx.Response(200, json=VLLM_MODELS)
+
+        await is_reachable(
+            "http://localhost:1/v1",
+            api_key="sekrit",
+            transport=httpx.MockTransport(handler),
+        )
+        assert seen["auth"] == "Bearer sekrit"
 
 
 class TestBackendDisplay:

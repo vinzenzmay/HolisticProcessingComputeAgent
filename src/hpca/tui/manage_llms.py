@@ -33,6 +33,7 @@ from hpca.discover import (
     ordered_ports,
     scan_local_ports,
 )
+from hpca.tui.backend_form import BackendFormScreen
 from hpca.tui.confirm_screen import ConfirmScreen
 
 # Shown whenever thinking is switched on, because the setting looks like a
@@ -72,12 +73,16 @@ class DiscoveredList(ListView):
         # escape binding handles it, this just orders the footer display.
         Binding("escape", "close", "back", show=True),
         Binding("enter", "select_cursor", "add llm to list", show=True),
+        Binding("a", "add_manually", "add llm manually", show=True),
     ]
 
     def check_action(self, action: str, parameters) -> bool | None:
         if action == "select_cursor":
             return self.highlighted_child is not None
         return True
+
+    def action_add_manually(self) -> None:
+        self.screen.add_manually()
 
 
 class ConfiguredList(ListView):
@@ -215,7 +220,9 @@ class ManageLLMsScreen(Screen):
     @work(group="llm-reach")
     async def reachability_worker(self) -> None:
         for backend in list(self.app.settings.backends):
-            self._reachable[backend.base_url] = await is_reachable(backend.base_url)
+            self._reachable[backend.base_url] = await is_reachable(
+                backend.base_url, api_key=backend.api_key
+            )
         await self.refresh_configured()
 
     def _is_configured(self, discovered: DiscoveredBackend) -> bool:
@@ -292,19 +299,41 @@ class ManageLLMsScreen(Screen):
             await self._add_backend(discovered)
 
     async def _add_backend(self, discovered: DiscoveredBackend) -> None:
-        self.app.settings.backends.append(
+        # A key-locked endpoint came through the scan as "(api key required)"
+        # with no real model name — open the form to collect the key (and let
+        # it auto-fill the model), rather than saving the placeholder.
+        if discovered.needs_key:
+            self.app.push_screen(
+                BackendFormScreen(base_url=discovered.base_url, editable_url=False),
+                self._on_backend_form,
+            )
+            return
+        await self._save_backend(
             LLMBackend(
                 model=discovered.model,
                 base_url=discovered.base_url,
                 max_model_len=discovered.max_model_len,
             )
         )
-        self.app.settings.remember_llm_ports([discovered.base_url])
+
+    def add_manually(self) -> None:
+        """Add a backend the scan never surfaced — full form, editable URL."""
+        self.app.push_screen(
+            BackendFormScreen(editable_url=True), self._on_backend_form
+        )
+
+    def _on_backend_form(self, backend: LLMBackend | None) -> None:
+        if backend is not None:
+            self.run_worker(self._save_backend(backend), group="llm-add")
+
+    async def _save_backend(self, backend: LLMBackend) -> None:
+        self.app.settings.backends.append(backend)
+        self.app.settings.remember_llm_ports([backend.base_url])
         self.app.settings.save()
-        self._reachable[discovered.base_url] = True  # just probed by the scan
+        self._reachable[backend.base_url] = True  # just probed, or user-asserted
         await self.refresh_discovered()
         await self.refresh_configured()
-        self.notify(f"Configured {discovered.model}")
+        self.notify(f"Configured {backend.model}")
 
     def toggle_thinking_selected(self) -> None:
         configured_list = self.query_one("#llm-configured", ListView)

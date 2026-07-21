@@ -68,15 +68,28 @@ class DiscoveredBackend:
         return f"{self.model} │ {self.details()}"
 
 
+def _auth_headers(api_key: str | None) -> dict[str, str]:
+    return {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+
 async def probe_endpoint(
     base_url: str,
     *,
+    api_key: str | None = None,
     timeout: float = PROBE_TIMEOUT_S,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> list[DiscoveredBackend]:
-    """Models served at one endpoint; [] if it is not an OpenAI-style API."""
+    """Models served at one endpoint; [] if it is not an OpenAI-style API.
+
+    Pass ``api_key`` to authenticate the probe: the scan leaves it unset (a
+    key-locked endpoint just surfaces as ``needs_key``), but validating a key
+    the user just typed sends it and reads a lingering 401 as "key rejected".
+    """
     async with httpx.AsyncClient(
-        base_url=base_url.rstrip("/") + "/", timeout=timeout, transport=transport
+        base_url=base_url.rstrip("/") + "/",
+        headers=_auth_headers(api_key),
+        timeout=timeout,
+        transport=transport,
     ) as client:
         try:
             response = await client.get("models")
@@ -160,13 +173,31 @@ async def scan_local_ports(
     return backends
 
 
-async def is_reachable(base_url: str, *, timeout: float = PROBE_TIMEOUT_S) -> bool:
-    """Whether a configured backend currently answers /v1/models."""
+async def is_reachable(
+    base_url: str,
+    *,
+    api_key: str | None = None,
+    timeout: float = PROBE_TIMEOUT_S,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> bool:
+    """Whether a configured backend currently answers /v1/models.
+
+    With ``api_key`` the request is authenticated and only a 200 counts as
+    reachable — a 401/403 then means the stored key is bad, which should read
+    as disconnected rather than the misleading "connected" an unauthenticated
+    probe would show. Without a key, a 401/403 still counts as reachable (the
+    endpoint is up, it just needs a key we are not supplying here).
+    """
     async with httpx.AsyncClient(
-        base_url=base_url.rstrip("/") + "/", timeout=timeout
+        base_url=base_url.rstrip("/") + "/",
+        headers=_auth_headers(api_key),
+        timeout=timeout,
+        transport=transport,
     ) as client:
         try:
             response = await client.get("models")
         except httpx.HTTPError:
             return False
+    if api_key:
+        return response.status_code == 200
     return response.status_code in (200, 401, 403)

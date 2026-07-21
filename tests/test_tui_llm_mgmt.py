@@ -3,15 +3,17 @@
 import json
 
 import pytest
-from textual.widgets import ListView
+from textual.widgets import Input, ListView
 from textual.widgets._toast import Toast
 
 from hpca.config import LLMBackend, Settings
 from hpca.discover import DiscoveredBackend
 from hpca.llm import ChatResponse
+from hpca.tui import backend_form as backend_form_module
 from hpca.tui import manage_llms as manage_module
 from hpca.tui import switch_llm as switch_module
 from hpca.tui.app import HpcaApp
+from hpca.tui.backend_form import BackendFormScreen
 from hpca.tui.confirm_screen import ConfirmScreen
 from hpca.tui.manage_llms import ManageLLMsScreen
 from hpca.tui.switch_llm import SwitchLLMScreen
@@ -43,6 +45,11 @@ MINI = DiscoveredBackend(
     base_url="http://localhost:51943/v1",
     model="sentence-transformers/all-MiniLM-L6-v2",
     max_model_len=256,
+)
+KEYED = DiscoveredBackend(
+    base_url="http://localhost:51944/v1",
+    model="(api key required)",
+    needs_key=True,
 )
 
 
@@ -651,3 +658,141 @@ class TestThinkingToggle:
             await pilot.press("t")  # left panel: not a configured backend
             await pilot.pause()
             assert app.is_running
+
+
+async def _wait_for_backend(app, pilot, count=1, tries=30):
+    for _ in range(tries):
+        await pilot.pause()
+        if len(app.settings.backends) >= count:
+            return
+    raise AssertionError("backend was never saved")
+
+
+@pytest.fixture
+def fake_keyed_discovery(monkeypatch):
+    """The scan surfaces one key-locked endpoint (as the 401 does)."""
+
+    async def fake_scan(*args, **kwargs):
+        return [KEYED]
+
+    async def fake_reachable(base_url, **kwargs):
+        return True
+
+    monkeypatch.setattr(manage_module, "scan_local_ports", fake_scan)
+    monkeypatch.setattr(manage_module, "is_reachable", fake_reachable)
+    monkeypatch.setattr(switch_module, "is_reachable", fake_reachable)
+
+
+@pytest.fixture
+def fake_probe(monkeypatch):
+    """probe_endpoint used by the form: 'goodkey' (or no key) sees the model."""
+
+    async def probe(base_url, *, api_key=None, **kwargs):
+        if api_key in (None, "goodkey"):
+            return [
+                DiscoveredBackend(
+                    base_url=base_url, model="qwen3.6:35B", max_model_len=32768
+                )
+            ]
+        return [
+            DiscoveredBackend(
+                base_url=base_url, model="(api key required)", needs_key=True
+            )
+        ]
+
+    monkeypatch.setattr(backend_form_module, "probe_endpoint", probe)
+
+
+class TestBackendForm:
+    async def test_enter_on_keyed_endpoint_opens_form_with_url_locked(
+        self, hpca_home, fake_keyed_discovery
+    ):
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("m")
+            await app.screen.workers.wait_for_complete()
+            await pilot.pause()
+            left = app.screen.query_one("#llm-discovered", ListView)
+            left.focus()
+            left.index = 0
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, BackendFormScreen)
+            url = app.screen.query_one("#backend-url", Input)
+            assert url.value == KEYED.base_url
+            assert url.disabled is True  # base_url came from the scan
+            # nothing saved yet — the key hasn't been entered
+            assert app.settings.backends == []
+
+    async def test_key_and_autofill_saves_backend(
+        self, hpca_home, fake_keyed_discovery, fake_probe
+    ):
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("m")
+            await app.screen.workers.wait_for_complete()
+            await pilot.pause()
+            left = app.screen.query_one("#llm-discovered", ListView)
+            left.focus()
+            left.index = 0
+            await pilot.press("enter")
+            await pilot.pause()
+            # supply only the key; model + context auto-fill from the probe
+            app.screen.query_one("#backend-key", Input).value = "goodkey"
+            app.screen.query_one("#backend-model", Input).focus()
+            await pilot.press("enter")
+            await _wait_for_backend(app, pilot)
+            saved = app.settings.backends[0]
+            assert saved.api_key == "goodkey"
+            assert saved.model == "qwen3.6:35B"  # auto-detected
+            assert saved.max_model_len == 32768
+            assert saved.base_url == KEYED.base_url
+            assert Settings.load().backends[0].api_key == "goodkey"
+
+    async def test_rejected_key_warns_and_keeps_input(
+        self, hpca_home, fake_keyed_discovery, fake_probe
+    ):
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("m")
+            await app.screen.workers.wait_for_complete()
+            await pilot.pause()
+            left = app.screen.query_one("#llm-discovered", ListView)
+            left.focus()
+            left.index = 0
+            await pilot.press("enter")
+            await pilot.pause()
+            app.screen.query_one("#backend-key", Input).value = "wrong"
+            app.screen.query_one("#backend-model", Input).focus()
+            await pilot.press("enter")
+            for _ in range(10):
+                await pilot.pause()
+            assert isinstance(app.screen, BackendFormScreen)  # still open
+            status = str(app.screen.query_one("#backend-status").render())
+            assert "rejected" in status.lower()
+            assert app.screen.query_one("#backend-key", Input).value == "wrong"
+            assert app.settings.backends == []
+
+    async def test_a_opens_blank_manual_form_and_saves(
+        self, hpca_home, fake_keyed_discovery, fake_probe
+    ):
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("m")
+            await app.screen.workers.wait_for_complete()
+            await pilot.pause()
+            app.screen.query_one("#llm-discovered", ListView).focus()
+            await pilot.press("a")
+            await pilot.pause()
+            assert isinstance(app.screen, BackendFormScreen)
+            url = app.screen.query_one("#backend-url", Input)
+            assert url.disabled is False  # editable for a manual add
+            url.value = "http://localhost:52000/v1"
+            app.screen.query_one("#backend-key", Input).value = "goodkey"
+            app.screen.query_one("#backend-url", Input).focus()
+            await pilot.press("enter")
+            await _wait_for_backend(app, pilot)
+            saved = app.settings.backends[0]
+            assert saved.base_url == "http://localhost:52000/v1"
+            assert saved.model == "qwen3.6:35B"
+            assert saved.api_key == "goodkey"
