@@ -1,9 +1,9 @@
-"""The curator: slow consolidation of what the fast loop accumulated (P6).
+"""The curator: slow consolidation of what /conclude accumulated.
 
-The self-review loop (Phase 4) adds; nothing removes. Left alone, tier 3
-fills with near-duplicate struggle notes from the same rough problem and
-retrieval quality decays. The curator is the counterweight — a periodic,
-idle-triggered pass that ages entries out and proposes merges.
+Self-review adds; nothing removes. Left alone, the RAG scope fills with
+near-duplicate struggle notes from the same rough problem and retrieval quality
+decays. The curator is the counterweight — a periodic, idle-triggered pass that
+ages entries out and proposes merges.
 
 Two rules, both from Hermes' curator, both about being safe enough to run
 unattended:
@@ -23,7 +23,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from hpca.config import app_dir
-from hpca.profiles import Memory, Profile, profiles_dir
+from hpca.profiles import Memory, MemoryScope, Profile, profiles_dir
 
 STALE_DAYS = 30
 ARCHIVE_DAYS = 90
@@ -101,15 +101,15 @@ def curate(
     stale_days: int = STALE_DAYS,
     archive_days: int = ARCHIVE_DAYS,
 ) -> CuratorReport:
-    """Age tier-3 entries out of the profile. Mutates ``profile`` in place.
+    """Age RAG entries out of the profile. Mutates ``profile`` in place.
 
-    Only tier 3 is aged: tiers 1 and 2 are small, curated, and injected
-    everywhere, so the user is already looking at them. Tier 3 is the tier
-    that grows unattended, which is the one that needs a gardener.
+    Only RAG is aged: the system-prompt scope is small, curated, and injected
+    every turn, so the user is already looking at it. RAG is the scope that
+    grows unattended, which is the one that needs a gardener.
     """
     archived, stale = [], []
     for memory in list(profile.memories):
-        if memory.tier != 3 or memory.kind == PINNED_KIND:
+        if memory.scope is not MemoryScope.RAG or memory.kind == PINNED_KIND:
             continue
         age = _age_days(memory.created)
         if age is None:
@@ -135,19 +135,19 @@ def append_to_archive(profile_name: str, memories: list[Memory]) -> Path:
             f"# Archived memories for {profile_name}",
             "",
             "To restore one, move its block back under the matching "
-            "`## [tierN]` heading in the profile file.",
+            "`## [system-prompt|rag]` heading in the profile file.",
             "",
         ]
     )
     for memory in memories:
-        # The tier is recorded because restoring means putting the block back
-        # under the right heading, and the parser accepts it anywhere — a
-        # tier-3 note restored into tier 2 would start costing context on
+        # The scope is recorded because restoring means putting the block back
+        # under the right heading, and the parser accepts it anywhere — a RAG
+        # note restored into system-prompt would start costing context on
         # every turn.
         meta = ", ".join(
             f"{key}: {value}"
             for key, value in (
-                ("tier", memory.tier),
+                ("scope", memory.scope.value),
                 ("backend", memory.backend),
                 ("created", memory.created),
                 ("kind", memory.kind),

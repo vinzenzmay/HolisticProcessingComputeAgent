@@ -1,12 +1,11 @@
-"""Built-in tier-3 memories shipped with HPCA.
+"""Built-in RAG memories shipped with HPCA.
 
 These are indexed under a reserved profile (:data:`BUILTIN_PROFILE`) and
 searched alongside whatever profile is active, so *every* agent can recall
 them regardless of which profile the user is on — including profiles that
-existed before the memory was added. Like all tier-3 memories they are
-retrieved (BM25), never injected wholesale, so they cost context only on the
-turns whose wording matches — e.g. a user asking how to copy text out of the
-app.
+existed before the memory was added. Like all RAG memories they are retrieved
+(BM25), never injected wholesale, so they cost context only on the turns whose
+wording matches — e.g. a user asking how to copy text out of the app.
 
 The text is written for the *agent* to relay to a user who is not expected to
 know terminal internals: it names the "Ubuntu standard terminal" (GNOME
@@ -15,7 +14,7 @@ Terminal), and gives concrete, copy-pasteable setup steps.
 
 from __future__ import annotations
 
-from hpca.profiles import Memory
+from hpca.profiles import Memory, MemoryScope
 
 BUILTIN_PROFILE = "__builtin__"
 
@@ -74,7 +73,7 @@ TERMINAL_COPY_PASTE = Memory(
         '"xclip -selection clipboard -i" (X11) to always route copy through '
         "that tool."
     ),
-    tier=3,
+    scope=MemoryScope.RAG,
     kind="reference",
 )
 

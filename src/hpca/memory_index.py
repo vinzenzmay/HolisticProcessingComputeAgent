@@ -1,9 +1,9 @@
-"""Tier-3 retrieval index (redesign Phase 5).
+"""RAG retrieval index.
 
-Tier 3 holds memories too situational for tier 2 — struggle notes,
-backend-specific workarounds, one-topic learnings. They are not injected
-wholesale; the ones matching the current request are retrieved and fenced
-into the turn, so the tier can grow without costing context on every turn.
+The RAG scope holds memories too situational for the system prompt — struggle
+notes, backend-specific workarounds, one-topic learnings. They are not injected
+wholesale; the ones matching the current request are retrieved and fenced into
+the turn, so the scope can grow without costing context on every turn.
 
 The markdown profile file stays the source of truth (users edit it by hand);
 this index is derived from it and rebuilt whenever the file changes. Search
@@ -19,18 +19,18 @@ from dataclasses import dataclass
 from datetime import date
 
 from hpca.builtin_memory import BUILTIN_MEMORIES, BUILTIN_PROFILE
-from hpca.profiles import Memory, Profile
+from hpca.profiles import Memory, MemoryScope, Profile
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS profile_memories (
     profile TEXT NOT NULL,
-    tier INTEGER NOT NULL,
+    scope TEXT NOT NULL,
     kind TEXT,
     backend TEXT,
     created TEXT,
     text TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_profile_memories ON profile_memories(profile, tier);
+CREATE INDEX IF NOT EXISTS idx_profile_memories ON profile_memories(profile, scope);
 """
 
 FTS_SCHEMA = """
@@ -92,9 +92,9 @@ class MemoryIndex:
 
     def _insert(self, profile: str, memory: Memory) -> None:
         self._conn.execute(
-            "INSERT INTO profile_memories (profile, tier, kind, backend, "
+            "INSERT INTO profile_memories (profile, scope, kind, backend, "
             "created, text) VALUES (?, ?, ?, ?, ?, ?)",
-            (profile, memory.tier, memory.kind, memory.backend,
+            (profile, memory.scope.value, memory.kind, memory.backend,
              memory.created, memory.text),
         )
 
@@ -109,11 +109,11 @@ class MemoryIndex:
         self._conn.commit()
 
     def reindex(self, profile: Profile) -> int:
-        """Rebuild one profile's tier-3 index from its parsed memories."""
+        """Rebuild one profile's RAG index from its parsed memories."""
         self._conn.execute(
             "DELETE FROM profile_memories WHERE profile = ?", (profile.name,)
         )
-        memories = [m for m in profile.memories if m.tier == 3]
+        memories = [m for m in profile.memories if m.scope is MemoryScope.RAG]
         for memory in memories:
             self._insert(profile.name, memory)
         self._conn.commit()
@@ -170,11 +170,12 @@ class MemoryIndex:
 
 
 def demote(profile: Profile, memories: list[Memory]) -> int:
-    """Move memories to tier 3: they stop costing context on every turn but
-    stay retrievable. This is what a full tier-2 offers instead of deletion."""
+    """Move memories to RAG: they stop costing context on every turn but stay
+    retrievable. This is what a full system-prompt scope offers instead of
+    deletion."""
     moved = 0
     for memory in memories:
-        if memory.tier != 3:
-            memory.tier = 3
+        if memory.scope is not MemoryScope.RAG:
+            memory.scope = MemoryScope.RAG
             moved += 1
     return moved

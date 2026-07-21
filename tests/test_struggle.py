@@ -9,7 +9,7 @@ from hpca.agent.struggle import (
     note_keywords,
     turn_struggled,
 )
-from hpca.profiles import Memory
+from hpca.profiles import Memory, MemoryScope
 
 
 class TestTurnStruggled:
@@ -47,7 +47,7 @@ class TestTurnStruggled:
 
 class TestKeywordMatching:
     def make_note(self, text: str) -> Memory:
-        return Memory(text=text, tier=2, kind=STRUGGLE_KIND)
+        return Memory(text=text, scope=MemoryScope.RAG, kind=STRUGGLE_KIND)
 
     def test_keywords_parsed(self):
         memory = self.make_note("Snakemake DAG errors are hard.\nkeywords: snakemake, dag")
@@ -63,7 +63,9 @@ class TestKeywordMatching:
         assert matching_struggles(memories, "run my snakemake workflow")
 
     def test_non_struggle_memories_ignored(self):
-        memories = [Memory(text="keywords: snakemake", tier=2, kind="learning")]
+        memories = [
+            Memory(text="keywords: snakemake", scope=MemoryScope.RAG, kind="learning")
+        ]
         assert matching_struggles(memories, "snakemake please") == []
 
     def test_unrelated_request_no_match(self):

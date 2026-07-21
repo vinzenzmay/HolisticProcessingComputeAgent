@@ -370,9 +370,7 @@ async def ask_docs(args: AskDocsParams, ctx: ToolContext) -> str:
 
     if ctx.llm is None:
         return "Documentation research is unavailable (no LLM in this context)."
-    return await research(
-        ctx.llm, args.question, ctx, tier1=ctx.tier1_text
-    )
+    return await research(ctx.llm, args.question, ctx)
 
 
 RESEARCH_TOOL_NAMES = ["lookup_symbol", "read_manpage", "read_source", "search_docs"]

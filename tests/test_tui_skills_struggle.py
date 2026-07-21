@@ -1,14 +1,19 @@
-"""TUI wiring for skills and struggle notes (milestone 12)."""
+"""TUI wiring for skills and struggle notes (milestone 12).
+
+Reflection (memories, struggle notes and skill patches/new skills) is now
+generated ONLY when the user runs ``/conclude``. There is no automatic
+turn-counter review, no struggle-triggered review, and no pre-eviction review.
+So every test that used to rely on a review firing on its own drives it by
+submitting ``/conclude``.
+"""
 
 import json
 
 import pytest
-from textual.widgets import ListView
 
 from hpca.agent.struggle import STRUGGLE_KIND
-from hpca.config import LLMBackend
 from hpca.llm import ChatResponse
-from hpca.profiles import Profile
+from hpca.profiles import MemoryScope, Profile
 from hpca.skills import load_skills, skills_dir
 from hpca.tui.app import ChatInput, HpcaApp
 from hpca.tui.memory_screens import ReflectionScreen
@@ -134,19 +139,33 @@ REVIEW_JSON = json.dumps(
     }
 )
 
+MEMORY_JSON = json.dumps(
+    {
+        "proposals": [
+            {
+                "kind": "memory",
+                "scope": "system-prompt",
+                "text": "User pins conda environments by hash.",
+            }
+        ]
+    }
+)
+
 NOTHING_JSON = json.dumps({"proposals": []})
 
 
 class TestSelfReview:
-    """Redesign Phase 4: reviews fire on a struggling turn AND on a counter,
-    so learnings from conversations that went fine are captured too."""
+    """Reflection now fires only on /conclude — there is no automatic review.
+    Both a struggling and a clean conversation surface their learnings, but
+    only once the user asks for them."""
 
-    async def test_failed_turn_reviews_and_saves_on_approval(self, hpca_home):
-        # decision fails -> graph reports failure -> review kicks in at once
-        llm = RecordingLLM(["garbage"] * 4 + [REVIEW_JSON])
+    async def test_conclude_saves_struggle_on_approval(self, hpca_home):
+        # turn 1 consumes respond_json; /conclude consumes REVIEW_JSON
+        llm = RecordingLLM([respond_json("ok"), REVIEW_JSON])
         app = HpcaApp(llm=llm)
         async with app.run_test(size=(120, 40)) as pilot:
-            await submit(app, pilot, "run my snakemake workflow", expect_modal=True)
+            await submit(app, pilot, "run my snakemake workflow")
+            await submit(app, pilot, "/conclude", expect_modal=True)
             assert isinstance(app.screen, ReflectionScreen)
             await pilot.press("y")
             await app.workers.wait_for_complete()
@@ -157,16 +176,20 @@ class TestSelfReview:
             assert "keywords: snakemake, dry-run" in memories[0].text
 
     async def test_rejected_proposal_not_saved(self, hpca_home):
-        llm = RecordingLLM(["garbage"] * 4 + [REVIEW_JSON])
+        llm = RecordingLLM([respond_json("ok"), REVIEW_JSON])
         app = HpcaApp(llm=llm)
         async with app.run_test(size=(120, 40)) as pilot:
-            await submit(app, pilot, "run my snakemake workflow", expect_modal=True)
+            await submit(app, pilot, "run my snakemake workflow")
+            await submit(app, pilot, "/conclude", expect_modal=True)
+            assert isinstance(app.screen, ReflectionScreen)
             await pilot.press("n")
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert Profile.load("default").memories == []
 
-    async def test_clean_turn_does_not_review_before_the_interval(self, hpca_home):
+    async def test_clean_turn_does_not_review(self, hpca_home):
+        """A normal turn triggers no review at all — nothing is proposed and
+        nothing is saved until the user runs /conclude."""
         llm = RecordingLLM([respond_json("all good")])
         app = HpcaApp(llm=llm)
         async with app.run_test(size=(120, 40)) as pilot:
@@ -174,28 +197,31 @@ class TestSelfReview:
             assert not isinstance(app.screen, ReflectionScreen)
             assert Profile.load("default").memories == []
 
-    async def test_counter_triggers_review_on_a_clean_session(self, hpca_home):
-        """The gap the old struggle-only heuristic left: a user stating a
-        preference never trips a failure marker."""
-        llm = RecordingLLM([respond_json("noted")] * 2 + [REVIEW_JSON])
+    async def test_conclude_on_a_clean_session_proposes_and_saves(self, hpca_home):
+        """A conversation that never tripped a failure still yields memories —
+        the old struggle-only heuristic missed a user simply stating a
+        preference; /conclude reviews the whole thing regardless."""
+        llm = RecordingLLM([respond_json("noted"), MEMORY_JSON])
         app = HpcaApp(llm=llm)
-        app.settings.memory.review_interval = 2
         async with app.run_test(size=(120, 40)) as pilot:
-            await submit(app, pilot, "first message")
+            await submit(app, pilot, "I always pin conda envs by hash")
             assert not isinstance(app.screen, ReflectionScreen)
-            await submit(app, pilot, "second message", expect_modal=True)
+            await submit(app, pilot, "/conclude", expect_modal=True)
             assert isinstance(app.screen, ReflectionScreen)
             await pilot.press("y")
             await app.workers.wait_for_complete()
             await pilot.pause()
-            assert len(Profile.load("default").memories) == 1
+            memories = Profile.load("default").memories
+            assert len(memories) == 1
+            assert memories[0].scope is MemoryScope.SYSTEM_PROMPT
 
     async def test_nothing_to_save_is_silent(self, hpca_home):
-        llm = RecordingLLM([respond_json("ok")] + [NOTHING_JSON])
+        # /conclude with an empty proposal list shows no dialog and saves nothing
+        llm = RecordingLLM([respond_json("ok"), NOTHING_JSON])
         app = HpcaApp(llm=llm)
-        app.settings.memory.review_interval = 1
         async with app.run_test(size=(120, 40)) as pilot:
             await submit(app, pilot, "hello")
+            await submit(app, pilot, "/conclude")
             assert not isinstance(app.screen, ReflectionScreen)
             assert Profile.load("default").memories == []
 
@@ -229,11 +255,11 @@ NEW_SKILL_JSON = json.dumps(
 class TestSkillLearning:
     async def test_patch_appends_to_the_profile_copy(self, hpca_home):
         write_skill_file(SKILL)
-        llm = RecordingLLM([respond_json("ok")] + [SKILL_PATCH_JSON])
+        llm = RecordingLLM([respond_json("ok"), SKILL_PATCH_JSON])
         app = HpcaApp(llm=llm)
-        app.settings.memory.review_interval = 1
         async with app.run_test(size=(120, 40)) as pilot:
-            await submit(app, pilot, "subset a bam", expect_modal=True)
+            await submit(app, pilot, "subset a bam")
+            await submit(app, pilot, "/conclude", expect_modal=True)
             assert isinstance(app.screen, ReflectionScreen)
             await pilot.press("y")
             await app.workers.wait_for_complete()
@@ -246,11 +272,12 @@ class TestSkillLearning:
             assert "Corrections" not in (skills_dir() / "bam.md").read_text()
 
     async def test_new_skill_created_when_enabled(self, hpca_home):
-        llm = RecordingLLM([respond_json("ok")] + [NEW_SKILL_JSON])
+        llm = RecordingLLM([respond_json("ok"), NEW_SKILL_JSON])
         app = HpcaApp(llm=llm)
-        app.settings.memory.review_interval = 1
         async with app.run_test(size=(120, 40)) as pilot:
-            await submit(app, pilot, "run qc", expect_modal=True)
+            await submit(app, pilot, "run qc")
+            await submit(app, pilot, "/conclude", expect_modal=True)
+            assert isinstance(app.screen, ReflectionScreen)
             await pilot.press("y")
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -259,12 +286,15 @@ class TestSkillLearning:
             assert "read_skill" in app._tools.names()  # tool now enabled
 
     async def test_new_skills_can_be_disabled(self, hpca_home):
-        llm = RecordingLLM([respond_json("ok")] + [NEW_SKILL_JSON])
+        # with new skills disabled the reflection drops the skill_new proposal,
+        # so /conclude finds nothing to keep and writes no skill
+        llm = RecordingLLM([respond_json("ok"), NEW_SKILL_JSON])
         app = HpcaApp(llm=llm)
-        app.settings.memory.review_interval = 1
         app.settings.memory.propose_new_skills = False
         async with app.run_test(size=(120, 40)) as pilot:
             await submit(app, pilot, "run qc")
+            await submit(app, pilot, "/conclude")
+            assert not isinstance(app.screen, ReflectionScreen)
             assert load_skills("default") == []
 
 
@@ -278,7 +308,7 @@ class TestFencedRecall:
         profile = Profile.load("default")
         profile.add_memory(
             "Snakemake dry-runs fail here.\nkeywords: snakemake, dry-run",
-            tier=2,
+            scope=MemoryScope.RAG,
             kind=STRUGGLE_KIND,
         )
         profile.save()
@@ -310,16 +340,16 @@ class TestFencedRecall:
             assert "Current date and time" not in llm.calls[0][0]["content"]
 
 
-class TestTierThreeRecall:
-    """Redesign Phase 5: tier 3 is retrieved per request, not injected."""
+class TestRagRecall:
+    """Redesign Phase 5: RAG memories are retrieved per request, not injected."""
 
-    def write_tier3(self, text, **kwargs):
+    def write_rag(self, text, **kwargs):
         profile = Profile.load("default")
-        profile.add_memory(text, tier=3, **kwargs)
+        profile.add_memory(text, scope=MemoryScope.RAG, **kwargs)
         profile.save()
 
-    async def test_tier3_is_not_in_the_system_prompt(self, hpca_home):
-        self.write_tier3("Deepvariant needs a GPU partition here.")
+    async def test_rag_is_not_in_the_system_prompt(self, hpca_home):
+        self.write_rag("Deepvariant needs a GPU partition here.")
         llm = RecordingLLM([respond_json("ok")])
         app = HpcaApp(llm=llm)
         async with app.run_test(size=(120, 40)) as pilot:
@@ -327,7 +357,7 @@ class TestTierThreeRecall:
             assert "Deepvariant" not in llm.calls[0][0]["content"]
 
     async def test_matching_request_retrieves_it(self, hpca_home):
-        self.write_tier3("Deepvariant needs a GPU partition here.")
+        self.write_rag("Deepvariant needs a GPU partition here.")
         llm = RecordingLLM([respond_json("ok")])
         app = HpcaApp(llm=llm)
         async with app.run_test(size=(120, 40)) as pilot:
@@ -339,18 +369,18 @@ class TestTierThreeRecall:
             assert user["content"] == "run deepvariant on this sample"
 
     async def test_unrelated_request_retrieves_nothing(self, hpca_home):
-        self.write_tier3("Deepvariant needs a GPU partition here.")
+        self.write_rag("Deepvariant needs a GPU partition here.")
         llm = RecordingLLM([respond_json("ok")])
         app = HpcaApp(llm=llm)
         async with app.run_test(size=(120, 40)) as pilot:
             await submit(app, pilot, "what time is it")
-            # sidecar carries env facts, but no tier-3 memory was retrieved
+            # sidecar carries env facts, but no RAG memory was retrieved
             user = llm.calls[0][-1]
             assert "Deepvariant" not in user.get("api_content", "")
             assert "<memory-context>" not in user.get("api_content", "")
 
     async def test_recall_is_visible_in_the_transcript(self, hpca_home):
-        self.write_tier3("Deepvariant needs a GPU partition here.")
+        self.write_rag("Deepvariant needs a GPU partition here.")
         llm = RecordingLLM([respond_json("ok")])
         app = HpcaApp(llm=llm)
         async with app.run_test(size=(120, 40)) as pilot:
@@ -362,7 +392,7 @@ class TestTierThreeRecall:
 
     async def test_prefetch_respects_the_char_budget(self, hpca_home):
         for i in range(5):
-            self.write_tier3(f"bam handling note {i}: " + "x" * 400)
+            self.write_rag(f"bam handling note {i}: " + "x" * 400)
         llm = RecordingLLM([respond_json("ok")])
         app = HpcaApp(llm=llm)
         async with app.run_test(size=(120, 40)) as pilot:
@@ -370,65 +400,15 @@ class TestTierThreeRecall:
             block = llm.calls[0][-1]["api_content"]
             assert len(block) < 1200  # message + fence, budget is 800
 
-    async def test_struggle_notes_from_review_land_in_tier3(self, hpca_home):
-        llm = RecordingLLM(["garbage"] * 4 + [REVIEW_JSON])
+    async def test_struggle_notes_from_review_land_in_rag(self, hpca_home):
+        llm = RecordingLLM([respond_json("ok"), REVIEW_JSON])
         app = HpcaApp(llm=llm)
         async with app.run_test(size=(120, 40)) as pilot:
-            await submit(app, pilot, "run my snakemake workflow", expect_modal=True)
-            await pilot.press("y")
-            await app.workers.wait_for_complete()
-            await pilot.pause()
-            memories = Profile.load("default").memories
-            assert memories[0].tier == 3  # situational: retrieved, not injected
-
-
-class TestEvictionReview:
-    """Redesign Phase 6: compaction hands its evicted slice to the review
-    loop — but after the reply lands, never as a modal mid-turn."""
-
-    def long_history(self, count=40, chars=200):
-        return [
-            {
-                "role": "user" if i % 2 == 0 else "assistant",
-                "content": f"m{i} " + "x" * chars,
-            }
-            for i in range(count)
-        ]
-
-    async def prime(self, app, session_id):
-        await app.graph.aupdate_state(
-            {"configurable": {"thread_id": session_id}},
-            {"messages": self.long_history()},
-        )
-
-    async def test_evicted_context_is_reviewed_after_the_reply(self, hpca_home):
-        llm = RecordingLLM(
-            ["a summary of earlier work", respond_json("done"), REVIEW_JSON]
-        )
-        app = HpcaApp(llm=llm)
-        app.settings.backends.append(
-            LLMBackend(
-                model=app.settings.llm.model,
-                base_url=app.settings.llm.base_url,
-                max_model_len=2000,
-            )
-        )
-        async with app.run_test(size=(120, 40)) as pilot:
-            await app.start_new_session()
-            await self.prime(app, app.active_session.session_id)
-            await submit(app, pilot, "carry on", expect_modal=True)
-            # the reply landed before the review modal appeared
-            assert any("done" == t for t in app.chat_log_texts())
+            await submit(app, pilot, "run my snakemake workflow")
+            await submit(app, pilot, "/conclude", expect_modal=True)
             assert isinstance(app.screen, ReflectionScreen)
             await pilot.press("y")
             await app.workers.wait_for_complete()
             await pilot.pause()
-            assert len(Profile.load("default").memories) == 1
-
-    async def test_no_eviction_no_extra_review(self, hpca_home):
-        llm = RecordingLLM([respond_json("done")])
-        app = HpcaApp(llm=llm)
-        async with app.run_test(size=(120, 40)) as pilot:
-            await submit(app, pilot, "hello")
-            assert app._evicted == {}
-            assert not isinstance(app.screen, ReflectionScreen)
+            memories = Profile.load("default").memories
+            assert memories[0].scope is MemoryScope.RAG  # situational: retrieved

@@ -131,7 +131,7 @@ async def get_job_report(args: GetJobReportParams, ctx: ToolContext) -> str:
     header = f"Job {args.job_id} ({row.script_key}): {report.state} — {matched}."
     if ctx.llm is None:
         return header
-    explanation = await explain_failure(ctx.llm, report, tier1=ctx.tier1_text)
+    explanation = await explain_failure(ctx.llm, report)
     return f"{header}\n{explanation.render()}"
 
 

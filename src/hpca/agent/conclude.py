@@ -1,4 +1,5 @@
-"""`\\conclude` (§6.3): the model proposes memories; the user approves each.
+"""`/memorize <note>`: the model turns the user's note plus the conversation
+into durable memory proposals; the user approves each.
 
 Firewalled like the explainer: the conversation transcript enters a fresh
 LLM call; only validated proposals come back. Writing anything to the
@@ -9,11 +10,11 @@ a small model writes these, so review is essential).
 from __future__ import annotations
 
 import json
-from typing import Literal
 
 from pydantic import BaseModel, ValidationError
 
 from hpca.llm import Message
+from hpca.profiles import MemoryScope
 
 MAX_PROPOSALS = 5
 MAX_TRANSCRIPT_MESSAGES = 60
@@ -23,10 +24,14 @@ CONCLUDE_MAX_RETRIES = 2
 SYSTEM_PROMPT = (
     "You review a conversation between a scientist and an HPC assistant and "
     "propose durable memories worth keeping for future sessions. Propose only "
-    "facts that will still be true later: site/cluster facts (tier 1), task "
-    "learnings, user preferences, or backend-specific workarounds (tier 2). "
-    "Do NOT propose session-specific details like file names or job ids. "
-    "Propose nothing if the conversation contained nothing durable."
+    "facts that will still be true later. Choose a scope for each: "
+    "'system-prompt' for something worth putting in front of the assistant on "
+    "every future turn (a stable site fact, a lasting preference, a "
+    "correction) — kept small, so reserve it for what is always relevant; "
+    "'rag' for a situational, one-topic learning recalled only when a later "
+    "request resembles it. Do NOT propose session-specific details like file "
+    "names or job ids. Propose nothing if the conversation contained nothing "
+    "durable."
 )
 
 PROPOSALS_SCHEMA = {
@@ -38,13 +43,13 @@ PROPOSALS_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "tier": {"enum": [1, 2]},
+                    "scope": {"enum": ["system-prompt", "rag"]},
                     "kind": {
                         "enum": ["fact", "learning", "preference", "workaround"]
                     },
                     "text": {"type": "string"},
                 },
-                "required": ["tier", "kind", "text"],
+                "required": ["scope", "kind", "text"],
                 "additionalProperties": False,
             },
         }
@@ -55,7 +60,7 @@ PROPOSALS_SCHEMA = {
 
 
 class MemoryProposal(BaseModel):
-    tier: Literal[1, 2]
+    scope: MemoryScope
     kind: str
     text: str
 
@@ -83,17 +88,17 @@ async def propose_memories(
     llm,
     messages: list[Message],
     *,
-    tier1: str = "",
+    system_prompt_memories: str = "",
     guidance: str = "",
     max_retries: int = CONCLUDE_MAX_RETRIES,
 ) -> list[MemoryProposal]:
     """Memory proposals from the conversation; ``guidance`` is the user's own
     /memorize note — what they, not the model, decided is worth keeping."""
     system = SYSTEM_PROMPT
-    if tier1:
+    if system_prompt_memories:
         system += (
-            "\n\nAlready-known standing notes (do not propose duplicates):\n"
-            + tier1
+            "\n\nAlready-known system-prompt memories (do not propose "
+            "duplicates):\n" + system_prompt_memories
         )
     prompt = transcript(messages)
     if guidance:

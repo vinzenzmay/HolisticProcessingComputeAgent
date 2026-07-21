@@ -13,51 +13,8 @@ from hpca.agent.conclude import MemoryProposal
 from hpca.memory_ops import MemoryOp
 
 
-class TierSelectScreen(ModalScreen[int | None]):
-    """`\\memorize`: pick the tier for the new memory; default is tier 2."""
-
-    BINDINGS = [
-        Binding("escape", "cancel", "cancel", priority=True),
-        Binding("1", "pick(1)", "tier 1"),
-        Binding("2", "pick(2)", "tier 2"),
-        Binding("enter", "pick(2)", "tier 2 (default)", priority=True),
-    ]
-
-    DEFAULT_CSS = """
-    TierSelectScreen { align: center middle; }
-    #tier-dialog {
-        width: 60;
-        height: auto;
-        border: heavy $accent;
-        background: $surface;
-        padding: 1 2;
-    }
-    #tier-hint { color: $text-muted; }
-    """
-
-    def __init__(self, text: str) -> None:
-        super().__init__()
-        self._text = text
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="tier-dialog"):
-            yield Static("Memorize into which tier?", id="tier-title")
-            yield Static(Content(self._text), id="tier-text")
-            yield Static(
-                "(esc) cancel · (1) global standing note · "
-                "(2) profile memory [default]",
-                id="tier-hint",
-            )
-
-    def action_pick(self, tier: int) -> None:
-        self.dismiss(tier)
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)
-
-
 class MemoryProposalScreen(ModalScreen[bool]):
-    """`\\conclude`: approve or reject one proposed memory."""
+    """`/memorize`: approve or reject one proposed memory."""
 
     BINDINGS = [
         Binding("y", "accept", "accept"),
@@ -89,7 +46,7 @@ class MemoryProposalScreen(ModalScreen[bool]):
         with Vertical(id="proposal-dialog"):
             yield Static(
                 f"Proposed memory {self._index}/{self._total} — "
-                f"tier {p.tier}, {p.kind}",
+                f"{p.scope.value}, {p.kind}",
                 id="proposal-title",
             )
             yield Static(Content(p.text), id="proposal-text")
@@ -103,7 +60,8 @@ class MemoryProposalScreen(ModalScreen[bool]):
 
 
 class MemoryBatchScreen(ModalScreen[bool]):
-    """The `memory` tool's batch: approve or reject it whole (§6.3, P3).
+    """The facts the agent flagged this session, reviewed together at
+    /conclude: approve or reject the batch whole.
 
     Whole-batch rather than per-operation, because a batch is often a trade —
     remove two stale entries to make room for one new one — and approving

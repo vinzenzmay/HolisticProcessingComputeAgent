@@ -69,7 +69,6 @@ from hpca.agent.titler import propose_title
 from hpca.agent.struggle import (
     STRUGGLE_KIND,
     matching_struggles,
-    turn_struggled,
 )
 from hpca.editor import resolve_editor
 from hpca.embeddings import EmbeddingClient
@@ -80,7 +79,7 @@ from hpca.rag import RagStore
 from hpca.transcript import ASSISTANT as ASSISTANT_ENTRY
 from hpca.transcript import THINKING, Entry, Step, build_entries
 from hpca.transcript import USER as USER_ENTRY
-from hpca.profiles import DEFAULT_PROFILE, Profile
+from hpca.profiles import DEFAULT_PROFILE, MemoryScope, Profile
 from hpca.registry import PathRegistry
 from hpca.runner import (
     ProcessRecord,
@@ -960,11 +959,10 @@ class HpcaApp(App):
         # byte-stable for the backend's prefix cache. Refreshed on approved
         # writes and profile edits, never silently mid-session.
         self._memory_snapshots: dict[str, Profile] = {}
-        # User turns since the last self-review, per session (redesign P4).
-        self._turns_since_review: dict[str, int] = {}
-        # Messages compaction dropped from the model's view, waiting to be
-        # reviewed once the turn they were dropped during has finished (P6).
-        self._evicted: dict[str, list[dict]] = {}
+        # Memory the agent flagged mid-conversation with the `memory` tool,
+        # per session. Nothing is written until the user runs /conclude, which
+        # reviews these together with the self-review proposals and clears them.
+        self._pending_memory: dict[str, list[MemoryOp]] = {}
         # Context meter state: the window the backend reports, and the last
         # measured prompt size (per session — a different thread is a
         # different context).
@@ -1130,13 +1128,11 @@ class HpcaApp(App):
             else self._memory_snapshot(self.profile)
         )
         skills = self._turn_skills if self._turn_skills is not None else self.skills
-        caps = self.settings.memory
+        cap = self.settings.memory.system_prompt_token_cap
         backend = self._active_model()
         return orchestrator_system_prompt(
-            tier1=memory.tier_prompt_text(1, active_backend=backend),
-            tier2=memory.tier_prompt_text(2, active_backend=backend),
-            tier1_meter=memory.usage_meter(1, caps.cap_chars(1)),
-            tier2_meter=memory.usage_meter(2, caps.cap_chars(2)),
+            system_prompt_memories=memory.system_prompt_text(active_backend=backend),
+            memory_meter=memory.usage_meter(cap),
             skills=summarize_skills(skills),
             session_search="session_search" in self._tools.names(),
             memory_tool="memory" in self._tools.names(),
@@ -1145,12 +1141,12 @@ class HpcaApp(App):
     def _recall_lines(
         self, user_text: str, memory: Profile, profile: str
     ) -> list[str]:
-        """What this request recalls: matching tier-2 struggle notes plus
-        retrieved tier-3 memories (redesign Phase 5).
+        """What this request recalls: matching struggle notes plus retrieved
+        RAG memories.
 
-        Tier 3 is retrieved rather than injected wholesale, which is what lets
-        it grow: situational memories cost context only on the turns they
-        actually match.
+        RAG is retrieved rather than injected wholesale, which is what lets it
+        grow: situational memories cost context only on the turns they actually
+        match.
         """
         lines = [note_line(m) for m in matching_struggles(memory.memories, user_text)]
         seen = set(lines)
@@ -1161,7 +1157,7 @@ class HpcaApp(App):
                     user_text,
                     profile=profile,
                     active_backend=self._active_model(),
-                    limit=self.settings.memory.tier3_prefetch_count,
+                    limit=self.settings.memory.rag_prefetch_count,
                 )
             except Exception:
                 hits = []
@@ -1416,8 +1412,8 @@ class HpcaApp(App):
             lines = self._recall_lines(user_text, self._turn_memory, session.profile)
             block = build_memory_context(
                 lines,
-                max_notes=self.settings.memory.tier3_prefetch_count,
-                max_chars=self.settings.memory.tier3_prefetch_chars,
+                max_notes=self.settings.memory.rag_prefetch_count,
+                max_chars=self.settings.memory.rag_prefetch_chars,
             )
             api_content = compose_api_content(
                 user_text, block, environment_facts()
@@ -1428,7 +1424,7 @@ class HpcaApp(App):
         # a resume/event has no prompt to hand back, so it arms nothing.
         self._interrupt_text = user_text
         self._interrupt_keep = None  # filled once we know the pre-turn count
-        self._turn_ctx = self._make_tool_ctx(session, log, memory=self._turn_memory)
+        self._turn_ctx = self._make_tool_ctx(session, log)
         if self._is_active_session(session):
             # the UI's context (process list, registry) stays the turn's twin
             self._tool_ctx = self._turn_ctx
@@ -1549,15 +1545,6 @@ class HpcaApp(App):
             # like an approval, so it waits inline (and flags the sidebar)
             # even when the user has switched away, instead of being lost.
             await self._set_pending_decision(session, "plan", result.plan)
-        if self._is_active_session(session):
-            # Context dropped by compaction first: it is gone from the
-            # model's view and this is the last chance to keep anything.
-            evicted = self._evicted.pop(session.session_id, None)
-            if evicted:
-                await self.maybe_review(
-                    session, evicted, forced=True, span="whole"
-                )
-            await self.maybe_review(session, result.messages)
         await self.maybe_title_session(session, result.messages, log=log)
 
     async def maybe_title_session(
@@ -1925,7 +1912,9 @@ class HpcaApp(App):
             proposals = await propose_memories(
                 self._labelled_llm("memorize"),
                 messages,
-                tier1=self.profile_memory.tier_text(1),
+                system_prompt_memories=self.profile_memory.scope_text(
+                    MemoryScope.SYSTEM_PROMPT
+                ),
                 guidance=note,
             )
         except Exception as e:
@@ -1937,47 +1926,46 @@ class HpcaApp(App):
         await self._review_proposals(proposals)
 
     async def _conclude_worker(self) -> None:
+        """The one place memory is generated: a full self-review of the whole
+        conversation (memories, struggle notes, skills) followed by the facts
+        the agent flagged mid-session — all approved in one pass."""
         assert self.active_session is not None
-        messages = await self._session_messages(self.active_session)
-        if not messages:
+        session = self.active_session
+        messages = await self._session_messages(session)
+        pending = self._pending_memory.get(session.session_id)
+        if not messages and not pending:
             self.notify("Nothing to conclude yet.", severity="warning")
             return
-        self.profile_memory = Profile.load(self.profile)
         try:
-            proposals = await propose_memories(
-                self._labelled_llm("conclude"),
-                messages,
-                tier1=self.profile_memory.tier_text(1),
-            )
+            kept = await self.review_conversation(session, messages, span="whole")
         except Exception as e:
             self.notify(f"/conclude failed: {e}", severity="error")
-            return
-        if not proposals:
-            self.notify("The model proposed no memories for this conversation.")
-            return
-        await self._review_proposals(proposals)
+            kept = 0
+        kept += await self._drain_pending_memory(session)
+        if kept == 0:
+            self.notify("Nothing durable to keep from this conversation.")
 
     def _memory_write_blocked(
-        self, tier: int, text: str, memory: Profile | None = None
+        self, scope: MemoryScope, text: str, memory: Profile | None = None
     ) -> bool:
-        """Hard char budget on writes (redesign Phase 1): a full tier rejects
-        new memories until the user condenses it. Injection never truncates;
-        only growth is stopped.
+        """Hard token budget on writes: a full system-prompt scope rejects new
+        memories until the user condenses it. Injection never truncates; only
+        growth is stopped. RAG is retrieved, not injected, so it has no budget.
 
         ``memory`` is the profile the caller is about to write to — pass the
         same object, or the budget gets checked against one state and the
         write lands in another.
         """
-        if tier not in (1, 2):
-            return False  # tier 3 is retrieved, not injected: no budget
+        if scope is not MemoryScope.SYSTEM_PROMPT:
+            return False  # RAG is retrieved, not injected: no budget
         target = memory if memory is not None else self.profile_memory
-        cap = self.settings.memory.cap_chars(tier)
-        if not target.would_exceed(tier, text, cap=cap):
+        cap = self.settings.memory.system_prompt_token_cap
+        if not target.would_exceed(text, cap=cap):
             return False
         self.notify(
-            f"Tier {tier} is full "
-            f"({target.usage_meter(tier, cap)}) — memory NOT "
-            "saved. Press ctrl+e to condense the profile, then retry.",
+            f"System-prompt memory is full "
+            f"({target.usage_meter(cap)}) — memory NOT saved. "
+            "Press ctrl+e to condense the profile, then retry.",
             severity="warning",
             timeout=12,
         )
@@ -1991,11 +1979,11 @@ class HpcaApp(App):
                 MemoryProposalScreen(proposal, i, len(proposals))
             )
             if approved:
-                if self._memory_write_blocked(proposal.tier, proposal.text):
+                if self._memory_write_blocked(proposal.scope, proposal.text):
                     continue
                 self.profile_memory.add_memory(
                     proposal.text,
-                    tier=proposal.tier,
+                    scope=proposal.scope,
                     backend=self._active_model(),
                     kind=proposal.kind,
                 )
@@ -2007,33 +1995,48 @@ class HpcaApp(App):
         self.check_memory_caps()
         return kept
 
-    async def propose_memory_edits(
-        self, operations: list[MemoryOp], *, profile: str
+    def _queue_memory_edits(
+        self, session_id: str, operations: list[MemoryOp]
     ) -> str:
-        """The `memory` tool's write path: validate, ask, apply (P3).
+        """The `memory` tool's path: queue a flagged batch for review at the
+        next /conclude. Nothing is written now — the agent flags, the user
+        decides. Returns the tool result so the model knows it was noted."""
+        if not operations:
+            return "Nothing to flag."
+        self._pending_memory.setdefault(session_id, []).extend(operations)
+        count = sum(1 for _ in operations)
+        return (
+            f"Noted {count} memory change(s) — they will be reviewed together "
+            "when the user runs /conclude. Nothing is saved yet."
+        )
 
-        Returns the tool result — what the user approved, or why the batch
-        did not apply. The model is told the outcome plainly so it can react
-        (condense and retry, or move on) instead of guessing.
-        """
+    async def _drain_pending_memory(self, session: Session) -> int:
+        """Review the facts flagged this session, at /conclude. Returns how
+        many batches were applied (0 or 1 — the batch is all-or-nothing)."""
+        operations = self._pending_memory.pop(session.session_id, [])
+        if not operations:
+            return 0
+        profile = session.profile
         loaded = Profile.load(profile)
-        caps = {1: self.settings.memory.cap_chars(1), 2: self.settings.memory.cap_chars(2)}
+        cap = self.settings.memory.system_prompt_token_cap
         try:
             result = apply_batch(
                 loaded,
                 operations,
                 backend=self._active_model(),
-                caps=caps,
+                system_prompt_cap=cap,
             )
         except MemoryOpError as e:
-            return f"Memory unchanged: {e}"
+            self.notify(f"Flagged memory not applied: {e}", severity="warning")
+            return 0
         if not result.applied:
-            return "Memory unchanged: " + "; ".join(result.skipped)
+            return 0
         approved = await self.push_screen_wait(
             MemoryBatchScreen(operations, result.flagged)
         )
         if not approved:
-            return "Memory unchanged: the user rejected the proposed changes."
+            self.notify("Discarded the flagged memory changes.")
+            return 0
         # The user may have edited this file by hand since it was loaded;
         # rewriting from a stale copy would silently discard those edits.
         path = Profile.path_for(profile)
@@ -2041,79 +2044,36 @@ class HpcaApp(App):
             backup = path.with_suffix(f".bak.{int(time())}")
             backup.write_text(path.read_text())
             self._refresh_memory_snapshot(profile)
-            return (
-                "Memory unchanged: the profile file changed on disk since "
-                f"this session read it (backed up to {backup.name}). "
-                "The edits were not applied."
+            self.notify(
+                "Flagged memory not applied: the profile file changed on disk "
+                f"since this session read it (backed up to {backup.name}).",
+                severity="warning",
             )
+            return 0
         result.profile.save()
         self._refresh_memory_snapshot(profile)
         if profile == self.profile:
             self.profile_memory = Profile.load(profile)
-        self.notify(f"Memory updated ({len(result.applied)} change(s)).")
         self.check_memory_caps()
-        report = "; ".join(result.applied)
-        if result.skipped:
-            report += " (skipped: " + "; ".join(result.skipped) + ")"
-        return f"Saved to memory: {report}"
+        return 1
 
-    def _review_due(self, session: Session, messages: list[dict]) -> bool:
-        """Whether to look back at this stretch now (redesign Phase 4).
-
-        Two triggers: a turn that visibly went wrong (§4.4 — reviewed at once,
-        while the evidence is in context) and a plain counter, so learnings
-        from conversations that went *fine* are captured too. The counter is
-        what the old struggle-only heuristic was missing: a session where the
-        user corrects a preference never trips a failure marker.
-        """
-        session_id = session.session_id
-        count = self._turns_since_review.get(session_id, 0) + 1
-        self._turns_since_review[session_id] = count
-        if turn_struggled(messages):
-            self._turns_since_review[session_id] = 0
-            return True
-        if count >= max(1, self.settings.memory.review_interval):
-            self._turns_since_review[session_id] = 0
-            return True
-        return False
-
-    async def maybe_review(
-        self,
-        session: Session,
-        messages: list[dict],
-        *,
-        forced: bool = False,
-        span: str = "recent",
+    async def review_conversation(
+        self, session: Session, messages: list[dict], *, span: str = "whole"
     ) -> int:
-        """Self-review: propose what this stretch is worth remembering.
-
-        Runs after the reply is delivered, so it never competes with the
-        user's turn. Best-effort throughout — a failed review is invisible.
-        ``forced`` skips the cadence check, for the one case that cannot
-        wait: context about to be discarded by compaction.
-        """
-        if forced:
-            # A forced review covers this stretch as thoroughly as a due one,
-            # so restart the cadence — otherwise the counter trips again a
-            # turn later and re-proposes what was just reviewed.
-            self._turns_since_review[session.session_id] = 0
-        elif not self._review_due(session, messages):
-            return 0
+        """The /conclude self-review: propose what this conversation is worth
+        keeping — memories, struggle notes, skill changes — each approved by
+        the user. Returns how many proposals were kept."""
         memory = self._memory_snapshot(session.profile)
         skills = load_skills(session.profile)
-        try:
-            proposals = await propose_reflections(
-                self._labelled_llm("review"),
-                messages,
-                tier1=memory.tier_text(1),
-                tier2=memory.tier_text(2),
-                tier3=memory.tier_text(3),
-                skills=summarize_skills(skills),
-                allow_new_skills=self.settings.memory.propose_new_skills,
-                span=span,
-            )
-        except Exception:
-            return 0  # reflection is best-effort; never disrupt the user
+        proposals = await propose_reflections(
+            self._labelled_llm("conclude"),
+            messages,
+            system_prompt_memories=memory.scope_text(MemoryScope.SYSTEM_PROMPT),
+            rag_memories=memory.scope_text(MemoryScope.RAG),
+            skills=summarize_skills(skills),
+            allow_new_skills=self.settings.memory.propose_new_skills,
+            span=span,
+        )
         if not proposals:
             return 0
         kept = 0
@@ -2124,7 +2084,6 @@ class HpcaApp(App):
             if approved and self._apply_reflection(proposal, session.profile):
                 kept += 1
         if kept:
-            self.notify(f"Self-review: kept {kept} of {len(proposals)}.")
             self.check_memory_caps()
         return kept
 
@@ -2132,16 +2091,13 @@ class HpcaApp(App):
         """Persist one approved proposal; returns whether anything was written."""
         if proposal.kind in ("memory", "struggle"):
             text = proposal.memory_text()
-            # Struggle notes go to tier 3: they are situational by nature and
-            # were the main source of tier-2 bloat. Retrieval brings them
-            # back when a request actually resembles the old one.
-            tier = 3 if proposal.kind == "struggle" else proposal.tier
+            scope = proposal.target_scope()
             target = Profile.load(profile)  # merge, don't clobber
-            if self._memory_write_blocked(tier, text, target):
+            if self._memory_write_blocked(scope, text, target):
                 return False
             target.add_memory(
                 text,
-                tier=tier,
+                scope=scope,
                 backend=self._active_model(),
                 kind=STRUGGLE_KIND if proposal.kind == "struggle" else "learning",
             )
@@ -2216,25 +2172,22 @@ class HpcaApp(App):
                 )
         return reports
 
-    def check_memory_caps(self) -> list[int]:
-        """§6.4 size warnings; returns the tiers currently over their cap.
+    def check_memory_caps(self) -> bool:
+        """Size warning; returns whether the system-prompt scope is over budget.
 
-        A tier can only get over cap through hand edits (in-app writes are
-        rejected at the cap), so the fix offered is the external editor."""
-        caps = self.settings.memory
-        over = self.profile_memory.over_cap_tiers(
-            tier1_cap=caps.cap_chars(1),
-            tier2_cap=caps.cap_chars(2),
+        It can only get over cap through hand edits (in-app writes are rejected
+        at the cap), so the fix offered is the external editor."""
+        cap = self.settings.memory.system_prompt_token_cap
+        if not self.profile_memory.over_budget(cap):
+            return False
+        meter = self.profile_memory.usage_meter(cap)
+        self.notify(
+            f"System-prompt memory is over its budget ({meter}) — "
+            "press ctrl+e to edit the profile externally.",
+            severity="warning",
+            timeout=12,
         )
-        for tier in over:
-            meter = self.profile_memory.usage_meter(tier, caps.cap_chars(tier))
-            self.notify(
-                f"Profile tier {tier} is over its budget ({meter}) — "
-                "press ctrl+e to edit the profile externally.",
-                severity="warning",
-                timeout=12,
-            )
-        return over
+        return True
 
     def action_edit_profile(self) -> None:
         """§6.4 (e): suspend the TUI, open the profile in the user's editor."""
@@ -2284,12 +2237,9 @@ class HpcaApp(App):
         self,
         session: Session,
         log: SessionLog | None,
-        memory: Profile | None = None,
     ) -> ToolContext:
         """A tool context bound to one session and its transcript, so a turn
         keeps its own registry, runner and log however the UI moves on."""
-        if memory is None:
-            memory = self.profile_memory
         ctx = ToolContext(
             registry=PathRegistry(
                 self._conn, profile=session.profile, session_id=session.session_id
@@ -2308,16 +2258,13 @@ class HpcaApp(App):
             job_log_dir=app_dir() / "job_logs",
             llm=self._llm,
             trash=self.trash,
-            tier1_text=memory.tier_prompt_text(
-                1, active_backend=self._active_model()
-            ),
             symbols=self.symbol_index,
             rag=self.rag_store,
             embedder=self.embedder,
             episodic=self.episodic,
             skills=self._turn_skills if self._turn_skills is not None else self.skills,
-            propose_memory_edits=lambda operations: self.propose_memory_edits(
-                operations, profile=session.profile
+            queue_memory_edits=lambda operations: self._queue_memory_edits(
+                session.session_id, operations
             ),
         )
         if log is not None:
@@ -2848,7 +2795,6 @@ class HpcaApp(App):
                 name=change.name,
                 exit_code=change.exit_code,
                 candidates=finding.candidates,
-                tier1=self.profile_memory.tier_text(1) if self.profile_memory else "",
             )
         except Exception as e:
             self.notify(f"Log explainer failed: {e}", severity="warning")
@@ -3265,6 +3211,40 @@ class HpcaApp(App):
         if name == self.profile:
             self.profile_memory = profile
 
+    def save_profile_archive(self, name: str, text: str) -> None:
+        """Persist a hand-edited archive file. Emptying it removes the file —
+        the archive is a plain appendix, not part of the loaded profile."""
+        path = curator.archive_path(name)
+        if text.strip():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text if text.endswith("\n") else text + "\n")
+            self.notify(f"Saved archive for “{name}”.")
+        elif path.exists():
+            path.unlink()
+            self.notify(f"Cleared archive for “{name}”.")
+
+    def save_skill_file(self, profile: str, name: str, text: str) -> None:
+        """Persist a hand-edited skill file verbatim (front matter and body).
+        The user owns the file; a parse problem is reported, never fatal."""
+        path = skill_path(name, profile)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text if text.endswith("\n") else text + "\n")
+        if profile == self.profile:
+            self.skills = load_skills(profile)
+        self.notify(f"Saved skill “{name}”.")
+
+    def delete_profile_skill(self, profile: str, name: str) -> None:
+        """Delete one of a profile's own skills (never shared/project)."""
+        skill = next(
+            (s for s in load_own_skills(profile) if s.name == name), None
+        )
+        if skill is None or not delete_own_skill(skill, profile):
+            self.notify(f"No skill “{name}” to delete.", severity="warning")
+            return
+        if profile == self.profile:
+            self.skills = load_skills(profile)
+        self.notify(f"Deleted skill “{name}”.")
+
     def create_profile(self, name: str) -> str | None:
         """Make a blank profile; returns an error message, or None on success."""
         try:
@@ -3435,7 +3415,6 @@ class HpcaApp(App):
             max_tool_rounds=self.settings.llm.max_tool_rounds,
             on_activity=lambda activity: self.report_activity(activity),
             max_model_len=self._active_max_model_len,
-            on_evict=self._extract_before_eviction,
             on_usage=self._on_usage,
             mode_fn=self._turn_mode,
         )
@@ -3543,21 +3522,6 @@ class HpcaApp(App):
                 self.settings.save()
                 break
         self._refresh_context_bar()
-
-    async def _extract_before_eviction(self, messages: list[dict]) -> None:
-        """Last look at context about to leave the model's view (Phase 6).
-
-        Compaction is the one moment where something the agent learned can
-        disappear without anyone deciding to drop it, so the review loop gets
-        a chance at it first — but this runs *inside* the graph round, where
-        putting a modal on screen would suspend the turn behind a dialog the
-        user did not ask for. So the slice is only captured here; the review
-        itself runs after the reply lands, like every other review.
-        """
-        session = self._busy_turn
-        if session is None:
-            return
-        self._evicted.setdefault(session.session_id, []).extend(messages)
 
     def action_confirm_quit(self) -> None:
         def verdict(confirmed: bool | None) -> None:

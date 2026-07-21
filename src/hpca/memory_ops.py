@@ -21,7 +21,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import date
 
-from hpca.profiles import Memory, Profile
+from hpca.profiles import Memory, MemoryScope, Profile
 
 # Text that must never enter a system prompt unreviewed. Deliberately short:
 # every write is human-approved anyway, so this exists to make an injection
@@ -46,18 +46,18 @@ class MemoryOpError(Exception):
 @dataclass
 class MemoryOp:
     op: str  # add | replace | remove | demote
-    tier: int = 2
+    scope: MemoryScope = MemoryScope.SYSTEM_PROMPT
     match: str = ""  # replace/remove/demote: a unique substring of the target
     text: str = ""  # add/replace: the new text
 
     def describe(self) -> str:
         if self.op == "add":
-            return f"add to tier {self.tier}: {self.text}"
+            return f"add to {self.scope.value}: {self.text}"
         if self.op == "remove":
-            return f"remove from tier {self.tier}: “{self.match}”"
+            return f"remove from {self.scope.value}: “{self.match}”"
         if self.op == "demote":
-            return f"move “{self.match}” from tier {self.tier} to tier 3"
-        return f"replace “{self.match}” (tier {self.tier}) with: {self.text}"
+            return f"move “{self.match}” from system-prompt to rag"
+        return f"replace “{self.match}” ({self.scope.value}) with: {self.text}"
 
 
 @dataclass
@@ -73,8 +73,8 @@ def scan_threats(text: str) -> list[str]:
     return [pattern.pattern for pattern in THREAT_PATTERNS if pattern.search(text)]
 
 
-def resolve(profile: Profile, tier: int, match: str) -> Memory:
-    """The one memory in ``tier`` containing ``match``.
+def resolve(profile: Profile, scope: MemoryScope, match: str) -> Memory:
+    """The one memory in ``scope`` containing ``match``.
 
     Raises with the candidates when the substring is ambiguous or absent —
     guessing on the model's behalf is how the wrong memory gets deleted.
@@ -85,17 +85,17 @@ def resolve(profile: Profile, tier: int, match: str) -> Memory:
     candidates = [
         memory
         for memory in profile.memories
-        if memory.tier == tier and needle in memory.text.lower()
+        if memory.scope == scope and needle in memory.text.lower()
     ]
     if not candidates:
         raise MemoryOpError(
-            f"No tier-{tier} memory contains “{match}”. "
-            f"Current tier-{tier} memories: {_inventory(profile, tier)}"
+            f"No {scope.value} memory contains “{match}”. "
+            f"Current {scope.value} memories: {_inventory(profile, scope)}"
         )
     if len(candidates) > 1:
         shown = "; ".join(_summarize(m.text) for m in candidates[:4])
         raise MemoryOpError(
-            f"“{match}” matches {len(candidates)} tier-{tier} memories "
+            f"“{match}” matches {len(candidates)} {scope.value} memories "
             f"({shown}) — use a longer, unique substring."
         )
     return candidates[0]
@@ -106,24 +106,25 @@ def _summarize(text: str, limit: int = 60) -> str:
     return flat if len(flat) <= limit else flat[: limit - 1] + "…"
 
 
-def _inventory(profile: Profile, tier: int) -> str:
-    texts = [_summarize(m.text) for m in profile.memories if m.tier == tier]
+def _inventory(profile: Profile, scope: MemoryScope) -> str:
+    texts = [_summarize(m.text) for m in profile.memories if m.scope == scope]
     return "; ".join(texts) if texts else "(none)"
 
 
-def inventory_report(profile: Profile, tier: int, cap: int) -> str:
-    """What the model is shown when a batch does not fit: the full tier plus
-    its usage, so it can reissue one batch that frees room and adds.
+def inventory_report(profile: Profile, cap: int) -> str:
+    """What the model is shown when a batch does not fit: the full system-prompt
+    scope plus its usage, so it can reissue one batch that frees room and adds.
 
-    Demotion is offered before removal — a situational memory moved to tier 3
-    stops costing context on every turn but stays retrievable, so nothing has
-    to be thrown away to make room.
+    Demotion is offered before removal — a situational memory moved to RAG stops
+    costing context on every turn but stays retrievable, so nothing has to be
+    thrown away to make room.
     """
     return (
-        f"Tier {tier} is full ({profile.usage_meter(tier, cap)}). "
-        f"Current tier-{tier} memories: {_inventory(profile, tier)}. "
+        f"The system-prompt memory is full ({profile.usage_meter(cap)}). "
+        f"Current system-prompt memories: "
+        f"{_inventory(profile, MemoryScope.SYSTEM_PROMPT)}. "
         "Reissue ONE batch that frees room and adds: prefer 'demote' on "
-        "situational entries (they move to tier 3 and stay retrievable) over "
+        "situational entries (they move to rag and stay retrievable) over "
         "removing them outright."
     )
 
@@ -133,13 +134,13 @@ def apply_batch(
     operations: list[MemoryOp],
     *,
     backend: str = "",
-    caps: dict[int, int] | None = None,
+    system_prompt_cap: int | None = None,
 ) -> BatchResult:
     """Apply operations to a copy of ``profile``; budget checked at the end.
 
     Raises ``MemoryOpError`` if any operation cannot be applied or the final
-    state breaks a tier budget — the batch is all-or-nothing, so a partly
-    applied edit can never leave memory in a state nobody approved.
+    state breaks the system-prompt budget — the batch is all-or-nothing, so a
+    partly applied edit can never leave memory in a state nobody approved.
     """
     if not operations:
         raise MemoryOpError("No operations given.")
@@ -158,7 +159,7 @@ def apply_batch(
             if not text:
                 raise MemoryOpError("An add needs text.")
             if any(
-                memory.tier == operation.tier and memory.text.strip() == text
+                memory.scope == operation.scope and memory.text.strip() == text
                 for memory in working.memories
             ):
                 result.skipped.append(f"already present: {_summarize(text)}")
@@ -166,7 +167,7 @@ def apply_batch(
             working.memories.append(
                 Memory(
                     text=text,
-                    tier=operation.tier,
+                    scope=operation.scope,
                     backend=backend,
                     created=today,
                     kind=_kind_for(operation),
@@ -175,20 +176,21 @@ def apply_batch(
             result.applied.append(operation.describe())
             result.flagged += scan_threats(text)
         elif operation.op == "remove":
-            target = resolve(working, operation.tier, operation.match)
+            target = resolve(working, operation.scope, operation.match)
             working.memories.remove(target)
             result.applied.append(operation.describe())
         elif operation.op == "demote":
-            # Tier 3 is retrieved, not injected: the entry stops costing
-            # context every turn but is still there when it matches.
-            target = resolve(working, operation.tier, operation.match)
-            target.tier = 3
+            # RAG is retrieved, not injected: the entry stops costing context
+            # every turn but is still there when it matches. Demotion always
+            # addresses a system-prompt memory (RAG has nowhere lower to go).
+            target = resolve(working, MemoryScope.SYSTEM_PROMPT, operation.match)
+            target.scope = MemoryScope.RAG
             result.applied.append(operation.describe())
         elif operation.op == "replace":
             text = operation.text.strip()
             if not text:
                 raise MemoryOpError("A replace needs text.")
-            target = resolve(working, operation.tier, operation.match)
+            target = resolve(working, operation.scope, operation.match)
             target.text = text
             target.backend = backend or target.backend
             target.created = today
@@ -196,14 +198,13 @@ def apply_batch(
             result.flagged += scan_threats(text)
         else:
             raise MemoryOpError(f"Unknown operation {operation.op!r}.")
-    for tier, cap in (caps or {}).items():
-        if working.tier_chars(tier) > cap:
-            raise MemoryOpError(inventory_report(working, tier, cap))
+    if system_prompt_cap is not None and working.over_budget(system_prompt_cap):
+        raise MemoryOpError(inventory_report(working, system_prompt_cap))
     return result
 
 
 def _kind_for(operation: MemoryOp) -> str:
-    return "fact" if operation.tier == 1 else "learning"
+    return "fact" if operation.scope is MemoryScope.SYSTEM_PROMPT else "learning"
 
 
 def drift_detected(profile: Profile, path_text: str) -> bool:
@@ -214,6 +215,6 @@ def drift_detected(profile: Profile, path_text: str) -> bool:
     mismatch means: back up, refuse, reload.
     """
     on_disk = Profile.parse(path_text, name=profile.name)
-    return [(m.tier, m.text.strip()) for m in on_disk.memories] != [
-        (m.tier, m.text.strip()) for m in profile.memories
+    return [(m.scope, m.text.strip()) for m in on_disk.memories] != [
+        (m.scope, m.text.strip()) for m in profile.memories
     ]

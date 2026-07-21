@@ -1,8 +1,16 @@
-"""Tests for hpca.profiles: two-tier markdown memory store (§6)."""
+"""Tests for hpca.profiles: two-scope markdown memory store (§6)."""
 
 import pytest
 
-from hpca.profiles import Memory, Profile, estimate_tokens, profiles_dir
+from hpca.profiles import (
+    MemoryScope,
+    Profile,
+    estimate_tokens,
+    profiles_dir,
+)
+
+SP = MemoryScope.SYSTEM_PROMPT
+RAG = MemoryScope.RAG
 
 
 @pytest.fixture
@@ -38,21 +46,21 @@ class TestRoundTrip:
         profile = Profile.load("default")
         profile.add_memory(
             "Cluster is called cubi, scheduler is Slurm 25.05.",
-            tier=1, backend="qwen3-6b", kind="fact",
+            scope=SP, backend="qwen3-6b", kind="fact",
         )
         profile.add_memory(
             "STAR alignments need at least 40G of memory here.",
-            tier=2, backend="qwen3-6b", kind="learning",
+            scope=SP, backend="qwen3-6b", kind="learning",
         )
         profile.save()
         loaded = Profile.load("default")
         assert len(loaded.memories) == 2
-        tier1 = [m for m in loaded.memories if m.tier == 1]
-        assert tier1[0].text == "Cluster is called cubi, scheduler is Slurm 25.05."
-        assert tier1[0].backend == "qwen3-6b"
-        assert tier1[0].kind == "fact"
-        tier2 = [m for m in loaded.memories if m.tier == 2]
-        assert "STAR" in tier2[0].text
+        assert all(m.scope is SP for m in loaded.memories)
+        facts = [m for m in loaded.memories if m.kind == "fact"]
+        assert facts[0].text == "Cluster is called cubi, scheduler is Slurm 25.05."
+        assert facts[0].backend == "qwen3-6b"
+        learnings = [m for m in loaded.memories if m.kind == "learning"]
+        assert "STAR" in learnings[0].text
 
     def test_front_matter_preserved(self, hpca_home):
         profile = Profile.load("default")
@@ -64,7 +72,7 @@ class TestRoundTrip:
 
     def test_multiline_memory_text(self, hpca_home):
         profile = Profile.load("default")
-        profile.add_memory("line one\nline two\nline three", tier=2)
+        profile.add_memory("line one\nline two\nline three", scope=SP)
         profile.save()
         loaded = Profile.load("default")
         assert loaded.memories[0].text == "line one\nline two\nline three"
@@ -79,25 +87,26 @@ class TestLenientParsing:
     def test_hand_written_block_without_metadata(self, hpca_home):
         profile = self.write(
             hpca_home,
-            "---\nname: edited\n---\n\n## [tier1]\n\n"
+            "---\nname: edited\n---\n\n## [system-prompt]\n\n"
             "The site firewall blocks outgoing traffic.\n",
         )
         assert len(profile.memories) == 1
-        assert profile.memories[0].tier == 1
+        assert profile.memories[0].scope is SP
         assert profile.memories[0].backend == ""
         assert "firewall" in profile.memories[0].text
 
-    def test_moving_block_between_headings_changes_tier(self, hpca_home):
+    def test_moving_block_between_headings_changes_scope(self, hpca_home):
+        # a block filed under the rag heading is retrieved-only, not injected
         profile = self.write(
             hpca_home,
-            "---\nname: edited\n---\n\n## [tier1]\n\n## [tier2]\n\n"
+            "---\nname: edited\n---\n\n## [system-prompt]\n\n## [rag]\n\n"
             "<!-- backend: q, created: 2026-01-01, kind: fact -->\nmoved here\n",
         )
-        assert profile.memories[0].tier == 2
+        assert profile.memories[0].scope is RAG
 
     def test_missing_front_matter_reports_problem_but_parses(self, hpca_home):
         profile = self.write(
-            hpca_home, "## [tier2]\n\nremember this\n"
+            hpca_home, "## [system-prompt]\n\nremember this\n"
         )
         assert profile.problems  # reported
         assert profile.memories[0].text == "remember this"
@@ -106,17 +115,17 @@ class TestLenientParsing:
         profile = self.write(
             hpca_home,
             "---\nname: edited\n---\n\n## random notes\n\nnot a memory\n\n"
-            "## [tier2]\n\na real memory\n",
+            "## [system-prompt]\n\na real memory\n",
         )
         assert any("random notes" in p for p in profile.problems)
         assert [m.text for m in profile.memories] == ["a real memory"]
 
-    def test_tier3_accepted_in_format(self, hpca_home):
-        # deferred tier (§6.1): parsed, stored, not injected anywhere yet
+    def test_rag_scope_accepted_in_format(self, hpca_home):
+        # the retrieved scope: parsed, stored, indexed rather than injected
         profile = self.write(
-            hpca_home, "---\nname: edited\n---\n\n## [tier3]\n\nfuture memory\n"
+            hpca_home, "---\nname: edited\n---\n\n## [rag]\n\nfuture memory\n"
         )
-        assert profile.memories[0].tier == 3
+        assert profile.memories[0].scope is RAG
 
     def test_empty_file(self, hpca_home):
         profile = self.write(hpca_home, "")
@@ -125,32 +134,36 @@ class TestLenientParsing:
     def test_malformed_metadata_comment_kept_as_text_problem(self, hpca_home):
         profile = self.write(
             hpca_home,
-            "---\nname: edited\n---\n\n## [tier2]\n\n"
+            "---\nname: edited\n---\n\n## [system-prompt]\n\n"
             "<!-- backend qwen no colons here -->\nsome memory text\n",
         )
         assert profile.memories[0].text == "some memory text"
 
 
-class TestTierAccess:
-    def test_tier_text_joins_memories(self, hpca_home):
+class TestScopeAccess:
+    def test_scope_text_joins_memories(self, hpca_home):
         profile = Profile.load("default")
-        profile.add_memory("fact one", tier=1)
-        profile.add_memory("fact two", tier=1)
-        profile.add_memory("tier2 thing", tier=2)
-        text = profile.tier_text(1)
+        profile.add_memory("fact one", scope=SP)
+        profile.add_memory("fact two", scope=SP)
+        profile.add_memory("rag thing", scope=RAG)
+        text = profile.scope_text(SP)
         assert "fact one" in text and "fact two" in text
-        assert "tier2 thing" not in text
+        assert "rag thing" not in text
 
-    def test_tier_tokens_positive_and_scales(self, hpca_home):
+    def test_system_prompt_tokens_positive_and_scales(self, hpca_home):
         profile = Profile.load("default")
-        profile.add_memory("word " * 400, tier=2)
-        assert profile.tier_tokens(2) > 100
-        assert profile.tier_tokens(1) == 0
+        profile.add_memory("word " * 400, scope=SP)
+        # rag memories do not count against the injected budget
+        profile.add_memory("word " * 400, scope=RAG)
+        assert profile.system_prompt_tokens() > 100
+        assert Profile.load("default").system_prompt_tokens() == 0
 
-    def test_over_cap_tiers(self, hpca_home):
+    def test_over_budget(self, hpca_home):
         profile = Profile.load("default")
-        profile.add_memory("x" * 4000, tier=1)  # ~1000 tokens
-        assert profile.over_cap_tiers(tier1_cap=300, tier2_cap=800) == [1]
+        profile.add_memory("x" * 4000, scope=SP)  # well over any small cap
+        used = profile.system_prompt_tokens()
+        assert profile.over_budget(used - 1) is True
+        assert profile.over_budget(used) is False
 
 
 class TestEstimateTokens:
@@ -206,39 +219,42 @@ class TestProfileManagement:
         Profile.delete("never-existed")  # must not raise
 
 
-class TestCharBudgets:
-    """Redesign Phase 1: hard, model-independent character budgets."""
+class TestTokenBudgets:
+    """Redesign §6.4: a hard, write-time token budget on the injected scope."""
 
-    def test_tier_chars_counts_injected_text(self, hpca_home):
+    def test_system_prompt_tokens_counts_injected_text(self, hpca_home):
         profile = Profile.load("default")
-        profile.add_memory("abcd", tier=1)
-        profile.add_memory("efgh", tier=1)
-        assert profile.tier_chars(1) == len("abcd\n\nefgh")
+        profile.add_memory("abcd", scope=SP)
+        profile.add_memory("efgh", scope=SP)
+        assert profile.system_prompt_tokens() == estimate_tokens("abcd\n\nefgh")
 
     def test_usage_meter_format(self, hpca_home):
         profile = Profile.load("default")
-        profile.add_memory("x" * 600, tier=2)
-        assert profile.usage_meter(2, 1200) == "50% — 600/1200 chars"
+        profile.add_memory("word " * 100, scope=SP)
+        used = profile.system_prompt_tokens()
+        assert profile.usage_meter(used * 2) == f"50% — {used}/{used * 2} tokens"
 
     def test_usage_meter_zero_cap_does_not_divide(self, hpca_home):
-        assert Profile.load("default").usage_meter(1, 0) == "0% — 0/0 chars"
+        assert Profile.load("default").usage_meter(0) == "0% — 0/0 tokens"
 
     def test_would_exceed_counts_the_joiner(self, hpca_home):
         profile = Profile.load("default")
-        profile.add_memory("x" * 10, tier=1)
-        # 10 used + 2 joiner + 5 new = 17
-        assert not profile.would_exceed(1, "y" * 5, cap=17)
-        assert profile.would_exceed(1, "y" * 5, cap=16)
+        profile.add_memory("alpha", scope=SP)
+        # the "\n\n" joiner between the existing and the new text is budgeted
+        combined = estimate_tokens("alpha\n\nbeta")
+        assert not profile.would_exceed("beta", cap=combined)
+        assert profile.would_exceed("beta", cap=combined - 1)
 
-    def test_would_exceed_empty_tier_has_no_joiner(self, hpca_home):
+    def test_would_exceed_empty_scope_has_no_joiner(self, hpca_home):
         profile = Profile.load("default")
-        assert not profile.would_exceed(1, "y" * 5, cap=5)
+        assert not profile.would_exceed("beta", cap=estimate_tokens("beta"))
 
-    def test_over_cap_tiers_uses_chars(self, hpca_home):
+    def test_over_budget_uses_tokens(self, hpca_home):
         profile = Profile.load("default")
-        profile.add_memory("x" * 100, tier=2)
-        assert profile.over_cap_tiers(tier1_cap=50, tier2_cap=99) == [2]
-        assert profile.over_cap_tiers(tier1_cap=50, tier2_cap=100) == []
+        profile.add_memory("word " * 100, scope=SP)
+        used = profile.system_prompt_tokens()
+        assert profile.over_budget(used - 1) is True
+        assert profile.over_budget(used) is False
 
 
 class TestBackendAnnotation:
@@ -247,21 +263,21 @@ class TestBackendAnnotation:
 
     def test_other_backend_annotated(self, hpca_home):
         profile = Profile.load("default")
-        profile.add_memory("Use --no-mmap here.", tier=2, backend="qwen3-6b")
-        text = profile.tier_prompt_text(2, active_backend="gemma3-27b")
+        profile.add_memory("Use --no-mmap here.", scope=SP, backend="qwen3-6b")
+        text = profile.system_prompt_text(active_backend="gemma3-27b")
         assert text == "(learned on qwen3-6b) Use --no-mmap here."
 
     def test_same_backend_unannotated(self, hpca_home):
         profile = Profile.load("default")
-        profile.add_memory("Use --no-mmap here.", tier=2, backend="qwen3-6b")
-        text = profile.tier_prompt_text(2, active_backend="qwen3-6b")
+        profile.add_memory("Use --no-mmap here.", scope=SP, backend="qwen3-6b")
+        text = profile.system_prompt_text(active_backend="qwen3-6b")
         assert text == "Use --no-mmap here."
 
     def test_untagged_memory_unannotated(self, hpca_home):
         profile = Profile.load("default")
-        profile.add_memory("Cluster is cubi.", tier=1)
+        profile.add_memory("Cluster is cubi.", scope=SP)
         assert (
-            profile.tier_prompt_text(1, active_backend="qwen3-6b")
+            profile.system_prompt_text(active_backend="qwen3-6b")
             == "Cluster is cubi."
         )
 
@@ -273,19 +289,21 @@ class TestDuplication:
     def base(self, name="base"):
         profile = Profile.create(name)
         profile.default_backend = "qwen3-35b"
-        profile.add_memory("Cluster is cubi, scheduler is Slurm.", tier=1)
-        profile.add_memory("The user prefers R.", tier=2)
-        profile.add_memory("Snakemake dry-runs fail here.", tier=3, kind="struggle")
+        profile.add_memory("Cluster is cubi, scheduler is Slurm.", scope=SP)
+        profile.add_memory("The user prefers R.", scope=SP)
+        profile.add_memory(
+            "Snakemake dry-runs fail here.", scope=RAG, kind="struggle"
+        )
         profile.save()
         return profile
 
-    def test_all_tiers_copied(self, hpca_home):
+    def test_all_scopes_copied(self, hpca_home):
         self.base()
         copy = Profile.duplicate("base", "variants")
-        assert [(m.tier, m.text) for m in copy.memories] == [
-            (1, "Cluster is cubi, scheduler is Slurm."),
-            (2, "The user prefers R."),
-            (3, "Snakemake dry-runs fail here."),
+        assert [(m.scope, m.text) for m in copy.memories] == [
+            (SP, "Cluster is cubi, scheduler is Slurm."),
+            (SP, "The user prefers R."),
+            (RAG, "Snakemake dry-runs fail here."),
         ]
 
     def test_metadata_preserved_and_provenance_recorded(self, hpca_home):
@@ -317,11 +335,11 @@ class TestDuplication:
         Profile.duplicate("base", "variants")
 
         original = Profile.load("base")
-        original.add_memory("Learned later by the base.", tier=2)
+        original.add_memory("Learned later by the base.", scope=SP)
         original.save()
 
         copy = Profile.load("variants")
-        copy.add_memory("Learned later by the copy.", tier=2)
+        copy.add_memory("Learned later by the copy.", scope=SP)
         copy.save()
 
         base_texts = [m.text for m in Profile.load("base").memories]

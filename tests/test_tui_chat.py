@@ -314,11 +314,11 @@ class RecordingLLM(FakeLLM):
 
 
 async def test_profile_memories_injected_into_system_prompt(hpca_home):
-    from hpca.profiles import Profile
+    from hpca.profiles import MemoryScope, Profile
 
     profile = Profile.load("default")
-    profile.add_memory("The cluster is called cubi.", tier=1)
-    profile.add_memory("User prefers verbose logs.", tier=2)
+    profile.add_memory("The cluster is called cubi.", scope=MemoryScope.SYSTEM_PROMPT)
+    profile.add_memory("User prefers verbose logs.", scope=MemoryScope.SYSTEM_PROMPT)
     profile.save()
 
     llm = RecordingLLM([respond_json("ok")])
@@ -336,7 +336,7 @@ async def test_memories_are_frozen_per_session_and_refresh_at_boundaries(hpca_ho
     system-prompt prefix stays byte-stable for the backend's prefix cache.
     A note written by another session or instance mid-session does NOT shift
     the prompt; it is picked up at the next session boundary."""
-    from hpca.profiles import Profile
+    from hpca.profiles import MemoryScope, Profile
 
     llm = RecordingLLM(
         [respond_json("ok"), respond_json("ok again"), respond_json("ok third")]
@@ -348,7 +348,9 @@ async def test_memories_are_frozen_per_session_and_refresh_at_boundaries(hpca_ho
 
         # another instance (or session) memorizes something
         profile = Profile.load("default")
-        profile.add_memory("STAR needs 40G on this cluster.", tier=1)
+        profile.add_memory(
+            "STAR needs 40G on this cluster.", scope=MemoryScope.SYSTEM_PROMPT
+        )
         profile.save()
 
         # mid-session the frozen snapshot keeps the prompt stable
@@ -367,8 +369,10 @@ async def test_memories_are_frozen_per_session_and_refresh_at_boundaries(hpca_ho
             call[0]["role"] == "system" and "STAR needs 40G" in call[0]["content"]
             for call in llm.calls[seen:]
         )
-        # and the tool context the turn carries has it too
-        assert "STAR needs 40G" in app._tool_ctx.tier1_text
+        # and the refreshed per-session memory snapshot carries it too
+        assert "STAR needs 40G" in app.profile_memory.scope_text(
+            MemoryScope.SYSTEM_PROMPT
+        )
 
 
 async def test_turns_are_indexed_and_recallable_across_sessions(hpca_home):

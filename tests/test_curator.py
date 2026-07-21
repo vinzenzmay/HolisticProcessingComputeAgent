@@ -1,11 +1,19 @@
-"""Tests for the curator: ageing tier-3 memories out (redesign Phase 6)."""
+"""Tests for the curator: ageing RAG memories out (redesign Phase 6)."""
 
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
 from hpca import curator
-from hpca.profiles import Profile
+from hpca.profiles import MemoryScope, Profile
+
+# Old integer tiers map onto the two scopes: tiers 1 and 2 were both
+# always-injected (system-prompt); tier 3 was the retrieved scope (rag).
+_SCOPE = {
+    1: MemoryScope.SYSTEM_PROMPT,
+    2: MemoryScope.SYSTEM_PROMPT,
+    3: MemoryScope.RAG,
+}
 
 
 @pytest.fixture
@@ -22,7 +30,7 @@ def profile_with(*entries, name="default"):
     """entries: (text, tier, age_days[, kind])"""
     profile = Profile(name=name)
     for entry in entries:
-        memory = profile.add_memory(entry[0], tier=entry[1])
+        memory = profile.add_memory(entry[0], scope=_SCOPE[entry[1]])
         memory.created = days_ago(entry[2])
         if len(entry) > 3:
             memory.kind = entry[3]
@@ -48,9 +56,9 @@ class TestCurate:
         report = curator.curate(profile)
         assert report.archived == [] and report.stale == []
 
-    def test_injected_tiers_are_never_aged(self, hpca_home):
-        """Tiers 1 and 2 are small, curated, and in front of the user
-        already; tier 3 is the one that grows unattended."""
+    def test_injected_scope_is_never_aged(self, hpca_home):
+        """The system-prompt scope is small, curated, and in front of the user
+        already; RAG is the one that grows unattended."""
         profile = profile_with(
             ("an ancient site fact", 1, 900), ("an ancient preference", 2, 900)
         )
@@ -68,7 +76,7 @@ class TestCurate:
         """A hand-written entry with no date must not be aged out on a
         guess."""
         profile = Profile(name="default")
-        memory = profile.add_memory("hand written", tier=3)
+        memory = profile.add_memory("hand written", scope=MemoryScope.RAG)
         memory.created = ""
         assert curator.curate(profile).archived == []
         assert len(profile.memories) == 1
@@ -99,7 +107,7 @@ class TestArchive:
         curator.run(["default"])
         curator.save_state({})  # force the next run to be due
         profile = Profile.load("default")
-        memory = profile.add_memory("second old note", tier=3)
+        memory = profile.add_memory("second old note", scope=MemoryScope.RAG)
         memory.created = days_ago(200)
         profile.save()
         curator.run(["default"])
@@ -148,11 +156,11 @@ class TestMultipleProfiles:
 
 
 class TestArchiveMetadata:
-    def test_tier_recorded_for_restoration(self, hpca_home):
+    def test_scope_recorded_for_restoration(self, hpca_home):
         """Restoring means moving the block back under the right heading, and
-        the parser accepts it anywhere — so the tier has to be written down."""
+        the parser accepts it anywhere — so the scope has to be written down."""
         profile_with(("an old note", 3, 120)).save()
         curator.run(["default"])
         text = curator.archive_path("default").read_text()
-        assert "tier: 3" in text
-        assert "tierN" in text  # the how-to-restore header
+        assert "scope: rag" in text
+        assert "[system-prompt|rag]" in text  # the how-to-restore header

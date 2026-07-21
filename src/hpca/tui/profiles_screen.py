@@ -30,7 +30,9 @@ from textual.content import Content
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Footer, Input, Label, ListItem, ListView, Static, TextArea
 
+from hpca.curator import archive_path
 from hpca.profiles import DEFAULT_PROFILE, Profile
+from hpca.skills import load_own_skills, skill_path
 
 NEW_PROFILE_LABEL = "(new profile)"
 
@@ -45,7 +47,9 @@ class ProfilesList(ListView):
         # esc first so the footer shows "back" leftmost (§ esc/quit ordering);
         # the screen's own escape binding handles it, this orders the display.
         Binding("escape", "close", "back", show=True),
-        Binding("enter", "select_cursor", "edit / create", show=True),
+        Binding("enter", "select_cursor", "edit memories", show=True),
+        Binding("s", "edit_skills", "skills", show=True),
+        Binding("r", "edit_archive", "archive", show=True),
         Binding("c", "copy_profile", "copy profile", show=True),
         Binding("d", "delete_profile", "delete profile", show=True),
     ]
@@ -55,8 +59,8 @@ class ProfilesList(ListView):
         if action == "delete_profile":
             # "(new profile)" is not a profile; the default is the fallback
             return name is not None and name != DEFAULT_PROFILE
-        if action == "copy_profile":
-            return name is not None  # the default is copyable, just not removable
+        if action in ("copy_profile", "edit_skills", "edit_archive"):
+            return name is not None  # not on the "(new profile)" row
         return True
 
     def action_copy_profile(self) -> None:
@@ -65,9 +69,17 @@ class ProfilesList(ListView):
     def action_delete_profile(self) -> None:
         self.screen.delete_selected()
 
+    def action_edit_skills(self) -> None:
+        self.screen.edit_skills_selected()
+
+    def action_edit_archive(self) -> None:
+        self.screen.edit_archive_selected()
+
 
 class MemoryEditorScreen(ModalScreen[str | None]):
-    """A profile's memories as raw editable text; esc asks to keep changes."""
+    """Raw editable text — a profile's memories, its archive, or a skill body;
+    esc asks to keep changes. Content-agnostic: it returns the edited text and
+    the caller decides where it lands."""
 
     BINDINGS = [Binding("escape", "close", "back", priority=True)]
 
@@ -85,16 +97,15 @@ class MemoryEditorScreen(ModalScreen[str | None]):
     #memory-hint { color: $text-muted; }
     """
 
-    def __init__(self, profile_name: str, text: str) -> None:
+    def __init__(self, profile_name: str, text: str, *, title: str = "") -> None:
         super().__init__()
         self._profile_name = profile_name
         self._original = text
+        self._title = title or f"Memories — {profile_name}"
 
     def compose(self) -> ComposeResult:
         with Vertical(id="memory-dialog"):
-            yield Static(
-                f"Memories — {self._profile_name}", id="memory-title"
-            )
+            yield Static(self._title, id="memory-title")
             yield TextArea(self._original, id="memory-editor")
             yield Static("esc — back (asks to keep changes)", id="memory-hint")
 
@@ -112,6 +123,99 @@ class MemoryEditorScreen(ModalScreen[str | None]):
             self.dismiss(text if keep else None)
 
         self.app.push_screen(ConfirmScreen("Keep changes?"), verdict)
+
+
+class ProfileSkillsScreen(ModalScreen[None]):
+    """A profile's own skills: enter edits a skill's raw file, (d) deletes one.
+
+    The profile's own copy only — shared and project skills are edited where
+    they live, not from one profile's screen."""
+
+    BINDINGS = [
+        Binding("escape", "close", "back", priority=True),
+        Binding("d", "delete_skill", "delete", show=True),
+    ]
+
+    DEFAULT_CSS = """
+    ProfileSkillsScreen { align: center middle; }
+    #pskills-dialog {
+        width: 72;
+        height: auto;
+        max-height: 80%;
+        border: heavy $accent;
+        background: $surface;
+        padding: 1;
+    }
+    #pskills-title { height: 1; text-style: bold; }
+    #pskills-hint { color: $text-muted; }
+    """
+
+    def __init__(self, profile_name: str) -> None:
+        super().__init__()
+        self._profile_name = profile_name
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="pskills-dialog"):
+            yield Static(f"Skills — {self._profile_name}", id="pskills-title")
+            yield ListView(id="pskills-list")
+            yield Static("(enter) edit · (d) delete · (esc) back", id="pskills-hint")
+
+    async def on_mount(self) -> None:
+        await self._refresh()
+        self.query_one("#pskills-list", ListView).focus()
+
+    async def _refresh(self) -> None:
+        listview = self.query_one("#pskills-list", ListView)
+        await listview.clear()
+        skills = load_own_skills(self._profile_name)
+        if not skills:
+            empty = ListItem(Label("(no skills for this profile)"))
+            empty.data_skill = None
+            listview.append(empty)
+            return
+        for skill in skills:
+            item = ListItem(Label(Content(f"{skill.name}  ·  {skill.description}")))
+            item.data_skill = skill.name
+            listview.append(item)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+    @on(ListView.Selected, "#pskills-list")
+    def _on_selected(self, event: ListView.Selected) -> None:
+        name = getattr(event.item, "data_skill", None)
+        if name is None:
+            return
+        path = skill_path(name, self._profile_name)
+        text = path.read_text() if path.exists() else ""
+
+        def apply(edited: str | None) -> None:
+            if edited is not None:
+                self.app.save_skill_file(self._profile_name, name, edited)
+                self.run_worker(self._refresh(), group="pskills")
+
+        self.app.push_screen(
+            MemoryEditorScreen(
+                self._profile_name,
+                text,
+                title=f"Skill “{name}” — {self._profile_name}",
+            ),
+            apply,
+        )
+
+    def action_delete_skill(self) -> None:
+        listview = self.query_one("#pskills-list", ListView)
+        name = getattr(listview.highlighted_child, "data_skill", None)
+        if name is None:
+            return
+        from hpca.tui.confirm_screen import ConfirmScreen
+
+        def verdict(confirmed: bool | None) -> None:
+            if confirmed:
+                self.app.delete_profile_skill(self._profile_name, name)
+                self.run_worker(self._refresh(), group="pskills")
+
+        self.app.push_screen(ConfirmScreen(f"Delete skill “{name}”?"), verdict)
 
 
 class ProfilesScreen(Screen):
@@ -194,6 +298,33 @@ class ProfilesScreen(Screen):
         self.app.push_screen(
             MemoryEditorScreen(name, profile.render()), apply
         )
+
+    def _highlighted_profile(self) -> str | None:
+        highlighted = self.query_one("#profiles-list", ListView).highlighted_child
+        return getattr(highlighted, "data_profile", None)
+
+    def edit_archive_selected(self) -> None:
+        """The RAG archive (curator-aged entries) as raw editable text — the
+        one place to see what was aged out and move a block back into ## [rag]."""
+        name = self._highlighted_profile()
+        if name is None:
+            return
+        path = archive_path(name)
+        text = path.read_text() if path.exists() else ""
+
+        def apply(edited: str | None) -> None:
+            if edited is not None:
+                self.app.save_profile_archive(name, edited)
+
+        self.app.push_screen(
+            MemoryEditorScreen(name, text, title=f"Archive — {name}"), apply
+        )
+
+    def edit_skills_selected(self) -> None:
+        name = self._highlighted_profile()
+        if name is None:
+            return
+        self.app.push_screen(ProfileSkillsScreen(name))
 
     def add_profile(self) -> None:
         from hpca.tui.rename_screen import RenameScreen
