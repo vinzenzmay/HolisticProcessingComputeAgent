@@ -25,14 +25,18 @@ async def test_app_boots_with_three_columns(hpca_home):
         assert [c.id for c in columns] == ["sessions", "chat", "processes"]
 
 
-async def test_top_bar_shows_model_from_settings(hpca_home):
+async def test_top_bar_no_longer_shows_the_model(hpca_home):
+    # The model moved to a dedicated line at the top of the chat column; the
+    # top bar keeps the profile but no longer echoes the model (decision 11).
     settings = Settings()
     settings.llm.model = "Qwen/Qwen3.6-35B-A3B-FP8"
     settings.save()
     app = HpcaApp()
     async with app.run_test(size=(120, 40)):
-        top = app.query_one(TopBar)
-        assert "Qwen/Qwen3.6-35B-A3B-FP8" in top.render_text()
+        text = app.query_one(TopBar).render_text()
+        assert "model:" not in text
+        assert "Qwen/Qwen3.6-35B-A3B-FP8" not in text
+        assert "profile:" in text
 
 
 async def test_top_bar_shows_version(hpca_home):
@@ -285,7 +289,9 @@ class TestConfigEditorModal:
             on_disk = json.loads((hpca_home / "settings.json").read_text())
             assert on_disk["llm"]["model"] == "new-model"
             assert app.settings.llm.model == "new-model"
-            assert "new-model" in app.query_one(TopBar).render_text()
+            # The model is no longer surfaced in the top bar (it moved to the
+            # chat-column model line); the top bar keeps only the profile.
+            assert "new-model" not in app.query_one(TopBar).render_text()
 
     async def test_escape_with_changes_discards_on_no(self, hpca_home):
         app = HpcaApp()

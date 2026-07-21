@@ -122,7 +122,7 @@ from hpca.tui.approval_screen import (
     approval_title,
 )
 from hpca.tui.confirm_screen import ConfirmScreen
-from hpca.tui.context_bar import ContextBar
+from hpca.tui.context_bar import ContextBar, ModelLine
 from hpca.tui.inspect_screen import InspectScreen, format_job, format_process
 from hpca.tui.manage_llms import ManageLLMsScreen
 from hpca.tui.mode_bar import ModeBar
@@ -242,24 +242,27 @@ LOG_KINDS = {
 
 
 class TopBar(Static):
-    """Top bar: app name | profile | model | settings hint."""
+    """Top bar: app name | profile | settings hint.
+
+    The per-session model moved to a dedicated line at the top of the chat
+    column (``ModelLine``); it belongs to the session on screen, not to the
+    app as a whole. ``profile`` stays here (it is also echoed on each sidebar
+    row).
+    """
 
     def __init__(self) -> None:
         super().__init__(id="top-bar")
         self._profile = ""
-        self._model = ""
 
-    def update_info(self, profile: str, model: str) -> None:
+    def update_info(self, profile: str) -> None:
         self._profile = profile
-        self._model = model
         self.update(self.render_text())
 
     def render_text(self) -> str:
         from hpca import __version__
 
         return (
-            f" HPCA v{__version__} │ profile: {self._profile} │ "
-            f"model: {self._model} │ (c) config"
+            f" HPCA v{__version__} │ profile: {self._profile} │ (c) config"
         )
 
 
@@ -705,6 +708,11 @@ class ChatPanel(ColumnPanel):
 
     def compose(self) -> ComposeResult:
         yield Static(self._title, classes="column-title")
+        # The model in use for the on-screen session, on its own row directly
+        # above the context meter. Hidden until a session is open.
+        model_line = ModelLine(id="model-line")
+        model_line.display = False
+        yield model_line
         yield ContextBar(id="context-bar")
         yield ChatList(id="chat-list")
         menu = Static(id="command-menu")
@@ -1071,6 +1079,7 @@ class HpcaApp(App):
             self.notify(f"Trash: cleaned up {removed} expired entr"
                         f"{'y' if removed == 1 else 'ies'}")
         self._refresh_top_bar()
+        self._refresh_model_line()
         self._refresh_context_bar()
         self.run_worker(self._discover_context_window(), group="llm-probe")
         await self._reload_sessions()
@@ -2389,6 +2398,7 @@ class HpcaApp(App):
         self._refresh_mode_bar()
         # The top bar and context meter follow the opened session's LLM.
         self._refresh_top_bar()
+        self._refresh_model_line()
         self._refresh_context_bar()
         if self._log is not None:
             self._log.write(
@@ -2483,6 +2493,7 @@ class HpcaApp(App):
             if changed:
                 self._refresh_session_log()
                 self._refresh_top_bar()
+                self._refresh_model_line()
                 self._refresh_context_bar()
                 await self._reload_sessions()
         else:
@@ -2675,6 +2686,7 @@ class HpcaApp(App):
         await self._set_chat_messages([])
         self.query_one("#chat-input", ChatInput).display = False
         self._refresh_mode_bar()
+        self._refresh_model_line()  # no session: hide the model line
         await self._sync_decision_bar()  # no session: nothing to decide inline
         self._focus_column("sessions")
 
@@ -3502,6 +3514,7 @@ class HpcaApp(App):
         self.session_store.set_backend(self.active_session.session_id, blob)
         self.active_session.backend = blob
         self._refresh_top_bar()
+        self._refresh_model_line()
         self._refresh_context_bar()
         self._refresh_session_log()  # rebind the tool context to the new client
         self.notify(f"This session now uses {backend.model}")
@@ -3530,6 +3543,7 @@ class HpcaApp(App):
         self._owns_llm = True
         self._rebuild_graph()
         self._refresh_session_log()  # rebind the tool context to the new client
+        self._refresh_model_line()  # the bootstrap model may have changed
         # A different model means a different window, and the token counts
         # measured against the old one no longer describe it — drop every
         # session's measurement so each re-measures on its next turn.
@@ -3745,6 +3759,21 @@ class HpcaApp(App):
         self.push_screen(SettingsScreen(self.settings), apply)
 
     def _refresh_top_bar(self) -> None:
-        self.query_one(TopBar).update_info(
-            profile=self.profile, model=self._active_model()
-        )
+        self.query_one(TopBar).update_info(profile=self.profile)
+
+    def _model_line(self) -> ModelLine | None:
+        found = self.query("#model-line")
+        return found.first(ModelLine) if found else None
+
+    def _refresh_model_line(self) -> None:
+        """The model line atop the chat column: shown with a session and bound
+        to the on-screen session's model, hidden without one (like the mode
+        line and chat entry)."""
+        line = self._model_line()
+        if line is None:
+            return
+        if self.active_session is None:
+            line.display = False
+            return
+        line.display = True
+        line.set_model(self._active_model())
