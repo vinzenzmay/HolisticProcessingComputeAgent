@@ -975,6 +975,15 @@ class HpcaApp(App):
         self._conn = None
         self._saver_ctx = None
 
+    def notify(self, message: str, **kwargs) -> None:
+        """Toasts carry dynamic text — LLM output, exception strings, memory
+        excerpts — that may contain Textual markup (``[...]``, ``$(...)``).
+        Rendering that as markup raises ``MarkupError`` deep inside the
+        compositor and takes the whole app down, so default ``markup=False``.
+        A caller that genuinely wants markup can still pass ``markup=True``."""
+        kwargs.setdefault("markup", False)
+        super().notify(message, **kwargs)
+
     def compose(self) -> ComposeResult:
         yield TopBar()
         with Horizontal(id="columns"):
