@@ -26,6 +26,7 @@ call a tool that was never offered, and cannot run a gated one unapproved.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
@@ -174,6 +175,93 @@ PLAN_CONTINUE_NUDGE = (
     "present_plan with the checklist and any open questions. Do not describe "
     "your next step — take it."
 )
+
+# Fed back (not persisted) in any non-plan mode when a bare reply only announces
+# the next step. Unlike plan mode, these modes legitimately end a turn on chat —
+# that is how the agent answers or asks — so the nudge keeps both those doors
+# open while refusing the false stop.
+CONTINUE_NUDGE = (
+    "[continue] You described your next step instead of doing it, so your turn "
+    "would end here without anything happening — and that reply is all the user "
+    "would see. Do not narrate what you are about to do; take the action now by "
+    "calling the tool. Only stop if you are actually finished (then give the "
+    "user your final answer) or you are genuinely blocked and need something "
+    "only the user can provide (then ask them directly)."
+)
+
+# Openers that, at the start of a bare reply's final sentence(s), mark the model
+# announcing its next action rather than delivering an answer. Matched at the
+# sentence start (after list/emphasis markers), never mid-sentence, so a real
+# answer that merely contains "I'll" in passing is left to stand.
+_DEFERRED_ACTION_OPENERS = (
+    "let me ",
+    "let's ",
+    "let us ",
+    "i'll ",
+    "i will ",
+    "i'm going to ",
+    "i am going to ",
+    "i'm gonna ",
+    "i'm about to ",
+    "i am about to ",
+    "i need to ",
+    "i should ",
+    "i have to ",
+    "i want to ",
+    "i plan to ",
+    "next, i ",
+    "next i ",
+    "now i'll ",
+    "now let ",
+    "time to ",
+)
+# "Let me know…" hands the turn back to the user — an ending, not a deferred
+# action — so it must not be read as one despite the shared "let me" opener.
+_INVITATION_OPENERS = ("let me know", "let us know")
+
+
+def _last_sentences(text: str, n: int = 2) -> list[str]:
+    """The final ``n`` sentences of ``text``, trailing markers and blanks gone."""
+    parts = re.split(r"(?<=[.!?])\s+", text.strip())
+    return [p.strip() for p in parts if p.strip()][-n:]
+
+
+def looks_like_deferred_action(text: str) -> bool:
+    """Whether a bare chat reply merely announces its next step instead of
+    taking it — the "false stop" fed back with a nudge in every mode.
+
+    Only the reply's last one or two sentences are inspected, each stripped of
+    leading list/emphasis markers, and only when the reply does not end on a
+    question (a genuine ask the user must answer). A sentence that opens with a
+    deferred-action phrase ("Let me…", "I'll…", "Next I…") — but not an
+    invitation ("Let me know…") — marks the false stop.
+    """
+    stripped = text.strip()
+    if not stripped or stripped.endswith("?"):
+        return False
+    for sentence in _last_sentences(stripped):
+        opener = sentence.lstrip("-*#> \t").lower()
+        if opener.startswith(_INVITATION_OPENERS):
+            continue
+        if opener.startswith(_DEFERRED_ACTION_OPENERS):
+            return True
+    return False
+
+
+def continue_nudge_for(mode: str | None, text: str) -> str | None:
+    """The nudge to feed back when a turn would otherwise end on a bare chat
+    reply, or ``None`` to let the reply stand as the turn's answer.
+
+    Plan mode never ends on chat — the model must hand over through
+    present_plan — so any bare reply is fed back. Every other mode ends on chat
+    normally, so it is nudged only when the reply is a deferred action: an
+    announced next step the model did not take.
+    """
+    if mode == "plan":
+        return PLAN_CONTINUE_NUDGE
+    if looks_like_deferred_action(text):
+        return CONTINUE_NUDGE
+    return None
 
 MODE_GUIDANCE = {
     "manual": MANUAL_MODE_GUIDANCE,

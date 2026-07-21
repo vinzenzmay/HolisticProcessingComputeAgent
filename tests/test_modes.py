@@ -8,14 +8,16 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from hpca.agent.builtin_tools import _bash_is_destructive
-from hpca.agent.graph import MAX_PLAN_NUDGES, build_graph, run_turn
+from hpca.agent.graph import MAX_CONTINUE_NUDGES, build_graph, run_turn
 from hpca.agent.modes import (
     EXECUTION_TOOLS,
     MODES,
     PresentPlanParams,
     add_plan_tool,
+    continue_nudge_for,
     destructive_approval_required,
     kickoff_message,
+    looks_like_deferred_action,
     mode_prompt_suffix,
     next_mode,
     parse_checklist,
@@ -221,6 +223,34 @@ class TestHelpers:
         args = PresentPlanParams(steps=[{"text": "s", "done": False}])
         assert present_plan_reply(args).strip()
 
+    def test_deferred_action_is_detected(self):
+        for text in (
+            "The README does not mention it. Let me dig deeper into the source.",
+            "I'll grep the source for the subcommand.",
+            "Next, I will read the CLI entrypoint.",
+            "First I check the docs.\n\nNow let me look at the code.",
+            "- Let me examine the alignment module.",
+        ):
+            assert looks_like_deferred_action(text), text
+
+    def test_real_answers_and_questions_are_not_deferred_actions(self):
+        for text in (
+            "The command is `svirlpool cut`.",
+            "Done — I cut the reads and wrote them to out.bam.",
+            "Which reference build should I use?",
+            "I found two candidates. Let me know which one you want.",
+            "The tool will let me parse the interval, so it should work.",
+            "",
+        ):
+            assert not looks_like_deferred_action(text), text
+
+    def test_continue_nudge_is_mode_aware(self):
+        # plan mode nudges any chat reply; other modes only a deferred action.
+        assert continue_nudge_for("plan", "here is my answer") is not None
+        assert continue_nudge_for("auto", "here is my answer") is None
+        assert continue_nudge_for("auto", "Let me dig into the source.") is not None
+        assert continue_nudge_for(None, "Let me dig into the source.") is not None
+
 
 class TestManualMode:
     async def test_execution_tool_gates_with_script_preview(self, tools):
@@ -423,18 +453,58 @@ class TestPlanMode:
     async def test_nudge_gives_up_after_the_budget(self, tools):
         # A model that only ever narrates cannot hang the turn: after the
         # nudge budget it ends with whatever it last said.
-        llm = FakeLLM([respond_json("a"), respond_json("b"), respond_json("c")])
+        llm = FakeLLM(
+            [
+                respond_json("Let me look at a."),
+                respond_json("Let me look at b."),
+                respond_json("Let me look at c."),
+            ]
+        )
         graph = make_graph(llm, tools, "plan")
         result = await run_turn(graph, session_id="s1", user_text="plan it")
-        assert len(llm.calls) == MAX_PLAN_NUDGES + 1
-        assert result.reply == "c"
+        assert len(llm.calls) == MAX_CONTINUE_NUDGES + 1
+        assert result.reply == "Let me look at c."
 
-    async def test_bare_reply_ends_the_turn_outside_plan_mode(self, tools):
-        llm = FakeLLM([respond_json("done")])
+    async def test_a_real_answer_ends_the_turn_outside_plan_mode(self, tools):
+        llm = FakeLLM([respond_json("The command is `svirlpool cut`.")])
         graph = make_graph(llm, tools, "auto")
         result = await run_turn(graph, session_id="s1", user_text="go")
-        assert result.reply == "done"
-        assert len(llm.calls) == 1  # no nudge outside plan mode
+        assert result.reply == "The command is `svirlpool cut`."
+        assert len(llm.calls) == 1  # a genuine answer is not a deferred action
+
+    async def test_deferred_action_is_nudged_then_taken_in_auto_mode(self, tools):
+        # The exact failure this fixes: the model narrates "Let me dig deeper"
+        # and stops. In every mode it is now fed back and, on retry, acts.
+        seen = []
+
+        async def peek_handler(args, ctx):
+            seen.append(args.registry_key)
+            return "peeked"
+
+        tools.register(
+            Tool(
+                name="peek",
+                description="Look at something (no side effects)",
+                params=KeyParams,
+                handler=peek_handler,
+            )
+        )
+        llm = FakeLLM(
+            [
+                respond_json("Let me dig deeper into the source code to find it."),
+                tool_json("peek", registry_key="svirlpool"),
+                respond_json("Found it: `svirlpool cut`."),
+            ]
+        )
+        graph = make_graph(llm, tools, "auto")
+        result = await run_turn(graph, session_id="s1", user_text="find the cut cmd")
+        assert seen == ["svirlpool"]  # the narrated action actually ran
+        assert result.reply == "Found it: `svirlpool cut`."
+        # the fumbled narration is fed back as a nudge, never persisted
+        assert any("[continue]" in m["content"] for m in llm.calls[1]["messages"])
+        assert not any(
+            "Let me dig deeper" in m["content"] for m in result.messages
+        )
 
     async def test_benign_look_around_runs_unattended_in_plan_mode(self, tools):
         # A read-only look-around no longer gates in plan mode — it just runs,
