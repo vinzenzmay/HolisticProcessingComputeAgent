@@ -18,6 +18,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import date
 
+from hpca.builtin_memory import BUILTIN_MEMORIES, BUILTIN_PROFILE
 from hpca.profiles import Memory, Profile
 
 SCHEMA = """
@@ -87,6 +88,25 @@ class MemoryIndex:
         except sqlite3.OperationalError:
             self.available = False  # sqlite without FTS5
         conn.commit()
+        self._seed_builtins()
+
+    def _insert(self, profile: str, memory: Memory) -> None:
+        self._conn.execute(
+            "INSERT INTO profile_memories (profile, tier, kind, backend, "
+            "created, text) VALUES (?, ?, ?, ?, ?, ?)",
+            (profile, memory.tier, memory.kind, memory.backend,
+             memory.created, memory.text),
+        )
+
+    def _seed_builtins(self) -> None:
+        """Index HPCA's shipped memories under the reserved profile so any
+        agent can recall them (see :mod:`hpca.builtin_memory`)."""
+        self._conn.execute(
+            "DELETE FROM profile_memories WHERE profile = ?", (BUILTIN_PROFILE,)
+        )
+        for memory in BUILTIN_MEMORIES:
+            self._insert(BUILTIN_PROFILE, memory)
+        self._conn.commit()
 
     def reindex(self, profile: Profile) -> int:
         """Rebuild one profile's tier-3 index from its parsed memories."""
@@ -95,18 +115,7 @@ class MemoryIndex:
         )
         memories = [m for m in profile.memories if m.tier == 3]
         for memory in memories:
-            self._conn.execute(
-                "INSERT INTO profile_memories (profile, tier, kind, backend, "
-                "created, text) VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    profile.name,
-                    memory.tier,
-                    memory.kind,
-                    memory.backend,
-                    memory.created,
-                    memory.text,
-                ),
-            )
+            self._insert(profile.name, memory)
         self._conn.commit()
         return len(memories)
 
@@ -129,9 +138,9 @@ class MemoryIndex:
                 "  bm25(profile_memories_fts) AS rank "
                 "FROM profile_memories_fts "
                 "JOIN profile_memories m ON m.rowid = profile_memories_fts.rowid "
-                "WHERE profile_memories_fts MATCH ? AND m.profile = ? "
+                "WHERE profile_memories_fts MATCH ? AND m.profile IN (?, ?) "
                 "ORDER BY rank LIMIT 50",
-                (fts_query, profile),
+                (fts_query, profile, BUILTIN_PROFILE),
             ).fetchall()
         except sqlite3.OperationalError:
             return []
