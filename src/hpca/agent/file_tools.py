@@ -16,8 +16,6 @@ from pydantic import BaseModel, Field
 from hpca.agent.context import ToolContext
 from hpca.agent.tools import Tool, ToolRegistry
 
-LIST_DIR_LIMIT = 100
-
 
 def _require_trash(ctx: ToolContext):
     if ctx.trash is None:
@@ -42,23 +40,6 @@ async def register_path(args: RegisterPathParams, ctx: ToolContext) -> str:
     ctx.registry.register(args.key, path)
     kind = "directory" if path.is_dir() else "file"
     return f"Registered {kind} as {args.key!r}."
-
-
-class ListDirParams(BaseModel):
-    dir_key: str = Field(description="Registry key of the directory")
-    pattern: str = Field(default="*", description="Glob pattern, e.g. '*.bam'")
-
-
-async def list_dir(args: ListDirParams, ctx: ToolContext) -> str:
-    directory = ctx.registry.resolve(args.dir_key)
-    if not directory.is_dir():
-        return f"{args.dir_key!r} is not a directory."
-    entries = sorted(directory.glob(args.pattern))
-    shown = entries[:LIST_DIR_LIMIT]
-    lines = [f"{e.name}/" if e.is_dir() else e.name for e in shown]
-    if len(entries) > LIST_DIR_LIMIT:
-        lines.append(f"... [{len(entries) - LIST_DIR_LIMIT} more entries omitted]")
-    return "\n".join(lines) if lines else "(empty)"
 
 
 class DeleteFileParams(BaseModel):
@@ -191,14 +172,6 @@ def add_file_tools(registry: ToolRegistry) -> ToolRegistry:
             description="Register a path (the user's, or one you found) under a new key",
             params=RegisterPathParams,
             handler=register_path,
-        )
-    )
-    registry.register(
-        Tool(
-            name="list_dir",
-            description="List a registered directory (optionally glob-filtered)",
-            params=ListDirParams,
-            handler=list_dir,
         )
     )
     registry.register(

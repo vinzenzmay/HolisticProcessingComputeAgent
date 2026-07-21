@@ -57,32 +57,6 @@ class TestRegisterPath:
         assert "ghost" not in ctx.registry.list()
 
 
-class TestListDir:
-    async def test_lists_with_pattern(self, tools, ctx, tmp_path):
-        d = tmp_path / "data"
-        d.mkdir()
-        (d / "a.bam").write_text("x")
-        (d / "b.bam").write_text("x")
-        (d / "notes.txt").write_text("x")
-        (d / "sub").mkdir()
-        ctx.registry.register("data", d)
-        result = await call(tools, "list_dir", ctx, dir_key="data", pattern="*.bam")
-        assert "a.bam" in result and "b.bam" in result
-        assert "notes.txt" not in result
-        full = await call(tools, "list_dir", ctx, dir_key="data")
-        assert "sub/" in full
-
-    async def test_bounded_listing(self, tools, ctx, tmp_path):
-        d = tmp_path / "many"
-        d.mkdir()
-        for i in range(150):
-            (d / f"f{i:03}.txt").write_text("x")
-        ctx.registry.register("many", d)
-        result = await call(tools, "list_dir", ctx, dir_key="many")
-        assert len(result.splitlines()) <= 101
-        assert "omitted" in result
-
-
 class TestDeleteFile:
     async def test_gated_when_key_resolves(self, tools, ctx, tmp_path):
         f = tmp_path / "x.txt"
