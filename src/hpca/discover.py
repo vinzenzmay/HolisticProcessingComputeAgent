@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Sequence
 from urllib.parse import urlparse
 
 import httpx
+
+KEY_REQUIRED = "(api key required)"
 
 DEFAULT_PORT_RANGE = range(1024, 65536)
 # Scanned first so known/likely endpoints appear within the first chunks:
@@ -48,6 +50,7 @@ class DiscoveredBackend:
     model: str
     max_model_len: int | None = None
     needs_key: bool = False
+    api_key: str | None = None  # the pool key that unlocked this endpoint
 
     def details(self) -> str:
         """Everything but the name: context size, key requirement, endpoint."""
@@ -72,19 +75,13 @@ def _auth_headers(api_key: str | None) -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
 
-async def probe_endpoint(
+async def _fetch_models(
     base_url: str,
-    *,
-    api_key: str | None = None,
-    timeout: float = PROBE_TIMEOUT_S,
-    transport: httpx.AsyncBaseTransport | None = None,
-) -> list[DiscoveredBackend]:
-    """Models served at one endpoint; [] if it is not an OpenAI-style API.
-
-    Pass ``api_key`` to authenticate the probe: the scan leaves it unset (a
-    key-locked endpoint just surfaces as ``needs_key``), but validating a key
-    the user just typed sends it and reads a lingering 401 as "key rejected".
-    """
+    api_key: str | None,
+    timeout: float,
+    transport: httpx.AsyncBaseTransport | None,
+) -> httpx.Response | None:
+    """One GET /v1/models; None if the endpoint is not reachable at all."""
     async with httpx.AsyncClient(
         base_url=base_url.rstrip("/") + "/",
         headers=_auth_headers(api_key),
@@ -92,17 +89,19 @@ async def probe_endpoint(
         transport=transport,
     ) as client:
         try:
-            response = await client.get("models")
+            return await client.get("models")
         except (httpx.HTTPError, Exception):
-            return []
-    if response.status_code in (401, 403):
-        return [
-            DiscoveredBackend(
-                base_url=base_url, model="(api key required)", needs_key=True
-            )
-        ]
-    if response.status_code != 200:
-        return []
+            return None
+
+
+def _parse_models(
+    base_url: str,
+    response: httpx.Response,
+    *,
+    needs_key: bool = False,
+    api_key: str | None = None,
+) -> list[DiscoveredBackend]:
+    """Turn a 200 /v1/models body into DiscoveredBackend rows; [] if not one."""
     try:
         entries = response.json().get("data", [])
     except ValueError:
@@ -118,9 +117,53 @@ async def probe_endpoint(
                 base_url=base_url,
                 model=str(entry["id"]),
                 max_model_len=entry.get("max_model_len"),
+                needs_key=needs_key,
+                api_key=api_key,
             )
         )
     return backends
+
+
+async def probe_endpoint(
+    base_url: str,
+    *,
+    api_key: str | None = None,
+    api_keys: Sequence[str] = (),
+    timeout: float = PROBE_TIMEOUT_S,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> list[DiscoveredBackend]:
+    """Models served at one endpoint; [] if it is not an OpenAI-style API.
+
+    Pass ``api_key`` to authenticate the probe: the scan leaves it unset (a
+    key-locked endpoint just surfaces as ``needs_key``), but validating a key
+    the user just typed sends it and reads a lingering 401 as "key rejected".
+
+    ``api_keys`` is a pool of keys tried only when the unauthenticated (or
+    single-``api_key``) probe comes back 401/403: each is tried in order and
+    the first returning 200 wins, yielding real model rows with ``needs_key``
+    and ``api_key`` set to that key. If none work (or the pool is empty) the
+    ``(api key required)`` sentinel is returned as before.
+    """
+    response = await _fetch_models(base_url, api_key, timeout, transport)
+    if response is None:
+        return []
+    if response.status_code in (401, 403):
+        for key in api_keys:
+            keyed = await _fetch_models(base_url, key, timeout, transport)
+            if keyed is not None and keyed.status_code == 200:
+                rows = _parse_models(
+                    base_url, keyed, needs_key=True, api_key=key
+                )
+                if rows:
+                    return rows
+        return [
+            DiscoveredBackend(
+                base_url=base_url, model=KEY_REQUIRED, needs_key=True
+            )
+        ]
+    if response.status_code != 200:
+        return []
+    return _parse_models(base_url, response)
 
 
 async def _port_open(host: str, port: int) -> bool:
@@ -144,6 +187,7 @@ async def scan_local_ports(
     host: str = "127.0.0.1",
     progress: Callable[[int, int], None] | None = None,
     on_found: Callable[[DiscoveredBackend], None] | None = None,
+    api_keys: Sequence[str] = (),
 ) -> list[DiscoveredBackend]:
     """Find OpenAI-compatible endpoints on the given localhost ports.
 
@@ -162,7 +206,10 @@ async def scan_local_ports(
         results = await asyncio.gather(*(_port_open(host, p) for p in chunk))
         open_ports = [p for p, is_open in zip(chunk, results) if is_open]
         for probe_results in await asyncio.gather(
-            *(probe_endpoint(f"http://{host}:{port}/v1") for port in open_ports)
+            *(
+                probe_endpoint(f"http://{host}:{port}/v1", api_keys=api_keys)
+                for port in open_ports
+            )
         ):
             for backend in probe_results:
                 backends.append(backend)

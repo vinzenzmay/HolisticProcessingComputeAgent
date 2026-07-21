@@ -796,3 +796,171 @@ class TestBackendForm:
             assert saved.base_url == "http://localhost:52000/v1"
             assert saved.model == "qwen3.6:35B"
             assert saved.api_key == "goodkey"
+
+
+UNLOCKED = DiscoveredBackend(
+    base_url="http://localhost:51945/v1",
+    model="pool-unlocked-model",
+    max_model_len=4096,
+    needs_key=True,
+    api_key="poolkey",  # a pooled key already validated against this endpoint
+)
+
+
+@pytest.fixture
+def fake_pool_probe(monkeypatch):
+    """probe_endpoint on the manage screen: 'goodkey' anywhere in the pool
+    unlocks the real model; otherwise the sentinel comes back."""
+
+    async def probe(base_url, *, api_key=None, api_keys=(), **kwargs):
+        if api_key == "goodkey" or "goodkey" in tuple(api_keys):
+            return [
+                DiscoveredBackend(
+                    base_url=base_url,
+                    model="qwen3.6:35B",
+                    max_model_len=32768,
+                    needs_key=True,
+                    api_key="goodkey",
+                )
+            ]
+        return [
+            DiscoveredBackend(
+                base_url=base_url, model="(api key required)", needs_key=True
+            )
+        ]
+
+    monkeypatch.setattr(manage_module, "probe_endpoint", probe)
+
+
+def _left_labels(app):
+    left = app.screen.query_one("#llm-discovered", ListView)
+    return [str(item.query_one("Label").content) for item in left.children]
+
+
+async def _wait_for_left_label(app, pilot, needle, tries=40):
+    labels = []
+    for _ in range(tries):
+        await app.screen.workers.wait_for_complete()
+        await pilot.pause()
+        labels = _left_labels(app)
+        if any(needle in t for t in labels):
+            return labels
+    return labels
+
+
+class TestKeyRegistry:
+    """Slice C: the key pool re-probes locked endpoints in place, adds
+    pool-unlocked entries directly, and no longer leaves stale sentinels."""
+
+    async def test_reprobe_upgrades_sentinel_with_pooled_key(
+        self, hpca_home, fake_keyed_discovery, fake_pool_probe
+    ):
+        settings = Settings()
+        settings.llm_api_keys = ["goodkey"]  # a key the pool already knows
+        settings.save()
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("m")
+            await app.screen.workers.wait_for_complete()
+            await pilot.pause()
+            # the scan surfaced the bare sentinel (fake_scan ignores the pool)
+            assert any("api key required" in t for t in _left_labels(app))
+            # an in-place re-probe with the pool key upgrades it
+            app.screen._reprobe_discovered()
+            labels = await _wait_for_left_label(app, pilot, "qwen3.6:35B")
+            assert any("qwen3.6:35B" in t for t in labels)
+            assert not any("api key required" in t for t in labels)
+
+    async def test_added_keyed_endpoint_leaves_no_duplicate(
+        self, hpca_home, fake_keyed_discovery, fake_probe, fake_pool_probe
+    ):
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("m")
+            await app.screen.workers.wait_for_complete()
+            await pilot.pause()
+            left = app.screen.query_one("#llm-discovered", ListView)
+            left.focus()
+            left.index = 0
+            await pilot.press("enter")  # opens the form for the bare sentinel
+            await pilot.pause()
+            app.screen.query_one("#backend-key", Input).value = "goodkey"
+            app.screen.query_one("#backend-model", Input).focus()
+            await pilot.press("enter")
+            await _wait_for_backend(app, pilot)
+            await app.screen.workers.wait_for_complete()
+            await pilot.pause()
+            # the just-added endpoint is gone from Discovered — no re-add
+            assert not any("51944" in t for t in _left_labels(app))
+
+    async def test_save_time_guard_drops_sentinel_without_a_working_key(
+        self, hpca_home, fake_keyed_discovery
+    ):
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("m")
+            await app.screen.workers.wait_for_complete()
+            await pilot.pause()
+            assert any("51944" in t for t in _left_labels(app))
+            # force-save a backend at that base_url with a key nothing unlocks
+            await app.screen._save_backend(
+                LLMBackend(model="forced", base_url=KEYED.base_url, api_key="badkey")
+            )
+            await app.screen.workers.wait_for_complete()
+            await pilot.pause()
+            assert not any("51944" in t for t in _left_labels(app))
+
+    async def test_pool_unlocked_entry_adds_without_form(
+        self, hpca_home, monkeypatch
+    ):
+        async def fake_scan(*args, **kwargs):
+            return [UNLOCKED]
+
+        async def fake_reachable(base_url, **kwargs):
+            return True
+
+        monkeypatch.setattr(manage_module, "scan_local_ports", fake_scan)
+        monkeypatch.setattr(manage_module, "is_reachable", fake_reachable)
+        monkeypatch.setattr(switch_module, "is_reachable", fake_reachable)
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("m")
+            await app.screen.workers.wait_for_complete()
+            await pilot.pause()
+            left = app.screen.query_one("#llm-discovered", ListView)
+            left.focus()
+            left.index = 0
+            await pilot.press("enter")
+            await _wait_for_backend(app, pilot)
+            # saved directly, no form pushed
+            assert not isinstance(app.screen, BackendFormScreen)
+            assert isinstance(app.screen, ManageLLMsScreen)
+            saved = app.settings.backends[0]
+            assert saved.api_key == "poolkey"
+            assert saved.model == "pool-unlocked-model"
+            assert saved.base_url == UNLOCKED.base_url
+
+    async def test_manual_key_feeds_pool_and_reprobes(
+        self, hpca_home, fake_keyed_discovery, fake_probe, fake_pool_probe
+    ):
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("m")
+            await app.screen.workers.wait_for_complete()
+            await pilot.pause()
+            app.screen.query_one("#llm-discovered", ListView).focus()
+            await pilot.press("a")  # manual add form
+            await pilot.pause()
+            assert isinstance(app.screen, BackendFormScreen)
+            app.screen.query_one("#backend-url", Input).value = (
+                "http://localhost:52000/v1"
+            )
+            app.screen.query_one("#backend-key", Input).value = "goodkey"
+            app.screen.query_one("#backend-url", Input).focus()
+            await pilot.press("enter")
+            await _wait_for_backend(app, pilot)
+            # the manually-typed key joined the pool…
+            assert "goodkey" in app.settings.llm_api_keys
+            # …and its arrival re-probed the leftover 51944 sentinel in place
+            labels = await _wait_for_left_label(app, pilot, "qwen3.6:35B")
+            assert any("qwen3.6:35B" in t for t in labels)

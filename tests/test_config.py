@@ -261,6 +261,40 @@ class TestKnownLLMPorts:
         assert Settings.load(tmp_path / "settings.json").known_llm_ports == [51941]
 
 
+class TestLLMKeyPool:
+    def test_default_empty(self):
+        assert Settings().llm_api_keys == []
+
+    def test_remember_appends_new_key_and_reports_change(self):
+        s = Settings()
+        assert s.remember_llm_key("sekrit")
+        assert s.llm_api_keys == ["sekrit"]
+
+    def test_remember_duplicate_is_noop(self):
+        s = Settings()
+        s.remember_llm_key("sekrit")
+        assert not s.remember_llm_key("sekrit")
+        assert s.llm_api_keys == ["sekrit"]
+
+    def test_remember_none_is_noop(self):
+        s = Settings()
+        assert not s.remember_llm_key(None)
+        assert s.llm_api_keys == []
+
+    def test_remember_empty_string_is_noop(self):
+        s = Settings()
+        assert not s.remember_llm_key("")
+        assert s.llm_api_keys == []
+
+    def test_roundtrip(self, tmp_path):
+        s = Settings()
+        s.remember_llm_key("key-a")
+        s.remember_llm_key("key-b")
+        s.save(tmp_path / "settings.json")
+        loaded = Settings.load(tmp_path / "settings.json")
+        assert loaded.llm_api_keys == ["key-a", "key-b"]
+
+
 class TestMemoryScopeBudget:
     """Redesign §6.4: one token budget on the injected system-prompt scope."""
 

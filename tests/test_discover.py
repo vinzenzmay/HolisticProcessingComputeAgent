@@ -118,6 +118,45 @@ class TestProbeEndpoint:
         assert len(backends) == 1
         assert backends[0].needs_key is True
 
+    async def test_api_keys_pool_accepts_matching_key(self):
+        # Only "good" unlocks the endpoint; the pool is tried after the
+        # unauthenticated probe comes back 401.
+        def handler(request):
+            if request.headers.get("Authorization") == "Bearer good":
+                return httpx.Response(200, json=VLLM_MODELS)
+            return httpx.Response(401, json={"error": "unauthorized"})
+
+        backends = await probe_endpoint(
+            "http://localhost:1/v1",
+            api_keys=["bad1", "good", "bad2"],
+            transport=httpx.MockTransport(handler),
+        )
+        assert len(backends) == 1
+        assert backends[0].model == "Qwen/Qwen3.6-27B-FP8"
+        assert backends[0].needs_key is True
+        assert backends[0].api_key == "good"
+
+    async def test_api_keys_pool_none_work_returns_sentinel(self):
+        backends = await probe_endpoint(
+            "http://localhost:1/v1",
+            api_keys=["nope1", "nope2"],
+            transport=make_probe({"error": "unauthorized"}, status=401),
+        )
+        assert len(backends) == 1
+        assert backends[0].model == "(api key required)"
+        assert backends[0].needs_key is True
+        assert backends[0].api_key is None
+
+    async def test_empty_api_keys_on_401_is_sentinel(self):
+        backends = await probe_endpoint(
+            "http://localhost:1/v1",
+            api_keys=[],
+            transport=make_probe({"error": "unauthorized"}, status=401),
+        )
+        assert len(backends) == 1
+        assert backends[0].model == "(api key required)"
+        assert backends[0].api_key is None
+
 
 @pytest.fixture
 def live_stub():
@@ -145,6 +184,33 @@ def live_stub():
     server.shutdown()
 
 
+@pytest.fixture
+def keyed_stub():
+    """A /v1/models endpoint that 401s unless Bearer 'poolkey' is sent."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            if self.headers.get("Authorization") != "Bearer poolkey":
+                self.send_response(401)
+                self.end_headers()
+                return
+            body = json.dumps(VLLM_MODELS).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield server.server_address[1]
+    server.shutdown()
+
+
 class TestScanLocalPorts:
     async def test_finds_stub_among_closed_ports(self, live_stub):
         ports = range(live_stub - 3, live_stub + 4)
@@ -157,6 +223,26 @@ class TestScanLocalPorts:
     async def test_all_closed_is_empty(self):
         # ports 47-53 in the reserved low range are extremely unlikely bound
         assert await scan_local_ports(range(47, 53)) == []
+
+    async def test_api_keys_threaded_through_to_resolve_locked_port(
+        self, keyed_stub
+    ):
+        ports = range(keyed_stub - 3, keyed_stub + 4)
+        backends = await scan_local_ports(ports, api_keys=["poolkey"])
+        resolved = [
+            b for b in backends if str(keyed_stub) in b.base_url
+        ]
+        assert len(resolved) == 1
+        assert resolved[0].model == "Qwen/Qwen3.6-27B-FP8"
+        assert resolved[0].needs_key is True
+        assert resolved[0].api_key == "poolkey"
+
+    async def test_locked_port_without_pool_is_sentinel(self, keyed_stub):
+        ports = range(keyed_stub - 3, keyed_stub + 4)
+        backends = await scan_local_ports(ports)
+        resolved = [b for b in backends if str(keyed_stub) in b.base_url]
+        assert len(resolved) == 1
+        assert resolved[0].model == "(api key required)"
 
 
 class TestIsReachable:
