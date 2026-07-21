@@ -115,7 +115,7 @@ class TestInterrupt:
         app = HpcaApp(llm=BlockingLLM())
         async with app.run_test(size=(120, 40)) as pilot:
             await send_and_park(app, pilot, "draft with a typo")
-            assert app._busy_turn is not None
+            assert app.active_session.session_id in app._turns
 
             await select_working_indicator(app, pilot)
             assert isinstance(app.screen, ConfirmScreen)
@@ -128,7 +128,7 @@ class TestInterrupt:
 
             chat_input = app.query_one("#chat-input", ChatInput)
             assert chat_input.text == "draft with a typo"  # handed back to edit
-            assert app._busy_turn is None
+            assert app.active_session.session_id not in app._turns
             # the aborted message left the thread: the next turn starts clean
             snap = await app.graph.aget_state(
                 {"configurable": {"thread_id": app.active_session.session_id}}
@@ -144,7 +144,7 @@ class TestInterrupt:
             await pilot.press("n")  # decline
             await pilot.pause()
             assert not isinstance(app.screen, ConfirmScreen)
-            assert app._busy_turn is not None  # still running
+            assert app.active_session.session_id in app._turns  # still running
             assert app._interrupt_worker is None  # nothing fired
             app._llm.release.set()
 

@@ -54,6 +54,40 @@ def severity(used: int, window: int | None) -> str:
     return "ok"
 
 
+class ModelLine(Static):
+    """The model in use for the session on screen, shown at the very top of
+    the chat column so it reads as a property of *this* session rather than a
+    global app setting (it sits directly above the context meter).
+
+    Session-specific: the app repaints it on session switch and whenever the
+    active session's backend changes. Blank/hidden when no session is open,
+    matching the chat input and mode line.
+    """
+
+    DEFAULT_CSS = """
+    ModelLine {
+        height: 1;
+        padding: 0 1;
+        color: $text-muted;
+        background: $boost;
+    }
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__("", **kwargs)
+        self._text = ""
+
+    @property
+    def text(self) -> str:
+        """The line as displayed. Textual keeps rendered content private, so
+        the widget reports its own state rather than tests reading internals."""
+        return self._text
+
+    def set_model(self, model: str) -> None:
+        self._text = f"model: {model}"
+        self.update(Content(self._text))
+
+
 class ContextBar(Static):
     """One line at the top of the chat column, updated after every model call."""
 

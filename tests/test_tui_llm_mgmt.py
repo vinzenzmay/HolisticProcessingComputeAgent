@@ -402,7 +402,7 @@ class TestSwitcher:
             await pilot.pause()
             assert isinstance(app.screen, SwitchLLMScreen)
 
-    async def test_switch_sets_the_sessions_backend_and_topbar(
+    async def test_switch_sets_the_sessions_backend_and_model_line(
         self, hpca_home, fake_discovery
     ):
         settings = Settings()
@@ -422,8 +422,11 @@ class TestSwitcher:
             assert QWEN.model in app.active_session.backend
             assert app.settings.llm.model == "qwen3-6b"  # bootstrap untouched
             from hpca.tui.app import TopBar
+            from hpca.tui.context_bar import ModelLine
 
-            assert QWEN.model in app.query_one(TopBar).render_text()
+            # The model shows in the chat-column model line, not the top bar.
+            assert QWEN.model in app.query_one(ModelLine).text
+            assert QWEN.model not in app.query_one(TopBar).render_text()
 
     async def test_switch_escape_changes_nothing(self, hpca_home, fake_discovery):
         settings = Settings()

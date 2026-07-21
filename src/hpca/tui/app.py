@@ -122,7 +122,7 @@ from hpca.tui.approval_screen import (
     approval_title,
 )
 from hpca.tui.confirm_screen import ConfirmScreen
-from hpca.tui.context_bar import ContextBar
+from hpca.tui.context_bar import ContextBar, ModelLine
 from hpca.tui.inspect_screen import InspectScreen, format_job, format_process
 from hpca.tui.manage_llms import ManageLLMsScreen
 from hpca.tui.mode_bar import ModeBar
@@ -171,6 +171,14 @@ def format_started(started_at: str) -> str:
 SESSION_TITLE_MAX = 40
 UNTITLED_SESSION = "untitled"  # placeholder until the first message names it
 
+# Sidebar in-flight marker (stage 3 / decision 6): prefixed on the row of any
+# session with a live TurnState, so an OFF-SCREEN session that is still working
+# is visible. A stable glyph (not an animated spinner) — appears/clears reliably
+# and needs no timer. Distinct from the "! " pending-decision mark so the two do
+# not collide; when a row is somehow both, the "! " decision mark wins (a
+# decision needs the user, working is transient — see _session_row_text).
+WORKING_MARK = "⟳ "
+
 # Interrupt-while-waiting-for-the-LLM (§ interrupt): the activity string the
 # graph reports while a turn is parked on the model — the one phase the
 # interrupt is armed in. The user aborts it by selecting the working indicator
@@ -196,6 +204,26 @@ class PendingWork:
     kind: str  # "user" — typed and waiting | "event" — background completion
 
 
+@dataclass
+class TurnState:
+    """Everything one in-flight turn owns, kept per session so turns on
+    different sessions never read each other's client, context, memory,
+    interrupt bookkeeping, or activity.
+
+    A session "has a turn in flight" ⇔ its session_id is a key in
+    ``HpcaApp._turns``. Cleared wholesale in ``_agent_turn``'s finally block.
+    """
+
+    session: "Session"
+    worker: Any = None
+    ctx: "ToolContext | None" = None
+    memory: "Profile | None" = None       # that turn's frozen profile snapshot
+    skills: "list[Skill] | None" = None
+    interrupt_keep: int | None = None
+    interrupt_text: str | None = None
+    activity: str = "working"             # what the spinner says (decision 7)
+
+
 # Chat commands ("/" or "\"): typing the prefix lists these above the entry.
 COMMANDS = (
     ("memorize", "/memorize <note> — form memories from the note and this conversation"),
@@ -214,24 +242,27 @@ LOG_KINDS = {
 
 
 class TopBar(Static):
-    """Top bar: app name | profile | model | settings hint."""
+    """Top bar: app name | profile | settings hint.
+
+    The per-session model moved to a dedicated line at the top of the chat
+    column (``ModelLine``); it belongs to the session on screen, not to the
+    app as a whole. ``profile`` stays here (it is also echoed on each sidebar
+    row).
+    """
 
     def __init__(self) -> None:
         super().__init__(id="top-bar")
         self._profile = ""
-        self._model = ""
 
-    def update_info(self, profile: str, model: str) -> None:
+    def update_info(self, profile: str) -> None:
         self._profile = profile
-        self._model = model
         self.update(self.render_text())
 
     def render_text(self) -> str:
         from hpca import __version__
 
         return (
-            f" HPCA v{__version__} │ profile: {self._profile} │ "
-            f"model: {self._model} │ (c) config"
+            f" HPCA v{__version__} │ profile: {self._profile} │ (c) config"
         )
 
 
@@ -677,6 +708,11 @@ class ChatPanel(ColumnPanel):
 
     def compose(self) -> ComposeResult:
         yield Static(self._title, classes="column-title")
+        # The model in use for the on-screen session, on its own row directly
+        # above the context meter. Hidden until a session is open.
+        model_line = ModelLine(id="model-line")
+        model_line.display = False
+        yield model_line
         yield ContextBar(id="context-bar")
         yield ChatList(id="chat-list")
         menu = Static(id="command-menu")
@@ -849,6 +885,15 @@ class HpcaApp(App):
     #sessions-list > ListItem.session-pending {
         border: round $warning;
     }
+    /* A turn is in flight for this session (stage 3 / decision 6): frame it in
+       accent and prefix its label with the working glyph, so an OFF-SCREEN
+       session that is still working is visible. Listed LAST so, of equal CSS
+       specificity, a live turn's accent border wins over a stale
+       session-updated success frame while the turn runs; it clears (revealing
+       any success frame) the moment the turn ends. */
+    #sessions-list > ListItem.session-working {
+        border: round $accent;
+    }
     """
 
     # RESERVED HOTKEYS — do NOT bind these anywhere in the TUI (they are eaten
@@ -926,20 +971,18 @@ class HpcaApp(App):
         self._log: SessionLog | None = None
         self._untitled: set[str] = set()  # sessions awaiting their first title
         self._updated: set[str] = set()  # replies that landed while switched away
-        self._busy_turn: Session | None = None  # the one turn in flight, if any
-        self._turn_worker = None  # handle to the in-flight turn, for cancelling
+        # In-flight turns, keyed by session_id. Turns on different sessions run
+        # concurrently (per-session backends, separate checkpoint keys); a
+        # session "has a turn in flight" ⇔ its id is a key here. Replaces the
+        # old app-wide singletons (_busy_turn/_turn_worker/_turn_ctx/…) so two
+        # live turns never read each other's client, context or interrupt state.
+        self._turns: dict[str, TurnState] = {}
         self._interrupt_worker = None  # the rollback worker after a 3s hold
-        # Interrupt bookkeeping for the in-flight turn: the message count to
-        # roll back to, and the user's text to hand back for editing. Set only
-        # for a fresh user message (not a resume/event), which is what "adjust
-        # the last prompt" means.
-        self._interrupt_keep: int | None = None
-        self._interrupt_text: str | None = None
-        # Work waiting for the orchestrator: messages the user typed while a
-        # turn was running, and background completions reporting in. Exactly
-        # one turn runs at a time — two on one thread_id would interleave
-        # checkpoint writes — so anything arriving mid-turn waits here rather
-        # than being refused. Drained in order, one item per pass.
+        # Work waiting for a session's orchestrator: messages the user typed
+        # while that session's turn was running, and background completions
+        # reporting in. Same-session turns still serialise — two on one
+        # thread_id would interleave checkpoint writes — so anything arriving
+        # for a busy session waits here; other sessions start straight away.
         self._pending_work: list[PendingWork] = []
         # Sessions whose thread is parked on a destructive-op approval. Their
         # queued messages wait for the resume; other sessions are unaffected.
@@ -951,9 +994,6 @@ class HpcaApp(App):
         # hides the right prompt without losing a decision left behind.
         self._pending_decision: dict[str, dict] = {}
         self._shutting_down = False
-        self._turn_ctx: ToolContext | None = None  # that turn's tool context
-        self._turn_memory: Profile | None = None  # that turn's profile memories
-        self._turn_skills: list[Skill] | None = None  # that turn's skills
         # Frozen per-session memory views (redesign Phase 1): one snapshot per
         # profile, reused across turns so the system-prompt prefix stays
         # byte-stable for the backend's prefix cache. Refreshed on approved
@@ -967,11 +1007,15 @@ class HpcaApp(App):
         # measured prompt size (per session — a different thread is a
         # different context).
         self._discovered_window: int | None = None
-        self._context_used = 0
+        # The last measured prompt size per session (thread_id → prompt_tokens).
+        # A background turn updates its own entry silently; the meter on screen
+        # always reflects the active session's number (decision 9), so switching
+        # to a session that ran off-screen shows its current fill, not a stale
+        # zero or another session's count.
+        self._context_used: dict[str, int] = {}
         # Panel labels by pid: describe() reads a script off disk, and the
         # script behind a finished process never changes.
         self._process_labels: dict[int, str] = {}
-        self._activity = "working"
         self._conn = None
         self._saver_ctx = None
 
@@ -1035,6 +1079,7 @@ class HpcaApp(App):
             self.notify(f"Trash: cleaned up {removed} expired entr"
                         f"{'y' if removed == 1 else 'ies'}")
         self._refresh_top_bar()
+        self._refresh_model_line()
         self._refresh_context_bar()
         self.run_worker(self._discover_context_window(), group="llm-probe")
         await self._reload_sessions()
@@ -1126,19 +1171,25 @@ class HpcaApp(App):
         worth it."""
         self._memory_snapshots.pop(profile, None)
 
-    def _render_system_prompt(self) -> str:
+    def _render_system_prompt(self, session_id: str | None = None) -> str:
         """Per-call prompt assembly (§4.3): memories, skills, dynamic facts.
 
-        A running turn reads its own session's profile memories, which may
-        not be the profile on screen."""
-        memory = (
-            self._turn_memory
-            if self._turn_memory is not None
-            else self._memory_snapshot(self.profile)
-        )
-        skills = self._turn_skills if self._turn_skills is not None else self.skills
+        Rendered for the running session (``session_id``), so a background
+        turn reads its own session's profile memories and tags with its own
+        model, not the profile/model on screen. Falls back to the on-screen
+        defaults for the session with no live turn."""
+        ts = self._turns.get(session_id) if session_id is not None else None
+        if ts is not None:
+            memory = ts.memory if ts.memory is not None else (
+                self._memory_snapshot(ts.session.profile)
+            )
+            skills = ts.skills if ts.skills is not None else self.skills
+            backend = self._model_of(ts.session)
+        else:
+            memory = self._memory_snapshot(self.profile)
+            skills = self.skills
+            backend = self._active_model()
         cap = self.settings.memory.system_prompt_token_cap
-        backend = self._active_model()
         return orchestrator_system_prompt(
             system_prompt_memories=memory.system_prompt_text(active_backend=backend),
             memory_meter=memory.usage_meter(cap),
@@ -1200,10 +1251,16 @@ class HpcaApp(App):
             return
         if text.startswith(("\\", "/")):
             # Slash commands act on the UI and run their own exclusive
-            # workers; they are not turns and are not queued.
-            if self._busy_turn is not None:
+            # workers; they are not turns and are not queued. Refused only
+            # while THIS session's own turn is running (a background turn in
+            # another session leaves the open session free to run a command).
+            active_busy = (
+                self.active_session is not None
+                and self.active_session.session_id in self._turns
+            )
+            if active_busy:
                 self.notify(
-                    f"Still working in “{self._busy_turn.title}” — "
+                    f"Still working in “{self.active_session.title}” — "
                     "commands wait for that reply.",
                     severity="warning",
                 )
@@ -1220,7 +1277,9 @@ class HpcaApp(App):
         self.warn_about_struggles(text)
         # The message is accepted either way; only its turn may have to wait.
         # It goes in the transcript now so typing ahead looks like it worked.
-        queued = self._busy_turn is not None
+        # Queued only when THIS session already has a turn in flight — a turn
+        # busy in another session no longer blocks this one (concurrent turns).
+        queued = self.active_session.session_id in self._turns
         await self._append_chat("queued" if queued else "user", text)
         self._pending_work.append(
             PendingWork(
@@ -1320,16 +1379,24 @@ class HpcaApp(App):
 
     # ------------------------------------------------- interrupt the model
 
+    def _active_turn(self) -> "TurnState | None":
+        """The TurnState of the session on screen, if it has a turn in flight.
+        Interrupt and the visible spinner both target only this — a background
+        turn in another session is never interruptible from here (decision 8)."""
+        if self.active_session is None:
+            return None
+        return self._turns.get(self.active_session.session_id)
+
     def _can_interrupt(self) -> bool:
         """Only while the active session's own user turn is parked on the LLM —
         the one phase where telling the backend to stop makes sense, and the
         only case with a prompt to hand back."""
+        ts = self._active_turn()
         return (
-            self._activity == LLM_WAIT_ACTIVITY
-            and self._busy_turn is not None
-            and self._interrupt_text is not None
-            and self._interrupt_keep is not None
-            and self._is_active_session(self._busy_turn)
+            ts is not None
+            and ts.activity == LLM_WAIT_ACTIVITY
+            and ts.interrupt_text is not None
+            and ts.interrupt_keep is not None
         )
 
     def _maybe_interrupt_llm(self) -> None:
@@ -1352,15 +1419,16 @@ class HpcaApp(App):
 
     def _fire_interrupt(self) -> None:
         """Capture what the interrupt needs and roll the turn back off the main
-        loop — the message comes back to the entry for editing."""
-        session = self._busy_turn
-        keep = self._interrupt_keep
-        text = self._interrupt_text
-        worker = self._turn_worker
-        if session is None or keep is None or text is None:
+        loop — the message comes back to the entry for editing. Operates on the
+        active session's turn only (decision 8)."""
+        ts = self._active_turn()
+        if ts is None or ts.interrupt_keep is None or ts.interrupt_text is None:
             return
         self._interrupt_worker = self.run_worker(
-            self._interrupt_turn(session, keep, text, worker), group="interrupt"
+            self._interrupt_turn(
+                ts.session, ts.interrupt_keep, ts.interrupt_text, ts.worker
+            ),
+            group="interrupt",
         )
 
     async def _interrupt_turn(self, session, keep, text, worker) -> None:
@@ -1372,7 +1440,8 @@ class HpcaApp(App):
                 await worker.wait()  # let the cancellation unwind before we edit
             except (Exception, asyncio.CancelledError):
                 pass
-        self._busy_turn = None
+        self._turns.pop(session.session_id, None)
+        self._refresh_session_row(session.session_id)  # clear the working marker
         self.hide_working()
         try:
             surviving = await rollback_thread(
@@ -1408,17 +1477,17 @@ class HpcaApp(App):
         # resume it while a differently-profiled session is open on screen.
         # The snapshot is frozen per session (not reloaded per turn) so the
         # prompt prefix stays cacheable; approved writes refresh it.
-        self._turn_memory = self._memory_snapshot(session.profile)
+        turn_memory = self._memory_snapshot(session.profile)
         if session.profile == self.profile:
-            self.profile_memory = self._turn_memory
-        self._turn_skills = load_skills(session.profile)
+            self.profile_memory = turn_memory
+        turn_skills = load_skills(session.profile)
         # Recalled memory and the volatile date/time both ride on the API copy
         # of the user message — the model is warned in-context, the stored
         # transcript stays clean, and (unlike the system prompt) the tail is
         # where changing content belongs so the cacheable prefix survives.
         api_content = None
         if user_text is not None:
-            lines = self._recall_lines(user_text, self._turn_memory, session.profile)
+            lines = self._recall_lines(user_text, turn_memory, session.profile)
             block = build_memory_context(
                 lines,
                 max_notes=self.settings.memory.rag_prefetch_count,
@@ -1428,17 +1497,27 @@ class HpcaApp(App):
                 user_text, block, environment_facts()
             )
         log = open_log(self.settings, session)
-        self._busy_turn = session
-        # A fresh user message can be interrupted and re-edited (§ interrupt);
-        # a resume/event has no prompt to hand back, so it arms nothing.
-        self._interrupt_text = user_text
-        self._interrupt_keep = None  # filled once we know the pre-turn count
-        self._turn_ctx = self._make_tool_ctx(session, log)
+        # Everything this turn owns lives in its own TurnState, keyed by
+        # session, so a concurrent turn in another session never reads it.
+        ts = TurnState(
+            session=session,
+            ctx=self._make_tool_ctx(session, log, skills=turn_skills),
+            memory=turn_memory,
+            skills=turn_skills,
+            # A fresh user message can be interrupted and re-edited (§ interrupt);
+            # a resume/event has no prompt to hand back, so it arms nothing.
+            interrupt_text=user_text,
+            interrupt_keep=None,  # filled once we know the pre-turn count
+        )
+        self._turns[session.session_id] = ts
+        # Light the sidebar in-flight marker — works whether or not this
+        # session is on screen (decision 6).
+        self._refresh_session_row(session.session_id)
         if self._is_active_session(session):
             # the UI's context (process list, registry) stays the turn's twin
-            self._tool_ctx = self._turn_ctx
+            self._tool_ctx = ts.ctx
             self.show_working()
-        self._turn_worker = self.run_worker(
+        ts.worker = self.run_worker(
             self._agent_turn(
                 session,
                 user_text=user_text,
@@ -1446,9 +1525,11 @@ class HpcaApp(App):
                 log=log,
                 api_content=api_content,
             ),
-            exclusive=True,
+            # Per-session group (not exclusive): a session's own new turn still
+            # cannot double-run, but a turn in another session is untouched.
+            group=f"turn-{session.session_id}",
         )
-        return self._turn_worker
+        return ts.worker
 
     def _chat_list(self) -> ListView | None:
         """The chat column, or None once the screen is gone.
@@ -1461,12 +1542,17 @@ class HpcaApp(App):
         return found.first(ListView) if found else None
 
     def show_working(self) -> None:
-        """Put the spinner after the last message: a reply is on its way."""
+        """Put the spinner after the last message: a reply is on its way.
+
+        Seeded from the active session's own turn activity, so re-opening a
+        busy session shows what that turn is doing, not a stale global."""
         chat_list = self._chat_list()
         if chat_list is None:
             return
+        ts = self._active_turn()
+        activity = ts.activity if ts is not None else "working"
         if not chat_list.query(WorkingIndicator):
-            chat_list.append(ChatItem(WorkingIndicator(self._activity)))
+            chat_list.append(ChatItem(WorkingIndicator(activity)))
             chat_list.scroll_end(animate=False)
 
     def hide_working(self) -> None:
@@ -1477,11 +1563,22 @@ class HpcaApp(App):
             if item.query(WorkingIndicator):
                 item.remove()
 
-    def report_activity(self, activity: str) -> None:
-        """What the graph is doing right now, for the spinner to say."""
-        self._activity = activity  # survives leaving and re-opening the session
-        for indicator in self.query(WorkingIndicator):
-            indicator.set_activity(activity)
+    def report_activity(self, session_id: str, activity: str) -> None:
+        """What a session's turn is doing right now, for the spinner to say.
+
+        Recorded on that turn's own TurnState (so it survives leaving and
+        re-opening the session), but only the visible chat's spinner is
+        updated — a background turn never touches a chat the user is not
+        looking at (decision 7)."""
+        ts = self._turns.get(session_id)
+        if ts is not None:
+            ts.activity = activity
+        if (
+            self.active_session is not None
+            and self.active_session.session_id == session_id
+        ):
+            for indicator in self.query(WorkingIndicator):
+                indicator.set_activity(activity)
 
     async def _agent_turn(
         self,
@@ -1495,12 +1592,15 @@ class HpcaApp(App):
         # The point to roll the thread back to if this turn is interrupted:
         # captured before run_turn appends the user message (§ interrupt).
         if user_text is not None:
+            ts = self._turns.get(session.session_id)
             try:
-                self._interrupt_keep = await thread_message_count(
+                keep = await thread_message_count(
                     self.graph, session_id=session.session_id
                 )
             except Exception:
-                self._interrupt_keep = None
+                keep = None
+            if ts is not None:
+                ts.interrupt_keep = keep
         try:
             result = await run_turn(
                 self.graph,
@@ -1520,13 +1620,13 @@ class HpcaApp(App):
             self.notify(str(e), severity="error")
             return
         finally:
-            self._busy_turn = None
-            self._turn_worker = None
-            self._interrupt_keep = None
-            self._interrupt_text = None
-            self._turn_ctx = None
-            self._turn_memory = None
-            self._turn_skills = None
+            # Drop this session's turn wholesale — everything the old finally
+            # block cleared lived on the TurnState and goes with it.
+            self._turns.pop(session.session_id, None)
+            # Clear the sidebar in-flight marker now the turn is gone (works
+            # off-screen too; a pending decision, set just below, repaints its
+            # own "!").
+            self._refresh_session_row(session.session_id)
             # Whatever queued up behind this turn starts as soon as this
             # handler unwinds, rather than waiting for the next timer tick.
             self.call_later(self.drain_work)
@@ -1700,18 +1800,15 @@ class HpcaApp(App):
             return self.settings.agent.default_mode
         return session.mode or self.settings.agent.default_mode
 
-    def _turn_mode(self) -> str:
-        """The mode the graph obeys this round — for the turn in flight if
-        there is one, else the open session. Read fresh from the store so
-        cycling the mode mid-turn applies to the very next round instead of
-        a stale Session copy."""
-        session = (
-            self._busy_turn if self._busy_turn is not None else self.active_session
-        )
-        if session is None:
-            return self.settings.agent.default_mode
-        fresh = self.session_store.get(session.session_id)
-        return self._mode_of(fresh if fresh is not None else session)
+    def _mode_for_turn(self, session_id: str) -> str:
+        """The mode the graph obeys this round for the session running
+        ``session_id``. Read fresh from the store so cycling the mode mid-turn
+        applies to the very next round instead of a stale Session copy."""
+        fresh = self.session_store.get(session_id)
+        if fresh is not None:
+            return self._mode_of(fresh)
+        ts = self._turns.get(session_id)
+        return self._mode_of(ts.session if ts is not None else None)
 
     def action_cycle_mode(self) -> None:
         session = self.active_session
@@ -2246,9 +2343,14 @@ class HpcaApp(App):
         self,
         session: Session,
         log: SessionLog | None,
+        *,
+        skills: "list[Skill] | None" = None,
     ) -> ToolContext:
         """A tool context bound to one session and its transcript, so a turn
-        keeps its own registry, runner and log however the UI moves on."""
+        keeps its own registry, runner and log however the UI moves on.
+
+        ``skills`` is the running turn's frozen skill set; the on-screen
+        session (no turn) falls back to ``self.skills``."""
         ctx = ToolContext(
             registry=PathRegistry(
                 self._conn, profile=session.profile, session_id=session.session_id
@@ -2271,7 +2373,7 @@ class HpcaApp(App):
             rag=self.rag_store,
             embedder=self.embedder,
             episodic=self.episodic,
-            skills=self._turn_skills if self._turn_skills is not None else self.skills,
+            skills=skills if skills is not None else self.skills,
             queue_memory_edits=lambda operations: self._queue_memory_edits(
                 session.session_id, operations
             ),
@@ -2296,6 +2398,7 @@ class HpcaApp(App):
         self._refresh_mode_bar()
         # The top bar and context meter follow the opened session's LLM.
         self._refresh_top_bar()
+        self._refresh_model_line()
         self._refresh_context_bar()
         if self._log is not None:
             self._log.write(
@@ -2390,6 +2493,7 @@ class HpcaApp(App):
             if changed:
                 self._refresh_session_log()
                 self._refresh_top_bar()
+                self._refresh_model_line()
                 self._refresh_context_bar()
                 await self._reload_sessions()
         else:
@@ -2402,7 +2506,6 @@ class HpcaApp(App):
                 )
             )
             await self._set_chat_messages([])
-            self._context_used = 0
             bar = self._context_bar()
             if bar is not None:
                 bar.reset()  # a fresh thread starts from an empty window
@@ -2524,6 +2627,10 @@ class HpcaApp(App):
         # A parked thread and its inline decision go with the session.
         self._awaiting_approval.discard(session.session_id)
         self._pending_decision.pop(session.session_id, None)
+        # Stage-2 leftover: drop this session's stored context number, and any
+        # live turn defensively, so nothing leaks past the delete.
+        self._context_used.pop(session.session_id, None)
+        self._turns.pop(session.session_id, None)
         self.session_store.delete(session.session_id)
         # Patient-data environment: a deleted conversation must not resurface
         # through episodic search either.
@@ -2545,7 +2652,15 @@ class HpcaApp(App):
         bar = self._context_bar()
         if bar is None:
             return
-        self._context_used = 0
+        # A measured number for this session (its own turn, foreground or
+        # background, already reported one) always supersedes an estimate.
+        session_id = (
+            self.active_session.session_id if self.active_session else None
+        )
+        measured = self._context_used.get(session_id) if session_id else None
+        if measured:
+            bar.set_used(measured)
+            return
         messages = list(values.get("messages", []))
         compacted = values.get("compacted")
         if compacted:
@@ -2557,16 +2672,21 @@ class HpcaApp(App):
 
     async def close_session(self) -> None:
         """Leave the active session: empty chat, no entry, nothing to type in."""
+        # Deliberately leaving drops the measured number, so reopening re-derives
+        # the fill from the stored history (which reflects compaction and any
+        # growth since); a running turn re-stores its count when it reports.
+        if self.active_session is not None:
+            self._context_used.pop(self.active_session.session_id, None)
         self.active_session = None
         self._tool_ctx = None
         self._log = None
-        self._context_used = 0
         bar = self._context_bar()
         if bar is not None:
             bar.reset()
         await self._set_chat_messages([])
         self.query_one("#chat-input", ChatInput).display = False
         self._refresh_mode_bar()
+        self._refresh_model_line()  # no session: hide the model line
         await self._sync_decision_bar()  # no session: nothing to decide inline
         self._focus_column("sessions")
 
@@ -2589,10 +2709,7 @@ class HpcaApp(App):
             row_session = getattr(item, "data_session", None)
             if row_session is not None and row_session.session_id == session.session_id:
                 item.remove_class("session-updated")
-        if (
-            self._busy_turn is not None
-            and self._busy_turn.session_id == session.session_id
-        ):
+        if session.session_id in self._turns:
             self.show_working()  # its turn is still in flight
         # Reveal (or hide) whatever decision this session was left waiting on.
         await self._sync_decision_bar()
@@ -2619,6 +2736,8 @@ class HpcaApp(App):
             item.set_class(
                 session.session_id in self._pending_decision, "session-pending"
             )
+            # A full rebuild mid-turn keeps the in-flight marker on live rows.
+            item.set_class(session.session_id in self._turns, "session-working")
             items.append(item)
         sessions_list.extend(items)
         # A ListView filled after mount has no cursor, and without one Enter
@@ -2642,18 +2761,32 @@ class HpcaApp(App):
 
     def _session_row_text(self, session: Session) -> Content:
         """One sidebar row's label: the title, its profile tag, and a leading
-        "!" when the session is waiting on a decision (deliverable 2), so a
-        user working elsewhere sees the choice pending in another session."""
+        marker. A "!" when the session is waiting on a decision (deliverable 2),
+        else the working glyph while a turn is in flight (stage 3 / decision 6),
+        so a user working elsewhere sees a choice pending — or an off-screen
+        turn still running — in another session. The decision mark takes
+        precedence: it needs the user, whereas working is transient (in normal
+        flow the two never coexist — a parked turn has left ``_turns``)."""
         tag = (
             f"  · {session.profile}" if session.profile != DEFAULT_PROFILE else ""
         )
-        mark = "! " if session.session_id in self._pending_decision else ""
+        if session.session_id in self._pending_decision:
+            mark = "! "
+        elif session.session_id in self._turns:
+            mark = WORKING_MARK
+        else:
+            mark = ""
         return Content(f"{mark}{session.title}{tag}")
 
     def _refresh_session_row(self, session_id: str) -> None:
-        """Repaint one row's label and pending class from live state — used
-        when a decision appears or is answered, without a full list reload."""
-        for item in self.query_one("#sessions-list", ListView).children:
+        """Repaint one row's label, pending class, and working class from live
+        state — used when a decision appears/answers or a turn starts/ends,
+        without a full list reload. Guarded: it now fires on every turn end,
+        including while the screen is tearing down after a turn finished late."""
+        found = self.query("#sessions-list")
+        if not found:
+            return
+        for item in found.first(ListView).children:
             row_session = getattr(item, "data_session", None)
             if row_session is not None and row_session.session_id == session_id:
                 label = item.query(Label)
@@ -2662,6 +2795,7 @@ class HpcaApp(App):
                 item.set_class(
                     session_id in self._pending_decision, "session-pending"
                 )
+                item.set_class(session_id in self._turns, "session-working")
                 return
 
     def _is_active_session(self, session: Session | None) -> bool:
@@ -2839,39 +2973,45 @@ class HpcaApp(App):
         )
 
     async def drain_work(self) -> None:
-        """Start the next waiting turn, if the orchestrator is free.
+        """Start the next waiting item for every session that is free to run.
 
-        One item per pass: concurrent ainvoke on a thread would interleave
-        checkpoint writes, and draining a burst all at once would stack model
-        calls anyway. Called when work arrives and again when a turn ends, so
-        the queue does not sit waiting for the next timer tick.
+        Turns on different sessions run concurrently, so this no longer bails
+        when "anything is busy": it walks the queue and starts the first item
+        for each session that is not already running a turn and not parked on
+        an approval. Same-session serialisation is preserved — a session with
+        a turn in flight (or one already started this pass) is skipped, so two
+        turns never interleave checkpoint writes on one thread_id.
         """
-        if self._busy_turn is not None or self._shutting_down:
+        if self._shutting_down:
             return
-        # A session parked on an approval has a thread mid-interrupt; its next
-        # message must wait for the resume, but other sessions need not.
-        index = next(
-            (
-                i
-                for i, work in enumerate(self._pending_work)
-                if work.session_id not in self._awaiting_approval
-            ),
-            None,
-        )
-        if index is None:
-            return
-        item = self._pending_work.pop(index)
-        try:
-            if item.kind == "user":
-                session = self.session_store.get(item.session_id)
-                if session is not None:
-                    if self._is_active_session(session):
-                        await self._promote_queued_entry(item.text)
-                    self._run_agent(session, user_text=item.text)
-            else:
-                await self._deliver_event(item.session_id, item.text)
-        except Exception as e:
-            self.notify(f"Queued work failed: {e}", severity="error")
+        started: set[str] = set()
+        # Snapshot: _run_agent mutates self._turns, and _deliver_event awaits;
+        # iterate a copy and remove drained items by identity.
+        for item in list(self._pending_work):
+            if item not in self._pending_work:
+                continue
+            sid = item.session_id
+            # Skip a session already running a turn, one parked on an approval,
+            # or one we already started an item for earlier in this same pass.
+            if (
+                sid in self._turns
+                or sid in started
+                or sid in self._awaiting_approval
+            ):
+                continue
+            self._pending_work.remove(item)
+            started.add(sid)
+            try:
+                if item.kind == "user":
+                    session = self.session_store.get(sid)
+                    if session is not None:
+                        if self._is_active_session(session):
+                            await self._promote_queued_entry(item.text)
+                        self._run_agent(session, user_text=item.text)
+                else:
+                    await self._deliver_event(sid, item.text)
+            except Exception as e:
+                self.notify(f"Queued work failed: {e}", severity="error")
 
     async def _promote_queued_entry(self, text: str) -> None:
         """A queued message is starting: show it as sent rather than waiting."""
@@ -3295,7 +3435,7 @@ class HpcaApp(App):
         or while any of its sessions has a live sub-process — deleting it then
         would strand running work under a gone profile.
         """
-        if self._busy_turn is not None and self._busy_turn.profile == name:
+        if any(ts.session.profile == name for ts in self._turns.values()):
             return f"“{name}” has a reply in progress — wait for it to finish."
         session_ids = {
             session.session_id
@@ -3360,18 +3500,21 @@ class HpcaApp(App):
 
     def switch_backend(self, backend: LLMBackend) -> None:
         """Point the open session at a different configured backend."""
-        if self._busy_turn is not None:
+        if self.active_session is None:
+            return
+        # Refuse only if THIS session is mid-turn; a background turn in another
+        # session does not block switching the open session's backend.
+        if self.active_session.session_id in self._turns:
             self.notify(
                 "The agent is mid-reply — switch backends once it finishes.",
                 severity="warning",
             )
             return
-        if self.active_session is None:
-            return
         blob = backend.model_dump_json()
         self.session_store.set_backend(self.active_session.session_id, blob)
         self.active_session.backend = blob
         self._refresh_top_bar()
+        self._refresh_model_line()
         self._refresh_context_bar()
         self._refresh_session_log()  # rebind the tool context to the new client
         self.notify(f"This session now uses {backend.model}")
@@ -3382,7 +3525,9 @@ class HpcaApp(App):
         An injected client belongs to whoever passed it in (tests, embedding
         hosts); only a client we built is ours to replace.
         """
-        if self._busy_turn is not None:
+        # A rebuild swaps the whole graph and bootstrap client, so it must wait
+        # until NO turn is in flight anywhere — not just the active session.
+        if self._turns:
             self.notify(
                 "The agent is mid-reply — the new LLM settings apply "
                 "after this turn.",
@@ -3398,10 +3543,12 @@ class HpcaApp(App):
         self._owns_llm = True
         self._rebuild_graph()
         self._refresh_session_log()  # rebind the tool context to the new client
-        # A different model means a different window, and the token count
-        # measured against the old one no longer describes this one.
+        self._refresh_model_line()  # the bootstrap model may have changed
+        # A different model means a different window, and the token counts
+        # measured against the old one no longer describe it — drop every
+        # session's measurement so each re-measures on its next turn.
         self._discovered_window = None
-        self._context_used = 0
+        self._context_used.clear()
         bar = self._context_bar()
         if bar is not None:
             bar.reset()
@@ -3411,22 +3558,62 @@ class HpcaApp(App):
             self.run_worker(old_llm.close(), group="llm-close")
 
     def _rebuild_graph(self) -> None:
+        # Every per-session dependency is resolved by the invoked thread_id
+        # (session_id), never from an app global, so two live turns on two
+        # sessions each see their own client / context / mode / prompt.
         self.graph = build_graph(
-            # Per-session LLM: the turn resolves its client from whichever
-            # session is running (busy turn), so no rebuild is needed on switch.
-            llm=lambda: self._client_for(self._busy_turn or self.active_session),
+            llm=self._llm_for_turn,
             tools=self._tools,
             checkpointer=self._checkpointer,
-            # a running turn keeps its own context however the UI moves on
-            ctx=lambda: self._turn_ctx if self._turn_ctx is not None else self._tool_ctx,
+            ctx=self._ctx_for_turn,
             system_prompt_fn=self._render_system_prompt,
             max_retries=self.settings.llm.max_retries,
             max_tool_rounds=self.settings.llm.max_tool_rounds,
-            on_activity=lambda activity: self.report_activity(activity),
-            max_model_len=self._active_max_model_len,
-            on_usage=self._on_usage,
-            mode_fn=self._turn_mode,
+            # Wrapped so a late reassignment of report_activity / _on_usage
+            # (tests, hot-swaps) is picked up, rather than freezing the bound
+            # method at build time.
+            on_activity=lambda sid, act: self.report_activity(sid, act),
+            max_model_len=self._max_model_len_for,
+            on_usage=lambda sid, usage: self._on_usage(sid, usage),
+            mode_fn=self._mode_for_turn,
         )
+
+    # ------------------------------------------- per-turn dependency resolvers
+
+    def _turn_session(self, session_id: str) -> Session | None:
+        """The session a turn belongs to, resolvable even after the user has
+        switched away: its live TurnState's session, else the stored session."""
+        ts = self._turns.get(session_id)
+        if ts is not None:
+            return ts.session
+        return self.session_store.get(session_id)
+
+    def _llm_for_turn(self, session_id: str) -> LLMClient:
+        """The client for the session running ``session_id`` — its own backend's
+        client, resolved off the thread_id the graph was invoked with."""
+        return self._client_for(self._turn_session(session_id))
+
+    def _ctx_for_turn(self, session_id: str) -> ToolContext | None:
+        """The running turn's tool context, or the on-screen UI context for the
+        active session with no turn in flight (tests, direct helpers)."""
+        ts = self._turns.get(session_id)
+        if ts is not None:
+            return ts.ctx
+        return self._tool_ctx
+
+    def _max_model_len_for(self, session_id: str) -> int | None:
+        """The context window of the session running ``session_id``, from its
+        backend; the display fallback otherwise."""
+        session = self._turn_session(session_id)
+        backend = self._backend_of(session)
+        if backend is not None:
+            return backend.max_model_len
+        if self._discovered_window is not None:
+            return self._discovered_window
+        for candidate in self.settings.backends:
+            if self.settings.is_active(candidate):
+                return candidate.max_model_len
+        return None
 
     # --------------------------------------------------- per-session LLM
 
@@ -3454,21 +3641,25 @@ class HpcaApp(App):
         return client
 
     def _reads_session(self) -> Session | None:
-        """Whose LLM the display/tagging should reflect right now: the running
-        turn if there is one, else the session on screen."""
-        return self._busy_turn or self.active_session
+        """Whose LLM the display/tagging reflects: always the session on screen.
+        A background turn in another session never moves the top bar or meter."""
+        return self.active_session
+
+    def _model_of(self, session: Session | None) -> str:
+        """The model name a specific session talks to, else the bootstrap."""
+        backend = self._backend_of(session)
+        return backend.model if backend is not None else self.settings.llm.model
 
     def _active_backend(self) -> LLMBackend | None:
         return self._backend_of(self._reads_session())
 
     def _active_model(self) -> str:
-        """The model name to show/tag with: the current session's, else the
+        """The model name to show/tag with: the on-screen session's, else the
         bootstrap model."""
-        backend = self._active_backend()
-        return backend.model if backend is not None else self.settings.llm.model
+        return self._model_of(self._reads_session())
 
     def _active_max_model_len(self) -> int | None:
-        """The current session's context window, from its backend (or the
+        """The on-screen session's context window, from its backend (or the
         bootstrap discovery). Without either, compaction stays off — better
         than guessing a window and folding history needlessly.
         """
@@ -3482,20 +3673,27 @@ class HpcaApp(App):
                 return backend.max_model_len
         return None
 
-    def _on_usage(self, usage: dict) -> None:
-        """The backend's token count for the decision just made.
+    def _on_usage(self, session_id: str, usage: dict) -> None:
+        """The backend's token count for a session's just-made decision.
 
         prompt_tokens is what occupies the window; the completion is spent
         the moment it is generated. Reported per round, so a tool-heavy turn
-        visibly fills the bar as it works.
-        """
+        visibly fills the bar as it works. The count is stored per session
+        ALWAYS — a background turn silently updates its own number so switching
+        to it later shows the current fill — but the visible meter moves only
+        when the reporting session is the one on screen (decision 9)."""
         prompt_tokens = usage.get("prompt_tokens")
         if not prompt_tokens:
             return
-        self._context_used = int(prompt_tokens)
+        self._context_used[session_id] = int(prompt_tokens)
+        if (
+            self.active_session is None
+            or self.active_session.session_id != session_id
+        ):
+            return
         bar = self._context_bar()
         if bar is not None:
-            bar.set_used(self._context_used)
+            bar.set_used(int(prompt_tokens))
 
     def _context_bar(self) -> ContextBar | None:
         found = self.query("#context-bar")
@@ -3506,8 +3704,16 @@ class HpcaApp(App):
         if bar is None:
             return
         bar.set_window(self._active_max_model_len())
-        if self._context_used:
-            bar.set_used(self._context_used)
+        # Bind the meter to the active session's stored number. Non-destructive
+        # otherwise: callers that open/create a session follow with an explicit
+        # estimate or reset, and a session showing only an estimate keeps it
+        # when the async window probe lands.
+        session_id = (
+            self.active_session.session_id if self.active_session else None
+        )
+        used = self._context_used.get(session_id) if session_id else None
+        if used:
+            bar.set_used(used)
 
     async def _discover_context_window(self) -> None:
         """Ask the backend how big its window is, and remember it.
@@ -3553,6 +3759,21 @@ class HpcaApp(App):
         self.push_screen(SettingsScreen(self.settings), apply)
 
     def _refresh_top_bar(self) -> None:
-        self.query_one(TopBar).update_info(
-            profile=self.profile, model=self._active_model()
-        )
+        self.query_one(TopBar).update_info(profile=self.profile)
+
+    def _model_line(self) -> ModelLine | None:
+        found = self.query("#model-line")
+        return found.first(ModelLine) if found else None
+
+    def _refresh_model_line(self) -> None:
+        """The model line atop the chat column: shown with a session and bound
+        to the on-screen session's model, hidden without one (like the mode
+        line and chat entry)."""
+        line = self._model_line()
+        if line is None:
+            return
+        if self.active_session is None:
+            line.display = False
+            return
+        line.display = True
+        line.set_model(self._active_model())
