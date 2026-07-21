@@ -158,19 +158,12 @@ def format_started(started_at: str) -> str:
 SESSION_TITLE_MAX = 40
 UNTITLED_SESSION = "untitled"  # placeholder until the first message names it
 
-# Interrupt-while-waiting-for-the-LLM (§ interrupt): hold esc for this long in
-# the chat window to abort the in-flight request and re-edit the last message.
-# The activity string the graph reports while parked on the model — the one
-# phase the interrupt is armed in.
+# Interrupt-while-waiting-for-the-LLM (§ interrupt): the activity string the
+# graph reports while a turn is parked on the model — the one phase the
+# interrupt is armed in. The user aborts it by selecting the working indicator
+# in the chat log and confirming (see _maybe_interrupt_llm), so the message can
+# be re-edited and sent again.
 LLM_WAIT_ACTIVITY = "LLM processing"
-ESC_INTERRUPT_SECONDS = 3.0
-ESC_TICK_SECONDS = 0.05
-ESC_INTERRUPT_TICKS = int(ESC_INTERRUPT_SECONDS / ESC_TICK_SECONDS)
-# Terminals send no key-release, so a held esc is inferred from its repeat
-# events; if none arrive for this long the hold is treated as released. Longer
-# than a typical key-repeat delay so the first repeat still lands in time.
-ESC_IDLE_SECONDS = 0.75
-ESC_BAR_WIDTH = 24
 CHAT_TITLES = {
     "user": "you",
     "assistant": "agent",
@@ -320,12 +313,6 @@ class ChatInput(TextArea):
                 event.stop()
                 event.prevent_default()
                 return
-        if event.key == "escape" and self.app.handle_esc_hold():
-            # Held esc interrupts the model while it is thinking; consumed only
-            # while that is possible, so a plain esc is otherwise free.
-            event.stop()
-            event.prevent_default()
-            return
         if event.key == "enter":
             event.stop()
             event.prevent_default()
@@ -455,11 +442,15 @@ class WorkingIndicator(Static):
         self._frame = (self._frame + 1) % len(self.FRAMES)
         self._render_frame()
 
-    def _render_frame(self) -> None:
+    def _frame_text(self) -> str:
         elapsed = f" {self.elapsed}s" if self.elapsed else ""
-        self.update(
-            Content(f"{self.FRAMES[self._frame]} {self._activity}…{elapsed}")
-        )
+        # While parked on the model this line is selectable to abort the turn;
+        # say so, mirroring the ThinkingBox's inline "(enter …)" hint.
+        hint = "  (enter to interrupt)" if self._activity == LLM_WAIT_ACTIVITY else ""
+        return f"{self.FRAMES[self._frame]} {self._activity}…{elapsed}{hint}"
+
+    def _render_frame(self) -> None:
+        self.update(Content(self._frame_text()))
 
 
 class ChatList(ListView):
@@ -491,11 +482,6 @@ class ChatPanel(ColumnPanel):
         mode_bar = ModeBar(id="mode-bar")
         mode_bar.display = False
         yield mode_bar
-        # Fills over 3s while esc is held to interrupt the model; hidden
-        # otherwise. Right above the entry, where the eye already is.
-        esc_bar = Static(id="esc-progress")
-        esc_bar.display = False
-        yield esc_bar
         chat_input = ChatInput(placeholder="Message the agent…", id="chat-input")
         chat_input.display = False
         yield chat_input
@@ -635,11 +621,6 @@ class HpcaApp(App):
         color: $text-muted;
         padding: 0 1;
     }
-    #esc-progress {
-        height: 1;
-        color: $warning;
-        padding: 0 1;
-    }
     /* A reply landed in a session the user has left: frame it, never
        force it open. Cleared when the session is opened. */
     #sessions-list > ListItem.session-updated {
@@ -726,10 +707,6 @@ class HpcaApp(App):
         # the last prompt" means.
         self._interrupt_keep: int | None = None
         self._interrupt_text: str | None = None
-        # esc-hold state: the ticking timer, the release watchdog, and progress.
-        self._esc_timer = None
-        self._esc_idle = None
-        self._esc_ticks = 0
         # Work waiting for the orchestrator: messages the user typed while a
         # turn was running, and background completions reporting in. Exactly
         # one turn runs at a time — two on one thread_id would interleave
@@ -1115,59 +1092,31 @@ class HpcaApp(App):
             and self._is_active_session(self._busy_turn)
         )
 
-    def handle_esc_hold(self) -> bool:
-        """One esc key event in the chat entry. Returns whether it was consumed
-        (it is, only while an interrupt is possible). The 3s hold is inferred
-        from esc auto-repeat; each event refreshes the release watchdog."""
+    def _maybe_interrupt_llm(self) -> None:
+        """Selecting the working indicator while the turn waits on the model
+        offers to abort it. The confirm dialog can sit open long enough for the
+        reply to land, so re-check that an interrupt is still possible when it
+        returns before firing (callback form: a message handler is not a
+        worker, so push_screen_wait is unavailable here)."""
         if not self._can_interrupt():
-            return False
-        if self._esc_timer is None:
-            self._esc_ticks = 0
-            self._render_esc_bar()
-            self.query_one("#esc-progress", Static).display = True
-            self._esc_timer = self.set_interval(
-                ESC_TICK_SECONDS, self._advance_esc_hold
-            )
-        if self._esc_idle is not None:
-            self._esc_idle.stop()
-        self._esc_idle = self.set_timer(ESC_IDLE_SECONDS, self._cancel_esc_hold)
-        return True
-
-    def _advance_esc_hold(self) -> None:
-        self._esc_ticks += 1
-        self._render_esc_bar()
-        if self._esc_ticks >= ESC_INTERRUPT_TICKS:
-            self._fire_interrupt()
-
-    def _render_esc_bar(self) -> None:
-        found = self.query("#esc-progress")
-        if not found:
             return
-        filled = min(ESC_BAR_WIDTH, self._esc_ticks * ESC_BAR_WIDTH // ESC_INTERRUPT_TICKS)
-        bar = "█" * filled + "░" * (ESC_BAR_WIDTH - filled)
-        found.first(Static).update(Content(f"hold esc to interrupt  {bar}"))
 
-    def _cancel_esc_hold(self) -> None:
-        """esc released (or the turn ended) before 3s — no interrupt."""
-        if self._esc_timer is not None:
-            self._esc_timer.stop()
-            self._esc_timer = None
-        if self._esc_idle is not None:
-            self._esc_idle.stop()
-            self._esc_idle = None
-        self._esc_ticks = 0
-        found = self.query("#esc-progress")
-        if found:
-            found.first(Static).display = False
+        def resolved(confirmed: bool | None) -> None:
+            if confirmed and self._can_interrupt():
+                self._fire_interrupt()
+
+        self.push_screen(
+            ConfirmScreen("Interrupt the LLM and re-edit your last message?"),
+            resolved,
+        )
 
     def _fire_interrupt(self) -> None:
-        """The 3s hold completed: capture what the interrupt needs, stop the
-        hold UI, and roll the turn back off the main loop."""
+        """Capture what the interrupt needs and roll the turn back off the main
+        loop — the message comes back to the entry for editing."""
         session = self._busy_turn
         keep = self._interrupt_keep
         text = self._interrupt_text
         worker = self._turn_worker
-        self._cancel_esc_hold()
         if session is None or keep is None or text is None:
             return
         self._interrupt_worker = self.run_worker(
@@ -1335,7 +1284,6 @@ class HpcaApp(App):
             self._turn_worker = None
             self._interrupt_keep = None
             self._interrupt_text = None
-            self._cancel_esc_hold()  # a turn that ends drops any pending hold
             self._turn_ctx = None
             self._turn_memory = None
             self._turn_skills = None
@@ -2841,6 +2789,10 @@ class HpcaApp(App):
 
     @on(ListView.Selected, "#chat-list")
     def _on_chat_list_selected(self, event: ListView.Selected) -> None:
+        if event.item.query(WorkingIndicator):
+            # Enter on the "LLM processing" line offers to abort the turn.
+            self._maybe_interrupt_llm()
+            return
         boxes = list(event.item.query(ThinkingBox))
         if boxes:
             boxes[0].toggle()

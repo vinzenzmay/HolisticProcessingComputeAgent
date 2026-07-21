@@ -1,13 +1,24 @@
-"""Hold-esc-3s to interrupt the model while it waits for the LLM (§ interrupt)."""
+"""Interrupt the model by selecting the working indicator and confirming.
+
+While a turn waits on the LLM a "working" line sits at the end of the chat log
+(§ interrupt). Selecting it (enter) opens a yes/no dialog; yes aborts the
+in-flight request and hands the message back for editing, no leaves it running.
+"""
 
 import asyncio
 import json
 
 import pytest
-from textual.widgets import Static
+from textual.widgets import ListView, Static
 
 from hpca.llm import ChatResponse
-from hpca.tui.app import ESC_INTERRUPT_TICKS, ChatInput, HpcaApp
+from hpca.tui.app import (
+    LLM_WAIT_ACTIVITY,
+    ChatInput,
+    HpcaApp,
+    WorkingIndicator,
+)
+from hpca.tui.confirm_screen import ConfirmScreen
 
 
 def is_title_request(json_schema):
@@ -54,38 +65,63 @@ async def send_and_park(app, pilot, text):
     await pilot.pause()
 
 
-class TestArming:
-    async def test_esc_does_nothing_when_idle(self, hpca_home):
-        app = HpcaApp(llm=BlockingLLM())
-        async with app.run_test(size=(120, 40)) as pilot:
-            await app.start_new_session()
-            await pilot.pause()
-            assert app.handle_esc_hold() is False  # not waiting on the LLM
-            assert not app.query_one("#esc-progress", Static).display
+async def select_working_indicator(app, pilot):
+    """Move into the log, land on the working indicator (the last line), and
+    press enter to select it — the real path a user takes."""
+    app.browse_chat_messages()
+    await pilot.pause()
+    await pilot.press("enter")
+    await pilot.pause()
 
-    async def test_esc_arms_while_waiting_on_the_llm(self, hpca_home):
+
+class TestArming:
+    async def test_working_indicator_present_while_waiting(self, hpca_home):
         app = HpcaApp(llm=BlockingLLM())
         async with app.run_test(size=(120, 40)) as pilot:
             await send_and_park(app, pilot, "hello")
             assert app._can_interrupt()
-            assert app.handle_esc_hold() is True
-            assert app.query_one("#esc-progress", Static).display
-            app._cancel_esc_hold()
-            assert not app.query_one("#esc-progress", Static).display
+            assert app.query(WorkingIndicator)  # sits at the end of the log
             app._llm.release.set()
+
+    def test_indicator_hints_at_interrupt_only_while_on_the_llm(self):
+        assert "enter to interrupt" in WorkingIndicator(LLM_WAIT_ACTIVITY)._frame_text()
+        # a tool step or plain "working" is not interruptible: no hint
+        assert "enter to interrupt" not in WorkingIndicator("run_bash")._frame_text()
+        assert "enter to interrupt" not in WorkingIndicator()._frame_text()
+
+    async def test_no_dialog_when_not_waiting_on_the_llm(self, hpca_home):
+        app = HpcaApp(llm=BlockingLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            await pilot.pause()
+            assert not app._can_interrupt()
+            app._maybe_interrupt_llm()  # no-op: nothing to interrupt
+            await pilot.pause()
+            assert not isinstance(app.screen, ConfirmScreen)
 
 
 class TestInterrupt:
-    async def test_hold_to_threshold_fires_the_interrupt(self, hpca_home):
+    async def test_selecting_the_indicator_offers_the_dialog(self, hpca_home):
+        app = HpcaApp(llm=BlockingLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await send_and_park(app, pilot, "hello")
+            await select_working_indicator(app, pilot)
+            assert isinstance(app.screen, ConfirmScreen)
+            await pilot.press("n")  # dismiss so teardown is clean
+            await pilot.pause()
+            app._llm.release.set()
+
+    async def test_confirming_interrupts_and_hands_the_message_back(self, hpca_home):
         app = HpcaApp(llm=BlockingLLM())
         async with app.run_test(size=(120, 40)) as pilot:
             await send_and_park(app, pilot, "draft with a typo")
             assert app._busy_turn is not None
 
-            app.handle_esc_hold()  # begin the hold
-            for _ in range(ESC_INTERRUPT_TICKS):  # drive the 3s worth of ticks
-                app._advance_esc_hold()
-            # the tick past the threshold scheduled the rollback worker
+            await select_working_indicator(app, pilot)
+            assert isinstance(app.screen, ConfirmScreen)
+            await pilot.press("y")  # confirm the interrupt
+            await pilot.pause()
+
             assert app._interrupt_worker is not None
             await app._interrupt_worker.wait()
             await pilot.pause()
@@ -99,17 +135,33 @@ class TestInterrupt:
             )
             assert (snap.values or {}).get("messages", []) == []
 
-    async def test_short_press_does_not_interrupt(self, hpca_home):
+    async def test_declining_leaves_the_turn_running(self, hpca_home):
         app = HpcaApp(llm=BlockingLLM())
         async with app.run_test(size=(120, 40)) as pilot:
             await send_and_park(app, pilot, "keep going")
-            app.handle_esc_hold()
-            # a few ticks, then release before 3s
-            for _ in range(5):
-                app._advance_esc_hold()
-            app._cancel_esc_hold()
+            await select_working_indicator(app, pilot)
+            assert isinstance(app.screen, ConfirmScreen)
+            await pilot.press("n")  # decline
             await pilot.pause()
+            assert not isinstance(app.screen, ConfirmScreen)
             assert app._busy_turn is not None  # still running
             assert app._interrupt_worker is None  # nothing fired
-            assert not app.query_one("#esc-progress", Static).display
             app._llm.release.set()
+
+    async def test_reply_landing_while_the_dialog_is_open_is_a_no_op(self, hpca_home):
+        # If the model answers while the confirm dialog sits open, confirming
+        # must not fire an interrupt against a turn that is already gone.
+        app = HpcaApp(llm=BlockingLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await send_and_park(app, pilot, "hello")
+            await select_working_indicator(app, pilot)
+            assert isinstance(app.screen, ConfirmScreen)
+            # the turn completes underneath the dialog
+            app._llm.release.set()
+            await pilot.pause()
+            await asyncio.sleep(0.05)
+            await pilot.pause()
+            await pilot.press("y")  # confirm — but there is nothing to abort now
+            await pilot.pause()
+            assert app._interrupt_worker is None
+            assert not app.query(WorkingIndicator)  # the reply landed normally
