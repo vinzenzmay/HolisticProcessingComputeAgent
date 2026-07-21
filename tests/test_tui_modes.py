@@ -9,10 +9,8 @@ from pydantic import BaseModel, Field
 
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.llm import ChatResponse
-from hpca.tui.app import ChatInput, HpcaApp
-from hpca.tui.approval_screen import ApprovalScreen
+from hpca.tui.app import ChatInput, DecisionBar, HpcaApp
 from hpca.tui.mode_bar import ModeBar
-from hpca.tui.plan_screen import PlanScreen
 
 
 def is_title_request(json_schema):
@@ -51,6 +49,20 @@ def hpca_home(monkeypatch, tmp_path):
 
 def chat_texts(app):
     return app.chat_log_texts()
+
+
+def decision_bar(app):
+    return app.query_one("#decision-bar", DecisionBar)
+
+
+def pending_payload(app):
+    """The payload of the decision the active session is parked on."""
+    return app._pending_decision[app.active_session.session_id]["payload"]
+
+
+def no_modal(app):
+    """The inline decision never pushes a screen — the stack stays at one."""
+    return len(app.screen_stack) == 1
 
 
 async def submit_chat(app, pilot, text):
@@ -117,16 +129,18 @@ class TestManualFlow:
         )
         async with app.run_test(size=(120, 40)) as pilot:
             await submit_chat(app, pilot, "check something")
-            assert isinstance(app.screen, ApprovalScreen)
-            assert app.screen.kind == "execution"
-            assert "run script" in app.screen.hint_text()
-            assert "echo hi" in app.screen._payload["script"]
+            bar = decision_bar(app)
+            assert bar.display and bar.kind == "approval"
+            assert no_modal(app)  # inline, not a full-screen modal
+            assert pending_payload(app)["kind"] == "execution"
+            assert "echo hi" in pending_payload(app)["script"]
             await pilot.press("n")  # skip script
             await app.workers.wait_for_complete()
             await pilot.pause()
             texts = chat_texts(app)
             assert any("SKIPPED" in t for t in texts)
             assert not any("exit 0" in t for t in texts)
+            assert not bar.display  # cleared once answered
 
     async def test_approve_actually_runs_the_script(self, hpca_home):
         app = HpcaApp(
@@ -139,7 +153,7 @@ class TestManualFlow:
         )
         async with app.run_test(size=(120, 40)) as pilot:
             await submit_chat(app, pilot, "check something")
-            assert isinstance(app.screen, ApprovalScreen)
+            assert decision_bar(app).display and no_modal(app)
             await pilot.press("y")  # run script
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -160,7 +174,7 @@ class TestAutoFlow:
         app.settings.agent.default_mode = "auto"
         async with app.run_test(size=(120, 40)) as pilot:
             await submit_chat(app, pilot, "check something")
-            assert not isinstance(app.screen, ApprovalScreen)
+            assert not decision_bar(app).display  # auto mode never gates
             texts = chat_texts(app)
             assert any("auto-run" in t and "exit 0" in t for t in texts)
 
@@ -192,7 +206,7 @@ class TestFullAutoFlow:
         app.settings.agent.default_mode = "full-auto"
         async with app.run_test(size=(120, 40)) as pilot:
             await submit_chat(app, pilot, "clean up scratch")
-            assert not isinstance(app.screen, ApprovalScreen)
+            assert not decision_bar(app).display  # full-auto never gates
             texts = chat_texts(app)
             assert any("deleted scratch/" in t for t in texts)
             assert any("it is gone" in t for t in texts)
@@ -224,9 +238,10 @@ class TestPlanFlow:
         app = self.plan_app()
         async with app.run_test(size=(120, 40)) as pilot:
             await submit_chat(app, pilot, "help me convert a BAM")
-            assert isinstance(app.screen, PlanScreen)
-            editor_text = app.screen.query_one("#plan-editor").text
-            assert "[ ] find the input" in editor_text
+            bar = decision_bar(app)
+            assert bar.display and bar.kind == "plan"
+            assert no_modal(app)  # inline, not a full-screen modal
+            assert "[ ] find the input" in bar.plan_editor_text()
 
     async def test_keep_planning_changes_nothing(self, hpca_home):
         app = self.plan_app()
@@ -235,12 +250,13 @@ class TestPlanFlow:
             await pilot.press("escape")
             await pilot.pause()
             assert app.active_session.mode == "plan"
+            assert not decision_bar(app).display  # dismissed
 
     async def test_execute_step_by_step_switches_to_manual(self, hpca_home):
         app = self.plan_app(extra_outputs=[respond_json("starting step one")])
         async with app.run_test(size=(120, 40)) as pilot:
             await submit_chat(app, pilot, "help me convert a BAM")
-            assert isinstance(app.screen, PlanScreen)
+            assert decision_bar(app).display and no_modal(app)
             await pilot.press("ctrl+e")  # execute step-by-step (manual)
             await app.workers.wait_for_complete()
             await pilot.pause()

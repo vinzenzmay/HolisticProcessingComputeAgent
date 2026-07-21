@@ -16,7 +16,7 @@ from langgraph.types import Command
 from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.geometry import Offset
 from textual.content import Content
 from textual.message import Message
@@ -56,7 +56,12 @@ from hpca.agent.memory_context import (
     retrieved_line,
 )
 from hpca.agent.memory_tools import add_memory_tools
-from hpca.agent.modes import add_plan_tool, kickoff_message, next_mode
+from hpca.agent.modes import (
+    add_plan_tool,
+    kickoff_message,
+    next_mode,
+    render_checklist,
+)
 from hpca.agent.prompts import environment_facts, orchestrator_system_prompt
 from hpca.agent.reflect import Reflection, propose_reflections
 from hpca.agent.skill_tools import add_skill_tools
@@ -110,7 +115,13 @@ from hpca.slurm import TERMINAL_STATES as SLURM_TERMINAL_STATES
 from hpca.slurm import SlurmClient
 from hpca.symbols import SymbolIndex
 from hpca.trash import TrashManager
-from hpca.tui.approval_screen import ApprovalScreen
+from hpca.tui.approval_screen import (
+    approval_details,
+    approval_hint,
+    approval_kind,
+    approval_script,
+    approval_title,
+)
 from hpca.tui.confirm_screen import ConfirmScreen
 from hpca.tui.context_bar import ContextBar
 from hpca.tui.inspect_screen import InspectScreen, format_job, format_process
@@ -128,7 +139,7 @@ from hpca.tui.memory_screens import (
     MemoryProposalScreen,
     ReflectionScreen,
 )
-from hpca.tui.plan_screen import PlanScreen
+from hpca.tui.plan_screen import PLAN_HINT, PLAN_TITLE, edited_plan_steps
 from hpca.tui.profiles_screen import ProfilePickerScreen, ProfilesScreen
 from hpca.tui.rename_screen import RenameScreen
 from hpca.tui.settings_screen import SettingsScreen
@@ -501,6 +512,153 @@ class WorkingIndicator(Static):
         self.update(Content(self._frame_text()))
 
 
+class DecisionBar(Vertical):
+    """Inline, non-modal decision prompt at the foot of the chat column.
+
+    A parked turn's approval (destructive/execution gate) or a plan-mode
+    handoff renders here — inside the chat column of the session it belongs
+    to — instead of a full-screen modal that would cover every other column
+    and block a session the user has switched to. Its keys fire only while it
+    (or its plan editor) holds focus, i.e. only when the chat column is
+    focused; a decision waiting in a background session shows nothing here and
+    only lights the "!" in the sidebar until that session is opened.
+
+    One bar serves both kinds, told apart by ``self.kind`` and gated in
+    ``check_action`` so the footer never offers plan keys on an approval (or
+    the reverse). It answers by calling back into the app, which runs the same
+    resume path the modal screens used to.
+    """
+
+    can_focus = True
+
+    # esc listed first (esc/quit ordering). Priority so the plan keys still
+    # fire while the checklist editor (a focused child) has the keystrokes,
+    # and so esc keeps planning rather than the editor eating it.
+    BINDINGS = [
+        Binding("y", "approve", "approve"),
+        Binding("n", "deny", "deny"),
+        Binding("escape", "cancel", "keep planning", priority=True),
+        Binding("ctrl+r", "execute_auto", "run on auto", priority=True),
+        Binding("ctrl+e", "execute_manual", "run step-by-step", priority=True),
+    ]
+
+    DEFAULT_CSS = """
+    DecisionBar {
+        display: none;
+        height: auto;
+        max-height: 60%;
+        margin: 0 1;
+        padding: 0 1;
+        border: heavy $error;
+    }
+    DecisionBar.decision-execution, DecisionBar.decision-plan {
+        border: heavy $warning;
+    }
+    DecisionBar.decision-plan {
+        border: heavy $accent;
+    }
+    .decision-title {
+        text-style: bold;
+        color: $error;
+    }
+    DecisionBar.decision-execution .decision-title { color: $warning; }
+    DecisionBar.decision-plan .decision-title { color: $accent; }
+    .decision-script {
+        height: auto;
+        max-height: 12;
+        border: round $panel;
+        padding: 0 1;
+        margin: 1 0;
+    }
+    #decision-plan-editor {
+        height: auto;
+        max-height: 16;
+        margin: 1 0;
+    }
+    .decision-hint {
+        color: $text-muted;
+    }
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.kind = ""  # "" (hidden) | "approval" | "plan"
+        self._payload = None
+
+    def check_action(self, action: str, parameters) -> bool | None:
+        if action in ("approve", "deny"):
+            return self.kind == "approval"
+        if action in ("execute_auto", "execute_manual"):
+            return self.kind == "plan"
+        if action == "cancel":  # esc means deny (approval) or keep (plan)
+            return self.kind != ""
+        return True
+
+    async def _reset(self, kind: str, payload) -> None:
+        self.kind = kind
+        self._payload = payload
+        for cls in ("decision-execution", "decision-plan"):
+            self.remove_class(cls)
+        await self.remove_children()
+
+    async def show_approval(self, payload: dict) -> None:
+        await self._reset("approval", payload)
+        if approval_kind(payload) == "execution":
+            self.add_class("decision-execution")
+        widgets: list[Static] = [
+            Static(approval_title(payload), classes="decision-title"),
+            Static(Content(approval_details(payload)), classes="decision-details"),
+        ]
+        script = approval_script(payload)
+        if script:
+            scroller = VerticalScroll(
+                Static(Content(script)), classes="decision-script"
+            )
+            widgets.append(scroller)
+        widgets.append(Static(approval_hint(payload), classes="decision-hint"))
+        await self.mount(*widgets)
+        self.display = True
+
+    async def show_plan(self, steps: list[dict]) -> None:
+        await self._reset("plan", steps)
+        self.add_class("decision-plan")
+        await self.mount(
+            Static(PLAN_TITLE, classes="decision-title"),
+            TextArea(render_checklist(steps), id="decision-plan-editor"),
+            Static(PLAN_HINT, classes="decision-hint"),
+        )
+        self.display = True
+
+    async def clear_decision(self) -> None:
+        await self._reset("", None)
+        self.display = False
+
+    def plan_editor_text(self) -> str:
+        editor = self.query("#decision-plan-editor")
+        return editor.first(TextArea).text if editor else ""
+
+    def action_approve(self) -> None:
+        self.app.resolve_decision("approval", True)
+
+    def action_deny(self) -> None:
+        self.app.resolve_decision("approval", False)
+
+    def action_cancel(self) -> None:
+        if self.kind == "approval":
+            self.app.resolve_decision("approval", False)
+        elif self.kind == "plan":
+            self.app.resolve_decision("plan", None)
+
+    def action_execute_auto(self) -> None:
+        self.app.resolve_decision("plan", ("auto", self._edited_steps()))
+
+    def action_execute_manual(self) -> None:
+        self.app.resolve_decision("plan", ("manual", self._edited_steps()))
+
+    def _edited_steps(self) -> list[dict]:
+        return edited_plan_steps(self.plan_editor_text(), self._payload or [])
+
+
 class ChatList(ListView):
     """Message log; ↓ past the last message returns to the chat entry."""
 
@@ -525,6 +683,10 @@ class ChatPanel(ColumnPanel):
         menu = Static(id="command-menu")
         menu.display = False
         yield menu
+        # A parked turn's approval / plan handoff renders here, at the foot of
+        # the chat log for the session it belongs to — never as a modal over
+        # the whole TUI (deliverable 1). Hidden until there is one.
+        yield DecisionBar(id="decision-bar")
         # The mode line sits directly above the entry, visible exactly when
         # the entry is: mode is a per-session property (§3.5).
         mode_bar = ModeBar(id="mode-bar")
@@ -681,6 +843,13 @@ class HpcaApp(App):
     #sessions-list > ListItem.session-updated {
         border: round $success;
     }
+    /* A decision (approval / plan) is waiting in this session: frame it in
+       warning and prefix its label with "!" (deliverable 2). Distinct from
+       session-updated and, unlike it, held until the decision is answered —
+       opening the session reveals the prompt but does not resolve it. */
+    #sessions-list > ListItem.session-pending {
+        border: round $warning;
+    }
     """
 
     # RESERVED HOTKEYS — do NOT bind these anywhere in the TUI (they are eaten
@@ -776,6 +945,12 @@ class HpcaApp(App):
         # Sessions whose thread is parked on a destructive-op approval. Their
         # queued messages wait for the resume; other sessions are unaffected.
         self._awaiting_approval: set[str] = set()
+        # The inline decision each session is waiting on, keyed by session_id:
+        # {"kind": "approval"|"plan", "payload": ...}. Drives both the inline
+        # DecisionBar (shown only for the active session) and the sidebar "!"
+        # (shown for every session with one), so switching sessions reveals or
+        # hides the right prompt without losing a decision left behind.
+        self._pending_decision: dict[str, dict] = {}
         self._shutting_down = False
         self._turn_ctx: ToolContext | None = None  # that turn's tool context
         self._turn_memory: Profile | None = None  # that turn's profile memories
@@ -1361,27 +1536,19 @@ class HpcaApp(App):
             self._mark_session_updated(session)
         if result.interrupt is not None:
             # Parked on an approval (destructive op, or a gated execution in
-            # manual/plan mode): the turn cannot move without an answer, so
-            # ask even if another session is open.
+            # manual/plan mode): the turn's thread cannot move without an
+            # answer. Record it as this session's pending decision — shown
+            # inline if the session is open, or only as a sidebar "!" if the
+            # user has switched away — never a modal over the other columns.
             self._awaiting_approval.add(session.session_id)
-            self.push_screen(
-                ApprovalScreen(result.interrupt),
-                lambda approved: self._on_approval(session, approved),
-            )
+            await self._set_pending_decision(session, "approval", result.interrupt)
             return
-        if (
-            result.plan
-            and self._mode_of(session) == "plan"
-            and self._is_active_session(session)
-        ):
-            # A plan-mode turn ended with a checklist: hand it to the user
-            # to adjust and decide how to continue (§3.5). Never forced on a
-            # session the user has switched away from — the plan waits in
-            # the chat and the state.
-            self.push_screen(
-                PlanScreen(result.plan),
-                lambda outcome: self._on_plan_decision(session, outcome),
-            )
+        if result.plan and self._mode_of(session) == "plan":
+            # A plan-mode turn ended with a checklist: hand it to the user to
+            # adjust and decide how to continue (§3.5). Recorded per session
+            # like an approval, so it waits inline (and flags the sidebar)
+            # even when the user has switched away, instead of being lost.
+            await self._set_pending_decision(session, "plan", result.plan)
         if self._is_active_session(session):
             # Context dropped by compaction first: it is gone from the
             # model's view and this is the last chance to keep anything.
@@ -1450,9 +1617,83 @@ class HpcaApp(App):
 
     def _on_approval(self, session: Session, approved: bool | None) -> None:
         # Resume the turn on the thread it belongs to — the user may have
-        # switched sessions while the approval dialog was up.
+        # switched sessions since the prompt appeared.
         self._awaiting_approval.discard(session.session_id)
         self._run_agent(session, resume=Command(resume={"approved": bool(approved)}))
+
+    # -------------------------------------------------- inline decision prompt
+
+    def _decision_bar(self) -> DecisionBar | None:
+        """The inline decision panel, or None once the screen is gone."""
+        found = self.query("#decision-bar")
+        return found.first(DecisionBar) if found else None
+
+    async def _set_pending_decision(
+        self, session: Session, kind: str, payload
+    ) -> None:
+        """Record a decision this session is waiting on and surface it: inline
+        if the session is open, otherwise only as the sidebar "!"."""
+        self._pending_decision[session.session_id] = {
+            "kind": kind,
+            "payload": payload,
+        }
+        self._refresh_session_row(session.session_id)  # light the "!"
+        if self._is_active_session(session):
+            await self._sync_decision_bar()
+            # Land on the prompt so its keys work at once — but only if the
+            # user is already in the chat column; a decision must never yank
+            # focus away from another column (or another session).
+            if self.focused_column_id == "chat":
+                self._focus_decision_bar()
+
+    async def _sync_decision_bar(self) -> None:
+        """Show the active session's pending decision in the inline bar, or
+        hide the bar when it has none. The bar only ever shows the open
+        session's decision — background ones live in ``_pending_decision`` and
+        the sidebar "!" until their session is opened."""
+        bar = self._decision_bar()
+        if bar is None:
+            return
+        pending = None
+        if self.active_session is not None:
+            pending = self._pending_decision.get(self.active_session.session_id)
+        if pending is None:
+            await bar.clear_decision()
+        elif pending["kind"] == "approval":
+            await bar.show_approval(pending["payload"])
+        else:
+            await bar.show_plan(pending["payload"])
+
+    def _focus_decision_bar(self) -> None:
+        """Focus the inline prompt: its plan editor when editing a checklist,
+        else the bar itself so y/n reach it."""
+        bar = self._decision_bar()
+        if bar is None or not bar.display:
+            return
+        editor = bar.query("#decision-plan-editor")
+        (editor.first() if editor else bar).focus()
+
+    def resolve_decision(self, kind: str, value) -> None:
+        """Answer the inline decision the chat column is showing (DecisionBar).
+
+        Only the active session's decision is ever displayed, so that is the
+        one resolved. Clear the pending state and the "!", hide the bar, then
+        run the very same resume path the modal screens used to — kept
+        synchronous so ``_run_agent``'s exclusive turn worker is unchanged."""
+        session = self.active_session
+        if session is None:
+            return
+        pending = self._pending_decision.get(session.session_id)
+        if pending is None or pending["kind"] != kind:
+            return  # stale keystroke: the decision changed or is already gone
+        self._pending_decision.pop(session.session_id, None)
+        self._refresh_session_row(session.session_id)  # drop the "!"
+        self.call_later(self._sync_decision_bar)  # hide the now-empty bar
+        self.focus_chat_input()
+        if kind == "approval":
+            self._on_approval(session, value)
+        else:
+            self._on_plan_decision(session, value)
 
     # ------------------------------------------------------------ agent modes
 
@@ -2324,6 +2565,9 @@ class HpcaApp(App):
             await self.close_session()
         self._untitled.discard(session.session_id)
         self._updated.discard(session.session_id)
+        # A parked thread and its inline decision go with the session.
+        self._awaiting_approval.discard(session.session_id)
+        self._pending_decision.pop(session.session_id, None)
         self.session_store.delete(session.session_id)
         # Patient-data environment: a deleted conversation must not resurface
         # through episodic search either.
@@ -2367,6 +2611,7 @@ class HpcaApp(App):
         await self._set_chat_messages([])
         self.query_one("#chat-input", ChatInput).display = False
         self._refresh_mode_bar()
+        await self._sync_decision_bar()  # no session: nothing to decide inline
         self._focus_column("sessions")
 
     async def open_session(self, session: Session) -> None:
@@ -2393,6 +2638,8 @@ class HpcaApp(App):
             and self._busy_turn.session_id == session.session_id
         ):
             self.show_working()  # its turn is still in flight
+        # Reveal (or hide) whatever decision this session was left waiting on.
+        await self._sync_decision_bar()
 
     @on(ListView.Selected, "#sessions-list")
     async def _on_session_selected(self, event: ListView.Selected) -> None:
@@ -2410,14 +2657,12 @@ class HpcaApp(App):
         new_item.data_session = None
         items = [new_item]
         for session in self.session_store.list_all():
-            tag = (
-                f"  · {session.profile}"
-                if session.profile != DEFAULT_PROFILE
-                else ""
-            )
-            item = ListItem(Label(Content(f"{session.title}{tag}")))
+            item = ListItem(Label(self._session_row_text(session)))
             item.data_session = session
             item.set_class(session.session_id in self._updated, "session-updated")
+            item.set_class(
+                session.session_id in self._pending_decision, "session-pending"
+            )
             items.append(item)
         sessions_list.extend(items)
         # A ListView filled after mount has no cursor, and without one Enter
@@ -2438,6 +2683,30 @@ class HpcaApp(App):
             row_session = getattr(item, "data_session", None)
             if row_session is not None and row_session.session_id == session.session_id:
                 item.add_class("session-updated")
+
+    def _session_row_text(self, session: Session) -> Content:
+        """One sidebar row's label: the title, its profile tag, and a leading
+        "!" when the session is waiting on a decision (deliverable 2), so a
+        user working elsewhere sees the choice pending in another session."""
+        tag = (
+            f"  · {session.profile}" if session.profile != DEFAULT_PROFILE else ""
+        )
+        mark = "! " if session.session_id in self._pending_decision else ""
+        return Content(f"{mark}{session.title}{tag}")
+
+    def _refresh_session_row(self, session_id: str) -> None:
+        """Repaint one row's label and pending class from live state — used
+        when a decision appears or is answered, without a full list reload."""
+        for item in self.query_one("#sessions-list", ListView).children:
+            row_session = getattr(item, "data_session", None)
+            if row_session is not None and row_session.session_id == session_id:
+                label = item.query(Label)
+                if label:
+                    label.first(Label).update(self._session_row_text(row_session))
+                item.set_class(
+                    session_id in self._pending_decision, "session-pending"
+                )
+                return
 
     def _is_active_session(self, session: Session | None) -> bool:
         return (
@@ -2874,9 +3143,15 @@ class HpcaApp(App):
         return None
 
     def _focus_column(self, column_id: str) -> None:
-        """Focus a column. The chat column lands on its entry, ready to type."""
+        """Focus a column. The chat column lands on its inline decision prompt
+        when one is waiting — the user brings the chat window into focus to
+        answer there — otherwise on its entry, ready to type."""
         if column_id == "chat" and self.active_session is not None:
-            self.focus_chat_input()
+            bar = self._decision_bar()
+            if bar is not None and bar.display:
+                self._focus_decision_bar()
+            else:
+                self.focus_chat_input()
         else:
             self.query_one(f"#{column_id}-list", ListView).focus()
 
