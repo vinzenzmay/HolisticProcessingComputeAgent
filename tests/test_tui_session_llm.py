@@ -121,3 +121,49 @@ class TestClientSelection:
             )
             assert app._active_max_model_len() == 2000
             assert app._active_model() == "qwen-b"
+
+
+def _unwrap(labelled):
+    """The underlying client behind a possibly-LoggedLLM wrapper."""
+    return getattr(labelled, "_llm", labelled)
+
+
+class TestLabelledLLM:
+    """The app's own sub-agent calls (/conclude, /memorize, titling) must run
+    on the session's *own* backend — the live client chat uses — not the
+    bootstrap client, which may point at a backend that is no longer running
+    once the session has been switched away (regression: /conclude failed with
+    "all connection attempts failed")."""
+
+    async def test_labelled_llm_routes_to_the_sessions_backend(self, hpca_home):
+        with_backends()
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)):
+            blob = LLMBackend(
+                model="qwen-b", base_url="http://b/v1"
+            ).model_dump_json()
+            session = app.session_store.create(profile="default", backend=blob)
+            client = _unwrap(app._labelled_llm("conclude", session=session))
+            assert client is app._client_for(session)
+            assert client is not app._llm  # not the (possibly dead) bootstrap
+            assert client._settings.model == "qwen-b"
+
+    async def test_labelled_llm_defaults_to_the_active_session(self, hpca_home):
+        with_backends()
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)):
+            blob = LLMBackend(
+                model="qwen-b", base_url="http://b/v1"
+            ).model_dump_json()
+            app.active_session = app.session_store.create(
+                profile="default", backend=blob
+            )
+            client = _unwrap(app._labelled_llm("memorize"))
+            assert client._settings.model == "qwen-b"
+
+    async def test_labelled_llm_falls_back_to_bootstrap(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)):
+            session = app.session_store.create(profile="default")  # no backend
+            client = _unwrap(app._labelled_llm("conclude", session=session))
+            assert client is app._llm

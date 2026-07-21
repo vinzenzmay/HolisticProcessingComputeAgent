@@ -1730,7 +1730,7 @@ class HpcaApp(App):
         if session.session_id not in self._untitled:
             return False
         self._untitled.discard(session.session_id)
-        title = await self._propose_title(messages, log=log)
+        title = await self._propose_title(messages, log=log, session=session)
         if title is None:
             return False
         self._rename_session(session, title, by="llm", log=log)
@@ -2078,7 +2078,7 @@ class HpcaApp(App):
         self.profile_memory = Profile.load(self.profile)  # merge, don't clobber
         try:
             proposals = await propose_memories(
-                self._labelled_llm("memorize"),
+                self._labelled_llm("memorize", session=self.active_session),
                 messages,
                 system_prompt_memories=self.profile_memory.scope_text(
                     MemoryScope.SYSTEM_PROMPT
@@ -2234,7 +2234,7 @@ class HpcaApp(App):
         memory = self._memory_snapshot(session.profile)
         skills = load_skills(session.profile)
         proposals = await propose_reflections(
-            self._labelled_llm("conclude"),
+            self._labelled_llm("conclude", session=session),
             messages,
             system_prompt_memories=memory.scope_text(MemoryScope.SYSTEM_PROMPT),
             rag_memories=memory.scope_text(MemoryScope.RAG),
@@ -2479,13 +2479,27 @@ class HpcaApp(App):
         self._log = open_log(self.settings, self.active_session)
         self._tool_ctx = self._make_tool_ctx(self.active_session, self._log)
 
-    def _labelled_llm(self, label: str, *, log: SessionLog | None = None) -> Any:
+    def _labelled_llm(
+        self,
+        label: str,
+        *,
+        log: SessionLog | None = None,
+        session: Session | None = None,
+    ) -> Any:
         """The client for one of the app's own sub-agent calls (titling,
-        \\conclude, struggle notes), logged under that name."""
+        \\conclude, struggle notes), logged under that name.
+
+        Routed through the session's *own* backend — the same live client chat
+        uses — not the bootstrap client, which may point at a backend that is
+        not running once the session has been switched to another (§ per-session
+        LLM). Falls back to the open session, then the bootstrap client."""
+        client = self._client_for(
+            session if session is not None else self.active_session
+        )
         sink = log if log is not None else self._log
         if sink is None:
-            return self._llm
-        return LoggedLLM(self._llm, sink, label=lambda: f"subagent:{label}")
+            return client
+        return LoggedLLM(client, sink, label=lambda: f"subagent:{label}")
 
     def pick_profile_for_new_session(self) -> None:
         """Every new session starts by choosing its profile (or creating one),
@@ -2637,7 +2651,7 @@ class HpcaApp(App):
         if not messages:
             self.notify("Nothing to summarize yet.", severity="warning")
             return
-        title = await self._propose_title(messages)
+        title = await self._propose_title(messages, session=session)
         if title is None:
             self.notify("The model could not write a title.", severity="error")
             return
@@ -2645,11 +2659,15 @@ class HpcaApp(App):
         self.notify(f"Renamed to “{title}”")
 
     async def _propose_title(
-        self, messages: list[dict], *, log: SessionLog | None = None
+        self,
+        messages: list[dict],
+        *,
+        log: SessionLog | None = None,
+        session: Session | None = None,
     ) -> str | None:
         try:
             return await propose_title(
-                self._labelled_llm("title", log=log), messages
+                self._labelled_llm("title", log=log, session=session), messages
             )
         except Exception:
             return None  # naming is a nicety; never break a turn over it
