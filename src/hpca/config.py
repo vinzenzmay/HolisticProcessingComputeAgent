@@ -160,6 +160,7 @@ class Settings(_Section):
     agent: AgentSettings = AgentSettings()
     backends: list[LLMBackend] = []
     known_llm_ports: list[int] = []
+    llm_api_keys: list[str] = []
     cluster: ClusterSettings = ClusterSettings()
     safety: SafetySettings = SafetySettings()
     memory: MemorySettings = MemorySettings()
@@ -219,6 +220,21 @@ class Settings(_Section):
                 self.known_llm_ports.append(port)
                 learned = True
         return learned
+
+    def remember_llm_key(self, api_key: str | None) -> bool:
+        """Add an API key to the pool if new. Returns whether it was newly
+        learned (i.e. whether settings need saving).
+
+        Keys already known to the app are tried against key-locked endpoints,
+        so any key typed for one backend can unlock the others. Empty or
+        missing keys are ignored; dedup is by exact string.
+        """
+        if not api_key:
+            return False
+        if api_key in self.llm_api_keys:
+            return False
+        self.llm_api_keys.append(api_key)
+        return True
 
     def is_active(self, backend: LLMBackend) -> bool:
         return (

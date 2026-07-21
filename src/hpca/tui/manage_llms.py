@@ -28,9 +28,11 @@ from urllib.parse import urlparse
 
 from hpca.config import LLMBackend
 from hpca.discover import (
+    KEY_REQUIRED,
     DiscoveredBackend,
     is_reachable,
     ordered_ports,
+    probe_endpoint,
     scan_local_ports,
 )
 from hpca.tui.backend_form import BackendFormScreen
@@ -165,6 +167,9 @@ class ManageLLMsScreen(Screen):
         Only tiny UI updates are marshalled back via call_from_thread.
         """
         worker = get_current_worker()
+        # Gather the pool up front (like _priority_ports()): the scan tries
+        # these keys against 401/403 endpoints so key-locked ports resolve inline.
+        keys = self._effective_keys()
 
         def report(done: int, total: int) -> None:
             if not worker.is_cancelled:
@@ -180,11 +185,25 @@ class ManageLLMsScreen(Screen):
 
         discovered = asyncio.run(
             scan_local_ports(
-                ordered_ports(self._priority_ports()), progress=report, on_found=found
+                ordered_ports(self._priority_ports()),
+                progress=report,
+                on_found=found,
+                api_keys=keys,
             )
         )
         if not worker.is_cancelled:
             self.app.call_from_thread(self._apply_scan_results, discovered)
+
+    def _effective_keys(self) -> list[str]:
+        """The key pool unioned with keys already on configured backends,
+        deduped and order-stable — every key we could try against a locked
+        endpoint."""
+        settings = self.app.settings
+        keys = list(settings.llm_api_keys)
+        for backend in settings.backends:
+            if backend.api_key and backend.api_key not in keys:
+                keys.append(backend.api_key)
+        return keys
 
     def _priority_ports(self) -> list[int]:
         """Ports worth trying first: ones that served an LLM before, then
@@ -224,6 +243,32 @@ class ManageLLMsScreen(Screen):
                 backend.base_url, api_key=backend.api_key
             )
         await self.refresh_configured()
+
+    @work(group="llm-reprobe")
+    async def _reprobe_discovered(self) -> None:
+        """Re-probe only the sentinel entries already in the Discovered list,
+        trying the current key pool — no TCP sweep. Sentinels a pooled key
+        unlocks are replaced in place with their real model rows."""
+        keys = self._effective_keys()
+        if not keys:
+            return
+        resolved: dict[str, list[DiscoveredBackend]] = {}
+        for backend in list(self._discovered):
+            if backend.model != KEY_REQUIRED:
+                continue
+            rows = await probe_endpoint(backend.base_url, api_keys=keys)
+            if rows and all(row.model != KEY_REQUIRED for row in rows):
+                resolved[backend.base_url] = rows
+        if not resolved:
+            return
+        new_discovered: list[DiscoveredBackend] = []
+        for backend in self._discovered:
+            if backend.model == KEY_REQUIRED and backend.base_url in resolved:
+                new_discovered.extend(resolved.pop(backend.base_url, []))
+            else:
+                new_discovered.append(backend)
+        self._discovered = new_discovered
+        await self.refresh_discovered()
 
     def _is_configured(self, discovered: DiscoveredBackend) -> bool:
         return any(
@@ -299,9 +344,21 @@ class ManageLLMsScreen(Screen):
             await self._add_backend(discovered)
 
     async def _add_backend(self, discovered: DiscoveredBackend) -> None:
-        # A key-locked endpoint came through the scan as "(api key required)"
-        # with no real model name — open the form to collect the key (and let
-        # it auto-fill the model), rather than saving the placeholder.
+        # Pool-unlocked: a pooled key already validated against this exact
+        # endpoint during the probe, so save directly with that key — no form.
+        if discovered.api_key is not None:
+            await self._save_backend(
+                LLMBackend(
+                    model=discovered.model,
+                    base_url=discovered.base_url,
+                    max_model_len=discovered.max_model_len,
+                    api_key=discovered.api_key,
+                )
+            )
+            return
+        # A bare key-locked endpoint came through the scan as "(api key
+        # required)" with no real model name — open the form to collect the key
+        # (and let it auto-fill the model), rather than saving the placeholder.
         if discovered.needs_key:
             self.app.push_screen(
                 BackendFormScreen(base_url=discovered.base_url, editable_url=False),
@@ -327,13 +384,28 @@ class ManageLLMsScreen(Screen):
             self.run_worker(self._save_backend(backend), group="llm-add")
 
     async def _save_backend(self, backend: LLMBackend) -> None:
-        self.app.settings.backends.append(backend)
-        self.app.settings.remember_llm_ports([backend.base_url])
-        self.app.settings.save()
+        settings = self.app.settings
+        settings.backends.append(backend)
+        settings.remember_llm_ports([backend.base_url])
+        learned_key = settings.remember_llm_key(backend.api_key)
+        settings.save()
         self._reachable[backend.base_url] = True  # just probed, or user-asserted
+        # Save-time guard: drop any sentinel still sitting at this base_url so
+        # the just-configured endpoint can't be added again. The (base_url,
+        # model) dedup misses it because the sentinel model differs from the
+        # real one; this closes the force-save / bad-key path too.
+        self._discovered = [
+            b
+            for b in self._discovered
+            if not (b.model == KEY_REQUIRED and b.base_url == backend.base_url)
+        ]
         await self.refresh_discovered()
         await self.refresh_configured()
         self.notify(f"Configured {backend.model}")
+        if learned_key:
+            # A new key landed in the pool — re-probe the remaining sentinels
+            # in place; any it unlocks turn informative without a rescan.
+            self._reprobe_discovered()
 
     def toggle_thinking_selected(self) -> None:
         configured_list = self.query_one("#llm-configured", ListView)
