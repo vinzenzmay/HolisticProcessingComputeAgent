@@ -1,6 +1,6 @@
 [project]
 name = "hpca"
-version = "0.5.3"
+version = "0.6.0"
 description = "HolisticProcessingComputeAgent - terminal AI agent for HPC Slurm clusters"
 readme = "README.md"
 requires-python = ">=3.11"
