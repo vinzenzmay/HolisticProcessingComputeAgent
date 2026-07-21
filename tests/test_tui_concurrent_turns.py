@@ -15,9 +15,11 @@ import json
 
 import pytest
 
+from textual.widgets import ListView
+
 from hpca.config import LLMBackend
 from hpca.llm import ChatResponse
-from hpca.tui.app import ChatInput, HpcaApp
+from hpca.tui.app import WORKING_MARK, ChatInput, HpcaApp
 
 
 def is_title_request(json_schema):
@@ -171,6 +173,87 @@ async def _wait_turn_done(app, pilot, session_id, tries=100):
             return
         await pilot.pause()
     raise AssertionError(f"turn for {session_id} did not finish")
+
+
+def _row_for(app, session_id):
+    """The sidebar ``ListItem`` whose session matches ``session_id``."""
+    for item in app.query_one("#sessions-list", ListView).children:
+        row_session = getattr(item, "data_session", None)
+        if row_session is not None and row_session.session_id == session_id:
+            return item
+    raise AssertionError(f"no sidebar row for {session_id}")
+
+
+class TestSidebarWorkingIndicator:
+    """Decision 6: any session with a live ``TurnState`` shows an in-flight
+    marker on its sidebar row (glyph + ``session-working`` class), so the user
+    can see an OFF-SCREEN session is still working. The marker clears when the
+    turn ends."""
+
+    async def test_live_turn_lights_its_row(self, hpca_home):
+        llm = SlowLLM()
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            session_a = app.active_session
+            await send(app, pilot, "in A")
+            assert session_a.session_id in app._turns
+
+            # Both the glyph (via _session_row_text) and the CSS class light up.
+            assert WORKING_MARK in app._session_row_text(session_a).plain
+            assert _row_for(app, session_a.session_id).has_class("session-working")
+
+            llm.gate.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+    async def test_marker_clears_when_turn_completes(self, hpca_home):
+        llm = SlowLLM()
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            session_a = app.active_session
+            await send(app, pilot, "in A")
+            assert _row_for(app, session_a.session_id).has_class("session-working")
+
+            llm.gate.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert session_a.session_id not in app._turns
+            assert WORKING_MARK not in app._session_row_text(session_a).plain
+            assert not _row_for(app, session_a.session_id).has_class(
+                "session-working"
+            )
+
+    async def test_marker_shows_for_off_screen_session(self, hpca_home):
+        """Start A's turn, switch to B, and A's row still shows working while
+        A is held open in the background."""
+        llm = SlowLLM()
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            session_a = app.active_session
+            await send(app, pilot, "in A")
+            assert session_a.session_id in app._turns
+
+            await app.start_new_session()  # switch to a fresh session B
+            session_b = app.active_session
+            assert session_b.session_id != session_a.session_id
+            await pilot.pause()
+
+            # A is off screen but its row still carries the working marker.
+            assert session_a.session_id in app._turns
+            assert _row_for(app, session_a.session_id).has_class("session-working")
+            assert WORKING_MARK in app._session_row_text(session_a).plain
+            # B, idle, does not.
+            assert not _row_for(app, session_b.session_id).has_class(
+                "session-working"
+            )
+
+            llm.gate.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
 
 
 class TestPerSessionContextMeter:

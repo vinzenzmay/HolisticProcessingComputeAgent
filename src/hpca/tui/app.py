@@ -171,6 +171,14 @@ def format_started(started_at: str) -> str:
 SESSION_TITLE_MAX = 40
 UNTITLED_SESSION = "untitled"  # placeholder until the first message names it
 
+# Sidebar in-flight marker (stage 3 / decision 6): prefixed on the row of any
+# session with a live TurnState, so an OFF-SCREEN session that is still working
+# is visible. A stable glyph (not an animated spinner) — appears/clears reliably
+# and needs no timer. Distinct from the "! " pending-decision mark so the two do
+# not collide; when a row is somehow both, the "! " decision mark wins (a
+# decision needs the user, working is transient — see _session_row_text).
+WORKING_MARK = "⟳ "
+
 # Interrupt-while-waiting-for-the-LLM (§ interrupt): the activity string the
 # graph reports while a turn is parked on the model — the one phase the
 # interrupt is armed in. The user aborts it by selecting the working indicator
@@ -869,6 +877,15 @@ class HpcaApp(App):
     #sessions-list > ListItem.session-pending {
         border: round $warning;
     }
+    /* A turn is in flight for this session (stage 3 / decision 6): frame it in
+       accent and prefix its label with the working glyph, so an OFF-SCREEN
+       session that is still working is visible. Listed LAST so, of equal CSS
+       specificity, a live turn's accent border wins over a stale
+       session-updated success frame while the turn runs; it clears (revealing
+       any success frame) the moment the turn ends. */
+    #sessions-list > ListItem.session-working {
+        border: round $accent;
+    }
     """
 
     # RESERVED HOTKEYS — do NOT bind these anywhere in the TUI (they are eaten
@@ -1415,6 +1432,7 @@ class HpcaApp(App):
             except (Exception, asyncio.CancelledError):
                 pass
         self._turns.pop(session.session_id, None)
+        self._refresh_session_row(session.session_id)  # clear the working marker
         self.hide_working()
         try:
             surviving = await rollback_thread(
@@ -1483,6 +1501,9 @@ class HpcaApp(App):
             interrupt_keep=None,  # filled once we know the pre-turn count
         )
         self._turns[session.session_id] = ts
+        # Light the sidebar in-flight marker — works whether or not this
+        # session is on screen (decision 6).
+        self._refresh_session_row(session.session_id)
         if self._is_active_session(session):
             # the UI's context (process list, registry) stays the turn's twin
             self._tool_ctx = ts.ctx
@@ -1593,6 +1614,10 @@ class HpcaApp(App):
             # Drop this session's turn wholesale — everything the old finally
             # block cleared lived on the TurnState and goes with it.
             self._turns.pop(session.session_id, None)
+            # Clear the sidebar in-flight marker now the turn is gone (works
+            # off-screen too; a pending decision, set just below, repaints its
+            # own "!").
+            self._refresh_session_row(session.session_id)
             # Whatever queued up behind this turn starts as soon as this
             # handler unwinds, rather than waiting for the next timer tick.
             self.call_later(self.drain_work)
@@ -2591,6 +2616,10 @@ class HpcaApp(App):
         # A parked thread and its inline decision go with the session.
         self._awaiting_approval.discard(session.session_id)
         self._pending_decision.pop(session.session_id, None)
+        # Stage-2 leftover: drop this session's stored context number, and any
+        # live turn defensively, so nothing leaks past the delete.
+        self._context_used.pop(session.session_id, None)
+        self._turns.pop(session.session_id, None)
         self.session_store.delete(session.session_id)
         # Patient-data environment: a deleted conversation must not resurface
         # through episodic search either.
@@ -2695,6 +2724,8 @@ class HpcaApp(App):
             item.set_class(
                 session.session_id in self._pending_decision, "session-pending"
             )
+            # A full rebuild mid-turn keeps the in-flight marker on live rows.
+            item.set_class(session.session_id in self._turns, "session-working")
             items.append(item)
         sessions_list.extend(items)
         # A ListView filled after mount has no cursor, and without one Enter
@@ -2718,18 +2749,32 @@ class HpcaApp(App):
 
     def _session_row_text(self, session: Session) -> Content:
         """One sidebar row's label: the title, its profile tag, and a leading
-        "!" when the session is waiting on a decision (deliverable 2), so a
-        user working elsewhere sees the choice pending in another session."""
+        marker. A "!" when the session is waiting on a decision (deliverable 2),
+        else the working glyph while a turn is in flight (stage 3 / decision 6),
+        so a user working elsewhere sees a choice pending — or an off-screen
+        turn still running — in another session. The decision mark takes
+        precedence: it needs the user, whereas working is transient (in normal
+        flow the two never coexist — a parked turn has left ``_turns``)."""
         tag = (
             f"  · {session.profile}" if session.profile != DEFAULT_PROFILE else ""
         )
-        mark = "! " if session.session_id in self._pending_decision else ""
+        if session.session_id in self._pending_decision:
+            mark = "! "
+        elif session.session_id in self._turns:
+            mark = WORKING_MARK
+        else:
+            mark = ""
         return Content(f"{mark}{session.title}{tag}")
 
     def _refresh_session_row(self, session_id: str) -> None:
-        """Repaint one row's label and pending class from live state — used
-        when a decision appears or is answered, without a full list reload."""
-        for item in self.query_one("#sessions-list", ListView).children:
+        """Repaint one row's label, pending class, and working class from live
+        state — used when a decision appears/answers or a turn starts/ends,
+        without a full list reload. Guarded: it now fires on every turn end,
+        including while the screen is tearing down after a turn finished late."""
+        found = self.query("#sessions-list")
+        if not found:
+            return
+        for item in found.first(ListView).children:
             row_session = getattr(item, "data_session", None)
             if row_session is not None and row_session.session_id == session_id:
                 label = item.query(Label)
@@ -2738,6 +2783,7 @@ class HpcaApp(App):
                 item.set_class(
                     session_id in self._pending_decision, "session-pending"
                 )
+                item.set_class(session_id in self._turns, "session-working")
                 return
 
     def _is_active_session(self, session: Session | None) -> bool:
