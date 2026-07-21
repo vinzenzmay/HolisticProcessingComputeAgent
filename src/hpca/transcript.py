@@ -11,7 +11,7 @@ back to the model, and lives outside ``messages`` for exactly that reason.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from hpca.llm import Message
 
@@ -36,11 +36,37 @@ FENCE_CLOSE = "</memory-context>"
 
 
 @dataclass
+class Step:
+    """One ordered part of a turn's working: a block of reasoning, or one tool
+    step. The chat window reveals these as individually-collapsible lines when a
+    thinking box is expanded; ``Entry.text`` still holds the whole box as one
+    string, which is what the session log writes."""
+
+    kind: str  # reasoning | step
+    text: str
+
+    def label(self) -> str:
+        """Short header for the collapsed line — the tool name for a step,
+        parsed from its ``[tool result] <tool>: …`` prefix, else "reasoning"."""
+        if self.kind != "step":
+            return self.kind
+        for prefix in TOOL_PREFIXES:
+            if self.text.startswith(prefix):
+                name = self.text[len(prefix) :].strip().split(":", 1)[0].strip()
+                suffix = " (error)" if prefix == "[tool error]" else ""
+                return (name or "tool") + suffix
+        return "step"
+
+
+@dataclass
 class Entry:
     kind: str  # user | assistant | thinking | error
     text: str
     steps: int = 0  # thinking: tool steps folded in
     reasoning_chars: int = 0  # thinking: how much the model thought
+    # thinking: the ordered parts, kept structured so an expanded box can show
+    # each one as its own collapsible element (``text`` folds them for the log).
+    parts: list[Step] = field(default_factory=list)
 
     def summary(self) -> str:
         """One-line gist, for the collapsed box: only what is actually there."""
@@ -118,6 +144,7 @@ def build_entries(
                     text=_block(pending),
                     steps=steps,
                     reasoning_chars=reasoning_chars,
+                    parts=[Step(kind=kind, text=text) for kind, text in pending],
                 )
             )
         pending, steps, reasoning_chars = [], 0, 0

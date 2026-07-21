@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from os import environ as os_environ
 from time import monotonic, time
@@ -72,7 +72,7 @@ from hpca.llm import LLMClient
 from hpca.logs import LoggedLLM, SessionLog, open_log
 from hpca.rag import RagStore
 from hpca.transcript import ASSISTANT as ASSISTANT_ENTRY
-from hpca.transcript import THINKING, Entry, build_entries
+from hpca.transcript import THINKING, Entry, Step, build_entries
 from hpca.transcript import USER as USER_ENTRY
 from hpca.profiles import DEFAULT_PROFILE, Profile
 from hpca.registry import PathRegistry
@@ -345,29 +345,74 @@ class ChatInput(TextArea):
 
 class ThinkingBox(Static):
     """One turn's working — the model's reasoning and the tool steps it led
-    to — folded into a single box. Collapsed by default; enter toggles it."""
+    to — folded into a single box. Collapsed by default; enter toggles it.
 
-    def __init__(self, entry: Entry) -> None:
+    Expanding no longer spells the whole box out inline: the app reveals each
+    part as its own :class:`StepBox` row below this one, so the header only ever
+    carries the summary and the expand/collapse hint."""
+
+    def __init__(self, entry: Entry, *, expanded: bool = False) -> None:
         super().__init__(classes="chat-thinking")
         self.border_title = "thinking"
         self._entry = entry
-        self._collapsed = True
+        self._collapsed = not expanded
         self._render_entry()
+
+    @property
+    def entry(self) -> Entry:
+        return self._entry
 
     @property
     def collapsed(self) -> bool:
         return self._collapsed
 
     def toggle(self) -> None:
-        self._collapsed = not self._collapsed
+        self.set_expanded(self._collapsed)
+
+    def set_expanded(self, expanded: bool) -> None:
+        self._collapsed = not expanded
         self._render_entry()
 
     def _render_entry(self) -> None:
         marker = "▶" if self._collapsed else "▼"
         hint = "enter to expand" if self._collapsed else "enter to collapse"
-        header = f"{marker} {self._entry.summary()}  ({hint})"
-        body = "" if self._collapsed else "\n\n" + self._entry.text
+        self.update(Content(f"{marker} {self._entry.summary()}  ({hint})"))
+
+
+class StepBox(Static):
+    """One part of an expanded thinking box — a reasoning block or a tool step —
+    collapsible on its own. Collapsed shows just its label; expanded appends the
+    part's full text. Each is a ListView row, so up/down/enter navigate them
+    with no special-casing."""
+
+    def __init__(self, step: Step, *, expanded: bool = False) -> None:
+        super().__init__(classes="chat-step")
+        self._step = step
+        self._collapsed = not expanded
+        self._render_step()
+
+    @property
+    def expanded(self) -> bool:
+        return not self._collapsed
+
+    def toggle(self) -> None:
+        self._collapsed = not self._collapsed
+        self._render_step()
+
+    def _render_step(self) -> None:
+        marker = "▶" if self._collapsed else "▼"
+        header = f"{marker} {self._step.label()}"
+        body = "" if self._collapsed else "\n\n" + self._step.text.strip()
         self.update(Content(header + body))
+
+
+@dataclass
+class _ThinkingExpansion:
+    """Whether a thinking box is open, and which of its parts are open. Held per
+    Entry so an expanded view is not lost to an unrelated chat re-render."""
+
+    open: bool = False
+    parts: dict[int, bool] = field(default_factory=dict)  # part index → open
 
 
 class ChatItem(ListItem):
@@ -591,6 +636,13 @@ class HpcaApp(App):
         border: round $panel-lighten-2;
         color: $text-muted;
     }
+    /* A single revealed part of an expanded thinking box: no frame and inset,
+       so the rows read as belonging under the box above them. */
+    .chat-step {
+        color: $text-muted;
+        margin-left: 2;
+        padding: 0 1;
+    }
     .chat-error {
         border: round $error;
         color: $error;
@@ -691,6 +743,11 @@ class HpcaApp(App):
         self.active_session: Session | None = None
         self._tool_ctx: ToolContext | None = None
         self._chat_entries: list[Entry] = []
+        # Which thinking boxes (and which of their parts) the user has opened,
+        # keyed by the Entry's identity so the expansion survives a chat
+        # re-render but resets when a session is reloaded and fresh entries are
+        # built. See _ThinkingExpansion / _entry_items.
+        self._thinking_expanded: dict[int, _ThinkingExpansion] = {}
         # Slash-command autocomplete: the currently-shown (name, usage) matches
         # and which one the ↑/↓ selection is on.
         self._command_matches: list[tuple[str, str]] = []
@@ -2677,6 +2734,9 @@ class HpcaApp(App):
         chat_list = self.query_one("#chat-list", ListView)
         await chat_list.clear()
         self._chat_entries = []
+        # Fresh entries mean the old id()-keyed expansion state is stale (and
+        # a recycled id could wrongly re-open a new box); start clean.
+        self._thinking_expanded.clear()
         for entry in build_entries(messages, thinking or []):
             self._add_chat_entry(entry)
         # Messages typed while this turn ran are not in the graph yet, so the
@@ -2691,7 +2751,8 @@ class HpcaApp(App):
         chat_list = self.query_one("#chat-list", ListView)
         await chat_list.clear()
         for entry in self._chat_entries:
-            chat_list.append(ChatItem(self._entry_widget(entry)))
+            for item in self._entry_items(entry):
+                chat_list.append(item)
         chat_list.scroll_end(animate=False)
 
     async def _append_chat(self, kind: str, text: str) -> None:
@@ -2702,12 +2763,29 @@ class HpcaApp(App):
         chat_list = self._chat_list()
         if chat_list is None:
             return  # screen already gone (shutdown); the entry is still kept
-        chat_list.append(ChatItem(self._entry_widget(entry)))
+        for item in self._entry_items(entry):
+            chat_list.append(item)
         chat_list.scroll_end(animate=False)
 
+    def _entry_items(self, entry: Entry) -> list[ChatItem]:
+        """The ListView rows an entry renders as: one for most entries, but an
+        expanded thinking box also yields a collapsed :class:`StepBox` row per
+        part. Consulting ``_thinking_expanded`` keeps a box open across a
+        re-render rather than snapping it shut."""
+        if entry.kind != THINKING:
+            return [ChatItem(self._entry_widget(entry))]
+        state = self._thinking_expanded.setdefault(id(entry), _ThinkingExpansion())
+        items = [ChatItem(ThinkingBox(entry, expanded=state.open))]
+        if state.open:
+            items += [
+                ChatItem(StepBox(part, expanded=state.parts.get(i, False)))
+                for i, part in enumerate(entry.parts)
+            ]
+        return items
+
     def _entry_widget(self, entry: Entry) -> Static:
-        if entry.kind == THINKING:
-            return ThinkingBox(entry)
+        # Thinking entries are rendered by _entry_items (box + optional step
+        # rows); everything else is a single framed message.
         widget = Static(Content(entry.text), classes=f"chat-{entry.kind}")
         widget.border_title = CHAT_TITLES.get(entry.kind, entry.kind)
         return widget
@@ -2788,17 +2866,62 @@ class HpcaApp(App):
         self._focus_column(COLUMN_IDS[(index + delta) % len(COLUMN_IDS)])
 
     @on(ListView.Selected, "#chat-list")
-    def _on_chat_list_selected(self, event: ListView.Selected) -> None:
+    async def _on_chat_list_selected(self, event: ListView.Selected) -> None:
         if event.item.query(WorkingIndicator):
             # Enter on the "LLM processing" line offers to abort the turn.
             self._maybe_interrupt_llm()
             return
+        steps = list(event.item.query(StepBox))
+        if steps:
+            await self._toggle_step(event.item, steps[0])
+            return
         boxes = list(event.item.query(ThinkingBox))
         if boxes:
-            boxes[0].toggle()
+            await self._toggle_thinking(event.item, boxes[0])
         else:
             # Enter on a message moves to the input (message actions later)
             self.focus_chat_input()
+
+    async def _toggle_thinking(self, item: ChatItem, box: ThinkingBox) -> None:
+        """Expand a thinking box into its parts (or fold them away again),
+        inserting/removing the child rows right below it. The highlight is held
+        on the box itself so the user keeps their place across the toggle."""
+        chat_list = self.query_one("#chat-list", ListView)
+        index = list(chat_list.children).index(item)
+        state = self._thinking_expanded.setdefault(
+            id(box.entry), _ThinkingExpansion()
+        )
+        state.open = not state.open
+        box.set_expanded(state.open)
+        if state.open:
+            children = [
+                ChatItem(StepBox(part, expanded=state.parts.get(i, False)))
+                for i, part in enumerate(box.entry.parts)
+            ]
+            await chat_list.insert(index + 1, children)
+        else:
+            # The children are exactly the rows following the box; drop them.
+            count = len(box.entry.parts)
+            await chat_list.remove_items(range(index + 1, index + 1 + count))
+        chat_list.index = index
+
+    async def _toggle_step(self, item: ChatItem, box: StepBox) -> None:
+        """Flip a single revealed part open or closed. Its state is recorded
+        against the owning box so a later re-render restores it."""
+        rows = list(self.query_one("#chat-list", ListView).children)
+        position = rows.index(item)
+        # Walk up to the thinking box this part belongs to; the offset between
+        # them is the part's index.
+        owner = position
+        while owner > 0 and not rows[owner].query(ThinkingBox):
+            owner -= 1
+        part_index = position - owner - 1
+        box.toggle()
+        parent = rows[owner].query_one(ThinkingBox)
+        state = self._thinking_expanded.setdefault(
+            id(parent.entry), _ThinkingExpansion()
+        )
+        state.parts[part_index] = box.expanded
 
     # ---------------------------------------------------------- llm backends
 
