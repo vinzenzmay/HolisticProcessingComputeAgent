@@ -8,8 +8,11 @@ from textual.widgets import ListView
 
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.llm import ChatResponse
-from hpca.tui.app import ChatInput, HpcaApp
-from hpca.tui.approval_screen import ApprovalScreen
+from hpca.tui.app import ChatInput, DecisionBar, HpcaApp
+
+
+def decision_bar(app):
+    return app.query_one("#decision-bar", DecisionBar)
 
 
 class DeleteParams(BaseModel):
@@ -153,17 +156,19 @@ class TestChatFlow:
 
 
 class TestApprovalFlow:
-    async def test_destructive_tool_opens_modal(self, hpca_home):
+    async def test_destructive_tool_prompts_inline(self, hpca_home):
         app = HpcaApp(
             llm=FakeLLM([tool_json("delete", target="results/")]),
             tools=destructive_tools(),
         )
         async with app.run_test(size=(120, 40)) as pilot:
             await submit_chat(app, pilot, "delete results")
-            assert isinstance(app.screen, ApprovalScreen)
-            rendered = app.screen.details_text()
-            assert "delete" in rendered
-            assert "results/" in rendered
+            bar = decision_bar(app)
+            assert bar.display and bar.kind == "approval"
+            assert len(app.screen_stack) == 1  # inline, no modal on the stack
+            payload = app._pending_decision[app.active_session.session_id]["payload"]
+            assert payload["tool"] == "delete"
+            assert "results/" in payload["arguments"]["target"]
 
     async def test_approve_runs_tool(self, hpca_home):
         app = HpcaApp(
@@ -397,7 +402,7 @@ async def test_tool_traffic_is_not_indexed(hpca_home):
     async with app.run_test(size=(120, 40)) as pilot:
         await submit_chat(app, pilot, "please delete scratch")
         await pilot.pause()
-        if isinstance(app.screen, ApprovalScreen):
+        if decision_bar(app).display:
             await pilot.press("y")
             await app.workers.wait_for_complete()
             await pilot.pause()
