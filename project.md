@@ -109,11 +109,18 @@ Prefer a bare letter gated (via `check_action`) to a non-typing column, or a saf
 * **Config editor** `(c)`: edit the settings JSON, persisted to
   `~/.HolisticProcessingComputeAgent/settings.json`.
 * **Profiles & learnings** `(a)`: manage profiles and their memories (see §6).
-* **Chat commands** (typing `/` or `\` lists them):
+* **Chat commands** (typing `/` or `\` lists the built-in commands *and* the
+  profile's skills; ↑/↓ select, `⇥` completes):
   * `/memorize [NOTE]` — the agent forms memories from NOTE plus the conversation
     so far and proposes them for approval (see §6).
   * `/conclude` — the agent analyses the conversation and proposes memories to write
     into the profile (user approves before write, see §6).
+  * `/skill-creator`, `/skills-list`, `/skill-remove` — manage this profile's
+    skills (see §5.1).
+  * `/<skill> [PROMPT]` — invoke a user-defined skill directly: its procedure is
+    handed to the model inline for that turn (see §5.1). Unlike the built-in
+    commands, this is a real turn — queued and run like any message, not an
+    exclusive UI worker.
 
 **Typing is never blocked.** One turn runs at a time — two invocations on a single
 `thread_id` would interleave checkpoint writes — but that is the orchestrator's
@@ -333,7 +340,26 @@ attempt it anyway.
 The tool suite must be a plugin-style registry so new tools can be added without
 touching core code. Additionally, users can provide **skills**: user-defined
 markdown/YAML files describing procedures the agent should follow for specific tasks,
-loaded per profile.
+loaded per profile (three levels — **project > profile > global** — with the most
+specific winning a name collision).
+
+**Skills stay out of the standing prompt.** Listing every skill each turn scaled
+the prompt with the skill count and pulled the small model toward procedures the
+user had not asked for. Instead the system prompt carries only a one-line note that
+skills exist; a skill body reaches the model just two ways, cheapest first:
+
+1. **Direct invocation** — the user types `/<skill> [PROMPT]`. The named skill's
+   full procedure is dropped onto the *API copy* of that user message (the same
+   sidecar that carries recalled memory and the volatile date, so the stored
+   transcript keeps the clean `/<skill> …` and the cacheable prompt prefix is
+   untouched). The turn is queued and run like any other message. Skills also
+   appear in the `/` autocomplete menu next to the built-in commands; single-token
+   names only (the parser splits on the first space), and a built-in command wins a
+   name clash.
+2. **On-demand fetch** — the model calls the `read_skill` tool itself when a
+   request seems to match one (passing any name returns the available skills, so it
+   can still discover them without the list being spent on every turn). The tool is
+   registered whenever any skill exists anywhere reachable.
 
 Core tools:
 

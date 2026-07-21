@@ -62,7 +62,11 @@ from hpca.agent.modes import (
     next_mode,
     render_checklist,
 )
-from hpca.agent.prompts import environment_facts, orchestrator_system_prompt
+from hpca.agent.prompts import (
+    build_skill_directive,
+    environment_facts,
+    orchestrator_system_prompt,
+)
 from hpca.agent.reflect import Reflection, propose_reflections
 from hpca.agent.skill_tools import add_skill_tools
 from hpca.agent.titler import propose_title
@@ -202,6 +206,9 @@ class PendingWork:
     session_id: str
     text: str
     kind: str  # "user" — typed and waiting | "event" — background completion
+    # Set when the text is a "/<skill>" invocation: the named skill's procedure
+    # is dropped into that turn's API copy so the model follows it directly.
+    forced_skill: "Skill | None" = None
 
 
 @dataclass
@@ -224,7 +231,9 @@ class TurnState:
     activity: str = "working"             # what the spinner says (decision 7)
 
 
-# Chat commands ("/" or "\"): typing the prefix lists these above the entry.
+# Built-in chat commands ("/" or "\"): typing the prefix lists these above the
+# entry, alongside the profile's skills (see ``_all_commands``). Built-ins run a
+# UI worker; a "/<skill>" runs a normal turn with that skill's procedure forced.
 COMMANDS = (
     ("memorize", "/memorize <note> — form memories from the note and this conversation"),
     ("conclude", "/conclude — propose memories from this conversation"),
@@ -1193,7 +1202,10 @@ class HpcaApp(App):
         return orchestrator_system_prompt(
             system_prompt_memories=memory.system_prompt_text(active_backend=backend),
             memory_meter=memory.usage_meter(cap),
-            skills=summarize_skills(skills),
+            # The skill list is deliberately kept out of the prompt; the model
+            # is only told skills exist and reaches one via read_skill (or gets
+            # it inline when the user invokes "/<skill>").
+            has_skills=bool(skills),
             session_search="session_search" in self._tools.names(),
             memory_tool="memory" in self._tools.names(),
         )
@@ -1249,25 +1261,30 @@ class HpcaApp(App):
         text = event.text.strip()
         if not text:
             return
+        forced_skill: "Skill | None" = None
         if text.startswith(("\\", "/")):
-            # Slash commands act on the UI and run their own exclusive
-            # workers; they are not turns and are not queued. Refused only
-            # while THIS session's own turn is running (a background turn in
-            # another session leaves the open session free to run a command).
-            active_busy = (
-                self.active_session is not None
-                and self.active_session.session_id in self._turns
-            )
-            if active_busy:
-                self.notify(
-                    f"Still working in “{self.active_session.title}” — "
-                    "commands wait for that reply.",
-                    severity="warning",
+            # A "/<skill>" invocation is a real turn (queued/concurrent like any
+            # message), so it falls through to the turn machinery below carrying
+            # the skill. A built-in slash command instead acts on the UI and
+            # runs its own exclusive worker: not a turn, not queued, and refused
+            # only while THIS session's own turn is running (a background turn
+            # in another session leaves the open session free to run one).
+            forced_skill = self._slash_skill(text)
+            if forced_skill is None:
+                active_busy = (
+                    self.active_session is not None
+                    and self.active_session.session_id in self._turns
                 )
+                if active_busy:
+                    self.notify(
+                        f"Still working in “{self.active_session.title}” — "
+                        "commands wait for that reply.",
+                        severity="warning",
+                    )
+                    return
+                event.chat_input.text = ""
+                self._handle_slash_command(text)
                 return
-            event.chat_input.text = ""
-            self._handle_slash_command(text)
-            return
         event.chat_input.text = ""
         if self.active_session is None:
             await self.start_new_session()
@@ -1283,7 +1300,10 @@ class HpcaApp(App):
         await self._append_chat("queued" if queued else "user", text)
         self._pending_work.append(
             PendingWork(
-                session_id=self.active_session.session_id, text=text, kind="user"
+                session_id=self.active_session.session_id,
+                text=text,
+                kind="user",
+                forced_skill=forced_skill,
             )
         )
         await self.drain_work()
@@ -1323,13 +1343,41 @@ class HpcaApp(App):
         self._render_command_menu()
         menu.display = True
 
+    def _all_commands(self) -> list[tuple[str, str]]:
+        """Built-in chat commands plus the on-screen profile's skills, so both
+        show in the "/" menu and tab-complete. Built-ins win a name clash. A
+        skill whose name has whitespace is left out: the slash parser splits on
+        the first space, so it could never be selected as "/<skill>" anyway."""
+        builtin = {name for name, _ in COMMANDS}
+        skill_cmds = [
+            (
+                s.name,
+                f"/{s.name} — {s.description}" if s.description else f"/{s.name}",
+            )
+            for s in self.skills
+            if s.name
+            and s.name not in builtin
+            and not any(ch.isspace() for ch in s.name)
+        ]
+        return list(COMMANDS) + skill_cmds
+
+    def _slash_skill(self, text: str) -> "Skill | None":
+        """The visible skill a leading "/<token>" names, or None. Built-in
+        commands win a name clash, and a skill is reachable this way only when
+        its name is a single token (the parser splits on the first space)."""
+        token = text[1:].partition(" ")[0]
+        if not token or token in {name for name, _ in COMMANDS}:
+            return None
+        return next((s for s in self.skills if s.name == token), None)
+
     def _matching_commands(self, typed: str) -> list[tuple[str, str]]:
         """(name, usage) pairs whose name contains ``typed``, most-used first
         then in definition order. Empty ``typed`` matches everything."""
         needle = typed.lower()
-        order = {name: i for i, (name, _) in enumerate(COMMANDS)}
+        commands = self._all_commands()
+        order = {name: i for i, (name, _) in enumerate(commands)}
         counts = self._command_counts()
-        matches = [(n, u) for n, u in COMMANDS if needle in n.lower()]
+        matches = [(n, u) for n, u in commands if needle in n.lower()]
         matches.sort(key=lambda nu: (-counts.get(nu[0], 0), order[nu[0]]))
         return matches
 
@@ -1467,6 +1515,7 @@ class HpcaApp(App):
         *,
         user_text: str | None = None,
         resume: Command | None = None,
+        forced_skill: "Skill | None" = None,
     ):
         """Start a turn for one session; it stays that session's turn even if
         the user switches away while the model works. Everything the turn
@@ -1487,14 +1536,27 @@ class HpcaApp(App):
         # where changing content belongs so the cacheable prefix survives.
         api_content = None
         if user_text is not None:
-            lines = self._recall_lines(user_text, turn_memory, session.profile)
+            # A "/<skill>" invocation: the model works from the request alone
+            # (the "/<skill>" prefix stripped off) plus the skill's procedure on
+            # the sidecar. Recall runs on the request too, not the command word.
+            if forced_skill is not None:
+                request = user_text[1:].partition(" ")[2].strip()
+                directive = build_skill_directive(
+                    forced_skill.name,
+                    forced_skill.description,
+                    forced_skill.body,
+                )
+            else:
+                request = user_text
+                directive = ""
+            lines = self._recall_lines(request, turn_memory, session.profile)
             block = build_memory_context(
                 lines,
                 max_notes=self.settings.memory.rag_prefetch_count,
                 max_chars=self.settings.memory.rag_prefetch_chars,
             )
             api_content = compose_api_content(
-                user_text, block, environment_facts()
+                request, block, environment_facts(), skill_directive=directive
             )
         log = open_log(self.settings, session)
         # Everything this turn owns lives in its own TurnState, keyed by
@@ -3007,7 +3069,11 @@ class HpcaApp(App):
                     if session is not None:
                         if self._is_active_session(session):
                             await self._promote_queued_entry(item.text)
-                        self._run_agent(session, user_text=item.text)
+                        self._run_agent(
+                            session,
+                            user_text=item.text,
+                            forced_skill=item.forced_skill,
+                        )
                 else:
                     await self._deliver_event(sid, item.text)
             except Exception as e:

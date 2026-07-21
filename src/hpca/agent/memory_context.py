@@ -86,16 +86,23 @@ def build_environment_context(environment: str) -> str:
 
 
 def compose_api_content(
-    user_text: str, context_block: str = "", environment: str = ""
+    user_text: str,
+    context_block: str = "",
+    environment: str = "",
+    skill_directive: str = "",
 ) -> str:
-    """The user message as the model sees it: clean text, then recalled memory,
-    then volatile environment facts.
+    """The user message as the model sees it: clean text, an explicitly-invoked
+    skill's procedure, then recalled memory, then volatile environment facts.
 
-    Recall and environment both ride this sidecar (``hpca.llm.wire_messages``)
-    so they land *after* the stable history and never disturb the cacheable
-    prompt prefix. The stored transcript keeps only ``user_text``.
+    ``skill_directive``, recall, and environment all ride this sidecar
+    (``hpca.llm.wire_messages``) so they land *after* the stable history and
+    never disturb the cacheable prompt prefix. The stored transcript keeps only
+    ``user_text``. The skill procedure sits right after the request so the model
+    reads the two together.
     """
     parts = [user_text]
+    if skill_directive:
+        parts.append(skill_directive)
     if context_block:
         parts.append(context_block)
     env_block = build_environment_context(environment)
