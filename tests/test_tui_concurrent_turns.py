@@ -30,11 +30,16 @@ TITLE_REPLY = json.dumps({"title": "a test session"})
 class SlowLLM:
     """Holds a turn open until released, recording the user text it sees so a
     cross-contamination leak (session B's turn hitting session A's client) is
-    detectable."""
+    detectable.
 
-    def __init__(self):
+    ``prompt_tokens`` is the usage the meter reads: give each backend a
+    distinct number so a leak onto the wrong session's meter is visible.
+    """
+
+    def __init__(self, prompt_tokens: int | None = None):
         self.gate = asyncio.Event()
         self.seen_user_texts: list[str] = []
+        self._prompt_tokens = prompt_tokens
 
     async def chat(self, messages, *, json_schema=None, **kwargs):
         if is_title_request(json_schema):
@@ -45,8 +50,14 @@ class SlowLLM:
             ).startswith(("[tool", "[process", "[job")):
                 self.seen_user_texts.append(message["content"])
         await self.gate.wait()
+        usage = (
+            {"prompt_tokens": self._prompt_tokens}
+            if self._prompt_tokens is not None
+            else {}
+        )
         return ChatResponse(
-            content=json.dumps({"action": "respond", "response": "ok"})
+            content=json.dumps({"action": "respond", "response": "ok"}),
+            usage=usage,
         )
 
     async def supports_constrained_decoding(self):
@@ -151,3 +162,109 @@ class TestConcurrentTurns:
             llm.gate.set()
             await app.workers.wait_for_complete()
             await pilot.pause()
+
+
+async def _wait_turn_done(app, pilot, session_id, tries=100):
+    """Pump the UI until ``session_id``'s background turn has cleared."""
+    for _ in range(tries):
+        if session_id not in app._turns:
+            return
+        await pilot.pause()
+    raise AssertionError(f"turn for {session_id} did not finish")
+
+
+class TestPerSessionContextMeter:
+    """Decision 9: the meter always reflects the session on screen — a live
+    foreground turn ticks it, a background turn silently updates its OWN stored
+    number, and switching to that session later shows its current value (not a
+    stale zero, not another session's count)."""
+
+    def _route(self, boot, slow_a, slow_b):
+        def client_for(session):
+            if session is not None and "qwen-a" in (session.backend or ""):
+                return slow_a
+            if session is not None and "qwen-b" in (session.backend or ""):
+                return slow_b
+            return boot
+
+        return client_for
+
+    async def test_background_usage_updates_its_own_stored_number(self, hpca_home):
+        """A finishes off-screen while B is visible: A's count is stored, and
+        the visible (B) meter never shows A's number."""
+        boot = SlowLLM()
+        slow_a = SlowLLM(prompt_tokens=5000)
+        slow_b = SlowLLM(prompt_tokens=9000)
+        app = HpcaApp(llm=boot)
+        async with app.run_test(size=(120, 40)) as pilot:
+            app._client_for = self._route(boot, slow_a, slow_b)
+            await app.start_new_session(backend=backend_blob("qwen-a", "http://a/v1"))
+            session_a = app.active_session
+            await send(app, pilot, "in A")
+
+            await app.start_new_session(backend=backend_blob("qwen-b", "http://b/v1"))
+            session_b = app.active_session
+            await send(app, pilot, "in B")
+
+            # Let A finish in the background; B stays held open and on screen.
+            slow_a.gate.set()
+            await _wait_turn_done(app, pilot, session_a.session_id)
+
+            # A's usage landed on A's stored number, not B's, and not the meter.
+            assert app._context_used[session_a.session_id] == 5000
+            assert app._context_used.get(session_b.session_id) is None
+            assert "5,000" not in app._context_bar().text
+
+            slow_b.gate.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+    async def test_switching_shows_the_sessions_measured_number(self, hpca_home):
+        """After A ran off-screen, switching back to A shows A's measured count
+        — not zero, and not B's number."""
+        boot = SlowLLM()
+        slow_a = SlowLLM(prompt_tokens=5000)
+        slow_b = SlowLLM(prompt_tokens=9000)
+        app = HpcaApp(llm=boot)
+        async with app.run_test(size=(120, 40)) as pilot:
+            app._client_for = self._route(boot, slow_a, slow_b)
+            await app.start_new_session(backend=backend_blob("qwen-a", "http://a/v1"))
+            session_a = app.active_session
+            await send(app, pilot, "in A")
+
+            await app.start_new_session(backend=backend_blob("qwen-b", "http://b/v1"))
+            session_b = app.active_session
+            await send(app, pilot, "in B")
+
+            slow_a.gate.set()
+            slow_b.gate.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            # On screen is B: its meter reads B's number.
+            assert app.active_session.session_id == session_b.session_id
+            assert "9,000" in app._context_bar().text
+
+            # Switch back to A: the meter now reads A's measured number.
+            await app.open_session(session_a)
+            await pilot.pause()
+            text = app._context_bar().text
+            assert "5,000" in text
+            assert "9,000" not in text
+
+    async def test_visible_turn_ticks_the_meter_live(self, hpca_home):
+        """The on-screen session's own turn drives the meter to its number."""
+        llm = SlowLLM(prompt_tokens=7000)
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            session_a = app.active_session
+            await send(app, pilot, "hello")
+            assert session_a.session_id in app._turns
+
+            llm.gate.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert app._context_used[session_a.session_id] == 7000
+            assert "7,000" in app._context_bar().text

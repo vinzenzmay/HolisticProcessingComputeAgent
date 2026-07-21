@@ -982,7 +982,12 @@ class HpcaApp(App):
         # measured prompt size (per session — a different thread is a
         # different context).
         self._discovered_window: int | None = None
-        self._context_used = 0
+        # The last measured prompt size per session (thread_id → prompt_tokens).
+        # A background turn updates its own entry silently; the meter on screen
+        # always reflects the active session's number (decision 9), so switching
+        # to a session that ran off-screen shows its current fill, not a stale
+        # zero or another session's count.
+        self._context_used: dict[str, int] = {}
         # Panel labels by pid: describe() reads a script off disk, and the
         # script behind a finished process never changes.
         self._process_labels: dict[int, str] = {}
@@ -2465,7 +2470,6 @@ class HpcaApp(App):
                 )
             )
             await self._set_chat_messages([])
-            self._context_used = 0
             bar = self._context_bar()
             if bar is not None:
                 bar.reset()  # a fresh thread starts from an empty window
@@ -2608,7 +2612,15 @@ class HpcaApp(App):
         bar = self._context_bar()
         if bar is None:
             return
-        self._context_used = 0
+        # A measured number for this session (its own turn, foreground or
+        # background, already reported one) always supersedes an estimate.
+        session_id = (
+            self.active_session.session_id if self.active_session else None
+        )
+        measured = self._context_used.get(session_id) if session_id else None
+        if measured:
+            bar.set_used(measured)
+            return
         messages = list(values.get("messages", []))
         compacted = values.get("compacted")
         if compacted:
@@ -2620,10 +2632,14 @@ class HpcaApp(App):
 
     async def close_session(self) -> None:
         """Leave the active session: empty chat, no entry, nothing to type in."""
+        # Deliberately leaving drops the measured number, so reopening re-derives
+        # the fill from the stored history (which reflects compaction and any
+        # growth since); a running turn re-stores its count when it reports.
+        if self.active_session is not None:
+            self._context_used.pop(self.active_session.session_id, None)
         self.active_session = None
         self._tool_ctx = None
         self._log = None
-        self._context_used = 0
         bar = self._context_bar()
         if bar is not None:
             bar.reset()
@@ -3468,10 +3484,11 @@ class HpcaApp(App):
         self._owns_llm = True
         self._rebuild_graph()
         self._refresh_session_log()  # rebind the tool context to the new client
-        # A different model means a different window, and the token count
-        # measured against the old one no longer describes this one.
+        # A different model means a different window, and the token counts
+        # measured against the old one no longer describe it — drop every
+        # session's measurement so each re-measures on its next turn.
         self._discovered_window = None
-        self._context_used = 0
+        self._context_used.clear()
         bar = self._context_bar()
         if bar is not None:
             bar.reset()
@@ -3601,22 +3618,22 @@ class HpcaApp(App):
 
         prompt_tokens is what occupies the window; the completion is spent
         the moment it is generated. Reported per round, so a tool-heavy turn
-        visibly fills the bar as it works. Stage 1 keeps the scalar
-        ``_context_used`` but only updates the visible meter when the reporting
-        session is the one on screen — a background turn must not move it
-        (stage 2 makes the storage per-session)."""
+        visibly fills the bar as it works. The count is stored per session
+        ALWAYS — a background turn silently updates its own number so switching
+        to it later shows the current fill — but the visible meter moves only
+        when the reporting session is the one on screen (decision 9)."""
         prompt_tokens = usage.get("prompt_tokens")
         if not prompt_tokens:
             return
+        self._context_used[session_id] = int(prompt_tokens)
         if (
             self.active_session is None
             or self.active_session.session_id != session_id
         ):
             return
-        self._context_used = int(prompt_tokens)
         bar = self._context_bar()
         if bar is not None:
-            bar.set_used(self._context_used)
+            bar.set_used(int(prompt_tokens))
 
     def _context_bar(self) -> ContextBar | None:
         found = self.query("#context-bar")
@@ -3627,8 +3644,16 @@ class HpcaApp(App):
         if bar is None:
             return
         bar.set_window(self._active_max_model_len())
-        if self._context_used:
-            bar.set_used(self._context_used)
+        # Bind the meter to the active session's stored number. Non-destructive
+        # otherwise: callers that open/create a session follow with an explicit
+        # estimate or reset, and a session showing only an estimate keeps it
+        # when the async window probe lands.
+        session_id = (
+            self.active_session.session_id if self.active_session else None
+        )
+        used = self._context_used.get(session_id) if session_id else None
+        if used:
+            bar.set_used(used)
 
     async def _discover_context_window(self) -> None:
         """Ask the backend how big its window is, and remember it.
