@@ -1,5 +1,6 @@
 """Tests for the memory workflows: /memorize, /conclude, caps, editor (§6.3, §6.4)."""
 
+import asyncio
 import json
 from contextlib import contextmanager
 
@@ -9,7 +10,7 @@ from textual.widgets import ListView
 from hpca.editor import resolve_editor
 from hpca.llm import ChatResponse
 from hpca.profiles import MemoryScope, Profile
-from hpca.tui.app import ChatInput, HpcaApp, UNTITLED_SESSION
+from hpca.tui.app import ChatInput, HpcaApp, UNTITLED_SESSION, WorkingIndicator
 from hpca.tui.memory_screens import MemoryProposalScreen, ReflectionScreen
 
 
@@ -157,6 +158,38 @@ class TestMemorize:
             assert app.chat_log_texts() == []
             assert app.active_session.title == UNTITLED_SESSION
 
+    async def test_spinner_visible_while_forming_memories(self, hpca_home):
+        """The silent /memorize LLM call shows the chat-bottom spinner while it
+        runs, labelled "forming memories", and clears it once the call returns."""
+        gate = asyncio.Event()
+
+        class GatedLLM(FakeLLM):
+            async def chat(self, messages, *, json_schema=None, **kwargs):
+                if kwargs.get("schema_name") == "memory_proposals":
+                    await gate.wait()
+                return await super().chat(
+                    messages, json_schema=json_schema, **kwargs
+                )
+
+        app = HpcaApp(llm=GatedLLM([MEMORIZE_REPLY]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await type_and_submit(app, pilot, "/memorize STAR needed 40G here")
+            for _ in range(50):  # let the worker park on the gated call
+                if app.query(WorkingIndicator):
+                    break
+                await pilot.pause()
+            indicators = app.query(WorkingIndicator)
+            assert indicators, "spinner should be visible while forming memories"
+            assert indicators.first(WorkingIndicator).activity == "forming memories"
+            gate.set()
+            for _ in range(6):
+                await pilot.pause()
+            assert isinstance(app.screen, MemoryProposalScreen)
+            await pilot.press("n")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert not app.query(WorkingIndicator)
+
 
 class TestCommandMenu:
     """Typing the prefix lists the commands: /memorize should be discoverable
@@ -246,6 +279,47 @@ class TestConclude:
             assert loaded.memories[0].text == "STAR needs 40G."
             assert loaded.memories[0].scope is MemoryScope.SYSTEM_PROMPT
             assert loaded.memories[0].kind == "learning"
+
+    async def test_spinner_visible_while_reviewing(self, hpca_home):
+        """The silent /conclude LLM call shows the chat-bottom spinner while it
+        runs, labelled for the step, and clears it once the call returns."""
+        gate = asyncio.Event()
+
+        class GatedLLM(FakeLLM):
+            async def chat(self, messages, *, json_schema=None, **kwargs):
+                if kwargs.get("schema_name") == "reflection":
+                    await gate.wait()
+                return await super().chat(
+                    messages, json_schema=json_schema, **kwargs
+                )
+
+        llm = GatedLLM(
+            [
+                respond_json("hi"),
+                proposals_json(
+                    {"kind": "memory", "scope": "system-prompt", "text": "STAR needs 40G."},
+                ),
+            ]
+        )
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await type_and_submit(app, pilot, "hello")
+            await app.workers.wait_for_complete()
+            await type_and_submit(app, pilot, r"\conclude")
+            for _ in range(50):  # let the worker park on the gated call
+                if app.query(WorkingIndicator):
+                    break
+                await pilot.pause()
+            indicators = app.query(WorkingIndicator)
+            assert indicators, "spinner should be visible during the review call"
+            assert indicators.first(WorkingIndicator).activity == "reviewing conversation"
+            gate.set()
+            await pilot.pause()
+            assert isinstance(app.screen, ReflectionScreen)
+            await pilot.press("y")  # keep the proposal
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert not app.query(WorkingIndicator)
 
     async def test_conclude_without_a_conversation_warns(self, hpca_home):
         app = HpcaApp(llm=FakeLLM([]))

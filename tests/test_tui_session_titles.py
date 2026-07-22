@@ -1,12 +1,18 @@
 """Session titles: written by the model, renamed by hand, or re-asked for."""
 
+import asyncio
 import json
 
 import pytest
-from textual.widgets import Input, ListView
+from textual.widgets import Input, Label, ListView
 
 from hpca.llm import ChatResponse
-from hpca.tui.app import ChatInput, HpcaApp
+from hpca.tui.app import (
+    ChatInput,
+    HpcaApp,
+    WORKING_MARK,
+    WorkingIndicator,
+)
 from hpca.tui.rename_screen import RenameScreen
 
 
@@ -235,6 +241,115 @@ class TestLLMRetitle:
             await pilot.pause()
             assert app.active_session.title == "hello"
             assert app.is_running  # reported, not crashed
+
+    async def test_retitling_the_open_session_shows_the_chat_spinner(self, hpca_home):
+        """Retitling the session the user is looking at parks the chat-bottom
+        spinner, labelled "writing a title", until the call returns."""
+        gate = asyncio.Event()
+
+        class GatedTitler(FakeLLM):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.armed = False  # the opening auto-title must not block submit
+
+            async def chat(self, messages, *, json_schema=None, **kwargs):
+                if is_title_request(json_schema) and self.armed:
+                    await gate.wait()
+                return await super().chat(messages, json_schema=json_schema, **kwargs)
+
+        llm = GatedTitler([respond_json("a")], titles=["first name", "second name"])
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "hello")
+            assert app.active_session.title == "first name"
+            llm.armed = True
+            sessions_list = app.query_one("#sessions-list", ListView)
+            sessions_list.focus()
+            sessions_list.index = 1
+            await pilot.press("t")
+            for _ in range(50):  # let the worker park on the gated title call
+                if app.query(WorkingIndicator):
+                    break
+                await pilot.pause()
+            indicators = app.query(WorkingIndicator)
+            assert indicators, "the open session should show the chat spinner"
+            assert indicators.first(WorkingIndicator).activity == "writing a title"
+            gate.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert not app.query(WorkingIndicator)
+            assert app.active_session.title == "second name"
+
+    async def test_retitling_a_background_session_lights_the_row_not_the_chat(
+        self, hpca_home
+    ):
+        """Retitling a session that is highlighted but NOT open lights its
+        sidebar row glyph — never the chat spinner, which belongs to the open
+        session the user is looking at."""
+        gate = asyncio.Event()
+
+        class GatedTitler(FakeLLM):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.armed = False
+
+            async def chat(self, messages, *, json_schema=None, **kwargs):
+                if is_title_request(json_schema) and self.armed:
+                    await gate.wait()
+                return await super().chat(messages, json_schema=json_schema, **kwargs)
+
+        llm = GatedTitler(
+            [respond_json("a"), respond_json("b")],
+            titles=["A first", "B first", "A second"],
+        )
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "first")
+            first = app.active_session
+            await app.start_new_session()
+            await pilot.pause()
+            await submit_chat(app, pilot, "second")
+            second = app.active_session
+            llm.armed = True
+
+            def row_for(session):
+                for item in app.query_one("#sessions-list", ListView).children:
+                    rs = getattr(item, "data_session", None)
+                    if rs is not None and rs.session_id == session.session_id:
+                        return item
+                return None
+
+            sessions_list = app.query_one("#sessions-list", ListView)
+            sessions_list.focus()
+            sessions_list.index = next(
+                i
+                for i, item in enumerate(sessions_list.children)
+                if getattr(item, "data_session", None)
+                and item.data_session.session_id == first.session_id
+            )
+            # A is highlighted, B is still the open/active session.
+            assert app.active_session.session_id == second.session_id
+            assert app._highlighted_session().session_id == first.session_id
+
+            await pilot.press("t")
+            for _ in range(50):  # let the worker park on the gated title call
+                if first.session_id in app._busy_sessions:
+                    break
+                await pilot.pause()
+            # No chat spinner: A isn't the open chat.
+            assert not app.query(WorkingIndicator)
+            row = row_for(first)
+            assert row.has_class("session-working")
+            assert str(row.query_one("Label").content).startswith(WORKING_MARK)
+
+            gate.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert not row_for(first).has_class("session-working")
+            assert not str(row_for(first).query_one("Label").content).startswith(
+                WORKING_MARK
+            )
+            assert app.session_store.get(first.session_id).title == "A second"
 
 
 class TestTitleLogging:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from os import environ as os_environ
@@ -986,6 +987,9 @@ class HpcaApp(App):
         # old app-wide singletons (_busy_turn/_turn_worker/_turn_ctx/…) so two
         # live turns never read each other's client, context or interrupt state.
         self._turns: dict[str, TurnState] = {}
+        # Sessions busy with a silent backend call (e.g. an off-screen retitle)
+        # that has no TurnState — a second source for the sidebar working glyph.
+        self._busy_sessions: set[str] = set()
         self._interrupt_worker = None  # the rollback worker after a 3s hold
         # Work waiting for a session's orchestrator: messages the user typed
         # while that session's turn was running, and background completions
@@ -1603,19 +1607,49 @@ class HpcaApp(App):
         found = self.query("#chat-list")
         return found.first(ListView) if found else None
 
-    def show_working(self) -> None:
+    def show_working(self, label: str | None = None) -> None:
         """Put the spinner after the last message: a reply is on its way.
 
-        Seeded from the active session's own turn activity, so re-opening a
-        busy session shows what that turn is doing, not a stale global."""
+        With no ``label``, seeded from the active session's own turn activity,
+        so re-opening a busy session shows what that turn is doing, not a stale
+        global. An explicit ``label`` names the step directly — used by silent
+        backend calls (e.g. /conclude) that have no TurnState to read from."""
         chat_list = self._chat_list()
         if chat_list is None:
             return
-        ts = self._active_turn()
-        activity = ts.activity if ts is not None else "working"
+        if label is not None:
+            activity = label
+        else:
+            ts = self._active_turn()
+            activity = ts.activity if ts is not None else "working"
         if not chat_list.query(WorkingIndicator):
             chat_list.append(ChatItem(WorkingIndicator(activity)))
             chat_list.scroll_end(animate=False)
+
+    @asynccontextmanager
+    async def _backend_working(self, label: str, *, session: "Session | None"):
+        """Feedback around a silent backend (LLM) call. Chat-bottom spinner when
+        `session` is the open, turn-free session; otherwise the sidebar row glyph.
+        Teardown is guaranteed, so an exception in the call can't strand it."""
+        sid = session.session_id if session is not None else None
+        use_chat = (
+            session is not None
+            and self._is_active_session(session)
+            and sid not in self._turns
+        )
+        if use_chat:
+            self.show_working(label)
+        elif sid is not None:
+            self._busy_sessions.add(sid)
+            self._refresh_session_row(sid)
+        try:
+            yield
+        finally:
+            if use_chat:
+                self.hide_working()
+            elif sid is not None:
+                self._busy_sessions.discard(sid)
+                self._refresh_session_row(sid)
 
     def hide_working(self) -> None:
         chat_list = self._chat_list()
@@ -2077,14 +2111,17 @@ class HpcaApp(App):
         )
         self.profile_memory = Profile.load(self.profile)  # merge, don't clobber
         try:
-            proposals = await propose_memories(
-                self._labelled_llm("memorize", session=self.active_session),
-                messages,
-                system_prompt_memories=self.profile_memory.scope_text(
-                    MemoryScope.SYSTEM_PROMPT
-                ),
-                guidance=note,
-            )
+            async with self._backend_working(
+                "forming memories", session=self.active_session
+            ):
+                proposals = await propose_memories(
+                    self._labelled_llm("memorize", session=self.active_session),
+                    messages,
+                    system_prompt_memories=self.profile_memory.scope_text(
+                        MemoryScope.SYSTEM_PROMPT
+                    ),
+                    guidance=note,
+                )
         except Exception as e:
             self.notify(f"/memorize failed: {e}", severity="error")
             return
@@ -2233,15 +2270,16 @@ class HpcaApp(App):
         the user. Returns how many proposals were kept."""
         memory = self._memory_snapshot(session.profile)
         skills = load_skills(session.profile)
-        proposals = await propose_reflections(
-            self._labelled_llm("conclude", session=session),
-            messages,
-            system_prompt_memories=memory.scope_text(MemoryScope.SYSTEM_PROMPT),
-            rag_memories=memory.scope_text(MemoryScope.RAG),
-            skills=summarize_skills(skills),
-            allow_new_skills=self.settings.memory.propose_new_skills,
-            span=span,
-        )
+        async with self._backend_working("reviewing conversation", session=session):
+            proposals = await propose_reflections(
+                self._labelled_llm("conclude", session=session),
+                messages,
+                system_prompt_memories=memory.scope_text(MemoryScope.SYSTEM_PROMPT),
+                rag_memories=memory.scope_text(MemoryScope.RAG),
+                skills=summarize_skills(skills),
+                allow_new_skills=self.settings.memory.propose_new_skills,
+                span=span,
+            )
         if not proposals:
             return 0
         kept = 0
@@ -2651,7 +2689,8 @@ class HpcaApp(App):
         if not messages:
             self.notify("Nothing to summarize yet.", severity="warning")
             return
-        title = await self._propose_title(messages, session=session)
+        async with self._backend_working("writing a title", session=session):
+            title = await self._propose_title(messages, session=session)
         if title is None:
             self.notify("The model could not write a title.", severity="error")
             return
@@ -2852,7 +2891,10 @@ class HpcaApp(App):
         )
         if session.session_id in self._pending_decision:
             mark = "! "
-        elif session.session_id in self._turns:
+        elif (
+            session.session_id in self._turns
+            or session.session_id in self._busy_sessions
+        ):
             mark = WORKING_MARK
         else:
             mark = ""
@@ -2875,7 +2917,11 @@ class HpcaApp(App):
                 item.set_class(
                     session_id in self._pending_decision, "session-pending"
                 )
-                item.set_class(session_id in self._turns, "session-working")
+                item.set_class(
+                    session_id in self._turns
+                    or session_id in self._busy_sessions,
+                    "session-working",
+                )
                 return
 
     def _is_active_session(self, session: Session | None) -> bool:
