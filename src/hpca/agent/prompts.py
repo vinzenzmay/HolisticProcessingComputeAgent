@@ -34,7 +34,8 @@ PATH_WORKFLOW_GUIDANCE = (
     "path from the user's message exactly), then call the actual tool with "
     "the new key. When the user does NOT give you a path, find it yourself "
     "(see below) and register what you found. Do not ask the user to "
-    "register paths — that is your job."
+    "register paths — that is your job. A registered path may be a directory: "
+    "read_file lists it, and read_file with a subpath reads a file inside it."
 )
 
 # Without this the model has no idea it may look around: every file tool takes

@@ -140,13 +140,56 @@ async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
 
 class ReadFileParams(BaseModel):
     registry_key: str = Field(description="Registry key of the file to read")
+    subpath: str = Field(
+        default="",
+        description=(
+            "Path relative to registry_key when it names a directory, e.g. "
+            "'src/main.py'. Leave empty to read the key itself."
+        ),
+    )
     max_lines: int = Field(
         default=100, ge=10, le=500, description="Line budget for the output"
     )
 
 
+def _list_dir(path: Path, key: str, max_lines: int) -> str:
+    # A directory key is a dead end for read_text; instead of a raw
+    # IsADirectoryError, list it and point at the subpath route so the model
+    # can descend without registering every file first (live-session thrash).
+    entries = sorted(
+        p.name + ("/" if p.is_dir() else "") for p in path.iterdir()
+    )
+    shown = entries[:max_lines]
+    omitted = len(entries) - len(shown)
+    tail = f"\n... [{omitted} more] ..." if omitted > 0 else ""
+    body = "\n".join(shown) or "(empty)"
+    return (
+        f"{key!r} is a directory, not a file. Contents:\n{body}{tail}\n"
+        f"Read one with read_file(registry_key={key!r}, subpath='<name>')."
+    )
+
+
 async def read_file(args: ReadFileParams, ctx: ToolContext) -> str:
     path = ctx.registry.resolve(args.registry_key)
+    key = args.registry_key
+    if args.subpath:
+        # Descend into a registered directory. Reject escapes and keep the
+        # resolved file addressable next turn via its own auto-registered key.
+        candidate = (path / args.subpath).resolve()
+        if not candidate.is_relative_to(path.resolve()):
+            return (
+                f"subpath {args.subpath!r} escapes {args.registry_key!r}; "
+                "use a path inside the directory."
+            )
+        if not candidate.exists():
+            return (
+                f"No such file: {args.subpath!r} under {args.registry_key!r}. "
+                f"Call read_file(registry_key={args.registry_key!r}) to list it."
+            )
+        path = candidate
+        key = ctx.registry.register_auto(path, hint=path.name)
+    if path.is_dir():
+        return _list_dir(path, key, args.max_lines)
     lines = path.read_text(errors="replace").splitlines()
     if len(lines) <= args.max_lines:
         return "\n".join(lines)
@@ -430,7 +473,10 @@ def default_tool_registry() -> ToolRegistry:
     registry.register(
         Tool(
             name="read_file",
-            description="Read a registered file (head/tail truncated)",
+            description=(
+                "Read a registered file (head/tail truncated). If the key is a "
+                "directory, lists it; pass subpath to read a file inside it."
+            ),
             params=ReadFileParams,
             handler=read_file,
         )
