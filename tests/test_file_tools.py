@@ -86,6 +86,60 @@ class TestDeleteFile:
         result = await call(tools, "delete_file", ctx, registry_key="big")
         assert "WITHOUT backup" in result
 
+    async def test_subpath_deletes_file_inside_directory_keeping_dir_key(
+        self, tools, ctx, tmp_path
+    ):
+        d = tmp_path / "run"
+        d.mkdir()
+        victim = d / "old.log"
+        victim.write_text("stale")
+        ctx.registry.register("run_dir", d)
+        result = await call(
+            tools, "delete_file", ctx, registry_key="run_dir", subpath="old.log"
+        )
+        assert not victim.exists()
+        assert "recoverable" in result
+        # the directory key survives; only the inner file was removed
+        assert ctx.registry.resolve("run_dir") == d
+
+    async def test_subpath_delete_is_gated_when_it_resolves(
+        self, tools, ctx, tmp_path
+    ):
+        d = tmp_path / "run"
+        d.mkdir()
+        (d / "old.log").write_text("stale")
+        ctx.registry.register("run_dir", d)
+        assert (
+            gates(tools, "delete_file", ctx, registry_key="run_dir", subpath="old.log")
+            is True
+        )
+
+    async def test_missing_subpath_is_a_useful_error(self, tools, ctx, tmp_path):
+        d = tmp_path / "run"
+        d.mkdir()
+        ctx.registry.register("run_dir", d)
+        # a bad subpath is not gated, and the handler explains rather than crashes
+        assert (
+            gates(tools, "delete_file", ctx, registry_key="run_dir", subpath="ghost")
+            is False
+        )
+        result = await call(
+            tools, "delete_file", ctx, registry_key="run_dir", subpath="ghost"
+        )
+        assert "No such path" in result
+
+    async def test_subpath_cannot_escape_the_directory(self, tools, ctx, tmp_path):
+        outside = tmp_path / "keepme.txt"
+        outside.write_text("precious")
+        d = tmp_path / "run"
+        d.mkdir()
+        ctx.registry.register("run_dir", d)
+        result = await call(
+            tools, "delete_file", ctx, registry_key="run_dir", subpath="../keepme.txt"
+        )
+        assert "escapes" in result
+        assert outside.exists()
+
 
 class TestMoveFile:
     async def test_fresh_target_not_gated_and_reassigns_key(
@@ -140,6 +194,27 @@ class TestMoveFile:
         with pytest.raises(UnknownKeyError):
             await call(tools, "move_file", ctx, source_key="nope", dest_dir_key="dest")
 
+    async def test_subpath_moves_file_from_directory_and_registers_it(
+        self, tools, ctx, tmp_path
+    ):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("content")
+        d = tmp_path / "dest"
+        d.mkdir()
+        ctx.registry.register("src_dir", src)
+        ctx.registry.register("dest", d)
+        result = await call(
+            tools, "move_file", ctx,
+            source_key="src_dir", subpath="a.txt", dest_dir_key="dest",
+        )
+        assert not (src / "a.txt").exists()
+        assert (d / "a.txt").read_text() == "content"
+        # the source directory key is untouched; the moved file gets its own key
+        assert ctx.registry.resolve("src_dir") == src
+        assert ctx.registry.resolve("a.txt") == d / "a.txt"
+        assert "a.txt" in result
+
 
 class TestCopyFile:
     async def test_copy_registers_new_key(self, tools, ctx, tmp_path):
@@ -164,6 +239,22 @@ class TestCopyFile:
         ctx.registry.register("a", f)
         ctx.registry.register("dest", d)
         assert gates(tools, "copy_file", ctx, source_key="a", dest_dir_key="dest") is True
+
+    async def test_subpath_copies_file_from_directory(self, tools, ctx, tmp_path):
+        src = tmp_path / "src"
+        (src / "nested").mkdir(parents=True)
+        (src / "nested" / "a.txt").write_text("content")
+        d = tmp_path / "dest"
+        d.mkdir()
+        ctx.registry.register("src_dir", src)
+        ctx.registry.register("dest", d)
+        result = await call(
+            tools, "copy_file", ctx,
+            source_key="src_dir", subpath="nested/a.txt", dest_dir_key="dest",
+        )
+        assert (src / "nested" / "a.txt").exists()  # original untouched
+        assert (d / "a.txt").read_text() == "content"
+        assert "a.txt_copy" in result
 
 
 class TestDescribeCall:
@@ -201,3 +292,15 @@ class TestDescribeCall:
         )
         assert str(f) in text and str(d / "a.txt") in text
         assert "OVERWRITES" in text
+
+    async def test_delete_description_resolves_subpath(self, tools, ctx, tmp_path):
+        d = tmp_path / "run"
+        d.mkdir()
+        (d / "old.log").write_text("stale")
+        ctx.registry.register("run_dir", d)
+        tool = tools.get("delete_file")
+        text = tool.describe_call(
+            tool.params.model_validate({"registry_key": "run_dir", "subpath": "old.log"}),
+            ctx,
+        )
+        assert str(d / "old.log") in text
