@@ -109,6 +109,61 @@ class TestReadFile:
         with pytest.raises(UnknownKeyError, match="known"):
             await call(tools, "read_file", ctx, registry_key="nope")
 
+    async def test_directory_key_is_listed_not_an_error(self, tools, ctx, tmp_path):
+        d = tmp_path / "tools"
+        d.mkdir()
+        (d / "run.sh").write_text("echo hi\n")
+        (d / "sub").mkdir()
+        ctx.registry.register("tools_dir", d)
+        result = await call(tools, "read_file", ctx, registry_key="tools_dir")
+        assert "is a directory" in result
+        assert "run.sh" in result
+        assert "sub/" in result  # trailing slash marks nested directories
+        assert "subpath" in result
+
+    async def test_subpath_reads_file_inside_registered_directory(
+        self, tools, ctx, tmp_path
+    ):
+        d = tmp_path / "pkg"
+        (d / "src").mkdir(parents=True)
+        (d / "src" / "main.py").write_text("print('hello')\n")
+        ctx.registry.register("pkg", d)
+        result = await call(
+            tools, "read_file", ctx, registry_key="pkg", subpath="src/main.py"
+        )
+        assert "hello" in result
+
+    async def test_subpath_autoregisters_the_file_for_reuse(
+        self, tools, ctx, tmp_path
+    ):
+        d = tmp_path / "pkg"
+        d.mkdir()
+        (d / "notes.txt").write_text("body\n")
+        ctx.registry.register("pkg", d)
+        await call(tools, "read_file", ctx, registry_key="pkg", subpath="notes.txt")
+        assert ctx.registry.resolve("notes.txt") == d / "notes.txt"
+
+    async def test_missing_subpath_is_a_useful_error(self, tools, ctx, tmp_path):
+        d = tmp_path / "pkg"
+        d.mkdir()
+        ctx.registry.register("pkg", d)
+        result = await call(
+            tools, "read_file", ctx, registry_key="pkg", subpath="nope.txt"
+        )
+        assert "No such file" in result
+
+    async def test_subpath_cannot_escape_the_directory(self, tools, ctx, tmp_path):
+        secret = tmp_path / "secret.txt"
+        secret.write_text("top secret\n")
+        d = tmp_path / "pkg"
+        d.mkdir()
+        ctx.registry.register("pkg", d)
+        result = await call(
+            tools, "read_file", ctx, registry_key="pkg", subpath="../secret.txt"
+        )
+        assert "escapes" in result
+        assert "top secret" not in result
+
 
 class TestStartScript:
     async def test_runs_and_registers_logs(self, tools, ctx):
