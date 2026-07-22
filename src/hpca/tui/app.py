@@ -329,7 +329,9 @@ class ChatInput(TextArea):
     that cannot report shift+enter still have the other two). Arrow keys move
     the text cursor and only hand focus on at the edges of the draft: ← at the
     very start leaves for the sessions column, → at the very end for the
-    processes column, ↑ on the first line leaves to browse the message log.
+    processes column, ↑ on the first *visual* row leaves to browse the message
+    log. The row check is wrap-aware, so ↑/↓ still step through a long draft
+    that soft-wraps onto several rows even though it is one logical line.
     The draft is kept, so the user can step away mid-sentence and come back.
     """
 
@@ -391,7 +393,10 @@ class ChatInput(TextArea):
             super().action_cursor_right(select)
 
     def action_cursor_up(self, select: bool = False) -> None:
-        if not select and self.cursor_at_first_line:
+        # Wrap-aware: leave only from the first *visual* row. cursor_at_first_line
+        # is true for the whole logical line, so with soft wrap it would fire
+        # anywhere in a wrapped first paragraph and never let ↑ climb rows.
+        if not select and self.navigator.is_first_wrapped_line(self.selection.end):
             self.app.browse_chat_messages()
         else:
             super().action_cursor_up(select)
