@@ -130,6 +130,32 @@ class RagSettings(_Section):
     embedding_base_url: str = "http://localhost:20000/v1"
 
 
+class EndpointsSettings(_Section):
+    """Auto-connect: cluster endpoint discovery (spec §6).
+
+    On the cluster, HPCA reads vLLM manifest files (written by the launch
+    scripts) from ``endpoints_dir`` and connects directly. Off the cluster
+    that dir is empty, so it falls through to the localhost scan and prints an
+    SSH-tunnel template built from ``login_host``/``login_user``.
+    """
+
+    endpoints_dir: str = "~/.hpca/endpoints"
+    # Optional ordered model-id substrings for full auto-connect to the top
+    # available match; empty => the "auto if one, list if many" default.
+    preferred_models: list[str] = []
+    login_host: str = "hpc-login-2.cubi.bihealth.org"
+    login_user: str | None = None
+
+    def dir_path(self) -> Path:
+        return Path(os.path.expanduser(self.endpoints_dir))
+
+    def login_target(self) -> str:
+        """``user@host`` for the tunnel template, or just ``host`` if unset."""
+        if self.login_user:
+            return f"{self.login_user}@{self.login_host}"
+        return self.login_host
+
+
 class LLMBackend(_Section):
     """One entry of the configured backend catalog (manage-LLMs screen)."""
 
@@ -167,6 +193,7 @@ class Settings(_Section):
     editor: str | None = None
     rag: RagSettings = RagSettings()
     logging: LoggingSettings = LoggingSettings()
+    endpoints: EndpointsSettings = EndpointsSettings()
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Settings":

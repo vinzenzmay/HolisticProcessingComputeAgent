@@ -323,3 +323,44 @@ class TestMemoryScopeBudget:
         assert memory.rag_prefetch_chars == 800
         assert memory.rag_prefetch_count == 3
         assert memory.propose_new_skills is True
+
+    def test_endpoints_defaults(self):
+        endpoints = Settings().endpoints
+        assert endpoints.endpoints_dir == "~/.hpca/endpoints"
+        assert endpoints.preferred_models == []
+        assert endpoints.login_host == "hpc-login-2.cubi.bihealth.org"
+        assert endpoints.login_user is None
+
+
+class TestEndpointsSettings:
+    def test_dir_path_expands_user(self, monkeypatch):
+        monkeypatch.setenv("HOME", "/home/someone")
+        s = Settings()
+        assert str(s.endpoints.dir_path()) == "/home/someone/.hpca/endpoints"
+
+    def test_dir_path_honors_override(self, tmp_path):
+        s = Settings()
+        s.endpoints.endpoints_dir = str(tmp_path / "eps")
+        assert s.endpoints.dir_path() == tmp_path / "eps"
+
+    def test_login_target_without_user(self):
+        s = Settings()
+        assert s.endpoints.login_target() == "hpc-login-2.cubi.bihealth.org"
+
+    def test_login_target_with_user(self):
+        s = Settings()
+        s.endpoints.login_user = "mayv_c"
+        assert s.endpoints.login_target() == "mayv_c@hpc-login-2.cubi.bihealth.org"
+
+    def test_preferred_models_roundtrips(self, tmp_path):
+        s = Settings()
+        s.endpoints.preferred_models = ["35B", "27B"]
+        s.save(tmp_path / "settings.json")
+        loaded = Settings.load(tmp_path / "settings.json")
+        assert loaded.endpoints.preferred_models == ["35B", "27B"]
+
+    def test_unknown_keys_ignored(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"endpoints": {"endpoints_dir": "/x", "bogus": 1}}))
+        loaded = Settings.load(path)
+        assert loaded.endpoints.endpoints_dir == "/x"
