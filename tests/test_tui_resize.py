@@ -104,7 +104,7 @@ class TestNarrowTerminal:
     async def test_manage_llms_survives(self, hpca_home, fake_discovery):
         settings = Settings()
         settings.backends = [
-            LLMBackend(model="m", base_url="http://localhost:51941/v1")
+            LLMBackend(model="m", base_url="http://localhost:20001/v1")
         ]
         settings.save()
         app = HpcaApp(llm=FakeLLM())

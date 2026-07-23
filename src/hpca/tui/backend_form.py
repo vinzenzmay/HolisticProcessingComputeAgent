@@ -107,7 +107,7 @@ class BackendFormScreen(ModalScreen["LLMBackend | None"]):
             yield Label("Endpoint URL")
             yield Input(
                 value=self._base_url,
-                placeholder="http://localhost:51941/v1",
+                placeholder="http://localhost:20001/v1",
                 disabled=not self._editable_url,
                 id="backend-url",
             )
@@ -161,7 +161,7 @@ class BackendFormScreen(ModalScreen["LLMBackend | None"]):
     async def _attempt_save(self) -> None:
         base_url, model, key, ctx_raw = self._fields()
         if not base_url:
-            self._set_status("Enter the endpoint URL, e.g. http://localhost:51941/v1")
+            self._set_status("Enter the endpoint URL, e.g. http://localhost:20001/v1")
             return
         ctx_override = self._parse_ctx(ctx_raw)
         if ctx_override is False:

@@ -59,8 +59,8 @@ def record(name: str, ok: bool, detail: str = "") -> None:
 
 async def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--chat-url", default="http://localhost:51941/v1")
-    parser.add_argument("--embed-url", default="http://localhost:51943/v1")
+    parser.add_argument("--chat-url", default="http://localhost:20001/v1")
+    parser.add_argument("--embed-url", default="http://localhost:20000/v1")
     parser.add_argument("--embed-model", default=None)
     parser.add_argument("--chat-model", default=None)
     args = parser.parse_args()

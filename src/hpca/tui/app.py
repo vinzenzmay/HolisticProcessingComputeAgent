@@ -37,9 +37,12 @@ from hpca.agent.graph import (
 )
 from hpca.agent.job_tools import add_job_tools
 from hpca.agent.tools import ToolRegistry
+from hpca.autoconnect import plan_auto_connect
 from hpca.clipboard import ClipboardManager, CopyResult
+from hpca.cluster_endpoints import discover_cluster_endpoints
 from hpca import curator
 from hpca.config import LLMBackend, Settings, app_dir, llm_settings_for
+from hpca.discover import DiscoveredBackend
 from hpca.db import (
     checkpoints_db_path,
     command_use_counts,
@@ -1100,6 +1103,9 @@ class HpcaApp(App):
         self._refresh_model_line()
         self._refresh_context_bar()
         self.run_worker(self._discover_context_window(), group="llm-probe")
+        # Pre-agent auto-connect: on the cluster, wire up whatever vLLM servers
+        # are live (spec §4). Best-effort and off the critical path.
+        self.run_worker(self._auto_connect_cluster(), group="auto-connect")
         await self._reload_sessions()
         self.run_curator_if_due()
         self.set_interval(2.0, self.refresh_processes)
@@ -3653,6 +3659,89 @@ class HpcaApp(App):
         self._refresh_context_bar()
         self._refresh_session_log()  # rebind the tool context to the new client
         self.notify(f"This session now uses {backend.model}")
+
+    # ----------------------------------------------------------- auto-connect
+
+    async def _auto_connect_cluster(self) -> None:
+        """Discover live cluster vLLM endpoints and connect with no setup (§4).
+
+        On the cluster (Slurm present) this reads the manifest dir, reconciles
+        it against Slurm liveness + a live probe, then applies rule (c): one
+        LLM auto-connects, several are announced for the picker, and the
+        embeddings server (if up) is always wired to RAG. Off the cluster
+        (no Slurm) it is a no-op — the manage-LLMs scan and tunnel template
+        cover that path. Every step is best-effort: discovery must never take
+        the app down or block the first turn.
+        """
+        if self.slurm is None:
+            return
+        try:
+            endpoints = await discover_cluster_endpoints(
+                self.settings.endpoints.dir_path(),
+                self.slurm,
+                api_keys=self.settings.llm_api_keys,
+            )
+        except Exception:
+            return
+        plan = plan_auto_connect(
+            endpoints, preferred_models=self.settings.endpoints.preferred_models
+        )
+        if plan.embedding_base_url:
+            self._wire_embedding(plan.embedding_base_url)
+        if plan.connect is not None:
+            self._auto_activate(plan.connect)
+        elif len(plan.choices) > 1:
+            self.notify(
+                f"{len(plan.choices)} cluster LLMs discovered — "
+                "ctrl+l to pick one"
+            )
+
+    def _ensure_catalog(self, discovered: DiscoveredBackend) -> LLMBackend:
+        """The catalog entry for a discovered endpoint, adding it if new."""
+        for backend in self.settings.backends:
+            if (
+                backend.base_url == discovered.base_url
+                and backend.model == discovered.model
+            ):
+                return backend
+        entry = LLMBackend(
+            model=discovered.model,
+            base_url=discovered.base_url,
+            api_key=discovered.api_key,
+            max_model_len=discovered.max_model_len,
+        )
+        self.settings.backends.append(entry)
+        self.settings.remember_llm_ports([entry.base_url])
+        self.settings.remember_llm_key(entry.api_key)
+        self.settings.save()
+        return entry
+
+    def _auto_activate(self, discovered: DiscoveredBackend) -> None:
+        """Make a discovered LLM the active backend (adding it to the catalog
+        first). A no-op when it is already active, so a restart against an
+        unchanged endpoint causes no client churn."""
+        entry = self._ensure_catalog(discovered)
+        if self.settings.is_active(entry):
+            return
+        self.settings.activate_backend(entry)
+        self.settings.save()
+        self.reload_llm()
+        self.notify(f"Auto-connected to {discovered.model}")
+
+    def _wire_embedding(self, base_url: str) -> None:
+        """Point RAG's embedder at a discovered embeddings server. Rebuilding
+        ``self.embedder`` is enough: tool contexts read it when they are built,
+        which for the auto-connect worker is before any turn runs."""
+        if self.settings.rag.embedding_base_url == base_url:
+            return
+        self.settings.rag.embedding_base_url = base_url
+        self.settings.save()
+        old = getattr(self, "embedder", None)
+        self.embedder = EmbeddingClient(
+            base_url=base_url, model=self.settings.rag.embedding
+        )
+        if old is not None:
+            self.run_worker(old.close(), group="embed-close")
 
     def reload_llm(self) -> None:
         """Rebuild the client so edited LLM settings apply to the next turn.

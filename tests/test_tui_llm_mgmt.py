@@ -37,12 +37,12 @@ def hpca_home(monkeypatch, tmp_path):
 
 
 QWEN = DiscoveredBackend(
-    base_url="http://localhost:51941/v1",
+    base_url="http://localhost:20001/v1",
     model="Qwen/Qwen3.6-27B-FP8",
     max_model_len=192000,
 )
 MINI = DiscoveredBackend(
-    base_url="http://localhost:51943/v1",
+    base_url="http://localhost:20000/v1",
     model="sentence-transformers/all-MiniLM-L6-v2",
     max_model_len=256,
 )
@@ -59,7 +59,7 @@ def fake_discovery(monkeypatch):
         return [QWEN, MINI]
 
     async def fake_reachable(base_url, **kwargs):
-        return "51941" in base_url  # qwen up, everything else down
+        return "20001" in base_url  # qwen up, everything else down
 
     monkeypatch.setattr(manage_module, "scan_local_ports", fake_scan)
     monkeypatch.setattr(manage_module, "is_reachable", fake_reachable)
@@ -145,7 +145,25 @@ class TestManageScreen:
             labels = [str(item.query_one("Label").content) for item in left.children]
             assert any("Qwen/Qwen3.6-27B-FP8" in t for t in labels)
             assert any("ctx 192k" in t for t in labels)
-            assert any("localhost:51941" in t for t in labels)
+            assert any("localhost:20001" in t for t in labels)
+
+    async def test_empty_scan_shows_tunnel_help(self, hpca_home, monkeypatch):
+        async def empty_scan(*args, **kwargs):
+            return []
+
+        async def down(base_url, **kwargs):
+            return False
+
+        monkeypatch.setattr(manage_module, "scan_local_ports", empty_scan)
+        monkeypatch.setattr(manage_module, "is_reachable", down)
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40), notifications=True) as pilot:
+            await pilot.press("m")
+            await app.screen.workers.wait_for_complete()
+            for _ in range(8):  # notify -> call_later -> mount -> render
+                await pilot.pause()
+            toasts = [str(toast.render()) for toast in app.screen.query(Toast)]
+            assert any("ssh -fN" in t for t in toasts)
 
     async def test_enter_on_left_configures_and_persists(
         self, hpca_home, fake_discovery
@@ -330,12 +348,12 @@ class TestPortMemory:
             await pilot.press("m")
             await app.screen.workers.wait_for_complete()
             await pilot.pause()
-            assert app.settings.known_llm_ports == [51941, 51943]
-            assert Settings.load().known_llm_ports == [51941, 51943]
+            assert app.settings.known_llm_ports == [20001, 20000]
+            assert Settings.load().known_llm_ports == [20001, 20000]
 
     async def test_remembered_ports_scanned_first(self, hpca_home, monkeypatch):
         settings = Settings()
-        settings.known_llm_ports = [51941]
+        settings.known_llm_ports = [20001]
         settings.backends = [LLMBackend(model=MINI.model, base_url=MINI.base_url)]
         settings.save()
         scanned: list[list[int]] = []
@@ -355,7 +373,7 @@ class TestPortMemory:
             await app.screen.workers.wait_for_complete()
             await pilot.pause()
         # remembered port first, then the configured backend's, then the rest
-        assert scanned[0][:2] == [51941, 51943]
+        assert scanned[0][:2] == [20001, 20000]
         assert len(scanned[0]) == 64512  # full range still covered
 
     async def test_port_remembered_when_backend_configured(
@@ -371,7 +389,7 @@ class TestPortMemory:
             left.index = 0
             await pilot.press("enter")
             await pilot.pause()
-            assert 51941 in Settings.load().known_llm_ports
+            assert 20001 in Settings.load().known_llm_ports
 
 
 class TestSwitcher:

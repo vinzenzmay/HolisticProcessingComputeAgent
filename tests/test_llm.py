@@ -2,7 +2,7 @@
 
 Unit tests run against a mocked httpx transport. Integration tests
 (`-m integration`) run against the live backend configured via
-$HPCA_TEST_LLM_URL (default http://localhost:51941/v1) and are skipped when it
+$HPCA_TEST_LLM_URL (default http://localhost:20001/v1) and are skipped when it
 is unreachable.
 """
 
@@ -285,7 +285,7 @@ class TestModels:
 
 # --------------------------------------------------------- integration tests
 
-from tests.live_backend import LIVE_MODEL, LIVE_URL, integration  # noqa: E402
+from tests.live_backend import LIVE_KEY, LIVE_MODEL, LIVE_URL, integration  # noqa: E402
 
 
 @pytest.fixture
@@ -293,6 +293,7 @@ def live_client():
     settings = LLMSettings(
             base_url=LIVE_URL,
             model=LIVE_MODEL,
+            api_key=LIVE_KEY,
             request_timeout_s=120,
             # these test routing, not reasoning; thinking is ~15x slower
             enable_thinking=False,
@@ -361,7 +362,7 @@ class TestLiveThinking:
     def client(self, **overrides):
         return LLMClient(
             LLMSettings(
-                base_url=LIVE_URL, model=LIVE_MODEL, request_timeout_s=180, **overrides
+                base_url=LIVE_URL, model=LIVE_MODEL, api_key=LIVE_KEY, request_timeout_s=180, **overrides
             )
         )
 
