@@ -176,6 +176,17 @@ async def poll_active(slurm: SlurmClient, store: JobStore) -> list[StateChange]:
     if not active:
         return []
     statuses = await slurm.status([j.job_id for j in active])
+    return apply_statuses(store, active, statuses)
+
+
+def apply_statuses(
+    store: JobStore, active: list[JobRow], statuses: dict[str, JobStatus]
+) -> list[StateChange]:
+    """Fold fresh sacct statuses into the store; returns the state changes.
+
+    Split from poll_active so the TUI can run the store halves on its DB
+    thread while awaiting sacct on the loop.
+    """
     changes: list[StateChange] = []
     for job in active:
         status = statuses.get(job.job_id)

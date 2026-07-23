@@ -7,10 +7,15 @@ in the same file (their tables are managed by the langgraph sqlite saver);
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Callable, TypeVar
 
 from hpca.config import app_dir
+
+T = TypeVar("T")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -156,6 +161,64 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+class DbIO:
+    """Sqlite work on one dedicated thread, keeping the event loop responsive.
+
+    On a cluster node ``$HOME`` is typically NFS, where every sqlite call is
+    network round-trips plus a remote fsync — hundreds of milliseconds each,
+    seconds under lock contention. Run on the event loop (as the TUI's 2s
+    poll timers did), that blocks keystroke handling and freezes the UI.
+
+    The worker owns its own connection, opened lazily *inside* the thread, so
+    it is never touched from the loop thread and the two logical transactions
+    of loop-side and worker-side callers can never interleave on one
+    connection. Cross-connection visibility is safe because every store
+    method commits, and writer collisions wait out sqlite's 5s busy timeout
+    instead of failing.
+    """
+
+    def __init__(self, path: Path | None = None) -> None:
+        self._path = path
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="hpca-db"
+        )
+        self._conn: sqlite3.Connection | None = None
+        self._closed = False
+
+    def _connection(self) -> sqlite3.Connection:
+        # Worker thread only.
+        if self._conn is None:
+            self._conn = connect(self._path)
+        return self._conn
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    async def run(self, fn: Callable[[sqlite3.Connection], T]) -> T:
+        """Run ``fn(conn)`` on the worker thread and await its result."""
+        if self._closed:
+            raise RuntimeError("DbIO is closed")
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor, lambda: fn(self._connection())
+        )
+
+    async def close(self) -> None:
+        """Close the worker's connection after queued work has drained."""
+        if self._closed:
+            return
+        self._closed = True
+
+        def _close() -> None:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
+
+        await asyncio.get_running_loop().run_in_executor(self._executor, _close)
+        self._executor.shutdown(wait=False)
 
 
 def record_command_use(conn: sqlite3.Connection, name: str) -> None:
