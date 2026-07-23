@@ -23,3 +23,4 @@ uv.lock
 
 # Legacy log location (pre-chatlogs); still created by ad-hoc test runs
 hpca-logs/
+.snakemake/
