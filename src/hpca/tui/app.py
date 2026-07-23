@@ -45,13 +45,14 @@ from hpca import curator
 from hpca.config import LLMBackend, Settings, app_dir, llm_settings_for
 from hpca.discover import DiscoveredBackend
 from hpca.db import (
+    DbIO,
     checkpoints_db_path,
     command_use_counts,
     connect,
     init_db,
     record_command_use,
 )
-from hpca.jobs import JobRow, JobStore, poll_active
+from hpca.jobs import JobRow, JobStore, apply_statuses
 from hpca.agent.conclude import MemoryProposal, propose_memories
 from hpca.agent.doc_tools import add_ask_docs, add_doc_tools
 from hpca.agent.memory_context import (
@@ -1058,7 +1059,11 @@ class HpcaApp(App):
         # Panel labels by pid: describe() reads a script off disk, and the
         # script behind a finished process never changes.
         self._process_labels: dict[int, str] = {}
+        self._refreshing_processes = False
         self._conn = None
+        # Sync sqlite off the event loop (NFS homes make each call slow
+        # enough to eat keystrokes); the periodic pollers go through this.
+        self._dbio: DbIO | None = None
         self._saver_ctx = None
 
     def notify(self, message: str, **kwargs) -> None:
@@ -1084,6 +1089,7 @@ class HpcaApp(App):
         )
         self._conn = connect()
         init_db(self._conn)
+        self._dbio = DbIO()
         # Processes the previous run was watching when it exited would claim
         # to be running forever; harmless while the panel was empty on
         # restart, a standing lie now that it shows history.
@@ -1151,6 +1157,8 @@ class HpcaApp(App):
         self._pending_work.clear()
         if self._saver_ctx is not None:
             await self._saver_ctx.__aexit__(None, None, None)
+        if self._dbio is not None:
+            await self._dbio.close()
         if self._conn is not None:
             self._conn.close()
         if getattr(self, "rag_store", None) is not None:
@@ -1759,7 +1767,7 @@ class HpcaApp(App):
             # handler unwinds, rather than waiting for the next timer tick.
             self.call_later(self.drain_work)
         self.hide_working()
-        self._log_turn(result, log, session)
+        await self._log_turn(result, log, session)
         if self._is_active_session(session):
             await self._set_chat_messages(result.messages, result.thinking)
             await self.refresh_processes()
@@ -1802,7 +1810,9 @@ class HpcaApp(App):
         self._rename_session(session, title, by="llm", log=log)
         return True
 
-    def _log_turn(self, result, log: SessionLog | None, session: Session) -> None:
+    async def _log_turn(
+        self, result, log: SessionLog | None, session: Session
+    ) -> None:
         """Write what this turn added into the turn's own transcript — not
         into whichever session is open when the reply lands.
 
@@ -1825,12 +1835,22 @@ class HpcaApp(App):
             for entry in entries
             if entry.kind in (USER_ENTRY, ASSISTANT_ENTRY)
         ]
-        try:
-            self.episodic.record(
-                session_id=session.session_id,
-                profile=session.profile,
-                entries=turns,
+        session_id = session.session_id
+        profile = session.profile
+
+        def _record(conn) -> None:
+            # The user may delete the session while this waits in the DB
+            # queue; recording then would leave ghost rows in the index.
+            if SessionStore(conn).get(session_id) is None:
+                return
+            EpisodicStore(conn).record(
+                session_id=session_id, profile=profile, entries=turns
             )
+
+        try:
+            # On the DB thread: the FTS triggers make this the heaviest
+            # per-turn write, too slow for the loop on an NFS home.
+            await self._db(_record)
         except Exception as e:  # recall is best-effort; never fail the turn
             if log is not None:
                 log.write("error", f"episodic index write failed: {e}")
@@ -2875,12 +2895,19 @@ class HpcaApp(App):
             self._focus_column("chat")  # entering a session means typing in it
 
     async def _reload_sessions(self) -> None:
-        sessions_list = self.query_one("#sessions-list", ListView)
+        # Fetched on the DB thread first: rebuilding the list happens after
+        # every turn, and a slow (NFS) read here must not stall the loop.
+        sessions = await self._db(lambda conn: SessionStore(conn).list_all())
+        # The await yields; app shutdown may have torn the widget down since.
+        found = self.query("#sessions-list")
+        if not found:
+            return
+        sessions_list = found.first(ListView)
         await sessions_list.clear()
         new_item = ListItem(Label("(new session)"))
         new_item.data_session = None
         items = [new_item]
-        for session in self.session_store.list_all():
+        for session in sessions:
             item = ListItem(Label(self._session_row_text(session)))
             item.data_session = session
             item.set_class(session.session_id in self._updated, "session-updated")
@@ -2965,6 +2992,11 @@ class HpcaApp(App):
 
     # ------------------------------------------------------------- processes
 
+    async def _db(self, fn):
+        """Run ``fn(conn)`` on the DB thread; see DbIO for why not the loop."""
+        assert self._dbio is not None
+        return await self._dbio.run(fn)
+
     async def refresh_processes(self) -> None:
         """Repaint the right column from the *table*, not the live runner.
 
@@ -2972,28 +3004,64 @@ class HpcaApp(App):
         built per turn, so reading it emptied the panel the moment a session
         was reopened. The table outlives all of that, which is what makes the
         history still be there after a restart.
+
+        Guarded against overlap: a fetch outlasting the 2s tick (NFS) would
+        let two calls interleave clear() and extend() and paint duplicates.
+        Skipping is safe — the next tick repaints.
         """
+        if self._refreshing_processes:
+            return
+        self._refreshing_processes = True
+        try:
+            await self._refresh_processes_inner()
+        finally:
+            self._refreshing_processes = False
+
+    async def _refresh_processes_inner(self) -> None:
         session = self.active_session
         records: list[ProcessRecord] = []
         truncated = 0
-        if session is not None and self._conn is not None:
-            records = list_processes(
-                self._conn, session_id=session.session_id, limit=PROCESS_HISTORY_LIMIT
-            )
-            if len(records) > PROCESS_HISTORY_LIMIT:
-                records = records[:PROCESS_HISTORY_LIMIT]
-                truncated = (
-                    count_processes(self._conn, session_id=session.session_id)
-                    - PROCESS_HISTORY_LIMIT
+        jobs: list[JobRow] = []
+        if (
+            session is not None
+            and self._dbio is not None
+            and not self._dbio.closed
+        ):
+            session_id = session.session_id
+
+            def _gather(conn):
+                records = list_processes(
+                    conn, session_id=session_id, limit=PROCESS_HISTORY_LIMIT
                 )
-        jobs = self.job_store.list(session_id=session.session_id) if session else []
+                truncated = 0
+                if len(records) > PROCESS_HISTORY_LIMIT:
+                    records = records[:PROCESS_HISTORY_LIMIT]
+                    truncated = (
+                        count_processes(conn, session_id=session_id)
+                        - PROCESS_HISTORY_LIMIT
+                    )
+                jobs = JobStore(conn).list(session_id=session_id)
+                return records, truncated, jobs
+
+            records, truncated, jobs = await self._db(_gather)
+            if (
+                self.active_session is None
+                or self.active_session.session_id != session_id
+            ):
+                return  # switched away mid-fetch; the next tick repaints
         signature = [(r.pid, r.state) for r in records] + [
             (j.job_id, j.state) for j in jobs
         ]
         if signature == getattr(self, "_process_signature", None):
             return  # unchanged; avoid churn from the 2s timer
+        # The DB await above yields; shutdown may have torn the widget down.
+        # Checked before recording the signature so a skipped repaint here
+        # cannot suppress the next one.
+        found = self.query("#processes-list")
+        if not found:
+            return
         self._process_signature = signature
-        processes_list = self.query_one("#processes-list", ListView)
+        processes_list = found.first(ListView)
         await processes_list.clear()
         items = []
         for job in jobs:
@@ -3030,10 +3098,22 @@ class HpcaApp(App):
         return cached
 
     async def poll_jobs(self) -> None:
-        """Background sacct poll (§5.4); notifies on state changes."""
+        """Background sacct poll (§5.4); notifies on state changes.
+
+        poll_active's store halves run on the DB thread; only the sacct
+        subprocess is awaited here.
+        """
         assert self.slurm is not None
+        if self._dbio is None or self._dbio.closed:
+            return
         try:
-            changes = await poll_active(self.slurm, self.job_store)
+            active = await self._db(lambda conn: JobStore(conn).active())
+            if not active:
+                return
+            statuses = await self.slurm.status([j.job_id for j in active])
+            changes = await self._db(
+                lambda conn: apply_statuses(JobStore(conn), active, statuses)
+            )
         except Exception as e:
             self.notify(f"Job polling failed: {e}", severity="warning")
             return
@@ -3063,10 +3143,10 @@ class HpcaApp(App):
         the script it started had exited — it promised to check back and had
         no way to keep the promise.
         """
-        if self._conn is None:
+        if self._conn is None or self._dbio is None or self._dbio.closed:
             return
         try:
-            changes = poll_processes(self._conn)
+            changes = await self._db(poll_processes)
         except Exception as e:
             self.notify(f"Process watch failed: {e}", severity="warning")
             return
