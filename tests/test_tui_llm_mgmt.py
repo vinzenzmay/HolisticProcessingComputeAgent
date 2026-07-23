@@ -147,6 +147,24 @@ class TestManageScreen:
             assert any("ctx 192k" in t for t in labels)
             assert any("localhost:20001" in t for t in labels)
 
+    async def test_empty_scan_shows_tunnel_help(self, hpca_home, monkeypatch):
+        async def empty_scan(*args, **kwargs):
+            return []
+
+        async def down(base_url, **kwargs):
+            return False
+
+        monkeypatch.setattr(manage_module, "scan_local_ports", empty_scan)
+        monkeypatch.setattr(manage_module, "is_reachable", down)
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40), notifications=True) as pilot:
+            await pilot.press("m")
+            await app.screen.workers.wait_for_complete()
+            for _ in range(8):  # notify -> call_later -> mount -> render
+                await pilot.pause()
+            toasts = [str(toast.render()) for toast in app.screen.query(Toast)]
+            assert any("ssh -fN" in t for t in toasts)
+
     async def test_enter_on_left_configures_and_persists(
         self, hpca_home, fake_discovery
     ):

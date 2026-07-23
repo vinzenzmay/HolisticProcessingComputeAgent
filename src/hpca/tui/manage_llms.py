@@ -26,6 +26,7 @@ from textual.widgets import Footer, Label, ListItem, ListView, Static
 
 from urllib.parse import urlparse
 
+from hpca.autoconnect import offcluster_help
 from hpca.config import LLMBackend
 from hpca.discover import (
     KEY_REQUIRED,
@@ -235,6 +236,14 @@ class ManageLLMsScreen(Screen):
         self._set_status(
             f"scan finished: {len(discovered)} endpoint(s) found · F5 to rescan"
         )
+        # Nothing on localhost. On a workstation that means no tunnel yet —
+        # show how to create one (§4.6); node/port come from the manifests.
+        if not discovered:
+            self.app.notify(
+                offcluster_help(self.app.settings.endpoints.login_target()),
+                title="No LLM endpoints found",
+                timeout=30,
+            )
 
     @work(group="llm-reach")
     async def reachability_worker(self) -> None:
