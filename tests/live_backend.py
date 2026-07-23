@@ -10,7 +10,7 @@ import os
 import httpx
 import pytest
 
-LIVE_URL = os.environ.get("HPCA_TEST_LLM_URL", "http://localhost:51941/v1")
+LIVE_URL = os.environ.get("HPCA_TEST_LLM_URL", "http://localhost:20001/v1")
 
 
 def _discover_model() -> str | None:

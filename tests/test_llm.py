@@ -2,7 +2,7 @@
 
 Unit tests run against a mocked httpx transport. Integration tests
 (`-m integration`) run against the live backend configured via
-$HPCA_TEST_LLM_URL (default http://localhost:51941/v1) and are skipped when it
+$HPCA_TEST_LLM_URL (default http://localhost:20001/v1) and are skipped when it
 is unreachable.
 """
 

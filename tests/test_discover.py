@@ -38,12 +38,12 @@ def make_probe(payload=None, status=200):
 class TestProbeEndpoint:
     async def test_vllm_shape_parsed(self):
         backends = await probe_endpoint(
-            "http://localhost:51941/v1", transport=make_probe(VLLM_MODELS)
+            "http://localhost:20001/v1", transport=make_probe(VLLM_MODELS)
         )
         assert len(backends) == 1
         b = backends[0]
         assert b.model == "Qwen/Qwen3.6-27B-FP8"
-        assert b.base_url == "http://localhost:51941/v1"
+        assert b.base_url == "http://localhost:20001/v1"
         assert b.max_model_len == 192000
         assert b.needs_key is False
 
@@ -88,7 +88,7 @@ class TestProbeEndpoint:
             return httpx.Response(200, json=VLLM_MODELS)
 
         backends = await probe_endpoint(
-            "http://localhost:51941/v1",
+            "http://localhost:20001/v1",
             api_key="sekrit",
             transport=httpx.MockTransport(handler),
         )
@@ -291,7 +291,7 @@ class TestIsReachable:
 class TestBackendDisplay:
     def test_describe(self):
         b = DiscoveredBackend(
-            base_url="http://localhost:51941/v1",
+            base_url="http://localhost:20001/v1",
             model="Qwen/Qwen3.6-27B-FP8",
             max_model_len=192000,
             needs_key=False,
@@ -299,7 +299,7 @@ class TestBackendDisplay:
         text = b.describe()
         assert "Qwen/Qwen3.6-27B-FP8" in text
         assert "192k" in text
-        assert "localhost:51941" in text
+        assert "localhost:20001" in text
         assert "key: no" in text
 
     def test_describe_unknown_context(self):
@@ -344,8 +344,8 @@ class TestOrderedPorts:
     def test_priority_then_likely_then_rest(self):
         from hpca.discover import LIKELY_PORTS, ordered_ports
 
-        order = ordered_ports([51941])
-        assert order[0] == 51941
+        order = ordered_ports([20001])
+        assert order[0] == 20001
         assert order[1 : 1 + len(LIKELY_PORTS) - 1]  # likely ports follow
         assert order.index(8000) < order.index(1024)
         assert len(order) == len(set(order))  # no duplicates

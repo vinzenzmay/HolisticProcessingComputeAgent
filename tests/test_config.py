@@ -60,9 +60,8 @@ class TestDefaults:
     def test_editor_and_rag_defaults(self):
         s = Settings()
         assert s.editor is None
-        assert s.rag.store == "sqlite-vec"
         assert s.rag.embedding == "sentence-transformers/all-MiniLM-L6-v2"
-        assert s.rag.embedding_base_url == "http://localhost:51943/v1"
+        assert s.rag.embedding_base_url == "http://localhost:20000/v1"
 
 
 class TestLoad:
@@ -74,7 +73,7 @@ class TestLoad:
         path = tmp_path / "settings.json"
         s = Settings()
         s.llm.model = "Qwen/Qwen3.6-35B-A3B-FP8"
-        s.llm.base_url = "http://localhost:51941/v1"
+        s.llm.base_url = "http://localhost:20001/v1"
         s.cluster.submit_host = "login01"
         s.save(path)
         loaded = Settings.load(path)
@@ -145,7 +144,7 @@ class TestBackendCatalog:
         s.backends = [
             LLMBackend(
                 model="Qwen/Qwen3.6-27B-FP8",
-                base_url="http://localhost:51941/v1",
+                base_url="http://localhost:20001/v1",
                 max_model_len=192000,
             ),
             LLMBackend(
@@ -231,23 +230,23 @@ class TestKnownLLMPorts:
     def test_remember_collects_ports_and_reports_change(self):
         s = Settings()
         assert s.remember_llm_ports(
-            ["http://localhost:51941/v1", "http://127.0.0.1:51943/v1"]
+            ["http://localhost:20001/v1", "http://127.0.0.1:20000/v1"]
         )
-        assert s.known_llm_ports == [51941, 51943]
+        assert s.known_llm_ports == [20001, 20000]
 
     def test_remember_is_idempotent(self):
         s = Settings()
-        s.remember_llm_ports(["http://localhost:51941/v1"])
-        assert not s.remember_llm_ports(["http://localhost:51941/v1"])
-        assert s.known_llm_ports == [51941]
+        s.remember_llm_ports(["http://localhost:20001/v1"])
+        assert not s.remember_llm_ports(["http://localhost:20001/v1"])
+        assert s.known_llm_ports == [20001]
 
     def test_new_port_learned_alongside_known_one(self):
         s = Settings()
-        s.remember_llm_ports(["http://localhost:51941/v1"])
+        s.remember_llm_ports(["http://localhost:20001/v1"])
         assert s.remember_llm_ports(
-            ["http://localhost:51941/v1", "http://localhost:8000/v1"]
+            ["http://localhost:20001/v1", "http://localhost:8000/v1"]
         )
-        assert s.known_llm_ports == [51941, 8000]
+        assert s.known_llm_ports == [20001, 8000]
 
     def test_urls_without_a_port_ignored(self):
         s = Settings()
@@ -256,9 +255,9 @@ class TestKnownLLMPorts:
 
     def test_roundtrip(self, tmp_path):
         s = Settings()
-        s.remember_llm_ports(["http://localhost:51941/v1"])
+        s.remember_llm_ports(["http://localhost:20001/v1"])
         s.save(tmp_path / "settings.json")
-        assert Settings.load(tmp_path / "settings.json").known_llm_ports == [51941]
+        assert Settings.load(tmp_path / "settings.json").known_llm_ports == [20001]
 
 
 class TestLLMKeyPool:

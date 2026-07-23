@@ -126,9 +126,8 @@ class LoggingSettings(_Section):
 
 
 class RagSettings(_Section):
-    store: Literal["sqlite-vec", "chromadb"] = "sqlite-vec"
     embedding: str = "sentence-transformers/all-MiniLM-L6-v2"
-    embedding_base_url: str = "http://localhost:51943/v1"
+    embedding_base_url: str = "http://localhost:20000/v1"
 
 
 class LLMBackend(_Section):

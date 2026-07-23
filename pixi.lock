@@ -5,8 +5,6 @@ environments:
     - url: https://conda.anaconda.org/conda-forge/
     indexes:
     - https://pypi.org/simple
-    options:
-      pypi-prerelease-mode: if-necessary-or-explicit
     packages:
       linux-64:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
@@ -83,8 +81,6 @@ environments:
     - url: https://conda.anaconda.org/conda-forge/
     indexes:
     - https://pypi.org/simple
-    options:
-      pypi-prerelease-mode: if-necessary-or-explicit
     packages:
       linux-64:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
@@ -252,8 +248,8 @@ packages:
   requires_python: '>=3.8'
 - pypi: ./
   name: hpca
-  version: 0.6.1
-  sha256: 5d3b7619f01e81c9ea4b1c51ff469e99f825c42dcffbb2310c746d96eca763a8
+  version: 0.6.7
+  sha256: 1552273cd6ce13100e878b342c5b9b11c3cd1b06e00f7fe468f3a3a41e3d9f06
   requires_dist:
   - textual>=0.80
   - pydantic>=2.7
@@ -266,6 +262,7 @@ packages:
   - pytest>=8.0 ; extra == 'dev'
   - pytest-asyncio>=0.23 ; extra == 'dev'
   requires_python: '>=3.11'
+  editable: true
 - pypi: https://files.pythonhosted.org/packages/7e/f5/f66802a942d491edb555dd61e3a9961140fd64c90bce1eafd741609d334d/httpcore-1.0.9-py3-none-any.whl
   name: httpcore
   version: 1.0.9
