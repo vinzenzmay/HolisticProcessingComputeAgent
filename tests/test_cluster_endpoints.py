@@ -282,3 +282,49 @@ class TestDiscover:
         )
         assert result.embedding is not None
         assert result.embedding.model == "Embed/One"
+
+
+# --- discovery log trail ------------------------------------------------------
+
+
+class TestDiscoveryLog:
+    """Discovery outcomes must leave a trail on the ``hpca.autoconnect``
+    logger — silent skips are undebuggable in the TUI (which swallows them)."""
+
+    async def test_key_locked_outcome_logged(self, tmp_path, caplog):
+        write_manifest(tmp_path, "J1", 20001, _LOCKED_MODEL, needs_key=True)
+        transport = make_transport({20001: locked(good_keys=("other",))})
+        with caplog.at_level("INFO", logger="hpca.autoconnect"):
+            await discover_cluster_endpoints(
+                tmp_path,
+                FakeSlurm({"J1": "RUNNING"}),
+                api_keys=["stale-key"],
+                transport=transport,
+            )
+        trail = caplog.text
+        assert "key-locked" in trail
+        assert _LOCKED_MODEL in trail
+        assert "1 pool key(s)" in trail
+
+    async def test_reap_and_no_answer_logged(self, tmp_path, caplog):
+        write_manifest(tmp_path, "GONE", 20001, "Dead/Model")
+        write_manifest(
+            tmp_path, "J1", 20003, "Starting/Model", needs_key=False
+        )
+        transport = make_transport({})  # nothing answers
+        with caplog.at_level("INFO", logger="hpca.autoconnect"):
+            await discover_cluster_endpoints(
+                tmp_path, FakeSlurm({"J1": "RUNNING"}), transport=transport
+            )
+        assert "gone from squeue" in caplog.text
+        assert "not answering" in caplog.text
+
+    async def test_squeue_failure_and_mismatch_logged(self, tmp_path, caplog):
+        write_manifest(tmp_path, "J1", 20001, "Claimed/Model", needs_key=False)
+        transport = make_transport({20001: serve("Other/Model")})
+        with caplog.at_level("INFO", logger="hpca.autoconnect"):
+            await discover_cluster_endpoints(
+                tmp_path, FakeSlurm(error=True), transport=transport
+            )
+        assert "probe-only mode" in caplog.text
+        assert "reused port" in caplog.text

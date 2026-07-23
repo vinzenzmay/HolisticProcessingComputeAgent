@@ -101,6 +101,42 @@ class TestPlanAutoConnect:
         assert plan.embedding_base_url == "http://172.16.0.9:20000/v1"
 
 
+class TestPlanNotice:
+    """The user-facing line for found-but-not-connected outcomes. A lone locked
+    endpoint used to fail in complete silence (the bug that hid a stale pool
+    key); every no-connect-but-found plan must now carry a notice."""
+
+    def test_none_when_connected(self):
+        plan = plan_auto_connect(ClusterEndpoints([llm("A", 20001)], None))
+        assert plan.connect is not None
+        assert plan.notice is None
+
+    def test_none_when_nothing_found(self):
+        plan = plan_auto_connect(ClusterEndpoints([], None))
+        assert plan.notice is None
+
+    def test_single_locked_llm_notice_names_model_and_key(self):
+        b = llm("Qwen/Qwen3.6-35B-A3B-FP8", 20001, needs_key=True)
+        plan = plan_auto_connect(ClusterEndpoints([b], None))
+        assert plan.connect is None
+        assert "Qwen/Qwen3.6-35B-A3B-FP8" in plan.notice
+        assert "API key" in plan.notice
+        assert "ctrl+l" in plan.notice
+
+    def test_many_llms_notice_offers_picker(self):
+        a, b = llm("A", 20001), llm("B", 20003)
+        plan = plan_auto_connect(ClusterEndpoints([a, b], None))
+        assert plan.notice == "2 cluster LLMs discovered — ctrl+l to pick one"
+
+    def test_preferred_miss_with_single_locked_still_notices(self):
+        locked = llm("27B", 20003, needs_key=True)
+        plan = plan_auto_connect(
+            ClusterEndpoints([locked], None), preferred_models=["27B"]
+        )
+        assert plan.connect is None
+        assert "API key" in plan.notice
+
+
 class TestOffclusterHelp:
     def test_includes_login_target_and_ports(self):
         msg = offcluster_help("mayv_c@hpc-login-2.cubi.bihealth.org")

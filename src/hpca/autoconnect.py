@@ -36,6 +36,10 @@ class AutoConnectPlan:
     choices: list[DiscoveredBackend] = field(default_factory=list)
     # The embeddings endpoint to wire RAG to, if one is live.
     embedding_base_url: str | None = None
+    # User-facing status line when LLMs were found but none auto-connected
+    # (picker hint, or the locked-endpoint add-a-key hint). None otherwise —
+    # a lone locked endpoint must not fail silently.
+    notice: str | None = None
 
 
 def _first_preferred(
@@ -70,6 +74,20 @@ def plan_auto_connect(
     if connect is None and len(connectable) == 1:
         connect = connectable[0]
 
+    notice: str | None = None
+    if connect is None:
+        if len(choices) > 1:
+            notice = (
+                f"{len(choices)} cluster LLMs discovered — ctrl+l to pick one"
+            )
+        elif len(choices) == 1:
+            # One LLM found but not connectable: it is key-locked and no pool
+            # key unlocked it (a lone connectable one would have connected).
+            notice = (
+                f"Found {choices[0].model} on the cluster — "
+                "it needs an API key (ctrl+l to add one)"
+            )
+
     embedding_base_url = (
         endpoints.embedding.base_url if endpoints.embedding is not None else None
     )
@@ -77,6 +95,7 @@ def plan_auto_connect(
         connect=connect,
         choices=choices,
         embedding_base_url=embedding_base_url,
+        notice=notice,
     )
 
 
