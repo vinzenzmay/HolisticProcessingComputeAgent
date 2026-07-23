@@ -19,6 +19,7 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "pytest-xdist>=3.5",
 ]
 
 [project.scripts]
@@ -34,6 +35,13 @@ packages = ["src/hpca"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Live-backend tests are opt-in: `pytest -m integration` (needs a reachable
+# LLM, e.g. the cluster tunnel on localhost:20001). Everything else is the
+# fast, hermetic unit suite.
+addopts = "-m 'not integration'"
+markers = [
+    "integration: live-LLM backend test (runs real generations; opt in with -m integration)",
+]
 
 [tool.pixi.workspace]
 channels = ["conda-forge"]
@@ -47,3 +55,11 @@ default = { solve-group = "default" }
 dev = { features = ["dev"], solve-group = "default" }
 
 [tool.pixi.tasks]
+
+[tool.pixi.feature.dev.tasks]
+# Fast hermetic suite, parallel across CPUs (the default day-to-day run).
+test = "pytest -n auto"
+# Serial run, for debugging (readable output, -x/--pdb work as usual).
+test-serial = "pytest"
+# Live-backend integration tests: needs a reachable LLM (cluster tunnel).
+test-live = "pytest -m integration"

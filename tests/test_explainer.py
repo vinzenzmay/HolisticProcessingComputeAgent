@@ -104,7 +104,7 @@ class TestExplainFailure:
 from hpca.config import LLMSettings  # noqa: E402
 from hpca.llm import LLMClient  # noqa: E402
 
-from tests.live_backend import LIVE_MODEL, LIVE_URL, integration  # noqa: E402
+from tests.live_backend import LIVE_KEY, LIVE_MODEL, LIVE_URL, integration  # noqa: E402
 
 
 @integration
@@ -114,6 +114,7 @@ class TestExplainLive:
             LLMSettings(
                 base_url=LIVE_URL,
                 model=LIVE_MODEL,
+                api_key=LIVE_KEY,
                 request_timeout_s=120,
                 # these test routing, not reasoning; thinking is ~15x slower
                 enable_thinking=False,

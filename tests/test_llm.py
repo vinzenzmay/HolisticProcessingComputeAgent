@@ -285,7 +285,7 @@ class TestModels:
 
 # --------------------------------------------------------- integration tests
 
-from tests.live_backend import LIVE_MODEL, LIVE_URL, integration  # noqa: E402
+from tests.live_backend import LIVE_KEY, LIVE_MODEL, LIVE_URL, integration  # noqa: E402
 
 
 @pytest.fixture
@@ -293,6 +293,7 @@ def live_client():
     settings = LLMSettings(
             base_url=LIVE_URL,
             model=LIVE_MODEL,
+            api_key=LIVE_KEY,
             request_timeout_s=120,
             # these test routing, not reasoning; thinking is ~15x slower
             enable_thinking=False,
@@ -361,7 +362,7 @@ class TestLiveThinking:
     def client(self, **overrides):
         return LLMClient(
             LLMSettings(
-                base_url=LIVE_URL, model=LIVE_MODEL, request_timeout_s=180, **overrides
+                base_url=LIVE_URL, model=LIVE_MODEL, api_key=LIVE_KEY, request_timeout_s=180, **overrides
             )
         )
 

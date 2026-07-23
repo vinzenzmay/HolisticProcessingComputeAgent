@@ -96,7 +96,7 @@ class TestProposeTitle:
 
 # --------------------------------------------------------- integration tests
 
-from tests.live_backend import LIVE_MODEL, LIVE_URL, integration  # noqa: E402
+from tests.live_backend import LIVE_KEY, LIVE_MODEL, LIVE_URL, integration  # noqa: E402
 
 
 @integration
@@ -109,6 +109,7 @@ class TestTitleLive:
             LLMSettings(
                 base_url=LIVE_URL,
                 model=LIVE_MODEL,
+                api_key=LIVE_KEY,
                 request_timeout_s=120,
                 enable_thinking=True,  # the titler must override this itself
             )
