@@ -120,6 +120,20 @@ def parse_sacct(text: str) -> dict[str, JobStatus]:
     return jobs
 
 
+def parse_squeue(text: str) -> dict[str, str]:
+    """Parse ``squeue -h -o '%i|%T'`` output into ``{job_id: state}``."""
+    states: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or "|" not in line:
+            continue
+        job_id, _, state = line.partition("|")
+        job_id, state = job_id.strip(), state.strip()
+        if job_id:
+            states[job_id] = state
+    return states
+
+
 async def _default_run(argv: list[str]) -> tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
         *argv,
@@ -181,6 +195,28 @@ class SlurmClient:
         if rc != 0:
             raise SlurmError(f"sacct failed: {stderr.strip()}")
         return parse_sacct(stdout)
+
+    async def job_states(self, job_ids: list[str]) -> dict[str, str]:
+        """Liveness via ``squeue`` (§4.2 layer 1): ``{job_id: state}``.
+
+        Ids not present in the output are absent from the dict — the job is no
+        longer queued/running (safe to reap). Raises :class:`SlurmError` if
+        ``squeue`` cannot reach the controller, so callers can tell "not
+        running" (reap the manifest) from "SLURM unreachable" (keep endpoints,
+        fall back to probe-only). A gone job id makes ``squeue`` exit non-zero
+        with "Invalid job id specified" while still being authoritative; that
+        is treated as "not running", not a failure.
+        """
+        if not job_ids:
+            return {}
+        rc, stdout, stderr = await self._run(
+            self._wrap(["squeue", "-h", "-o", "%i|%T", "-j", ",".join(job_ids)])
+        )
+        if rc != 0:
+            if "invalid job id" in stderr.lower():
+                return parse_squeue(stdout)
+            raise SlurmError(f"squeue failed: {stderr.strip() or stdout.strip()}")
+        return parse_squeue(stdout)
 
     async def cancel(self, job_id: str) -> None:
         rc, stdout, stderr = await self._run(self._wrap(["scancel", job_id]))

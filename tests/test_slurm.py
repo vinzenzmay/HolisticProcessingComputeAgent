@@ -194,3 +194,70 @@ class TestSlurmClient:
         await client.submit("/tmp/job.sh", [])
         assert run.calls[0][:3] == ["ssh", "login01", "--"]
         assert "sbatch" in run.calls[0]
+
+
+class TestJobStates:
+    """squeue-based liveness (§4.2 layer 1): running? -> keep, gone -> reap."""
+
+    async def test_empty_list_makes_no_call(self):
+        run = FakeRun([])
+        client = SlurmClient(run=run)
+        assert await client.job_states([]) == {}
+        assert run.calls == []
+
+    async def test_running_job_mapped(self):
+        run = FakeRun([(0, "27744534|RUNNING\n", "")])
+        client = SlurmClient(run=run)
+        states = await client.job_states(["27744534"])
+        assert states == {"27744534": "RUNNING"}
+        argv = run.calls[0]
+        assert argv[0] == "squeue"
+        assert "-h" in argv
+        assert "%i|%T" in argv
+        assert any("27744534" in a for a in argv)
+
+    async def test_missing_id_is_absent(self):
+        # Queried two jobs, squeue only reports the live one; the other is gone.
+        run = FakeRun([(0, "27744534|RUNNING\n", "")])
+        client = SlurmClient(run=run)
+        states = await client.job_states(["27744534", "999999"])
+        assert states == {"27744534": "RUNNING"}
+        assert "999999" not in states
+
+    async def test_pending_state_preserved(self):
+        run = FakeRun([(0, "50|PENDING\n", "")])
+        client = SlurmClient(run=run)
+        assert await client.job_states(["50"]) == {"50": "PENDING"}
+
+    async def test_invalid_job_id_is_not_running_not_error(self):
+        # A gone job makes squeue exit non-zero with "Invalid job id
+        # specified" — that is authoritative "not running", not a failure.
+        run = FakeRun(
+            [(1, "", "slurm_load_jobs error: Invalid job id specified\n")]
+        )
+        client = SlurmClient(run=run)
+        assert await client.job_states(["999999"]) == {}
+
+    async def test_invalid_job_id_still_parses_partial_stdout(self):
+        run = FakeRun(
+            [(1, "100|RUNNING\n", "slurm_load_jobs error: Invalid job id specified\n")]
+        )
+        client = SlurmClient(run=run)
+        assert await client.job_states(["100", "999999"]) == {"100": "RUNNING"}
+
+    async def test_controller_unreachable_raises(self):
+        # A real squeue failure must NOT read as "all jobs dead" — callers
+        # fall back to probe-only rather than reaping every endpoint.
+        run = FakeRun(
+            [(1, "", "slurm_load_jobs error: Unable to contact slurm controller\n")]
+        )
+        client = SlurmClient(run=run)
+        with pytest.raises(SlurmError, match="squeue"):
+            await client.job_states(["27744534"])
+
+    async def test_submit_host_wraps_in_ssh(self):
+        run = FakeRun([(0, "7|RUNNING\n", "")])
+        client = SlurmClient(submit_host="login01", run=run)
+        await client.job_states(["7"])
+        assert run.calls[0][:3] == ["ssh", "login01", "--"]
+        assert "squeue" in run.calls[0]
