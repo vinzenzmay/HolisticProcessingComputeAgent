@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import shutil
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -156,6 +157,26 @@ COLUMN_IDS = ("sessions", "chat", "processes")
 # Rows the processes column shows before summarising the rest. A long-lived
 # session accumulates hundreds; the panel is a view, not an archive.
 PROCESS_HISTORY_LIMIT = 60
+
+
+def _autoconnect_logger() -> logging.Logger:
+    """The ``hpca.autoconnect`` logger, writing to <app_dir>/autoconnect.log.
+
+    Discovery is best-effort and must never interrupt startup, so its failures
+    are invisible in the TUI; this file is the debugging trail. The handler is
+    attached on first use (idempotent) and does not propagate — a TUI owns the
+    terminal, so nothing may reach the root logger's stderr handler.
+    """
+    logger = logging.getLogger("hpca.autoconnect")
+    if not any(isinstance(h, logging.FileHandler) for h in logger.handlers):
+        handler = logging.FileHandler(app_dir() / "autoconnect.log")
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        )
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+    return logger
 
 
 def format_started(started_at: str) -> str:
@@ -3671,10 +3692,12 @@ class HpcaApp(App):
         embeddings server (if up) is always wired to RAG. Off the cluster
         (no Slurm) it is a no-op — the manage-LLMs scan and tunnel template
         cover that path. Every step is best-effort: discovery must never take
-        the app down or block the first turn.
+        the app down or block the first turn — but every outcome, including
+        a swallowed exception, leaves a trail in <app_dir>/autoconnect.log.
         """
         if self.slurm is None:
             return
+        logger = _autoconnect_logger()
         try:
             endpoints = await discover_cluster_endpoints(
                 self.settings.endpoints.dir_path(),
@@ -3682,19 +3705,23 @@ class HpcaApp(App):
                 api_keys=self.settings.llm_api_keys,
             )
         except Exception:
+            logger.exception("auto-connect: discovery failed")
             return
         plan = plan_auto_connect(
             endpoints, preferred_models=self.settings.endpoints.preferred_models
+        )
+        logger.info(
+            "auto-connect: %d LLM choice(s); connecting to %s; embeddings %s",
+            len(plan.choices),
+            plan.connect.model if plan.connect else "none",
+            plan.embedding_base_url or "none",
         )
         if plan.embedding_base_url:
             self._wire_embedding(plan.embedding_base_url)
         if plan.connect is not None:
             self._auto_activate(plan.connect)
-        elif len(plan.choices) > 1:
-            self.notify(
-                f"{len(plan.choices)} cluster LLMs discovered — "
-                "ctrl+l to pick one"
-            )
+        elif plan.notice:
+            self.notify(plan.notice)
 
     def _ensure_catalog(self, discovered: DiscoveredBackend) -> LLMBackend:
         """The catalog entry for a discovered endpoint, adding it if new."""

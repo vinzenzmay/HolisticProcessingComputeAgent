@@ -25,6 +25,7 @@ rather than the anonymous ``(api key required)`` sentinel.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -33,6 +34,10 @@ import httpx
 
 from hpca.discover import KEY_REQUIRED, DiscoveredBackend, probe_endpoint
 from hpca.slurm import SlurmClient, SlurmError
+
+# Discovery trail for debugging silent auto-connect outcomes; the TUI routes
+# this logger to <app_dir>/autoconnect.log.
+logger = logging.getLogger("hpca.autoconnect")
 
 # Manifest keys that must be present and coercible; anything else is skipped
 # rather than raised, since these files are written by external scripts.
@@ -124,6 +129,7 @@ async def discover_cluster_endpoints(
 ) -> ClusterEndpoints:
     """Reconcile manifests with Slurm liveness and a live probe (see module doc)."""
     manifests = read_manifests(endpoints_dir)
+    logger.info("discovery: %d manifest(s) in %s", len(manifests), endpoints_dir)
     if not manifests:
         return ClusterEndpoints([], None)
 
@@ -133,7 +139,8 @@ async def discover_cluster_endpoints(
     job_ids = sorted({m.jobid for m in manifests})
     try:
         states: dict[str, str] | None = await slurm.job_states(job_ids)
-    except SlurmError:
+    except SlurmError as exc:
+        logger.warning("discovery: squeue failed (%s); probe-only mode", exc)
         states = None
 
     llms: list[DiscoveredBackend] = []
@@ -144,6 +151,10 @@ async def discover_cluster_endpoints(
         # is gone; reap its stale manifest (idempotent — another HPCA instance
         # may have deleted it already) and move on.
         if states is not None and m.jobid not in states:
+            logger.info(
+                "discovery: %s (job %s) gone from squeue — reaping %s",
+                m.model, m.jobid, m.path.name,
+            )
             if reap:
                 try:
                     m.path.unlink()
@@ -159,12 +170,21 @@ async def discover_cluster_endpoints(
         # inside a live job, or a non-LLM on a reused port). Don't surface,
         # don't delete — the job may still be coming up.
         if not rows:
+            logger.info(
+                "discovery: %s at %s not answering (job %s alive) — skipped",
+                m.model, m.base_url, m.jobid,
+            )
             continue
 
         # Key-locked and no pool key unlocked it: we can't verify the model id,
         # but the manifest names it. Surface a NAMED needs_key backend for the
         # add-a-key flow; never auto-connect it.
         if len(rows) == 1 and rows[0].model == KEY_REQUIRED:
+            logger.info(
+                "discovery: %s at %s is key-locked and none of the %d pool "
+                "key(s) unlocked it — surfacing for add-a-key",
+                m.model, m.base_url, len(api_keys),
+            )
             backend = DiscoveredBackend(
                 base_url=m.base_url,
                 model=m.model,
@@ -177,10 +197,19 @@ async def discover_cluster_endpoints(
             # else — don't surface, don't delete (the real job may be alive).
             matches = [r for r in rows if r.model == m.model]
             if not matches:
+                logger.warning(
+                    "discovery: %s serves %s but manifest %s claims %s — "
+                    "skipped (reused port?)",
+                    m.base_url, [r.model for r in rows], m.path.name, m.model,
+                )
                 continue
             # Prefer the probe's row: it carries the server's real
             # max_model_len and any pool api_key that unlocked it.
             backend = matches[0]
+            logger.info(
+                "discovery: %s live at %s (%s)",
+                m.model, m.base_url, m.role,
+            )
 
         if m.role == "embedding":
             # Effectively one embeddings server; keep the first live match.
