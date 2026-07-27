@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Iterable, Literal
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 APP_DIR_NAME = ".HolisticProcessingComputeAgent"
 
@@ -156,6 +156,26 @@ class EndpointsSettings(_Section):
         return self.login_host
 
 
+class DatabaseSettings(_Section):
+    """Where the sqlite databases actually run (see specs-db-local-cache.md).
+
+    On a cluster node ``$HOME`` is NFS, where every sqlite call is network
+    round-trips plus a remote fsync, and the TUI lags whenever the agent
+    works. With ``local_cache`` on, the databases are copied to node-local
+    storage at startup, used from there, and synced back to home periodically
+    and on exit.
+    """
+
+    local_cache: bool = True
+    # Where the working copies go. None => $TMPDIR (the per-job dir Slurm
+    # sets, which is what makes them node-local), else the system temp dir.
+    local_dir: str | None = None
+    # How often the working copies are written back, and so the upper bound on
+    # what a hard kill (walltime, node failure, SIGKILL) can lose. 0 syncs only
+    # on exit.
+    sync_interval_s: int = Field(default=60, ge=0)
+
+
 class LLMBackend(_Section):
     """One entry of the configured backend catalog (manage-LLMs screen)."""
 
@@ -194,6 +214,7 @@ class Settings(_Section):
     rag: RagSettings = RagSettings()
     logging: LoggingSettings = LoggingSettings()
     endpoints: EndpointsSettings = EndpointsSettings()
+    database: DatabaseSettings = DatabaseSettings()
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Settings":

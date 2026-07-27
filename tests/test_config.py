@@ -364,3 +364,43 @@ class TestEndpointsSettings:
         path.write_text(json.dumps({"endpoints": {"endpoints_dir": "/x", "bogus": 1}}))
         loaded = Settings.load(path)
         assert loaded.endpoints.endpoints_dir == "/x"
+
+
+class TestDatabaseSettings:
+    def test_local_cache_is_on_by_default(self):
+        # NFS homes are the norm on the cluster this targets; a local disk
+        # only pays a couple of small copies at start and exit.
+        assert Settings().database.local_cache is True
+
+    def test_local_dir_defaults_to_the_node_temp_dir(self):
+        assert Settings().database.local_dir is None
+
+    def test_sync_interval_bounds_how_much_a_hard_kill_can_lose(self):
+        assert Settings().database.sync_interval_s == 60
+
+    def test_roundtrips(self, tmp_path):
+        s = Settings()
+        s.database.local_cache = False
+        s.database.local_dir = "/scratch/local"
+        s.database.sync_interval_s = 15
+        s.save(tmp_path / "settings.json")
+        loaded = Settings.load(tmp_path / "settings.json")
+        assert loaded.database.local_cache is False
+        assert loaded.database.local_dir == "/scratch/local"
+        assert loaded.database.sync_interval_s == 15
+
+    def test_missing_section_falls_back_to_defaults(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"llm": {"model": "m"}}))
+        assert Settings.load(path).database.local_cache is True
+
+    def test_unknown_keys_ignored(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"database": {"sync_interval_s": 5, "bogus": 1}}))
+        assert Settings.load(path).database.sync_interval_s == 5
+
+    def test_negative_sync_interval_is_rejected(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"database": {"sync_interval_s": -1}}))
+        with pytest.raises(SettingsError):
+            Settings.load(path)
