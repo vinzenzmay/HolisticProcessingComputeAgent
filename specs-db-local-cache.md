@@ -99,6 +99,14 @@ lease. Deleting is deliberate — after a *clean* exit home is authoritative, so
 leaving the copies behind would only make the next start do pointless recovery
 work. A crash skips this, which is exactly when recovery is wanted.
 
+The working dir is deleted **only if the final sync got everything home**
+(`sync()` returns that). If it did not, the working dir holds the only copy of
+what is missing, so it is kept and the next start recovers it — a failed exit
+is treated as a crash.
+
+`sync()` and `release()` are serialised by a reentrant lock: both run on worker
+threads, and shutdown can begin while a periodic sync is still copying.
+
 ### 2.5 Concurrency — the lease
 
 Whole-file sync-back is last-writer-wins over the **entire** database. Two
@@ -127,7 +135,11 @@ crash and never to data loss:
 - working dir not creatable / not writable ⇒ inactive, toast the reason;
 - `local_dir` resolving to the app dir itself ⇒ inactive (nothing to gain, and
   copying a file onto itself must not be attempted);
-- a sync raising ⇒ logged to `<app_dir>/dbcache.log`, next tick tries again;
+- a sync failing ⇒ logged to `<app_dir>/dbcache.log`, next tick tries again.
+  `sync()` never raises: one unreadable database costs only its own copy, and
+  an unwritable lease costs only the heartbeat. The log has a file handler and
+  `propagate = False` — a TUI owns the terminal, and logging's last-resort
+  handler writes `WARNING`+ to stderr, which would shred the display;
 - `settings.database.local_cache = false` ⇒ inactive, no lease, no copies.
 
 ## 3. Configuration
@@ -156,5 +168,8 @@ rather than exit-only.
 - `src/hpca/dbcache.py` — new: `local_root`, `local_dir_for`, `copy_database`,
   `Lease`, `DbCache`
 - `src/hpca/config.py` — new `DatabaseSettings` section
-- `src/hpca/tui/app.py` — `on_mount` wiring, sync timer, `on_unmount` release
-- `tests/test_dbcache.py` — new
+- `src/hpca/tui/app.py` — `on_mount` wiring, sync timer, `on_unmount` release,
+  `_file_logger` (generalised out of `_autoconnect_logger`)
+- `src/hpca/db.py` — `checkpoints_db_path()` removed (its only caller now asks
+  the cache); its rationale moved to `DB_NAMES`
+- `tests/test_dbcache.py`, `tests/test_tui_dbcache.py` — new

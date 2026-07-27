@@ -26,6 +26,7 @@ import shutil
 import socket
 import sqlite3
 import tempfile
+import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -36,6 +37,11 @@ logger = logging.getLogger("hpca.dbcache")
 # The databases this module manages. Everything else in the app dir
 # (settings.json, profiles/, skills/, chatlogs/, trash/, ...) stays in home:
 # none of it is on the hot path.
+#
+# checkpoints.db is a separate file from hpca.db by design: the LangGraph
+# checkpointer writes through its own aiosqlite connection during graph
+# execution, and sharing one file produced writer contention ("database is
+# locked") with tool code updating the app tables mid-turn.
 DB_NAMES = ("hpca.db", "checkpoints.db", "rag.db")
 
 LEASE_NAME = "db.lease"
@@ -200,6 +206,10 @@ class DbCache:
         self._configured_dir = Path(local_dir) if local_dir is not None else None
         self._local: Path | None = None
         self._holds_lease = False
+        # sync() and release() both run on worker threads, and shutdown can
+        # start while a periodic sync is still copying. Reentrant because
+        # release() syncs before it lets go.
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------ paths
 
@@ -253,36 +263,54 @@ class DbCache:
         self._seed(skip=recovered)
         return True
 
-    def sync(self) -> None:
-        """Write the local databases back to home. Never raises."""
-        if not self.active or self._local is None:
-            return
-        for name in self.names:
-            src = self._local / name
-            if not src.exists():
-                continue
+    def sync(self) -> bool:
+        """Write the local databases back to home.
+
+        Never raises — home being briefly unreachable is a reason to try again
+        next tick, not to take the app down. Returns whether *everything* got
+        there, which is what ``release`` needs to know before it deletes the
+        only other copy.
+        """
+        with self._lock:
+            if not self.active or self._local is None:
+                return False
+            complete = True
+            for name in self.names:
+                src = self._local / name
+                if not src.exists():
+                    continue
+                try:
+                    copy_database(src, self.home / name)
+                except Exception:
+                    # One unreadable database must not cost the others their
+                    # sync; the next tick tries again.
+                    logger.exception("sync back failed for %s", name)
+                    complete = False
             try:
-                copy_database(src, self.home / name)
-            except Exception:
-                # One unreadable database must not cost the others their sync;
-                # the next tick tries again.
-                logger.exception("sync back failed for %s", name)
-        self._write_lease()
+                self._write_lease()
+            except OSError:
+                logger.exception("could not refresh the lease heartbeat")
+                complete = False
+            return complete
 
     def release(self) -> None:
         """Final sync, then hand local mode back. Idempotent."""
-        if not self.active:
-            return
-        try:
-            self.sync()
-        finally:
+        with self._lock:
+            if not self.active:
+                return
+            try:
+                synced = self.sync()
+            except Exception:  # pragma: no cover - sync is already total
+                logger.exception("final sync back failed")
+                synced = False
             self.active = False
             local, self._local = self._local, None
-            if local is not None:
-                # After a clean exit home is authoritative, so leaving the
-                # copies behind would only make the next start recover them
-                # pointlessly. A crash skips this — which is the case where
-                # recovery is wanted.
+            if local is not None and synced:
+                # After a clean, complete sync home is authoritative, so
+                # leaving the copies behind would only make the next start
+                # recover them pointlessly. If the sync did NOT get everything
+                # home, the working dir is the only copy of what is missing —
+                # keep it, and let the next start recover it as after a crash.
                 shutil.rmtree(local, ignore_errors=True)
             self._drop_lease()
 

@@ -11,6 +11,8 @@ import json
 import os
 import sqlite3
 import struct
+import subprocess
+import sys
 
 import pytest
 
@@ -286,6 +288,26 @@ class TestSync:
 
         assert read_notes(home / "rag.db") == ["fine"]
 
+    def test_reports_success(self, home, local):
+        cache = DbCache(home, local_dir=local)
+        cache.acquire()
+        make_db(cache.path_for("hpca.db"))
+        assert cache.sync() is True
+
+    def test_reports_failure_without_raising(self, home, local):
+        cache = DbCache(home, local_dir=local)
+        cache.acquire()
+        (local / "hpca.db").write_bytes(b"this is not a database")
+        assert cache.sync() is False
+
+    def test_an_unwritable_lease_does_not_raise(self, home, local):
+        # Home briefly unreachable must not take the app down.
+        cache = DbCache(home, local_dir=local)
+        cache.acquire()
+        (home / "db.lease").unlink()
+        (home / "db.lease").mkdir()  # a directory: the write cannot succeed
+        assert cache.sync() is False
+
     def test_refreshes_the_lease_heartbeat(self, home, local):
         cache = DbCache(home, local_dir=local)
         cache.acquire()
@@ -324,6 +346,30 @@ class TestRelease:
         cache.release()
         assert not cache.active
         assert cache.path_for("hpca.db") == home / "hpca.db"
+
+    def test_keeps_the_working_dir_when_the_final_sync_fails(self, home, local):
+        # Deleting it would destroy the only surviving copy; leaving it lets
+        # the next start recover, exactly as after a crash.
+        cache = DbCache(home, local_dir=local)
+        cache.acquire()
+        make_db(local / "hpca.db", rows=("only-copy",))
+        (local / "checkpoints.db").write_bytes(b"this is not a database")
+
+        cache.release()
+
+        assert read_notes(local / "hpca.db") == ["only-copy"]
+
+    def test_a_failing_sync_does_not_stop_the_release(self, home, local):
+        cache = DbCache(home, local_dir=local)
+        cache.acquire()
+
+        def boom():
+            raise OSError("home unreachable")
+
+        cache.sync = boom
+        cache.release()
+
+        assert not cache.active
 
     def test_is_idempotent(self, home, local):
         cache = DbCache(home, local_dir=local)
@@ -432,12 +478,14 @@ class TestLease:
 
 
 def _dead_pid() -> int:
-    """A pid that is certainly not running: fork a child and reap it."""
-    pid = os.fork()
-    if pid == 0:  # pragma: no cover - the child never returns
-        os._exit(0)
-    os.waitpid(pid, 0)
-    return pid
+    """A pid that is certainly not running: run a child and reap it.
+
+    Not os.fork(): forking a multi-threaded pytest process is deprecated and
+    can deadlock in the child.
+    """
+    child = subprocess.Popen([sys.executable, "-c", ""])
+    child.wait()
+    return child.pid
 
 
 class TestRoundTrip:
