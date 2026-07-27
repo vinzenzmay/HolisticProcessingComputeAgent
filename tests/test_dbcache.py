@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import stat
 import struct
 import subprocess
 import sys
@@ -192,6 +193,20 @@ class TestAcquire:
         DbCache(home, local_dir=local).acquire()
         for name in DB_NAMES:
             assert read_notes(local / name) == [name]
+
+    def test_the_working_dir_is_private_to_this_user(self, home, local):
+        # /tmp is shared on a cluster node, and these databases hold the whole
+        # conversation history.
+        DbCache(home, local_dir=local).acquire()
+        assert stat.S_IMODE(local.stat().st_mode) == 0o700
+
+    def test_an_inherited_working_dir_is_locked_down_too(self, home, local):
+        # A crash left it behind; it may have been created world-readable by
+        # an older version, or by a umask that allowed it.
+        local.mkdir(parents=True)
+        local.chmod(0o755)
+        DbCache(home, local_dir=local).acquire()
+        assert stat.S_IMODE(local.stat().st_mode) == 0o700
 
     def test_inactive_cache_hands_back_the_home_paths(self, home, local):
         cache = DbCache(home, local_dir=local, enabled=False)

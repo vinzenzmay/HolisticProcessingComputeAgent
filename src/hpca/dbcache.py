@@ -251,6 +251,11 @@ class DbCache:
             return False
         try:
             local.mkdir(parents=True, exist_ok=True)
+            # /tmp is shared on a cluster node and these databases hold whole
+            # conversations. Set explicitly rather than via mkdir's mode: the
+            # dir may be inherited from a crashed run, and umask can only
+            # remove bits from what mkdir was asked for.
+            local.chmod(0o700)
         except OSError as e:
             self._drop_lease()
             self.reason = f"cannot use {local}: {e}"

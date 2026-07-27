@@ -60,7 +60,10 @@ The working dir is `<local_root>/hpca-<uid>-<digest>`, where `digest` is the
 first 12 hex chars of `sha256(str(app_dir().resolve()))`. Keying on the app dir
 means two different `$HPCA_HOME`s (different tests, a scratch profile) never
 share a working dir, and the same home always maps back to the same one — which
-is what makes crash recovery possible.
+is what makes crash recovery possible. The uid keeps users apart in a shared
+`/tmp`, and the dir is `chmod 0700` on every acquire (not just at creation: it
+may be inherited from a crashed run) — `/tmp` is shared on a cluster node and
+these databases hold whole conversations.
 
 ### 2.3 Copying
 
