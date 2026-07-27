@@ -46,12 +46,12 @@ from hpca.config import LLMBackend, Settings, app_dir, llm_settings_for
 from hpca.discover import DiscoveredBackend
 from hpca.db import (
     DbIO,
-    checkpoints_db_path,
     command_use_counts,
     connect,
     init_db,
     record_command_use,
 )
+from hpca.dbcache import DbCache, local_dir_for
 from hpca.jobs import JobRow, JobStore, apply_statuses
 from hpca.agent.conclude import MemoryProposal, propose_memories
 from hpca.agent.doc_tools import add_ask_docs, add_doc_tools
@@ -160,17 +160,16 @@ COLUMN_IDS = ("sessions", "chat", "processes")
 PROCESS_HISTORY_LIMIT = 60
 
 
-def _autoconnect_logger() -> logging.Logger:
-    """The ``hpca.autoconnect`` logger, writing to <app_dir>/autoconnect.log.
+def _file_logger(name: str, filename: str) -> logging.Logger:
+    """A logger writing to <app_dir>/<filename>, and only there.
 
-    Discovery is best-effort and must never interrupt startup, so its failures
-    are invisible in the TUI; this file is the debugging trail. The handler is
-    attached on first use (idempotent) and does not propagate — a TUI owns the
-    terminal, so nothing may reach the root logger's stderr handler.
+    The handler is attached on first use (idempotent) and does not propagate:
+    a TUI owns the terminal, so nothing may reach the root logger — whose
+    last-resort handler writes to stderr and would shred the display.
     """
-    logger = logging.getLogger("hpca.autoconnect")
+    logger = logging.getLogger(name)
     if not any(isinstance(h, logging.FileHandler) for h in logger.handlers):
-        handler = logging.FileHandler(app_dir() / "autoconnect.log")
+        handler = logging.FileHandler(app_dir() / filename)
         handler.setFormatter(
             logging.Formatter("%(asctime)s %(levelname)s %(message)s")
         )
@@ -178,6 +177,20 @@ def _autoconnect_logger() -> logging.Logger:
         logger.setLevel(logging.INFO)
         logger.propagate = False
     return logger
+
+
+def _autoconnect_logger() -> logging.Logger:
+    """The ``hpca.autoconnect`` logger. Discovery is best-effort and must never
+    interrupt startup, so its failures are invisible in the TUI and this file
+    is the debugging trail."""
+    return _file_logger("hpca.autoconnect", "autoconnect.log")
+
+
+def _dbcache_logger() -> logging.Logger:
+    """The ``hpca.dbcache`` logger. A failed sync is retried on the next tick
+    rather than surfaced, and recovery happens before the UI exists, so this
+    file is where both leave their trail."""
+    return _file_logger("hpca.dbcache", "dbcache.log")
 
 
 def format_started(started_at: str) -> str:
@@ -1064,6 +1077,12 @@ class HpcaApp(App):
         # Sync sqlite off the event loop (NFS homes make each call slow
         # enough to eat keystrokes); the periodic pollers go through this.
         self._dbio: DbIO | None = None
+        # ...and run the databases themselves on node-local disk, so each of
+        # those calls is fast in the first place. DbIO decides who waits,
+        # DbCache how long. Built in on_mount, before anything opens a
+        # database, because it is what decides where the databases are.
+        self._dbcache: DbCache | None = None
+        self._syncing_db_cache = False
         self._saver_ctx = None
 
     def notify(self, message: str, **kwargs) -> None:
@@ -1087,9 +1106,10 @@ class HpcaApp(App):
         self.clipboard_manager = ClipboardManager(
             self.settings.clipboard, emit=self._emit_to_terminal
         )
-        self._conn = connect()
+        self._dbcache = self._open_db_cache()
+        self._conn = connect(self._dbcache.path_for("hpca.db"))
         init_db(self._conn)
-        self._dbio = DbIO()
+        self._dbio = DbIO(self._dbcache.path_for("hpca.db"))
         # Processes the previous run was watching when it exited would claim
         # to be running forever; harmless while the panel was empty on
         # restart, a standing lie now that it shows history.
@@ -1097,7 +1117,9 @@ class HpcaApp(App):
         self.session_store = SessionStore(self._conn)
         self.episodic = EpisodicStore(self._conn)
         self.memory_index = MemoryIndex(self._conn)
-        self._saver_ctx = AsyncSqliteSaver.from_conn_string(str(checkpoints_db_path()))
+        self._saver_ctx = AsyncSqliteSaver.from_conn_string(
+            str(self._dbcache.path_for("checkpoints.db"))
+        )
         checkpointer = await self._saver_ctx.__aenter__()
         self._checkpointer = checkpointer  # kept for graph rebuilds on switch
         if self._llm is None:
@@ -1113,7 +1135,7 @@ class HpcaApp(App):
         self._rebuild_graph()
         self.job_store = JobStore(self._conn)
         self.symbol_index = SymbolIndex(self._conn)
-        self.rag_store = RagStore(app_dir() / "rag.db")
+        self.rag_store = RagStore(self._dbcache.path_for("rag.db"))
         self.embedder = EmbeddingClient(
             base_url=self.settings.rag.embedding_base_url,
             model=self.settings.rag.embedding,
@@ -1137,11 +1159,55 @@ class HpcaApp(App):
         self.run_curator_if_due()
         self.set_interval(2.0, self.refresh_processes)
         self.set_interval(2.0, self.watch_processes)
+        sync_interval = self.settings.database.sync_interval_s
+        if self._dbcache.active and sync_interval > 0:
+            self.set_interval(sync_interval, self._sync_db_cache)
         if self.slurm is not None:
             self.set_interval(
                 max(5, self.settings.cluster.job_poll_seconds), self.poll_jobs
             )
         self._focus_column("sessions")
+
+    # ------------------------------------------------------------- db cache
+
+    def _open_db_cache(self) -> DbCache:
+        """Decide where the databases run, before any of them is opened.
+
+        Local mode is the fast path; declining it (disabled in settings,
+        another instance holding the lease, an unusable working dir) means
+        running straight from home, which is slower but always correct — so
+        the only thing to do about it is say so.
+        """
+        _dbcache_logger()  # before acquire(): recovery logs through it
+        cache = DbCache(
+            app_dir(),
+            local_dir=(
+                local_dir_for(app_dir(), configured=self.settings.database.local_dir)
+            ),
+            enabled=self.settings.database.local_cache,
+        )
+        if not cache.acquire() and self.settings.database.local_cache:
+            self.notify(f"Databases: {cache.reason}", severity="warning")
+        return cache
+
+    async def _sync_db_cache(self) -> None:
+        """Write the node-local databases back to home (the periodic tick).
+
+        Skipped while a previous sync is still running: on NFS one can outlast
+        its interval, and two backups of the same file at once is pointless
+        work. Failures are reported and retried on the next tick — home being
+        briefly unreachable must not take the app down.
+        """
+        cache = self._dbcache
+        if cache is None or not cache.active or self._syncing_db_cache:
+            return
+        self._syncing_db_cache = True
+        try:
+            await asyncio.to_thread(cache.sync)
+        except Exception as e:
+            self.notify(f"Database sync to home failed: {e}", severity="warning")
+        finally:
+            self._syncing_db_cache = False
 
     def _detect_slurm(self) -> SlurmClient | None:
         """Job tools are available when sbatch exists or a submit host is set."""
@@ -1163,6 +1229,11 @@ class HpcaApp(App):
             self._conn.close()
         if getattr(self, "rag_store", None) is not None:
             self.rag_store.close()
+        # Last, and only once every connection above is closed: the final sync
+        # should copy a quiesced database, and nothing may open a local file
+        # after the working dir is removed.
+        if self._dbcache is not None:
+            await asyncio.to_thread(self._dbcache.release)
         if getattr(self, "embedder", None) is not None:
             await self.embedder.close()
         if self._owns_llm and self._llm is not None:
