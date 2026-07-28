@@ -1400,6 +1400,14 @@ class HpcaApp(App):
             # in another session leaves the open session free to run one).
             forced_skill = self._slash_skill(text)
             if forced_skill is None:
+                command = text[1:].partition(" ")[0]
+                if command not in {name for name, _ in COMMANDS}:
+                    # Neither a built-in nor a skill — almost always a typo, so
+                    # leave the draft standing: the user fixes the spelling (or
+                    # reopens the menu to look the command up) instead of having
+                    # to type the whole thing again.
+                    self.notify(f"Unknown command: /{command}", severity="warning")
+                    return
                 active_busy = (
                     self.active_session is not None
                     and self.active_session.session_id in self._turns

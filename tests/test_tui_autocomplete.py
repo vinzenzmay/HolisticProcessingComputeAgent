@@ -128,3 +128,39 @@ class TestNavigation:
             # it ran: the entry cleared and the command was counted
             assert chat_input.text == ""
             assert command_use_counts(app._conn).get("skills-list") == 1
+
+
+class TestMistyped:
+    """A "/" word naming neither a command nor a skill is nearly always a
+    typo, so the draft stays put and can be corrected in place."""
+
+    async def test_unknown_command_keeps_the_draft(self, hpca_home):
+        app = HpcaApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", ChatInput)
+            chat_input.text = "/skils-list"  # mistyped /skills-list
+            app._update_command_menu(chat_input.text)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert chat_input.text == "/skils-list"
+            # …and it was not sent to the model as an ordinary message either
+            assert not app._pending_work
+
+    async def test_correcting_it_then_runs(self, hpca_home):
+        app = HpcaApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", ChatInput)
+            chat_input.text = "/skils-list"
+            app._update_command_menu(chat_input.text)
+            await pilot.press("enter")
+            await pilot.pause()
+            chat_input.text = "/skills-list"  # the retained draft, fixed up
+            app._update_command_menu(chat_input.text)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert chat_input.text == ""
+            assert command_use_counts(app._conn).get("skills-list") == 1
