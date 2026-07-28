@@ -33,11 +33,9 @@ from hpca.agent.modes import (
     continue_nudge_for,
     destructive_approval_required,
     mode_prompt_suffix,
-    present_plan_reply,
     requires_execution_approval,
     script_preview,
     skipped_message,
-    tools_for_mode,
 )
 from hpca.agent.prompts import orchestrator_system_prompt
 from hpca.agent.tools import ToolRegistry
@@ -49,8 +47,7 @@ from hpca.llm import Message
 MAX_TOOL_ROUNDS = 30
 # A turn never ends on a bare chat reply that only narrates the next step: the
 # reply is fed back with a nudge and the model tries again (see
-# continue_nudge_for — plan mode nudges any chat reply, other modes only a
-# deferred action). Bounded so a model that only ever narrates cannot loop
+# continue_nudge_for). Bounded so a model that only ever narrates cannot loop
 # forever — after this many nudges the turn ends with whatever it said.
 MAX_CONTINUE_NUDGES = 2
 
@@ -99,7 +96,7 @@ class AgentState(TypedDict, total=False):
     thinking: Annotated[list[dict], _append]
     pending_tool: dict | None
     tool_rounds: int
-    # The plan-mode checklist (§3.5): list of {"text": str, "done": bool}.
+    # The progress checklist: list of {"text": str, "done": bool}.
     # Checkpointed with the thread, re-injected into the system prompt every
     # round, replaced wholesale by each update_plan call.
     plan: list[dict] | None
@@ -215,18 +212,14 @@ def build_graph(
         if compaction:
             state = {**state, **compaction}
         mode = mode_for(thread_id)
-        # Plan mode withdraws execution tools from the offer itself — a tool
-        # the model is never shown is one it cannot call (§3.5).
-        active_tools = tools_for_mode(tools, mode)
         system: Message = {
             "role": "system",
             "content": _system_text(state, mode, thread_id),
         }
         # A bare chat reply that only announces the next step ("Let me dig into
         # the source…") is the model narrating instead of acting, so feed it
-        # back with a nudge and let it retry — in every mode (plan mode nudges
-        # any chat reply, other modes only a deferred action; see
-        # continue_nudge_for). Bounded, and the fumbled narration is never
+        # back with a nudge and let it retry (see continue_nudge_for).
+        # Bounded, and the fumbled narration is never
         # persisted — the same shape as decide()'s validation-retry.
         nudges: list[Message] = []
         for attempt in range(MAX_CONTINUE_NUDGES + 1):
@@ -235,7 +228,7 @@ def build_graph(
                 decision = await decide(
                     client(thread_id),
                     [system] + _view(state) + nudges,
-                    active_tools,
+                    tools,
                     max_retries=max_retries,
                 )
             except DecisionError as e:
@@ -257,10 +250,6 @@ def build_graph(
                     ]
                     continue
                 return _final(decision.text) | thinking | compaction
-            if decision.tool.name == "present_plan":
-                # The explicit end of a planning turn: record the checklist and
-                # answer with the plan; the TUI then offers it for approval.
-                return _present_plan(decision.arguments) | thinking | compaction
             return {
                 "pending_tool": {
                     "tool": decision.tool.name,
@@ -288,7 +277,7 @@ def build_graph(
         destructive = tool.gates(arguments, context) and destructive_approval_required(
             mode
         )
-        # Manual and plan modes gate execution tools too (§3.5) — same
+        # Manual mode gates execution tools too (§3.5) — same
         # interrupt/resume machinery, a different question to the user.
         execution = not destructive and requires_execution_approval(mode, tool.name)
         if destructive or execution:
@@ -365,46 +354,6 @@ def build_graph(
             "role": "system",
             "content": _system_text(state, mode, thread_id),
         }
-        # Plan mode never trails off in chat, not even out of budget: hand the
-        # plan over instead. Offer only present_plan so the model finishes the
-        # turn the one way it should — the best plan it has now, unknowns as
-        # open questions — and the TUI still gets a checklist to approve.
-        if mode == "plan" and "present_plan" in tools.names():
-            note = {
-                "role": "user",
-                "content": (
-                    f"[tool budget: you have used all {max_tool_rounds} "
-                    "look-around steps this turn]\nStop investigating and hand "
-                    "the plan over now: call present_plan with the best "
-                    "checklist you can from what you have already found, and "
-                    "put anything still uncertain in open_questions. Do not ask "
-                    "to read more."
-                ),
-            }
-            report(thread_id, "LLM processing")
-            try:
-                decision = await decide(
-                    client(thread_id),
-                    [system] + _view(state) + [note],
-                    tools.subset(["present_plan"]),
-                    max_retries=max_retries,
-                )
-            except DecisionError:
-                return _final(
-                    f"I used all {max_tool_rounds} look-around steps this turn "
-                    "without finishing the plan. Tell me how to proceed."
-                ) | compaction
-            report_usage(thread_id, decision.usage)
-            thinking = _thinking(state, decision.reasoning)
-            if isinstance(decision, ToolCall) and decision.tool.name == "present_plan":
-                return _present_plan(decision.arguments) | thinking | compaction
-            text = (
-                decision.text
-                if isinstance(decision, DirectResponse)
-                else f"I used all {max_tool_rounds} look-around steps. Tell me "
-                "how to proceed."
-            )
-            return _final(text) | thinking | compaction
         budget_note = {
             "role": "user",
             "content": (
@@ -441,18 +390,6 @@ def build_graph(
             "pending_tool": None,
             "tool_rounds": 0,
         }
-
-    def _present_plan(args: Any) -> dict:
-        """End a planning turn on an explicit present_plan call: answer with
-        the plan and store the checklist so the TUI hands it over (§3.5).
-
-        Empty steps (a plan-blocking question with no checklist yet) leave any
-        earlier plan untouched — only a real checklist replaces it.
-        """
-        update = _final(present_plan_reply(args))
-        if args.steps:
-            update["plan"] = [step.model_dump() for step in args.steps]
-        return update
 
     def _tool_message(content: str) -> dict:
         # Tool results use the user role: vLLM/Qwen templates reject

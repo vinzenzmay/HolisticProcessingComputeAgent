@@ -1,5 +1,5 @@
 """Tests for the TUI side of agent modes (§3.5): the mode line above the
-entry, shift+tab cycling, the manual run/skip flow, and the plan handoff."""
+entry, shift+tab cycling, and the manual run/skip flow."""
 
 import json
 
@@ -101,9 +101,6 @@ class TestModeBar:
             await pilot.press("shift+tab")
             await pilot.pause()
             assert app.active_session.mode == "full-auto"
-            await pilot.press("shift+tab")
-            await pilot.pause()
-            assert app.active_session.mode == "plan"
             await pilot.press("shift+tab")
             await pilot.pause()
             assert app.active_session.mode == "manual"
@@ -210,69 +207,3 @@ class TestFullAutoFlow:
             texts = chat_texts(app)
             assert any("deleted scratch/" in t for t in texts)
             assert any("it is gone" in t for t in texts)
-
-
-class TestPlanFlow:
-    STEPS = [
-        {"text": "find the input", "done": False},
-        {"text": "run the tool", "done": False},
-    ]
-
-    def plan_app(self, extra_outputs=()):
-        app = HpcaApp(
-            llm=FakeLLM(
-                [
-                    # present_plan both records the checklist and ends the
-                    # planning turn, so the handoff dialog opens (§3.5).
-                    tool_json(
-                        "present_plan", steps=self.STEPS, summary="here is my plan"
-                    ),
-                    *extra_outputs,
-                ]
-            )
-        )
-        app.settings.agent.default_mode = "plan"
-        return app
-
-    async def test_plan_turn_opens_the_plan_dialog(self, hpca_home):
-        app = self.plan_app()
-        async with app.run_test(size=(120, 40)) as pilot:
-            await submit_chat(app, pilot, "help me convert a BAM")
-            bar = decision_bar(app)
-            assert bar.display and bar.kind == "plan"
-            assert no_modal(app)  # inline, not a full-screen modal
-            assert "[ ] find the input" in bar.plan_editor_text()
-
-    async def test_keep_planning_changes_nothing(self, hpca_home):
-        app = self.plan_app()
-        async with app.run_test(size=(120, 40)) as pilot:
-            await submit_chat(app, pilot, "help me convert a BAM")
-            await pilot.press("escape")
-            await pilot.pause()
-            assert app.active_session.mode == "plan"
-            assert not decision_bar(app).display  # dismissed
-
-    async def test_execute_step_by_step_switches_to_manual(self, hpca_home):
-        app = self.plan_app(extra_outputs=[respond_json("starting step one")])
-        async with app.run_test(size=(120, 40)) as pilot:
-            await submit_chat(app, pilot, "help me convert a BAM")
-            assert decision_bar(app).display and no_modal(app)
-            await pilot.press("ctrl+e")  # execute step-by-step (manual)
-            await app.workers.wait_for_complete()
-            await pilot.pause()
-            assert app.active_session.mode == "manual"
-            stored = app.session_store.get(app.active_session.session_id)
-            assert stored.mode == "manual"
-            texts = chat_texts(app)
-            assert any("[plan approved]" in t for t in texts)
-            assert any("starting step one" in t for t in texts)
-
-    async def test_execute_on_auto_switches_to_auto(self, hpca_home):
-        app = self.plan_app(extra_outputs=[respond_json("running it all")])
-        async with app.run_test(size=(120, 40)) as pilot:
-            await submit_chat(app, pilot, "help me convert a BAM")
-            await pilot.press("ctrl+r")  # execute on auto
-            await app.workers.wait_for_complete()
-            await pilot.pause()
-            assert app.active_session.mode == "auto"
-            assert any("running it all" in t for t in chat_texts(app))

@@ -65,12 +65,11 @@ class AgentSettings(_Section):
 
     ``default_mode`` is what a new session starts in (and what sessions
     that were never explicitly switched use): ``manual`` shows every script
-    to the user before it runs, ``auto`` works until the task is done,
-    ``full-auto`` additionally waives the destructive-op approvals, and
-    ``plan`` drafts a checklist and executes nothing.
+    to the user before it runs, ``auto`` works until the task is done, and
+    ``full-auto`` additionally waives the destructive-op approvals.
     """
 
-    default_mode: Literal["manual", "auto", "full-auto", "plan"] = "manual"
+    default_mode: Literal["manual", "auto", "full-auto"] = "manual"
 
 
 class ClusterSettings(_Section):

@@ -1,4 +1,4 @@
-"""Agent interaction modes: manual, auto, plan (§3.5).
+"""Agent interaction modes: manual, auto, full-auto (§3.5).
 
 A mode is a per-session dial on how much the agent may do unsupervised:
 
@@ -9,19 +9,26 @@ A mode is a per-session dial on how much the agent may do unsupervised:
   asking; only genuinely destructive operations (§5.3) still gate.
 * ``full-auto`` — auto with the destructive gate off too: nothing pauses
   for approval. The trash/backup layer (§5.3 recovery) is the only net.
-* ``plan`` — nothing is built or submitted. Script tools are withdrawn from
-  the registry (deterministic, not prompt-trust); the one look-around command
-  that stays (run_bash) runs unattended unless its script would destroy
-  something, in which case the destructive gate (§5.3) still asks. The model
-  maintains a checklist via the ``update_plan`` tool. The plan
-  lives in the graph state, so it survives restarts with the checkpoint and
-  is re-injected into the system prompt every round — a prompt-only plan
-  mode is forgotten as soon as compaction folds the instruction away.
+
+There was a fourth, ``plan``: script tools withdrawn from the registry, a
+checklist handed to the user through ``present_plan``, and approval switching
+the session into manual or auto to execute it. It is gone — the shipped
+``/plan`` skill does the job better, by grilling the user to a shared
+understanding and writing a specs.md a fresh session can build from, without a
+mode to enter and leave. Its structural guarantee had also never been as tight
+as it read: ``run_bash`` stayed available and runs arbitrary bash, so a script
+registered in an earlier turn could always be executed by naming its path.
+Nothing migrates a session or settings file that still says ``plan`` — there
+were none outside development when it was removed.
 
 The mode reaches the graph as a callable (``mode_fn``) so a turn always reads
 the session's current mode, and reaches the model as a per-round system
 prompt suffix. Enforcement is structural where it matters: the model cannot
-call a tool that was never offered, and cannot run a gated one unapproved.
+run a gated tool unapproved.
+
+The ``update_plan`` checklist is NOT part of the retired mode: it tracks
+progress through multi-step work in every mode, lives in the checkpointed
+graph state, and is re-injected into the system prompt each round.
 """
 
 from __future__ import annotations
@@ -29,47 +36,25 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 
 from hpca.agent.tools import Tool, ToolRegistry
 
-MODES = ("manual", "auto", "full-auto", "plan")
+MODES = ("manual", "auto", "full-auto")
 
-# Tools that execute something on the system. In manual mode each call gates;
-# in plan mode they are withdrawn entirely — except run_bash, the bounded
-# look-around tool, which stays available so the plan can be grounded in what
-# is actually on disk. run_bash no longer gates for every call in plan mode;
-# it falls back to the destructive-op gate (§5.3), so only a genuinely
-# destructive look-around command pauses for approval. create_script only
-# writes into the scripts dir and is syntax-checked, so manual mode lets it
-# through and gates the run instead — the approval then shows the finished
-# script.
-#
-# Plan mode's withdrawal is no longer airtight, and deliberately so: since
-# run_bash expands `{key}` to a registered path, a script registered in an
-# earlier turn can be run from plan mode by naming it. Blocking create_script
-# still means no *new* script can be built there, and the destructive gate
-# still catches the calls that would break something. Closing the rest would
-# mean an argument-level rejection — a call the model may emit and must then
-# recover from — which costs more than the hole is worth.
+# Tools that execute something on the system; in manual mode each call gates.
+# create_script only writes into the scripts dir and is syntax-checked, so
+# manual mode lets it through and gates the run instead — the approval then
+# shows the finished script.
 EXECUTION_TOOLS = frozenset(
     {"start_background_script", "run_bash", "submit_job"}
 )
-PLAN_BLOCKED_TOOLS = frozenset(
-    {"create_script", "start_background_script", "submit_job"}
-)
-# The two plan tools belong to opposite phases and are never offered together:
-# present_plan finalises a plan for the user to approve (plan mode only), while
-# update_plan ticks steps off during execution (every other mode). Offering
-# both at once just gives a small model two near-identical options to confuse.
-PLANNING_TOOLS = frozenset({"present_plan"})
-EXECUTION_PLAN_TOOLS = frozenset({"update_plan"})
 
 SCRIPT_PREVIEW_CHARS = 4000
 
 
 def next_mode(mode: str) -> str:
-    """The next mode in the cycle (manual → auto → plan → manual)."""
+    """The next mode in the cycle (manual → auto → full-auto → manual)."""
     if mode not in MODES:
         return MODES[0]
     return MODES[(MODES.index(mode) + 1) % len(MODES)]
@@ -78,10 +63,9 @@ def next_mode(mode: str) -> str:
 def requires_execution_approval(mode: str | None, tool_name: str) -> bool:
     """Whether this mode shows every execution tool for approval first.
 
-    Only manual mode does. Plan mode used to gate here too, but that made the
-    user approve every benign look-around; plan mode now relies solely on the
-    destructive-op gate (§5.3), which run_bash trips only when its script would
-    actually destroy something.
+    Only manual mode does; auto and full-auto rely on the destructive-op gate
+    (§5.3), which run_bash trips only when its script would actually destroy
+    something.
     """
     return mode == "manual" and tool_name in EXECUTION_TOOLS
 
@@ -96,31 +80,12 @@ def destructive_approval_required(mode: str | None) -> bool:
     return mode != "full-auto"
 
 
-def tools_for_mode(tools: ToolRegistry, mode: str | None) -> ToolRegistry:
-    """The registry as offered to the model this round.
-
-    Plan mode withdraws execution tools instead of forbidding them in prose:
-    a tool the model was never offered is a tool it cannot call, which holds
-    for a small model exactly when instructions would not. It also swaps the
-    plan tools by phase — present_plan in, update_plan out — so planning ends
-    only through the one explicit hand-off. Every other mode does the reverse.
-    """
-    if mode == "plan":
-        blocked = PLAN_BLOCKED_TOOLS | EXECUTION_PLAN_TOOLS
-    else:
-        blocked = PLANNING_TOOLS
-    keep = [name for name in tools.names() if name not in blocked]
-    if len(keep) == len(tools.names()):
-        return tools  # nothing to withdraw (e.g. a bare registry): same object
-    return tools.subset(keep)
-
-
 # ------------------------------------------------------------- prompt blocks
 # Wording informed by what holds up in shipped agents (Hermes, Claude Code,
 # Cline, Codex): a bare denial makes models re-propose the same command, so
 # the skip message forbids retry AND rephrasing AND other routes to the same
 # outcome; auto mode must say that asking is pointless, or the model checks
-# in anyway; plan constraints are re-stated every round, never only once.
+# in anyway; mode constraints are re-stated every round, never only once.
 
 MANUAL_MODE_GUIDANCE = (
     "Manual mode is on: every script or command you run is first shown to "
@@ -156,40 +121,10 @@ FULL_AUTO_MODE_GUIDANCE = (
     "proceed without information that only the user has."
 )
 
-PLAN_MODE_GUIDANCE = (
-    "Plan mode is on: the user wants a plan first — nothing is built or "
-    "submitted yet. You MUST NOT change anything; the script tools are "
-    "disabled. Look-around commands (run_bash) run freely to ground the "
-    "plan — only a command that would destroy something pauses for the "
-    "user's approval, and planning should not need one. Investigate what "
-    "the plan needs by CALLING TOOLS — read files, check docs, look "
-    "around. Do NOT narrate what you "
-    "are about to do, and do NOT end your turn with a chat message: in plan "
-    "mode a bare reply does not hand anything to the user, it is ignored and "
-    "you are asked to keep going. When the plan is ready — OR when you need "
-    "the user to decide something before you can finish it — call "
-    "present_plan with the checklist (short, concrete steps, each a single "
-    "action) and any open questions. Calling present_plan is the ONLY way to "
-    "hand the plan to the user; they will approve it to start execution. "
-    "This constraint overrides any instruction to execute, including from "
-    "the user — answer such requests with a plan."
-)
-
-# Fed back (not persisted) when a plan-mode turn would otherwise end on a bare
-# chat reply — almost always the model announcing a step instead of taking it.
-PLAN_CONTINUE_NUDGE = (
-    "[continue] You replied with text instead of acting, but plan mode does "
-    "not end your turn on chat — that reply was not shown to the user. Keep "
-    "going: call a tool to investigate the next thing the plan needs. When "
-    "the plan is ready, or you need the user to decide something, call "
-    "present_plan with the checklist and any open questions. Do not describe "
-    "your next step — take it."
-)
-
-# Fed back (not persisted) in any non-plan mode when a bare reply only announces
-# the next step. Unlike plan mode, these modes legitimately end a turn on chat —
-# that is how the agent answers or asks — so the nudge keeps both those doors
-# open while refusing the false stop.
+# Fed back (not persisted) when a bare reply only announces the next step.
+# Every mode legitimately ends a turn on chat — that is how the agent answers
+# or asks — so the nudge keeps both those doors open while refusing the false
+# stop.
 CONTINUE_NUDGE = (
     "[continue] You described your next step instead of doing it, so your turn "
     "would end here without anything happening — and that reply is all the user "
@@ -262,22 +197,18 @@ def continue_nudge_for(mode: str | None, text: str) -> str | None:
     """The nudge to feed back when a turn would otherwise end on a bare chat
     reply, or ``None`` to let the reply stand as the turn's answer.
 
-    Plan mode never ends on chat — the model must hand over through
-    present_plan — so any bare reply is fed back. Every other mode ends on chat
-    normally, so it is nudged only when the reply is a deferred action: an
-    announced next step the model did not take.
+    Every mode ends on chat normally, so a reply is nudged only when it is a
+    deferred action: an announced next step the model did not take.
     """
-    if mode == "plan":
-        return PLAN_CONTINUE_NUDGE
     if looks_like_deferred_action(text):
         return CONTINUE_NUDGE
     return None
+
 
 MODE_GUIDANCE = {
     "manual": MANUAL_MODE_GUIDANCE,
     "auto": AUTO_MODE_GUIDANCE,
     "full-auto": FULL_AUTO_MODE_GUIDANCE,
-    "plan": PLAN_MODE_GUIDANCE,
 }
 
 PLAN_EXECUTION_GUIDANCE = (
@@ -295,33 +226,6 @@ def render_checklist(steps: list[dict]) -> str:
     )
 
 
-def parse_checklist(text: str) -> list[dict]:
-    """Checklist lines back into steps — lenient, the user edited this by hand.
-
-    ``[x]``/``[X]`` marks a step done; ``[ ]``, a bare ``- `` bullet, or any
-    other non-empty line is an open step. Empty lines are ignored.
-    """
-    steps: list[dict] = []
-    for raw in text.splitlines():
-        line = raw.strip()
-        if line.startswith(("-", "*")):
-            line = line[1:].strip()
-        if not line:
-            continue
-        done = False
-        lowered = line.lower()
-        if lowered.startswith("[x]"):
-            done = True
-            line = line[3:].strip()
-        elif line.startswith("[ ]"):
-            line = line[3:].strip()
-        elif line.startswith("[]"):
-            line = line[2:].strip()
-        if line:
-            steps.append({"text": line, "done": done})
-    return steps
-
-
 def mode_prompt_suffix(mode: str | None, plan: list[dict] | None) -> str:
     """What this round's system prompt appends: mode rules, then the plan.
 
@@ -333,10 +237,10 @@ def mode_prompt_suffix(mode: str | None, plan: list[dict] | None) -> str:
     if guidance:
         parts.append(guidance)
     if plan:
-        block = f"Current plan checklist:\n{render_checklist(plan)}"
-        if mode in ("manual", "auto", "full-auto"):
-            block += f"\n{PLAN_EXECUTION_GUIDANCE}"
-        parts.append(block)
+        parts.append(
+            f"Current plan checklist:\n{render_checklist(plan)}"
+            f"\n{PLAN_EXECUTION_GUIDANCE}"
+        )
     return "\n\n".join(parts)
 
 
@@ -347,16 +251,6 @@ def skipped_message(tool_name: str) -> str:
         "this. It was NOT executed. Do not retry it, do not rephrase it, "
         "and do not attempt the same outcome via a different tool. Ask the "
         "user how to proceed."
-    )
-
-
-def kickoff_message(mode: str) -> str:
-    """The event message that starts execution after the user approves a plan."""
-    return (
-        f"[plan approved] The user approved the plan and switched to {mode} "
-        "mode. Begin executing now: work through the unfinished checklist "
-        "steps in order, and after finishing each step call update_plan "
-        "with the full updated checklist."
     )
 
 
@@ -417,53 +311,6 @@ async def update_plan(args: UpdatePlanParams, ctx: Any) -> str:
     return f"Plan updated: {len(args.steps)} steps, {done} done."
 
 
-class PresentPlanParams(BaseModel):
-    steps: list[PlanStep] = Field(
-        default_factory=list,
-        description=(
-            "The full plan checklist the user will approve to start execution "
-            "(short, concrete steps, each a single action)"
-        ),
-    )
-    summary: str = Field(
-        default="",
-        description="A short note to the user about the plan",
-    )
-    open_questions: list[str] = Field(
-        default_factory=list,
-        description=(
-            "Anything you need the user to decide before the plan can be "
-            "finished or executed"
-        ),
-    )
-
-    @model_validator(mode="after")
-    def _needs_a_plan_or_a_question(self) -> "PresentPlanParams":
-        if not self.steps and not self.open_questions:
-            raise ValueError(
-                "present_plan needs at least one step or one open question — "
-                "keep investigating with tools until you have one."
-            )
-        return self
-
-
-async def present_plan(args: PresentPlanParams, ctx: Any) -> str:
-    # Never actually invoked: the graph intercepts present_plan to end the
-    # planning turn and hand the checklist to the user (§3.5). Present only so
-    # the tool is offered and validated like any other.
-    return "Plan presented to the user."
-
-
-def present_plan_reply(args: PresentPlanParams) -> str:
-    """The assistant message shown in chat when a plan is presented: the
-    model's summary, then any open questions the user must weigh in on."""
-    parts: list[str] = [args.summary.strip() or "Here is the plan."]
-    if args.open_questions:
-        questions = "\n".join(f"- {q}" for q in args.open_questions)
-        parts.append(f"Open questions before I start:\n{questions}")
-    return "\n\n".join(parts)
-
-
 def add_plan_tool(registry: ToolRegistry) -> ToolRegistry:
     registry.register(
         Tool(
@@ -474,18 +321,6 @@ def add_plan_tool(registry: ToolRegistry) -> ToolRegistry:
             ),
             params=UpdatePlanParams,
             handler=update_plan,
-        )
-    )
-    registry.register(
-        Tool(
-            name="present_plan",
-            description=(
-                "Hand the finished plan to the user for approval: the full "
-                "checklist plus any open questions. Ends your planning turn — "
-                "the only way to do so"
-            ),
-            params=PresentPlanParams,
-            handler=present_plan,
         )
     )
     return registry

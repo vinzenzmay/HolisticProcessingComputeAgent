@@ -65,9 +65,7 @@ from hpca.agent.memory_context import (
 from hpca.agent.memory_tools import add_memory_tools
 from hpca.agent.modes import (
     add_plan_tool,
-    kickoff_message,
     next_mode,
-    render_checklist,
 )
 from hpca.agent.prompts import (
     build_skill_directive,
@@ -148,7 +146,6 @@ from hpca.tui.memory_screens import (
     MemoryProposalScreen,
     ReflectionScreen,
 )
-from hpca.tui.plan_screen import PLAN_HINT, PLAN_TITLE, edited_plan_steps
 from hpca.tui.profiles_screen import ProfilePickerScreen, ProfilesScreen
 from hpca.tui.rename_screen import RenameScreen
 from hpca.tui.settings_screen import SettingsScreen
@@ -607,31 +604,27 @@ class WorkingIndicator(Static):
 class DecisionBar(Vertical):
     """Inline, non-modal decision prompt at the foot of the chat column.
 
-    A parked turn's approval (destructive/execution gate) or a plan-mode
-    handoff renders here — inside the chat column of the session it belongs
+    A parked turn's approval (destructive op, or a gated execution in manual
+    mode) renders here — inside the chat column of the session it belongs
     to — instead of a full-screen modal that would cover every other column
     and block a session the user has switched to. Its keys fire only while it
-    (or its plan editor) holds focus, i.e. only when the chat column is
+    holds focus, i.e. only when the chat column is
     focused; a decision waiting in a background session shows nothing here and
     only lights the "!" in the sidebar until that session is opened.
 
-    One bar serves both kinds, told apart by ``self.kind`` and gated in
-    ``check_action`` so the footer never offers plan keys on an approval (or
-    the reverse). It answers by calling back into the app, which runs the same
-    resume path the modal screens used to.
+    ``self.kind`` gates the keys in ``check_action`` so the footer offers
+    nothing while the bar is hidden. It answers by calling back into the app,
+    which runs the same resume path the modal screens used to.
     """
 
     can_focus = True
 
-    # esc listed first (esc/quit ordering). Priority so the plan keys still
-    # fire while the checklist editor (a focused child) has the keystrokes,
-    # and so esc keeps planning rather than the editor eating it.
+    # esc listed first (esc/quit ordering), and priority so it denies the
+    # call rather than being eaten by whatever holds focus.
     BINDINGS = [
         Binding("y", "approve", "approve"),
         Binding("n", "deny", "deny"),
-        Binding("escape", "cancel", "keep planning", priority=True),
-        Binding("ctrl+r", "execute_auto", "run on auto", priority=True),
-        Binding("ctrl+e", "execute_manual", "run step-by-step", priority=True),
+        Binding("escape", "cancel", "deny", priority=True),
     ]
 
     DEFAULT_CSS = """
@@ -643,28 +636,19 @@ class DecisionBar(Vertical):
         padding: 0 1;
         border: heavy $error;
     }
-    DecisionBar.decision-execution, DecisionBar.decision-plan {
+    DecisionBar.decision-execution {
         border: heavy $warning;
-    }
-    DecisionBar.decision-plan {
-        border: heavy $accent;
     }
     .decision-title {
         text-style: bold;
         color: $error;
     }
     DecisionBar.decision-execution .decision-title { color: $warning; }
-    DecisionBar.decision-plan .decision-title { color: $accent; }
     .decision-script {
         height: auto;
         max-height: 12;
         border: round $panel;
         padding: 0 1;
-        margin: 1 0;
-    }
-    #decision-plan-editor {
-        height: auto;
-        max-height: 16;
         margin: 1 0;
     }
     .decision-hint {
@@ -674,23 +658,20 @@ class DecisionBar(Vertical):
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
-        self.kind = ""  # "" (hidden) | "approval" | "plan"
+        self.kind = ""  # "" (hidden) | "approval"
         self._payload = None
 
     def check_action(self, action: str, parameters) -> bool | None:
         if action in ("approve", "deny"):
             return self.kind == "approval"
-        if action in ("execute_auto", "execute_manual"):
-            return self.kind == "plan"
-        if action == "cancel":  # esc means deny (approval) or keep (plan)
+        if action == "cancel":  # esc denies
             return self.kind != ""
         return True
 
     async def _reset(self, kind: str, payload) -> None:
         self.kind = kind
         self._payload = payload
-        for cls in ("decision-execution", "decision-plan"):
-            self.remove_class(cls)
+        self.remove_class("decision-execution")
         await self.remove_children()
 
     async def show_approval(self, payload: dict) -> None:
@@ -711,23 +692,9 @@ class DecisionBar(Vertical):
         await self.mount(*widgets)
         self.display = True
 
-    async def show_plan(self, steps: list[dict]) -> None:
-        await self._reset("plan", steps)
-        self.add_class("decision-plan")
-        await self.mount(
-            Static(PLAN_TITLE, classes="decision-title"),
-            TextArea(render_checklist(steps), id="decision-plan-editor"),
-            Static(PLAN_HINT, classes="decision-hint"),
-        )
-        self.display = True
-
     async def clear_decision(self) -> None:
         await self._reset("", None)
         self.display = False
-
-    def plan_editor_text(self) -> str:
-        editor = self.query("#decision-plan-editor")
-        return editor.first(TextArea).text if editor else ""
 
     def action_approve(self) -> None:
         self.app.resolve_decision("approval", True)
@@ -738,17 +705,6 @@ class DecisionBar(Vertical):
     def action_cancel(self) -> None:
         if self.kind == "approval":
             self.app.resolve_decision("approval", False)
-        elif self.kind == "plan":
-            self.app.resolve_decision("plan", None)
-
-    def action_execute_auto(self) -> None:
-        self.app.resolve_decision("plan", ("auto", self._edited_steps()))
-
-    def action_execute_manual(self) -> None:
-        self.app.resolve_decision("plan", ("manual", self._edited_steps()))
-
-    def _edited_steps(self) -> list[dict]:
-        return edited_plan_steps(self.plan_editor_text(), self._payload or [])
 
 
 class ChatList(ListView):
@@ -780,7 +736,7 @@ class ChatPanel(ColumnPanel):
         menu = Static(id="command-menu")
         menu.display = False
         yield menu
-        # A parked turn's approval / plan handoff renders here, at the foot of
+        # A parked turn's approval renders here, at the foot of
         # the chat log for the session it belongs to — never as a modal over
         # the whole TUI (deliverable 1). Hidden until there is one.
         yield DecisionBar(id="decision-bar")
@@ -946,7 +902,7 @@ class HpcaApp(App):
     #sessions-list > ListItem.session-updated {
         border: round $success;
     }
-    /* A decision (approval / plan) is waiting in this session: frame it in
+    /* A decision is waiting in this session: frame it in
        warning and prefix its label with "!" (deliverable 2). Distinct from
        session-updated and, unlike it, held until the decision is answered —
        opening the session reveals the prompt but does not resolve it. */
@@ -1058,7 +1014,7 @@ class HpcaApp(App):
         # queued messages wait for the resume; other sessions are unaffected.
         self._awaiting_approval: set[str] = set()
         # The inline decision each session is waiting on, keyed by session_id:
-        # {"kind": "approval"|"plan", "payload": ...}. Drives both the inline
+        # {"kind": "approval", "payload": ...}. Drives both the inline
         # DecisionBar (shown only for the active session) and the sidebar "!"
         # (shown for every session with one), so switching sessions reveals or
         # hides the right prompt without losing a decision left behind.
@@ -1870,19 +1826,13 @@ class HpcaApp(App):
             self._mark_session_updated(session)
         if result.interrupt is not None:
             # Parked on an approval (destructive op, or a gated execution in
-            # manual/plan mode): the turn's thread cannot move without an
+            # manual mode): the turn's thread cannot move without an
             # answer. Record it as this session's pending decision — shown
             # inline if the session is open, or only as a sidebar "!" if the
             # user has switched away — never a modal over the other columns.
             self._awaiting_approval.add(session.session_id)
             await self._set_pending_decision(session, "approval", result.interrupt)
             return
-        if result.plan and self._mode_of(session) == "plan":
-            # A plan-mode turn ended with a checklist: hand it to the user to
-            # adjust and decide how to continue (§3.5). Recorded per session
-            # like an approval, so it waits inline (and flags the sidebar)
-            # even when the user has switched away, instead of being lost.
-            await self._set_pending_decision(session, "plan", result.plan)
         await self.maybe_title_session(session, result.messages, log=log)
 
     async def maybe_title_session(
@@ -1996,19 +1946,15 @@ class HpcaApp(App):
             pending = self._pending_decision.get(self.active_session.session_id)
         if pending is None:
             await bar.clear_decision()
-        elif pending["kind"] == "approval":
-            await bar.show_approval(pending["payload"])
         else:
-            await bar.show_plan(pending["payload"])
+            await bar.show_approval(pending["payload"])
 
     def _focus_decision_bar(self) -> None:
-        """Focus the inline prompt: its plan editor when editing a checklist,
-        else the bar itself so y/n reach it."""
+        """Focus the inline prompt so y/n reach it."""
         bar = self._decision_bar()
         if bar is None or not bar.display:
             return
-        editor = bar.query("#decision-plan-editor")
-        (editor.first() if editor else bar).focus()
+        bar.focus()
 
     def resolve_decision(self, kind: str, value) -> None:
         """Answer the inline decision the chat column is showing (DecisionBar).
@@ -2027,10 +1973,7 @@ class HpcaApp(App):
         self._refresh_session_row(session.session_id)  # drop the "!"
         self.call_later(self._sync_decision_bar)  # hide the now-empty bar
         self.focus_chat_input()
-        if kind == "approval":
-            self._on_approval(session, value)
-        else:
-            self._on_plan_decision(session, value)
+        self._on_approval(session, value)
 
     # ------------------------------------------------------------ agent modes
 
@@ -2074,41 +2017,6 @@ class HpcaApp(App):
             return
         bar.display = True
         bar.set_mode(self._mode_of(self.active_session))
-
-    def _on_plan_decision(self, session: Session, outcome) -> None:
-        """The user's verdict on a proposed plan (§3.5).
-
-        ``None`` = keep planning — nothing changes, feedback is typed in
-        chat. Otherwise switch the session to the chosen mode, store the
-        (possibly edited) checklist in the thread state, and kick off
-        execution as an event turn.
-        """
-        if not outcome:
-            return
-        mode, steps = outcome
-        session.mode = mode
-        self.session_store.set_mode(session.session_id, mode)
-        if self._is_active_session(session):
-            self.active_session.mode = mode
-            self._refresh_mode_bar()
-        self.run_worker(self._start_plan_execution(session, mode, steps))
-
-    async def _start_plan_execution(
-        self, session: Session, mode: str, steps: list[dict]
-    ) -> None:
-        # The user may have edited the checklist in the dialog; what they
-        # approved is what the state must hold before execution starts.
-        await self.graph.aupdate_state(
-            {"configurable": {"thread_id": session.session_id}}, {"plan": steps}
-        )
-        self._pending_work.append(
-            PendingWork(
-                session_id=session.session_id,
-                text=kickoff_message(mode),
-                kind="event",
-            )
-        )
-        await self.drain_work()
 
     # ---------------------------------------------------------------- memory
 

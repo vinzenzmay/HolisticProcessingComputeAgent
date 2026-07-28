@@ -3,7 +3,7 @@
 Two kinds of gate share this rendering, told apart by ``payload["kind"]``:
 
 * ``destructive`` — the always-on gate for destructive operations.
-* ``execution`` — manual/plan mode showing a script or command before it
+* ``execution`` — manual mode showing a script or command before it
   runs; the user decides on the actual script text, not on a JSON blob.
 
 The prompt is rendered inline in the chat column (see ``DecisionBar`` in
