@@ -22,20 +22,30 @@ def is_title_request(json_schema):
 
 
 class SlowLLM:
-    """Holds a turn open until released, so 'busy' is a real state."""
+    """Holds a turn open until released, so 'busy' is a real state.
 
-    def __init__(self):
+    ``hold`` names a message whose turn is never released, so a test can look
+    at the app with that turn genuinely mid-flight rather than racing it.
+    """
+
+    def __init__(self, hold: str | None = None):
         self.gate = asyncio.Event()
+        self.hold = hold
+        self.never = asyncio.Event()  # deliberately never set
         self.seen_user_texts: list[str] = []
 
     async def chat(self, messages, *, json_schema=None, **kwargs):
         if is_title_request(json_schema):
             return ChatResponse(content=TITLE_REPLY)
+        latest = ""
         for message in messages:
             if message["role"] == "user" and not str(
                 message["content"]
             ).startswith(("[tool", "[process", "[job")):
                 self.seen_user_texts.append(message["content"])
+                latest = str(message["content"])
+        if self.hold is not None and self.hold in latest:
+            await self.never.wait()
         await self.gate.wait()
         return ChatResponse(
             content=json.dumps({"action": "respond", "response": "ok"})
@@ -157,6 +167,29 @@ class TestQueueing:
             assert "third" in texts
             await app.workers.wait_for_complete()
 
+    async def test_a_queued_message_survives_the_turn_it_waited_for(
+        self, hpca_home
+    ):
+        """The queue can drain into the next turn before the finished turn's
+        reply is drawn. That reply rebuilds the chat from its own snapshot,
+        taken before the message it drained even existed — the message is no
+        longer queued and not yet in the graph, and must survive anyway."""
+        llm = SlowLLM(hold="third")  # "third" runs but never finishes
+        app = HpcaApp(llm=llm)
+        async with app.run_test() as pilot:
+            await app.start_new_session()
+            await send(app, pilot, "first")
+            await send(app, pilot, "second")
+            await send(app, pilot, "third")
+            llm.gate.set()
+            for _ in range(20):
+                await pilot.pause()
+            assert llm.seen_user_texts[-1] == "third"  # its turn is in flight
+            entries = [(e.kind, e.text) for e in app._chat_entries]
+            assert ("user", "third") in entries  # shown as sent, not queued
+            llm.never.set()
+            await app.workers.wait_for_complete()
+
     async def test_slash_commands_are_refused_not_queued(self, hpca_home):
         """They act on the UI and run their own exclusive workers."""
         llm = SlowLLM()
@@ -168,6 +201,25 @@ class TestQueueing:
             assert app._pending_work == []
             llm.gate.set()
             await app.workers.wait_for_complete()
+
+
+class TestShutdown:
+    async def test_a_reply_landing_after_the_screen_is_gone_does_not_raise(
+        self, hpca_home
+    ):
+        """A turn the queue started can finish while the app is tearing down.
+        The rebuild then has no chat column to draw into: it keeps the entries
+        and stays quiet, rather than failing the worker on the way out."""
+        app = HpcaApp(llm=SlowLLM())
+        async with app.run_test() as pilot:
+            await app.start_new_session()
+            await pilot.pause()
+            await app.query_one("#chat-list").remove()  # stand in for teardown
+            await app._set_chat_messages(
+                [{"role": "user", "content": "landed late"}]
+            )
+            await app._rerender_chat()
+            assert app.chat_log_texts() == ["landed late"]
 
 
 class TestApprovalInteraction:

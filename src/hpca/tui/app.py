@@ -266,7 +266,10 @@ class TurnState:
     memory: "Profile | None" = None       # that turn's frozen profile snapshot
     skills: "list[Skill] | None" = None
     interrupt_keep: int | None = None
-    interrupt_text: str | None = None
+    # The user message this turn is running (None for a resume or an event).
+    # Two readers: the interrupt hands it back to the entry for editing, and a
+    # transcript rebuild re-adds it while the graph copy still predates it.
+    user_text: str | None = None
     activity: str = "working"             # what the spinner says (decision 7)
 
 
@@ -1558,7 +1561,7 @@ class HpcaApp(App):
         return (
             ts is not None
             and ts.activity == LLM_WAIT_ACTIVITY
-            and ts.interrupt_text is not None
+            and ts.user_text is not None
             and ts.interrupt_keep is not None
         )
 
@@ -1585,11 +1588,11 @@ class HpcaApp(App):
         loop — the message comes back to the entry for editing. Operates on the
         active session's turn only (decision 8)."""
         ts = self._active_turn()
-        if ts is None or ts.interrupt_keep is None or ts.interrupt_text is None:
+        if ts is None or ts.interrupt_keep is None or ts.user_text is None:
             return
         self._interrupt_worker = self.run_worker(
             self._interrupt_turn(
-                ts.session, ts.interrupt_keep, ts.interrupt_text, ts.worker
+                ts.session, ts.interrupt_keep, ts.user_text, ts.worker
             ),
             group="interrupt",
         )
@@ -1683,7 +1686,7 @@ class HpcaApp(App):
             skills=turn_skills,
             # A fresh user message can be interrupted and re-edited (§ interrupt);
             # a resume/event has no prompt to hand back, so it arms nothing.
-            interrupt_text=user_text,
+            user_text=user_text,
             interrupt_keep=None,  # filled once we know the pre-turn count
         )
         self._turns[session.session_id] = ts
@@ -3444,24 +3447,44 @@ class HpcaApp(App):
     async def _set_chat_messages(
         self, messages: list[dict], thinking: list[dict] | None = None
     ) -> None:
-        chat_list = self.query_one("#chat-list", ListView)
-        await chat_list.clear()
+        # Tolerates the screen already being gone: a queued turn can start and
+        # land its reply while the app shuts down, and the entries are still
+        # worth keeping (see _chat_list).
+        chat_list = self._chat_list()
+        if chat_list is not None:
+            await chat_list.clear()
         self._chat_entries = []
         # Fresh entries mean the old id()-keyed expansion state is stale (and
         # a recycled id could wrongly re-open a new box); start clean.
         self._thinking_expanded.clear()
         for entry in build_entries(messages, thinking or []):
             self._add_chat_entry(entry)
-        # Messages typed while this turn ran are not in the graph yet, so the
-        # rebuild would erase them from under the user.
+        # Messages typed while a turn ran may not be in this copy of the graph,
+        # and the rebuild would erase them from under the user. Two kinds: the
+        # one whose turn has since started, and those still waiting behind it.
         if self.active_session is not None:
-            for text in self.queued_texts_for(self.active_session.session_id):
+            session_id = self.active_session.session_id
+            running = self._turns.get(session_id)
+            if running is not None and running.user_text is not None:
+                # interrupt_keep is the thread's length before this turn
+                # appended its message, so a copy no longer than that predates
+                # it — as the finished turn's own snapshot does when the queue
+                # drains into a new turn before that reply is drawn. None means
+                # the turn has not reached the graph at all yet.
+                keep = running.interrupt_keep
+                if keep is None or len(messages) <= keep:
+                    self._add_chat_entry(
+                        Entry(kind="user", text=running.user_text)
+                    )
+            for text in self.queued_texts_for(session_id):
                 self._add_chat_entry(Entry(kind="queued", text=text))
 
     async def _rerender_chat(self) -> None:
         """Redraw the chat from the entries already held, without rebuilding
         them from the graph — used when only an entry's kind changed."""
-        chat_list = self.query_one("#chat-list", ListView)
+        chat_list = self._chat_list()  # gone during shutdown; nothing to draw
+        if chat_list is None:
+            return
         await chat_list.clear()
         for entry in self._chat_entries:
             for item in self._entry_items(entry):
