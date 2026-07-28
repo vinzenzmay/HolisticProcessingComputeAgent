@@ -31,6 +31,7 @@ from hpca.agent.file_tools import add_file_tools
 from hpca.agent.explainer import explain_process_failure
 from hpca.agent.graph import (
     build_graph,
+    compact_now,
     deliver_event,
     rollback_thread,
     run_turn,
@@ -235,6 +236,7 @@ CHAT_TITLES = {
     "event": "background",
     "queued": "queued",
     "recall": "recalled from memory",
+    "notice": "context",
 }
 
 
@@ -279,6 +281,11 @@ class TurnState:
 COMMANDS = (
     ("memorize", "/memorize <note> — form memories from the note and this conversation"),
     ("conclude", "/conclude — propose memories from this conversation"),
+    (
+        "compact",
+        "/compact [what to keep / what you do next] — fold this conversation "
+        "into a summary and free the context",
+    ),
     ("skill-creator", "/skill-creator — add a skill (name, description, body) to this profile"),
     ("skills-list", "/skills-list — list this profile's skills"),
     ("skill-remove", "/skill-remove — remove one of this profile's skills"),
@@ -912,6 +919,12 @@ class HpcaApp(App):
         color: $text-muted;
     }
     .chat-recall {
+        border: round $panel-lighten-2;
+        color: $text-muted;
+    }
+    /* Something the app did to the session itself (a /compact fold), not part
+       of the conversation. */
+    .chat-notice {
         border: round $panel-lighten-2;
         color: $text-muted;
     }
@@ -2109,6 +2122,13 @@ class HpcaApp(App):
                 self.notify("No active session to conclude.", severity="warning")
                 return
             self.run_worker(self._conclude_worker(), exclusive=True)
+        elif command == "compact":
+            if self.active_session is None:
+                self.notify("No active session to compact.", severity="warning")
+                return
+            self.run_worker(
+                self._compact_worker(self.active_session, rest), exclusive=True
+            )
         elif command == "skill-creator":
             self.run_worker(self._skill_creator_worker(), exclusive=True)
         elif command == "skills-list":
@@ -2117,6 +2137,72 @@ class HpcaApp(App):
             self.run_worker(self._skill_remove_worker(), exclusive=True)
         else:
             self.notify(f"Unknown command: /{command}", severity="warning")
+
+    # --------------------------------------------------------------- context
+
+    async def _compact_worker(self, session: Session, guidance: str) -> None:
+        """/compact [instruction]: fold this conversation into a summary now.
+
+        The automatic fold waits for the window to fill and keeps the recent
+        turns verbatim, because it fires unasked. This one is asked for, so it
+        folds everything and takes the text after the command as its brief —
+        material to preserve, or the step the user is about to take, which is
+        the same instruction from the summarizer's point of view: that is what
+        the summary is being written *for*.
+
+        The chat is not touched: the fold changes what the model receives, not
+        what the user can scroll back to.
+        """
+        session_id = session.session_id
+        if session_id in self._awaiting_approval:
+            # The thread is parked on an interrupt; rewriting its state under
+            # the pending decision is not something to do quietly.
+            self.notify(
+                f"“{session.title}” is waiting on an approval — answer that first.",
+                severity="warning",
+            )
+            return
+        try:
+            async with self._backend_working("compacting context", session=session):
+                folded = await compact_now(
+                    self.graph,
+                    session_id=session_id,
+                    llm=self._labelled_llm("compact", session=session),
+                    guidance=guidance,
+                )
+        except Exception as e:
+            # Nothing was written: the thread is exactly as it was.
+            self.notify(f"/compact failed: {e}", severity="error")
+            return
+        if folded is None:
+            self.notify("Nothing new to compact in this conversation.")
+            return
+        note = f"Context compacted: {folded['folded']} messages folded into a summary."
+        if guidance:
+            note = f"{note} Asked to keep: {guidance}"
+        # The backend's last token count measured the unfolded prompt, so it no
+        # longer describes what the next turn will send: drop it and show what
+        # the folded view actually costs.
+        self._context_used.pop(session_id, None)
+        if self._is_active_session(session):
+            # ``_log_write`` writes to whichever session is open, so it belongs
+            # under this check: the user may have switched away while the
+            # summary was being written, and the record is worth nothing in
+            # another session's transcript.
+            self._log_write(
+                "context compacted", f"{note}\n{folded['summary']['content']}"
+            )
+            # Shown in full, not just announced: the user asked for this fold,
+            # possibly naming what it had to keep, and a small model does not
+            # always keep it. What the agent remembers from here on is exactly
+            # this text, so it is worth reading once.
+            await self._append_chat(
+                "notice", f"{note}\n\n{folded['summary']['content']}"
+            )
+            snapshot = await self.graph.aget_state(
+                {"configurable": {"thread_id": session_id}}
+            )
+            self._show_context_estimate(snapshot.values or {})
 
     # ------------------------------------------------------------- skills (§5.1)
 

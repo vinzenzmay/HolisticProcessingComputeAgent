@@ -506,6 +506,49 @@ async def deliver_event(graph, *, session_id: str, text: str) -> None:
     await graph.aupdate_state(config, {"messages": [{"role": "user", "content": text}]})
 
 
+async def compact_now(
+    graph, *, session_id: str, llm, guidance: str | None = None
+) -> dict | None:
+    """Fold a session's history on the user's say-so (``/compact``).
+
+    The automatic fold in the orchestrator waits for the window to fill and
+    keeps a recent tail verbatim, because it fires unasked and mid-task. This
+    one is asked for, so it folds *everything* not already folded: the user
+    wants the room now, and the point of asking is to decide the moment
+    yourself rather than have it happen mid-turn.
+
+    ``guidance`` is the text the user typed after the command — what the
+    summary must carry, or the next step it should be written for. It reaches
+    the summarizer and stays in the folded view (see :mod:`hpca.agent.compact`).
+
+    Returns ``{"folded": n, "upto": int, "summary": Message}``, or None when
+    there is nothing new to fold. The stored history is never rewritten, here
+    as in the automatic path: only the view the model receives changes, so the
+    user can still scroll back to every message behind the summary.
+    """
+    config = {"configurable": {"thread_id": session_id}}
+    snapshot = await graph.aget_state(config)
+    values = snapshot.values or {}
+    messages = list(values.get("messages", []))
+    already = (values.get("compacted") or {}).get("upto", 0)
+    older = messages[already:]
+    if not older:
+        return None
+    previous = (values.get("compacted") or {}).get("summary")
+    # Fold the previous summary in too, so compacting twice carries the early
+    # session forward instead of forgetting it.
+    summary = await compact.summarize(
+        llm, ([previous] if previous else []) + older, guidance=guidance
+    )
+    compacted = {"upto": len(messages), "summary": summary}
+    # Written as START, the way every out-of-band write enters this graph: no
+    # node produced it. Naming the node explicitly is not optional — LangGraph
+    # otherwise infers it from the last node that wrote, which is ambiguous on
+    # a thread whose most recent write was itself an external one.
+    await graph.aupdate_state(config, {"compacted": compacted}, as_node=START)
+    return {"folded": len(older), **compacted}
+
+
 async def thread_message_count(graph, *, session_id: str) -> int:
     """How many messages the thread holds right now (the point to roll back to
     before a turn appends to it)."""
@@ -521,9 +564,19 @@ async def rollback_thread(graph, *, session_id: str, keep: int) -> list[Message]
     user message and any partial tool traffic must leave the thread so the
     re-edited prompt starts from a clean history. Returns the surviving
     messages. Relies on the TRUNCATE_TO sentinel the messages reducer honours.
+
+    A fold that reached past ``keep`` is pulled back with the messages: the
+    compaction marker is an index into this list, and one left pointing beyond
+    its end would make the model's view (``[summary] + messages[upto:]``) skip
+    everything typed afterwards.
     """
     config = {"configurable": {"thread_id": session_id}}
-    await graph.aupdate_state(config, {"messages": {TRUNCATE_TO: keep}})
+    update: dict = {"messages": {TRUNCATE_TO: keep}}
+    before = await graph.aget_state(config)
+    compacted = (before.values or {}).get("compacted")
+    if compacted and compacted["upto"] > keep:
+        update["compacted"] = {**compacted, "upto": keep}
+    await graph.aupdate_state(config, update)
     snapshot = await graph.aget_state(config)
     return list((snapshot.values or {}).get("messages", []))
 

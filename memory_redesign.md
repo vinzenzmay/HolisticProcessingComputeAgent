@@ -281,6 +281,11 @@ Activates the format-reserved tier using infrastructure already in the repo.
   `on_pre_compress`): before discarding, the reflection reviewer (Phase 4)
   runs over the soon-to-be-dropped slice so durable facts can be proposed
   before the context that evidences them disappears.
+* **User-driven compaction** (`/compact [BRIEF]`, `graph.compact_now`): the same
+  fold on demand, before the threshold forces it. Because it is asked for it
+  folds everything not yet folded rather than keeping a recent tail, and the
+  text after the command steers the summarizer *and* survives in the folded
+  view — a next step declared while compacting keeps framing the turns after it.
 
 ## 8. Config additions (`settings.json`, `memory` section)
 

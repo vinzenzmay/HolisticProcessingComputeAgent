@@ -4,10 +4,11 @@ import json
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import START
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-from hpca.agent.graph import MAX_TOOL_ROUNDS, build_graph, run_turn
+from hpca.agent.graph import MAX_TOOL_ROUNDS, build_graph, compact_now, run_turn
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.llm import ChatResponse
 
@@ -335,6 +336,26 @@ class TestRollback:
         assert "corrected" in sent
         assert "oops typo" not in sent
 
+    async def test_a_fold_reaching_past_the_rollback_is_pulled_back(self, tools):
+        """A rollback can cut away messages the summary already stands for.
+        The fold marker must come back with them, or the folded view starts
+        past the end of the history and swallows what is typed next."""
+        from hpca.agent.graph import rollback_thread
+
+        llm = FakeLLM([respond_json("answered"), "a summary", respond_json("ok")])
+        graph = make_graph(llm, tools)
+        await run_turn(graph, session_id="s1", user_text="q1")  # -> 2 messages
+        await compact_now(graph, session_id="s1", llm=llm)  # folds both
+        await rollback_thread(graph, session_id="s1", keep=1)
+        values = (
+            await graph.aget_state({"configurable": {"thread_id": "s1"}})
+        ).values
+        assert values["compacted"]["upto"] == 1
+        # and the next message is really seen by the model
+        await run_turn(graph, session_id="s1", user_text="what now?")
+        sent = [str(m["content"]) for m in llm.calls[-1]["messages"]]
+        assert any("what now?" == m for m in sent)
+
 
 class TestDecisionFailure:
     async def test_exhausted_retries_surface_to_user(self, tools):
@@ -619,3 +640,113 @@ class TestCompaction:
         final = llm.calls[-1]["messages"]
         assert len(final) < 25  # folded, not the whole history
         assert any("a summary of the earlier work" in str(m["content"]) for m in final)
+
+
+class TestCompactNow:
+    """User-driven compaction (/compact): the user says when, and may say what
+    the summary has to carry — unlike the automatic fold, which waits for the
+    window to fill and keeps a recent tail verbatim."""
+
+    def history(self, count=8, chars=50):
+        return [
+            {
+                "role": "user" if i % 2 == 0 else "assistant",
+                "content": f"m{i} " + "x" * chars,
+            }
+            for i in range(count)
+        ]
+
+    async def prime(self, graph, session_id, messages):
+        await graph.aupdate_state(
+            {"configurable": {"thread_id": session_id}},
+            {"messages": messages},
+            as_node=START,
+        )
+
+    async def state(self, graph, session_id):
+        snapshot = await graph.aget_state({"configurable": {"thread_id": session_id}})
+        return snapshot.values or {}
+
+    async def test_folds_a_history_the_automatic_path_would_leave_alone(self, tools):
+        llm = FakeLLM(["what happened so far"])
+        graph = make_graph(llm, tools)  # no max_model_len: auto compaction is off
+        await self.prime(graph, "s1", self.history())
+        result = await compact_now(graph, session_id="s1", llm=llm)
+        assert result["folded"] == 8
+        values = await self.state(graph, "s1")
+        assert values["compacted"]["upto"] == 8
+        assert "what happened so far" in values["compacted"]["summary"]["content"]
+
+    async def test_the_stored_history_is_untouched(self, tools):
+        llm = FakeLLM(["a summary"])
+        graph = make_graph(llm, tools)
+        await self.prime(graph, "s1", self.history())
+        await compact_now(graph, session_id="s1", llm=llm)
+        values = await self.state(graph, "s1")
+        assert len(values["messages"]) == 8
+        assert "m0 " in str(values["messages"][0]["content"])
+
+    async def test_the_next_turn_sees_only_the_summary(self, tools):
+        llm = FakeLLM(["a summary of everything", respond_json("ok")])
+        graph = make_graph(llm, tools)
+        await self.prime(graph, "s1", self.history())
+        await compact_now(graph, session_id="s1", llm=llm)
+        await run_turn(graph, session_id="s1", user_text="and now?")
+        sent = llm.calls[-1]["messages"]  # system + summary + the new message
+        assert len(sent) == 3
+        assert "a summary of everything" in str(sent[1]["content"])
+        assert not any("m0 " in str(m["content"]) for m in sent)
+
+    async def test_the_instruction_steers_the_summary(self, tools):
+        llm = FakeLLM(["a summary"])
+        graph = make_graph(llm, tools)
+        await self.prime(graph, "s1", self.history())
+        await compact_now(
+            graph, session_id="s1", llm=llm, guidance="keep the sbatch flags"
+        )
+        system = llm.calls[0]["messages"][0]["content"]
+        assert "keep the sbatch flags" in system
+        values = await self.state(graph, "s1")
+        assert "keep the sbatch flags" in values["compacted"]["summary"]["content"]
+
+    async def test_an_empty_thread_compacts_to_nothing(self, tools):
+        llm = FakeLLM([])
+        graph = make_graph(llm, tools)
+        assert await compact_now(graph, session_id="s1", llm=llm) is None
+        assert not llm.calls  # the backend is never bothered
+
+    async def test_nothing_new_since_the_last_fold(self, tools):
+        llm = FakeLLM(["a summary"])
+        graph = make_graph(llm, tools)
+        await self.prime(graph, "s1", self.history())
+        await compact_now(graph, session_id="s1", llm=llm)
+        assert await compact_now(graph, session_id="s1", llm=llm) is None
+        assert len(llm.calls) == 1
+
+    async def test_a_second_compaction_carries_the_first_forward(self, tools):
+        llm = FakeLLM(["the early session", "the whole session"])
+        graph = make_graph(llm, tools)
+        await self.prime(graph, "s1", self.history())
+        await compact_now(graph, session_id="s1", llm=llm)
+        await self.prime(graph, "s1", [{"role": "user", "content": "m8 later"}])
+        result = await compact_now(graph, session_id="s1", llm=llm)
+        assert result["folded"] == 1
+        # the second summarize saw the first summary, not just the new message
+        transcript = llm.calls[-1]["messages"][-1]["content"]
+        assert "the early session" in transcript
+        assert "m8 later" in transcript
+        values = await self.state(graph, "s1")
+        assert values["compacted"]["upto"] == 9
+
+    async def test_a_failing_summarizer_leaves_the_thread_alone(self, tools):
+        class Failing(FakeLLM):
+            async def chat(self, messages, *, json_schema=None, **kwargs):
+                raise RuntimeError("backend down")
+
+        llm = Failing([])
+        graph = make_graph(llm, tools)
+        await self.prime(graph, "s1", self.history())
+        with pytest.raises(RuntimeError):
+            await compact_now(graph, session_id="s1", llm=llm)
+        values = await self.state(graph, "s1")
+        assert not values.get("compacted")  # nothing half-applied

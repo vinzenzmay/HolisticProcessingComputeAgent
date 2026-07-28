@@ -115,6 +115,12 @@ Prefer a bare letter gated (via `check_action`) to a non-typing column, or a saf
     so far and proposes them for approval (see §6).
   * `/conclude` — the agent analyses the conversation and proposes memories to write
     into the profile (user approves before write, see §6).
+  * `/compact [BRIEF]` — fold the conversation into a summary now rather than
+    waiting for the automatic fold, freeing the window. BRIEF is what the summary
+    must carry: material to keep, or the step the user is about to take — the
+    summary is then written for it, and the brief itself stays in the folded view
+    so it keeps framing the turns that follow. The chat is not rewritten; only the
+    view the model receives is folded.
   * `/skill-creator`, `/skills-list`, `/skill-remove` — manage this profile's
     skills (see §5.1).
   * `/<skill> [PROMPT]` — invoke a user-defined skill directly: its procedure is
