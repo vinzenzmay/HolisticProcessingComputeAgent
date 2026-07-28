@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import httpx
 import pytest
 
+from hpca import discover
 from hpca.discover import (
     DiscoveredBackend,
     is_reachable,
@@ -325,15 +326,30 @@ class TestScanProgress:
 
 
 class TestIncrementalDiscovery:
-    async def test_on_found_fires_before_scan_completes(self, live_stub):
+    async def test_on_found_fires_before_scan_completes(
+        self, live_stub, monkeypatch
+    ):
+        # A small chunk keeps this about *when* the callback fires. At the
+        # production 1024 the chunk holding the stub opens a thousand
+        # concurrent connections, and with the suite running in parallel the
+        # event loop cannot service them inside TCP_TIMEOUT_S: the stub's own
+        # connect times out and the scan reports nothing, failing on how busy
+        # the machine is rather than on the code.
+        monkeypatch.setattr(discover, "SCAN_CHUNK", 8)
         progress_calls = []
         found_at_progress: list[int] = []
 
+        def on_found(backend):
+            # Ephemeral ports are handed out in near-sequence, so a parallel
+            # worker's stub can sit inside this window — count only ours.
+            if f":{live_stub}/" in backend.base_url:
+                found_at_progress.append(len(progress_calls))
+
         await scan_local_ports(
-            # stub lands in the first of three 1024-port chunks
-            range(live_stub - 100, live_stub - 100 + 3000),
+            # stub lands in the first of three chunks
+            range(live_stub - 2, live_stub - 2 + 24),
             progress=lambda done, total: progress_calls.append(done),
-            on_found=lambda b: found_at_progress.append(len(progress_calls)),
+            on_found=on_found,
         )
         assert len(found_at_progress) == 1
         # found during the first chunk — before any later progress ticks
