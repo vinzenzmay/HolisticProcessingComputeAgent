@@ -3,6 +3,7 @@
 import pytest
 
 from hpca.db import command_use_counts, connect, init_db, record_command_use
+from hpca.skills import load_builtin_skills
 from hpca.tui.app import COMMANDS, ChatInput, HpcaApp
 
 
@@ -34,7 +35,11 @@ class TestMatching:
         async with app.run_test(size=(120, 40)):
             app._update_command_menu("/")
             assert app.command_menu_active()
-            assert set(menu_names(app)) == {name for name, _ in COMMANDS}
+            # Every built-in command, plus the skills HPCA ships — those are
+            # invocable as "/<skill>" too, so the menu offers them.
+            assert set(menu_names(app)) == {name for name, _ in COMMANDS} | {
+                s.name for s in load_builtin_skills()
+            }
 
     async def test_substring_not_only_prefix(self, hpca_home):
         app = HpcaApp()

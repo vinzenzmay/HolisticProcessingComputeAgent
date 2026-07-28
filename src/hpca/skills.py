@@ -1,12 +1,17 @@
-"""User-defined skills (§5.1): procedure files loaded per profile.
+"""Skills (§5.1): procedure files loaded per profile, plus the few HPCA ships.
 
 Markdown or YAML files describing how the agent should handle specific tasks.
 Like profiles (§6.2), these are hand-edited, so parsing is lenient: a file
 without front matter is still a skill (its filename is the name, its text the
 body), and a broken header reports a problem rather than vanishing.
 
-Three *levels* decide where a skill lives and who sees it:
+Four *levels* decide where a skill lives and who sees it:
 
+- **builtin** — shipped with HPCA itself, in this package's ``data/skills/``.
+  Visible to every profile with no setup, so a fresh install already knows a
+  few procedures. Ranked *below* every user level: a user file of the same name
+  shadows the shipped one instead of colliding with it, and the shipped file is
+  never written to or deleted through the app.
 - **global** — every profile. Stored under ``<app_dir>/skills/_shared/``.
   This is the original "shared" concept, surfaced to the user as "global".
   (Files directly in ``<app_dir>/skills/`` are the legacy flat layout and are
@@ -17,8 +22,8 @@ Three *levels* decide where a skill lives and who sees it:
   hidden ``<cwd>/.hpca/skills/`` and only visible while running there. The
   project root is threaded explicitly (``project_root``) so it stays testable.
 
-On a name collision the most specific level wins: **project > profile >
-global** (legacy flat files rank with global).
+On a name collision the most specific level wins: **project > profile > global
+> builtin** (legacy flat files rank with global).
 
 Skills are *surfaced* to the model as a short list in the system prompt; the
 full body is fetched on demand via ``read_skill``, keeping the prompt small.
@@ -40,9 +45,12 @@ SHARED_SKILLS_DIR = "_shared"
 # Project skills hide under this dir in the working directory, so a repo can
 # carry its own procedures without them leaking into other projects.
 PROJECT_SKILLS_SUBDIR = ".hpca/skills"
+# Skills shipped with HPCA, as package data next to the other bundled files.
+BUILTIN_SKILLS_DIR = Path(__file__).parent / "data" / "skills"
 
 # Where a newly-created (or written-back) skill is stored. "global" maps to the
-# existing ``_shared/`` location for backward compatibility.
+# existing ``_shared/`` location for backward compatibility. The shipped
+# ``builtin`` level is deliberately absent: it is read-only.
 SkillLevel = Literal["global", "profile", "project"]
 
 
@@ -67,6 +75,10 @@ class Skill:
     body: str
     source: str = ""
     problems: list[str] = field(default_factory=list)
+    # Which level the skill was loaded from ("builtin", "global", "profile",
+    # "project"). Set by the loader, not by the file: the level is the
+    # location. Empty for skills built in memory (tests, the creator form).
+    level: str = ""
 
     def matches(self, text: str) -> bool:
         """Whole-word match of the name or any trigger against free text."""
@@ -132,7 +144,7 @@ def parse_skill(text: str, *, filename: str) -> Skill | None:
     )
 
 
-def _load_dir(directory: Path) -> list[Skill]:
+def _load_dir(directory: Path, level: str = "") -> list[Skill]:
     if not directory.exists():
         return []
     skills = []
@@ -141,8 +153,14 @@ def _load_dir(directory: Path) -> list[Skill]:
             continue
         skill = parse_skill(path.read_text(errors="replace"), filename=path.name)
         if skill is not None:
+            skill.level = level
             skills.append(skill)
     return skills
+
+
+def load_builtin_skills() -> list[Skill]:
+    """The skills shipped with HPCA. Always visible, never removable."""
+    return sorted(_load_dir(BUILTIN_SKILLS_DIR, "builtin"), key=lambda s: s.name)
 
 
 def load_skills(
@@ -151,18 +169,22 @@ def load_skills(
     root: Path | None = None,
     project_root: Path | None = None,
 ) -> list[Skill]:
-    """Skills visible to one profile: legacy flat files, ``_shared/`` (global),
-    the profile's own directory, then the project's ``.hpca/skills`` — later
-    sources win on a name collision, so precedence is project > profile >
-    global."""
+    """Skills visible to one profile: the shipped ones, legacy flat files,
+    ``_shared/`` (global), the profile's own directory, then the project's
+    ``.hpca/skills`` — later sources win on a name collision, so precedence is
+    project > profile > global > builtin."""
     root = root or skills_dir()
-    directories = [root, root / SHARED_SKILLS_DIR]
+    sources = [
+        (BUILTIN_SKILLS_DIR, "builtin"),
+        (root, "global"),  # legacy flat files rank with global
+        (root / SHARED_SKILLS_DIR, "global"),
+    ]
     if profile:
-        directories.append(root / profile)
-    directories.append(project_skills_dir(project_root))
+        sources.append((root / profile, "profile"))
+    sources.append((project_skills_dir(project_root), "project"))
     by_name: dict[str, Skill] = {}
-    for directory in directories:
-        for skill in _load_dir(directory):
+    for directory, level in sources:
+        for skill in _load_dir(directory, level):
             by_name[skill.name] = skill
     return sorted(by_name.values(), key=lambda s: s.name)
 
@@ -172,14 +194,15 @@ def load_own_skills(profile: str, *, root: Path | None = None) -> list[Skill]:
     not the legacy flat files. This is the set the user may remove: deleting a
     shared procedure from one profile would silently change every other."""
     root = root or skills_dir()
-    return sorted(_load_dir(root / profile), key=lambda s: s.name)
+    return sorted(_load_dir(root / profile, "profile"), key=lambda s: s.name)
 
 
 def load_project_skills(*, project_root: Path | None = None) -> list[Skill]:
     """The project-level skills under ``<cwd>/.hpca/skills``. Removable like a
     profile's own (they belong to this directory, not to other profiles)."""
     return sorted(
-        _load_dir(project_skills_dir(project_root)), key=lambda s: s.name
+        _load_dir(project_skills_dir(project_root), "project"),
+        key=lambda s: s.name,
     )
 
 
@@ -199,8 +222,8 @@ def delete_own_skill(
     one would silently change every other profile that sees it.
     """
     root = root or skills_dir()
-    if not skill.source:
-        return False
+    if not skill.source or skill.level == "builtin":
+        return False  # shipped skills belong to the package, not the user
     # Profile dir first, then the project dir — the two removable levels.
     for path in (
         root / profile / skill.source,
@@ -210,23 +233,6 @@ def delete_own_skill(
             path.unlink()
             return True
     return False
-
-
-def any_skills(
-    root: Path | None = None, *, project_root: Path | None = None
-) -> bool:
-    """Whether any skill exists anywhere reachable — decides if the skill tools
-    are registered, since the active profile (and cwd) can change per session.
-    Includes project skills so a project-only setup still enables the tool."""
-    root = root or skills_dir()
-
-    def has_skill(directory: Path) -> bool:
-        return directory.exists() and any(
-            path.suffix.lower() in SKILL_SUFFIXES and path.is_file()
-            for path in directory.rglob("*")
-        )
-
-    return has_skill(root) or has_skill(project_skills_dir(project_root))
 
 
 def skill_path(

@@ -483,7 +483,7 @@ class TestCopyProfile:
             assert Profile.load("taken").memories == []
 
     async def test_copying_carries_the_profiles_own_skills(self, hpca_home):
-        from hpca.skills import load_skills, skills_dir
+        from hpca.skills import load_own_skills, skills_dir
 
         self.base_with_memories()
         (skills_dir() / "base").mkdir(parents=True, exist_ok=True)
@@ -493,7 +493,7 @@ class TestCopyProfile:
         app = HpcaApp(llm=FakeLLM())
         async with app.run_test(size=(120, 40)) as pilot:
             await self.copy_via_ui(app, pilot, "base", "variants")
-            assert [s.name for s in load_skills("variants")] == ["align"]
+            assert [s.name for s in load_own_skills("variants")] == ["align"]
 
     async def test_deleting_a_profile_removes_its_skills(self, hpca_home):
         from hpca.skills import skills_dir

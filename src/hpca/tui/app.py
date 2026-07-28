@@ -109,7 +109,6 @@ from hpca.triage import Signature, append_user_signature
 from hpca.sessions import Session, SessionStore
 from hpca.skills import (
     Skill,
-    any_skills,
     copy_profile_skills,
     delete_own_skill,
     delete_profile_skills,
@@ -1019,10 +1018,9 @@ class HpcaApp(App):
             )
             if self.slurm is not None:
                 add_job_tools(self._tools)
-            # Registered when ANY profile has a skill: the active profile
-            # changes per session, but the tool registry does not.
-            if any_skills():
-                add_skill_tools(self._tools)
+            # Always registered: HPCA ships skills of its own, so read_skill
+            # has something to fetch on any install and in any profile.
+            add_skill_tools(self._tools)
             add_memory_tools(self._tools)
             add_plan_tool(self._tools)
         self.active_session: Session | None = None
@@ -2238,9 +2236,19 @@ class HpcaApp(App):
         }[level]
         self.notify(f"Added skill “{skill.name}” for {where}.")
 
+    # The profile's own skills carry no tag — they are the removable, unsurprising
+    # case; everything else says where it came from.
+    SKILL_LEVEL_TAGS = {
+        "project": "  (project)",
+        "profile": "",
+        "global": "  (global)",
+        "builtin": "  (built-in)",
+    }
+
     def _show_skills_list(self) -> None:
         """/skills-list: a read-only view of every skill the profile can see,
-        marking which level each resolves to (project > profile > global)."""
+        marking which level each resolves to (project > profile > global >
+        built-in)."""
         project_root = Path.cwd()
         visible = load_skills(self.profile, project_root=project_root)
         if not visible:
@@ -2249,16 +2257,9 @@ class HpcaApp(App):
                 "/skill-creator.",
             )
             return
-        project_names = {s.name for s in load_project_skills(project_root=project_root)}
-        own_names = {s.name for s in load_own_skills(self.profile)}
         lines = []
         for skill in visible:
-            if skill.name in project_names:
-                tag = "  (project)"
-            elif skill.name in own_names:
-                tag = ""  # the profile's own — removable, no tag
-            else:
-                tag = "  (global)"
+            tag = self.SKILL_LEVEL_TAGS.get(skill.level, "")
             lines.append(f"• {skill.name}{tag}")
             if skill.description:
                 lines.append(f"    {skill.description}")
@@ -2302,14 +2303,11 @@ class HpcaApp(App):
 
     def _refresh_skills(self) -> None:
         """Make a skill change visible without a graph rebuild: the on-screen
-        profile's list feeds the next turn's prompt, and the first-ever skill
-        enables the read_skill tool (the registry is shared, mutated in place)."""
-        project_root = Path.cwd()
-        self.skills = load_skills(self.profile, project_root=project_root)
-        if (
-            any_skills(project_root=project_root)
-            and "read_skill" not in self._tools.names()
-        ):
+        profile's list feeds the next turn's prompt. read_skill is registered
+        from the start (HPCA ships skills), but a caller may have passed in its
+        own registry, so top it up rather than assume."""
+        self.skills = load_skills(self.profile, project_root=Path.cwd())
+        if "read_skill" not in self._tools.names():
             add_skill_tools(self._tools)
 
     async def _memorize_worker(self, note: str) -> None:
