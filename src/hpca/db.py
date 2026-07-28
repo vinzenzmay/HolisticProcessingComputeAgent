@@ -96,9 +96,9 @@ CREATE TABLE IF NOT EXISTS processes (
     -- Persisted rather than kept in memory so a completion that happens while
     -- the TUI is closed is still delivered on the next start (§5.4).
     notified INTEGER NOT NULL DEFAULT 0,
-    -- 1 only for start_script. run_script and run_bash hand their result back
-    -- as the tool result the agent is already reading, so announcing those
-    -- again would tell it the same thing twice.
+    -- 1 only for start_background_script. run_bash hands its result back as
+    -- the tool result the agent is already reading, so announcing it again
+    -- would tell it the same thing twice.
     background INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS command_usage (

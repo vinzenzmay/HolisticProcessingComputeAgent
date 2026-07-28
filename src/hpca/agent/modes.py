@@ -44,9 +44,19 @@ MODES = ("manual", "auto", "full-auto", "plan")
 # writes into the scripts dir and is syntax-checked, so manual mode lets it
 # through and gates the run instead — the approval then shows the finished
 # script.
-EXECUTION_TOOLS = frozenset({"run_script", "start_script", "run_bash", "submit_job"})
+#
+# Plan mode's withdrawal is no longer airtight, and deliberately so: since
+# run_bash expands `{key}` to a registered path, a script registered in an
+# earlier turn can be run from plan mode by naming it. Blocking create_script
+# still means no *new* script can be built there, and the destructive gate
+# still catches the calls that would break something. Closing the rest would
+# mean an argument-level rejection — a call the model may emit and must then
+# recover from — which costs more than the hole is worth.
+EXECUTION_TOOLS = frozenset(
+    {"start_background_script", "run_bash", "submit_job"}
+)
 PLAN_BLOCKED_TOOLS = frozenset(
-    {"create_script", "run_script", "start_script", "submit_job"}
+    {"create_script", "start_background_script", "submit_job"}
 )
 # The two plan tools belong to opposite phases and are never offered together:
 # present_plan finalises a plan for the user to approve (plan mode only), while
@@ -356,10 +366,17 @@ def script_preview(tool_name: str, arguments: dict, ctx: Any) -> str | None:
 
     Best-effort and side-effect-free: the graph re-runs gating when a parked
     turn resumes, so this must stay a pure read.
+
+    run_bash lines are shown with their ``{key}`` references expanded. The
+    point of the modal is that the user approves what will actually run, and
+    `rm -rf {scratch}` hides exactly the part they need to check.
     """
+    from hpca.agent.builtin_tools import expand_keys
+
     try:
         if "content_lines" in arguments:  # run_bash, create_script
-            return _clip("\n".join(arguments["content_lines"]))
+            lines, _ = expand_keys(arguments["content_lines"], ctx)
+            return _clip("\n".join(lines))
         key = arguments.get("registry_key")
         if key and ctx is not None and getattr(ctx, "registry", None) is not None:
             path = ctx.registry.resolve(key)

@@ -53,8 +53,8 @@ class LLMSettings(_Section):
     # in the catalog below; this is whichever one is active.
     enable_thinking: bool = False
     # Tool calls allowed in one turn before the agent must stop and summarise.
-    # Each create_script+run_script (or run_bash) is one "look at the system"
-    # step; a real check needs several, and debugging a script costs more. The
+    # Each run_bash call is one "look at the system" step; a real check needs
+    # several, and debugging a script costs more. The
     # default is -1: no cap, the agent works until it is done. Set a positive
     # number to keep turns snappy or to bound autonomous work.
     max_tool_rounds: int = -1

@@ -35,7 +35,10 @@ PATH_WORKFLOW_GUIDANCE = (
     "the new key. When the user does NOT give you a path, find it yourself "
     "(see below) and register what you found. Do not ask the user to "
     "register paths — that is your job. A registered path may be a directory: "
-    "read_file lists it, and read_file with a subpath reads a file inside it."
+    "read_file lists it, and read_file with a subpath reads a file inside it. "
+    "Inside a run_bash line a key is written in braces — `head -2 {ref_fasta}` "
+    "— and expands to the real path; that is also how you run a script you "
+    "created: `{my_script} --flag`."
 )
 
 # Without this the model has no idea it may look around: every file tool takes
@@ -44,8 +47,7 @@ PATH_WORKFLOW_GUIDANCE = (
 DISCOVERY_GUIDANCE = (
     "You can look around this system, and you should rather than guess or ask. "
     "Use run_bash for a one-shot check — it writes, runs and returns the "
-    "output of a small bash script in one step (create_script + run_script is "
-    "for scripts worth keeping, e.g. submitted to Slurm). Useful lines: "
+    "output of a small bash script in one step. Useful lines: "
     "`find <dirs> -maxdepth <n> -iname '<pattern>' 2>/dev/null | head -20` to "
     "locate files; `command -v samtools` to check a program. For a tool that "
     "is not on PATH, first see which package managers this site actually has "
@@ -61,11 +63,15 @@ DISCOVERY_GUIDANCE = (
 # environment-managed tool and thrashes trying to activate one. The idiom that
 # ends that thrashing lives in ENVIRONMENT_TOOL_GUIDANCE below.
 SCRIPT_GUIDANCE = (
-    "Run real work (a tool, a pipeline) with create_script then start_script — "
-    "those bash scripts run fail-fast (`set -euo pipefail` is added), so a "
-    "failed command stops the script and is reported as failed. Because of "
-    "that, never end a script with an unconditional `echo \"Done\"`: let the "
-    "exit code report success. run_bash is for quick look-around checks only. "
+    "Run real work (a tool, a pipeline) with create_script then "
+    "start_background_script — those bash scripts run fail-fast (`set -euo "
+    "pipefail` is added), so a failed command stops the script and is reported "
+    "as failed. Because of that, never end a script with an unconditional "
+    "`echo \"Done\"`: let the exit code report success. Choose between the two "
+    "run tools by when you need the answer, not by what the script is: "
+    "start_background_script for work that outlives this turn (it returns a pid "
+    "and tells you later how it ended), run_bash when you want the output now — "
+    "a look-around check, or a kept script run with `{its_key}`. "
     "Build each command plainly on one line — real flags and paths separated "
     "by single spaces, nothing else. Do NOT insert quotes, commas or `\\` "
     "line-continuations between arguments; a stray `\",` turns your command "

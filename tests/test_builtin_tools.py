@@ -172,7 +172,9 @@ class TestStartScript:
             kind="bash", registry_key="greeter",
             content_lines=['echo "hi from script"'],
         )
-        result = await call(tools, "start_script", ctx, registry_key="greeter")
+        result = await call(
+            tools, "start_background_script", ctx, registry_key="greeter"
+        )
         assert "pid" in result.lower()
         assert "greeter_stdout" in result
         record = ctx.runner.list()[0]
@@ -185,7 +187,10 @@ class TestStartScript:
             tools, "create_script", ctx,
             kind="bash", registry_key="argsy", content_lines=['echo "arg1=$1"'],
         )
-        await call(tools, "start_script", ctx, registry_key="argsy", args="banana")
+        await call(
+            tools, "start_background_script", ctx,
+            registry_key="argsy", args="banana",
+        )
         record = ctx.runner.list()[0]
         await ctx.runner.wait(record.pid)
         assert "arg1=banana" in ctx.registry.resolve("argsy_stdout").read_text()
@@ -196,7 +201,7 @@ class TestStartScript:
             kind="python", registry_key="pyhello",
             content_lines=['print("python says hi")'],
         )
-        await call(tools, "start_script", ctx, registry_key="pyhello")
+        await call(tools, "start_background_script", ctx, registry_key="pyhello")
         record = ctx.runner.list()[0]
         await ctx.runner.wait(record.pid)
         assert record.state == "finished"
@@ -221,8 +226,7 @@ class TestRegistryShape:
             "create_script",
             "read_file",
             "run_bash",
-            "run_script",
-            "start_script",
+            "start_background_script",
             "list_paths",
         }
 
@@ -260,102 +264,6 @@ class TestSingleLineScriptGate:
             content_lines=["#!/bin/bash", "for i in 1 2 3; do echo $i; done"],
         )
         assert "ok" in result.lower()
-
-
-class TestRunScript:
-    """run_script waits and hands the output back — this is how the agent
-    looks around the system (find a file, check a program exists)."""
-
-    async def test_returns_stdout(self, tools, ctx):
-        await call(
-            tools, "create_script", ctx,
-            kind="bash", registry_key="hello",
-            content_lines=["#!/bin/bash", "echo found-it"],
-        )
-        result = await call(tools, "run_script", ctx, registry_key="hello")
-        assert "found-it" in result
-        assert "exit 0" in result
-
-    async def test_a_find_style_search_comes_back(self, tools, ctx, tmp_path):
-        planted = tmp_path / "refs" / "GRCh38.primary.fa"
-        planted.parent.mkdir(parents=True)
-        planted.write_text(">chr1\nACGT\n")
-        await call(
-            tools, "create_script", ctx,
-            kind="bash", registry_key="findref",
-            content_lines=[
-                "#!/bin/bash",
-                f"find {tmp_path} -maxdepth 3 -iname '*GRCh38*' 2>/dev/null | head",
-            ],
-        )
-        result = await call(tools, "run_script", ctx, registry_key="findref")
-        assert str(planted) in result  # the agent can now register this path
-
-    async def test_failure_is_reported_with_stderr(self, tools, ctx):
-        await call(
-            tools, "create_script", ctx,
-            kind="bash", registry_key="boom",
-            content_lines=["#!/bin/bash", "echo to-stderr >&2", "exit 3"],
-        )
-        result = await call(tools, "run_script", ctx, registry_key="boom")
-        assert "FAILED with exit code 3" in result
-        assert "to-stderr" in result
-
-    async def test_timeout_kills_and_says_how_to_recover(self, tools, ctx):
-        await call(
-            tools, "create_script", ctx,
-            kind="bash", registry_key="slow",
-            content_lines=["#!/bin/bash", "sleep 30"],
-        )
-        result = await call(
-            tools, "run_script", ctx, registry_key="slow", timeout_s=1
-        )
-        assert "TIMED OUT" in result
-        assert "-maxdepth" in result or "Narrow" in result
-
-    async def test_long_output_is_bounded_and_points_at_the_log(self, tools, ctx):
-        await call(
-            tools, "create_script", ctx,
-            kind="bash", registry_key="chatty",
-            content_lines=["#!/bin/bash", "seq 1 500"],
-        )
-        result = await call(tools, "run_script", ctx, registry_key="chatty")
-        assert len(result) < 6000  # the prompt is not flooded
-        assert "500" in result  # the tail, which is what a search prints last
-        assert "omitted" in result and "read_file" in result
-
-    async def test_no_output_is_stated_not_silent(self, tools, ctx):
-        await call(
-            tools, "create_script", ctx,
-            kind="bash", registry_key="quiet",
-            content_lines=["#!/bin/bash", "true"],
-        )
-        result = await call(tools, "run_script", ctx, registry_key="quiet")
-        assert "(no output)" in result
-
-    async def test_logs_are_registered_for_follow_up(self, tools, ctx):
-        await call(
-            tools, "create_script", ctx,
-            kind="bash", registry_key="logged",
-            content_lines=["#!/bin/bash", "echo x"],
-        )
-        await call(tools, "run_script", ctx, registry_key="logged")
-        assert any("logged_stdout" in key for key in ctx.registry.list())
-
-    async def test_the_run_is_tracked_like_any_process(self, tools, ctx):
-        await call(
-            tools, "create_script", ctx,
-            kind="bash", registry_key="tracked",
-            content_lines=["#!/bin/bash", "echo x"],
-        )
-        await call(tools, "run_script", ctx, registry_key="tracked")
-        records = ctx.runner.list()
-        assert [r.name for r in records] == ["tracked"]
-        assert records[0].state == "finished"
-
-    async def test_unknown_key_is_a_useful_error(self, tools, ctx):
-        with pytest.raises(Exception):
-            await call(tools, "run_script", ctx, registry_key="nope")
 
 
 class TestRunBash:
@@ -420,12 +328,83 @@ class TestRunBash:
         )
         assert "NOT run" in result
 
+    async def test_no_output_is_stated_not_silent(self, tools, ctx):
+        result = await call(tools, "run_bash", ctx, content_lines=["true"])
+        assert "(no output)" in result
+
     async def test_throwaway_scripts_are_not_registered(self, tools, ctx):
         await call(tools, "run_bash", ctx, content_lines=["echo x"])
         await call(tools, "run_bash", ctx, content_lines=["echo y"])
-        # no bash_* keys clutter the registry the model reasons over
-        assert not any(k.startswith("bash_") for k in ctx.registry.list())
+        # nothing clutters the registry the model reasons over: the script is
+        # throwaway, and output that fit needs no log key
+        assert ctx.registry.list() == {}
         assert ctx.runner.list()[0].state == "finished"
+
+    async def test_clipped_output_registers_a_log_that_can_be_read(self, tools, ctx):
+        result = await call(tools, "run_bash", ctx, content_lines=["seq 1 500"])
+        assert "omitted" in result and "read_file" in result
+        # the key it points at must actually exist — the whole point of
+        # registering lazily is that the follow-up read works
+        key = next(k for k in ctx.registry.list() if k.startswith("bash_stdout"))
+        assert key in result
+        assert "1\n" in ctx.registry.resolve(key).read_text()
+
+
+class TestRunBashKeyInterpolation:
+    """`{key}` in a run_bash line expands to the registered path, which is how
+    a kept script is run now that run_script is gone — and it keeps the
+    "tools take keys, never literal paths" rule instead of carving it open."""
+
+    async def test_key_expands_to_its_path(self, tools, ctx, tmp_path):
+        target = tmp_path / "reads.bam"
+        target.write_text("BAMDATA\n")
+        ctx.registry.register("reads", target)
+        result = await call(tools, "run_bash", ctx, content_lines=["cat {reads}"])
+        assert "BAMDATA" in result
+
+    async def test_a_registered_script_is_run_by_key(self, tools, ctx):
+        await call(
+            tools, "create_script", ctx,
+            kind="python", registry_key="qc",
+            content_lines=["import sys", "print('qc ran', sys.argv[1])"],
+        )
+        result = await call(
+            tools, "run_bash", ctx, content_lines=["python3 {qc} --strict"]
+        )
+        assert "qc ran --strict" in result
+        assert "exit 0" in result
+
+    async def test_awk_body_is_left_alone(self, tools, ctx):
+        # {print $1} is not a key reference; substituting it would break the
+        # single most common look-around idiom.
+        result = await call(
+            tools, "run_bash", ctx,
+            content_lines=["echo 'a b' | awk '{print $1}'"],
+        )
+        assert "exit 0" in result
+        assert result.strip().endswith("a")
+
+    async def test_shell_variables_are_left_alone(self, tools, ctx):
+        result = await call(
+            tools, "run_bash", ctx,
+            content_lines=["X=hello", "echo ${X}"],
+        )
+        assert "hello" in result
+
+    async def test_unresolved_reference_is_named_when_the_run_fails(
+        self, tools, ctx, tmp_path
+    ):
+        ctx.registry.register("reads", tmp_path / "reads.bam")
+        result = await call(tools, "run_bash", ctx, content_lines=["cat {readz}"])
+        assert "{readz}" in result
+        assert "reads" in result  # the keys that do exist, for the retry
+
+    async def test_a_successful_run_is_not_nagged_about_braces(self, tools, ctx):
+        result = await call(
+            tools, "run_bash", ctx,
+            content_lines=["echo 'a b' | awk '{print $2}'"],
+        )
+        assert "did not match" not in result
 
 
 class TestRunBashDestructiveGate:
