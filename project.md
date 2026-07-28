@@ -392,9 +392,11 @@ Core tools:
   `lookup_symbol` is the exact-match path used by the verification gate (§5.2),
   `search_docs` the embedding path for prose questions, `ask_docs` the firewalled
   doc-researcher sub-loop (§4.2).
-* File operations (`move_file`, `copy_file`, `delete_file`, `read_file`) — destructive
-  ones gated per §5.3. There is **no** `list_dir` tool: registry keys are listed by
-  `list_paths`, and directory contents are read via `run_bash`.
+* File operations (`move_file`, `copy_file`, `delete_file`, `restore_file`,
+  `read_file`) — destructive ones gated per §5.3. There is **no** `list_dir` tool:
+  registry keys are listed by `list_paths`, and directory contents are read via
+  `run_bash`. `restore_file` is the one file tool taking a path instead of a key:
+  the key died with the file.
 
 All subprocess execution goes through **one internal runner** (timeouts, output
 capture, cwd tracking, env control). There is deliberately **no free-form shell tool
@@ -484,10 +486,12 @@ gate (§5.3) or actual submission proceed.
   * *Content-overwriting operations* (in-place edits, overwrites): make a real copy
     first (this is the rarer case).
   * Trash entries carry a TTL (`trash_ttl_days`, default 7) and are cleaned up on
-    app start. *(`TrashManager.restore()`/`.list()` exist and are unit-tested, but
-    are not yet surfaced anywhere in the TUI — the "restore from the inspect view"
-    action is not wired up, so recovery is currently a library capability rather
-    than a user-facing button.)*
+    app start. Recovery is reached by *asking the agent*: the `restore_file` tool
+    wraps `TrashManager.list()`/`.restore()`, taking the file's original path (or
+    its name, or empty to list the trash) because the deletion dropped its registry
+    key. It never gates — restoring only creates a file, and refuses outright when
+    the original path is occupied. *(Still no TUI affordance: the "restore from the
+    inspect view" action is not wired up, so there is no trash browser to click.)*
 * Files ≥ 1 GB: no automatic backup (quota!), but the confirmation modal states this
   explicitly.
 
