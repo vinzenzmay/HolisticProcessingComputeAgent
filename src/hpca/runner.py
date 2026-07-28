@@ -487,9 +487,9 @@ def poll_processes(conn: sqlite3.Connection) -> list[ProcessChange]:
     runner owns the process. Rows are flagged as they are returned, so each
     completion is delivered exactly once even across restarts.
 
-    Only backgrounded scripts qualify. run_script and run_bash block until the
-    process ends and return its output as the tool result, so an event for
-    those would repeat what the agent has already read.
+    Only backgrounded scripts qualify. run_bash blocks until the process ends
+    and returns its output as the tool result, so an event for those runs
+    would repeat what the agent has already read.
     """
     placeholders = ", ".join("?" for _ in TERMINAL_STATES)
     rows = conn.execute(

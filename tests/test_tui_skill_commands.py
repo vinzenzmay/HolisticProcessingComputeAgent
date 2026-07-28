@@ -109,18 +109,18 @@ class TestSkillCreator:
             assert own[0].description == "Stress-test a plan"
             assert "Interview me" in own[0].body
 
-    async def test_first_skill_enables_the_read_skill_tool(self, hpca_home):
+    async def test_the_read_skill_tool_is_there_from_the_start(self, hpca_home):
+        """HPCA ships skills, so the tool is registered before the user writes
+        one — and a new skill does not disturb it."""
         app = HpcaApp(llm=FakeLLM())
         async with app.run_test(size=(120, 40)) as pilot:
-            assert "read_skill" not in app._tools.names()
+            assert "read_skill" in app._tools.names()
             await create_skill(app, pilot, "grilling", "d", GRILL_BODY)
             assert "read_skill" in app._tools.names()
 
     async def test_skill_list_stays_out_of_the_system_prompt(self, hpca_home):
         app = HpcaApp(llm=FakeLLM())
         async with app.run_test(size=(120, 40)) as pilot:
-            # No skills yet: no skills note in the prompt at all.
-            assert "read_skill" not in app._render_system_prompt()
             await create_skill(app, pilot, "grilling", "Stress-test a plan", GRILL_BODY)
             prompt = app._render_system_prompt()
             # The skill exists but is never enumerated in the prompt — neither
@@ -240,6 +240,20 @@ class TestSkillSlashInvocation:
             assert "review my plan" in user["api_content"]
             assert not user["api_content"].startswith("/grilling")
 
+    async def test_plan_is_invocable_out_of_the_box(self, hpca_home):
+        """A shipped skill needs no setup: "/plan …" on a fresh install hands
+        the model HPCA's own planning procedure."""
+        llm = FakeLLM(outputs=[respond_json("planning")])
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit(app, pilot, "/plan the trash browser")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            user = _user_message(llm.calls[-1])
+            assert user["content"] == "/plan the trash browser"
+            assert "specs.md" in user["api_content"]
+            assert "the trash browser" in user["api_content"]
+
     async def test_unknown_slash_is_still_an_error(self, hpca_home):
         app = HpcaApp(llm=FakeLLM())
         async with app.run_test(size=(120, 40)) as pilot:
@@ -260,11 +274,23 @@ class TestSkillsList:
             assert "grilling" in body
             assert "Stress-test a plan" in body
 
-    async def test_no_skills_notifies_instead_of_opening(self, hpca_home):
+    async def test_lists_the_shipped_skills_when_the_user_has_none(self, hpca_home):
+        """A fresh install is never empty: HPCA's own skills are there, tagged
+        so they are not mistaken for something the user wrote."""
         app = HpcaApp(llm=FakeLLM())
         async with app.run_test(size=(120, 40)) as pilot:
             await submit(app, pilot, "/skills-list")
-            assert not isinstance(app.screen, InspectScreen)
+            assert isinstance(app.screen, InspectScreen)
+            body = app.screen.body_text()
+            assert "plan  (built-in)" in body
+            assert "grillme  (built-in)" in body
+
+    async def test_own_skills_are_untagged(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await create_skill(app, pilot, "grilling", "Stress-test a plan", GRILL_BODY)
+            await submit(app, pilot, "/skills-list")
+            assert "• grilling\n" in app.screen.body_text()
 
 
 class TestSkillRemove:

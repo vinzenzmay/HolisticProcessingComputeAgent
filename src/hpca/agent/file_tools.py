@@ -5,16 +5,28 @@ registry — the one place the model must echo a literal path (copied from the
 user's message). Everything else is key-based. Deletions and overwrites are
 HITL-gated; a plain move/copy to a fresh target is not (conditional
 ``is_destructive_call``).
+
+``restore_file`` is the other half of the trash (§5.3): without it the backup
+a deletion writes is only reachable by the user digging through the app dir by
+hand, which is exactly what happened the first time someone asked for a file
+back. It takes the original path rather than a registry key — the key is gone,
+dropped by the deletion that created the backup.
 """
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 from pydantic import BaseModel, Field
 
 from hpca.agent.context import ToolContext
 from hpca.agent.tools import Tool, ToolRegistry
+from hpca.trash import TrashEntry
+
+# Enough for the model to recognise the file the user means without pasting a
+# week of deletions into the context.
+TRASH_LIST_LIMIT = 20
 
 
 def _require_trash(ctx: ToolContext):
@@ -135,7 +147,113 @@ async def delete_file(args: DeleteFileParams, ctx: ToolContext) -> str:
             f"Deleted {path} WITHOUT backup (file was above the backup size "
             "limit); this cannot be undone."
         )
-    return f"Deleted {path} (recoverable from trash via {entry.method})."
+    # Naming the tool, not just the trash: the model has to know recovery is
+    # something it can DO, or it tells the user to go dig in the app dir.
+    return (
+        f"Deleted {path} (backed up via {entry.method}; recoverable with "
+        f"restore_file if the user asks for it back)."
+    )
+
+
+class RestoreFileParams(BaseModel):
+    path: str = Field(
+        default="",
+        description=(
+            "Original path of the deleted file, as delete_file reported it "
+            "(its file name alone also works). Leave empty to list what is in "
+            "the trash."
+        ),
+    )
+
+
+def _local_time(trashed_at: str) -> str:
+    try:
+        return f"{datetime.fromisoformat(trashed_at).astimezone():%Y-%m-%d %H:%M}"
+    except ValueError:
+        return trashed_at
+
+
+def _newest_first(entries: list[TrashEntry]) -> list[TrashEntry]:
+    # trashed_at is an ISO UTC stamp, so it sorts lexicographically. Sorting on
+    # it rather than on the entry directory's name keeps the order right for
+    # entries written by any past version.
+    return sorted(entries, key=lambda entry: entry.trashed_at, reverse=True)
+
+
+def _trash_listing(entries: list[TrashEntry]) -> str:
+    if not entries:
+        return "The trash is empty — there is nothing to restore."
+    shown = entries[:TRASH_LIST_LIMIT]
+    lines = [
+        f"{entry.original_path} (deleted {_local_time(entry.trashed_at)})"
+        + ("" if entry.trashed_path else " — NO backup, not restorable")
+        for entry in shown
+    ]
+    if len(entries) > len(shown):
+        lines.append(f"... and {len(entries) - len(shown)} older entries")
+    return "In the trash, newest first:\n" + "\n".join(lines)
+
+
+def _matching_entries(entries: list[TrashEntry], wanted: str) -> list[TrashEntry]:
+    """Trash entries for ``wanted``, newest first.
+
+    Widening rather than exact-only: the model may quote the path it saw, the
+    file name alone, or a fragment of a long path, and a restore that fails on
+    a near-miss costs the user their file.
+    """
+    name = Path(wanted).name
+    for candidates in (
+        [e for e in entries if str(e.original_path) == wanted],
+        [e for e in entries if e.original_path.name == name],
+        [e for e in entries if wanted in str(e.original_path)],
+    ):
+        if candidates:
+            return candidates
+    return []
+
+
+async def restore_file(args: RestoreFileParams, ctx: ToolContext) -> str:
+    """Put a trashed file back where it was (§5.3 recovery).
+
+    Never gated: restore only ever *creates* a file, and refuses outright when
+    something already sits at the original path, so there is nothing for the
+    user to approve. Ambiguity is handed back to the model instead of guessed
+    at — restoring the wrong file over a name collision is not recoverable in
+    turn.
+    """
+    trash = _require_trash(ctx)
+    entries = _newest_first(trash.list())
+    wanted = args.path.strip()
+    if not wanted:
+        return _trash_listing(entries)
+    matches = _matching_entries(entries, wanted)
+    if not matches:
+        return f"Nothing in the trash matches {wanted!r}.\n{_trash_listing(entries)}"
+    if len({entry.original_path for entry in matches}) > 1:
+        return (
+            f"{wanted!r} matches several deleted files — call restore_file "
+            f"again with the full path of the one you want:\n"
+            f"{_trash_listing(matches)}"
+        )
+    entry = matches[0]  # the most recent deletion of that path
+    if entry.trashed_path is None:
+        return (
+            f"Cannot restore {entry.original_path}: it was deleted without a "
+            "backup (it was above the backup size limit), so no copy was kept. "
+            "Tell the user it is not recoverable from HPCA's trash."
+        )
+    try:
+        restored = trash.restore(entry)
+    except FileExistsError:
+        return (
+            f"Cannot restore {entry.original_path}: a file already exists "
+            "there. Move or rename that file first, then restore again — the "
+            "backup is still in the trash."
+        )
+    except OSError as exc:
+        return f"Could not restore {entry.original_path}: {exc}"
+    key = ctx.registry.register_auto(restored, hint=restored.name)
+    return f"Restored {restored}, registered as {key!r}."
 
 
 class MoveFileParams(BaseModel):
@@ -253,6 +371,18 @@ def add_file_tools(registry: ToolRegistry) -> ToolRegistry:
             handler=delete_file,
             is_destructive_call=_delete_resolvable,
             describe_call=_describe_delete,
+        )
+    )
+    registry.register(
+        Tool(
+            name="restore_file",
+            description=(
+                "Restore a file deleted earlier (by delete_file, or overwritten "
+                "by move/copy) from the trash, using its original path; call "
+                "with an empty path to list what can be restored"
+            ),
+            params=RestoreFileParams,
+            handler=restore_file,
         )
     )
     registry.register(

@@ -2,10 +2,20 @@
 execution through the tracked runner, bounded file reading, path listing.
 
 Scripts run two ways, both through the tracked runner (§5.1 — there is no
-free-form shell tool; a script is the unit of execution). ``run_script``
-waits and hands the output back, which is how the agent looks around the
-system: find a file, check a program exists, list conda environments.
-``start_script`` is for work that outlives the turn.
+free-form shell tool; a script is the unit of execution), split on the one
+axis the model cannot get back by itself: *when the result arrives*.
+``run_bash`` writes a throwaway script inline and waits — the look-around
+workhorse (find a file, check a program exists, list conda environments) and,
+via ``{key}`` expansion, the way a *registered* script is run synchronously
+too. ``start_background_script`` runs a registered script in the background,
+for work that outlives the turn; it alone reports back as a completion event
+(§5.4), because ``run_bash`` already handed its output over.
+
+The retired third tool was ``run_script`` (registered script, waits). Splitting
+on where the script came from bought nothing — its description advertised the
+same look-around job as ``run_bash``, so the model had two plausible tools for
+one move — while ``{key}`` expansion keeps the §4.3 "tools take keys, never
+literal paths" rule intact instead of carving an exception into it.
 
 Handlers return strings for the model; exceptions (unknown registry keys,
 key conflicts) propagate and are surfaced as ``[tool error]`` messages by the
@@ -17,7 +27,7 @@ from __future__ import annotations
 import re
 import sys
 import time
-from typing import Literal
+from typing import Callable, Literal
 
 from pydantic import BaseModel, Field
 
@@ -38,7 +48,18 @@ INTERPRETER = {
     ".R": ["Rscript"],
     ".smk": ["snakemake", "-s"],
 }
-KEY_PATTERN = r"^[a-z0-9_.-]+$"
+KEY_CHARS = r"[a-z0-9_.-]+"
+KEY_PATTERN = rf"^{KEY_CHARS}$"
+
+# A `{key}` in a run_bash line is a registry reference, expanded to the
+# registered absolute path before anything else looks at the script. The
+# lookbehind keeps `${VAR}` out; the character class keeps `{a,b}` brace
+# expansion and `awk '{print $1}'` out (comma, space and `$` are all excluded).
+# `{print}` still matches by shape, which is why expansion substitutes only
+# keys that are actually registered and leaves everything else untouched —
+# there is no way to tell a bare awk body from a typo'd key by shape alone.
+_KEY_REF = re.compile(rf"(?<![$\\]){{({KEY_CHARS})}}")
+MAX_KEYS_IN_NOTE = 30
 
 
 class CreateScriptParams(BaseModel):
@@ -53,6 +74,45 @@ class CreateScriptParams(BaseModel):
     content_lines: list[str] = Field(
         min_length=1,
         description="Script content as an array of lines, one string per line",
+    )
+
+
+def expand_keys(lines: list[str], ctx: object) -> tuple[list[str], list[str]]:
+    """Expand ``{key}`` references to registered paths.
+
+    Returns the expanded lines and the brace references that matched nothing,
+    which the caller reports only if the run then fails — an unmatched
+    ``{print}`` in an awk body is not an error, a typo'd key is, and the exit
+    code is what tells them apart.
+
+    The path is substituted raw, not shell-quoted: the model writes ``{ref}``
+    where it would otherwise write the literal path, and quoting would break
+    the equally common ``"{ref}"``. Pure apart from registry reads, as the
+    gating predicates that call it require.
+    """
+    registry = getattr(ctx, "registry", None)
+    unresolved: list[str] = []
+
+    def substitute(match: re.Match) -> str:
+        key = match.group(1)
+        if registry is not None and key in registry:
+            return str(registry.resolve(key))
+        unresolved.append(match.group(0))
+        return match.group(0)
+
+    return [_KEY_REF.sub(substitute, line) for line in lines], unresolved
+
+
+def _unresolved_note(unresolved: list[str], ctx: ToolContext) -> str:
+    """Told to the model only on failure — see ``expand_keys``."""
+    if not unresolved:
+        return ""
+    refs = ", ".join(sorted(set(unresolved)))
+    known = ", ".join(sorted(ctx.registry.list())[:MAX_KEYS_IN_NOTE]) or "(none)"
+    return (
+        f"\n\nNote: {refs} did not match any registry key and was passed "
+        f"through unchanged. If you meant a registered path, the keys are: "
+        f"{known}"
     )
 
 
@@ -134,7 +194,9 @@ async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
     )
     return (
         f"Created script {args.registry_key!r} ({args.kind}); "
-        f"syntax check ok{note}. Start it with start_script.{strict}"
+        f"syntax check ok{note}. Start it with start_background_script, or run "
+        f"it now with run_bash: {{{args.registry_key}}} expands to its "
+        f"path.{strict}"
     )
 
 
@@ -203,12 +265,14 @@ async def read_file(args: ReadFileParams, ctx: ToolContext) -> str:
     )
 
 
-class StartScriptParams(BaseModel):
+class StartBackgroundScriptParams(BaseModel):
     registry_key: str = Field(description="Registry key of the script to run")
     args: str = Field(default="", description="Command-line arguments, space-separated")
 
 
-async def start_script(args: StartScriptParams, ctx: ToolContext) -> str:
+async def start_background_script(
+    args: StartBackgroundScriptParams, ctx: ToolContext
+) -> str:
     path = ctx.registry.resolve(args.registry_key)
     interpreter = INTERPRETER.get(path.suffix)
     if interpreter is None:
@@ -239,77 +303,6 @@ async def start_script(args: StartScriptParams, ctx: ToolContext) -> str:
         f"background; logs: {stdout_key}, {stderr_key} (use read_file to check)."
     )
 
-
-class RunScriptParams(BaseModel):
-    registry_key: str = Field(description="Registry key of the script to run")
-    args: str = Field(default="", description="Arguments, space-separated")
-    timeout_s: int = Field(
-        default=RUN_TIMEOUT_DEFAULT,
-        ge=1,
-        le=RUN_TIMEOUT_MAX,
-        description=f"Seconds to wait before killing it (max {RUN_TIMEOUT_MAX})",
-    )
-
-
-def _tail(text: str, stream: str, log_key: str | None) -> str:
-    """Bound one stream for the prompt, pointing at the log for the rest."""
-    lines = text.splitlines()
-    clipped = lines[-RUN_OUTPUT_LINES:]
-    body = "\n".join(clipped)[-RUN_OUTPUT_CHARS:]
-    if not body.strip():
-        return ""
-    omitted = len(lines) - len(clipped)
-    if omitted > 0:
-        where = f"read_file {log_key!r} for all of it" if log_key else (
-            "re-run with a tighter filter for the rest"
-        )
-        note = f"\n[... {omitted} earlier {stream} lines omitted; {where}]"
-    else:
-        note = ""
-    return f"{stream}:\n{body}{note}"
-
-
-async def run_script(args: RunScriptParams, ctx: ToolContext) -> str:
-    """Run a script and wait for it, returning what it printed.
-
-    The same tracked runner as start_script — the process shows in the TUI and
-    is killable — but awaited, so the output comes back in this tool result
-    instead of a log the model would have to poll.
-    """
-    path = ctx.registry.resolve(args.registry_key)
-    interpreter = INTERPRETER.get(path.suffix)
-    if interpreter is None:
-        raise ValueError(
-            f"Cannot run {args.registry_key!r}: unknown script type {path.suffix!r}"
-        )
-    argv = interpreter + [str(path)] + (args.args.split() if args.args else [])
-    record = await ctx.runner.start(
-        argv, name=args.registry_key, timeout_s=args.timeout_s
-    )
-    record = await ctx.runner.wait(record.pid)
-    stdout_key = ctx.registry.register_auto(
-        record.stdout_path, hint=f"{args.registry_key}_stdout"
-    )
-    stderr_key = ctx.registry.register_auto(
-        record.stderr_path, hint=f"{args.registry_key}_stderr"
-    )
-    parts = [
-        _tail(record.stdout_path.read_text(errors="replace"), "stdout", stdout_key),
-        _tail(record.stderr_path.read_text(errors="replace"), "stderr", stderr_key),
-    ]
-    output = "\n\n".join(part for part in parts if part) or "(no output)"
-    if record.state == "killed":
-        return (
-            f"TIMED OUT after {args.timeout_s}s and was killed. Narrow the "
-            f"script (fewer directories, -maxdepth, pipe through head) or "
-            f"raise timeout_s, then run it again.\n\n{output}"
-        )
-    status = (
-        "exit 0"
-        if record.exit_code == 0
-        else f"FAILED with exit code {record.exit_code}"
-    )
-    return f"{args.registry_key} finished ({status}).\n\n{output}"
 
 
 class RunBashParams(BaseModel):
@@ -389,14 +382,63 @@ def _bash_flagged(content_lines: list[str]) -> list[str]:
 
 
 def _bash_is_destructive(args: RunBashParams, ctx: object = None) -> bool:
-    return bool(_bash_flagged(args.content_lines))
+    # Judged on the *expanded* script: a `{key}` standing in for /bin/rm would
+    # otherwise walk past the gate as an unrecognised word.
+    lines, _ = expand_keys(args.content_lines, ctx)
+    return bool(_bash_flagged(lines))
 
 
 def _describe_bash(args: RunBashParams, ctx: object = None) -> str:
-    flagged = _bash_flagged(args.content_lines)
+    lines, _ = expand_keys(args.content_lines, ctx)
+    flagged = _bash_flagged(lines)
     if not flagged:
         return ""
     return "Flagged command(s): " + ", ".join(flagged)
+
+
+def _tail(text: str, stream: str, register: Callable[[], str]) -> str:
+    """Bound one stream for the prompt, pointing at the log for the rest.
+
+    ``register`` is called only when something was actually cut. A look-around
+    command whose output fits needs no registry key, and minting one per run
+    would fill the registry the model reasons over with logs it never reads.
+    """
+    lines = text.splitlines()
+    kept = lines[-RUN_OUTPUT_LINES:]
+    body = "\n".join(kept)
+    cut_head = len(body) > RUN_OUTPUT_CHARS  # long lines, few of them
+    body = body[-RUN_OUTPUT_CHARS:]
+    if not body.strip():
+        return ""
+    omitted = len(lines) - len(kept)
+    if omitted > 0 or cut_head:
+        what = (
+            f"{omitted} earlier {stream} lines"
+            if omitted > 0
+            else f"the start of {stream}"
+        )
+        note = f"\n[... {what} omitted; read_file {register()!r} for all of it]"
+    else:
+        note = ""
+    return f"{stream}:\n{body}{note}"
+
+
+def _run_output(record, ctx: ToolContext, hint: str) -> str:
+    """Both streams, bounded, each registering its log only if it was cut."""
+    parts = [
+        _tail(
+            path.read_text(errors="replace"),
+            stream,
+            lambda p=path, s=stream: ctx.registry.register_auto(
+                p, hint=f"{hint}_{s}"
+            ),
+        )
+        for stream, path in (
+            ("stdout", record.stdout_path),
+            ("stderr", record.stderr_path),
+        )
+    ]
+    return "\n\n".join(part for part in parts if part) or "(no output)"
 
 
 async def run_bash(args: RunBashParams, ctx: ToolContext) -> str:
@@ -404,14 +446,15 @@ async def run_bash(args: RunBashParams, ctx: ToolContext) -> str:
     its output — all in one call.
 
     This is the look-around workhorse: find a file, check a program, read a BAM
-    header, list conda envs. create_script + run_script does the same thing in
-    two steps and is for scripts worth keeping (submitted to Slurm, re-run);
-    this is for the one-shot check you would otherwise pay two tool rounds for.
+    header, list conda envs. It is also how a *registered* script is run
+    synchronously — write ``{key}`` and it expands to the path — so there is
+    one tool for "run this and tell me what it said", whatever the script is.
+    Work that outlives the turn goes to start_background_script instead.
     """
     ctx.scripts_dir.mkdir(parents=True, exist_ok=True)
     name = f"bash_{time.time_ns()}"  # throwaway, unique on disk, never registered
     path = ctx.scripts_dir / f"{name}.sh"
-    lines = args.content_lines
+    lines, unresolved = expand_keys(args.content_lines, ctx)
     nonempty = [line for line in lines if line.strip()]
     if len(nonempty) == 1 and nonempty[0].lstrip().startswith("#!"):
         return (
@@ -430,11 +473,7 @@ async def run_bash(args: RunBashParams, ctx: ToolContext) -> str:
         ["bash", str(path)], name=name, timeout_s=args.timeout_s
     )
     record = await ctx.runner.wait(record.pid)
-    parts = [
-        _tail(record.stdout_path.read_text(errors="replace"), "stdout", name),
-        _tail(record.stderr_path.read_text(errors="replace"), "stderr", name),
-    ]
-    output = "\n\n".join(part for part in parts if part) or "(no output)"
+    output = _run_output(record, ctx, "bash")
     if record.state == "killed":
         return (
             f"TIMED OUT after {args.timeout_s}s and was killed. Narrow it "
@@ -446,6 +485,7 @@ async def run_bash(args: RunBashParams, ctx: ToolContext) -> str:
     return (
         f"ran (FAILED, exit {record.exit_code}). Read the error, fix the "
         f"script, and call run_bash again.\n\n{output}"
+        f"{_unresolved_note(unresolved, ctx)}"
     )
 
 
@@ -485,9 +525,10 @@ def default_tool_registry() -> ToolRegistry:
         Tool(
             name="run_bash",
             description=(
-                "Write and run a one-shot bash script in a single call, return "
-                "its output (the tool for looking around: find files, check a "
-                "program, read a BAM header, list conda envs)"
+                "Run bash and wait for its output: look around (find files, "
+                "check a program, read a BAM header, list conda envs) or run a "
+                "registered script by writing {registry_key}, which expands to "
+                "its path. Use for anything you want the result of now"
             ),
             params=RunBashParams,
             handler=run_bash,
@@ -497,21 +538,15 @@ def default_tool_registry() -> ToolRegistry:
     )
     registry.register(
         Tool(
-            name="run_script",
+            name="start_background_script",
             description=(
-                "Run a registered script, wait for it, and return its output "
-                "(use this to look around: find files, check a program exists)"
+                "Run a registered script as a tracked background process for "
+                "work that outlives this turn (a pipeline, a long tool run). "
+                "Returns a pid immediately, NOT the output; you are told when "
+                "it finishes. For output now, use run_bash"
             ),
-            params=RunScriptParams,
-            handler=run_script,
-        )
-    )
-    registry.register(
-        Tool(
-            name="start_script",
-            description="Run a registered script as a tracked background process",
-            params=StartScriptParams,
-            handler=start_script,
+            params=StartBackgroundScriptParams,
+            handler=start_background_script,
         )
     )
     registry.register(

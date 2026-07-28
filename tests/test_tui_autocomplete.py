@@ -3,6 +3,7 @@
 import pytest
 
 from hpca.db import command_use_counts, connect, init_db, record_command_use
+from hpca.skills import load_builtin_skills
 from hpca.tui.app import COMMANDS, ChatInput, HpcaApp
 
 
@@ -34,7 +35,11 @@ class TestMatching:
         async with app.run_test(size=(120, 40)):
             app._update_command_menu("/")
             assert app.command_menu_active()
-            assert set(menu_names(app)) == {name for name, _ in COMMANDS}
+            # Every built-in command, plus the skills HPCA ships — those are
+            # invocable as "/<skill>" too, so the menu offers them.
+            assert set(menu_names(app)) == {name for name, _ in COMMANDS} | {
+                s.name for s in load_builtin_skills()
+            }
 
     async def test_substring_not_only_prefix(self, hpca_home):
         app = HpcaApp()
@@ -121,5 +126,41 @@ class TestNavigation:
             await pilot.press("enter")
             await pilot.pause()
             # it ran: the entry cleared and the command was counted
+            assert chat_input.text == ""
+            assert command_use_counts(app._conn).get("skills-list") == 1
+
+
+class TestMistyped:
+    """A "/" word naming neither a command nor a skill is nearly always a
+    typo, so the draft stays put and can be corrected in place."""
+
+    async def test_unknown_command_keeps_the_draft(self, hpca_home):
+        app = HpcaApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", ChatInput)
+            chat_input.text = "/skils-list"  # mistyped /skills-list
+            app._update_command_menu(chat_input.text)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert chat_input.text == "/skils-list"
+            # …and it was not sent to the model as an ordinary message either
+            assert not app._pending_work
+
+    async def test_correcting_it_then_runs(self, hpca_home):
+        app = HpcaApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", ChatInput)
+            chat_input.text = "/skils-list"
+            app._update_command_menu(chat_input.text)
+            await pilot.press("enter")
+            await pilot.pause()
+            chat_input.text = "/skills-list"  # the retained draft, fixed up
+            app._update_command_menu(chat_input.text)
+            await pilot.press("enter")
+            await pilot.pause()
             assert chat_input.text == ""
             assert command_use_counts(app._conn).get("skills-list") == 1

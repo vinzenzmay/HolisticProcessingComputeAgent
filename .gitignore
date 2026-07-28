@@ -17,6 +17,9 @@ uv.lock
 
 # App runtime data (never commit user data)
 .HolisticProcessingComputeAgent/
+# Project-level skills the app picks up from the cwd. A real user commits
+# these with their project; here they are only ever hand-testing leftovers.
+.hpca/
 # pixi environments
 .pixi/*
 !.pixi/config.toml

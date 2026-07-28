@@ -1,6 +1,6 @@
 """Tests for background-process completion reaching the agent (§5.4).
 
-The gap these cover: start_script hands a process to the runner and the turn
+The gap these cover: start_background_script hands a process to the runner and the turn
 ends. Nothing used to detect that it exited, so the agent's "I'll check on it"
 was a promise the runtime could not keep.
 """
@@ -79,8 +79,8 @@ class TestPollProcesses:
 
 
 class TestOnlyBackgroundWork:
-    """run_script/run_bash block and hand their output back as the tool
-    result, so announcing those again would tell the agent the same thing
+    """run_bash blocks and hands its output back as the tool
+    result, so announcing it again would tell the agent the same thing
     twice — and a failing run_bash would look like a fresh crash to react to."""
 
     async def test_foreground_failure_produces_no_event(self, conn, runner):
@@ -116,7 +116,7 @@ class TestOnlyBackgroundWork:
             ),
             ctx,
         )
-        start = tools.get("start_script")
+        start = tools.get("start_background_script")
         await start.handler(
             start.params.model_validate({"registry_key": "job"}), ctx
         )
@@ -154,7 +154,7 @@ class TestNoDuplicateStart:
             ),
             ctx,
         )
-        return tools.get("start_script")
+        return tools.get("start_background_script")
 
     async def test_second_start_is_refused(self, ctx):
         start = await self._make(ctx, "slow_job", ["sleep 5"])

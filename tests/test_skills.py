@@ -12,9 +12,19 @@ from hpca.skills import (
 
 
 @pytest.fixture
-def hpca_home(monkeypatch, tmp_path):
+def app_home(monkeypatch, tmp_path):
+    """An empty app dir. The shipped skills stay visible."""
     monkeypatch.setenv("HPCA_HOME", str(tmp_path))
     return tmp_path
+
+
+@pytest.fixture
+def hpca_home(app_home, monkeypatch, tmp_path):
+    """An empty app dir *and* no shipped skills, so the tests below can assert
+    exact skill sets. The shipped ones are HPCA's own and always visible; they
+    are exercised in :class:`TestBuiltinSkills`, which uses ``app_home``."""
+    monkeypatch.setattr("hpca.skills.BUILTIN_SKILLS_DIR", tmp_path / "no-builtins")
+    return app_home
 
 
 def write_skill(name: str, content: str) -> None:
@@ -245,12 +255,11 @@ class TestPerProfileSkills:
         assert len(skills) == 1
         assert skills[0].body == "profile body"
 
-    def test_any_skills(self, hpca_home):
-        from hpca.skills import any_skills
-
-        assert not any_skills()
+    def test_level_is_stamped_by_the_loader(self, hpca_home):
+        self.write_in("_shared", "a.md", "---\nname: shared-a\n---\nbody")
         self.write_in("genetics", "b.md", "---\nname: gen-b\n---\nbody")
-        assert any_skills()
+        levels = {s.name: s.level for s in load_skills("genetics")}
+        assert levels == {"shared-a": "global", "gen-b": "profile"}
 
 
 class TestSkillWriting:
@@ -428,18 +437,6 @@ class TestSkillLevels:
         assert delete_own_skill(skill, "genetics", project_root=tmp_path) is True
         assert load_project_skills(project_root=tmp_path) == []
 
-    def test_any_skills_includes_project(self, hpca_home, tmp_path):
-        from hpca.skills import any_skills, write_skill
-
-        assert not any_skills(project_root=tmp_path)
-        write_skill(
-            Skill("proj", "d", [], "b"),
-            "genetics",
-            level="project",
-            project_root=tmp_path,
-        )
-        assert any_skills(project_root=tmp_path)
-
     def test_project_skill_path_is_sanitized_and_hidden(self, hpca_home, tmp_path):
         from hpca.skills import project_skills_dir, skill_path
 
@@ -448,6 +445,50 @@ class TestSkillLevels:
         )
         assert path.name == "etc-passwd.md"
         assert path.parent == project_skills_dir(tmp_path)
+
+
+class TestBuiltinSkills:
+    """Skills shipped with HPCA (``hpca/data/skills``): visible to every profile
+    on a fresh install, ranked below every user level, never removable."""
+
+    def test_shipped_skills_are_visible_on_a_fresh_install(self, app_home):
+        names = [s.name for s in load_skills("genetics")]
+        assert "grillme" in names
+        assert "plan" in names
+
+    def test_every_shipped_skill_parses(self, app_home):
+        from hpca.skills import load_builtin_skills
+
+        shipped = load_builtin_skills()
+        assert shipped, "HPCA ships no skills — the package data is missing"
+        for skill in shipped:
+            assert not skill.problems
+            assert skill.description and skill.body
+            assert skill.level == "builtin"
+
+    def test_plan_grills_first_then_writes_specs(self, app_home):
+        """The point of /plan: grill to a shared understanding, then leave a
+        specs.md a fresh session can implement from."""
+        plan = next(s for s in load_skills("genetics") if s.name == "plan")
+        assert "grillme" in plan.body
+        assert "specs.md" in plan.body
+
+    def test_a_user_skill_shadows_a_shipped_one(self, app_home):
+        from hpca.skills import write_skill
+
+        write_skill(Skill("plan", "mine", [], "my own planning procedure"), "genetics")
+        plan = next(s for s in load_skills("genetics") if s.name == "plan")
+        assert plan.body == "my own planning procedure"
+        assert plan.level == "profile"
+
+    def test_shipped_skills_are_not_removable(self, app_home):
+        """They live outside the profile and project dirs, so /skill-remove
+        never offers them and deleting one cannot reach the package."""
+        from hpca.skills import delete_own_skill, load_builtin_skills
+
+        shipped = load_builtin_skills()[0]
+        assert delete_own_skill(shipped, "genetics") is False
+        assert shipped.name in [s.name for s in load_builtin_skills()]
 
 
 class TestProfileSkillLifecycle:

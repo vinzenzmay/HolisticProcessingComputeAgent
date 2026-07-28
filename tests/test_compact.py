@@ -79,6 +79,68 @@ class TestSummarize:
         assert len(summary["content"]) < compact.MAX_SUMMARY_CHARS + 60
 
 
+class TestTranscript:
+    def test_an_ordinary_message_is_clipped(self):
+        text = compact.transcript([{"role": "user", "content": "y" * 5000}])
+        assert len(text) < compact.MAX_MESSAGE_CHARS + 20
+
+    def test_an_earlier_summary_survives_the_next_fold(self):
+        """Folding twice must not shred the first summary down to a per-message
+        excerpt: it already stands for the whole start of the session."""
+        summary = {
+            "role": "user",
+            "content": f"{compact.SUMMARY_PREFIX}\n" + "s" * 2000,
+        }
+        text = compact.transcript([summary, {"role": "user", "content": "next"}])
+        assert text.count("s") >= 2000
+
+
+class TestGuidedSummarize:
+    """/compact takes the text after it as an instruction for the summary:
+    what to keep, or what the user is about to do next."""
+
+    async def test_the_instruction_reaches_the_summarizer(self):
+        llm = FakeLLM()
+        await compact.summarize(
+            llm, history(20), guidance="keep the STAR parameters exactly"
+        )
+        system = llm.calls[0][0]["content"]
+        assert "keep the STAR parameters exactly" in system
+        # and it is framed as outranking the default brevity target
+        assert "word limit" in system
+
+    async def test_the_instruction_is_kept_in_the_summary_message(self):
+        """The declared next step stays in the model's view after the fold —
+        that is how the summary "aligns with what comes next" on later turns."""
+        summary = await compact.summarize(
+            llm := FakeLLM(), history(20), guidance="next I run the full cohort"
+        )
+        assert compact.is_summary(summary)  # still a summary message
+        assert "next I run the full cohort" in summary["content"]
+        assert compact.FOCUS_PREFIX in summary["content"]
+        assert llm.calls  # sanity: it really went through the model
+
+    async def test_without_an_instruction_nothing_is_added(self):
+        llm = FakeLLM()
+        summary = await compact.summarize(llm, history(20))
+        assert compact.FOCUS_PREFIX not in summary["content"]
+        assert "word limit" not in llm.calls[0][0]["content"]
+
+    async def test_a_guided_summary_may_be_longer(self):
+        """Naming things to keep needs room for them; the cap still exists."""
+        guided = await compact.summarize(
+            FakeLLM(summary="x" * 9000), history(20), guidance="keep every path"
+        )
+        assert compact.MAX_SUMMARY_CHARS < len(guided["content"])
+        assert len(guided["content"]) < compact.MAX_GUIDED_SUMMARY_CHARS + 200
+
+    async def test_a_blank_instruction_is_no_instruction(self):
+        llm = FakeLLM()
+        summary = await compact.summarize(llm, history(20), guidance="   ")
+        assert compact.FOCUS_PREFIX not in summary["content"]
+        assert "word limit" not in llm.calls[0][0]["content"]
+
+
 class TestSidecarAwareEstimate:
     """wire_messages sends api_content when present, so the estimate must
     count it — those are exactly the messages carrying extra payload."""

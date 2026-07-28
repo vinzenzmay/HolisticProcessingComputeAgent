@@ -14,7 +14,7 @@ import pytest
 from hpca.agent.struggle import STRUGGLE_KIND
 from hpca.llm import ChatResponse
 from hpca.profiles import MemoryScope, Profile
-from hpca.skills import load_skills, skills_dir
+from hpca.skills import load_own_skills, load_skills, skills_dir
 from hpca.tui.app import ChatInput, HpcaApp
 from hpca.tui.memory_screens import ReflectionScreen
 
@@ -122,13 +122,15 @@ class TestSkills:
             texts = app.chat_log_texts()
             assert any("samtools view" in t for t in texts)
 
-    async def test_no_skills_no_tool_no_section(self, hpca_home):
+    async def test_shipped_skills_keep_the_tool_and_note_present(self, hpca_home):
+        """The user has written no skills, but HPCA ships some — so read_skill
+        is registered and the prompt still says skills exist."""
         llm = RecordingLLM([respond_json("ok")])
         app = HpcaApp(llm=llm)
         async with app.run_test(size=(120, 40)) as pilot:
-            assert "read_skill" not in app._tools.names()
+            assert "read_skill" in app._tools.names()
             await submit(app, pilot, "hello")
-            assert "skills" not in llm.calls[0][0]["content"].lower()
+            assert "read_skill" in llm.calls[0][0]["content"]
 
 
 REVIEW_JSON = json.dumps(
@@ -299,7 +301,7 @@ class TestSkillLearning:
             await submit(app, pilot, "run qc")
             await submit(app, pilot, "/conclude")
             assert not isinstance(app.screen, ReflectionScreen)
-            assert load_skills("default") == []
+            assert load_own_skills("default") == []
 
 
 class TestFencedRecall:

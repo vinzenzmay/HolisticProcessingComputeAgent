@@ -86,7 +86,7 @@ def tools():
     )
     registry.register(
         Tool(
-            name="run_script",
+            name="start_background_script",
             description="Run a registered script",
             params=KeyParams,
             handler=key_handler,
@@ -137,7 +137,7 @@ class TestHelpers:
 
     def test_plan_mode_withdraws_execution_tools(self, tools):
         offered = tools_for_mode(tools, "plan")
-        assert "run_script" not in offered.names()
+        assert "start_background_script" not in offered.names()
         assert "run_bash" in offered.names()  # look-around stays available
         # planning ends through present_plan; update_plan is execution-phase
         assert "present_plan" in offered.names()
@@ -148,7 +148,7 @@ class TestHelpers:
             offered = tools_for_mode(tools, mode)
             assert "present_plan" not in offered.names()
             assert "update_plan" in offered.names()
-            assert "run_script" in offered.names()
+            assert "start_background_script" in offered.names()
 
     def test_a_registry_without_plan_tools_is_returned_unchanged(self):
         bare = ToolRegistry()
@@ -370,7 +370,7 @@ class TestPlanMode:
         await run_turn(graph, session_id="s1", user_text="plan something")
         # the tool listing (not the guidance prose) is what the model can call
         text = system_text(llm, 0)
-        assert '"tool": "run_script"' not in text
+        assert '"tool": "start_background_script"' not in text
         assert '"tool": "present_plan"' in text
         assert '"tool": "update_plan"' not in text  # execution-phase only
 

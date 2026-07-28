@@ -102,6 +102,11 @@ your skills (invoke a skill with `/<skill>`; see *Skills* below).
   orchestrator's prompt (under a token budget) and `rag` memories retrieved only
   when they match the current request. Memories are proposed for your approval via
   `/memorize` and `/conclude` and stored as hand-editable markdown.
+* **Context compaction** — a long session is folded into a summary before it
+  overflows the model's window (the meter above the chat shows how full it is),
+  and you can fold it yourself with `/compact` — adding what the summary has to
+  keep, or the step you are about to take, so it is written for what comes next.
+  Only what the model receives is folded; the chat itself keeps every message.
 * **Skills** — user-defined procedure files the agent follows for specific tasks
   (see *Skills* below).
 * **Configurable LLM backends** — talk to any OpenAI-compatible endpoint (vLLM,
@@ -145,9 +150,13 @@ skill* below.
 
 ### Where skills live (levels)
 
-A skill is stored at one of three levels, which decides who sees it. On a name
-collision the most specific level wins (**project > profile > global**):
+A skill is stored at one of four levels, which decides who sees it. On a name
+collision the most specific level wins (**project > profile > global >
+built-in**):
 
+* **built-in** — shipped with HPCA, so a fresh install already has them (see
+  *Built-in skills* below). Read-only: `/skill-remove` never offers one, and
+  writing your own skill with the same name simply shadows it.
 * **global** — visible to every profile. Stored under
   `~/.HolisticProcessingComputeAgent/skills/_shared/`.
 * **profile** — the current profile only. Stored under
@@ -155,6 +164,19 @@ collision the most specific level wins (**project > profile > global**):
 * **project** — tied to the directory you launch `hpca` from, and only visible
   while running there. Stored under a hidden `.hpca/skills/` in that directory, so
   a repo can carry its own procedures without them leaking into other projects.
+
+### Built-in skills
+
+Two ship with HPCA, both aimed at settling a plan before any of it gets built:
+
+* **`/grillme`** — the agent interviews you about a plan, decision or idea, one
+  question at a time, recommending an answer for each and looking facts up itself.
+  It does not act until you say you have reached a shared understanding.
+* **`/plan`** — `/grillme` first, then the agent writes a `specs.md` in the working
+  directory: the settled decisions and their reasoning, the files to touch, the
+  steps in order, and how to verify them — detailed enough to implement in a fresh
+  session that saw none of the conversation. It stops there; building is a separate
+  session. Use it instead of plan mode when the plan needs to survive the session.
 
 ### Create a skill
 
@@ -181,7 +203,7 @@ There are two ways a skill runs, cheapest first:
   your `/<skill>` or the model deciding to load one.
 
 Run `/skills-list` to see every skill the current profile can see, tagged with the
-level each one resolves to.
+level each one resolves to (the profile's own are untagged).
 
 ### Remove a skill
 

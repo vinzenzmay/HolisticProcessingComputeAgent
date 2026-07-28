@@ -115,6 +115,12 @@ Prefer a bare letter gated (via `check_action`) to a non-typing column, or a saf
     so far and proposes them for approval (see §6).
   * `/conclude` — the agent analyses the conversation and proposes memories to write
     into the profile (user approves before write, see §6).
+  * `/compact [BRIEF]` — fold the conversation into a summary now rather than
+    waiting for the automatic fold, freeing the window. BRIEF is what the summary
+    must carry: material to keep, or the step the user is about to take — the
+    summary is then written for it, and the brief itself stays in the folded view
+    so it keeps framing the turns that follow. The chat is not rewritten; only the
+    view the model receives is folded.
   * `/skill-creator`, `/skills-list`, `/skill-remove` — manage this profile's
     skills (see §5.1).
   * `/<skill> [PROMPT]` — invoke a user-defined skill directly: its procedure is
@@ -187,7 +193,7 @@ can tell them apart). The mode is stored per session (`sessions.mode`, empty =
 the `agent.default_mode` setting, default `manual`) and read fresh every graph
 round, so switching applies immediately — even to a turn already in flight.
 
-* **manual** — every execution tool call (`run_script`, `start_script`,
+* **manual** — every execution tool call (`start_background_script`,
   `run_bash`, `submit_job`) pauses at the same `interrupt()` gate as
   destructive operations; an inline approval bar at the foot of the chat column
   (`DecisionBar`, deliberately non-modal so the other columns and sessions stay
@@ -206,12 +212,18 @@ round, so switching applies immediately — even to a turn already in flight.
   backups, TTL restore) still stands behind every deletion and overwrite,
   and the prompt tells the model to verify paths itself and to list every
   destructive action in its final report.
-* **plan** — nothing executes. Enforcement is structural, not prompt-trust:
-  script tools are withdrawn from the registry offered to `decide()` (a tool
-  never offered cannot be called). `run_bash` is kept so the plan can be
+* **plan** — nothing *new* is built or submitted. Enforcement is structural, not
+  prompt-trust: `create_script`, `start_background_script` and `submit_job` are
+  withdrawn from the registry offered to `decide()` (a tool never offered cannot
+  be called). `run_bash` is kept so the plan can be
   grounded in what is actually on disk; it runs unattended (only the §5.3
   destructive gate still applies) rather than pausing for approval like manual —
-  look-around commands are cheap and gating each one made planning tedious. The
+  look-around commands are cheap and gating each one made planning tedious.
+  Since `run_bash` expands `{key}`, a script registered in an earlier turn can
+  still be run from plan mode by naming it — withdrawal stops new scripts being
+  built, not every path to executing an old one. Closing that would mean
+  rejecting the call after the model emitted it, which costs more than the hole.
+  The
   model maintains a checklist through an `update_plan` tool; the checklist lives
   in the checkpointed graph state (`AgentState.plan`) and is re-injected into the
   system prompt every round, so it survives restarts and context compaction.
@@ -313,8 +325,9 @@ the orchestrator's or another subagent's context.
 * **Output size control:** long tool outputs are kept small before they reach the
   model. *As built,* this is per-tool truncation rather than a single generic
   middleware layer: `read_file` returns head/tail, `read_manpage`/`read_source`
-  are bounded, and `run_script`/`run_bash` clip each stream to a tail and point at
-  the full log file (which is registered by key). There is **no** universal
+  are bounded, and `run_bash` clips each stream to a tail and points at the full
+  log file — registered by key at that moment, not on every run, so a check
+  whose output fit leaves no key behind. There is **no** universal
   "nothing above N tokens ever passes" guard in `execute_tool`, so a tool that
   returns a large string directly (e.g. several full `search_docs` chunks) is not
   spilled to disk and summarized — a known gap versus this design.
@@ -365,14 +378,24 @@ Core tools:
 
 * `create_script(kind: bash|python|R|snakemake, registry_key, content)` — writes the
   script, immediately syntax-checks it (§5.2), registers the path.
-* `run_script(registry_key, args)` / `run_bash(content)` — run *and block*,
-  returning captured output as the tool result; `run_bash` writes a throwaway
-  script, `bash -n`-checks it, and runs it through the same tracked runner (it is
-  not a free-form shell — see below). These are the built-in execution tools
-  beyond the §5.1 "core" list.
-* `start_script(registry_key, args)` — runs locally as a tracked **background**
+* `run_bash(content_lines, timeout_s)` — runs *and blocks*, returning captured
+  output as the tool result. Writes a throwaway script, `bash -n`-checks it, and
+  runs it through the same tracked runner (it is not a free-form shell — see
+  below). A `{registry_key}` in a line expands to the registered path, which is
+  how a *kept* script is run synchronously: `{my_script} --flag`. Only keys that
+  exist are substituted, so `awk '{print $1}'` and `${VAR}` survive untouched;
+  an unmatched `{…}` is named in the result if the run then fails.
+  *(The design had a second blocking tool, `run_script(registry_key, args)`, for
+  registered scripts. It was removed: splitting the two by where the script came
+  from gave the model two tools advertising one job, while `{key}` expansion
+  covers the case without carving an exception into the "keys, never paths"
+  rule.)*
+* `start_background_script(registry_key, args)` — runs locally as a tracked **background**
   subprocess (appears in the right column), stdout/stderr captured to files and
   registered; its completion is delivered back into the conversation (§5.4).
+  The split from `run_bash` is *when the result arrives*, not what is run — the
+  one choice the model cannot recover from on its own, which is why it is a
+  separate tool rather than a flag.
 * `submit_job(registry_key, args)` — submits an sbatch script to the cluster,
   records the job ID and log paths in the job DB (§5.4), starts periodic tracking.
   *(The design imagined a `kind: sbatch|snakemake` switch; only the sbatch path is
@@ -386,9 +409,11 @@ Core tools:
   `lookup_symbol` is the exact-match path used by the verification gate (§5.2),
   `search_docs` the embedding path for prose questions, `ask_docs` the firewalled
   doc-researcher sub-loop (§4.2).
-* File operations (`move_file`, `copy_file`, `delete_file`, `read_file`) — destructive
-  ones gated per §5.3. There is **no** `list_dir` tool: registry keys are listed by
-  `list_paths`, and directory contents are read via `run_bash`.
+* File operations (`move_file`, `copy_file`, `delete_file`, `restore_file`,
+  `read_file`) — destructive ones gated per §5.3. There is **no** `list_dir` tool:
+  registry keys are listed by `list_paths`, and directory contents are read via
+  `run_bash`. `restore_file` is the one file tool taking a path instead of a key:
+  the key died with the file.
 
 All subprocess execution goes through **one internal runner** (timeouts, output
 capture, cwd tracking, env control). There is deliberately **no free-form shell tool
@@ -478,10 +503,12 @@ gate (§5.3) or actual submission proceed.
   * *Content-overwriting operations* (in-place edits, overwrites): make a real copy
     first (this is the rarer case).
   * Trash entries carry a TTL (`trash_ttl_days`, default 7) and are cleaned up on
-    app start. *(`TrashManager.restore()`/`.list()` exist and are unit-tested, but
-    are not yet surfaced anywhere in the TUI — the "restore from the inspect view"
-    action is not wired up, so recovery is currently a library capability rather
-    than a user-facing button.)*
+    app start. Recovery is reached by *asking the agent*: the `restore_file` tool
+    wraps `TrashManager.list()`/`.restore()`, taking the file's original path (or
+    its name, or empty to list the trash) because the deletion dropped its registry
+    key. It never gates — restoring only creates a file, and refuses outright when
+    the original path is occupied. *(Still no TUI affordance: the "restore from the
+    inspect view" action is not wired up, so there is no trash browser to click.)*
 * Files ≥ 1 GB: no automatic backup (quota!), but the confirmation modal states this
   explicitly.
 
@@ -529,9 +556,9 @@ turn at no model cost. Both are the same primitive — new input on an existing
 
 Three constraints shape it. Delivery is serialised against live turns, because
 concurrent `ainvoke` on one `thread_id` interleaves checkpoint writes. Only
-`start_script` work qualifies (`background = 1`): `run_script` and `run_bash`
-block and return their output as the tool result, so an event for those would
-report the same failure twice. And `notified` lives in the table rather than in
+`start_background_script` work qualifies (`background = 1`): `run_bash`
+blocks and returns its output as the tool result, so an event for those runs
+would report the same failure twice. And `notified` lives in the table rather than in
 memory, so a job that ends while the TUI is closed is still announced on the
 next start — the watcher reads the table, since a fresh `ProcessRunner` is built
 per turn and no single instance knows about processes an earlier one started.
@@ -758,7 +785,7 @@ hard dependency, LangChain `AgentExecutor`.
    window and constrained-decoding probe.
 4. **LangGraph core:** orchestrator, checkpointed sessions (left column live),
    pydantic validation + retry middleware, path registry.
-5. **Runner + tools:** internal subprocess runner, `create_script`/`start_script`
+5. **Runner + tools:** internal subprocess runner, `create_script`/`start_background_script`
    with dry-run gate, right-column process list (Enter inspects, `k` kills).
 6. **Slurm layer:** job DB, `submit_job`/`job_status`/`cancel_job`, background
    poller, log collection.

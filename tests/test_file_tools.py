@@ -74,7 +74,9 @@ class TestDeleteFile:
         ctx.registry.register("x", f)
         result = await call(tools, "delete_file", ctx, registry_key="x")
         assert not f.exists()
-        assert "recoverable" in result
+        # names the tool that undoes it, not just "the trash": without that the
+        # model tells the user to go dig through the app dir themselves
+        assert "recoverable" in result and "restore_file" in result
         assert "x" not in ctx.registry.list()
         assert ctx.trash.list()[0].original_path == f
 
@@ -139,6 +141,118 @@ class TestDeleteFile:
         )
         assert "escapes" in result
         assert outside.exists()
+
+
+class TestRestoreFile:
+    async def test_not_gated(self, tools, ctx):
+        # restore never overwrites, so it needs no approval modal
+        assert gates(tools, "restore_file", ctx, path="/anything") is False
+
+    async def test_restores_a_deleted_file_and_registers_it(
+        self, tools, ctx, tmp_path
+    ):
+        f = tmp_path / "x.txt"
+        f.write_text("precious")
+        ctx.registry.register("x", f)
+        await call(tools, "delete_file", ctx, registry_key="x")
+        result = await call(tools, "restore_file", ctx, path=str(f))
+        assert f.read_text() == "precious"
+        assert str(f) in result
+        # usable again straight away: the delete dropped the key, restore adds one
+        assert ctx.registry.resolve("x.txt") == f
+        assert ctx.trash.list() == []
+
+    async def test_restores_by_file_name(self, tools, ctx, tmp_path):
+        f = tmp_path / "x.txt"
+        f.write_text("precious")
+        ctx.registry.register("x", f)
+        await call(tools, "delete_file", ctx, registry_key="x")
+        await call(tools, "restore_file", ctx, path="x.txt")
+        assert f.read_text() == "precious"
+
+    async def test_empty_path_lists_the_trash(self, tools, ctx, tmp_path):
+        f = tmp_path / "x.txt"
+        f.write_text("precious")
+        ctx.registry.register("x", f)
+        await call(tools, "delete_file", ctx, registry_key="x")
+        result = await call(tools, "restore_file", ctx)
+        assert str(f) in result
+        assert not f.exists()  # listing restores nothing
+
+    async def test_empty_trash_says_so(self, tools, ctx):
+        assert "empty" in await call(tools, "restore_file", ctx)
+
+    async def test_unknown_path_lists_what_is_there(self, tools, ctx, tmp_path):
+        f = tmp_path / "x.txt"
+        f.write_text("precious")
+        ctx.registry.register("x", f)
+        await call(tools, "delete_file", ctx, registry_key="x")
+        result = await call(tools, "restore_file", ctx, path="ghost.txt")
+        assert "ghost.txt" in result and "no" in result.lower()
+        assert str(f) in result  # ... and what it could have meant instead
+
+    async def test_ambiguous_name_asks_for_the_full_path(self, tools, ctx, tmp_path):
+        victims = []
+        for name in ("a", "b"):
+            d = tmp_path / name
+            d.mkdir()
+            victim = d / "run.log"
+            victim.write_text(name)
+            ctx.registry.register(name, victim)
+            await call(tools, "delete_file", ctx, registry_key=name)
+            victims.append(victim)
+        result = await call(tools, "restore_file", ctx, path="run.log")
+        assert all(str(v) in result for v in victims)
+        assert not any(v.exists() for v in victims)  # nothing guessed at
+
+    async def test_same_path_deleted_twice_restores_the_newest(
+        self, tools, ctx, tmp_path
+    ):
+        f = tmp_path / "x.txt"
+        for content in ("first", "second"):
+            f.write_text(content)
+            ctx.registry.register_auto(f)
+            await call(tools, "delete_file", ctx, registry_key="x.txt")
+        await call(tools, "restore_file", ctx, path=str(f))
+        assert f.read_text() == "second"
+
+    async def test_refuses_when_the_path_is_occupied(self, tools, ctx, tmp_path):
+        f = tmp_path / "x.txt"
+        f.write_text("precious")
+        ctx.registry.register("x", f)
+        await call(tools, "delete_file", ctx, registry_key="x")
+        f.write_text("something new")
+        result = await call(tools, "restore_file", ctx, path=str(f))
+        assert "already exists" in result
+        assert f.read_text() == "something new"
+        assert ctx.trash.list()  # the backup is kept, not consumed
+
+    async def test_unbacked_deletion_reported_as_unrecoverable(
+        self, tools, ctx, tmp_path
+    ):
+        ctx.trash = TrashManager(tmp_path / "trash", backup_limit_bytes=2)
+        f = tmp_path / "big.bin"
+        f.write_text("more than two bytes")
+        ctx.registry.register("big", f)
+        await call(tools, "delete_file", ctx, registry_key="big")
+        result = await call(tools, "restore_file", ctx, path=str(f))
+        assert "without a backup" in result
+        assert not f.exists()
+
+    async def test_restores_a_file_lost_to_an_overwrite(self, tools, ctx, tmp_path):
+        # move_file over an existing target trashes the old file the same way,
+        # so the same tool brings it back once the path is free again
+        f = tmp_path / "a.txt"
+        f.write_text("new content")
+        d = tmp_path / "dest"
+        d.mkdir()
+        (d / "a.txt").write_text("old content")
+        ctx.registry.register("a", f)
+        ctx.registry.register("dest", d)
+        await call(tools, "move_file", ctx, source_key="a", dest_dir_key="dest")
+        (d / "a.txt").unlink()
+        await call(tools, "restore_file", ctx, path=str(d / "a.txt"))
+        assert (d / "a.txt").read_text() == "old content"
 
 
 class TestMoveFile:
