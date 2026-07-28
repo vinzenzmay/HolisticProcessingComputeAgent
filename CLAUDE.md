@@ -5,7 +5,8 @@ Terminal AI agent (Textual TUI) for HPC Slurm clusters. Design doc: [project.md]
 ## Running tests
 
 - `pixi run -e dev test` — the default suite: hermetic unit tests, parallel via
-  pytest-xdist (`-n auto`; ~48s on a 12-core box). Use this for routine verification.
+  pytest-xdist (`-n auto`; 48s–2min on a 12-core box, the upper end when the box
+  is otherwise busy). Use this for routine verification.
 - `pixi run -e dev test-serial` — same tests, serial; use when debugging
   (readable output, `-x`/`--pdb` behave normally).
 - `pixi run -e dev test-live` — the live-backend integration tests
