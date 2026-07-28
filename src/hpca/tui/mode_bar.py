@@ -12,7 +12,6 @@ MODE_HINTS = {
     "manual": "scripts run only with your approval",
     "auto": "works until the task is done",
     "full-auto": "asks for nothing, destructive ops included",
-    "plan": "drafts a checklist, executes nothing",
 }
 # ctrl+m is carriage return in most terminals (it arrives as Enter), so
 # shift+tab is the binding that always works; ctrl+m is bound too for
@@ -35,9 +34,6 @@ class ModeBar(Static):
     }
     ModeBar.mode-full-auto {
         color: $error;
-    }
-    ModeBar.mode-plan {
-        color: $accent;
     }
     """
 

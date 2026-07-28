@@ -65,8 +65,8 @@ your skills (invoke a skill with `/<skill>`; see *Skills* below).
 * **Concurrent per-session turns** — each session runs its own agent turn
   independently, with a per-session model line, working indicator, and context
   meter, so one session can be busy while you work in another.
-* **Agent modes** — `manual`, `auto`, `full auto`, and `plan` control how much
-  the agent does on its own versus asking first (see *Agent modes* below).
+* **Agent modes** — `manual`, `auto` and `full auto` control how much the agent
+  does on its own versus asking first (see *Agent modes* below).
 * **Single orchestrator + firewalled sub-loops** — one orchestrating agent holds
   the full tool registry and delegates two narrowly-scoped jobs to context-isolated
   sub-loops: a **doc-researcher** (RAG questions, via the `ask_docs` tool) and a
@@ -116,7 +116,7 @@ your skills (invoke a skill with `/<skill>`; see *Skills* below).
 
 ## Agent modes
 
-Each session runs in one of four modes, shown on the line right above the chat
+Each session runs in one of three modes, shown on the line right above the chat
 entry and cycled with `shift+tab` (`ctrl+m` also works in terminals whose
 keyboard protocol can distinguish it from Enter — most cannot):
 
@@ -129,10 +129,11 @@ keyboard protocol can distinguish it from Enter — most cannot):
 * **full auto** — auto without the destructive-operation approvals: nothing
   pauses, nothing asks. The trash/backup layer still backs deletions and
   overwrites of small files, but this mode is otherwise on your own risk.
-* **plan** — the agent executes nothing and instead drafts a checklist
-  (look-around commands each ask first). When a plan is ready, a dialog lets you
-  edit the checklist and hand it over for execution — on auto (`ctrl+r`) or
-  step-by-step under manual approval (`ctrl+e`) — or keep refining it (`esc`).
+
+There was a fourth, `plan`, in which the agent executed nothing and drafted a
+checklist for you to approve. It is gone: the `/plan` skill below does the same
+job better — it settles the decisions with you first and writes the plan to a
+file that outlives the session — with no mode to enter and leave.
 
 New sessions start in `agent.default_mode` (settings, default `manual`); each
 session remembers its own mode across restarts.
@@ -176,7 +177,7 @@ Two ship with HPCA, both aimed at settling a plan before any of it gets built:
   directory: the settled decisions and their reasoning, the files to touch, the
   steps in order, and how to verify them — detailed enough to implement in a fresh
   session that saw none of the conversation. It stops there; building is a separate
-  session. Use it instead of plan mode when the plan needs to survive the session.
+  session. This replaced the old `plan` mode.
 
 ### Create a skill
 

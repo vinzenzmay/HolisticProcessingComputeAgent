@@ -184,7 +184,7 @@ Settings block:
 switches. `command` (e.g. `"xclip -selection clipboard"`, `"wl-copy"`) covers exotic
 setups: content is piped to the command's stdin.
 
-### 3.5 Agent modes (manual / auto / plan)
+### 3.5 Agent modes (manual / auto / full-auto)
 
 Each session has an interaction mode, indicated on a single line directly above
 the chat entry and cycled with **shift+tab** (ctrl+m is bound as well, but most
@@ -212,27 +212,22 @@ round, so switching applies immediately — even to a turn already in flight.
   backups, TTL restore) still stands behind every deletion and overwrite,
   and the prompt tells the model to verify paths itself and to list every
   destructive action in its final report.
-* **plan** — nothing *new* is built or submitted. Enforcement is structural, not
-  prompt-trust: `create_script`, `start_background_script` and `submit_job` are
-  withdrawn from the registry offered to `decide()` (a tool never offered cannot
-  be called). `run_bash` is kept so the plan can be
-  grounded in what is actually on disk; it runs unattended (only the §5.3
-  destructive gate still applies) rather than pausing for approval like manual —
-  look-around commands are cheap and gating each one made planning tedious.
-  Since `run_bash` expands `{key}`, a script registered in an earlier turn can
-  still be run from plan mode by naming it — withdrawal stops new scripts being
-  built, not every path to executing an old one. Closing that would mean
-  rejecting the call after the model emitted it, which costs more than the hole.
-  The
-  model maintains a checklist through an `update_plan` tool; the checklist lives
-  in the checkpointed graph state (`AgentState.plan`) and is re-injected into the
-  system prompt every round, so it survives restarts and context compaction.
-  When a plan-mode turn ends with a plan, the same inline decision bar shows the
-  editable checklist and offers: execute on auto (`ctrl+r`), execute
-  step-by-step under manual approval (`ctrl+e`), or keep planning (`esc`).
-  Approval switches the session's mode and starts execution with a
-  `[plan approved]` event turn; during execution the plan stays in the prompt
-  and the model checks steps off via `update_plan`.
+A fourth mode, **plan**, was removed. It withdrew `create_script`,
+`start_background_script` and `submit_job` from the registry offered to
+`decide()`, made the model hand its checklist over through a `present_plan`
+tool, and let the inline decision bar start execution on auto (`ctrl+r`) or
+step-by-step (`ctrl+e`). The shipped `/plan` skill (§5.1) does the job better:
+it grills the user to a shared understanding first and writes the plan to a
+`specs.md` that outlives the session, with no mode to enter and leave. Its
+structural guarantee had also always been softer than it read — `run_bash`
+stayed available and runs arbitrary bash, so a script registered in an earlier
+turn could be executed by naming its path.
+
+The `update_plan` checklist outlived the mode: the model maintains it in every
+mode, it lives in the checkpointed graph state (`AgentState.plan`), and it is
+re-injected into the system prompt every round, so it survives restarts and
+context compaction — a prompt-only checklist is forgotten as soon as compaction
+folds the instruction away.
 
 Mode guidance is appended to the system prompt per render (§4.3), never stored,
 and the per-mode gating decision is made in the graph's `execute_tool` node —
