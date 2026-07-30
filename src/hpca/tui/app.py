@@ -377,6 +377,9 @@ class ChatInput(TextArea):
     log. The row check is wrap-aware, so ↑/↓ still step through a long draft
     that soft-wraps onto several rows even though it is one logical line.
     The draft is kept, so the user can step away mid-sentence and come back.
+    It belongs to the session, not to this widget: one entry serves them all,
+    so switching sessions parks the text under the session being left and puts
+    that session's own back (see ``HpcaApp._park_draft``/``_restore_draft``).
     """
 
     NEWLINE_KEYS = ("shift+enter", "alt+enter", "ctrl+j")
@@ -992,6 +995,13 @@ class HpcaApp(App):
         self._command_matches: list[tuple[str, str]] = []
         self._command_index: int = 0
         self._log: SessionLog | None = None
+        # Unsent text per session (session_id → draft), for sessions that are
+        # not the one on screen. One entry widget serves every session, so
+        # without this a half-written message follows the user into the next
+        # session — where it reads as that session's draft and is one Enter
+        # away from being sent to the wrong thread. Held for the run only: a
+        # draft is a thought in progress, not part of the transcript.
+        self._drafts: dict[str, str] = {}
         self._untitled: set[str] = set()  # sessions awaiting their first title
         self._updated: set[str] = set()  # replies that landed while switched away
         # In-flight turns, keyed by session_id. Turns on different sessions run
@@ -1591,7 +1601,17 @@ class HpcaApp(App):
         except Exception as e:
             self.notify(f"Interrupt cleanup failed: {e}", severity="error")
             surviving = None
-        if self._is_active_session(session) and surviving is not None:
+        if not self._is_active_session(session):
+            # Switched away while the rollback ran: the message belongs to the
+            # session it was typed in, so park it as that session's draft
+            # rather than dropping it into whichever entry is on screen now.
+            self._store_draft(session.session_id, text)
+            self.notify(
+                f"Interrupted “{session.title}” — the message is waiting there."
+            )
+            self.call_later(self.drain_work)
+            return
+        if surviving is not None:
             await self._set_chat_messages(surviving)
         found = self.query("#chat-input")
         if found:  # absent only if the screen is tearing down
@@ -2612,7 +2632,38 @@ class HpcaApp(App):
             )
         return ctx
 
+    def _park_draft(self) -> None:
+        """Take the unsent text out of the entry and keep it under the session
+        being left, so it is waiting there on the way back."""
+        if self.active_session is None:
+            return
+        found = self.query("#chat-input")
+        if not found:  # the screen is tearing down: nothing to keep
+            return
+        self._store_draft(self.active_session.session_id, found.first(ChatInput).text)
+
+    def _store_draft(self, session_id: str, text: str) -> None:
+        """Remember (or forget, when empty) one session's unsent text."""
+        if text:
+            self._drafts[session_id] = text
+        else:
+            self._drafts.pop(session_id, None)
+
+    def _restore_draft(self, session: Session) -> None:
+        """Put the session's own unsent text back in the entry, cursor behind
+        it, so a message interrupted by a switch continues where it stopped.
+
+        Dropped from the store as it goes on screen: what is in the entry is
+        the live draft, and only sessions the user has left are parked here.
+        """
+        chat_input = self.query_one("#chat-input", ChatInput)
+        chat_input.text = self._drafts.pop(session.session_id, "")
+        chat_input.move_cursor(chat_input.document.end)
+
     def _activate_session(self, session: Session) -> None:
+        # Whatever is half-typed belongs to the session being left, not to the
+        # one being opened (per-session drafts).
+        self._park_draft()
         # A session boundary is a deliberate refresh point (redesign Phase 1):
         # memories written by another session or instance are picked up here,
         # while WITHIN a session the frozen snapshot keeps the prompt prefix
@@ -2620,6 +2671,7 @@ class HpcaApp(App):
         self._refresh_memory_snapshot(session.profile)
         self.active_session = session
         self._refresh_session_log()
+        self._restore_draft(session)
         self.query_one("#chat-input", ChatInput).display = True
         self._refresh_mode_bar()
         # The top bar and context meter follow the opened session's LLM.
@@ -2876,6 +2928,7 @@ class HpcaApp(App):
         # live turn defensively, so nothing leaks past the delete.
         self._context_used.pop(session.session_id, None)
         self._turns.pop(session.session_id, None)
+        self._drafts.pop(session.session_id, None)  # unsent text goes too
         self.session_store.delete(session.session_id)
         # Patient-data environment: a deleted conversation must not resurface
         # through episodic search either.
@@ -2922,6 +2975,10 @@ class HpcaApp(App):
         # growth since); a running turn re-stores its count when it reports.
         if self.active_session is not None:
             self._context_used.pop(self.active_session.session_id, None)
+        # The draft is not dropped with it — leaving a session is how you go
+        # and look something up, and coming back finds the sentence intact.
+        self._park_draft()
+        self.query_one("#chat-input", ChatInput).text = ""
         self.active_session = None
         self._tool_ctx = None
         self._log = None

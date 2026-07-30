@@ -135,6 +135,32 @@ class TestInterrupt:
             )
             assert (snap.values or {}).get("messages", []) == []
 
+    async def test_message_goes_back_to_its_own_session_not_the_open_one(
+        self, hpca_home
+    ):
+        """Switching sessions while the rollback runs must not drop the
+        interrupted message into the entry of whatever is now on screen — it
+        waits as a draft in the session it was typed in."""
+        app = HpcaApp(llm=BlockingLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await send_and_park(app, pilot, "typed in the first session")
+            interrupted = app.active_session
+            ts = app._turns[interrupted.session_id]
+            elsewhere = app.session_store.create(profile="default", title="second")
+            await app.open_session(elsewhere)
+            await pilot.pause()
+
+            await app._interrupt_turn(
+                interrupted, ts.interrupt_keep, ts.user_text, ts.worker
+            )
+            await pilot.pause()
+
+            chat_input = app.query_one("#chat-input", ChatInput)
+            assert chat_input.text == ""  # the open session's entry is untouched
+            await app.open_session(interrupted)
+            await pilot.pause()
+            assert chat_input.text == "typed in the first session"
+
     async def test_declining_leaves_the_turn_running(self, hpca_home):
         app = HpcaApp(llm=BlockingLLM())
         async with app.run_test(size=(120, 40)) as pilot:
