@@ -274,6 +274,11 @@ class TurnState:
     # transcript rebuild re-adds it while the graph copy still predates it.
     user_text: str | None = None
     activity: str = "working"             # what the spinner says (decision 7)
+    # When this turn began. Lives here, not on the spinner widget, because the
+    # widget is rebuilt every time the session is re-opened — reading the clock
+    # off the widget restarted it at 0 on every visit, so a turn the user had
+    # been waiting on for two minutes claimed to be three seconds old.
+    started: float = field(default_factory=monotonic)
 
 
 # Built-in chat commands ("/" or "\"): typing the prefix lists these above the
@@ -559,21 +564,27 @@ class WorkingIndicator(Static):
 
     A turn is silent for seconds, or minutes with thinking on, and a still
     screen looks like a hung one. It names the step the graph reports —
-    thinking, or the tool in flight — and times that step, which is how you
-    tell a slow answer from a lost one.
+    thinking, or the tool in flight — and counts up from the moment the turn
+    started, which is how you tell a slow answer from a lost one.
+
+    The count belongs to the turn (``TurnState.started``), not to this widget:
+    leaving a session and coming back rebuilds the widget, and a clock owned
+    here would start again from zero each visit.
     """
 
     FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     INTERVAL = 0.08
 
-    def __init__(self, activity: str = "working") -> None:
+    def __init__(self, activity: str = "working", started: float | None = None) -> None:
         super().__init__(classes="chat-working")
         self._frame = 0
         self._activity = activity
-        self._started = monotonic()
+        # Supplied by the caller for a turn already running (see TurnState);
+        # minted here only for a one-off backend call that has no turn.
+        self._started = monotonic() if started is None else started
+        self._width = -1  # last rendered width; see _render_frame
 
     def on_mount(self) -> None:
-        self._started = monotonic()
         self.set_interval(self.INTERVAL, self._advance)
         self._render_frame()
 
@@ -586,12 +597,16 @@ class WorkingIndicator(Static):
         return int(monotonic() - self._started)
 
     def set_activity(self, activity: str) -> None:
-        """Name the step now in flight; its clock starts over, so the number
-        answers "is this step stuck?" rather than "how long since I asked?"."""
+        """Name the step now in flight, leaving the clock alone.
+
+        The number answers "how long since I asked?", which is the question
+        the user actually has while waiting. Timing each step separately read
+        better in theory but hid the total: a turn that spent a minute across
+        four steps never showed a number above twenty.
+        """
         if activity == self._activity:
             return
         self._activity = activity
-        self._started = monotonic()
         self._render_frame()
 
     def _advance(self) -> None:
@@ -606,7 +621,17 @@ class WorkingIndicator(Static):
         return f"{self.FRAMES[self._frame]} {self._activity}…{elapsed}{hint}"
 
     def _render_frame(self) -> None:
-        self.update(Content(self._frame_text()))
+        # `Static.update` lays out by default, and a layout pass walks the
+        # whole chat log — O(messages). At 12.5 frames a second that made the
+        # TUI crawl for as long as a reply was in flight, and worse the longer
+        # the conversation: measured event-loop lag went from 0.7ms to 44ms
+        # (p95) at 300 messages, which is exactly the window where the user is
+        # waiting and most likely to scroll or type. Between most frames only
+        # the spinner glyph changes, and a line of the same width cannot move
+        # anything below it, so only a change in width earns a layout.
+        text = self._frame_text()
+        self.update(Content(text), layout=len(text) != self._width)
+        self._width = len(text)
 
 
 class DecisionBar(Vertical):
@@ -1731,13 +1756,15 @@ class HpcaApp(App):
         chat_list = self._chat_list()
         if chat_list is None:
             return
+        started = None
         if label is not None:
             activity = label
         else:
             ts = self._active_turn()
             activity = ts.activity if ts is not None else "working"
+            started = ts.started if ts is not None else None
         if not chat_list.query(WorkingIndicator):
-            chat_list.append(ChatItem(WorkingIndicator(activity)))
+            chat_list.append(ChatItem(WorkingIndicator(activity, started=started)))
             chat_list.scroll_end(animate=False)
 
     @asynccontextmanager
