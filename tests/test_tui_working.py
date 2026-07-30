@@ -226,12 +226,14 @@ class TestSpinnerText:
             llm.released.set()
             await app.workers.wait_for_complete()
 
-    async def test_a_new_step_restarts_the_clock(self, hpca_home):
+    async def test_a_new_step_does_not_restart_the_clock(self, hpca_home):
+        # The number answers "how long since I asked?", so it keeps running
+        # across the steps of one turn.
         spinner = WorkingIndicator("LLM processing")
         spinner._started -= 30  # as if it had been thinking for half a minute
         assert spinner.elapsed >= 30
         spinner.set_activity("running list_dir")
-        assert spinner.elapsed == 0  # the tool step times itself
+        assert spinner.elapsed >= 30
         assert spinner.activity == "running list_dir"
 
     async def test_repeating_the_same_step_does_not_restart_the_clock(self, hpca_home):
@@ -239,3 +241,92 @@ class TestSpinnerText:
         spinner._started -= 30
         spinner.set_activity("LLM processing")
         assert spinner.elapsed >= 30
+
+
+class TestClockSurvivesLeavingTheSession:
+    """The count is "how long since I sent it", so it must not restart when
+    the user looks at another session and comes back — the spinner widget is
+    rebuilt on the way back, and it used to bring a fresh clock with it."""
+
+    async def test_switching_away_and_back_keeps_the_elapsed_time(
+        self, hpca_home
+    ):
+        llm = SlowLLM([respond_json("ok")])
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await send(app, pilot)
+            await wait_for_spinner(app, pilot)
+            waiting = app.active_session
+            # as if the user had been waiting on this turn for half a minute
+            app._turns[waiting.session_id].started -= 30
+
+            await app.start_new_session()  # switches away
+            await pilot.pause()
+            assert not list(app.query(WorkingIndicator))  # the new one is idle
+
+            await app.open_session(waiting)
+            spinner = await wait_for_spinner(app, pilot)
+            assert spinner.elapsed >= 30, "the clock restarted on the way back"
+            assert f"{spinner.elapsed}s" in str(spinner.content)
+
+            llm.released.set()
+            await app.workers.wait_for_complete()
+
+    async def test_a_backend_call_without_a_turn_still_times_itself(
+        self, hpca_home
+    ):
+        # /conclude and friends have no TurnState to read a start from; they
+        # pass a label and the spinner mints its own clock.
+        app = HpcaApp(llm=SlowLLM([]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            await pilot.pause()
+            app.show_working("summarising")
+            spinner = await wait_for_spinner(app, pilot)
+            assert spinner.activity == "summarising"
+            assert spinner.elapsed == 0
+
+
+class TestSpinnerRepaintIsCheap:
+    """The spinner repaints 12.5 times a second for the whole time a reply is
+    in flight, and `Static.update` lays out by default — a pass that walks the
+    chat log. With a few hundred messages that alone made the TUI crawl
+    exactly while the user was waiting (measured: 0.7ms → 44ms p95 loop lag).
+    Only a change in the line's width can move anything, so only that lays
+    out."""
+
+    def layout_calls(self, spinner):
+        calls = []
+        spinner.update = lambda content, **kw: calls.append(kw.get("layout"))
+        return calls
+
+    async def test_a_frame_advance_does_not_lay_out(self, hpca_home):
+        spinner = WorkingIndicator("LLM processing")
+        spinner._render_frame()  # first paint establishes the width
+        calls = self.layout_calls(spinner)
+        spinner._advance()
+        spinner._advance()
+        assert calls == [False, False]
+
+    async def test_the_first_paint_lays_out(self, hpca_home):
+        spinner = WorkingIndicator("LLM processing")
+        calls = self.layout_calls(spinner)
+        spinner._render_frame()
+        assert calls == [True]
+
+    async def test_a_wider_line_lays_out(self, hpca_home):
+        spinner = WorkingIndicator("LLM processing")
+        spinner._render_frame()
+        calls = self.layout_calls(spinner)
+        spinner.set_activity("running a_considerably_longer_tool_name")
+        assert calls == [True]
+
+    async def test_the_seconds_ticking_over_lays_out(self, hpca_home):
+        # " 9s" → " 10s" widens the line, so that frame earns its layout.
+        spinner = WorkingIndicator("LLM processing")
+        spinner._started -= 9
+        spinner._render_frame()
+        calls = self.layout_calls(spinner)
+        spinner._started -= 1  # now reads 10s
+        spinner._advance()
+        assert calls == [True]

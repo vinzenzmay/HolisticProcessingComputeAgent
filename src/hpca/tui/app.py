@@ -274,6 +274,11 @@ class TurnState:
     # transcript rebuild re-adds it while the graph copy still predates it.
     user_text: str | None = None
     activity: str = "working"             # what the spinner says (decision 7)
+    # When this turn began. Lives here, not on the spinner widget, because the
+    # widget is rebuilt every time the session is re-opened — reading the clock
+    # off the widget restarted it at 0 on every visit, so a turn the user had
+    # been waiting on for two minutes claimed to be three seconds old.
+    started: float = field(default_factory=monotonic)
 
 
 # Built-in chat commands ("/" or "\"): typing the prefix lists these above the
@@ -291,6 +296,13 @@ COMMANDS = (
     ("skills-list", "/skills-list — list this profile's skills"),
     ("skill-remove", "/skill-remove — remove one of this profile's skills"),
 )
+# How the "/" menu marks its own commands apart from the profile's skills:
+# the built-in's name is bold, everything else is left alone. A plain ANSI
+# attribute, not a theme variable — a span style is parsed at paint time, and
+# `$text` there raises UnresolvedVariableError (variables resolve in CSS and
+# markup, not in assembled spans). The legend in the border title is what
+# makes the mark readable — bold alone says an entry is special, not why.
+BUILTIN_COMMAND_STYLE = "bold"
 LOG_KINDS = {
     "user": "user",
     "assistant": "agent",
@@ -559,21 +571,27 @@ class WorkingIndicator(Static):
 
     A turn is silent for seconds, or minutes with thinking on, and a still
     screen looks like a hung one. It names the step the graph reports —
-    thinking, or the tool in flight — and times that step, which is how you
-    tell a slow answer from a lost one.
+    thinking, or the tool in flight — and counts up from the moment the turn
+    started, which is how you tell a slow answer from a lost one.
+
+    The count belongs to the turn (``TurnState.started``), not to this widget:
+    leaving a session and coming back rebuilds the widget, and a clock owned
+    here would start again from zero each visit.
     """
 
     FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     INTERVAL = 0.08
 
-    def __init__(self, activity: str = "working") -> None:
+    def __init__(self, activity: str = "working", started: float | None = None) -> None:
         super().__init__(classes="chat-working")
         self._frame = 0
         self._activity = activity
-        self._started = monotonic()
+        # Supplied by the caller for a turn already running (see TurnState);
+        # minted here only for a one-off backend call that has no turn.
+        self._started = monotonic() if started is None else started
+        self._width = -1  # last rendered width; see _render_frame
 
     def on_mount(self) -> None:
-        self._started = monotonic()
         self.set_interval(self.INTERVAL, self._advance)
         self._render_frame()
 
@@ -586,12 +604,16 @@ class WorkingIndicator(Static):
         return int(monotonic() - self._started)
 
     def set_activity(self, activity: str) -> None:
-        """Name the step now in flight; its clock starts over, so the number
-        answers "is this step stuck?" rather than "how long since I asked?"."""
+        """Name the step now in flight, leaving the clock alone.
+
+        The number answers "how long since I asked?", which is the question
+        the user actually has while waiting. Timing each step separately read
+        better in theory but hid the total: a turn that spent a minute across
+        four steps never showed a number above twenty.
+        """
         if activity == self._activity:
             return
         self._activity = activity
-        self._started = monotonic()
         self._render_frame()
 
     def _advance(self) -> None:
@@ -606,7 +628,17 @@ class WorkingIndicator(Static):
         return f"{self.FRAMES[self._frame]} {self._activity}…{elapsed}{hint}"
 
     def _render_frame(self) -> None:
-        self.update(Content(self._frame_text()))
+        # `Static.update` lays out by default, and a layout pass walks the
+        # whole chat log — O(messages). At 12.5 frames a second that made the
+        # TUI crawl for as long as a reply was in flight, and worse the longer
+        # the conversation: measured event-loop lag went from 0.7ms to 44ms
+        # (p95) at 300 messages, which is exactly the window where the user is
+        # waiting and most likely to scroll or type. Between most frames only
+        # the spinner glyph changes, and a line of the same width cannot move
+        # anything below it, so only a change in width earns a layout.
+        text = self._frame_text()
+        self.update(Content(text), layout=len(text) != self._width)
+        self._width = len(text)
 
 
 class DecisionBar(Vertical):
@@ -902,7 +934,9 @@ class HpcaApp(App):
         height: auto;
         border: round $accent;
         border-title-color: $accent;
-        color: $text-muted;
+        /* Not muted: the menu carries its own distinction in weight (a
+           built-in's name is bold), so the text itself sits at full strength. */
+        color: $text;
         padding: 0 1;
     }
     /* A reply landed in a session the user has left: frame it, never
@@ -1447,7 +1481,9 @@ class HpcaApp(App):
         self._command_index = next(
             (i for i, (name, _) in enumerate(matches) if name == previous), 0
         )
-        menu.border_title = "commands  (↑/↓ select · ⇥ complete)"
+        menu.border_title = (
+            "commands  (bold = built-in · ↑/↓ select · ⇥ complete)"
+        )
         self._render_command_menu()
         menu.display = True
 
@@ -1498,12 +1534,34 @@ class HpcaApp(App):
             return {}
 
     def _render_command_menu(self) -> None:
+        """Draw the match list, marking which entries are HPCA's own.
+
+        The menu mixes two things the user cannot otherwise tell apart: HPCA's
+        built-in commands and the profile's skills. Only a built-in's ``/name``
+        is marked — bolding the description too would make half the menu shout
+        and bury the names it is there to help pick between, and skills need no
+        mark of their own once the built-ins carry one.
+
+        Assembled as styled spans rather than markup: a skill's description is
+        user-written, and a markup parse would eat its brackets.
+        """
         menu = self.query_one("#command-menu", Static)
-        lines = [
-            f"{'▶ ' if i == self._command_index else '  '}{usage}"
-            for i, (_, usage) in enumerate(self._command_matches)
-        ]
-        menu.update(Content("\n".join(lines)))
+        builtin = {name for name, _ in COMMANDS}
+        parts: list = []
+        for i, (name, usage) in enumerate(self._command_matches):
+            if i:
+                parts.append("\n")
+            parts.append("▶ " if i == self._command_index else "  ")
+            if name not in builtin:
+                parts.append(usage)
+                continue
+            head = f"/{name}"
+            if usage.startswith(head):
+                parts.append((head, BUILTIN_COMMAND_STYLE))
+                parts.append(usage[len(head):])
+            else:  # a usage string that does not open with its own name
+                parts.append((usage, BUILTIN_COMMAND_STYLE))
+        menu.update(Content.assemble(*parts))
 
     def command_menu_active(self) -> bool:
         """Whether the autocomplete menu is showing selectable matches."""
@@ -1731,13 +1789,15 @@ class HpcaApp(App):
         chat_list = self._chat_list()
         if chat_list is None:
             return
+        started = None
         if label is not None:
             activity = label
         else:
             ts = self._active_turn()
             activity = ts.activity if ts is not None else "working"
+            started = ts.started if ts is not None else None
         if not chat_list.query(WorkingIndicator):
-            chat_list.append(ChatItem(WorkingIndicator(activity)))
+            chat_list.append(ChatItem(WorkingIndicator(activity, started=started)))
             chat_list.scroll_end(animate=False)
 
     @asynccontextmanager
