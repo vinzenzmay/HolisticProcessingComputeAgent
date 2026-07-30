@@ -85,8 +85,13 @@ Terminals in 2026 are assumed wider than 80 columns
 * **ESC** ends the current interaction / closes modal / returns focus.
 * Interactions are resolved via modal prompts or the bottom hotkey bar:
   * *Session (left column):* open into the center chat window.
-  * *Chat message (center):* `(b)` go back in conversation to this point,
-    `(c)` copy content to clipboard.
+  * *Chat message (center):* **Enter** on one of your own messages (including a
+    queued one) puts its text back in the entry — appended on its own line to
+    whatever is already being written, so nothing typed is lost — which is how
+    a command is re-sent with one word changed. Enter on a thinking box expands
+    it, and on anything else (the agent's replies, background events, recalled
+    memory) simply hands focus to the entry. `(b)` go back in conversation to
+    this point, `(c)` copy content to clipboard.
   * *Sub-process / job (right column):* **Enter** inspects (opens the
     logs/status view), `(k)` kills the selected local process (with
     confirmation). (The design once envisaged an `(a)` "ask a Q&A subagent about

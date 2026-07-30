@@ -225,6 +225,11 @@ WORKING_MARK = "⟳ "
 # in the chat log and confirming (see _maybe_interrupt_llm), so the message can
 # be re-edited and sent again.
 LLM_WAIT_ACTIVITY = "LLM processing"
+# The chat kinds that are the user's own words — what Enter on a message in the
+# log offers back for reuse. "queued" is the same text, typed ahead of a
+# running turn; everything else in the log (the agent's replies, background
+# events, recalled memory) is not something the user would send again.
+OWN_MESSAGE_KINDS = ("user", "queued")
 CHAT_TITLES = {
     "user": "you",
     "assistant": "agent",
@@ -3566,7 +3571,9 @@ class HpcaApp(App):
         part. Consulting ``_thinking_expanded`` keeps a box open across a
         re-render rather than snapping it shut."""
         if entry.kind != THINKING:
-            return [ChatItem(self._entry_widget(entry))]
+            item = ChatItem(self._entry_widget(entry))
+            item.data_entry = entry  # what activating the row acts on
+            return [item]
         state = self._thinking_expanded.setdefault(id(entry), _ThinkingExpansion())
         items = [ChatItem(ThinkingBox(entry, expanded=state.open))]
         if state.open:
@@ -3677,9 +3684,30 @@ class HpcaApp(App):
         boxes = list(event.item.query(ThinkingBox))
         if boxes:
             await self._toggle_thinking(event.item, boxes[0])
+            return
+        entry = getattr(event.item, "data_entry", None)
+        if entry is not None and entry.kind in OWN_MESSAGE_KINDS:
+            self.reuse_message(entry.text)
         else:
-            # Enter on a message moves to the input (message actions later)
+            # Anything else in the log: Enter just moves to the input.
             self.focus_chat_input()
+
+    def reuse_message(self, text: str) -> None:
+        """Put one of the user's own past messages back in the entry, to send
+        again or edit into the next one — usually a command that needs a word
+        changed, which is otherwise retyped from the screen.
+
+        Added to whatever is already being written rather than replacing it, so
+        activating a message can never lose a draft. It starts its own line,
+        except after a draft the user left ending in whitespace — that space is
+        how you say "continue here" (``rerun this: `` + the old command).
+        """
+        chat_input = self.query_one("#chat-input", ChatInput)
+        draft = chat_input.text
+        if draft and not draft[-1].isspace():
+            draft += "\n"
+        chat_input.text = draft + text
+        self.focus_chat_input()  # focused, cursor behind the reused text
 
     async def _toggle_thinking(self, item: ChatItem, box: ThinkingBox) -> None:
         """Expand a thinking box into its parts (or fold them away again),
