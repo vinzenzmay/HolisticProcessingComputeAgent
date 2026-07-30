@@ -296,6 +296,13 @@ COMMANDS = (
     ("skills-list", "/skills-list — list this profile's skills"),
     ("skill-remove", "/skill-remove — remove one of this profile's skills"),
 )
+# How the "/" menu marks its own commands apart from the profile's skills:
+# the built-in's name is bold, everything else is left alone. A plain ANSI
+# attribute, not a theme variable — a span style is parsed at paint time, and
+# `$text` there raises UnresolvedVariableError (variables resolve in CSS and
+# markup, not in assembled spans). The legend in the border title is what
+# makes the mark readable — bold alone says an entry is special, not why.
+BUILTIN_COMMAND_STYLE = "bold"
 LOG_KINDS = {
     "user": "user",
     "assistant": "agent",
@@ -927,7 +934,9 @@ class HpcaApp(App):
         height: auto;
         border: round $accent;
         border-title-color: $accent;
-        color: $text-muted;
+        /* Not muted: the menu carries its own distinction in weight (a
+           built-in's name is bold), so the text itself sits at full strength. */
+        color: $text;
         padding: 0 1;
     }
     /* A reply landed in a session the user has left: frame it, never
@@ -1472,7 +1481,9 @@ class HpcaApp(App):
         self._command_index = next(
             (i for i, (name, _) in enumerate(matches) if name == previous), 0
         )
-        menu.border_title = "commands  (↑/↓ select · ⇥ complete)"
+        menu.border_title = (
+            "commands  (bold = built-in · ↑/↓ select · ⇥ complete)"
+        )
         self._render_command_menu()
         menu.display = True
 
@@ -1523,12 +1534,34 @@ class HpcaApp(App):
             return {}
 
     def _render_command_menu(self) -> None:
+        """Draw the match list, marking which entries are HPCA's own.
+
+        The menu mixes two things the user cannot otherwise tell apart: HPCA's
+        built-in commands and the profile's skills. Only a built-in's ``/name``
+        is marked — bolding the description too would make half the menu shout
+        and bury the names it is there to help pick between, and skills need no
+        mark of their own once the built-ins carry one.
+
+        Assembled as styled spans rather than markup: a skill's description is
+        user-written, and a markup parse would eat its brackets.
+        """
         menu = self.query_one("#command-menu", Static)
-        lines = [
-            f"{'▶ ' if i == self._command_index else '  '}{usage}"
-            for i, (_, usage) in enumerate(self._command_matches)
-        ]
-        menu.update(Content("\n".join(lines)))
+        builtin = {name for name, _ in COMMANDS}
+        parts: list = []
+        for i, (name, usage) in enumerate(self._command_matches):
+            if i:
+                parts.append("\n")
+            parts.append("▶ " if i == self._command_index else "  ")
+            if name not in builtin:
+                parts.append(usage)
+                continue
+            head = f"/{name}"
+            if usage.startswith(head):
+                parts.append((head, BUILTIN_COMMAND_STYLE))
+                parts.append(usage[len(head):])
+            else:  # a usage string that does not open with its own name
+                parts.append((usage, BUILTIN_COMMAND_STYLE))
+        menu.update(Content.assemble(*parts))
 
     def command_menu_active(self) -> bool:
         """Whether the autocomplete menu is showing selectable matches."""

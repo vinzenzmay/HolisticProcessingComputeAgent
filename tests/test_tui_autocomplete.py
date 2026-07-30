@@ -4,6 +4,8 @@ import pytest
 
 from hpca.db import command_use_counts, connect, init_db, record_command_use
 from hpca.skills import load_builtin_skills
+from textual.widgets import Static
+
 from hpca.tui.app import COMMANDS, ChatInput, HpcaApp
 
 
@@ -164,3 +166,84 @@ class TestMistyped:
             await pilot.pause()
             assert chat_input.text == ""
             assert command_use_counts(app._conn).get("skills-list") == 1
+
+
+class TestBuiltinHighlight:
+    """The menu mixes HPCA's own commands with the profile's skills, which
+    look identical otherwise; a built-in's name is bold, skills are left
+    alone, and the border title says what the bold means."""
+
+    def styled_usages(self, app):
+        """{usage text: style} read back off the rendered Content — the spans
+        are what actually reaches the screen."""
+        content = app.query_one("#command-menu", Static).render()
+        return {
+            content.plain[span.start : span.end]: span.style
+            for span in content.spans
+        }
+
+    async def test_only_the_builtin_name_is_bold(self, hpca_home):
+        app = HpcaApp()
+        async with app.run_test(size=(120, 40)):
+            app._update_command_menu("/")
+            styled = self.styled_usages(app)
+            builtin = {name for name, _ in COMMANDS}
+            for name, usage in app._command_matches:
+                if name in builtin:
+                    # the name carries the mark, the description does not
+                    assert styled[f"/{name}"] == "bold", name
+                    assert usage not in styled, name
+                else:  # a skill needs no mark of its own
+                    assert usage not in styled, name
+
+    async def test_skills_carry_no_styling_at_all(self, hpca_home):
+        app = HpcaApp()
+        async with app.run_test(size=(120, 40)):
+            app._update_command_menu("/")
+            builtin = {name for name, _ in COMMANDS}
+            # every span belongs to a built-in name; nothing else is touched
+            assert set(self.styled_usages(app)) == {
+                f"/{name}" for name, _ in app._command_matches if name in builtin
+            }
+
+    async def test_the_description_is_left_unstyled(self, hpca_home):
+        # "/memorize <note> — form memories…": only "/memorize" is bold, so
+        # the argument hint and the prose read as ordinary text.
+        app = HpcaApp()
+        async with app.run_test(size=(120, 40)):
+            app._update_command_menu("/memorize")
+            bolded = [
+                text for text, style in self.styled_usages(app).items()
+                if style == "bold"
+            ]
+            assert bolded == ["/memorize"]
+            assert "<note>" in app.query_one("#command-menu", Static).render().plain
+
+    async def test_the_styles_survive_being_painted(self, hpca_home):
+        # A span style is parsed at paint time, and a theme variable there
+        # (`bold $text`) raises UnresolvedVariableError — which inspecting the
+        # spans alone would never catch. Parse them the way rendering does.
+        from textual.style import Style
+
+        app = HpcaApp()
+        async with app.run_test(size=(120, 40)):
+            app._update_command_menu("/")
+            for style in set(self.styled_usages(app).values()):
+                Style.parse(style)  # raises if it could never be painted
+
+    async def test_the_title_says_what_bold_means(self, hpca_home):
+        app = HpcaApp()
+        async with app.run_test(size=(120, 40)):
+            app._update_command_menu("/")
+            title = str(app.query_one("#command-menu", Static).border_title)
+            assert "built-in" in title
+
+    async def test_skill_descriptions_are_not_parsed_as_markup(self, hpca_home):
+        # A skill description is user-written; markup would eat the brackets.
+        app = HpcaApp()
+        async with app.run_test(size=(120, 40)):
+            app._command_matches = [("bracketed", "/bracketed — keep [these] intact")]
+            app._command_index = 0
+            app._render_command_menu()
+            rendered = app.query_one("#command-menu", Static).render().plain
+            assert "[these]" in rendered
