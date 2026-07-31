@@ -244,13 +244,52 @@ def mode_prompt_suffix(mode: str | None, plan: list[dict] | None) -> str:
     return "\n\n".join(parts)
 
 
-def skipped_message(tool_name: str) -> str:
-    """Tool result fed back when the user skips an execution-gated call."""
+def skipped_message(tool_name: str, reason: str = "") -> str:
+    """Tool result fed back when the user skips an execution-gated call.
+
+    Two opposite instructions, decided by whether the user said why. A bare
+    refusal is final: nothing was given to work with, so another attempt is
+    guessing, and guessing at what a user just refused is how a turn gets
+    spent on three variants of the same rejected script. A refusal with a
+    reason is the reverse — the reason is a correction, and acting on it is
+    the whole point of having asked for it.
+    """
+    if not reason:
+        return (
+            f"[tool result] {tool_name}: SKIPPED — the user chose not to run "
+            "this. It was NOT executed. Do not retry it, do not rephrase it, "
+            "and do not attempt the same outcome via a different tool. Ask the "
+            "user how to proceed."
+        )
     return (
-        f"[tool result] {tool_name}: SKIPPED — the user chose not to run "
-        "this. It was NOT executed. Do not retry it, do not rephrase it, "
-        "and do not attempt the same outcome via a different tool. Ask the "
-        "user how to proceed."
+        f"[tool result] {tool_name}: SKIPPED — the user chose not to run this. "
+        "It was NOT executed. They said why:\n"
+        f"{reason}\n"
+        "Treat that as the correction to make. Work it into a fixed version and "
+        "put that up for approval — do not send back what was just refused. If "
+        "the reason does not tell you enough to fix it, ask the user."
+    )
+
+
+def denied_message(tool_name: str, reason: str = "") -> str:
+    """Tool result fed back when the user denies a destructive operation.
+
+    The counterpart of ``skipped_message`` for the always-on gate (§5.3), and
+    it reads the reason the same way: without one the operation is simply off
+    the table, with one there is something to correct.
+    """
+    if not reason:
+        return (
+            f"[tool result] {tool_name}: DENIED by the user — "
+            "the operation was not executed."
+        )
+    return (
+        f"[tool result] {tool_name}: DENIED by the user — the operation was "
+        "not executed. They said why:\n"
+        f"{reason}\n"
+        "Treat that as the correction to make. Propose an amended operation "
+        "that answers it, or ask the user if the reason leaves you unsure — "
+        "do not re-send what was just denied."
     )
 
 

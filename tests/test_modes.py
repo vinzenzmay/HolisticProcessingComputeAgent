@@ -14,6 +14,7 @@ from hpca.agent.modes import (
     MODES,
     add_plan_tool,
     continue_nudge_for,
+    denied_message,
     destructive_approval_required,
     looks_like_deferred_action,
     mode_prompt_suffix,
@@ -157,6 +158,22 @@ class TestHelpers:
         assert "SKIPPED" in text
         assert "not retry" in text.lower() or "do not retry" in text.lower()
 
+    def test_a_reason_turns_the_refusal_into_a_correction(self):
+        # A bare refusal is final; one the user explained is the opposite —
+        # the reason is what the fixed version has to act on.
+        text = skipped_message("run_bash", "wrong partition, use gpu")
+        assert "SKIPPED" in text
+        assert "wrong partition, use gpu" in text
+        assert "do not retry" not in text.lower()
+
+    def test_denial_message_carries_a_reason_too(self):
+        plain = denied_message("delete")
+        assert "DENIED" in plain
+        assert "not executed" in plain
+        explained = denied_message("delete", "that path holds the raw reads")
+        assert "DENIED" in explained
+        assert "that path holds the raw reads" in explained
+
     def test_deferred_action_is_detected(self):
         for text in (
             "The README does not mention it. Let me dig deeper into the source.",
@@ -219,6 +236,22 @@ class TestManualMode:
         skipped = [m for m in result.messages if "SKIPPED" in m["content"]]
         assert skipped, "the model must be told the user declined"
         assert not any("run_bash: ran" in m["content"] for m in result.messages)
+
+    async def test_a_skip_reason_rides_back_with_it(self, tools):
+        llm = FakeLLM(
+            [tool_json("run_bash", content_lines=["echo hi"]), respond_json("ok")]
+        )
+        graph = make_graph(llm, tools, "manual")
+        await run_turn(graph, session_id="s1", user_text="look around")
+        result = await run_turn(
+            graph,
+            session_id="s1",
+            resume=Command(
+                resume={"approved": False, "reason": "run it on the login node"}
+            ),
+        )
+        skipped = [m for m in result.messages if "SKIPPED" in m["content"]]
+        assert skipped and "run it on the login node" in skipped[0]["content"]
 
     async def test_manual_guidance_in_system_prompt(self, tools):
         llm = FakeLLM([respond_json()])

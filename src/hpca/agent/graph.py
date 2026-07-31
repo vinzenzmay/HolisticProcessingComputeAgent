@@ -9,7 +9,8 @@ State is plain OpenAI-style message dicts so it round-trips through the
 checkpointer and straight into the LLM client without conversion. Tool calls
 are stored by name + validated arguments (JSON), never as live objects.
 Destructive tools pause at ``interrupt()`` with the exact operation; the TUI
-resumes with ``Command(resume={"approved": bool})`` (§5.3).
+resumes with ``Command(resume={"approved": bool, "reason": str})`` (§5.3) —
+the reason being what the user typed when refusing, empty when they did not.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from hpca.agent.middleware import (
 )
 from hpca.agent.modes import (
     continue_nudge_for,
+    denied_message,
     destructive_approval_required,
     mode_prompt_suffix,
     requires_execution_approval,
@@ -298,13 +300,16 @@ def build_graph(
                 if isinstance(verdict, dict)
                 else bool(verdict)
             )
+            # What the user typed into the "why not" box, when they gave one.
+            # It rides back with the refusal so the next attempt can be a
+            # corrected one rather than the same call in another shape.
+            reason = (
+                str(verdict.get("reason", "")) if isinstance(verdict, dict) else ""
+            )
             if not approved:
                 if execution:
-                    return _tool_message(skipped_message(tool.name))
-                return _tool_message(
-                    f"[tool result] {tool.name}: DENIED by the user — "
-                    "the operation was not executed."
-                )
+                    return _tool_message(skipped_message(tool.name, reason))
+                return _tool_message(denied_message(tool.name, reason))
         try:
             output = await tool.handler(arguments, context)
             content = f"[tool result] {tool.name}: {output}"
