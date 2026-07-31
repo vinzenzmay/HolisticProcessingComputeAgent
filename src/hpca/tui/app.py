@@ -86,6 +86,7 @@ from hpca.embeddings import EmbeddingClient
 from hpca.episodic import EpisodicStore
 from hpca.llm import LLMClient
 from hpca.logs import LoggedLLM, SessionLog, open_log
+from hpca.looplag import LoopLagProbe
 from hpca.rag import RagStore
 from hpca.transcript import ASSISTANT as ASSISTANT_ENTRY
 from hpca.transcript import THINKING, Entry, Step, build_entries
@@ -1325,6 +1326,31 @@ class HpcaApp(App):
         self._dbcache: DbCache | None = None
         self._syncing_db_cache = False
         self._saver_ctx = None
+        # Event-loop lag, measured (specs-core-process.md §8). The case for
+        # moving the agent into its own process is that synchronous work on
+        # this loop makes the UI stutter, and that has to be a number taken
+        # before and after, not a feeling. Off unless $HPCA_LOOPLAG is set:
+        # a disabled probe starts no task, so it costs nothing to leave here.
+        self._looplag = LoopLagProbe(
+            enabled=bool(os_environ.get("HPCA_LOOPLAG")),
+            # What the app thinks it is doing when a stall is recorded. Read
+            # off the active turn rather than passed in, so a spike in the log
+            # names the tool that caused it.
+            label=self._current_activity,
+        )
+
+    def _current_activity(self) -> str:
+        """What to blame a loop stall on, for the lag probe's spike list.
+
+        The turn's own activity string — "running read_file", "LLM processing"
+        — is already what the spinner says, so a spike in looplag.log names the
+        step that caused it. Reads any live turn, not just the visible one: a
+        background turn blocks this loop exactly as hard as the open one.
+        """
+        turns = getattr(self, "_turns", {})
+        if not turns:
+            return "idle"
+        return ", ".join(sorted({ts.activity for ts in turns.values()}))
 
     def notify(self, message: str, **kwargs) -> None:
         """Toasts carry dynamic text — LLM output, exception strings, memory
@@ -1344,6 +1370,10 @@ class HpcaApp(App):
         yield Footer()
 
     async def on_mount(self) -> None:
+        # Before the DbCache, the graph and the registry are built: that
+        # startup path is itself one of the suspects, and a probe started
+        # after it would be measuring everything except.
+        self._looplag.start()
         self.clipboard_manager = ClipboardManager(
             self.settings.clipboard, emit=self._emit_to_terminal
         )
@@ -1484,6 +1514,15 @@ class HpcaApp(App):
             await self._llm.close()
         for client in self._session_clients.values():
             await client.close()
+        # Last: the report is written before the probe stops, because `elapsed`
+        # freezes at stop and the block would otherwise claim a shorter run
+        # than it measured. A disabled probe writes nothing and returns False,
+        # so this needs no guard of its own.
+        self._looplag.write_report(
+            app_dir() / "looplag.log",
+            note=os_environ.get("HPCA_LOOPLAG", ""),
+        )
+        await self._looplag.stop()
 
     # ------------------------------------------------------------- clipboard
 
