@@ -3566,6 +3566,15 @@ class HpcaApp(App):
         for that would reset the highlight twice a second and make the column
         impossible to navigate — so identical keys means update in place, and
         a genuine change restores the cursor onto the row it was on.
+
+        Something always ends up highlighted while the column has rows in it.
+        A `ListView` starts with no selection and `clear()` returns it to none,
+        and an unhighlighted column advertises none of its keys: `check_action`
+        answers about the highlighted row, so with nothing highlighted the
+        footer loses peek, unwatch and both moves, and the column reads as
+        inert until the user happens to press ↓. That was visible on the first
+        paint and every time the remembered row was gone — after dropping a
+        box, and on any switch to a session whose boxes are different ones.
         """
         keys = [row.key for row in rows]
         if keys == self._panel_keys and len(panel.children) == len(rows):
@@ -3582,6 +3591,7 @@ class HpcaApp(App):
                     body.border_title = row.title
                 return
         selected = self._selected_key(panel)
+        previous = panel.index
         self._panel_keys = keys
         await panel.clear()
         items = []
@@ -3594,8 +3604,19 @@ class HpcaApp(App):
             item.data_watch = row.watch
             items.append(item)
         await panel.extend(items)
-        if selected is not None and selected in keys:
-            panel.index = keys.index(selected)
+        if keys:
+            if selected is not None and selected in keys:
+                panel.index = keys.index(selected)
+            else:
+                # The row we were on is gone. Hold the position rather than the
+                # row: dropping the third of five boxes should leave the cursor
+                # on what is now third, not throw it back to the top. Clamped,
+                # for the box that was last, and 0 when there was no cursor at
+                # all — which is the first paint.
+                panel.index = min(previous or 0, len(keys) - 1)
+        # The footer caches what check_action last said, so a column that has
+        # just gained or lost its highlight has to ask for it to be asked again.
+        self.refresh_bindings()
 
     def _selected_key(self, panel: ListView) -> str | None:
         highlighted = panel.highlighted_child

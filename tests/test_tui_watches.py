@@ -426,6 +426,123 @@ class TestReorder:
             assert len(panel(app).children) == 0
 
 
+class TestTheColumnAlwaysHasACursor:
+    """A column with boxes in it must have one of them highlighted.
+
+    ``check_action`` answers about the highlighted row, so with nothing
+    highlighted the footer loses peek, unwatch and both moves and the column
+    reads as inert. The reported symptom was exactly that: arrowing between
+    the three columns sometimes landed on watchers with the wrong hotkeys.
+    """
+
+    def hotkeys(self, app):
+        """What the footer offers for the highlighted row, via check_action —
+        the same question the footer asks."""
+        watchers = panel(app)
+        return {
+            action
+            for action in ("peek_watch", "drop_watch", "move_watch")
+            if watchers.check_action(action, ())
+        }
+
+    ALL = {"peek_watch", "drop_watch", "move_watch"}
+
+    async def test_the_first_paint_lands_on_the_top_box(
+        self, hpca_home, tmp_path
+    ):
+        """Nothing was highlighted before, so there was no row to restore and
+        the cursor was left nowhere at all."""
+        app = HpcaApp(llm=FakeLLM([respond_json()]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await open_session(app, pilot)
+            await add_log_watch(app, pilot, written(tmp_path / "a.log"), "a.log")
+            assert panel(app).index == 0
+            assert self.hotkeys(app) == self.ALL
+
+    async def test_arriving_by_arrow_key_finds_the_hotkeys(
+        self, hpca_home, tmp_path
+    ):
+        """←/→ between the columns is how the user gets here."""
+        app = HpcaApp(llm=FakeLLM([respond_json()]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await open_session(app, pilot)
+            await add_log_watch(app, pilot, written(tmp_path / "a.log"), "a.log")
+            app._focus_column("chat")
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            assert app.focused_column_id == "watchers"
+            assert self.hotkeys(app) == self.ALL
+
+    async def test_switching_to_a_session_with_other_boxes_keeps_a_cursor(
+        self, hpca_home, tmp_path
+    ):
+        """The remembered row belongs to the session being left, so it is never
+        among the new keys — which used to leave the column unhighlighted."""
+        app = HpcaApp(llm=FakeLLM([respond_json("a"), respond_json("b")]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await open_session(app, pilot)
+            await add_log_watch(app, pilot, written(tmp_path / "a.log"), "a.log")
+            panel(app).focus()
+            panel(app).index = 0
+
+            await open_session(app, pilot)
+            await add_log_watch(app, pilot, written(tmp_path / "b.log"), "b.log")
+            highlighted = panel(app).highlighted_child
+            assert getattr(highlighted, "data_watch").title == "b.log"
+            assert self.hotkeys(app) == self.ALL
+
+    async def test_dropping_a_box_holds_the_position_not_the_row(
+        self, hpca_home, tmp_path
+    ):
+        """The row is gone by definition, so the cursor keeps its place in the
+        column: unwatching the middle of three leaves it on what is now the
+        middle, rather than jumping back to the top."""
+        app = HpcaApp(llm=FakeLLM([respond_json()]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await open_session(app, pilot)
+            for name in ("a.log", "b.log", "c.log"):
+                await add_log_watch(app, pilot, written(tmp_path / name), name)
+            panel(app).focus()
+            panel(app).index = 1
+            await pilot.press("d")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            highlighted = panel(app).highlighted_child
+            assert getattr(highlighted, "data_watch").title == "c.log"
+            assert self.hotkeys(app) == self.ALL
+
+    async def test_dropping_the_last_box_clamps_instead_of_overrunning(
+        self, hpca_home, tmp_path
+    ):
+        app = HpcaApp(llm=FakeLLM([respond_json()]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await open_session(app, pilot)
+            for name in ("a.log", "b.log"):
+                await add_log_watch(app, pilot, written(tmp_path / name), name)
+            panel(app).focus()
+            panel(app).index = 1
+            await pilot.press("d")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert panel(app).index == 0
+            assert getattr(panel(app).highlighted_child, "data_watch").title == "a.log"
+
+    async def test_an_empty_column_offers_nothing(self, hpca_home, tmp_path):
+        """The other half of the same rule: once the last box is gone there is
+        genuinely nothing to act on, and the footer has to say so."""
+        app = HpcaApp(llm=FakeLLM([respond_json()]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await open_session(app, pilot)
+            await add_log_watch(app, pilot, written(tmp_path / "a.log"), "a.log")
+            panel(app).focus()
+            assert self.hotkeys(app) == self.ALL
+            await pilot.press("d")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert self.hotkeys(app) == set()
+
+
 class TestRepaint:
     async def test_the_cursor_stays_put_while_the_clock_ticks(
         self, hpca_home, tmp_path
