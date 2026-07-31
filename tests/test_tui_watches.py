@@ -68,12 +68,15 @@ async def open_session(app, pilot):
 
 
 async def add_log_watch(app, pilot, path, label=""):
+    # Registered against the session that is actually open, as watch_log does:
+    # a watch belongs to its session now, so a hardcoded id would register it
+    # somewhere the panel is right not to show it.
     watch = app.watch_store.add(
         kind=KIND_LOG,
         target=str(path),
         label=label,
         profile=app._panel_profile(),
-        session_id="s1",
+        session_id=app._panel_session() or "",
     )
     await app.poll_watched_logs()
     await app.refresh_processes()
@@ -141,18 +144,44 @@ class TestTheBox:
             assert f"p{record.pid}" in keys
             assert "h:session" in keys  # and the two halves are labelled
 
-    async def test_a_watch_outlives_the_session_it_was_made_in(
+    async def test_a_watch_stays_in_the_session_it_was_made_in(
         self, hpca_home, tmp_path
     ):
-        """A watch describes the machine, not the conversation."""
+        """A watch belongs to its conversation, not to the machine.
+
+        It was the other way round, and in practice that meant every session
+        showed every other session's boxes — sessions on one profile are the
+        normal case — so the column stopped describing what was being read.
+        """
         app = HpcaApp(llm=FakeLLM([respond_json("a"), respond_json("b")]))
         async with app.run_test(size=(120, 40)) as pilot:
             await open_session(app, pilot)
             await add_log_watch(app, pilot, written(tmp_path / "a.log"), "kept")
+            first = app.active_session
+            assert len(watch_rows(app)) == 1
+
             await app.start_new_session()
             await app.refresh_processes()
             await pilot.pause()
+            assert watch_rows(app) == []
+
+            # ...and it is still there on the way back.
+            await app.open_session(first)
+            await app.refresh_processes()
+            await pilot.pause()
             assert len(watch_rows(app)) == 1
+
+    async def test_with_no_session_open_the_column_shows_no_watches(
+        self, hpca_home, tmp_path
+    ):
+        app = HpcaApp(llm=FakeLLM([respond_json()]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await open_session(app, pilot)
+            await add_log_watch(app, pilot, written(tmp_path / "a.log"), "kept")
+            await app.close_session()
+            await app.refresh_processes()
+            await pilot.pause()
+            assert watch_rows(app) == []
 
     async def test_it_survives_a_restart(self, hpca_home, tmp_path):
         app = HpcaApp(llm=FakeLLM([respond_json()]))
@@ -162,6 +191,9 @@ class TestTheBox:
 
         app2 = HpcaApp(llm=FakeLLM([respond_json()]))
         async with app2.run_test(size=(120, 40)) as pilot:
+            # Reopened rather than merely restarted: the watch belongs to its
+            # session, so finding it again means going back to that session.
+            await app2.open_session(app2.session_store.list_all()[0])
             await app2.refresh_processes()
             await pilot.pause()
             assert len(watch_rows(app2)) == 1
@@ -203,6 +235,7 @@ class TestPeek:
             watch = app.watch_store.add(
                 kind=KIND_JOB, target="27744534", label="snakemake",
                 profile=app._panel_profile(),
+                session_id=app._panel_session() or "",
             )
             app.watch_store.update(
                 watch.id, state="RUNNING", head="01:02:03", detail="node042"
@@ -233,6 +266,7 @@ class TestPeek:
             watch = app.watch_store.add(
                 kind=KIND_JOB, target="27744534", label="pipeline",
                 profile=app._panel_profile(),
+                session_id=app._panel_session() or "",
             )
             app.watch_store.update(watch.id, state="RUNNING")
             await app.refresh_processes()

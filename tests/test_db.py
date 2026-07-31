@@ -1,6 +1,7 @@
 """Tests for hpca.db: schema init and connection settings (§5.4)."""
 
 from hpca.db import connect, init_db
+from hpca.watches import KIND_LOG, WatchStore
 
 EXPECTED_TABLES = {"jobs", "job_logs", "sessions", "path_registry", "processes"}
 
@@ -52,6 +53,72 @@ class TestInitDb:
         init_db(conn)
         init_db(conn)  # must not raise
         assert EXPECTED_TABLES <= table_names(conn)
+        conn.close()
+
+
+class TestWatchUniqueness:
+    """Watches are session-scoped; the index that enforced profile-scoping has
+    to actually go, or an existing database keeps applying the old rule."""
+
+    def index_names(self, conn):
+        return {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+
+    def test_the_profile_scoped_index_is_dropped_on_an_existing_database(
+        self, tmp_path
+    ):
+        conn = connect(tmp_path / "hpca.db")
+        init_db(conn)
+        # Recreate the pre-migration state, as an older install has it.
+        conn.execute("DROP INDEX IF EXISTS idx_watches_session_target")
+        conn.execute(
+            "CREATE UNIQUE INDEX idx_watches_target "
+            "ON watches(profile, kind, target)"
+        )
+        conn.commit()
+
+        init_db(conn)
+        names = self.index_names(conn)
+        assert "idx_watches_target" not in names
+        assert "idx_watches_session_target" in names
+        conn.close()
+
+    def test_two_sessions_can_watch_the_same_log(self, tmp_path):
+        # The whole reason the index had to move: under the old one the second
+        # of these was a constraint violation.
+        conn = connect(tmp_path / "hpca.db")
+        init_db(conn)
+        store = WatchStore(conn)
+        first = store.add(
+            kind=KIND_LOG, target="/scratch/run.log", profile="default",
+            session_id="s1",
+        )
+        second = store.add(
+            kind=KIND_LOG, target="/scratch/run.log", profile="default",
+            session_id="s2",
+        )
+        assert first.id != second.id
+        assert [w.id for w in store.list(session_id="s1")] == [first.id]
+        assert [w.id for w in store.list(session_id="s2")] == [second.id]
+        conn.close()
+
+    def test_one_session_still_gets_a_single_box_per_target(self, tmp_path):
+        conn = connect(tmp_path / "hpca.db")
+        init_db(conn)
+        store = WatchStore(conn)
+        first = store.add(
+            kind=KIND_LOG, target="/scratch/run.log", profile="default",
+            session_id="s1",
+        )
+        again = store.add(
+            kind=KIND_LOG, target="/scratch/run.log", label="renamed",
+            profile="default", session_id="s1",
+        )
+        assert again.id == first.id and again.label == "renamed"
         conn.close()
 
 

@@ -18,9 +18,16 @@ Two kinds, both cheap enough to poll on a timer:
   the queue ``sacct`` supplies the final state, so the box settles on
   COMPLETED or FAILED instead of quietly vanishing.
 
-A watch is bound to a *profile*, not a session: it describes the machine, not
-the conversation, and the user wants it on screen whichever session they are
-reading. The originating session is recorded for provenance only.
+A watch belongs to the *session* that registered it. It was originally scoped
+to the profile, on the reasoning that a watch describes the machine rather than
+the conversation — but in use that is backwards: sessions on one profile are
+the normal case, so every session showed every other session's boxes, and the
+right column stopped describing the conversation the user was reading.
+
+Polling is deliberately *not* scoped the same way. State is refreshed for every
+watch in the store, so a session returned to shows a current clock rather than
+one frozen at the moment the user switched away. Scoping decides what is shown;
+it must not decide what stays true.
 
 Everything here is pure or sqlite-only. The subprocess half (squeue, sacct)
 lives in :mod:`hpca.slurm` and is handed in, so the whole module tests without
@@ -142,7 +149,7 @@ class WatchStore:
         """
         if kind not in KINDS:
             raise ValueError(f"Unknown watch kind {kind!r}; expected one of {KINDS}")
-        existing = self.find(kind=kind, target=target, profile=profile)
+        existing = self.find(kind=kind, target=target, session_id=session_id)
         if existing is not None:
             if label and label != existing.label:
                 self._conn.execute(
@@ -167,32 +174,59 @@ class WatchStore:
         ).fetchone()
         return _to_watch(row) if row else None
 
-    def find(self, *, kind: str, target: str, profile: str = "") -> Watch | None:
+    def find(self, *, kind: str, target: str, session_id: str = "") -> Watch | None:
         row = self._conn.execute(
-            "SELECT * FROM watches WHERE profile = ? AND kind = ? AND target = ?",
-            (profile, kind, target),
+            "SELECT * FROM watches WHERE session_id = ? AND kind = ? AND target = ?",
+            (session_id, kind, target),
         ).fetchone()
         return _to_watch(row) if row else None
 
-    def list(self, *, profile: str | None = None) -> list[Watch]:
-        """Every watch, oldest first.
+    def list(
+        self, *, session_id: str | None = None, profile: str | None = None
+    ) -> list[Watch]:
+        """Every watch, oldest first; ``session_id`` narrows to one session's.
 
         Insertion order, not freshness order: the panel is navigated with the
         arrow keys, and a list that reorders itself under the cursor every poll
         cannot be navigated at all.
+
+        Passing neither returns the whole store, which is what the pollers
+        want — see the module docstring on why refreshing is not scoped the way
+        displaying is. ``profile`` is still accepted because a profile-wide
+        sweep is the right question when a profile is being deleted.
         """
         sql = "SELECT * FROM watches"
-        params: tuple = ()
+        clauses: list[str] = []
+        params: list = []
+        if session_id is not None:
+            clauses.append("session_id = ?")
+            params.append(session_id)
         if profile is not None:
-            sql += " WHERE profile = ?"
-            params = (profile,)
+            clauses.append("profile = ?")
+            params.append(profile)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY id"
-        return [_to_watch(row) for row in self._conn.execute(sql, params)]
+        return [_to_watch(row) for row in self._conn.execute(sql, tuple(params))]
 
     def remove(self, watch_id: int) -> bool:
         cursor = self._conn.execute("DELETE FROM watches WHERE id = ?", (watch_id,))
         self._conn.commit()
         return cursor.rowcount > 0
+
+    def forget_session(self, session_id: str) -> int:
+        """Drop a deleted session's watches; returns how many.
+
+        Necessary because watches are session-scoped: without this a deleted
+        conversation's boxes become invisible — no session will ever match
+        them again — while the pollers go on stat-ing their files and asking
+        squeue about their jobs every few seconds, forever.
+        """
+        cursor = self._conn.execute(
+            "DELETE FROM watches WHERE session_id = ?", (session_id,)
+        )
+        self._conn.commit()
+        return cursor.rowcount
 
     def update(
         self,

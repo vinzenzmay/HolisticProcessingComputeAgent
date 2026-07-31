@@ -214,7 +214,8 @@ class TestPanelOrder:
         self, conn, deps, recorder, session, tmp_path
     ):
         WatchStore(conn).add(
-            kind=KIND_LOG, target=str(written(tmp_path / "a.log")), profile="default"
+            kind=KIND_LOG, target=str(written(tmp_path / "a.log")), profile="default",
+            session_id=session.session_id,
         )
         add_job(conn, session)
         conn.execute(
@@ -238,7 +239,7 @@ class TestPanelOrder:
     ):
         watch = WatchStore(conn).add(
             kind=KIND_LOG, target=str(written(tmp_path / "a.log")),
-            label="sniffles", profile="default",
+            label="sniffles", profile="default", session_id=session.session_id,
         )
         add_job(conn, session)
         await pollers(deps, recorder).refresh_panel()
@@ -254,7 +255,8 @@ class TestPanelOrder:
         """A heading as the very first row would take the cursor's opening
         position for itself."""
         WatchStore(conn).add(
-            kind=KIND_LOG, target=str(written(tmp_path / "a.log")), profile="default"
+            kind=KIND_LOG, target=str(written(tmp_path / "a.log")), profile="default",
+            session_id=session.session_id,
         )
         poller = pollers(deps, recorder)
         await poller.refresh_panel()
@@ -302,29 +304,31 @@ class TestPanelOrder:
         await pollers(deps, recorder).refresh_panel()
         assert "more" not in recorder.keys
 
-    async def test_a_watch_belongs_to_the_profile_not_the_session(
+    async def test_a_watch_belongs_to_the_session_that_made_it(
         self, conn, deps, recorder, session, tmp_path
     ):
-        """The column shows the focused session's profile's watches, so one
-        registered under another profile stays out of it."""
+        """The column shows the focused session's own watches, so one
+        registered in another session stays out of it."""
         WatchStore(conn).add(
-            kind=KIND_LOG, target=str(written(tmp_path / "a.log")), profile="other"
+            kind=KIND_LOG, target=str(written(tmp_path / "a.log")),
+            profile="default", session_id="some-other-session",
         )
         add_job(conn, session)
         await pollers(deps, recorder).refresh_panel()
         assert recorder.keys == ["j27744534"]
 
-    async def test_with_no_session_focused_the_core_profile_decides(
-        self, conn, deps, recorder, tmp_path
+    async def test_with_no_session_focused_there_are_no_watches_to_show(
+        self, conn, deps, recorder, session, tmp_path
     ):
-        """Nothing open is not nothing to show: the watches describe the
-        machine, and are what the panel is for."""
+        """A watch describes a conversation, so with none open there is
+        nothing of anyone's the column could honestly be showing."""
         WatchStore(conn).add(
-            kind=KIND_LOG, target=str(written(tmp_path / "a.log")), profile="default"
+            kind=KIND_LOG, target=str(written(tmp_path / "a.log")),
+            profile="default", session_id=session.session_id,
         )
+        deps.focused_session_id = None
         await pollers(deps, recorder).refresh_panel()
-        assert recorder.keys == ["w1"]
-        assert recorder.of(PanelUpdate)[0].session_id is None
+        assert recorder.keys == []
 
 
 class TestPanelPush:
@@ -431,7 +435,8 @@ class TestWatchedLogs:
         self, conn, deps, recorder, session, tmp_path
     ):
         WatchStore(conn).add(
-            kind=KIND_LOG, target=str(written(tmp_path / "a.log")), profile="default"
+            kind=KIND_LOG, target=str(written(tmp_path / "a.log")), profile="default",
+            session_id=session.session_id,
         )
         await pollers(deps, recorder).poll_watched_logs()
         assert recorder.keys == ["w1"]
@@ -442,7 +447,8 @@ class TestWatchedJobs:
         self, conn, deps, recorder, session
     ):
         watch = WatchStore(conn).add(
-            kind=KIND_JOB, target="27744534", label="snakemake", profile="default"
+            kind=KIND_JOB, target="27744534", label="snakemake",
+            profile="default", session_id=session.session_id,
         )
         WatchStore(conn).update(watch.id, state="PENDING")
         squeue = "27744534|RUNNING|node042|00:10:00|1-00:00:00|smk|\n"

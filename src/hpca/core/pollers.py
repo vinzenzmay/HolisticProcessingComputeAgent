@@ -217,13 +217,17 @@ class Pollers:
         default_profile = deps.profile
 
         def _gather(conn: sqlite3.Connection):
-            # Watches belong to the profile, not the conversation: they
-            # describe what is running on the machine, and the user wants them
-            # on screen whichever session they happen to be reading.
+            # A watch belongs to the session that registered it, so the column
+            # describes the conversation being read and nothing else. With no
+            # session focused there is nothing of anyone's to show.
             profile = panel_profile(
                 conn, session_id=session_id, default=default_profile
             )
-            watches = WatchStore(conn).list(profile=profile)
+            watches = (
+                WatchStore(conn).list(session_id=session_id)
+                if session_id is not None
+                else []
+            )
             records: list[ProcessRecord] = []
             truncated = 0
             jobs: list[JobRow] = []
@@ -399,11 +403,11 @@ class Pollers:
         default_profile = deps.profile
 
         def _poll(conn: sqlite3.Connection):
-            profile = panel_profile(
-                conn, session_id=session_id, default=default_profile
-            )
+            # Store-wide, not the focused session's: scoping decides what is
+            # *shown*, never what stays true. A watch left behind in another
+            # session must still be current when the user goes back to it.
             store = WatchStore(conn)
-            logs = [w for w in store.list(profile=profile) if w.kind == KIND_LOG]
+            logs = [w for w in store.list() if w.kind == KIND_LOG]
             return poll_log_watches(store, logs)
 
         try:
@@ -444,12 +448,10 @@ class Pollers:
         default_profile = deps.profile
 
         def _due(conn: sqlite3.Connection) -> list[Watch]:
-            profile = panel_profile(
-                conn, session_id=session_id, default=default_profile
-            )
+            # Store-wide; see poll_watched_logs.
             return [
                 w
-                for w in WatchStore(conn).list(profile=profile)
+                for w in WatchStore(conn).list()
                 if w.kind == KIND_JOB and not is_settled(w)
             ]
 

@@ -103,11 +103,11 @@ CREATE TABLE IF NOT EXISTS processes (
 );
 CREATE TABLE IF NOT EXISTS watches (
     -- Things the user asked to keep an eye on: a log file, a Slurm job id.
-    -- Bound to a profile rather than a session — a watch describes the
-    -- machine, not the conversation. See hpca.watches.
+    -- Scoped to the session that registered it: the right column describes
+    -- the conversation being read. See hpca.watches.
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    profile TEXT NOT NULL DEFAULT '',
-    session_id TEXT NOT NULL DEFAULT '',   -- provenance: who registered it
+    profile TEXT NOT NULL DEFAULT '',      -- the session's, for profile sweeps
+    session_id TEXT NOT NULL DEFAULT '',   -- the owner; what the panel filters on
     kind TEXT NOT NULL,                    -- 'log' | 'job'
     target TEXT NOT NULL,                  -- absolute path | Slurm job id
     label TEXT NOT NULL DEFAULT '',
@@ -121,8 +121,8 @@ CREATE TABLE IF NOT EXISTS watches (
     changed_at TEXT NOT NULL DEFAULT '',
     checked_at TEXT NOT NULL DEFAULT ''
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_watches_target
-    ON watches(profile, kind, target);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_watches_session_target
+    ON watches(session_id, kind, target);
 CREATE TABLE IF NOT EXISTS command_usage (
     -- How often each slash command has been run, so the autocomplete menu can
     -- list the most-used first.
@@ -140,6 +140,13 @@ ADDED_COLUMNS = [
     ("sessions", "mode", "TEXT NOT NULL DEFAULT ''"),
     ("sessions", "backend", "TEXT NOT NULL DEFAULT ''"),
 ]
+
+# Indexes an older database may still carry under an old definition.
+# CREATE INDEX IF NOT EXISTS leaves an existing index of the same name alone
+# however its columns have changed, so a redefinition has to drop first.
+# idx_watches_target keyed uniqueness on (profile, kind, target); watches are
+# session-scoped now, and leaving it would stop two sessions watching one log.
+DROPPED_INDEXES = ["idx_watches_target"]
 
 # Episodic search index (redesign Phase 2): an external-content FTS5 table
 # over messages, kept in sync by triggers. Separate from SCHEMA because FTS5
@@ -257,6 +264,8 @@ def command_use_counts(conn: sqlite3.Connection) -> dict[str, int]:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    for name in DROPPED_INDEXES:
+        conn.execute(f"DROP INDEX IF EXISTS {name}")
     for table, column, decl in ADDED_COLUMNS:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
         if column not in existing:

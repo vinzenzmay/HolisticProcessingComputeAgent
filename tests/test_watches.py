@@ -337,3 +337,18 @@ class TestPeek:
         log = tmp_path / "a.log"
         log.write_text("")
         assert peek(log) == "(empty)"
+
+
+class TestForgetSession:
+    """Watches are session-scoped, so a deleted session's must go with it —
+    otherwise they are invisible forever and still polled forever."""
+
+    def test_it_drops_only_that_sessions_watches(self, store):
+        keep = store.add(kind=KIND_LOG, target="/a.log", session_id="s1")
+        drop = store.add(kind=KIND_LOG, target="/b.log", session_id="s2")
+        assert store.forget_session("s2") == 1
+        assert [w.id for w in store.list()] == [keep.id]
+        assert store.get(drop.id) is None
+
+    def test_a_session_with_no_watches_is_not_an_error(self, store):
+        assert store.forget_session("never-watched") == 0

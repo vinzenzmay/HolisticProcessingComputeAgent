@@ -3326,6 +3326,10 @@ class HpcaApp(App):
         # Patient-data environment: a deleted conversation must not resurface
         # through episodic search either.
         self.episodic.forget_session(session.session_id)
+        # Its watches go too. They are session-scoped, so leaving them would
+        # leave boxes no session can ever show while the pollers went on
+        # stat-ing their files and asking squeue about their jobs.
+        self.watch_store.forget_session(session.session_id)
         try:
             await self._checkpointer.adelete_thread(session.session_id)
         except Exception as e:  # the row is already gone; say so and move on
@@ -3548,13 +3552,16 @@ class HpcaApp(App):
             return
         session = self.active_session
         session_id = session.session_id if session is not None else None
-        # Watches belong to the profile, not the conversation: they describe
-        # what is running on the machine, and the user wants them on screen
-        # whichever session they happen to be reading.
-        profile = self._panel_profile()
 
         def _gather(conn):
-            watches = WatchStore(conn).list(profile=profile)
+            # A watch belongs to the session that registered it, so the column
+            # describes the conversation being read and nothing else. With no
+            # session open there is nothing of anyone's to show.
+            watches = (
+                WatchStore(conn).list(session_id=session_id)
+                if session_id is not None
+                else []
+            )
             records: list[ProcessRecord] = []
             truncated = 0
             jobs: list[JobRow] = []
@@ -3759,10 +3766,23 @@ class HpcaApp(App):
     # ---------------------------------------------------------- watch polls
 
     def _panel_profile(self) -> str:
-        """Whose watches the right column shows: the open session's profile,
-        or the app's when nothing is open."""
+        """The profile behind the right column. Kept for callers that ask
+        about the profile rather than the conversation."""
         session = self.active_session
         return session.profile if session is not None else self.profile
+
+    def _panel_session(self) -> str | None:
+        """Whose watches the right column shows: the open session's, and none
+        at all when no session is open.
+
+        Watches were profile-scoped, which in practice meant every session
+        showed every other session's boxes — sessions on one profile are the
+        normal case — and the column stopped describing the conversation being
+        read. Polling stays store-wide (see hpca.watches), so a session
+        returned to shows a current clock rather than a frozen one.
+        """
+        session = self.active_session
+        return session.session_id if session is not None else None
 
     async def poll_watched_logs(self) -> None:
         """Stat every watched log — where the "last write …" clock comes from.
@@ -3773,11 +3793,13 @@ class HpcaApp(App):
         """
         if self._dbio is None or self._dbio.closed:
             return
-        profile = self._panel_profile()
 
         def _poll(conn):
+            # Store-wide, not the open session's: scoping decides what is
+            # *shown*, never what stays true. A watch left behind in another
+            # session must still be current when the user goes back to it.
             store = WatchStore(conn)
-            logs = [w for w in store.list(profile=profile) if w.kind == KIND_LOG]
+            logs = [w for w in store.list() if w.kind == KIND_LOG]
             return poll_log_watches(store, logs)
 
         try:
@@ -3809,11 +3831,10 @@ class HpcaApp(App):
         """
         if self.slurm is None or self._dbio is None or self._dbio.closed:
             return
-        profile = self._panel_profile()
         watches = await self._db(
             lambda conn: [
                 w
-                for w in WatchStore(conn).list(profile=profile)
+                for w in WatchStore(conn).list()  # store-wide; see poll_watched_logs
                 if w.kind == KIND_JOB and not is_settled(w)
             ]
         )
