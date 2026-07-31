@@ -132,6 +132,17 @@ Two constraints that bite:
 
 A stale socket file from a crashed core is removed before bind only after
 confirming no live process is listening (connect, expect `ECONNREFUSED`).
+`coreproc.clear_stale_socket()` is that check, and calling it is **mandatory**
+before `transport.serve_unix()`: asyncio's own unix-server setup unlinks any
+existing path that stats as a socket, unconditionally and without asking
+whether someone is listening on it. `EADDRINUSE` therefore never surfaces, and
+a second core would silently steal the path from a running one — two cores on
+one app dir, fighting over the sqlite lease.
+
+Wave 3's shutdown path must also close the accepted connections *before*
+awaiting `Server.wait_closed()`: since 3.12.1 that waits for every client
+transport to drop, so a core that awaits it while a handler is still parked on
+a live client hangs instead of exiting.
 
 ## 4. Protocol
 
@@ -328,6 +339,8 @@ class IdleShutdown:
 
 **Wave 1 — infrastructure (parallel, all new files, nothing existing edited).**
 `protocol.py`, `transport.py`, `coreproc.py`, `looplag.py`. Each with tests.
+**Done** (`5e1e6ad`, `eb16b45`, `c3a7e81`, `4ebd7b3`), plus the probe wired
+into the TUI behind `$HPCA_LOOPLAG` (`85d0a72`).
 
 **Wave 2 — extraction, in-process.** `AgentService` gains everything listed in
 §7's "moves" column; `HpcaApp` keeps method names as thin forwarders so the 34
