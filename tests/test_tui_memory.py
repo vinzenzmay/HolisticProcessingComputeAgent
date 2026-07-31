@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from time import monotonic
 from contextlib import contextmanager
 
 import pytest
@@ -70,6 +71,34 @@ async def type_and_submit(app, pilot, text):
     await pilot.pause()
 
 
+async def wait_for_screen(app, pilot, screen_type, *, timeout_s=10.0):
+    """Pause until the modal is actually up, rather than counting pauses.
+
+    A fixed number of pauses is a guess about scheduling. The worker behind
+    /memorize runs a model round trip and then pushes a screen, and six pauses
+    is sometimes not enough on a box running the suite across every core —
+    which is why this only ever failed in the parallel run and never when the
+    test was run on its own. Waiting on the condition makes the test say what
+    it means and stops the result depending on how busy the machine is.
+
+    The worker cannot simply be awaited: it pushes the screen and then blocks
+    on the user's answer, so ``wait_for_complete`` would deadlock against the
+    very modal this is waiting for.
+    """
+    deadline = monotonic() + timeout_s
+    while monotonic() < deadline:
+        if isinstance(app.screen, screen_type):
+            return app.screen
+        await pilot.pause()
+        # Yield properly rather than spinning: the whole point is not to make
+        # a loaded machine any busier.
+        await asyncio.sleep(0.01)
+    raise AssertionError(
+        f"{screen_type.__name__} never appeared within {timeout_s}s; "
+        f"on screen: {type(app.screen).__name__}"
+    )
+
+
 MEMORIZE_REPLY = proposals_json(
     {"scope": "system-prompt", "kind": "fact", "text": "STAR needs 40G on this cluster."}
 )
@@ -83,9 +112,7 @@ class TestMemorize:
         app = HpcaApp(llm=FakeLLM([MEMORIZE_REPLY]))
         async with app.run_test(size=(120, 40)) as pilot:
             await type_and_submit(app, pilot, "/memorize STAR needed 40G here")
-            for _ in range(6):
-                await pilot.pause()
-            assert isinstance(app.screen, MemoryProposalScreen)
+            await wait_for_screen(app, pilot, MemoryProposalScreen)
             await pilot.press("y")
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -102,8 +129,7 @@ class TestMemorize:
             await type_and_submit(app, pilot, "my STAR job was killed")
             await app.workers.wait_for_complete()
             await type_and_submit(app, pilot, "/memorize that was a memory limit")
-            for _ in range(6):
-                await pilot.pause()
+            await wait_for_screen(app, pilot, MemoryProposalScreen)
             prompt = llm.calls[-1][-1]["content"]
             assert "that was a memory limit" in prompt  # the user's note
             assert "my STAR job was killed" in prompt  # the conversation context
@@ -114,8 +140,7 @@ class TestMemorize:
         app = HpcaApp(llm=FakeLLM([MEMORIZE_REPLY]))
         async with app.run_test(size=(120, 40)) as pilot:
             await type_and_submit(app, pilot, "/memorize forget me")
-            for _ in range(6):
-                await pilot.pause()
+            await wait_for_screen(app, pilot, MemoryProposalScreen)
             await pilot.press("n")
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -133,9 +158,7 @@ class TestMemorize:
         app = HpcaApp(llm=FakeLLM([MEMORIZE_REPLY]))
         async with app.run_test(size=(120, 40)) as pilot:
             await type_and_submit(app, pilot, r"\memorize STAR needed 40G")
-            for _ in range(6):
-                await pilot.pause()
-            assert isinstance(app.screen, MemoryProposalScreen)
+            await wait_for_screen(app, pilot, MemoryProposalScreen)
             await pilot.press("n")
             await app.workers.wait_for_complete()
 
@@ -143,8 +166,7 @@ class TestMemorize:
         app = HpcaApp(llm=FakeLLM([MEMORIZE_REPLY]))
         async with app.run_test(size=(120, 40)) as pilot:
             await type_and_submit(app, pilot, "/memorize something")
-            for _ in range(6):
-                await pilot.pause()
+            await wait_for_screen(app, pilot, MemoryProposalScreen)
             await pilot.press("n")
             await app.workers.wait_for_complete()
             # a command is not a message: it must not name the session
@@ -182,9 +204,7 @@ class TestMemorize:
             assert indicators, "spinner should be visible while forming memories"
             assert indicators.first(WorkingIndicator).activity == "forming memories"
             gate.set()
-            for _ in range(6):
-                await pilot.pause()
-            assert isinstance(app.screen, MemoryProposalScreen)
+            await wait_for_screen(app, pilot, MemoryProposalScreen)
             await pilot.press("n")
             await app.workers.wait_for_complete()
             await pilot.pause()
