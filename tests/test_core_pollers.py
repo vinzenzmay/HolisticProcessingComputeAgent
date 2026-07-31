@@ -11,7 +11,7 @@ wall clock to run.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from os import utime
 from pathlib import Path
 
@@ -354,23 +354,30 @@ class TestPanelPush:
         self, conn, deps, recorder, session, tmp_path
     ):
         """"last write 4s ago" counts up on its own, so those rows differ
-        every pass even when nothing in the database moved."""
+        every pass even when nothing in the database moved.
+
+        Both clocks are pinned. Reading ``changed_at`` off the real clock
+        while the two ``now`` values stayed fixed made this pass only when
+        the suite ran before noon UTC: any later and both ``now`` values sit
+        *behind* the write, so both ages clamp to zero and the rows match.
+        """
+        wrote_at = datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc)
         watch = WatchStore(conn).add(
             kind=KIND_LOG, target=str(tmp_path / "a.log"), profile="default"
         )
         WatchStore(conn).update(
             watch.id,
             state="writing",
-            changed_at=datetime.now(timezone.utc).isoformat(),
+            changed_at=wrote_at.isoformat(),
         )
         poller = pollers(deps, recorder)
         first = poller.panel_rows(
             WatchStore(conn).list(profile="default"), [], [], 0,
-            now=datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc),
+            now=wrote_at + timedelta(seconds=4),
         )
         later = poller.panel_rows(
             WatchStore(conn).list(profile="default"), [], [], 0,
-            now=datetime(2026, 7, 31, 12, 5, tzinfo=timezone.utc),
+            now=wrote_at + timedelta(minutes=5),
         )
         assert first != later
 
