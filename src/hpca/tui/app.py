@@ -94,14 +94,9 @@ from hpca.transcript import USER as USER_ENTRY
 from hpca.profiles import DEFAULT_PROFILE, MemoryScope, Profile
 from hpca.registry import PathRegistry
 from hpca.runner import (
-    ProcessRecord,
     ProcessRunner,
     analyse_process_failure,
-    count_processes,
-    describe,
     format_process_event,
-    kill_unowned,
-    list_processes,
     poll_processes,
     reconcile_orphans,
     running_session_ids,
@@ -136,7 +131,7 @@ from hpca.tui.approval_screen import (
 )
 from hpca.tui.confirm_screen import ConfirmScreen
 from hpca.tui.context_bar import ContextBar, ModelLine
-from hpca.tui.inspect_screen import InspectScreen, format_job, format_process
+from hpca.tui.inspect_screen import InspectScreen
 from hpca.tui.manage_llms import ManageLLMsScreen
 from hpca.tui.mode_bar import ModeBar
 from hpca.memory_index import MemoryIndex
@@ -169,10 +164,7 @@ from hpca.watches import (
     watch_lines,
 )
 
-COLUMN_IDS = ("sessions", "chat", "processes")
-# Rows the processes column shows before summarising the rest. A long-lived
-# session accumulates hundreds; the panel is a view, not an archive.
-PROCESS_HISTORY_LIMIT = 60
+COLUMN_IDS = ("sessions", "chat", "watchers")
 # How often a watched log is stat'ed. Cheap (one stat per box) and worth being
 # responsive about: the whole point of a log box is that "still writing" and
 # "stopped a minute ago" are visibly different.
@@ -218,34 +210,14 @@ def _dbcache_logger() -> logging.Logger:
     return _file_logger("hpca.dbcache", "dbcache.log")
 
 
-def format_started(started_at: str) -> str:
-    """When a process started, in the reader's own timezone.
-
-    Stored UTC, shown local — the times are read next to a wall clock. The
-    date is omitted for today, which is most of what the panel holds, and
-    the narrow column has no room to spend on it.
-    """
-    if not started_at:
-        return "  --  "
-    try:
-        moment = datetime.fromisoformat(started_at)
-    except ValueError:
-        return "  --  "
-    if moment.tzinfo is not None:
-        moment = moment.astimezone()
-    if moment.date() == datetime.now().date():
-        return moment.strftime(" %H:%M")
-    return moment.strftime("%m-%d %H:%M")
-
 
 @dataclass
 class PanelRow:
-    """One row of the right column, whatever kind of thing it stands for.
+    """One box of the watchers column.
 
-    The column mixes watch boxes, cluster jobs, local processes and inert
-    headings, and it repaints on a timer while the user is arrowing through
-    it. Naming every row with a stable ``key`` is what lets a repaint update
-    the text in place — a watch's "last write 4s ago" ticks on its own — and
+    The column repaints on a timer while the user is arrowing through it.
+    Naming every row with a stable ``key`` is what lets a repaint update the
+    text in place — a watch's "last write 4s ago" ticks on its own — and
     rebuild only when the set of rows actually changes, so the cursor stops
     jumping back to the top twice a second.
     """
@@ -253,11 +225,8 @@ class PanelRow:
     key: str
     text: str
     classes: str
-    title: str = ""  # box border title; watches only
-    watch: "Watch | None" = None
-    record: "ProcessRecord | None" = None
-    job: "JobRow | None" = None
-    inert: bool = False  # a heading: skipped by the cursor, no actions
+    title: str  # the box's border title
+    watch: "Watch"
 
 
 SESSION_TITLE_MAX = 40
@@ -442,7 +411,7 @@ class ChatInput(TextArea):
     that cannot report shift+enter still have the other two). Arrow keys move
     the text cursor and only hand focus on at the edges of the draft: ← at the
     very start leaves for the sessions column, → at the very end for the
-    processes column, ↑ on the first *visual* row leaves to browse the message
+    watchers column, ↑ on the first *visual* row leaves to browse the message
     log. The row check is wrap-aware, so ↑/↓ still step through a long draft
     that soft-wraps onto several rows even though it is one logical line.
     The draft is kept, so the user can step away mid-sentence and come back.
@@ -955,51 +924,57 @@ class ChatPanel(ColumnPanel):
         yield chat_input
 
 
-class ProcessesList(ListView):
+class WatchersList(ListView):
     """Right-column list; its hotkeys appear in the footer when focused.
 
-    Enter means "show me what this is doing" for every row type, which for a
-    watch is a flash of the log's tail rather than a modal: the question a
+    Enter is a flash of the log's tail rather than a modal: the question a
     watch box provokes ("did it print an error, or is it just slow?") is
     answered by 300 characters, and a screen to open and dismiss is more
     ceremony than the answer is worth.
+
+    alt+↑/alt+↓ carry the highlighted box past its neighbour. The column is
+    registration-ordered by default, which has nothing to do with what the
+    user is actually waiting on — three finished jobs can sit above the one
+    log that matters. Moving beats sorting because only the reader knows which
+    box that is, and it is not a property anything here could compute.
+
+    The alt+arrows are on project.md's reserved list (zellij and tmux bind
+    them for pane navigation), so shift+↑/shift+↓ do the same thing — the same
+    belt-and-braces as ChatInput.NEWLINE_KEYS. Only the alt pair is shown in
+    the footer, which is the binding that was asked for; the shift pair is
+    there for the terminals that swallow it.
     """
 
     BINDINGS = [
-        Binding("enter", "inspect_process", "inspect"),
-        Binding("k", "kill_process", "kill"),
+        Binding("enter", "peek_watch", "peek"),
         Binding("d", "drop_watch", "unwatch"),
+        Binding("alt+up", "move_watch(-1)", "move up"),
+        Binding("alt+down", "move_watch(1)", "move down"),
+        Binding("shift+up", "move_watch(-1)", "move up", show=False),
+        Binding("shift+down", "move_watch(1)", "move down", show=False),
     ]
 
     def check_action(self, action: str, parameters) -> bool | None:
-        # Each row type advertises only the keys that do something on it: a
-        # watch box has nothing to kill, and a process has nothing to unwatch.
-        child = self.highlighted_child
-        if action == "drop_watch":
-            return getattr(child, "data_watch", None) is not None
-        if action == "kill_process":
-            return (
-                getattr(child, "data_record", None) is not None
-                or getattr(child, "data_job", None) is not None
-            )
-        if action == "inspect_process":
-            return child is not None
+        # An empty column offers nothing: with no box highlighted every one of
+        # these keys would be advertised in the footer and then do nothing.
+        if action in ("peek_watch", "drop_watch", "move_watch"):
+            return getattr(self.highlighted_child, "data_watch", None) is not None
         return True
 
-    def action_inspect_process(self) -> None:
-        self.app.inspect_selected_process()
-
-    def action_kill_process(self) -> None:
-        self.app.kill_selected_process()
+    def action_peek_watch(self) -> None:
+        self.app.peek_selected_watch()
 
     def action_drop_watch(self) -> None:
         self.app.drop_selected_watch()
 
+    def action_move_watch(self, delta: int) -> None:
+        self.app.move_selected_watch(delta)
 
-class ProcessesPanel(ColumnPanel):
+
+class WatchersPanel(ColumnPanel):
     def compose(self) -> ComposeResult:
         yield Static(self._title, classes="column-title")
-        yield ProcessesList(id="processes-list")
+        yield WatchersList(id="watchers-list")
 
 
 class HpcaApp(App):
@@ -1060,7 +1035,7 @@ class HpcaApp(App):
     #chat-input:focus {
         border: round $accent;
     }
-    #processes {
+    #watchers {
         width: 1fr;
         min-width: 24;
     }
@@ -1109,13 +1084,10 @@ class HpcaApp(App):
         border: round $panel-lighten-2;
         color: $text-muted;
     }
-    /* Secondary rows in the processes column: the count of history not shown,
-       and processes whose fate was never recorded because hpca exited first. */
-    .proc-more, .proc-unknown { color: $text-muted; }
-    /* Registered watches are boxes, not rows: they are the thing the user
-       opened this column for, and the frame is what separates "what I asked
-       to be told about" from the scrollback of everything hpca has run. The
-       border colour carries the state, so the column reads at a glance. */
+    /* A watch is a box, not a row: it is the whole content of this column now,
+       and the frame is what keeps several of them legible as separate things
+       in a narrow width. The border colour carries the state, so the column
+       reads at a glance. */
     .watch {
         border: round $panel;
         border-title-color: $text;
@@ -1132,13 +1104,6 @@ class HpcaApp(App):
     .watch-dead {
         border: round $error;
         color: $text-muted;
-    }
-    /* Section headings inside the column, so the boxes and the run history do
-       not read as one list. */
-    .panel-section {
-        color: $text-muted;
-        text-style: italic;
-        padding: 0 1;
     }
     .chat-working {
         color: $text-muted;
@@ -1310,10 +1275,7 @@ class HpcaApp(App):
         # to a session that ran off-screen shows its current fill, not a stale
         # zero or another session's count.
         self._context_used: dict[str, int] = {}
-        # Panel labels by pid: describe() reads a script off disk, and the
-        # script behind a finished process never changes.
-        self._process_labels: dict[int, str] = {}
-        self._refreshing_processes = False
+        self._refreshing_watchers = False
         # The right column's row keys as last painted; identical keys mean the
         # repaint can update text in place instead of rebuilding under the
         # user's cursor. See _paint_panel.
@@ -1369,7 +1331,7 @@ class HpcaApp(App):
         with Horizontal(id="columns"):
             yield SessionsPanel("Sessions", id="sessions")
             yield ChatPanel("Chat", id="chat")
-            yield ProcessesPanel("Processes", id="processes")
+            yield WatchersPanel("Watchers", id="watchers")
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -1432,7 +1394,7 @@ class HpcaApp(App):
         self.run_worker(self._auto_connect_cluster(), group="auto-connect")
         await self._reload_sessions()
         self.run_curator_if_due()
-        self.set_interval(2.0, self.refresh_processes)
+        self.set_interval(2.0, self.refresh_watchers)
         self.set_interval(2.0, self.watch_processes)
         self.set_interval(LOG_WATCH_SECONDS, self.poll_watched_logs)
         sync_interval = self.settings.database.sync_interval_s
@@ -2172,7 +2134,7 @@ class HpcaApp(App):
         await self._log_turn(result, log, session)
         if self._is_active_session(session):
             await self._set_chat_messages(result.messages, result.thinking)
-            await self.refresh_processes()
+            await self.refresh_watchers()
         else:
             # The reply belongs to a session the user has left: never yank
             # them back — frame its row in the list instead.
@@ -3530,27 +3492,22 @@ class HpcaApp(App):
         assert self._dbio is not None
         return await self._dbio.run(fn)
 
-    async def refresh_processes(self) -> None:
-        """Repaint the right column from the *table*, not the live runner.
-
-        The runner only knows the processes it started, and a fresh one is
-        built per turn, so reading it emptied the panel the moment a session
-        was reopened. The table outlives all of that, which is what makes the
-        history still be there after a restart.
+    async def refresh_watchers(self) -> None:
+        """Repaint the right column from the ``watches`` table.
 
         Guarded against overlap: a fetch outlasting the 2s tick (NFS) would
         let two calls interleave clear() and extend() and paint duplicates.
         Skipping is safe — the next tick repaints.
         """
-        if self._refreshing_processes:
+        if self._refreshing_watchers:
             return
-        self._refreshing_processes = True
+        self._refreshing_watchers = True
         try:
-            await self._refresh_processes_inner()
+            await self._refresh_watchers_inner()
         finally:
-            self._refreshing_processes = False
+            self._refreshing_watchers = False
 
-    async def _refresh_processes_inner(self) -> None:
+    async def _refresh_watchers_inner(self) -> None:
         if self._dbio is None or self._dbio.closed:
             return
         session = self.active_session
@@ -3560,58 +3517,37 @@ class HpcaApp(App):
             # A watch belongs to the session that registered it, so the column
             # describes the conversation being read and nothing else. With no
             # session open there is nothing of anyone's to show.
-            watches = (
-                WatchStore(conn).list(session_id=session_id)
-                if session_id is not None
-                else []
-            )
-            records: list[ProcessRecord] = []
-            truncated = 0
-            jobs: list[JobRow] = []
-            if session_id is not None:
-                records = list_processes(
-                    conn, session_id=session_id, limit=PROCESS_HISTORY_LIMIT
-                )
-                if len(records) > PROCESS_HISTORY_LIMIT:
-                    records = records[:PROCESS_HISTORY_LIMIT]
-                    truncated = (
-                        count_processes(conn, session_id=session_id)
-                        - PROCESS_HISTORY_LIMIT
-                    )
-                jobs = JobStore(conn).list(session_id=session_id)
-            return watches, records, truncated, jobs
+            if session_id is None:
+                return []
+            return WatchStore(conn).list(session_id=session_id)
 
-        watches, records, truncated, jobs = await self._db(_gather)
+        watches = await self._db(_gather)
         if session_id is not None and (
             self.active_session is None
             or self.active_session.session_id != session_id
         ):
             return  # switched away mid-fetch; the next tick repaints
         # The DB await above yields; shutdown may have torn the widget down.
-        found = self.query("#processes-list")
+        found = self.query("#watchers-list")
         if not found:
             return
-        await self._paint_panel(
-            found.first(ListView),
-            self._panel_rows(watches, jobs, records, truncated),
-        )
+        await self._paint_panel(found.first(ListView), self._panel_rows(watches))
 
-    def _panel_rows(
-        self,
-        watches: list[Watch],
-        jobs: list[JobRow],
-        records: list[ProcessRecord],
-        truncated: int,
-    ) -> list[PanelRow]:
-        """The whole right column, top to bottom.
+    def _panel_rows(self, watches: list[Watch]) -> list[PanelRow]:
+        """The whole right column, top to bottom: one box per watch.
 
-        Watches first: they are what the user asked to be shown, and what they
-        are checking when they look over there. Everything hpca ran itself
-        follows under a heading — the same history as before, demoted to what
-        it is, since every one of those calls is also in the chat log.
+        It used to carry the session's own run history underneath, under a
+        "── this session ──" heading. That is gone. Every one of those calls is
+        already in the chat log a column to the left, so the history was a
+        second copy of something the user had just read — and it grew without
+        bound while the boxes they had actually asked to be shown were pushed
+        off the bottom of a short terminal.
+
+        In ``watches`` order, which is the user's own — see
+        ``WatchStore.move`` and ``action_move_watch``.
         """
         now = datetime.now(timezone.utc)
-        rows = [
+        return [
             PanelRow(
                 key=f"w{watch.id}",
                 text="\n".join(watch_lines(watch, now=now)),
@@ -3621,50 +3557,6 @@ class HpcaApp(App):
             )
             for watch in watches
         ]
-        if rows and (jobs or records or truncated):
-            # Only when there is something above it: a heading as the very
-            # first row would take the cursor's opening position for itself.
-            rows.append(
-                PanelRow(
-                    key="h:session",
-                    text="── this session ──",
-                    classes="panel-section",
-                    inert=True,
-                )
-            )
-        for job in jobs:
-            rows.append(
-                PanelRow(
-                    key=f"j{job.job_id}",
-                    text=f"{job.state:<9} job {job.job_id} ({job.script_key})",
-                    classes="proc-job",
-                    job=job,
-                )
-            )
-        for record in records:
-            rows.append(
-                PanelRow(
-                    key=f"p{record.pid}",
-                    text=(
-                        f"{format_started(record.started_at)} "
-                        f"{record.state:<8} "
-                        f"{self._describe_process(record)} ({record.pid})"
-                    ),
-                    classes=f"proc-{record.state}",
-                    record=record,
-                )
-            )
-        if truncated > 0:
-            # Never let a cut list read as the whole history.
-            rows.append(
-                PanelRow(
-                    key="more",
-                    text=f"… {truncated} older",
-                    classes="proc-more",
-                    inert=True,
-                )
-            )
-        return rows
 
     async def _paint_panel(self, panel: ListView, rows: list[PanelRow]) -> None:
         """Draw the column, rebuilding only when its shape actually changed.
@@ -3684,13 +3576,10 @@ class HpcaApp(App):
                     # stands for a watch whose state has moved on, and `d`
                     # must act on what the box currently says.
                     item.data_watch = row.watch
-                    item.data_record = row.record
-                    item.data_job = row.job
                     body.update(Content(row.text))
                     if body.classes != frozenset(row.classes.split()):
                         body.set_classes(row.classes)
-                    if row.title:
-                        body.border_title = row.title
+                    body.border_title = row.title
                 return
         selected = self._selected_key(panel)
         self._panel_keys = keys
@@ -3698,14 +3587,11 @@ class HpcaApp(App):
         items = []
         for row in rows:
             body = Static(Content(row.text), classes=row.classes)
-            if row.title:
-                body.border_title = row.title
-            item = ListItem(body, disabled=row.inert)
+            body.border_title = row.title
+            item = ListItem(body)
             item.data_body = body
             item.data_key = row.key
             item.data_watch = row.watch
-            item.data_record = row.record
-            item.data_job = row.job
             items.append(item)
         await panel.extend(items)
         if selected is not None and selected in keys:
@@ -3714,19 +3600,6 @@ class HpcaApp(App):
     def _selected_key(self, panel: ListView) -> str | None:
         highlighted = panel.highlighted_child
         return getattr(highlighted, "data_key", None) if highlighted else None
-
-    def _describe_process(self, record: ProcessRecord) -> str:
-        """Panel label for a process, cached by pid.
-
-        ``describe`` reads the script from disk for throwaway run_bash names,
-        and the panel repaints on every change; the content of a written
-        script never changes, so once is enough.
-        """
-        cached = self._process_labels.get(record.pid)
-        if cached is None:
-            cached = describe(record)
-            self._process_labels[record.pid] = cached
-        return cached
 
     async def poll_jobs(self) -> None:
         """Background sacct poll (§5.4); notifies on state changes.
@@ -3764,7 +3637,7 @@ class HpcaApp(App):
                 ))
         if changes:
             await self.drain_work()
-            await self.refresh_processes()
+            await self.refresh_watchers()
 
     # ---------------------------------------------------------- watch polls
 
@@ -3822,7 +3695,7 @@ class HpcaApp(App):
                     f"{change.watch.title}: the file is gone", severity="warning"
                 )
         if changes:
-            await self.refresh_processes()
+            await self.refresh_watchers()
 
     async def poll_watched_jobs(self) -> None:
         """Refresh watched Slurm jobs from squeue, and finished ones from sacct.
@@ -3861,12 +3734,12 @@ class HpcaApp(App):
                     f"{change.new_state}"
                 )
         if changes:
-            await self.refresh_processes()
+            await self.refresh_watchers()
 
     async def watch_processes(self) -> None:
         """Turn finished background subprocesses into agent-visible events.
 
-        The sibling of poll_jobs for local work. refresh_processes only
+        The sibling of poll_jobs for local work. refresh_watchers only
         repaints the sidebar, so before this nothing ever told the agent that
         the script it started had exited — it promised to check back and had
         no way to keep the promise.
@@ -3914,6 +3787,21 @@ class HpcaApp(App):
             self._offer_signature(explanation.proposed_signature)
         head = fallback.split("\n\n", 1)[0]
         return f"{head}\n\n{explanation.render()}\n\nlog:\n{finding.excerpt}"
+
+    def _confirm_then(self, question: str, coro) -> None:
+        """Put a yes/no to the user and run ``coro`` if they accept.
+
+        The coroutine is built by the caller and closed on a refusal, so a
+        declined question leaves nothing un-awaited behind.
+        """
+
+        def on_confirm(confirmed: bool | None) -> None:
+            if confirmed:
+                self.run_worker(coro)
+            else:
+                coro.close()
+
+        self.push_screen(ConfirmScreen(question), on_confirm)
 
     def _offer_signature(self, proposed) -> None:
         """A tier-3 diagnosis means a signature was missing; offer to keep it."""
@@ -4018,29 +3906,14 @@ class HpcaApp(App):
             self._mark_session_updated(session)
             self.notify(f"{session.title}: background work finished")
 
-    def _selected_item(self) -> tuple[ProcessRecord | None, JobRow | None]:
-        highlighted = self.query_one("#processes-list", ListView).highlighted_child
-        return (
-            getattr(highlighted, "data_record", None),
-            getattr(highlighted, "data_job", None),
-        )
-
     def _selected_watch(self) -> Watch | None:
-        highlighted = self.query_one("#processes-list", ListView).highlighted_child
+        highlighted = self.query_one("#watchers-list", ListView).highlighted_child
         return getattr(highlighted, "data_watch", None)
 
-    def inspect_selected_process(self) -> None:
+    def peek_selected_watch(self) -> None:
         watch = self._selected_watch()
         if watch is not None:
             self.peek_watch(watch)
-            return
-        record, job = self._selected_item()
-        if record is not None:
-            self.push_screen(
-                InspectScreen(f"Process: {record.name}", format_process(record))
-            )
-        elif job is not None:
-            self.push_screen(InspectScreen(f"Job {job.job_id}", format_job(job)))
 
     def peek_watch(self, watch: Watch) -> None:
         """Flash what a watched thing is saying, and let it fade.
@@ -4087,66 +3960,28 @@ class HpcaApp(App):
         removed = await self._db(lambda conn: WatchStore(conn).remove(watch.id))
         if removed:
             self.notify(f"Stopped watching {watch.title}")
-        await self.refresh_processes()
+        await self.refresh_watchers()
 
-    def kill_selected_process(self) -> None:
-        record, job = self._selected_item()
-        if record is not None:
-            if record.state != "running":
-                self.notify(f"{record.name} is not running", severity="warning")
-                return
-            self._confirm_then(
-                f"Kill process {record.name!r} (pid {record.pid})?",
-                self._kill_process_and_refresh(record.pid),
-            )
-        elif job is not None:
-            from hpca.slurm import TERMINAL_STATES
+    def move_selected_watch(self, delta: int) -> None:
+        """Carry the highlighted box one place up (``-1``) or down (``+1``).
 
-            if job.state in TERMINAL_STATES:
-                self.notify(f"Job {job.job_id} is already {job.state}",
-                            severity="warning")
-                return
-            self._confirm_then(
-                f"Cancel cluster job {job.job_id} ({job.script_key})?",
-                self._cancel_job_and_refresh(job.job_id),
-            )
-
-    def _confirm_then(self, question: str, coro) -> None:
-        def on_confirm(confirmed: bool | None) -> None:
-            if confirmed:
-                self.run_worker(coro)
-            else:
-                coro.close()
-
-        self.push_screen(ConfirmScreen(question), on_confirm)
-
-    async def _kill_process_and_refresh(self, pid: int) -> None:
-        """Kill by pid, whichever turn started it.
-
-        The panel now shows the session's whole history, so the highlighted
-        process may predate the current runner — which would have no monitor
-        for it and raise. Prefer the owning runner when there is one, since
-        its monitor records the outcome properly.
+        Silent at either end. Holding alt+↑ to bring a box to the top is the
+        normal way to use this, and a warning toast on each of the last few
+        presses would be noise about having arrived.
         """
-        runner = self._tool_ctx.runner if self._tool_ctx else None
-        if runner is not None and runner.owns(pid):
-            await runner.kill(pid)
-            await runner.wait(pid)
-        elif self._conn is not None and self.active_session is not None:
-            kill_unowned(
-                self._conn, pid=pid, session_id=self.active_session.session_id
-            )
-        await self.refresh_processes()
-
-    async def _cancel_job_and_refresh(self, job_id: str) -> None:
-        assert self.slurm is not None
-        try:
-            await self.slurm.cancel(job_id)
-        except Exception as e:
-            self.notify(f"Cancel failed: {e}", severity="error")
+        watch = self._selected_watch()
+        if watch is None:
             return
-        self.job_store.mark(job_id, "CANCELLING")
-        await self.refresh_processes()
+        self.run_worker(self._move_watch(watch, delta))
+
+    async def _move_watch(self, watch: Watch, delta: int) -> None:
+        moved = await self._db(lambda conn: WatchStore(conn).move(watch.id, delta))
+        if moved:
+            # The repaint restores the cursor by row key, so it follows the
+            # box rather than staying at the index — which is what makes a
+            # held-down key walk one box up the column instead of swapping the
+            # same pair back and forth.
+            await self.refresh_watchers()
 
     # -------------------------------------------------------------- chat log
 
@@ -4259,7 +4094,7 @@ class HpcaApp(App):
         if action == "cycle_mode":
             # Mode is a per-session dial; without a session there is nothing
             # to switch. Only from the chat column — on the sessions and
-            # processes columns (and on modals) shift+tab keeps moving focus.
+            # watchers columns (and on modals) shift+tab keeps moving focus.
             return in_chat and self.active_session is not None
         if action == "open_settings":
             return not in_chat

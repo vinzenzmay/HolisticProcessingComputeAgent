@@ -239,11 +239,15 @@ class SessionRow(_Model):
 
 
 # What a panel row stands for. The UI turns `kind` plus `ref` into the command
-# a keypress sends, so both ends have to agree on these four strings.
+# a keypress sends, so both ends have to agree on the string.
+#
+# Only one, now that the right column is watch boxes and nothing else. There
+# were four — `process`, `job` and an inert `heading` alongside this — for the
+# run history the column used to carry underneath (project.md §3.3). The field
+# stays rather than being inlined: it is what tells the UI which command a
+# keypress becomes, and a column that grows a second kind of row should have to
+# say so on the wire rather than infer it from a key prefix.
 PANEL_WATCH = "watch"
-PANEL_PROCESS = "process"
-PANEL_JOB = "job"
-PANEL_HEADING = "heading"  # inert: skipped by the cursor, no actions
 
 
 class PanelRow(_Model):

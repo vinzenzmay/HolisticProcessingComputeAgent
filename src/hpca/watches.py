@@ -107,6 +107,9 @@ class Watch:
     # event time and not the time of the poll that noticed it.
     changed_at: str = ""
     checked_at: str = ""
+    # Where the box sits in the column. Assigned on insert and only ever
+    # rewritten by ``WatchStore.move``; see there for why it is dense.
+    position: int = 0
 
     @property
     def title(self) -> str:
@@ -121,6 +124,7 @@ _COLUMNS = (
     "target",
     "label",
     "created_at",
+    "position",
     "state",
     "head",
     "detail",
@@ -166,7 +170,13 @@ class WatchStore:
             return existing
         cursor = self._conn.execute(
             "INSERT INTO watches (profile, session_id, kind, target, label, "
-            "created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            "created_at, position) VALUES (?, ?, ?, ?, ?, ?, "
+            # One past the highest anywhere, so a new box lands at the bottom
+            # of its own column. Store-wide rather than per-session because
+            # ``move`` renumbers a session densely from 1: a per-session
+            # maximum would then hand out a number that session is already
+            # using, and the new box would land in the middle of the list.
+            "(SELECT COALESCE(MAX(position), 0) + 1 FROM watches))",
             (profile, session_id, kind, target, label, _stamp(_now())),
         )
         self._conn.commit()
@@ -190,11 +200,14 @@ class WatchStore:
     def list(
         self, *, session_id: str | None = None, profile: str | None = None
     ) -> list[Watch]:
-        """Every watch, oldest first; ``session_id`` narrows to one session's.
+        """Every watch in column order; ``session_id`` narrows to one session's.
 
-        Insertion order, not freshness order: the panel is navigated with the
-        arrow keys, and a list that reorders itself under the cursor every poll
-        cannot be navigated at all.
+        The order is the user's, falling back to insertion — never freshness.
+        The panel is navigated with the arrow keys, and a list that reorders
+        itself under the cursor every poll cannot be navigated at all, so
+        nothing a poll learns is allowed to move a box. ``id`` breaks ties so
+        rows that predate ``position`` still come out in the order they were
+        registered.
 
         Passing neither returns the whole store, which is what the pollers
         want — see the module docstring on why refreshing is not scoped the way
@@ -212,8 +225,48 @@ class WatchStore:
             params.append(profile)
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY id"
+        sql += " ORDER BY position, id"
         return [_to_watch(row) for row in self._conn.execute(sql, tuple(params))]
+
+    def move(self, watch_id: int, delta: int) -> bool:
+        """Shift a box one step up (``-1``) or down (``+1``) in its column.
+
+        Swapping with the neighbour rather than assigning an absolute slot,
+        because that is the whole gesture the user has: alt+↑ pressed twice
+        should walk a box past two others, and there is no way to say "third
+        from the top".
+
+        Scoped to the moving watch's own session, since that is the only list
+        anyone sees — a store-wide swap could put it next to a box belonging to
+        a conversation the user is not even looking at.
+
+        Returns whether anything moved: at the top or the bottom there is no
+        neighbour to trade with, and that is an ordinary outcome of holding the
+        key down, not a failure worth a message.
+        """
+        watch = self.get(watch_id)
+        if watch is None:
+            return False
+        column = self.list(session_id=watch.session_id)
+        index = next(
+            (i for i, other in enumerate(column) if other.id == watch_id), None
+        )
+        if index is None:
+            return False
+        target = index + delta
+        if not 0 <= target < len(column):
+            return False
+        column[index], column[target] = column[target], column[index]
+        # Renumber the whole column rather than swapping the two positions.
+        # Rows that predate the column all share position 0, and swapping two
+        # zeroes changes nothing at all; numbering from 1 also keeps 0 meaning
+        # "never assigned", which is what the backfill in db.py keys on.
+        self._conn.executemany(
+            "UPDATE watches SET position = ? WHERE id = ?",
+            [(position, other.id) for position, other in enumerate(column, 1)],
+        )
+        self._conn.commit()
+        return True
 
     def remove(self, watch_id: int) -> bool:
         cursor = self._conn.execute("DELETE FROM watches WHERE id = ?", (watch_id,))

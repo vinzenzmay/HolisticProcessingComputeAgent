@@ -108,6 +108,93 @@ class TestStore:
             store.add(kind="pipeline", target="x", profile="p")
 
 
+class TestReordering:
+    """alt+↑/alt+↓ in the watchers column, at the store level.
+
+    The point of the feature is that the boxes the user is actually watching
+    can be put at the top, so what is asserted here is the resulting order and
+    not the numbers behind it.
+    """
+
+    def three(self, store, session_id="s1"):
+        for name in ("a", "b", "c"):
+            store.add(
+                kind=KIND_LOG,
+                target=f"/{name}.log",
+                profile="p",
+                session_id=session_id,
+            )
+        return store.list(session_id=session_id)
+
+    def order(self, store, session_id="s1"):
+        return [w.target for w in store.list(session_id=session_id)]
+
+    def test_moving_up_trades_places_with_the_box_above(self, store):
+        _, b, _ = self.three(store)
+        assert store.move(b.id, -1) is True
+        assert self.order(store) == ["/b.log", "/a.log", "/c.log"]
+
+    def test_moving_down_trades_places_with_the_box_below(self, store):
+        _, b, _ = self.three(store)
+        assert store.move(b.id, +1) is True
+        assert self.order(store) == ["/a.log", "/c.log", "/b.log"]
+
+    def test_the_new_order_is_what_the_next_read_sees(self, store):
+        """It is the panel's own source, so the arrangement has to survive the
+        repaint two seconds later — and the restart after that."""
+        a, _, c = self.three(store)
+        store.move(c.id, -1)
+        store.move(c.id, -1)
+        store.update(a.id, state=LOG_PRESENT)  # a poll must not undo it
+        assert self.order(store) == ["/c.log", "/a.log", "/b.log"]
+
+    def test_the_top_box_cannot_go_further_up(self, store):
+        a, _, _ = self.three(store)
+        assert store.move(a.id, -1) is False
+        assert self.order(store) == ["/a.log", "/b.log", "/c.log"]
+
+    def test_the_bottom_box_cannot_go_further_down(self, store):
+        _, _, c = self.three(store)
+        assert store.move(c.id, +1) is False
+        assert self.order(store) == ["/a.log", "/b.log", "/c.log"]
+
+    def test_moving_a_watch_that_is_gone_is_not_an_error(self, store):
+        """The panel repaints on a timer, so the box under the cursor can be
+        dropped between the keypress and the write."""
+        a, _, _ = self.three(store)
+        store.remove(a.id)
+        assert store.move(a.id, -1) is False
+
+    def test_a_move_leaves_another_session_alone(self, store):
+        """Each session has its own column; one cannot reshuffle another's."""
+        self.three(store, session_id="s1")
+        self.three(store, session_id="s2")
+        store.move(store.list(session_id="s1")[2].id, -1)
+        assert self.order(store, "s1") == ["/a.log", "/c.log", "/b.log"]
+        assert self.order(store, "s2") == ["/a.log", "/b.log", "/c.log"]
+
+    def test_a_new_watch_lands_at_the_bottom_of_a_reordered_column(self, store):
+        """Renumbering a column reuses low numbers, so a new box has to be
+        given one past everything — otherwise it appears in the middle."""
+        _, _, c = self.three(store)
+        store.move(c.id, -1)
+        store.move(c.id, -1)
+        store.add(kind=KIND_LOG, target="/d.log", profile="p", session_id="s1")
+        assert self.order(store) == ["/c.log", "/a.log", "/b.log", "/d.log"]
+
+    def test_a_watch_from_before_the_column_existed_keeps_its_place(self, store):
+        """Rows written by an older hpca all carry position 0. Ordering has to
+        fall back to the id they were sorted by, or every one of them would
+        pile up above the boxes the user has arranged."""
+        self.three(store)
+        store._conn.execute("UPDATE watches SET position = 0")
+        store._conn.commit()
+        assert self.order(store) == ["/a.log", "/b.log", "/c.log"]
+        moved = store.list(session_id="s1")[2]
+        assert store.move(moved.id, -1) is True
+        assert self.order(store) == ["/a.log", "/c.log", "/b.log"]
+
+
 class TestFormatting:
     @pytest.mark.parametrize(
         "seconds,expected",

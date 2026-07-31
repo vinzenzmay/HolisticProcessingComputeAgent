@@ -365,9 +365,11 @@ nothing under `tui/` calls the core yet. What this step is:
 - Every extracted method becomes a forwarder. Keep the names: 34 `test_tui_*`
   files call them, and refactoring the code and its tests at the same time
   leaves nothing green in between.
-- `format_started` and `PROCESS_HISTORY_LIMIT` now exist in both `tui/app.py`
+- ~~`format_started` and `PROCESS_HISTORY_LIMIT` now exist in both `tui/app.py`
   and `core/pollers.py`, and `test_tui_processes.py` imports them from the
-  former. Re-export, do not delete.
+  former. Re-export, do not delete.~~ Moot: the right column lost its process
+  and job rows (project.md §3.3), so both names and that test module are gone
+  from either side. The panel is watch boxes only, in the store's order.
 - `on_mount`'s `EmbeddingClient` and `on_unmount`'s `embedder.close()` must go:
   `BackendRegistry` owns that client now, and leaving both is a double close.
 - Wire the UI's existing `ConfirmScreen` to `confirm.requested`, or triage

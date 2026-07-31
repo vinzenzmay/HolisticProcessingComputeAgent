@@ -109,10 +109,10 @@ class TestQuitConfirm:
             assert app.query_one("#chat-input", ChatInput).text == "q"
             assert not isinstance(app.screen, ConfirmScreen)
 
-    async def test_q_is_inert_on_the_processes_column(self, hpca_home):
+    async def test_q_is_inert_on_the_watchers_column(self, hpca_home):
         app = HpcaApp(llm=FakeLLM())
         async with app.run_test(size=(120, 40)) as pilot:
-            app._focus_column("processes")
+            app._focus_column("watchers")
             await pilot.pause()
             assert app.check_action("confirm_quit", ()) is False
             await pilot.press("q")

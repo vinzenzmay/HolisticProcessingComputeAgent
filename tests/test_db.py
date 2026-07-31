@@ -87,6 +87,33 @@ class TestWatchUniqueness:
         assert "idx_watches_session_target" in names
         conn.close()
 
+    def test_an_existing_database_gains_the_position_column_backfilled(
+        self, tmp_path
+    ):
+        """A DEFAULT only describes new rows, so without the backfill every
+        watch made before this release would sort above every one made after
+        it — the column would look shuffled on the first start."""
+        conn = connect(tmp_path / "hpca.db")
+        init_db(conn)
+        store = WatchStore(conn)
+        for name in ("a", "b"):
+            store.add(kind=KIND_LOG, target=f"/{name}.log", session_id="s1")
+        # Recreate the pre-migration state: the column gone, and with it the
+        # positions the two rows were given on insert.
+        conn.execute("ALTER TABLE watches DROP COLUMN position")
+        conn.commit()
+
+        init_db(conn)
+        rows = conn.execute("SELECT target, position FROM watches ORDER BY id")
+        placed = list(rows)
+        assert [row["target"] for row in placed] == ["/a.log", "/b.log"]
+        assert all(row["position"] > 0 for row in placed)
+        assert [w.target for w in store.list(session_id="s1")] == [
+            "/a.log",
+            "/b.log",
+        ]
+        conn.close()
+
     def test_two_sessions_can_watch_the_same_log(self, tmp_path):
         # The whole reason the index had to move: under the old one the second
         # of these was a constraint violation.
