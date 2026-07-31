@@ -212,6 +212,22 @@ class TestDestructiveGate:
         assert any("denied" in m["content"].lower() for m in second_call)
         assert not any("deleted results/" in m["content"] for m in second_call)
 
+    async def test_a_rejection_carries_the_users_reason(self, tools):
+        # The refusal is only half the message: why it was refused is what the
+        # model needs to come back with something acceptable.
+        llm = FakeLLM([tool_json("delete", target="results/"), respond_json("ok")])
+        graph = make_graph(llm, tools)
+        await run_turn(graph, session_id="s1", user_text="delete results")
+        await run_turn(
+            graph,
+            session_id="s1",
+            resume=Command(
+                resume={"approved": False, "reason": "that is the raw data"}
+            ),
+        )
+        second_call = llm.calls[1]["messages"]
+        assert any("that is the raw data" in m["content"] for m in second_call)
+
     async def test_conditionally_destructive_tool(self, tools):
         class FlagParams(BaseModel):
             danger: bool = False

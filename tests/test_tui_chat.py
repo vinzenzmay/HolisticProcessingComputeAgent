@@ -196,6 +196,8 @@ class TestApprovalFlow:
         async with app.run_test(size=(120, 40)) as pilot:
             await submit_chat(app, pilot, "delete results")
             await pilot.press("n")
+            await pilot.pause()
+            await pilot.press("enter")  # refuse without giving a reason
             await app.workers.wait_for_complete()
             await pilot.pause()
             texts = chat_texts(app)

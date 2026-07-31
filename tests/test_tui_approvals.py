@@ -188,6 +188,26 @@ class TestBackgroundIndicator:
             assert row.has_class("session-pending")
             assert app._session_row_text(parked).plain.startswith("! ")
 
+    async def test_a_new_session_does_not_inherit_the_prompt(self, hpca_home):
+        app = HpcaApp(
+            llm=FakeLLM([tool_json("delete", target="results/")]),
+            tools=destructive_tools(),
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "delete results")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            parked = app.active_session
+            assert decision_bar(app).display
+
+            await app.start_new_session()
+            await pilot.pause()
+            # The prompt belongs to the session that raised it. Left on screen
+            # it would read as this session's, over a thread that has nothing
+            # waiting — and the keys answering it are dead.
+            assert not decision_bar(app).display
+            assert parked.session_id in app._pending_decision  # still waiting there
+
     async def test_opening_the_flagged_session_reveals_the_prompt(self, hpca_home):
         app = HpcaApp(
             llm=BlockingLLM(

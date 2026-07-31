@@ -98,6 +98,33 @@ Terminals in 2026 are assumed wider than 80 columns
     this process" action; that is not implemented — failure explanation is done
     automatically by the triage pipeline in §5.5, not on demand from this
     column.)
+  * *Watch (right column, above the run history):* a box the user asked for,
+    pinned by the agent's `watch_log` / `watch_job` tools — see *Watches*
+    below. **Enter** flashes the last 300 characters of the log (a toast that
+    expires, not a screen to dismiss), `(d)` stops watching and removes the
+    box. The log itself is never touched.
+
+**Watches (right column).** What hpca started is only a slice of what runs on a
+cluster, and it is a slice already in the chat log — so the column's first job
+is somebody *else's* work: an sbatch script submitted by hand, a snakemake run
+spawning tool after tool, the log some long-running tool appends to. Finding
+out whether any of that is alive otherwise means `squeue`, then ssh to the
+node, then `tail`. The agent pins one to the column instead:
+
+* `watch_log <path>` — a file. Its mtime is the signal: "last write 4s ago" is
+  alive, "last write 40m ago" is dead or wedged. Registering a log that does
+  not exist yet is normal (the job has not created it), and the box says so.
+* `watch_job <id>` — refreshed from `squeue` every 15 s; once the job leaves the
+  queue `sacct` supplies the final state, so the box settles on COMPLETED or
+  FAILED rather than vanishing. A finished job stops being polled.
+* `list_watches`, `unwatch <name>` — the same operations from the model's side.
+
+A watch belongs to a **profile**, not a session: it describes the machine, not
+the conversation, so it stays on screen when the user switches sessions and
+survives a restart (table `watches`, see `hpca.watches`). Logs are stat'ed
+every 5 s on the DB thread — on an NFS home the stat is the slow half, and a
+wedged filesystem must cost a late repaint, never the event loop. A log going
+quiet, and any job state change, raise a toast.
 
 **Reserved hotkeys — never bind these** (they are eaten or made unreliable by the
 terminal, by zellij/tmux, or by the flow-control layer, so a future UI addition
@@ -203,10 +230,10 @@ round, so switching applies immediately — even to a turn already in flight.
   destructive operations; an inline approval bar at the foot of the chat column
   (`DecisionBar`, deliberately non-modal so the other columns and sessions stay
   visible) shows the actual script text and offers *run script* / *skip
-  script*. A skip is fed back to the model as a
+  script*. A skip without a reason is fed back to the model as a
   SKIPPED tool result that forbids retrying, rephrasing, or reaching the same
   outcome another way (bare denials make small models re-propose the same
-  command).
+  command); a skip *with* one says the opposite — see the refusal box in §5.3.
 * **auto** — structurally today's behaviour (only the §5.3 destructive gate),
   plus a prompt block telling the model that no confirmation will ever arrive,
   so it must work to completion instead of narrating and waiting for "do it".
@@ -494,6 +521,16 @@ gate (§5.3) or actual submission proceed.
   cancel) requires an explicit interactive confirmation in the TUI
   (LangGraph `interrupt()` → modal with the exact operation and resolved real paths
   shown to the user).
+* **Refusing asks why.** Saying no has a second step: the prompt keeps the call
+  on screen and opens a box for what should be different, sent with enter
+  (empty is allowed, and esc refuses without explaining). The graph resumes
+  with `Command(resume={"approved": bool, "reason": str})`, and the reason
+  turns the refusal into a correction — the SKIPPED/DENIED tool result then
+  tells the model to work it into a fixed version and put *that* up for
+  approval, instead of the "do not retry" a bare refusal carries. The point is
+  the common case: a script that is nearly right, where retyping the whole
+  request is the only way to say "wrong partition". Half-written reasons are
+  parked per session like chat drafts, so switching away does not lose them.
 * **Recovery for small files (< 1 GB, configurable):**
   * *Deletions:* do **not** copy — **hardlink the file into a trash directory**
     (`~/.HolisticProcessingComputeAgent/trash/<timestamp>/…`) before unlinking.

@@ -132,6 +132,8 @@ class TestManualFlow:
             assert pending_payload(app)["kind"] == "execution"
             assert "echo hi" in pending_payload(app)["script"]
             await pilot.press("n")  # skip script
+            await pilot.pause()
+            await pilot.press("enter")  # skip without giving a reason
             await app.workers.wait_for_complete()
             await pilot.pause()
             texts = chat_texts(app)

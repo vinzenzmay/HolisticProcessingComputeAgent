@@ -16,6 +16,11 @@ from typing import Awaitable, Callable
 
 SACCT_FIELDS = "JobID,State,ExitCode,Elapsed,MaxRSS,ReqMem,Timelimit"
 
+# What a watched job's box shows (§3.3): id, state, where it runs, how long it
+# has run, how long it may still run, its name, and — while PENDING — why it is
+# waiting. One squeue call answers every question the panel asks.
+SQUEUE_DETAIL_FORMAT = "%i|%T|%N|%M|%L|%j|%r"
+
 TERMINAL_STATES = {
     "COMPLETED",
     "FAILED",
@@ -134,6 +139,52 @@ def parse_squeue(text: str) -> dict[str, str]:
     return states
 
 
+@dataclass
+class JobDetail:
+    """One ``squeue`` row, as :data:`SQUEUE_DETAIL_FORMAT` lays it out."""
+
+    job_id: str
+    state: str
+    nodes: str = ""
+    elapsed: str = ""
+    time_left: str = ""
+    name: str = ""
+    reason: str = ""
+
+
+def parse_squeue_details(text: str) -> dict[str, JobDetail]:
+    """Parse ``squeue -h -o SQUEUE_DETAIL_FORMAT`` into ``{job_id: JobDetail}``.
+
+    Short rows are tolerated rather than dropped: sites configure squeue's
+    output in ways that surprise, and a job whose state is known but whose
+    reason is missing is still worth a box.
+    """
+    details: dict[str, JobDetail] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or "|" not in line:
+            continue
+        fields = [f.strip() for f in line.split("|")]
+        fields += [""] * (7 - len(fields))
+        job_id, state, nodes, elapsed, time_left, name, reason = fields[:7]
+        if not job_id:
+            continue
+        # squeue writes "(null)"/"None" into fields that do not apply (a
+        # pending job has no node, a running one has no reason).
+        blanks = {"(null)", "none", "n/a", "(none)"}
+        clean = lambda v: "" if v.lower() in blanks else v  # noqa: E731
+        details[job_id] = JobDetail(
+            job_id=job_id,
+            state=state,
+            nodes=clean(nodes),
+            elapsed=elapsed,
+            time_left=clean(time_left),
+            name=name,
+            reason=clean(reason),
+        )
+    return details
+
+
 async def _default_run(argv: list[str]) -> tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
         *argv,
@@ -217,6 +268,27 @@ class SlurmClient:
                 return parse_squeue(stdout)
             raise SlurmError(f"squeue failed: {stderr.strip() or stdout.strip()}")
         return parse_squeue(stdout)
+
+    async def job_details(self, job_ids: list[str]) -> dict[str, JobDetail]:
+        """Everything a watched job's box shows, in one squeue call (§3.3).
+
+        The sibling of :meth:`job_states` for the panel rather than the reaper,
+        and it reads a gone job the same way: ids missing from the result have
+        left the queue, and "Invalid job id" is squeue being authoritative
+        about that, not a failure.
+        """
+        if not job_ids:
+            return {}
+        rc, stdout, stderr = await self._run(
+            self._wrap(
+                ["squeue", "-h", "-o", SQUEUE_DETAIL_FORMAT, "-j", ",".join(job_ids)]
+            )
+        )
+        if rc != 0:
+            if "invalid job id" in stderr.lower():
+                return parse_squeue_details(stdout)
+            raise SlurmError(f"squeue failed: {stderr.strip() or stdout.strip()}")
+        return parse_squeue_details(stdout)
 
     async def cancel(self, job_id: str) -> None:
         rc, stdout, stderr = await self._run(self._wrap(["scancel", job_id]))

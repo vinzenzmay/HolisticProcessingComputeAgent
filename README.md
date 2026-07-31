@@ -83,6 +83,17 @@ your skills (invoke a skill with `/<skill>`; see *Skills* below).
 * **Destructive-operation safety net** — deletes, overwrites, kills, and cancels
   require explicit confirmation, and small files are hardlinked into a timestamped
   trash directory (with a TTL, cleaned on start) before being removed.
+* **Watches — pin a job or a log to the right column** — most of what runs on
+  a cluster was not started by hpca: an sbatch script you submitted by hand, a
+  snakemake run spawning sniffles, the log that tool appends to. Ask the agent
+  to watch one ("keep an eye on the sniffles log", "watch job 27744534") and it
+  gets a live box in the right column: a Slurm job's state, node and remaining
+  time, refreshed from `squeue` (and from `sacct` once it leaves the queue), or
+  a log file's size and **how long ago it was last written to** — the quickest
+  answer there is to "is it still going, or did it die?". On a box: **Enter**
+  flashes the last 300 characters of the log, **`d`** stops watching (the file
+  itself is never touched). Watches stay put when you switch sessions and
+  survive a restart.
 * **Job tracking** — a background poller watches cluster jobs (via `sacct`) and
   local subprocesses, records everything in an sqlite DB, and delivers terminal
   outcomes back into the conversation so the agent can react (a finished local

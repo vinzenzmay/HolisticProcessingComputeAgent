@@ -7,7 +7,7 @@ import logging
 import shutil
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from os import environ as os_environ
 from pathlib import Path
 from time import monotonic, time
@@ -22,6 +22,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.geometry import Offset
 from textual.content import Content
 from textual.message import Message
+from textual.widget import Widget
 from textual.widgets import Footer, Label, ListItem, ListView, Static, TextArea
 
 from hpca.agent import compact
@@ -38,6 +39,7 @@ from hpca.agent.graph import (
     thread_message_count,
 )
 from hpca.agent.job_tools import add_job_tools
+from hpca.agent.watch_tools import add_watch_tools
 from hpca.agent.tools import ToolRegistry
 from hpca.autoconnect import plan_auto_connect
 from hpca.clipboard import ClipboardManager, CopyResult
@@ -126,6 +128,8 @@ from hpca.tui.approval_screen import (
     approval_details,
     approval_hint,
     approval_kind,
+    approval_reason_hint,
+    approval_reason_title,
     approval_script,
     approval_title,
 )
@@ -150,11 +154,35 @@ from hpca.tui.profiles_screen import ProfilePickerScreen, ProfilesScreen
 from hpca.tui.rename_screen import RenameScreen
 from hpca.tui.settings_screen import SettingsScreen
 from hpca.tui.switch_llm import SwitchLLMScreen
+from hpca.watches import (
+    KIND_JOB,
+    KIND_LOG,
+    LOG_GONE,
+    LOG_IDLE,
+    Watch,
+    WatchStore,
+    apply_job_details,
+    is_settled,
+    peek,
+    poll_log_watches,
+    watch_class,
+    watch_lines,
+)
 
 COLUMN_IDS = ("sessions", "chat", "processes")
 # Rows the processes column shows before summarising the rest. A long-lived
 # session accumulates hundreds; the panel is a view, not an archive.
 PROCESS_HISTORY_LIMIT = 60
+# How often a watched log is stat'ed. Cheap (one stat per box) and worth being
+# responsive about: the whole point of a log box is that "still writing" and
+# "stopped a minute ago" are visibly different.
+LOG_WATCH_SECONDS = 5.0
+# ...and how often watched jobs are refreshed. Slower: each sweep is an squeue
+# call to the controller, and a job's state does not change on the second.
+JOB_WATCH_SECONDS = 15.0
+# The Enter peek flashes rather than parks: long enough to read 300 characters,
+# short enough that it is a glance, not a screen to dismiss.
+PEEK_TIMEOUT = 12.0
 
 
 def _file_logger(name: str, filename: str) -> logging.Logger:
@@ -208,6 +236,30 @@ def format_started(started_at: str) -> str:
     if moment.date() == datetime.now().date():
         return moment.strftime(" %H:%M")
     return moment.strftime("%m-%d %H:%M")
+
+
+@dataclass
+class PanelRow:
+    """One row of the right column, whatever kind of thing it stands for.
+
+    The column mixes watch boxes, cluster jobs, local processes and inert
+    headings, and it repaints on a timer while the user is arrowing through
+    it. Naming every row with a stable ``key`` is what lets a repaint update
+    the text in place — a watch's "last write 4s ago" ticks on its own — and
+    rebuild only when the set of rows actually changes, so the cursor stops
+    jumping back to the top twice a second.
+    """
+
+    key: str
+    text: str
+    classes: str
+    title: str = ""  # box border title; watches only
+    watch: "Watch | None" = None
+    record: "ProcessRecord | None" = None
+    job: "JobRow | None" = None
+    inert: bool = False  # a heading: skipped by the cursor, no actions
+
+
 SESSION_TITLE_MAX = 40
 UNTITLED_SESSION = "untitled"  # placeholder until the first message names it
 
@@ -641,6 +693,41 @@ class WorkingIndicator(Static):
         self._width = len(text)
 
 
+class ReasonInput(TextArea):
+    """The "why not" box, opened by refusing a gated call.
+
+    Enter sends what is written (empty is allowed — that is the plain refusal);
+    the same keys as the chat entry start a new line, for a reason worth more
+    than one. It only exists while a refusal is being explained, so unlike the
+    chat entry there is nothing to park: leaving the prompt answers it.
+    """
+
+    class Submitted(Message):
+        def __init__(self, reason_input: "ReasonInput", text: str) -> None:
+            super().__init__()
+            self.reason_input = reason_input
+            self.text = text
+
+        @property
+        def control(self) -> "ReasonInput":
+            return self.reason_input
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(soft_wrap=True, **kwargs)
+
+    async def _on_key(self, event) -> None:
+        if event.key == "enter":
+            event.stop()
+            event.prevent_default()
+            self.post_message(self.Submitted(self, self.text))
+        elif event.key in ChatInput.NEWLINE_KEYS:
+            event.stop()
+            event.prevent_default()
+            self.insert("\n")
+        else:
+            await super()._on_key(event)
+
+
 class DecisionBar(Vertical):
     """Inline, non-modal decision prompt at the foot of the chat column.
 
@@ -652,15 +739,25 @@ class DecisionBar(Vertical):
     focused; a decision waiting in a background session shows nothing here and
     only lights the "!" in the sidebar until that session is opened.
 
-    ``self.kind`` gates the keys in ``check_action`` so the footer offers
-    nothing while the bar is hidden. It answers by calling back into the app,
-    which runs the same resume path the modal screens used to.
+    Saying no has two stages, tracked by ``self.stage``. "ask" is the y/n
+    question; "n" moves to "reason", which keeps the call on screen — the
+    reason is written *about* it — and adds a box for why. Nothing is sent
+    until that box is answered, so the refusal and the reason reach the model
+    together. Escape stays a one-key way out at either stage: it refuses
+    without explaining, because the key that leaves a prompt must not open a
+    second one to get out of.
+
+    ``self.kind`` and ``self.stage`` gate the keys in ``check_action`` so the
+    footer offers nothing while the bar is hidden, and does not still offer
+    y/n once the answer is in. It answers by calling back into the app, which
+    owns the pending-decision state and runs the resume path.
     """
 
     can_focus = True
 
     # esc listed first (esc/quit ordering), and priority so it denies the
-    # call rather than being eaten by whatever holds focus.
+    # call rather than being eaten by whatever holds focus — including the
+    # reason box, which is a text field and would otherwise swallow it.
     BINDINGS = [
         Binding("y", "approve", "approve"),
         Binding("n", "deny", "deny"),
@@ -694,32 +791,62 @@ class DecisionBar(Vertical):
     .decision-hint {
         color: $text-muted;
     }
+    #decision-reason {
+        height: auto;
+        max-height: 6;
+        margin: 1 0 0 0;
+        border: round $panel;
+    }
     """
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self.kind = ""  # "" (hidden) | "approval"
+        self.stage = "ask"  # "ask" (y/n) | "reason" (saying why not)
         self._payload = None
 
     def check_action(self, action: str, parameters) -> bool | None:
         if action in ("approve", "deny"):
-            return self.kind == "approval"
-        if action == "cancel":  # esc denies
+            # Gone once the answer is "no": the question left is why, and the
+            # box below takes those letters as text.
+            return self.kind == "approval" and self.stage == "ask"
+        if action == "cancel":  # esc refuses, at either stage
             return self.kind != ""
         return True
 
-    async def _reset(self, kind: str, payload) -> None:
+    async def _reset(self, kind: str, payload, stage: str = "ask") -> None:
         self.kind = kind
+        self.stage = stage
         self._payload = payload
         self.remove_class("decision-execution")
         await self.remove_children()
 
-    async def show_approval(self, payload: dict) -> None:
-        await self._reset("approval", payload)
+    async def show_approval(
+        self, payload: dict, *, stage: str = "ask", reason: str = ""
+    ) -> None:
+        """Render one decision at the given stage.
+
+        Called afresh on every session switch, so it takes the stage and any
+        half-written reason as arguments rather than keeping them: the app
+        holds that per session, and this bar only ever shows one.
+
+        Never takes focus — a decision surfacing in the open session must not
+        pull the user out of whatever column they are in (see
+        ``HpcaApp._set_pending_decision``); ``focus_prompt`` is what lands on
+        it deliberately.
+        """
+        await self._reset("approval", payload, stage)
         if approval_kind(payload) == "execution":
             self.add_class("decision-execution")
-        widgets: list[Static] = [
-            Static(approval_title(payload), classes="decision-title"),
+        # Once the answer is in, the heading stops asking for it and asks what
+        # to change instead — the question the box below is there to answer.
+        title = (
+            approval_reason_title(payload)
+            if stage == "reason"
+            else approval_title(payload)
+        )
+        widgets: list[Widget] = [
+            Static(title, classes="decision-title"),
             Static(Content(approval_details(payload)), classes="decision-details"),
         ]
         script = approval_script(payload)
@@ -728,23 +855,61 @@ class DecisionBar(Vertical):
                 Static(Content(script)), classes="decision-script"
             )
             widgets.append(scroller)
-        widgets.append(Static(approval_hint(payload), classes="decision-hint"))
+        if stage == "reason":
+            # The call stays above the box: the reason is written about it,
+            # and a script the user can no longer see is one they cannot
+            # explain what is wrong with.
+            widgets.append(
+                Static(approval_reason_hint(), classes="decision-hint")
+            )
+            widgets.append(ReasonInput(id="decision-reason"))
+        else:
+            widgets.append(Static(approval_hint(payload), classes="decision-hint"))
         await self.mount(*widgets)
+        if stage == "reason":
+            box = self.query_one("#decision-reason", ReasonInput)
+            box.text = reason  # what was typed before switching away
+            box.move_cursor(box.document.end)
         self.display = True
 
     async def clear_decision(self) -> None:
         await self._reset("", None)
         self.display = False
 
+    def reason_box(self) -> ReasonInput | None:
+        """The "why not" box, while one is open."""
+        found = self.query("#decision-reason")
+        return found.first(ReasonInput) if found else None
+
+    def reason_text(self) -> str:
+        """What has been typed into the box so far (empty when there is none)."""
+        box = self.reason_box()
+        return box.text if box is not None else ""
+
+    def focus_prompt(self) -> None:
+        """Focus whatever answers the prompt: the box once a reason is being
+        written, otherwise the bar itself, where y/n live."""
+        box = self.reason_box()
+        if box is not None:
+            box.focus()
+        else:
+            self.focus()
+
     def action_approve(self) -> None:
         self.app.resolve_decision("approval", True)
 
     def action_deny(self) -> None:
-        self.app.resolve_decision("approval", False)
+        # Not an answer yet: the refusal is sent once the box says why, or
+        # says nothing.
+        self.app.begin_decline("approval")
 
     def action_cancel(self) -> None:
         if self.kind == "approval":
             self.app.resolve_decision("approval", False)
+
+    def _on_reason_input_submitted(self, event: ReasonInput.Submitted) -> None:
+        event.stop()
+        self.app.resolve_decision("approval", False, reason=event.text.strip())
 
 
 class ChatList(ListView):
@@ -791,16 +956,34 @@ class ChatPanel(ColumnPanel):
 
 
 class ProcessesList(ListView):
-    """Right-column list; its hotkeys appear in the footer when focused."""
+    """Right-column list; its hotkeys appear in the footer when focused.
+
+    Enter means "show me what this is doing" for every row type, which for a
+    watch is a flash of the log's tail rather than a modal: the question a
+    watch box provokes ("did it print an error, or is it just slow?") is
+    answered by 300 characters, and a screen to open and dismiss is more
+    ceremony than the answer is worth.
+    """
 
     BINDINGS = [
         Binding("enter", "inspect_process", "inspect"),
         Binding("k", "kill_process", "kill"),
+        Binding("d", "drop_watch", "unwatch"),
     ]
 
     def check_action(self, action: str, parameters) -> bool | None:
-        if action in ("inspect_process", "kill_process"):
-            return self.highlighted_child is not None
+        # Each row type advertises only the keys that do something on it: a
+        # watch box has nothing to kill, and a process has nothing to unwatch.
+        child = self.highlighted_child
+        if action == "drop_watch":
+            return getattr(child, "data_watch", None) is not None
+        if action == "kill_process":
+            return (
+                getattr(child, "data_record", None) is not None
+                or getattr(child, "data_job", None) is not None
+            )
+        if action == "inspect_process":
+            return child is not None
         return True
 
     def action_inspect_process(self) -> None:
@@ -808,6 +991,9 @@ class ProcessesList(ListView):
 
     def action_kill_process(self) -> None:
         self.app.kill_selected_process()
+
+    def action_drop_watch(self) -> None:
+        self.app.drop_selected_watch()
 
 
 class ProcessesPanel(ColumnPanel):
@@ -926,6 +1112,30 @@ class HpcaApp(App):
     /* Secondary rows in the processes column: the count of history not shown,
        and processes whose fate was never recorded because hpca exited first. */
     .proc-more, .proc-unknown { color: $text-muted; }
+    /* Registered watches are boxes, not rows: they are the thing the user
+       opened this column for, and the frame is what separates "what I asked
+       to be told about" from the scrollback of everything hpca has run. The
+       border colour carries the state, so the column reads at a glance. */
+    .watch {
+        border: round $panel;
+        border-title-color: $text;
+        padding: 0 1;
+        height: auto;
+    }
+    .watch-live { border: round $success; }
+    .watch-idle { border: round $warning; }
+    .watch-done { border: round $accent; }
+    .watch-dead {
+        border: round $error;
+        color: $text-muted;
+    }
+    /* Section headings inside the column, so the boxes and the run history do
+       not read as one list. */
+    .panel-section {
+        color: $text-muted;
+        text-style: italic;
+        padding: 0 1;
+    }
     .chat-working {
         color: $text-muted;
         padding: 0 1;
@@ -1016,6 +1226,10 @@ class HpcaApp(App):
             )
             if self.slurm is not None:
                 add_job_tools(self._tools)
+            # Watching is useful with or without Slurm: watch_job needs a
+            # cluster, but watch_log is just a file, and half the point is
+            # seeing a log that a hand-submitted job is writing.
+            add_watch_tools(self._tools)
             # Always registered: HPCA ships skills of its own, so read_skill
             # has something to fetch on any install and in any profile.
             add_skill_tools(self._tools)
@@ -1063,10 +1277,14 @@ class HpcaApp(App):
         # queued messages wait for the resume; other sessions are unaffected.
         self._awaiting_approval: set[str] = set()
         # The inline decision each session is waiting on, keyed by session_id:
-        # {"kind": "approval", "payload": ...}. Drives both the inline
-        # DecisionBar (shown only for the active session) and the sidebar "!"
-        # (shown for every session with one), so switching sessions reveals or
-        # hides the right prompt without losing a decision left behind.
+        # {"kind": "approval", "payload": ..., "stage": ..., "reason": ...}.
+        # Drives both the inline DecisionBar (shown only for the active
+        # session) and the sidebar "!" (shown for every session with one), so
+        # switching sessions reveals or hides the right prompt without losing a
+        # decision left behind. "stage"/"reason" carry the refusal in progress
+        # — which half of the prompt is up, and the words typed into it so far
+        # — for the same reason drafts are parked: one bar serves every
+        # session, so what is on screen has to be restorable per session.
         self._pending_decision: dict[str, dict] = {}
         self._shutting_down = False
         # Frozen per-session memory views (redesign Phase 1): one snapshot per
@@ -1092,6 +1310,10 @@ class HpcaApp(App):
         # script behind a finished process never changes.
         self._process_labels: dict[int, str] = {}
         self._refreshing_processes = False
+        # The right column's row keys as last painted; identical keys mean the
+        # repaint can update text in place instead of rebuilding under the
+        # user's cursor. See _paint_panel.
+        self._panel_keys: list[str] | None = None
         self._conn = None
         # Sync sqlite off the event loop (NFS homes make each call slow
         # enough to eat keystrokes); the periodic pollers go through this.
@@ -1153,6 +1375,7 @@ class HpcaApp(App):
             )
         self._rebuild_graph()
         self.job_store = JobStore(self._conn)
+        self.watch_store = WatchStore(self._conn)
         self.symbol_index = SymbolIndex(self._conn)
         self.rag_store = RagStore(self._dbcache.path_for("rag.db"))
         self.embedder = EmbeddingClient(
@@ -1178,6 +1401,7 @@ class HpcaApp(App):
         self.run_curator_if_due()
         self.set_interval(2.0, self.refresh_processes)
         self.set_interval(2.0, self.watch_processes)
+        self.set_interval(LOG_WATCH_SECONDS, self.poll_watched_logs)
         sync_interval = self.settings.database.sync_interval_s
         if self._dbcache.active and sync_interval > 0:
             self.set_interval(sync_interval, self._sync_db_cache)
@@ -1185,6 +1409,7 @@ class HpcaApp(App):
             self.set_interval(
                 max(5, self.settings.cluster.job_poll_seconds), self.poll_jobs
             )
+            self.set_interval(JOB_WATCH_SECONDS, self.poll_watched_jobs)
         self._focus_column("sessions")
 
     # ------------------------------------------------------------- db cache
@@ -1342,6 +1567,7 @@ class HpcaApp(App):
             has_skills=bool(skills),
             session_search="session_search" in self._tools.names(),
             memory_tool="memory" in self._tools.names(),
+            watch_tools="watch_log" in self._tools.names(),
         )
 
     def _recall_lines(
@@ -1987,11 +2213,16 @@ class HpcaApp(App):
         if self._log is not None:
             self._log.write(kind, text)
 
-    def _on_approval(self, session: Session, approved: bool | None) -> None:
+    def _on_approval(
+        self, session: Session, approved: bool | None, reason: str = ""
+    ) -> None:
         # Resume the turn on the thread it belongs to — the user may have
         # switched sessions since the prompt appeared.
         self._awaiting_approval.discard(session.session_id)
-        self._run_agent(session, resume=Command(resume={"approved": bool(approved)}))
+        self._run_agent(
+            session,
+            resume=Command(resume={"approved": bool(approved), "reason": reason}),
+        )
 
     # -------------------------------------------------- inline decision prompt
 
@@ -2008,6 +2239,8 @@ class HpcaApp(App):
         self._pending_decision[session.session_id] = {
             "kind": kind,
             "payload": payload,
+            "stage": "ask",  # y/n first; refusing opens the box for why
+            "reason": "",
         }
         self._refresh_session_row(session.session_id)  # light the "!"
         if self._is_active_session(session):
@@ -2032,22 +2265,71 @@ class HpcaApp(App):
         if pending is None:
             await bar.clear_decision()
         else:
-            await bar.show_approval(pending["payload"])
+            await bar.show_approval(
+                pending["payload"],
+                stage=pending.get("stage", "ask"),
+                reason=pending.get("reason", ""),
+            )
 
     def _focus_decision_bar(self) -> None:
-        """Focus the inline prompt so y/n reach it."""
+        """Focus the inline prompt so its keys reach it — the y/n bar, or the
+        box once a refusal is being explained."""
         bar = self._decision_bar()
         if bar is None or not bar.display:
             return
-        bar.focus()
+        bar.focus_prompt()
 
-    def resolve_decision(self, kind: str, value) -> None:
+    def _park_reason(self) -> None:
+        """Keep a half-written refusal reason under the session being left.
+
+        The same problem as the chat drafts: one bar serves every session, so
+        without this the words typed about one session's script are gone the
+        moment the user looks at another — and the decision they belong to is
+        still sitting there waiting to be answered.
+        """
+        session = self.active_session
+        if session is None:
+            return
+        pending = self._pending_decision.get(session.session_id)
+        if pending is None or pending.get("stage") != "reason":
+            return
+        bar = self._decision_bar()
+        if bar is None:  # the screen is tearing down: nothing to keep
+            return
+        pending["reason"] = bar.reason_text()
+
+    def begin_decline(self, kind: str) -> None:
+        """Move the open session's decision to its second half: the answer is
+        "no", and the box now opening collects why.
+
+        Nothing is sent yet — the turn stays parked, so the refusal and the
+        reason reach the model together and the model is never told "no" twice.
+        """
+        session = self.active_session
+        if session is None:
+            return
+        pending = self._pending_decision.get(session.session_id)
+        if pending is None or pending["kind"] != kind:
+            return  # stale keystroke: the decision changed or is already gone
+        pending["stage"] = "reason"
+        self.call_later(self._open_reason_box)
+
+    async def _open_reason_box(self) -> None:
+        """Re-render the prompt at its reason stage and land in the box — the
+        user pressed a key to get here, so the cursor belongs there."""
+        await self._sync_decision_bar()
+        self._focus_decision_bar()
+
+    def resolve_decision(self, kind: str, value, reason: str = "") -> None:
         """Answer the inline decision the chat column is showing (DecisionBar).
 
         Only the active session's decision is ever displayed, so that is the
         one resolved. Clear the pending state and the "!", hide the bar, then
         run the very same resume path the modal screens used to — kept
-        synchronous so ``_run_agent``'s exclusive turn worker is unchanged."""
+        synchronous so ``_run_agent``'s exclusive turn worker is unchanged.
+
+        ``reason`` is what the user typed into the box when refusing; empty
+        for an approval, and for a refusal they chose not to explain."""
         session = self.active_session
         if session is None:
             return
@@ -2058,7 +2340,7 @@ class HpcaApp(App):
         self._refresh_session_row(session.session_id)  # drop the "!"
         self.call_later(self._sync_decision_bar)  # hide the now-empty bar
         self.focus_chat_input()
-        self._on_approval(session, value)
+        self._on_approval(session, value, reason)
 
     # ------------------------------------------------------------ agent modes
 
@@ -2678,6 +2960,7 @@ class HpcaApp(App):
             slurm=self.slurm,
             jobs=self.job_store,
             job_log_dir=app_dir() / "job_logs",
+            watches=self.watch_store,
             llm=self._llm,
             trash=self.trash,
             symbols=self.symbol_index,
@@ -2727,8 +3010,10 @@ class HpcaApp(App):
 
     def _activate_session(self, session: Session) -> None:
         # Whatever is half-typed belongs to the session being left, not to the
-        # one being opened (per-session drafts).
+        # one being opened (per-session drafts) — in the chat entry, and in the
+        # box asking why that session's script was refused.
         self._park_draft()
+        self._park_reason()
         # A session boundary is a deliberate refresh point (redesign Phase 1):
         # memories written by another session or instance are picked up here,
         # while WITHIN a session the frozen snapshot keeps the prompt prefix
@@ -2866,6 +3151,10 @@ class HpcaApp(App):
             bar = self._context_bar()
             if bar is not None:
                 bar.reset()  # a fresh thread starts from an empty window
+            # A decision the last session was showing is not this session's to
+            # answer: hide it here, the way open_session does on its way in. A
+            # fresh thread never has one of its own, so this only ever clears.
+            await self._sync_decision_bar()
             await self._reload_sessions()
         self._focus_column("chat")
 
@@ -3042,7 +3331,9 @@ class HpcaApp(App):
             self._context_used.pop(self.active_session.session_id, None)
         # The draft is not dropped with it — leaving a session is how you go
         # and look something up, and coming back finds the sentence intact.
+        # Same for a half-written reason on a decision left unanswered.
         self._park_draft()
+        self._park_reason()
         self.query_one("#chat-input", ChatInput).text = ""
         self.active_session = None
         self._tool_ctx = None
@@ -3214,22 +3505,24 @@ class HpcaApp(App):
             self._refreshing_processes = False
 
     async def _refresh_processes_inner(self) -> None:
+        if self._dbio is None or self._dbio.closed:
+            return
         session = self.active_session
-        records: list[ProcessRecord] = []
-        truncated = 0
-        jobs: list[JobRow] = []
-        if (
-            session is not None
-            and self._dbio is not None
-            and not self._dbio.closed
-        ):
-            session_id = session.session_id
+        session_id = session.session_id if session is not None else None
+        # Watches belong to the profile, not the conversation: they describe
+        # what is running on the machine, and the user wants them on screen
+        # whichever session they happen to be reading.
+        profile = self._panel_profile()
 
-            def _gather(conn):
+        def _gather(conn):
+            watches = WatchStore(conn).list(profile=profile)
+            records: list[ProcessRecord] = []
+            truncated = 0
+            jobs: list[JobRow] = []
+            if session_id is not None:
                 records = list_processes(
                     conn, session_id=session_id, limit=PROCESS_HISTORY_LIMIT
                 )
-                truncated = 0
                 if len(records) > PROCESS_HISTORY_LIMIT:
                     records = records[:PROCESS_HISTORY_LIMIT]
                     truncated = (
@@ -3237,48 +3530,141 @@ class HpcaApp(App):
                         - PROCESS_HISTORY_LIMIT
                     )
                 jobs = JobStore(conn).list(session_id=session_id)
-                return records, truncated, jobs
+            return watches, records, truncated, jobs
 
-            records, truncated, jobs = await self._db(_gather)
-            if (
-                self.active_session is None
-                or self.active_session.session_id != session_id
-            ):
-                return  # switched away mid-fetch; the next tick repaints
-        signature = [(r.pid, r.state) for r in records] + [
-            (j.job_id, j.state) for j in jobs
-        ]
-        if signature == getattr(self, "_process_signature", None):
-            return  # unchanged; avoid churn from the 2s timer
+        watches, records, truncated, jobs = await self._db(_gather)
+        if session_id is not None and (
+            self.active_session is None
+            or self.active_session.session_id != session_id
+        ):
+            return  # switched away mid-fetch; the next tick repaints
         # The DB await above yields; shutdown may have torn the widget down.
-        # Checked before recording the signature so a skipped repaint here
-        # cannot suppress the next one.
         found = self.query("#processes-list")
         if not found:
             return
-        self._process_signature = signature
-        processes_list = found.first(ListView)
-        await processes_list.clear()
-        items = []
-        for job in jobs:
-            label = f"{job.state:<9} job {job.job_id} ({job.script_key})"
-            item = ListItem(Static(Content(label), classes="proc-job"))
-            item.data_job = job
-            items.append(item)
-        for record in records:
-            label = (
-                f"{format_started(record.started_at)} {record.state:<8} "
-                f"{self._describe_process(record)} ({record.pid})"
+        await self._paint_panel(
+            found.first(ListView),
+            self._panel_rows(watches, jobs, records, truncated),
+        )
+
+    def _panel_rows(
+        self,
+        watches: list[Watch],
+        jobs: list[JobRow],
+        records: list[ProcessRecord],
+        truncated: int,
+    ) -> list[PanelRow]:
+        """The whole right column, top to bottom.
+
+        Watches first: they are what the user asked to be shown, and what they
+        are checking when they look over there. Everything hpca ran itself
+        follows under a heading — the same history as before, demoted to what
+        it is, since every one of those calls is also in the chat log.
+        """
+        now = datetime.now(timezone.utc)
+        rows = [
+            PanelRow(
+                key=f"w{watch.id}",
+                text="\n".join(watch_lines(watch, now=now)),
+                classes=f"watch {watch_class(watch)}",
+                title=watch.title,
+                watch=watch,
             )
-            item = ListItem(Static(Content(label), classes=f"proc-{record.state}"))
-            item.data_record = record
-            items.append(item)
+            for watch in watches
+        ]
+        if rows and (jobs or records or truncated):
+            # Only when there is something above it: a heading as the very
+            # first row would take the cursor's opening position for itself.
+            rows.append(
+                PanelRow(
+                    key="h:session",
+                    text="── this session ──",
+                    classes="panel-section",
+                    inert=True,
+                )
+            )
+        for job in jobs:
+            rows.append(
+                PanelRow(
+                    key=f"j{job.job_id}",
+                    text=f"{job.state:<9} job {job.job_id} ({job.script_key})",
+                    classes="proc-job",
+                    job=job,
+                )
+            )
+        for record in records:
+            rows.append(
+                PanelRow(
+                    key=f"p{record.pid}",
+                    text=(
+                        f"{format_started(record.started_at)} "
+                        f"{record.state:<8} "
+                        f"{self._describe_process(record)} ({record.pid})"
+                    ),
+                    classes=f"proc-{record.state}",
+                    record=record,
+                )
+            )
         if truncated > 0:
             # Never let a cut list read as the whole history.
-            items.append(
-                ListItem(Static(Content(f"… {truncated} older"), classes="proc-more"))
+            rows.append(
+                PanelRow(
+                    key="more",
+                    text=f"… {truncated} older",
+                    classes="proc-more",
+                    inert=True,
+                )
             )
-        processes_list.extend(items)
+        return rows
+
+    async def _paint_panel(self, panel: ListView, rows: list[PanelRow]) -> None:
+        """Draw the column, rebuilding only when its shape actually changed.
+
+        A watch box counts up ("last write 12s ago"), so the text changes on
+        every tick while the set of rows does not. Clearing and re-extending
+        for that would reset the highlight twice a second and make the column
+        impossible to navigate — so identical keys means update in place, and
+        a genuine change restores the cursor onto the row it was on.
+        """
+        keys = [row.key for row in rows]
+        if keys == self._panel_keys and len(panel.children) == len(rows):
+            bodies = [getattr(item, "data_body", None) for item in panel.children]
+            if all(body is not None for body in bodies):
+                for item, body, row in zip(panel.children, bodies, rows):
+                    # The payloads are re-attached, not just the text: the row
+                    # stands for a watch whose state has moved on, and `d`
+                    # must act on what the box currently says.
+                    item.data_watch = row.watch
+                    item.data_record = row.record
+                    item.data_job = row.job
+                    body.update(Content(row.text))
+                    if body.classes != frozenset(row.classes.split()):
+                        body.set_classes(row.classes)
+                    if row.title:
+                        body.border_title = row.title
+                return
+        selected = self._selected_key(panel)
+        self._panel_keys = keys
+        await panel.clear()
+        items = []
+        for row in rows:
+            body = Static(Content(row.text), classes=row.classes)
+            if row.title:
+                body.border_title = row.title
+            item = ListItem(body, disabled=row.inert)
+            item.data_body = body
+            item.data_key = row.key
+            item.data_watch = row.watch
+            item.data_record = row.record
+            item.data_job = row.job
+            items.append(item)
+        await panel.extend(items)
+        if selected is not None and selected in keys:
+            panel.index = keys.index(selected)
+
+    def _selected_key(self, panel: ListView) -> str | None:
+        highlighted = panel.highlighted_child
+        return getattr(highlighted, "data_key", None) if highlighted else None
 
     def _describe_process(self, record: ProcessRecord) -> str:
         """Panel label for a process, cached by pid.
@@ -3329,6 +3715,91 @@ class HpcaApp(App):
                 ))
         if changes:
             await self.drain_work()
+            await self.refresh_processes()
+
+    # ---------------------------------------------------------- watch polls
+
+    def _panel_profile(self) -> str:
+        """Whose watches the right column shows: the open session's profile,
+        or the app's when nothing is open."""
+        session = self.active_session
+        return session.profile if session is not None else self.profile
+
+    async def poll_watched_logs(self) -> None:
+        """Stat every watched log — where the "last write …" clock comes from.
+
+        Stat and write happen together on the DB thread: on an NFS home the
+        stat is the slow half, and a stalled filesystem must cost the panel a
+        late repaint, never the event loop.
+        """
+        if self._dbio is None or self._dbio.closed:
+            return
+        profile = self._panel_profile()
+
+        def _poll(conn):
+            store = WatchStore(conn)
+            logs = [w for w in store.list(profile=profile) if w.kind == KIND_LOG]
+            return poll_log_watches(store, logs)
+
+        try:
+            changes = await self._db(_poll)
+        except Exception as e:
+            self.notify(f"Log watch failed: {e}", severity="warning")
+            return
+        for change in changes:
+            # Only the transitions the user is watching *for*. The first poll
+            # of a new watch moves it off "" into a state, which is not news.
+            if change.old_state and change.new_state in (LOG_IDLE, LOG_GONE):
+                self.notify(
+                    f"{change.watch.title}: "
+                    + (
+                        "the file is gone"
+                        if change.new_state == LOG_GONE
+                        else "no new output"
+                    ),
+                    severity="warning",
+                )
+        if changes:
+            await self.refresh_processes()
+
+    async def poll_watched_jobs(self) -> None:
+        """Refresh watched Slurm jobs from squeue, and finished ones from sacct.
+
+        Only jobs that can still move are asked about: a box that already says
+        COMPLETED costs nothing from here on.
+        """
+        if self.slurm is None or self._dbio is None or self._dbio.closed:
+            return
+        profile = self._panel_profile()
+        watches = await self._db(
+            lambda conn: [
+                w
+                for w in WatchStore(conn).list(profile=profile)
+                if w.kind == KIND_JOB and not is_settled(w)
+            ]
+        )
+        if not watches:
+            return
+        job_ids = [w.target for w in watches]
+        try:
+            details = await self.slurm.job_details(job_ids)
+            gone = [i for i in job_ids if i not in details]
+            finished = await self.slurm.status(gone) if gone else {}
+        except Exception as e:
+            self.notify(f"Job watch failed: {e}", severity="warning")
+            return
+        changes = await self._db(
+            lambda conn: apply_job_details(
+                WatchStore(conn), watches, details, finished
+            )
+        )
+        for change in changes:
+            if change.old_state:
+                self.notify(
+                    f"{change.watch.title}: {change.old_state} → "
+                    f"{change.new_state}"
+                )
+        if changes:
             await self.refresh_processes()
 
     async def watch_processes(self) -> None:
@@ -3493,7 +3964,15 @@ class HpcaApp(App):
             getattr(highlighted, "data_job", None),
         )
 
+    def _selected_watch(self) -> Watch | None:
+        highlighted = self.query_one("#processes-list", ListView).highlighted_child
+        return getattr(highlighted, "data_watch", None)
+
     def inspect_selected_process(self) -> None:
+        watch = self._selected_watch()
+        if watch is not None:
+            self.peek_watch(watch)
+            return
         record, job = self._selected_item()
         if record is not None:
             self.push_screen(
@@ -3501,6 +3980,53 @@ class HpcaApp(App):
             )
         elif job is not None:
             self.push_screen(InspectScreen(f"Job {job.job_id}", format_job(job)))
+
+    def peek_watch(self, watch: Watch) -> None:
+        """Flash what a watched thing is saying, and let it fade.
+
+        The question a box provokes — did it print an error, or is it just
+        slow? — is answered by the last few hundred characters, so this is a
+        toast that expires rather than a screen to open and dismiss.
+        """
+        if watch.kind == KIND_LOG:
+            self.notify(peek(watch.target), title=watch.title, timeout=PEEK_TIMEOUT)
+        else:
+            self.run_worker(self._peek_job(watch))
+
+    async def _peek_job(self, watch: Watch) -> None:
+        """A job box's peek: its state, plus its output when hpca knows where
+        that goes.
+
+        Only jobs hpca submitted itself have a known stdout path. A job the
+        user sbatch'ed by hand does not, and the state line is then the whole
+        answer — watching its log is a separate box.
+        """
+        state = " · ".join(part for part in watch_lines(watch) if part)
+        row = None
+        if self._dbio is not None and not self._dbio.closed:
+            job_id = watch.target
+            row = await self._db(lambda conn: JobStore(conn).get(job_id))
+        if row is not None and row.sbatch_stdout_path:
+            state += "\n" + peek(row.sbatch_stdout_path)
+        self.notify(state, title=watch.title, timeout=PEEK_TIMEOUT)
+
+    def drop_selected_watch(self) -> None:
+        """Stop watching the highlighted box (``d``).
+
+        Unconfirmed on purpose: nothing is deleted but the box — the log and
+        the job are untouched — and the user's own reason for pressing it is
+        usually that the run is over and the box has stopped saying anything.
+        """
+        watch = self._selected_watch()
+        if watch is None:
+            return
+        self.run_worker(self._drop_watch(watch))
+
+    async def _drop_watch(self, watch: Watch) -> None:
+        removed = await self._db(lambda conn: WatchStore(conn).remove(watch.id))
+        if removed:
+            self.notify(f"Stopped watching {watch.title}")
+        await self.refresh_processes()
 
     def kill_selected_process(self) -> None:
         record, job = self._selected_item()
