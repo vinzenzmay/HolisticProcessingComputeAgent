@@ -87,6 +87,11 @@ import of langgraph is not fast) and then connects. `version` is asserted even
 though both sides come from one install: it stops a stale core left by a
 crashed run from being attached to later.
 
+`coreproc.HANDSHAKE_VERSION` is deliberately a separate constant from
+`protocol.PROTOCOL_VERSION` — the supervisor must not import the protocol,
+since it has to be able to reap a core that cannot speak it. The two must be
+bumped in lockstep; wave 3 owes a test asserting they agree.
+
 **Terminal hygiene.** The core must never write a byte to the inherited tty; a
 stray traceback corrupts the TUI's screen. stderr is redirected to
 `<app_dir>/core.log` at spawn, and stdout is used only for the handshake line
