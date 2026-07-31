@@ -366,6 +366,25 @@ class CommandRun(Command):
     session_id: str | None = None
 
 
+class MemoryResolve(Command):
+    """The answer to a `memory.proposals` offer.
+
+    The same produce-then-apply shape as `decision.resolve`, and for the same
+    reason: nothing in the core may block waiting for a person. The core holds
+    the authoritative proposal objects and this only says which of them were
+    approved — positionally, against the order they were offered in. A
+    front-end therefore cannot smuggle an edited memory back in an approval,
+    which it could if the answer carried the text.
+
+    A short list rejects the rest: an answer that never arrived is not an
+    approval.
+    """
+
+    TYPE: ClassVar[str] = "memory.resolve"
+    session_id: str
+    approved: list[bool] = Field(default_factory=list)
+
+
 class ModeSet(Command):
     TYPE: ClassVar[str] = "mode.set"
     session_id: str
@@ -584,3 +603,9 @@ class Notify(Event):
     TYPE: ClassVar[str] = "notify"
     severity: Literal["information", "warning", "error"] = "information"
     text: str
+    # Seconds to keep it up, or None for the renderer's default. Carried
+    # because a few warnings — a matched past struggle, the memory budget, a
+    # curation run — are ones the user is meant to actually read, and the core
+    # is what knows which those are. How long a second is remains the
+    # renderer's business; this is a hint, not a layout instruction.
+    timeout: float | None = None

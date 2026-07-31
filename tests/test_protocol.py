@@ -25,6 +25,7 @@ from hpca.protocol import (
     Envelope,
     Event,
     Hello,
+    MemoryResolve,
     Message,
     Notify,
     PanelRow,
@@ -53,6 +54,7 @@ SPEC_COMMANDS = {
     "turn.interrupt",
     "decision.resolve",
     "command.run",
+    "memory.resolve",
     "mode.set",
     "backend.set",
     "profile.set",
@@ -337,6 +339,16 @@ class TestPayloadShapes:
 
     def test_a_profile_scoped_slash_command_names_no_session(self):
         assert CommandRun(name="skills-list").session_id is None
+
+    def test_answering_a_memory_offer_carries_no_memory_text(self):
+        # The core keeps the proposal objects; only the yes/no crosses. If the
+        # text came back in the answer, a front-end could approve a memory the
+        # user never saw.
+        answer = MemoryResolve(session_id="s1", approved=[True, False, True])
+        assert set(answer.to_envelope().payload) == {"session_id", "approved"}
+        assert parse(decode(encode(answer.to_envelope()))).approved == [
+            True, False, True
+        ]
 
 
 class TestWireFormat:

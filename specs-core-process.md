@@ -175,6 +175,7 @@ One envelope in both directions:
 | `turn.interrupt` | `session_id` |
 | `decision.resolve` | `session_id`, `approved: bool`, `reason: str` |
 | `command.run` | `name`, `args`, `session_id?` — `/compact`, `/memorize`, `/conclude`, `/skill-*`. Session-scoped commands carry the id explicitly rather than letting the core infer it from the last `session.focus`, which may have moved on between the keystroke and the frame arriving |
+| `memory.resolve` | `session_id`, `approved: [bool]` — answers a `memory.proposals` offer, positionally. The core holds the proposal objects; only the yes/no crosses, so a front-end cannot smuggle an edited memory back in an approval |
 | `mode.set` | `session_id`, `mode` |
 | `backend.set` | `backend` (JSON blob), `session_id?` |
 | `profile.set` | `name` |
