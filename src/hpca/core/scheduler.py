@@ -158,6 +158,8 @@ class TurnScheduler:
         # module docstring: this used to live in the UI and die with it.
         self._decisions: dict[str, dict] = {}
         self._shutting_down = False
+        # The coalesced drain scheduled by submit_event; see _schedule_drain.
+        self._drain_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------- inspection
 
@@ -210,10 +212,39 @@ class TurnScheduler:
     def submit_event(self, session_id: str, text: str) -> None:
         """A background completion reporting in — a finished process, a job
         that reached a terminal state. Queued exactly like a typed message so
-        it cannot land in the middle of a turn."""
+        it cannot land in the middle of a turn.
+
+        Schedules its own drain, because the caller is a poller and a poll's
+        cadence must not decide a turn's timing. In the old code the pollers
+        called ``drain_work()`` themselves; that coupled "how often we ask
+        sacct" to "how soon the agent hears about it", and a submitter that
+        forgot the call left the completion sitting in the queue until
+        something unrelated happened to drain it.
+        """
         self._pending.append(
             PendingWork(session_id=session_id, text=text, kind="event")
         )
+        self._schedule_drain()
+
+    def _schedule_drain(self) -> None:
+        """Drain soon, once, however many callers ask.
+
+        Coalesced rather than one task per submission: a poll can deliver a
+        dozen finished processes at once, and a dozen concurrent drains would
+        each walk the same queue. Re-entrant by construction anyway — drain
+        skips busy sessions and removes items by identity — so the coalescing
+        is about waste, not correctness.
+        """
+        if self._shutting_down:
+            return
+        if self._drain_task is not None and not self._drain_task.done():
+            return
+        try:
+            self._drain_task = asyncio.ensure_future(self.drain())
+        except RuntimeError:
+            # No running loop: a caller queued work outside the core's loop
+            # (tests do this). The next explicit drain picks it up.
+            self._drain_task = None
 
     # ---------------------------------------------------------------- drain
 

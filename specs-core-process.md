@@ -175,6 +175,7 @@ One envelope in both directions:
 | `turn.interrupt` | `session_id` |
 | `decision.resolve` | `session_id`, `approved: bool`, `reason: str` |
 | `command.run` | `name`, `args`, `session_id?` — `/compact`, `/memorize`, `/conclude`, `/skill-*`. Session-scoped commands carry the id explicitly rather than letting the core infer it from the last `session.focus`, which may have moved on between the keystroke and the frame arriving |
+| `confirm.resolve` | `id`, `confirmed` — answers a `confirm.requested`; the core holds the continuation, only the yes/no crosses |
 | `memory.resolve` | `session_id`, `approved: [bool]` — answers a `memory.proposals` offer, positionally. The core holds the proposal objects; only the yes/no crosses, so a front-end cannot smuggle an edited memory back in an approval |
 | `mode.set` | `session_id`, `mode` |
 | `backend.set` | `backend` (JSON blob), `session_id?` |
@@ -204,6 +205,7 @@ One envelope in both directions:
 | `decision.cleared` | `session_id` |
 | `panel.update` | `profile`, `session_id?`, `rows: [PanelRow]` |
 | `memory.proposals` | `session_id`, `proposals` |
+| `confirm.requested` | `id`, `question` — a yes/no that is not a tool approval (triage offering a learned log signature). Deliberately not `decision.requested`: nothing is parked on it, and conflating them would make an unanswered offer look like a stalled session |
 | `context.estimate` | `session_id`, `used`, `window` |
 | `notify` | `severity`, `text` |
 

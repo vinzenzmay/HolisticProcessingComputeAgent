@@ -366,6 +366,21 @@ class CommandRun(Command):
     session_id: str | None = None
 
 
+class ConfirmResolve(Command):
+    """The answer to a `confirm.requested` question, by its id.
+
+    Same shape as the other two round trips, and for the same reason: the core
+    holds the continuation — here, the coroutine that writes a learned log
+    signature — and only the yes/no crosses. An id rather than a session_id
+    because the question need not belong to a conversation; a triage offer
+    comes from a poll.
+    """
+
+    TYPE: ClassVar[str] = "confirm.resolve"
+    id: str
+    confirmed: bool = False
+
+
 class MemoryResolve(Command):
     """The answer to a `memory.proposals` offer.
 
@@ -587,6 +602,21 @@ class MemoryProposals(Event):
     TYPE: ClassVar[str] = "memory.proposals"
     session_id: str
     proposals: list[Proposal] = Field(default_factory=list)
+
+
+class ConfirmRequested(Event):
+    """A yes/no question that is not a tool approval.
+
+    One case today: triage proposing a log signature it just learned (§5.5
+    tier 3). It is deliberately not `decision.requested` — that one parks a
+    graph thread and its answer resumes a turn, whereas this one comes from a
+    poll and nothing is waiting on it. Conflating them would let an unanswered
+    triage offer look like a stalled session.
+    """
+
+    TYPE: ClassVar[str] = "confirm.requested"
+    id: str
+    question: str
 
 
 class ContextEstimate(Event):

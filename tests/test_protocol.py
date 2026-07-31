@@ -54,6 +54,7 @@ SPEC_COMMANDS = {
     "turn.interrupt",
     "decision.resolve",
     "command.run",
+    "confirm.resolve",
     "memory.resolve",
     "mode.set",
     "backend.set",
@@ -84,6 +85,7 @@ SPEC_EVENTS = {
     "decision.cleared",
     "panel.update",
     "memory.proposals",
+    "confirm.requested",
     "context.estimate",
     "notify",
 }

@@ -325,6 +325,34 @@ class TestBackgroundEvents:
         await settle()
         assert graph_calls["delivered"] == [("ghost", "[process finished]")]
 
+    async def test_a_submitted_event_drains_itself(self, sched, deps, graph_calls):
+        # A poll's cadence must not decide a turn's timing, so the poller does
+        # not drain and the scheduler does. Note: no explicit drain() here.
+        deps.focused_session_id = "s1"
+        sched.submit_event("s1", "[process finished] qc exited 0.")
+        await settle()
+        assert len(graph_calls["run_turn"]) == 1
+
+    async def test_a_burst_of_completions_costs_one_drain(self, sched, deps):
+        deps.focused_session_id = None
+        for i in range(12):
+            sched.submit_event("s2", f"[process finished] job{i}")
+        # One coalesced task, not twelve each walking the same queue.
+        assert sched._drain_task is not None
+        first = sched._drain_task
+        sched.submit_event("s2", "[process finished] job12")
+        assert sched._drain_task is first
+        await settle()
+
+    async def test_shutdown_stops_a_late_completion_starting_a_turn(
+        self, sched, deps, graph_calls
+    ):
+        deps.focused_session_id = "s1"
+        await sched.shutdown()
+        sched.submit_event("s1", "[process finished] straggler")
+        await settle()
+        assert graph_calls["run_turn"] == []
+
 
 class TestInterrupt:
     async def _park_on_the_model(self, sched, graph_calls, session_id="s1"):
