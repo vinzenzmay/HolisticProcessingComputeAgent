@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-from time import monotonic
 from contextlib import contextmanager
 
 import pytest
@@ -13,6 +12,7 @@ from hpca.llm import ChatResponse
 from hpca.profiles import MemoryScope, Profile
 from hpca.tui.app import ChatInput, HpcaApp, UNTITLED_SESSION, WorkingIndicator
 from hpca.tui.memory_screens import MemoryProposalScreen, ReflectionScreen
+from tests.conftest import wait_for_screen
 
 
 def is_title_request(json_schema):
@@ -70,33 +70,6 @@ async def type_and_submit(app, pilot, text):
     await pilot.press("enter")
     await pilot.pause()
 
-
-async def wait_for_screen(app, pilot, screen_type, *, timeout_s=10.0):
-    """Pause until the modal is actually up, rather than counting pauses.
-
-    A fixed number of pauses is a guess about scheduling. The worker behind
-    /memorize runs a model round trip and then pushes a screen, and six pauses
-    is sometimes not enough on a box running the suite across every core —
-    which is why this only ever failed in the parallel run and never when the
-    test was run on its own. Waiting on the condition makes the test say what
-    it means and stops the result depending on how busy the machine is.
-
-    The worker cannot simply be awaited: it pushes the screen and then blocks
-    on the user's answer, so ``wait_for_complete`` would deadlock against the
-    very modal this is waiting for.
-    """
-    deadline = monotonic() + timeout_s
-    while monotonic() < deadline:
-        if isinstance(app.screen, screen_type):
-            return app.screen
-        await pilot.pause()
-        # Yield properly rather than spinning: the whole point is not to make
-        # a loaded machine any busier.
-        await asyncio.sleep(0.01)
-    raise AssertionError(
-        f"{screen_type.__name__} never appeared within {timeout_s}s; "
-        f"on screen: {type(app.screen).__name__}"
-    )
 
 
 MEMORIZE_REPLY = proposals_json(
