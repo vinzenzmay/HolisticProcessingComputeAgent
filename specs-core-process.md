@@ -351,6 +351,31 @@ into the TUI behind `$HPCA_LOOPLAG` (`85d0a72`).
 `InProcessConnection`. This is the whole job; the socket afterwards is
 mechanical.
 
+*Done, except the surgery.* The four services (`3eff9ec`, `583bedc`,
+`750bee1`, `58bf34e`, `9bcefc1`) and their composition (`04d41e7`) exist and
+are proven headless: `test_core_service.py` drives a real graph through
+protocol commands with no terminal, and `test_core_headless.py` enforces that
+no module in the package can import Textual.
+
+**Wave 2b — the surgery.** `HpcaApp` still owns its own copy of everything;
+nothing under `tui/` calls the core yet. What this step is:
+
+- `on_mount` builds an `AgentService` instead of a graph, stores, registry and
+  clients. Delete the duplicated construction, *not* the method names.
+- Every extracted method becomes a forwarder. Keep the names: 34 `test_tui_*`
+  files call them, and refactoring the code and its tests at the same time
+  leaves nothing green in between.
+- `format_started` and `PROCESS_HISTORY_LIMIT` now exist in both `tui/app.py`
+  and `core/pollers.py`, and `test_tui_processes.py` imports them from the
+  former. Re-export, do not delete.
+- `on_mount`'s `EmbeddingClient` and `on_unmount`'s `embedder.close()` must go:
+  `BackendRegistry` owns that client now, and leaving both is a double close.
+- Wire the UI's existing `ConfirmScreen` to `confirm.requested`, or triage
+  stops offering to learn log signatures.
+- `_paint_panel` renders `panel.update` instead of polling; `_set_chat_messages`
+  becomes `chat.reset` + `chat.append` (§4.3), which is the last row of §1's
+  latency table.
+
 **Wave 3 — wiring.** `--serve` entry point, `CoreSupervisor` spawn from the UI,
 `--no-fork` for debugging, shutdown paths.
 
