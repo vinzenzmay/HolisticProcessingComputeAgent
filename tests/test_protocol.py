@@ -208,8 +208,8 @@ class TestMessages:
             rows=[
                 PanelRow(key="w:3", text="● RUNNING", classes="watch-live",
                          title="train.log", kind=protocol.PANEL_WATCH, ref="3"),
-                PanelRow(key="h:jobs", text="jobs", classes="dim",
-                         kind=protocol.PANEL_HEADING),
+                PanelRow(key="w:4", text="○ not polled yet", classes="watch-idle",
+                         title="run.log", kind=protocol.PANEL_WATCH, ref="4"),
             ],
         )
         assert parse(decode(encode(message.to_envelope()))) == message

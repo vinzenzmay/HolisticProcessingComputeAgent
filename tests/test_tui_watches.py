@@ -1,10 +1,10 @@
-"""The right column as a monitor: watch boxes, their hotkeys, their repaint.
+"""The watchers column: the boxes, their hotkeys, their order, their repaint.
 
-The panel used to show only what hpca itself started, which is both a small
-slice of what runs on a cluster and a slice already in the chat log. These
-tests are about the other half — the log the user asked to be shown, and the
-three keys that make it useful: Enter to peek, D to drop, arrows to move
-without the repaint stealing the cursor.
+The panel used to show what hpca itself started — a small slice of what runs
+on a cluster, and a slice already in the chat log — with the watch boxes above
+it. The history is gone and the boxes are the whole column now. These tests
+cover what makes it useful: Enter to peek, D to drop, alt+↑/alt+↓ to arrange,
+and arrows that keep working while the clock in every box ticks.
 """
 
 import json
@@ -79,13 +79,13 @@ async def add_log_watch(app, pilot, path, label=""):
         session_id=app._panel_session() or "",
     )
     await app.poll_watched_logs()
-    await app.refresh_processes()
+    await app.refresh_watchers()
     await pilot.pause()
     return watch
 
 
 def panel(app):
-    return app.query_one("#processes-list", ListView)
+    return app.query_one("#watchers-list", ListView)
 
 
 def box_texts(app):
@@ -134,16 +134,18 @@ class TestTheBox:
             assert "last write 1h01m ago" in text
             assert "idle" not in text
 
-    async def test_the_boxes_come_before_the_run_history(self, hpca_home, tmp_path):
+    async def test_the_boxes_are_the_whole_column(self, hpca_home, tmp_path):
+        """A subprocess hpca ran used to get a row under a heading. The run is
+        in the chat log already, and the history crowded out the boxes the user
+        asked for on any terminal short enough to matter."""
         app = HpcaApp(llm=FakeLLM([respond_json()]))
         async with app.run_test(size=(120, 40)) as pilot:
             await open_session(app, pilot)
             record = await app._tool_ctx.runner.start(["true"], name="align")
+            await app._tool_ctx.runner.wait(record.pid)
             await add_log_watch(app, pilot, written(tmp_path / "a.log"))
             keys = [getattr(i, "data_key", "") for i in panel(app).children]
-            assert keys[0].startswith("w")
-            assert f"p{record.pid}" in keys
-            assert "h:session" in keys  # and the two halves are labelled
+            assert keys == [f"w{app.watch_store.list()[0].id}"]
 
     async def test_a_watch_stays_in_the_session_it_was_made_in(
         self, hpca_home, tmp_path
@@ -162,13 +164,13 @@ class TestTheBox:
             assert len(watch_rows(app)) == 1
 
             await app.start_new_session()
-            await app.refresh_processes()
+            await app.refresh_watchers()
             await pilot.pause()
             assert watch_rows(app) == []
 
             # ...and it is still there on the way back.
             await app.open_session(first)
-            await app.refresh_processes()
+            await app.refresh_watchers()
             await pilot.pause()
             assert len(watch_rows(app)) == 1
 
@@ -180,7 +182,7 @@ class TestTheBox:
             await open_session(app, pilot)
             await add_log_watch(app, pilot, written(tmp_path / "a.log"), "kept")
             await app.close_session()
-            await app.refresh_processes()
+            await app.refresh_watchers()
             await pilot.pause()
             assert watch_rows(app) == []
 
@@ -195,7 +197,7 @@ class TestTheBox:
             # Reopened rather than merely restarted: the watch belongs to its
             # session, so finding it again means going back to that session.
             await app2.open_session(app2.session_store.list_all()[0])
-            await app2.refresh_processes()
+            await app2.refresh_watchers()
             await pilot.pause()
             assert len(watch_rows(app2)) == 1
 
@@ -241,7 +243,7 @@ class TestPeek:
             app.watch_store.update(
                 watch.id, state="RUNNING", head="01:02:03", detail="node042"
             )
-            await app.refresh_processes()
+            await app.refresh_watchers()
             await pilot.pause()
             panel(app).focus()
             panel(app).index = 0
@@ -270,7 +272,7 @@ class TestPeek:
                 session_id=app._panel_session() or "",
             )
             app.watch_store.update(watch.id, state="RUNNING")
-            await app.refresh_processes()
+            await app.refresh_watchers()
             await pilot.pause()
             panel(app).focus()
             panel(app).index = 0
@@ -308,19 +310,237 @@ class TestDrop:
             await pilot.pause()
             assert log.exists()
 
-    async def test_d_on_a_process_row_does_nothing(self, hpca_home):
-        """Only watches are droppable; a process row keeps its own k."""
+    async def test_d_on_an_empty_column_does_nothing(self, hpca_home):
+        """Nothing highlighted means nothing to unwatch — and check_action
+        keeps the key out of the footer rather than offering a no-op."""
         app = HpcaApp(llm=FakeLLM([respond_json()]))
         async with app.run_test(size=(120, 40)) as pilot:
             await open_session(app, pilot)
-            await app._tool_ctx.runner.start(["true"], name="align")
-            await app.refresh_processes()
-            await pilot.pause()
             panel(app).focus()
-            panel(app).index = 0
             await pilot.press("d")
             await pilot.pause()
-            assert len(panel(app).children) == 1
+            assert len(panel(app).children) == 0
+
+
+class TestReorder:
+    """alt+↑/alt+↓ carry a box past its neighbour.
+
+    Registration order is not importance order: three settled boxes can sit
+    above the one log the user is actually waiting on, and on a short terminal
+    that one is off the bottom of the column.
+    """
+
+    async def three_boxes(self, app, pilot, tmp_path):
+        for name in ("a.log", "b.log", "c.log"):
+            await add_log_watch(app, pilot, written(tmp_path / name), name)
+        panel(app).focus()
+        return self.titles(app)
+
+    def titles(self, app):
+        return [
+            item.query_one(Static).border_title for item in panel(app).children
+        ]
+
+    async def press_move(self, app, pilot, key):
+        await pilot.press(key)
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+    async def test_alt_up_swaps_with_the_box_above(self, hpca_home, tmp_path):
+        app = HpcaApp(llm=FakeLLM([respond_json()]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await open_session(app, pilot)
+            await self.three_boxes(app, pilot, tmp_path)
+            panel(app).index = 2
+            await self.press_move(app, pilot, "alt+up")
+            assert self.titles(app) == ["a.log", "c.log", "b.log"]
+
+    async def test_alt_down_swaps_with_the_box_below(self, hpca_home, tmp_path):
+        app = HpcaApp(llm=FakeLLM([respond_json()]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await open_session(app, pilot)
+            await self.three_boxes(app, pilot, tmp_path)
+            panel(app).index = 0
+            await self.press_move(app, pilot, "alt+down")
+            assert self.titles(app) == ["b.log", "a.log", "c.log"]
+
+    async def test_the_cursor_follows_the_box_it_moved(self, hpca_home, tmp_path):
+        """Otherwise a held-down alt+↑ swaps the same pair back and forth
+        instead of walking one box to the top."""
+        app = HpcaApp(llm=FakeLLM([respond_json()]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await open_session(app, pilot)
+            await self.three_boxes(app, pilot, tmp_path)
+            panel(app).index = 2
+            await self.press_move(app, pilot, "alt+up")
+            assert panel(app).index == 1
+            await self.press_move(app, pilot, "alt+up")
+            assert self.titles(app) == ["c.log", "a.log", "b.log"]
+            assert panel(app).index == 0
+
+    async def test_the_ends_are_silent(self, hpca_home, tmp_path):
+        """Arriving at the top is the normal end of holding the key down, not
+        something to warn about."""
+        app = HpcaApp(llm=FakeLLM([respond_json()]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await open_session(app, pilot)
+            await self.three_boxes(app, pilot, tmp_path)
+            panel(app).index = 0
+            await self.press_move(app, pilot, "alt+up")
+            assert self.titles(app) == ["a.log", "b.log", "c.log"]
+            assert toasts(app) == []
+
+    async def test_the_arrangement_outlives_the_repaint(self, hpca_home, tmp_path):
+        """The column is rebuilt from the store every two seconds, so an order
+        the poll does not know about would be undone almost at once."""
+        app = HpcaApp(llm=FakeLLM([respond_json()]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await open_session(app, pilot)
+            await self.three_boxes(app, pilot, tmp_path)
+            panel(app).index = 2
+            await self.press_move(app, pilot, "alt+up")
+            await app.poll_watched_logs()
+            await app.refresh_watchers()
+            await pilot.pause()
+            assert self.titles(app) == ["a.log", "c.log", "b.log"]
+
+    async def test_shift_arrows_do_the_same_in_a_multiplexer(
+        self, hpca_home, tmp_path
+    ):
+        """zellij and tmux bind alt+arrows for pane navigation, so the keypress
+        may never reach hpca at all — see project.md's reserved list."""
+        app = HpcaApp(llm=FakeLLM([respond_json()]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await open_session(app, pilot)
+            await self.three_boxes(app, pilot, tmp_path)
+            panel(app).index = 2
+            await self.press_move(app, pilot, "shift+up")
+            assert self.titles(app) == ["a.log", "c.log", "b.log"]
+
+    async def test_an_empty_column_has_nothing_to_move(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM([respond_json()]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await open_session(app, pilot)
+            panel(app).focus()
+            await self.press_move(app, pilot, "alt+up")
+            assert len(panel(app).children) == 0
+
+
+class TestTheColumnAlwaysHasACursor:
+    """A column with boxes in it must have one of them highlighted.
+
+    ``check_action`` answers about the highlighted row, so with nothing
+    highlighted the footer loses peek, unwatch and both moves and the column
+    reads as inert. The reported symptom was exactly that: arrowing between
+    the three columns sometimes landed on watchers with the wrong hotkeys.
+    """
+
+    def hotkeys(self, app):
+        """What the footer offers for the highlighted row, via check_action —
+        the same question the footer asks."""
+        watchers = panel(app)
+        return {
+            action
+            for action in ("peek_watch", "drop_watch", "move_watch")
+            if watchers.check_action(action, ())
+        }
+
+    ALL = {"peek_watch", "drop_watch", "move_watch"}
+
+    async def test_the_first_paint_lands_on_the_top_box(
+        self, hpca_home, tmp_path
+    ):
+        """Nothing was highlighted before, so there was no row to restore and
+        the cursor was left nowhere at all."""
+        app = HpcaApp(llm=FakeLLM([respond_json()]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await open_session(app, pilot)
+            await add_log_watch(app, pilot, written(tmp_path / "a.log"), "a.log")
+            assert panel(app).index == 0
+            assert self.hotkeys(app) == self.ALL
+
+    async def test_arriving_by_arrow_key_finds_the_hotkeys(
+        self, hpca_home, tmp_path
+    ):
+        """←/→ between the columns is how the user gets here."""
+        app = HpcaApp(llm=FakeLLM([respond_json()]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await open_session(app, pilot)
+            await add_log_watch(app, pilot, written(tmp_path / "a.log"), "a.log")
+            app._focus_column("chat")
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            assert app.focused_column_id == "watchers"
+            assert self.hotkeys(app) == self.ALL
+
+    async def test_switching_to_a_session_with_other_boxes_keeps_a_cursor(
+        self, hpca_home, tmp_path
+    ):
+        """The remembered row belongs to the session being left, so it is never
+        among the new keys — which used to leave the column unhighlighted."""
+        app = HpcaApp(llm=FakeLLM([respond_json("a"), respond_json("b")]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await open_session(app, pilot)
+            await add_log_watch(app, pilot, written(tmp_path / "a.log"), "a.log")
+            panel(app).focus()
+            panel(app).index = 0
+
+            await open_session(app, pilot)
+            await add_log_watch(app, pilot, written(tmp_path / "b.log"), "b.log")
+            highlighted = panel(app).highlighted_child
+            assert getattr(highlighted, "data_watch").title == "b.log"
+            assert self.hotkeys(app) == self.ALL
+
+    async def test_dropping_a_box_holds_the_position_not_the_row(
+        self, hpca_home, tmp_path
+    ):
+        """The row is gone by definition, so the cursor keeps its place in the
+        column: unwatching the middle of three leaves it on what is now the
+        middle, rather than jumping back to the top."""
+        app = HpcaApp(llm=FakeLLM([respond_json()]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await open_session(app, pilot)
+            for name in ("a.log", "b.log", "c.log"):
+                await add_log_watch(app, pilot, written(tmp_path / name), name)
+            panel(app).focus()
+            panel(app).index = 1
+            await pilot.press("d")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            highlighted = panel(app).highlighted_child
+            assert getattr(highlighted, "data_watch").title == "c.log"
+            assert self.hotkeys(app) == self.ALL
+
+    async def test_dropping_the_last_box_clamps_instead_of_overrunning(
+        self, hpca_home, tmp_path
+    ):
+        app = HpcaApp(llm=FakeLLM([respond_json()]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await open_session(app, pilot)
+            for name in ("a.log", "b.log"):
+                await add_log_watch(app, pilot, written(tmp_path / name), name)
+            panel(app).focus()
+            panel(app).index = 1
+            await pilot.press("d")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert panel(app).index == 0
+            assert getattr(panel(app).highlighted_child, "data_watch").title == "a.log"
+
+    async def test_an_empty_column_offers_nothing(self, hpca_home, tmp_path):
+        """The other half of the same rule: once the last box is gone there is
+        genuinely nothing to act on, and the footer has to say so."""
+        app = HpcaApp(llm=FakeLLM([respond_json()]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await open_session(app, pilot)
+            await add_log_watch(app, pilot, written(tmp_path / "a.log"), "a.log")
+            panel(app).focus()
+            assert self.hotkeys(app) == self.ALL
+            await pilot.press("d")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert self.hotkeys(app) == set()
 
 
 class TestRepaint:
@@ -338,7 +558,7 @@ class TestRepaint:
             panel(app).focus()
             panel(app).index = 2
             first = box_texts(app)[2]
-            await app.refresh_processes()
+            await app.refresh_watchers()
             await pilot.pause()
             assert panel(app).index == 2
             assert box_texts(app)[2] == first  # same row, still ours
@@ -357,7 +577,7 @@ class TestRepaint:
                     datetime.now(timezone.utc) - timedelta(minutes=5)
                 ).isoformat(),
             )
-            await app.refresh_processes()
+            await app.refresh_watchers()
             await pilot.pause()
             assert "9.9 MB" in box_texts(app)[0]
             assert "last write 5m ago" in box_texts(app)[0]

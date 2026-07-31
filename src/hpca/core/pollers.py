@@ -9,11 +9,11 @@ whole.
 
 Two shapes differ from the code they came from.
 
-**The panel is pushed, not pulled.** ``refresh_processes`` queried a widget and
+**The panel is pushed, not pulled.** ``refresh_watchers`` queried a widget and
 painted into it; here a poll produces `PanelRow` values and emits one
 `PanelUpdate`, and what draws them is the renderer's business. The row *order*
-crosses unchanged, because it is load-bearing for the UI's cursor: watches
-first, then the session's own work under a heading, then the truncation notice.
+crosses unchanged, because it is load-bearing for the UI's cursor — and it is
+the user's own order now, so a poll must never reach for a different one.
 
 **A finished background process reaches the agent through a callback.**
 ``watch_processes`` and ``poll_jobs`` appended to the app's ``_pending_work``
@@ -41,11 +41,8 @@ from typing import Any, Awaitable, Callable, Protocol
 
 from hpca.agent.explainer import ProposedSignature, explain_process_failure
 from hpca.core.deps import CoreDeps
-from hpca.jobs import JobRow, JobStore, apply_statuses
+from hpca.jobs import JobStore, apply_statuses
 from hpca.protocol import (
-    PANEL_HEADING,
-    PANEL_JOB,
-    PANEL_PROCESS,
     PANEL_WATCH,
     Notify,
     PanelRow,
@@ -53,12 +50,8 @@ from hpca.protocol import (
 )
 from hpca.runner import (
     ProcessChange,
-    ProcessRecord,
     analyse_process_failure,
-    count_processes,
-    describe,
     format_process_event,
-    list_processes,
     poll_processes,
 )
 from hpca.sessions import SessionStore
@@ -77,10 +70,6 @@ from hpca.watches import (
     watch_lines,
 )
 
-# Rows the processes column shows before summarising the rest. A long-lived
-# session accumulates hundreds; the panel is a view, not an archive.
-PROCESS_HISTORY_LIMIT = 60
-
 # How often the column is rebuilt. Also the resolution of the clock inside a
 # watch box, which counts up from the last write on its own.
 PANEL_SECONDS = 2.0
@@ -97,26 +86,6 @@ JOB_WATCH_SECONDS = 15.0
 # Floor under the configured sacct cadence. Accounting is a shared database on
 # a login node, and asking it faster than this tells nobody anything new.
 MIN_JOB_POLL_SECONDS = 5.0
-
-
-def format_started(started_at: str) -> str:
-    """When a process started, in the reader's own timezone.
-
-    Stored UTC, shown local — the times are read next to a wall clock. The
-    date is omitted for today, which is most of what the panel holds, and
-    the narrow column has no room to spend on it.
-    """
-    if not started_at:
-        return "  --  "
-    try:
-        moment = datetime.fromisoformat(started_at)
-    except ValueError:
-        return "  --  "
-    if moment.tzinfo is not None:
-        moment = moment.astimezone()
-    if moment.date() == datetime.now().date():
-        return moment.strftime(" %H:%M")
-    return moment.strftime("%m-%d %H:%M")
 
 
 def panel_profile(
@@ -177,10 +146,6 @@ class Pollers:
         # a tier-2 finding is still delivered, just undiagnosed.
         self._llm = llm
         self._confirm = confirm
-        # Panel labels, cached by pid. ``describe`` reads the script from disk
-        # to name a throwaway run_bash process and the panel repaints every
-        # two seconds, while the content of a written script never changes.
-        self._labels: dict[int, str] = {}
         # Overlap guard: a fetch outlasting the tick (NFS again) would let two
         # passes interleave. Skipping is safe — the next tick repaints.
         self._refreshing = False
@@ -227,24 +192,10 @@ class Pollers:
                 if session_id is not None
                 else []
             )
-            records: list[ProcessRecord] = []
-            truncated = 0
-            jobs: list[JobRow] = []
-            if session_id is not None:
-                records = list_processes(
-                    conn, session_id=session_id, limit=PROCESS_HISTORY_LIMIT
-                )
-                if len(records) > PROCESS_HISTORY_LIMIT:
-                    records = records[:PROCESS_HISTORY_LIMIT]
-                    truncated = (
-                        count_processes(conn, session_id=session_id)
-                        - PROCESS_HISTORY_LIMIT
-                    )
-                jobs = JobStore(conn).list(session_id=session_id)
-            return profile, watches, records, truncated, jobs
+            return profile, watches
 
         try:
-            profile, watches, records, truncated, jobs = await deps.db(_gather)
+            profile, watches = await deps.db(_gather)
         except Exception:
             # A column that failed to read is one missing repaint and the next
             # tick fixes it. A toast twice a second out of a database being
@@ -252,7 +203,7 @@ class Pollers:
             return
         if session_id != deps.focused_session_id:
             return  # focus moved mid-fetch; the next tick paints the new one
-        rows = self.panel_rows(watches, jobs, records, truncated)
+        rows = self.panel_rows(watches)
         if rows == self._last_rows and not force:
             return
         self._last_rows = rows
@@ -261,23 +212,22 @@ class Pollers:
         )
 
     def panel_rows(
-        self,
-        watches: list[Watch],
-        jobs: list[JobRow],
-        records: list[ProcessRecord],
-        truncated: int,
-        *,
-        now: datetime | None = None,
+        self, watches: list[Watch], *, now: datetime | None = None
     ) -> list[PanelRow]:
-        """The whole right column, top to bottom.
+        """The whole right column, top to bottom: one box per watch.
 
-        Watches first: they are what the user asked to be shown, and what they
-        are checking when they look over there. Everything hpca ran itself
-        follows under a heading — the same history as before, demoted to what
-        it is, since every one of those calls is also in the chat log.
+        It used to carry the session's own run history underneath, under a
+        "── this session ──" heading. That is gone. Every one of those calls is
+        already in the chat log a column to the left, so the history was a
+        second copy of something the user had just read — and it grew without
+        bound while the boxes they had actually asked to be shown were pushed
+        off the bottom of a short terminal. The column now holds only what was
+        asked for, in the order it was asked for.
+
+        In ``watches`` order, which is the user's own (``WatchStore.move``).
         """
         now = now or datetime.now(timezone.utc)
-        rows = [
+        return [
             PanelRow(
                 key=f"w{watch.id}",
                 text="\n".join(watch_lines(watch, now=now)),
@@ -288,61 +238,6 @@ class Pollers:
             )
             for watch in watches
         ]
-        if rows and (jobs or records or truncated):
-            # Only when there is something above it: a heading as the very
-            # first row would take the cursor's opening position for itself.
-            rows.append(
-                PanelRow(
-                    key="h:session",
-                    text="── this session ──",
-                    classes="panel-section",
-                    kind=PANEL_HEADING,
-                )
-            )
-        for job in jobs:
-            rows.append(
-                PanelRow(
-                    key=f"j{job.job_id}",
-                    text=f"{job.state:<9} job {job.job_id} ({job.script_key})",
-                    classes="proc-job",
-                    kind=PANEL_JOB,
-                    ref=job.job_id,
-                )
-            )
-        for record in records:
-            rows.append(
-                PanelRow(
-                    key=f"p{record.pid}",
-                    text=(
-                        f"{format_started(record.started_at)} "
-                        f"{record.state:<8} "
-                        f"{self._describe(record)} ({record.pid})"
-                    ),
-                    classes=f"proc-{record.state}",
-                    kind=PANEL_PROCESS,
-                    ref=str(record.pid),
-                )
-            )
-        if truncated > 0:
-            # Never let a cut list read as the whole history. Inert like a
-            # heading — there is nothing behind it to act on.
-            rows.append(
-                PanelRow(
-                    key="more",
-                    text=f"… {truncated} older",
-                    classes="proc-more",
-                    kind=PANEL_HEADING,
-                )
-            )
-        return rows
-
-    def _describe(self, record: ProcessRecord) -> str:
-        """Panel label for a process, cached by pid. See ``_labels``."""
-        cached = self._labels.get(record.pid)
-        if cached is None:
-            cached = describe(record)
-            self._labels[record.pid] = cached
-        return cached
 
     # -------------------------------------------------------------- the jobs
 

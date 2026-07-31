@@ -1,6 +1,6 @@
 """Resizing the terminal must never take the app down.
 
-A resize to ~50 columns used to crash it: the sessions and processes columns
+A resize to ~50 columns used to crash it: the sessions and watchers columns
 hold their min-widths, the chat column had none and was squeezed to nothing,
 and a bordered widget with zero content width crashes Rich's text wrapping
 ("range() arg 3 must not be zero") while wrapping the entry's placeholder.
@@ -123,7 +123,7 @@ class TestNarrowTerminal:
             for width in WIDTHS:
                 await pilot.resize_terminal(width, 30)
                 await pilot.pause()
-                for column in ("sessions", "chat", "processes"):
+                for column in ("sessions", "chat", "watchers"):
                     assert app.query_one(f"#{column}").size.width > 0, (
                         f"{column} collapsed at width {width}"
                     )
@@ -135,7 +135,7 @@ class TestNarrowTerminal:
             await pilot.pause()
             widths = {
                 column: app.query_one(f"#{column}").size.width
-                for column in ("sessions", "chat", "processes")
+                for column in ("sessions", "chat", "watchers")
             }
             assert widths["chat"] == 58  # 2fr of the room left by its neighbours
-            assert widths["sessions"] == widths["processes"] == 28
+            assert widths["sessions"] == widths["watchers"] == 28

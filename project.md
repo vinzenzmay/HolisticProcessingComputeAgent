@@ -67,11 +67,11 @@ Terminals in 2026 are assumed wider than 80 columns
 │ Top bar: app name | profile | model | (c) config editor      │
 ├───────────────┬───────────────────────────┬──────────────────┤
 │ LEFT          │ CENTER                    │ RIGHT            │
-│ Sessions      │ Chat window of the        │ Sub-processes of │
-│ (past +       │ selected session          │ the current      │
-│  current)     │ (scrollable message list) │ session (jobs,   │
-│               │                           │ subagents, local │
-│               │                           │ processes)       │
+│ Sessions      │ Chat window of the        │ Watchers: the    │
+│ (past +       │ selected session          │ logs and jobs    │
+│  current)     │ (scrollable message list) │ this session     │
+│               │                           │ asked to be      │
+│               │                           │ shown            │
 ├───────────────┴───────────────────────────┴──────────────────┤
 │ Bottom bar: context-sensitive hotkeys, e.g. (i) inspect ...  │
 └───────────────┴───────────────────────────┴──────────────────┘
@@ -92,24 +92,29 @@ Terminals in 2026 are assumed wider than 80 columns
     it, and on anything else (the agent's replies, background events, recalled
     memory) simply hands focus to the entry. `(b)` go back in conversation to
     this point, `(c)` copy content to clipboard.
-  * *Sub-process / job (right column):* **Enter** inspects (opens the
-    logs/status view), `(k)` kills the selected local process (with
-    confirmation). (The design once envisaged an `(a)` "ask a Q&A subagent about
-    this process" action; that is not implemented — failure explanation is done
-    automatically by the triage pipeline in §5.5, not on demand from this
-    column.)
-  * *Watch (right column, above the run history):* a box the user asked for,
-    pinned by the agent's `watch_log` / `watch_job` tools — see *Watches*
-    below. **Enter** flashes the last 300 characters of the log (a toast that
-    expires, not a screen to dismiss), `(d)` stops watching and removes the
-    box. The log itself is never touched.
+  * *Watch (right column):* a box the user asked for, pinned by the agent's
+    `watch_log` / `watch_job` tools — see *Watches* below. **Enter** flashes
+    the last 300 characters of the log (a toast that expires, not a screen to
+    dismiss), `(d)` stops watching and removes the box, `alt+↑` / `alt+↓` carry
+    it past its neighbour. The log itself is never touched.
 
-**Watches (right column).** What hpca started is only a slice of what runs on a
-cluster, and it is a slice already in the chat log — so the column's first job
-is somebody *else's* work: an sbatch script submitted by hand, a snakemake run
-spawning tool after tool, the log some long-running tool appends to. Finding
-out whether any of that is alive otherwise means `squeue`, then ssh to the
-node, then `tail`. The agent pins one to the column instead:
+The right column held the session's own run history too — every subprocess and
+sbatch hpca had started, under a "── this session ──" heading, with **Enter** to
+inspect and `(k)` to kill or cancel. That is gone. Every one of those calls is
+already in the chat log one column to the left, so it was a second copy of what
+the user had just read, and it grew without bound while the boxes they had
+actually asked for were pushed off the bottom of a short terminal. Nothing else
+changed: the `processes` table is still written and still wakes the agent when a
+background script exits (§5.4), and a job worth keeping on screen is a job worth
+`watch_job`. There is now no keyboard route to killing a local process from the
+TUI; the agent still has one.
+
+**Watches (right column, "Watchers").** What hpca started is only a slice of
+what runs on a cluster, and it is a slice already in the chat log — so the
+column's job is somebody *else's* work: an sbatch script submitted by hand, a
+snakemake run spawning tool after tool, the log some long-running tool appends
+to. Finding out whether any of that is alive otherwise means `squeue`, then ssh
+to the node, then `tail`. The agent pins one to the column instead:
 
 * `watch_log <path>` — a file. Its mtime is the signal: "last write 4s ago" is
   alive, "last write 40m ago" is dead or wedged. Registering a log that does
@@ -119,12 +124,24 @@ node, then `tail`. The agent pins one to the column instead:
   FAILED rather than vanishing. A finished job stops being polled.
 * `list_watches`, `unwatch <name>` — the same operations from the model's side.
 
-A watch belongs to a **profile**, not a session: it describes the machine, not
-the conversation, so it stays on screen when the user switches sessions and
-survives a restart (table `watches`, see `hpca.watches`). Logs are stat'ed
-every 5 s on the DB thread — on an NFS home the stat is the slow half, and a
-wedged filesystem must cost a late repaint, never the event loop. A log going
-quiet, and any job state change, raise a toast.
+A watch belongs to the **session** that registered it, not to the profile: the
+column describes the conversation being read. It was profile-scoped originally,
+on the reasoning that a watch describes the machine — but sessions on one
+profile are the normal case, so every session showed every other session's
+boxes. It survives a restart (table `watches`, see `hpca.watches`). Polling is
+deliberately *not* scoped the same way: state is refreshed for every watch in
+the store, so a session returned to shows a current clock rather than one frozen
+at the moment the user switched away. Logs are stat'ed every 5 s on the DB
+thread — on an NFS home the stat is the slow half, and a wedged filesystem must
+cost a late repaint, never the event loop. A log going quiet, and any job state
+change, raise a toast.
+
+**Order is the user's.** Boxes come out in registration order until `alt+↑` /
+`alt+↓` move one (column `watches.position`, `WatchStore.move`), and nothing a
+poll learns may reorder them — the cursor lives in this list, and a column that
+reshuffles itself every few seconds cannot be arrowed through. Sorting by
+freshness or state was rejected for the same reason it cannot work: only the
+reader knows which box matters, and it is not a property the code can compute.
 
 **Reserved hotkeys — never bind these** (they are eaten or made unreliable by the
 terminal, by zellij/tmux, or by the flow-control layer, so a future UI addition
@@ -135,9 +152,16 @@ must avoid them):
   multiplexer/zellij prefixes.
 * `alt` + `n f`, the arrow keys, `+`, `-` — commonly grabbed by zellij/tmux.
 
-Prefer a bare letter gated (via `check_action`) to a non-typing column, or a safe
-`ctrl` combo (`ctrl+l`, `ctrl+e`, `ctrl+r`, …). Keep this list in sync with the
-`RESERVED HOTKEYS` comment above `HpcaApp.BINDINGS`.
+One deliberate exception: `alt+↑` / `alt+↓` reorder the watchers column. It was
+asked for by name, and it is the gesture every editor uses for move-a-line. The
+reserved rule still holds — under zellij or tmux the keypress may never arrive —
+so `shift+↑` / `shift+↓` are bound to the same action as a fallback, the same
+belt-and-braces as `ChatInput.NEWLINE_KEYS`. Treat that pairing as the pattern
+for any future binding that has to use a reserved key.
+
+Otherwise prefer a bare letter gated (via `check_action`) to a non-typing
+column, or a safe `ctrl` combo (`ctrl+l`, `ctrl+e`, `ctrl+r`, …). Keep this list
+in sync with the `RESERVED HOTKEYS` comment above `HpcaApp.BINDINGS`.
 * **Config editor** `(c)`: edit the settings JSON, persisted to
   `~/.HolisticProcessingComputeAgent/settings.json`.
 * **Profiles & learnings** `(a)`: manage profiles and their memories (see §6).
@@ -418,7 +442,7 @@ Core tools:
   covers the case without carving an exception into the "keys, never paths"
   rule.)*
 * `start_background_script(registry_key, args)` — runs locally as a tracked **background**
-  subprocess (appears in the right column), stdout/stderr captured to files and
+  subprocess, stdout/stderr captured to files and
   registered; its completion is delivered back into the conversation (§5.4).
   The split from `run_bash` is *when the result arrives*, not what is run — the
   one choice the model cannot recover from on its own, which is why it is a
@@ -823,7 +847,8 @@ hard dependency, LangChain `AgentExecutor`.
 4. **LangGraph core:** orchestrator, checkpointed sessions (left column live),
    pydantic validation + retry middleware, path registry.
 5. **Runner + tools:** internal subprocess runner, `create_script`/`start_background_script`
-   with dry-run gate, right-column process list (Enter inspects, `k` kills).
+   with dry-run gate. *(This milestone also built a right-column process list —
+   Enter inspects, `k` kills — since removed; see §3.3.)*
 6. **Slurm layer:** job DB, `submit_job`/`job_status`/`cancel_job`, background
    poller, log collection.
 7. **Log triage:** signature library + report generator + log-explainer subagent.

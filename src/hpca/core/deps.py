@@ -10,7 +10,7 @@ constructor: they take :class:`CoreDeps`, and they say things through
 Two shapes matter more than the field list.
 
 **`emit` replaces four different reaches into the UI.** `self.notify(...)`,
-`self._append_chat(...)`, `await self.refresh_processes()` and
+`self._append_chat(...)`, `await self.refresh_watchers()` and
 `self._refresh_session_row(...)` were all "tell the user"; here they are one
 call taking a protocol event. A service that emits cannot accidentally depend
 on a widget existing, which is what made the old calls untestable outside a

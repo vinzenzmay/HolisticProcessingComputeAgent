@@ -112,6 +112,11 @@ CREATE TABLE IF NOT EXISTS watches (
     target TEXT NOT NULL,                  -- absolute path | Slurm job id
     label TEXT NOT NULL DEFAULT '',
     created_at TEXT,
+    -- Where the box sits in the column. Insertion order until the user drags
+    -- one with alt+↑/alt+↓, after which it is whatever they arranged; see
+    -- WatchStore.move. Ordered by (position, id) so a row that never got one
+    -- still falls in the order it was registered.
+    position INTEGER NOT NULL DEFAULT 0,
     state TEXT NOT NULL DEFAULT '',
     -- The rendered halves of the panel box, filled by the poller.
     head TEXT NOT NULL DEFAULT '',
@@ -139,6 +144,20 @@ ADDED_COLUMNS = [
     ("processes", "background", "INTEGER NOT NULL DEFAULT 0"),
     ("sessions", "mode", "TEXT NOT NULL DEFAULT ''"),
     ("sessions", "backend", "TEXT NOT NULL DEFAULT ''"),
+    ("watches", "position", "INTEGER NOT NULL DEFAULT 0"),
+]
+
+# Backfills to run after ADDED_COLUMNS, since a DEFAULT only describes what a
+# *new* row gets and says nothing about the rows already there. Each is written
+# to be idempotent, because init_db runs on every start and not just once.
+#
+# Watches added before the column existed all carry position 0, which would put
+# them above every re-ordered box rather than in the order they were made.
+# ``id`` is the autoincrement they were already sorted by, so copying it across
+# preserves exactly the order the user last saw, and leaves every position at or
+# above 1 — which is what makes "position = 0" mean "not backfilled yet".
+BACKFILLS = [
+    "UPDATE watches SET position = id WHERE position = 0",
 ]
 
 # Indexes an older database may still carry under an old definition.
@@ -270,6 +289,8 @@ def init_db(conn: sqlite3.Connection) -> None:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
         if column not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    for statement in BACKFILLS:
+        conn.execute(statement)
     try:
         conn.executescript(FTS_SCHEMA)
     except sqlite3.OperationalError:

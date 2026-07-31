@@ -20,17 +20,11 @@ import pytest
 from hpca.agent.explainer import ProposedSignature
 from hpca.config import Settings
 from hpca.core.deps import CoreDeps
-from hpca.core.pollers import PROCESS_HISTORY_LIMIT, Pollers
+from hpca.core.pollers import Pollers
 from hpca.db import connect, init_db
 from hpca.jobs import JobStore
 from hpca.llm import ChatResponse
-from hpca.protocol import (
-    PANEL_JOB,
-    PANEL_PROCESS,
-    PANEL_WATCH,
-    Notify,
-    PanelUpdate,
-)
+from hpca.protocol import PANEL_WATCH, Notify, PanelUpdate
 from hpca.runner import ProcessChange, ProcessRunner
 from hpca.sessions import SessionStore
 from hpca.slurm import SlurmClient
@@ -148,6 +142,22 @@ def add_job(conn, session, job_id="27744534", script_key="pipeline"):
     )
 
 
+def watched_job(conn, session, job_id="27744534"):
+    """One box whose rendering does not tick.
+
+    A log box counts up from its last write, so two repaints a few
+    milliseconds apart can still differ if a second boundary falls between
+    them. A job box is its state and nothing else, which is what makes it the
+    right instrument for asserting a column was or was not re-sent.
+    """
+    return WatchStore(conn).add(
+        kind=KIND_JOB,
+        target=job_id,
+        profile="default",
+        session_id=session.session_id,
+    )
+
+
 def written(path, text="progress\n", *, age_s=0.0):
     """A log file whose last write was ``age_s`` seconds ago."""
     path.write_text(text)
@@ -210,9 +220,12 @@ class TestJobPoll:
 
 
 class TestPanelOrder:
-    async def test_watches_come_first_then_jobs_then_processes(
+    async def test_the_column_is_watches_and_nothing_else(
         self, conn, deps, recorder, session, tmp_path
     ):
+        """A submitted job and a finished subprocess used to get rows of their
+        own under a "── this session ──" heading. Both are in the chat log a
+        column to the left; the panel is for what was asked to be watched."""
         WatchStore(conn).add(
             kind=KIND_LOG, target=str(written(tmp_path / "a.log")), profile="default",
             session_id=session.session_id,
@@ -228,11 +241,25 @@ class TestPanelOrder:
         conn.commit()
         await pollers(deps, recorder).refresh_panel()
 
-        assert recorder.keys == ["w1", "h:session", "j27744534", "p4242"]
-        kinds = [row.kind for row in recorder.rows]
-        assert kinds[0] == PANEL_WATCH
-        assert kinds[2] == PANEL_JOB
-        assert kinds[3] == PANEL_PROCESS
+        assert recorder.keys == ["w1"]
+        assert [row.kind for row in recorder.rows] == [PANEL_WATCH]
+
+    async def test_boxes_come_out_in_the_order_the_store_holds_them(
+        self, conn, deps, recorder, session, tmp_path
+    ):
+        """The user arranges the column with alt+↑/alt+↓ (WatchStore.move), so
+        a poll has to paint the store's order and never impose its own."""
+        store = WatchStore(conn)
+        for name in ("a", "b", "c"):
+            store.add(
+                kind=KIND_LOG, target=str(written(tmp_path / f"{name}.log")),
+                profile="default", session_id=session.session_id,
+            )
+        moved = store.list(session_id=session.session_id)[2]
+        store.move(moved.id, -1)
+        await pollers(deps, recorder).refresh_panel()
+
+        assert recorder.keys == ["w1", "w3", "w2"]
 
     async def test_rows_carry_the_id_a_keypress_acts_on(
         self, conn, deps, recorder, session, tmp_path
@@ -241,68 +268,21 @@ class TestPanelOrder:
             kind=KIND_LOG, target=str(written(tmp_path / "a.log")),
             label="sniffles", profile="default", session_id=session.session_id,
         )
-        add_job(conn, session)
         await pollers(deps, recorder).refresh_panel()
 
-        by_kind = {row.kind: row for row in recorder.rows}
-        assert by_kind[PANEL_WATCH].ref == str(watch.id)
-        assert by_kind[PANEL_WATCH].title == "sniffles"
-        assert by_kind[PANEL_JOB].ref == "27744534"
+        row = recorder.rows[0]
+        assert row.kind == PANEL_WATCH
+        assert row.ref == str(watch.id)
+        assert row.title == "sniffles"
 
-    async def test_the_heading_needs_something_under_it(
-        self, conn, deps, recorder, session, tmp_path
-    ):
-        """A heading as the very first row would take the cursor's opening
-        position for itself."""
-        WatchStore(conn).add(
-            kind=KIND_LOG, target=str(written(tmp_path / "a.log")), profile="default",
-            session_id=session.session_id,
-        )
-        poller = pollers(deps, recorder)
-        await poller.refresh_panel()
-        assert recorder.keys == ["w1"]
-
-        add_job(conn, session)
-        await poller.refresh_panel()
-        assert recorder.keys == ["w1", "h:session", "j27744534"]
-
-    async def test_no_watches_means_no_heading_either(
+    async def test_a_session_with_no_watches_gets_an_empty_column(
         self, conn, deps, recorder, session
     ):
+        """It used to fill with the session's run history instead, which is
+        why the boxes were never the first thing read."""
         add_job(conn, session)
         await pollers(deps, recorder).refresh_panel()
-        assert recorder.keys == ["j27744534"]
-
-    async def test_a_cut_history_says_so(self, conn, deps, recorder, session):
-        for i in range(PROCESS_HISTORY_LIMIT + 4):
-            conn.execute(
-                "INSERT INTO processes (pid, session_id, name, cmd, state, "
-                "stdout_path, stderr_path, started_at) "
-                "VALUES (?, ?, ?, 'bash /tmp/x.sh', 'finished', '/tmp/o', "
-                "'/tmp/e', ?)",
-                (9000 + i, session.session_id, f"p{i}",
-                 f"2026-07-19T10:{i:02d}:00+00:00"),
-            )
-        conn.commit()
-        await pollers(deps, recorder).refresh_panel()
-
-        assert recorder.keys[-1] == "more"
-        assert "4 older" in recorder.rows[-1].text
-        assert len(recorder.keys) == PROCESS_HISTORY_LIMIT + 1
-
-    async def test_a_short_history_gets_no_truncation_row(
-        self, conn, deps, recorder, session
-    ):
-        conn.execute(
-            "INSERT INTO processes (pid, session_id, name, cmd, state, "
-            "stdout_path, stderr_path, started_at) "
-            "VALUES (7, ?, 'align', 'bash /tmp/x.sh', 'finished', '/tmp/o', "
-            "'/tmp/e', '2026-07-19T10:00:00+00:00')",
-            (session.session_id,),
-        )
-        conn.commit()
-        await pollers(deps, recorder).refresh_panel()
-        assert "more" not in recorder.keys
+        assert recorder.keys == []
 
     async def test_a_watch_belongs_to_the_session_that_made_it(
         self, conn, deps, recorder, session, tmp_path
@@ -313,9 +293,8 @@ class TestPanelOrder:
             kind=KIND_LOG, target=str(written(tmp_path / "a.log")),
             profile="default", session_id="some-other-session",
         )
-        add_job(conn, session)
         await pollers(deps, recorder).refresh_panel()
-        assert recorder.keys == ["j27744534"]
+        assert recorder.keys == []
 
     async def test_with_no_session_focused_there_are_no_watches_to_show(
         self, conn, deps, recorder, session, tmp_path
@@ -335,7 +314,7 @@ class TestPanelPush:
     async def test_an_unchanged_column_is_not_resent(
         self, conn, deps, recorder, session
     ):
-        add_job(conn, session)
+        watched_job(conn, session)
         poller = pollers(deps, recorder)
         await poller.refresh_panel()
         await poller.refresh_panel()
@@ -344,7 +323,7 @@ class TestPanelPush:
     async def test_force_resends_it_for_a_client_with_a_blank_screen(
         self, conn, deps, recorder, session
     ):
-        add_job(conn, session)
+        watched_job(conn, session)
         poller = pollers(deps, recorder)
         await poller.refresh_panel()
         await poller.refresh_panel(force=True)
@@ -372,11 +351,11 @@ class TestPanelPush:
         )
         poller = pollers(deps, recorder)
         first = poller.panel_rows(
-            WatchStore(conn).list(profile="default"), [], [], 0,
+            WatchStore(conn).list(profile="default"),
             now=wrote_at + timedelta(seconds=4),
         )
         later = poller.panel_rows(
-            WatchStore(conn).list(profile="default"), [], [], 0,
+            WatchStore(conn).list(profile="default"),
             now=wrote_at + timedelta(minutes=5),
         )
         assert first != later
@@ -384,7 +363,7 @@ class TestPanelPush:
     async def test_the_panel_names_the_session_it_describes(
         self, conn, deps, recorder, session
     ):
-        add_job(conn, session)
+        watched_job(conn, session)
         await pollers(deps, recorder).refresh_panel()
         update = recorder.of(PanelUpdate)[0]
         assert update.session_id == session.session_id

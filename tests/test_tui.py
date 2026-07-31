@@ -22,7 +22,7 @@ async def test_app_boots_with_three_columns(hpca_home):
     app = HpcaApp()
     async with app.run_test(size=(120, 40)):
         columns = list(app.query(ColumnPanel))
-        assert [c.id for c in columns] == ["sessions", "chat", "processes"]
+        assert [c.id for c in columns] == ["sessions", "chat", "watchers"]
 
 
 async def test_top_bar_no_longer_shows_the_model(hpca_home):
@@ -65,11 +65,11 @@ async def test_arrow_keys_cycle_columns(hpca_home):
         await pilot.press("right")
         assert app.focused_column_id == "chat"
         await pilot.press("right")
-        assert app.focused_column_id == "processes"
+        assert app.focused_column_id == "watchers"
         await pilot.press("right")  # wraps
         assert app.focused_column_id == "sessions"
         await pilot.press("left")  # wraps back
-        assert app.focused_column_id == "processes"
+        assert app.focused_column_id == "watchers"
         await pilot.press("left")
         assert app.focused_column_id == "chat"
 
@@ -171,7 +171,7 @@ class TestCommandPalette:
 
 class TestAgentModeSwitching:
     """shift+tab cycles the agent mode, but only from the chat column —
-    the sessions and processes columns leave the mode alone."""
+    the sessions and watchers columns leave the mode alone."""
 
     async def test_shift_tab_cycles_mode_from_the_chat_column(self, hpca_home):
         app = HpcaApp()
@@ -196,9 +196,9 @@ class TestAgentModeSwitching:
             await pilot.press("shift+tab")
             assert app._mode_of(app.active_session) == start
 
-            app._focus_column("processes")
+            app._focus_column("watchers")
             await pilot.pause()
-            assert app.focused_column_id == "processes"
+            assert app.focused_column_id == "watchers"
             assert app.check_action("cycle_mode", ()) is False
             await pilot.press("shift+tab")
             assert app._mode_of(app.active_session) == start
@@ -227,7 +227,7 @@ class TestChatEntryNavigation:
             await new_session_via_picker(app, pilot)
             await pilot.press("h", "i")
             await pilot.press("right")  # cursor at the end: leave the column
-            assert app.focused_column_id == "processes"
+            assert app.focused_column_id == "watchers"
 
             await pilot.press("left")  # back into the chat column
             chat_input = app.query_one("#chat-input", ChatInput)
