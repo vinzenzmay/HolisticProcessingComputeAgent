@@ -17,6 +17,7 @@ from hpca.tui.profiles_screen import (
     ProfileSkillsScreen,
     ProfilesScreen,
 )
+from tests.conftest import wait_for_screen
 
 
 def is_title_request(json_schema):
@@ -104,10 +105,8 @@ class TestSkillEditing:
         async with app.run_test(size=(120, 40)) as pilot:
             await open_profiles_on(app, pilot)
             await pilot.press("s")
-            for _ in range(6):
-                await pilot.pause()
-            assert isinstance(app.screen, ProfileSkillsScreen)
-            skills_list = app.screen.query_one("#pskills-list", ListView)
+            screen = await wait_for_screen(app, pilot, ProfileSkillsScreen)
+            skills_list = screen.query_one("#pskills-list", ListView)
             assert any(
                 getattr(item, "data_skill", None) == "bam-subset"
                 for item in skills_list.children
@@ -134,10 +133,8 @@ class TestSkillEditing:
         async with app.run_test(size=(120, 40)) as pilot:
             await open_profiles_on(app, pilot)
             await pilot.press("s")
-            for _ in range(6):
-                await pilot.pause()
-            assert isinstance(app.screen, ProfileSkillsScreen)
-            skills_list = app.screen.query_one("#pskills-list", ListView)
+            screen = await wait_for_screen(app, pilot, ProfileSkillsScreen)
+            skills_list = screen.query_one("#pskills-list", ListView)
             assert any(
                 getattr(item, "data_skill", None) == "bam-subset"
                 for item in skills_list.children

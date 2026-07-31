@@ -260,8 +260,8 @@ packages:
   requires_python: '>=3.8'
 - pypi: ./
   name: hpca
-  version: 0.11.0
-  sha256: 7ce92ba806b3d3bc76bf7bebec2ac9f37ce96d3b2083bd2c1d11267db2a7636e
+  version: 0.13.0
+  sha256: 5623db158d2aca46114aa553cabd6bb16c25dddce235b2f9f58cd5b9ee9d1900
   requires_dist:
   - textual>=0.80
   - pydantic>=2.7

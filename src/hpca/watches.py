@@ -10,17 +10,27 @@ then ``tail``. A watch pins one of them to the panel instead.
 
 Two kinds, both cheap enough to poll on a timer:
 
-* ``log`` — a file. Its mtime answers the one question worth asking while a
-  tool runs: is anything still being written? "last write 4s ago" is alive,
-  "last write 40m ago" is dead or wedged, and the difference is legible at a
-  glance without leaving the TUI.
+* ``log`` — a file. The box reports its size and its mtime: "last write 4s
+  ago", legible at a glance without leaving the TUI. It reports nothing beyond
+  that, deliberately. The mtime used to be turned into a verdict — "writing"
+  under a couple of minutes, "idle" over — but that reads a fact about a file
+  as a claim about the work behind it, and the two are not the same: a job can
+  be entirely healthy and silent for an hour between checkpoints. The number is
+  shown; the conclusion is the reader's.
 * ``job`` — a Slurm job id, refreshed from ``squeue``. When it drops out of
   the queue ``sacct`` supplies the final state, so the box settles on
   COMPLETED or FAILED instead of quietly vanishing.
 
-A watch is bound to a *profile*, not a session: it describes the machine, not
-the conversation, and the user wants it on screen whichever session they are
-reading. The originating session is recorded for provenance only.
+A watch belongs to the *session* that registered it. It was originally scoped
+to the profile, on the reasoning that a watch describes the machine rather than
+the conversation — but in use that is backwards: sessions on one profile are
+the normal case, so every session showed every other session's boxes, and the
+right column stopped describing the conversation the user was reading.
+
+Polling is deliberately *not* scoped the same way. State is refreshed for every
+watch in the store, so a session returned to shows a current clock rather than
+one frozen at the moment the user switched away. Scoping decides what is shown;
+it must not decide what stays true.
 
 Everything here is pure or sqlite-only. The subprocess half (squeue, sacct)
 lives in :mod:`hpca.slurm` and is handed in, so the whole module tests without
@@ -40,19 +50,22 @@ KIND_LOG = "log"
 KIND_JOB = "job"
 KINDS = (KIND_LOG, KIND_JOB)
 
-# Log states.
-LOG_WRITING = "writing"
-LOG_IDLE = "idle"
+# Log states. Only two, and both are observed rather than inferred: the file
+# is there, or it is not.
+#
+# There used to be a third — the file's mtime was compared against a freshness
+# window and the box read "writing" or "idle" accordingly. That was a guess
+# dressed as a status. A job can be very much alive and not writing: buffered
+# output, a long compute phase between log lines, a rank that only reports at
+# checkpoints. Whether the work is alive cannot be read off the age of its last
+# write, so the box no longer claims to know. It shows when the file was last
+# written and lets the reader draw the conclusion, which is the one thing the
+# mtime actually supports.
+LOG_PRESENT = "present"
 LOG_GONE = "gone"
 
 # A job squeue no longer lists and sacct cannot account for either.
 JOB_GONE = "GONE"
-
-# How long after its last write a log still reads as "writing". Generous on
-# purpose: plenty of tools flush per output chunk rather than per line, and a
-# box that flickers between writing and idle every few seconds is worse than
-# useless — it teaches the user to ignore it.
-FRESH_SECONDS = 120
 
 # The Enter peek: enough tail to carry a traceback's last line or a "Done.",
 # short enough to stay a toast rather than a wall of text.
@@ -142,7 +155,7 @@ class WatchStore:
         """
         if kind not in KINDS:
             raise ValueError(f"Unknown watch kind {kind!r}; expected one of {KINDS}")
-        existing = self.find(kind=kind, target=target, profile=profile)
+        existing = self.find(kind=kind, target=target, session_id=session_id)
         if existing is not None:
             if label and label != existing.label:
                 self._conn.execute(
@@ -167,32 +180,59 @@ class WatchStore:
         ).fetchone()
         return _to_watch(row) if row else None
 
-    def find(self, *, kind: str, target: str, profile: str = "") -> Watch | None:
+    def find(self, *, kind: str, target: str, session_id: str = "") -> Watch | None:
         row = self._conn.execute(
-            "SELECT * FROM watches WHERE profile = ? AND kind = ? AND target = ?",
-            (profile, kind, target),
+            "SELECT * FROM watches WHERE session_id = ? AND kind = ? AND target = ?",
+            (session_id, kind, target),
         ).fetchone()
         return _to_watch(row) if row else None
 
-    def list(self, *, profile: str | None = None) -> list[Watch]:
-        """Every watch, oldest first.
+    def list(
+        self, *, session_id: str | None = None, profile: str | None = None
+    ) -> list[Watch]:
+        """Every watch, oldest first; ``session_id`` narrows to one session's.
 
         Insertion order, not freshness order: the panel is navigated with the
         arrow keys, and a list that reorders itself under the cursor every poll
         cannot be navigated at all.
+
+        Passing neither returns the whole store, which is what the pollers
+        want — see the module docstring on why refreshing is not scoped the way
+        displaying is. ``profile`` is still accepted because a profile-wide
+        sweep is the right question when a profile is being deleted.
         """
         sql = "SELECT * FROM watches"
-        params: tuple = ()
+        clauses: list[str] = []
+        params: list = []
+        if session_id is not None:
+            clauses.append("session_id = ?")
+            params.append(session_id)
         if profile is not None:
-            sql += " WHERE profile = ?"
-            params = (profile,)
+            clauses.append("profile = ?")
+            params.append(profile)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY id"
-        return [_to_watch(row) for row in self._conn.execute(sql, params)]
+        return [_to_watch(row) for row in self._conn.execute(sql, tuple(params))]
 
     def remove(self, watch_id: int) -> bool:
         cursor = self._conn.execute("DELETE FROM watches WHERE id = ?", (watch_id,))
         self._conn.commit()
         return cursor.rowcount > 0
+
+    def forget_session(self, session_id: str) -> int:
+        """Drop a deleted session's watches; returns how many.
+
+        Necessary because watches are session-scoped: without this a deleted
+        conversation's boxes become invisible — no session will ever match
+        them again — while the pollers go on stat-ing their files and asking
+        squeue about their jobs every few seconds, forever.
+        """
+        cursor = self._conn.execute(
+            "DELETE FROM watches WHERE session_id = ?", (session_id,)
+        )
+        self._conn.commit()
+        return cursor.rowcount
 
     def update(
         self,
@@ -288,11 +328,9 @@ GLYPH_DEAD = "✗"
 
 def watch_glyph(watch: Watch) -> str:
     if watch.kind == KIND_LOG:
-        return {
-            LOG_WRITING: GLYPH_LIVE,
-            LOG_IDLE: GLYPH_IDLE,
-            LOG_GONE: GLYPH_DEAD,
-        }.get(watch.state, GLYPH_IDLE)
+        # Never GLYPH_LIVE: a log file existing says nothing about whether
+        # anything is still writing to it.
+        return GLYPH_DEAD if watch.state == LOG_GONE else GLYPH_IDLE
     if watch.state == "RUNNING":
         return GLYPH_LIVE
     if watch.state == "COMPLETED":
@@ -303,13 +341,14 @@ def watch_glyph(watch: Watch) -> str:
 
 
 def watch_class(watch: Watch) -> str:
-    """CSS class for the box: colour carries the state, so a glance is enough."""
+    """CSS class for the box: colour carries the state, so a glance is enough.
+
+    A log is never "watch-live" — see the note on the log states. Colouring a
+    box green because the file was touched recently is the same claim in
+    another form, and it is the claim that cannot be supported.
+    """
     if watch.kind == KIND_LOG:
-        return {
-            LOG_WRITING: "watch-live",
-            LOG_IDLE: "watch-idle",
-            LOG_GONE: "watch-dead",
-        }.get(watch.state, "watch-idle")
+        return "watch-dead" if watch.state == LOG_GONE else "watch-idle"
     if watch.state == "RUNNING":
         return "watch-live"
     if watch.state == "COMPLETED":
@@ -334,11 +373,18 @@ def watch_lines(watch: Watch, *, now: datetime | None = None) -> list[str]:
     Kept to two so several watches fit a short terminal beside the process
     history — a monitor nobody can see all of monitors nothing.
     """
+    if watch.kind == KIND_LOG:
+        # No state word: "present" is not news, and the words it replaced
+        # ("writing", "idle") were a guess about the job, not a fact about the
+        # file. What the box has to say is the size and the last write.
+        first = f"{watch_glyph(watch)} {watch.head}" if watch.head else (
+            f"{watch_glyph(watch)} no such file" if watch.state == LOG_GONE
+            else f"{watch_glyph(watch)} not polled yet"
+        )
+        return [first, _log_freshness(watch, now)]
     first = f"{watch_glyph(watch)} {watch.state or 'not polled yet'}"
     if watch.head:
         first += f" · {watch.head}"
-    if watch.kind == KIND_LOG:
-        return [first, _log_freshness(watch, now)]
     return [first, watch.detail or f"id {watch.target}"]
 
 
@@ -381,9 +427,7 @@ def log_fields(
     except OSError:
         return LOG_GONE, "", ""
     written = datetime.fromtimestamp(stat.st_mtime, timezone.utc)
-    age = (now - written).total_seconds()
-    state = LOG_WRITING if age <= FRESH_SECONDS else LOG_IDLE
-    return state, format_size(stat.st_size), _stamp(written)
+    return LOG_PRESENT, format_size(stat.st_size), _stamp(written)
 
 
 def poll_log_watches(

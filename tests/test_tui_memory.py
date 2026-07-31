@@ -12,6 +12,7 @@ from hpca.llm import ChatResponse
 from hpca.profiles import MemoryScope, Profile
 from hpca.tui.app import ChatInput, HpcaApp, UNTITLED_SESSION, WorkingIndicator
 from hpca.tui.memory_screens import MemoryProposalScreen, ReflectionScreen
+from tests.conftest import wait_for_screen
 
 
 def is_title_request(json_schema):
@@ -70,6 +71,7 @@ async def type_and_submit(app, pilot, text):
     await pilot.pause()
 
 
+
 MEMORIZE_REPLY = proposals_json(
     {"scope": "system-prompt", "kind": "fact", "text": "STAR needs 40G on this cluster."}
 )
@@ -83,9 +85,7 @@ class TestMemorize:
         app = HpcaApp(llm=FakeLLM([MEMORIZE_REPLY]))
         async with app.run_test(size=(120, 40)) as pilot:
             await type_and_submit(app, pilot, "/memorize STAR needed 40G here")
-            for _ in range(6):
-                await pilot.pause()
-            assert isinstance(app.screen, MemoryProposalScreen)
+            await wait_for_screen(app, pilot, MemoryProposalScreen)
             await pilot.press("y")
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -102,8 +102,7 @@ class TestMemorize:
             await type_and_submit(app, pilot, "my STAR job was killed")
             await app.workers.wait_for_complete()
             await type_and_submit(app, pilot, "/memorize that was a memory limit")
-            for _ in range(6):
-                await pilot.pause()
+            await wait_for_screen(app, pilot, MemoryProposalScreen)
             prompt = llm.calls[-1][-1]["content"]
             assert "that was a memory limit" in prompt  # the user's note
             assert "my STAR job was killed" in prompt  # the conversation context
@@ -114,8 +113,7 @@ class TestMemorize:
         app = HpcaApp(llm=FakeLLM([MEMORIZE_REPLY]))
         async with app.run_test(size=(120, 40)) as pilot:
             await type_and_submit(app, pilot, "/memorize forget me")
-            for _ in range(6):
-                await pilot.pause()
+            await wait_for_screen(app, pilot, MemoryProposalScreen)
             await pilot.press("n")
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -133,9 +131,7 @@ class TestMemorize:
         app = HpcaApp(llm=FakeLLM([MEMORIZE_REPLY]))
         async with app.run_test(size=(120, 40)) as pilot:
             await type_and_submit(app, pilot, r"\memorize STAR needed 40G")
-            for _ in range(6):
-                await pilot.pause()
-            assert isinstance(app.screen, MemoryProposalScreen)
+            await wait_for_screen(app, pilot, MemoryProposalScreen)
             await pilot.press("n")
             await app.workers.wait_for_complete()
 
@@ -143,8 +139,7 @@ class TestMemorize:
         app = HpcaApp(llm=FakeLLM([MEMORIZE_REPLY]))
         async with app.run_test(size=(120, 40)) as pilot:
             await type_and_submit(app, pilot, "/memorize something")
-            for _ in range(6):
-                await pilot.pause()
+            await wait_for_screen(app, pilot, MemoryProposalScreen)
             await pilot.press("n")
             await app.workers.wait_for_complete()
             # a command is not a message: it must not name the session
@@ -182,9 +177,7 @@ class TestMemorize:
             assert indicators, "spinner should be visible while forming memories"
             assert indicators.first(WorkingIndicator).activity == "forming memories"
             gate.set()
-            for _ in range(6):
-                await pilot.pause()
-            assert isinstance(app.screen, MemoryProposalScreen)
+            await wait_for_screen(app, pilot, MemoryProposalScreen)
             await pilot.press("n")
             await app.workers.wait_for_complete()
             await pilot.pause()

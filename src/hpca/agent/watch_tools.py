@@ -178,7 +178,9 @@ class ListWatchesParams(BaseModel):
 
 async def list_watches(args: ListWatchesParams, ctx: ToolContext) -> str:
     store = _require_watches(ctx)
-    return _render_list(store.list(profile=ctx.profile))
+    # The agent sees its own session's watches, matching the panel the
+    # user is looking at while it answers.
+    return _render_list(store.list(session_id=ctx.session_id))
 
 
 class UnwatchParams(BaseModel):
@@ -216,7 +218,7 @@ def match_watches(watches: list[Watch], needle: str) -> list[Watch]:
 
 async def unwatch(args: UnwatchParams, ctx: ToolContext) -> str:
     store = _require_watches(ctx)
-    watches = store.list(profile=ctx.profile)
+    watches = store.list(session_id=ctx.session_id)
     matches = match_watches(watches, args.target)
     if not matches:
         return f"No watch matches {args.target!r}.\n{_render_list(watches)}"

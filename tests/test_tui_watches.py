@@ -68,12 +68,15 @@ async def open_session(app, pilot):
 
 
 async def add_log_watch(app, pilot, path, label=""):
+    # Registered against the session that is actually open, as watch_log does:
+    # a watch belongs to its session now, so a hardcoded id would register it
+    # somewhere the panel is right not to show it.
     watch = app.watch_store.add(
         kind=KIND_LOG,
         target=str(path),
         label=label,
         profile=app._panel_profile(),
-        session_id="s1",
+        session_id=app._panel_session() or "",
     )
     await app.poll_watched_logs()
     await app.refresh_processes()
@@ -113,13 +116,14 @@ class TestTheBox:
             await add_log_watch(app, pilot, log, "sniffles")
             assert len(watch_rows(app)) == 1
             text = box_texts(app)[0]
-            assert "writing" in text
             assert "last write" in text
+            # No alive/dead word: the mtime cannot support that claim.
+            assert "writing" not in text and "idle" not in text
 
     async def test_the_box_says_how_long_ago_the_log_was_written(
         self, hpca_home, tmp_path
     ):
-        """The whole point: is sniffles still going, or did it die an hour ago?"""
+        """The whole point, and the whole claim: when it was last written."""
         app = HpcaApp(llm=FakeLLM([respond_json()]))
         async with app.run_test(size=(120, 40)) as pilot:
             await open_session(app, pilot)
@@ -127,8 +131,8 @@ class TestTheBox:
                 app, pilot, written(tmp_path / "old.log", age_s=3700)
             )
             text = box_texts(app)[0]
-            assert "idle" in text
             assert "last write 1h01m ago" in text
+            assert "idle" not in text
 
     async def test_the_boxes_come_before_the_run_history(self, hpca_home, tmp_path):
         app = HpcaApp(llm=FakeLLM([respond_json()]))
@@ -141,18 +145,44 @@ class TestTheBox:
             assert f"p{record.pid}" in keys
             assert "h:session" in keys  # and the two halves are labelled
 
-    async def test_a_watch_outlives_the_session_it_was_made_in(
+    async def test_a_watch_stays_in_the_session_it_was_made_in(
         self, hpca_home, tmp_path
     ):
-        """A watch describes the machine, not the conversation."""
+        """A watch belongs to its conversation, not to the machine.
+
+        It was the other way round, and in practice that meant every session
+        showed every other session's boxes — sessions on one profile are the
+        normal case — so the column stopped describing what was being read.
+        """
         app = HpcaApp(llm=FakeLLM([respond_json("a"), respond_json("b")]))
         async with app.run_test(size=(120, 40)) as pilot:
             await open_session(app, pilot)
             await add_log_watch(app, pilot, written(tmp_path / "a.log"), "kept")
+            first = app.active_session
+            assert len(watch_rows(app)) == 1
+
             await app.start_new_session()
             await app.refresh_processes()
             await pilot.pause()
+            assert watch_rows(app) == []
+
+            # ...and it is still there on the way back.
+            await app.open_session(first)
+            await app.refresh_processes()
+            await pilot.pause()
             assert len(watch_rows(app)) == 1
+
+    async def test_with_no_session_open_the_column_shows_no_watches(
+        self, hpca_home, tmp_path
+    ):
+        app = HpcaApp(llm=FakeLLM([respond_json()]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await open_session(app, pilot)
+            await add_log_watch(app, pilot, written(tmp_path / "a.log"), "kept")
+            await app.close_session()
+            await app.refresh_processes()
+            await pilot.pause()
+            assert watch_rows(app) == []
 
     async def test_it_survives_a_restart(self, hpca_home, tmp_path):
         app = HpcaApp(llm=FakeLLM([respond_json()]))
@@ -162,6 +192,9 @@ class TestTheBox:
 
         app2 = HpcaApp(llm=FakeLLM([respond_json()]))
         async with app2.run_test(size=(120, 40)) as pilot:
+            # Reopened rather than merely restarted: the watch belongs to its
+            # session, so finding it again means going back to that session.
+            await app2.open_session(app2.session_store.list_all()[0])
             await app2.refresh_processes()
             await pilot.pause()
             assert len(watch_rows(app2)) == 1
@@ -203,6 +236,7 @@ class TestPeek:
             watch = app.watch_store.add(
                 kind=KIND_JOB, target="27744534", label="snakemake",
                 profile=app._panel_profile(),
+                session_id=app._panel_session() or "",
             )
             app.watch_store.update(
                 watch.id, state="RUNNING", head="01:02:03", detail="node042"
@@ -233,6 +267,7 @@ class TestPeek:
             watch = app.watch_store.add(
                 kind=KIND_JOB, target="27744534", label="pipeline",
                 profile=app._panel_profile(),
+                session_id=app._panel_session() or "",
             )
             app.watch_store.update(watch.id, state="RUNNING")
             await app.refresh_processes()
@@ -342,8 +377,13 @@ class TestRepaint:
 
 
 class TestQuietLogNotice:
-    async def test_a_log_going_quiet_raises_a_toast(self, hpca_home, tmp_path):
-        """The moment worth interrupting for: the tool stopped writing."""
+    async def test_a_log_going_quiet_raises_nothing(self, hpca_home, tmp_path):
+        """It used to toast "no new output". That is not an event.
+
+        The box already says when the last write was and that number climbs
+        on its own; interrupting the user to report that nothing happened
+        trains them to ignore the toasts that matter.
+        """
         app = HpcaApp(llm=FakeLLM([respond_json()]))
         async with app.run_test(size=(120, 40)) as pilot:
             await open_session(app, pilot)
@@ -352,7 +392,21 @@ class TestQuietLogNotice:
             written(log, age_s=3600)  # nothing new for an hour
             await app.poll_watched_logs()
             await pilot.pause()
-            assert any("sniffles" in t and "no new output" in t for t in toasts(app))
+            assert not any("no new output" in t for t in toasts(app))
+
+    async def test_a_log_that_vanishes_still_raises_a_toast(
+        self, hpca_home, tmp_path
+    ):
+        """The one thing a log poll observes rather than infers."""
+        app = HpcaApp(llm=FakeLLM([respond_json()]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await open_session(app, pilot)
+            log = written(tmp_path / "sniffles.log")
+            await add_log_watch(app, pilot, log, "sniffles")
+            log.unlink()
+            await app.poll_watched_logs()
+            await pilot.pause()
+            assert any("sniffles" in t and "gone" in t for t in toasts(app))
 
     async def test_the_first_poll_of_a_fresh_watch_is_not_news(
         self, hpca_home, tmp_path

@@ -86,6 +86,7 @@ from hpca.embeddings import EmbeddingClient
 from hpca.episodic import EpisodicStore
 from hpca.llm import LLMClient
 from hpca.logs import LoggedLLM, SessionLog, open_log
+from hpca.looplag import LoopLagProbe
 from hpca.rag import RagStore
 from hpca.transcript import ASSISTANT as ASSISTANT_ENTRY
 from hpca.transcript import THINKING, Entry, Step, build_entries
@@ -158,7 +159,6 @@ from hpca.watches import (
     KIND_JOB,
     KIND_LOG,
     LOG_GONE,
-    LOG_IDLE,
     Watch,
     WatchStore,
     apply_job_details,
@@ -1123,7 +1123,11 @@ class HpcaApp(App):
         height: auto;
     }
     .watch-live { border: round $success; }
-    .watch-idle { border: round $warning; }
+    /* Neutral, not amber. Every existing log box lands here now that a log is
+       no longer labelled writing-or-idle, and a warning colour on all of them
+       would make the same unsupported claim the words used to: that the age of
+       a file's last write says whether the work behind it is still alive. */
+    .watch-idle { border: round $panel; }
     .watch-done { border: round $accent; }
     .watch-dead {
         border: round $error;
@@ -1325,6 +1329,31 @@ class HpcaApp(App):
         self._dbcache: DbCache | None = None
         self._syncing_db_cache = False
         self._saver_ctx = None
+        # Event-loop lag, measured (specs-core-process.md §8). The case for
+        # moving the agent into its own process is that synchronous work on
+        # this loop makes the UI stutter, and that has to be a number taken
+        # before and after, not a feeling. Off unless $HPCA_LOOPLAG is set:
+        # a disabled probe starts no task, so it costs nothing to leave here.
+        self._looplag = LoopLagProbe(
+            enabled=bool(os_environ.get("HPCA_LOOPLAG")),
+            # What the app thinks it is doing when a stall is recorded. Read
+            # off the active turn rather than passed in, so a spike in the log
+            # names the tool that caused it.
+            label=self._current_activity,
+        )
+
+    def _current_activity(self) -> str:
+        """What to blame a loop stall on, for the lag probe's spike list.
+
+        The turn's own activity string — "running read_file", "LLM processing"
+        — is already what the spinner says, so a spike in looplag.log names the
+        step that caused it. Reads any live turn, not just the visible one: a
+        background turn blocks this loop exactly as hard as the open one.
+        """
+        turns = getattr(self, "_turns", {})
+        if not turns:
+            return "idle"
+        return ", ".join(sorted({ts.activity for ts in turns.values()}))
 
     def notify(self, message: str, **kwargs) -> None:
         """Toasts carry dynamic text — LLM output, exception strings, memory
@@ -1344,6 +1373,10 @@ class HpcaApp(App):
         yield Footer()
 
     async def on_mount(self) -> None:
+        # Before the DbCache, the graph and the registry are built: that
+        # startup path is itself one of the suspects, and a probe started
+        # after it would be measuring everything except.
+        self._looplag.start()
         self.clipboard_manager = ClipboardManager(
             self.settings.clipboard, emit=self._emit_to_terminal
         )
@@ -1484,6 +1517,15 @@ class HpcaApp(App):
             await self._llm.close()
         for client in self._session_clients.values():
             await client.close()
+        # Last: the report is written before the probe stops, because `elapsed`
+        # freezes at stop and the block would otherwise claim a shorter run
+        # than it measured. A disabled probe writes nothing and returns False,
+        # so this needs no guard of its own.
+        self._looplag.write_report(
+            app_dir() / "looplag.log",
+            note=os_environ.get("HPCA_LOOPLAG", ""),
+        )
+        await self._looplag.stop()
 
     # ------------------------------------------------------------- clipboard
 
@@ -3287,6 +3329,10 @@ class HpcaApp(App):
         # Patient-data environment: a deleted conversation must not resurface
         # through episodic search either.
         self.episodic.forget_session(session.session_id)
+        # Its watches go too. They are session-scoped, so leaving them would
+        # leave boxes no session can ever show while the pollers went on
+        # stat-ing their files and asking squeue about their jobs.
+        self.watch_store.forget_session(session.session_id)
         try:
             await self._checkpointer.adelete_thread(session.session_id)
         except Exception as e:  # the row is already gone; say so and move on
@@ -3509,13 +3555,16 @@ class HpcaApp(App):
             return
         session = self.active_session
         session_id = session.session_id if session is not None else None
-        # Watches belong to the profile, not the conversation: they describe
-        # what is running on the machine, and the user wants them on screen
-        # whichever session they happen to be reading.
-        profile = self._panel_profile()
 
         def _gather(conn):
-            watches = WatchStore(conn).list(profile=profile)
+            # A watch belongs to the session that registered it, so the column
+            # describes the conversation being read and nothing else. With no
+            # session open there is nothing of anyone's to show.
+            watches = (
+                WatchStore(conn).list(session_id=session_id)
+                if session_id is not None
+                else []
+            )
             records: list[ProcessRecord] = []
             truncated = 0
             jobs: list[JobRow] = []
@@ -3720,10 +3769,23 @@ class HpcaApp(App):
     # ---------------------------------------------------------- watch polls
 
     def _panel_profile(self) -> str:
-        """Whose watches the right column shows: the open session's profile,
-        or the app's when nothing is open."""
+        """The profile behind the right column. Kept for callers that ask
+        about the profile rather than the conversation."""
         session = self.active_session
         return session.profile if session is not None else self.profile
+
+    def _panel_session(self) -> str | None:
+        """Whose watches the right column shows: the open session's, and none
+        at all when no session is open.
+
+        Watches were profile-scoped, which in practice meant every session
+        showed every other session's boxes — sessions on one profile are the
+        normal case — and the column stopped describing the conversation being
+        read. Polling stays store-wide (see hpca.watches), so a session
+        returned to shows a current clock rather than a frozen one.
+        """
+        session = self.active_session
+        return session.session_id if session is not None else None
 
     async def poll_watched_logs(self) -> None:
         """Stat every watched log — where the "last write …" clock comes from.
@@ -3734,11 +3796,13 @@ class HpcaApp(App):
         """
         if self._dbio is None or self._dbio.closed:
             return
-        profile = self._panel_profile()
 
         def _poll(conn):
+            # Store-wide, not the open session's: scoping decides what is
+            # *shown*, never what stays true. A watch left behind in another
+            # session must still be current when the user goes back to it.
             store = WatchStore(conn)
-            logs = [w for w in store.list(profile=profile) if w.kind == KIND_LOG]
+            logs = [w for w in store.list() if w.kind == KIND_LOG]
             return poll_log_watches(store, logs)
 
         try:
@@ -3747,17 +3811,15 @@ class HpcaApp(App):
             self.notify(f"Log watch failed: {e}", severity="warning")
             return
         for change in changes:
-            # Only the transitions the user is watching *for*. The first poll
-            # of a new watch moves it off "" into a state, which is not news.
-            if change.old_state and change.new_state in (LOG_IDLE, LOG_GONE):
+            # A vanished file is the only thing a log poll can report, and the
+            # only one worth interrupting for. There used to be a "no new
+            # output" toast as well; it fired whenever a log had simply not
+            # been written to for a while, which is not an event — the box
+            # already says when the last write was, and a job between log
+            # lines is not news.
+            if change.old_state and change.new_state == LOG_GONE:
                 self.notify(
-                    f"{change.watch.title}: "
-                    + (
-                        "the file is gone"
-                        if change.new_state == LOG_GONE
-                        else "no new output"
-                    ),
-                    severity="warning",
+                    f"{change.watch.title}: the file is gone", severity="warning"
                 )
         if changes:
             await self.refresh_processes()
@@ -3770,11 +3832,10 @@ class HpcaApp(App):
         """
         if self.slurm is None or self._dbio is None or self._dbio.closed:
             return
-        profile = self._panel_profile()
         watches = await self._db(
             lambda conn: [
                 w
-                for w in WatchStore(conn).list(profile=profile)
+                for w in WatchStore(conn).list()  # store-wide; see poll_watched_logs
                 if w.kind == KIND_JOB and not is_settled(w)
             ]
         )

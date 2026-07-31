@@ -10,7 +10,7 @@ from hpca.db import connect, init_db
 from hpca.registry import PathRegistry
 from hpca.runner import ProcessRunner
 from hpca.slurm import SlurmClient
-from hpca.watches import KIND_JOB, KIND_LOG, WatchStore
+from hpca.watches import KIND_JOB, KIND_LOG, LOG_PRESENT, WatchStore
 
 SQUEUE_RUNNING = "27744534|RUNNING|node042|1-04:42:02|3-19:17:58|snakemake_run|None\n"
 SACCT_DONE = "27744534|COMPLETED|0:0|01:00:00||4G|02:00:00\n"
@@ -67,7 +67,9 @@ class TestWatchLog:
         assert "Watching" in result
         [watch] = ctx.watches.list(profile="default")
         assert (watch.kind, watch.label) == (KIND_LOG, "sniffles")
-        assert watch.state == "writing"  # polled once on registration
+        # Polled once on registration. "present", not "writing": whether
+        # anything is still writing cannot be read off the file's mtime.
+        assert watch.state == LOG_PRESENT
 
     async def test_a_registry_key_works_as_well_as_a_path(self, tools, tmp_path):
         ctx = make_ctx(tmp_path)
