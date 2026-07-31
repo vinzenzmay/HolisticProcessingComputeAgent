@@ -158,7 +158,7 @@ One envelope in both directions:
 | `turn.submit` | `session_id`, `text`, `forced_skill?` |
 | `turn.interrupt` | `session_id` |
 | `decision.resolve` | `session_id`, `approved: bool`, `reason: str` |
-| `command.run` | `name`, `args` — `/compact`, `/memorize`, `/conclude`, `/skill-*` |
+| `command.run` | `name`, `args`, `session_id?` — `/compact`, `/memorize`, `/conclude`, `/skill-*`. Session-scoped commands carry the id explicitly rather than letting the core infer it from the last `session.focus`, which may have moved on between the keystroke and the frame arriving |
 | `mode.set` | `session_id`, `mode` |
 | `backend.set` | `backend` (JSON blob), `session_id?` |
 | `profile.set` | `name` |
@@ -175,7 +175,7 @@ One envelope in both directions:
 | type | payload |
 |---|---|
 | `hello` | `version`, `profile`, `settings_digest` — first frame on connect |
-| `session.list` | `rows: [{session_id, title, profile, mode, flags}]` |
+| `session.rows` | `rows: [{session_id, title, profile, mode, flags}]` — deliberately **not** `session.list`: `parse()` sees a frame without knowing which direction it travelled, so one type string cannot carry two payload shapes |
 | `chat.reset` | `session_id`, `entries: [Entry]` — on open only |
 | `chat.append` | `session_id`, `entry: Entry` |
 | `turn.started` | `session_id` |
