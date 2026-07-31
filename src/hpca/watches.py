@@ -10,10 +10,13 @@ then ``tail``. A watch pins one of them to the panel instead.
 
 Two kinds, both cheap enough to poll on a timer:
 
-* ``log`` — a file. Its mtime answers the one question worth asking while a
-  tool runs: is anything still being written? "last write 4s ago" is alive,
-  "last write 40m ago" is dead or wedged, and the difference is legible at a
-  glance without leaving the TUI.
+* ``log`` — a file. The box reports its size and its mtime: "last write 4s
+  ago", legible at a glance without leaving the TUI. It reports nothing beyond
+  that, deliberately. The mtime used to be turned into a verdict — "writing"
+  under a couple of minutes, "idle" over — but that reads a fact about a file
+  as a claim about the work behind it, and the two are not the same: a job can
+  be entirely healthy and silent for an hour between checkpoints. The number is
+  shown; the conclusion is the reader's.
 * ``job`` — a Slurm job id, refreshed from ``squeue``. When it drops out of
   the queue ``sacct`` supplies the final state, so the box settles on
   COMPLETED or FAILED instead of quietly vanishing.
@@ -47,19 +50,22 @@ KIND_LOG = "log"
 KIND_JOB = "job"
 KINDS = (KIND_LOG, KIND_JOB)
 
-# Log states.
-LOG_WRITING = "writing"
-LOG_IDLE = "idle"
+# Log states. Only two, and both are observed rather than inferred: the file
+# is there, or it is not.
+#
+# There used to be a third — the file's mtime was compared against a freshness
+# window and the box read "writing" or "idle" accordingly. That was a guess
+# dressed as a status. A job can be very much alive and not writing: buffered
+# output, a long compute phase between log lines, a rank that only reports at
+# checkpoints. Whether the work is alive cannot be read off the age of its last
+# write, so the box no longer claims to know. It shows when the file was last
+# written and lets the reader draw the conclusion, which is the one thing the
+# mtime actually supports.
+LOG_PRESENT = "present"
 LOG_GONE = "gone"
 
 # A job squeue no longer lists and sacct cannot account for either.
 JOB_GONE = "GONE"
-
-# How long after its last write a log still reads as "writing". Generous on
-# purpose: plenty of tools flush per output chunk rather than per line, and a
-# box that flickers between writing and idle every few seconds is worse than
-# useless — it teaches the user to ignore it.
-FRESH_SECONDS = 120
 
 # The Enter peek: enough tail to carry a traceback's last line or a "Done.",
 # short enough to stay a toast rather than a wall of text.
@@ -322,11 +328,9 @@ GLYPH_DEAD = "✗"
 
 def watch_glyph(watch: Watch) -> str:
     if watch.kind == KIND_LOG:
-        return {
-            LOG_WRITING: GLYPH_LIVE,
-            LOG_IDLE: GLYPH_IDLE,
-            LOG_GONE: GLYPH_DEAD,
-        }.get(watch.state, GLYPH_IDLE)
+        # Never GLYPH_LIVE: a log file existing says nothing about whether
+        # anything is still writing to it.
+        return GLYPH_DEAD if watch.state == LOG_GONE else GLYPH_IDLE
     if watch.state == "RUNNING":
         return GLYPH_LIVE
     if watch.state == "COMPLETED":
@@ -337,13 +341,14 @@ def watch_glyph(watch: Watch) -> str:
 
 
 def watch_class(watch: Watch) -> str:
-    """CSS class for the box: colour carries the state, so a glance is enough."""
+    """CSS class for the box: colour carries the state, so a glance is enough.
+
+    A log is never "watch-live" — see the note on the log states. Colouring a
+    box green because the file was touched recently is the same claim in
+    another form, and it is the claim that cannot be supported.
+    """
     if watch.kind == KIND_LOG:
-        return {
-            LOG_WRITING: "watch-live",
-            LOG_IDLE: "watch-idle",
-            LOG_GONE: "watch-dead",
-        }.get(watch.state, "watch-idle")
+        return "watch-dead" if watch.state == LOG_GONE else "watch-idle"
     if watch.state == "RUNNING":
         return "watch-live"
     if watch.state == "COMPLETED":
@@ -368,11 +373,18 @@ def watch_lines(watch: Watch, *, now: datetime | None = None) -> list[str]:
     Kept to two so several watches fit a short terminal beside the process
     history — a monitor nobody can see all of monitors nothing.
     """
+    if watch.kind == KIND_LOG:
+        # No state word: "present" is not news, and the words it replaced
+        # ("writing", "idle") were a guess about the job, not a fact about the
+        # file. What the box has to say is the size and the last write.
+        first = f"{watch_glyph(watch)} {watch.head}" if watch.head else (
+            f"{watch_glyph(watch)} no such file" if watch.state == LOG_GONE
+            else f"{watch_glyph(watch)} not polled yet"
+        )
+        return [first, _log_freshness(watch, now)]
     first = f"{watch_glyph(watch)} {watch.state or 'not polled yet'}"
     if watch.head:
         first += f" · {watch.head}"
-    if watch.kind == KIND_LOG:
-        return [first, _log_freshness(watch, now)]
     return [first, watch.detail or f"id {watch.target}"]
 
 
@@ -415,9 +427,7 @@ def log_fields(
     except OSError:
         return LOG_GONE, "", ""
     written = datetime.fromtimestamp(stat.st_mtime, timezone.utc)
-    age = (now - written).total_seconds()
-    state = LOG_WRITING if age <= FRESH_SECONDS else LOG_IDLE
-    return state, format_size(stat.st_size), _stamp(written)
+    return LOG_PRESENT, format_size(stat.st_size), _stamp(written)
 
 
 def poll_log_watches(

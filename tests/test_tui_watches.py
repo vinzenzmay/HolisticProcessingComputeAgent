@@ -116,13 +116,14 @@ class TestTheBox:
             await add_log_watch(app, pilot, log, "sniffles")
             assert len(watch_rows(app)) == 1
             text = box_texts(app)[0]
-            assert "writing" in text
             assert "last write" in text
+            # No alive/dead word: the mtime cannot support that claim.
+            assert "writing" not in text and "idle" not in text
 
     async def test_the_box_says_how_long_ago_the_log_was_written(
         self, hpca_home, tmp_path
     ):
-        """The whole point: is sniffles still going, or did it die an hour ago?"""
+        """The whole point, and the whole claim: when it was last written."""
         app = HpcaApp(llm=FakeLLM([respond_json()]))
         async with app.run_test(size=(120, 40)) as pilot:
             await open_session(app, pilot)
@@ -130,8 +131,8 @@ class TestTheBox:
                 app, pilot, written(tmp_path / "old.log", age_s=3700)
             )
             text = box_texts(app)[0]
-            assert "idle" in text
             assert "last write 1h01m ago" in text
+            assert "idle" not in text
 
     async def test_the_boxes_come_before_the_run_history(self, hpca_home, tmp_path):
         app = HpcaApp(llm=FakeLLM([respond_json()]))
@@ -376,8 +377,13 @@ class TestRepaint:
 
 
 class TestQuietLogNotice:
-    async def test_a_log_going_quiet_raises_a_toast(self, hpca_home, tmp_path):
-        """The moment worth interrupting for: the tool stopped writing."""
+    async def test_a_log_going_quiet_raises_nothing(self, hpca_home, tmp_path):
+        """It used to toast "no new output". That is not an event.
+
+        The box already says when the last write was and that number climbs
+        on its own; interrupting the user to report that nothing happened
+        trains them to ignore the toasts that matter.
+        """
         app = HpcaApp(llm=FakeLLM([respond_json()]))
         async with app.run_test(size=(120, 40)) as pilot:
             await open_session(app, pilot)
@@ -386,7 +392,21 @@ class TestQuietLogNotice:
             written(log, age_s=3600)  # nothing new for an hour
             await app.poll_watched_logs()
             await pilot.pause()
-            assert any("sniffles" in t and "no new output" in t for t in toasts(app))
+            assert not any("no new output" in t for t in toasts(app))
+
+    async def test_a_log_that_vanishes_still_raises_a_toast(
+        self, hpca_home, tmp_path
+    ):
+        """The one thing a log poll observes rather than infers."""
+        app = HpcaApp(llm=FakeLLM([respond_json()]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await open_session(app, pilot)
+            log = written(tmp_path / "sniffles.log")
+            await add_log_watch(app, pilot, log, "sniffles")
+            log.unlink()
+            await app.poll_watched_logs()
+            await pilot.pause()
+            assert any("sniffles" in t and "gone" in t for t in toasts(app))
 
     async def test_the_first_poll_of_a_fresh_watch_is_not_news(
         self, hpca_home, tmp_path

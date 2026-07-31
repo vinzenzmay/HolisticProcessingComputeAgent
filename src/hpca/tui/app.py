@@ -159,7 +159,6 @@ from hpca.watches import (
     KIND_JOB,
     KIND_LOG,
     LOG_GONE,
-    LOG_IDLE,
     Watch,
     WatchStore,
     apply_job_details,
@@ -1124,7 +1123,11 @@ class HpcaApp(App):
         height: auto;
     }
     .watch-live { border: round $success; }
-    .watch-idle { border: round $warning; }
+    /* Neutral, not amber. Every existing log box lands here now that a log is
+       no longer labelled writing-or-idle, and a warning colour on all of them
+       would make the same unsupported claim the words used to: that the age of
+       a file's last write says whether the work behind it is still alive. */
+    .watch-idle { border: round $panel; }
     .watch-done { border: round $accent; }
     .watch-dead {
         border: round $error;
@@ -3808,17 +3811,15 @@ class HpcaApp(App):
             self.notify(f"Log watch failed: {e}", severity="warning")
             return
         for change in changes:
-            # Only the transitions the user is watching *for*. The first poll
-            # of a new watch moves it off "" into a state, which is not news.
-            if change.old_state and change.new_state in (LOG_IDLE, LOG_GONE):
+            # A vanished file is the only thing a log poll can report, and the
+            # only one worth interrupting for. There used to be a "no new
+            # output" toast as well; it fired whenever a log had simply not
+            # been written to for a while, which is not an event — the box
+            # already says when the last write was, and a job between log
+            # lines is not news.
+            if change.old_state and change.new_state == LOG_GONE:
                 self.notify(
-                    f"{change.watch.title}: "
-                    + (
-                        "the file is gone"
-                        if change.new_state == LOG_GONE
-                        else "no new output"
-                    ),
-                    severity="warning",
+                    f"{change.watch.title}: the file is gone", severity="warning"
                 )
         if changes:
             await self.refresh_processes()

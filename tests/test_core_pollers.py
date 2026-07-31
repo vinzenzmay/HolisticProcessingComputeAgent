@@ -399,24 +399,27 @@ class TestWatchedLogs:
         await pollers(deps, recorder).poll_watched_logs()
         assert recorder.toasts == []
 
-    async def test_a_log_going_quiet_notifies_once(
+    async def test_a_log_going_quiet_notifies_about_nothing(
         self, conn, deps, recorder, session, tmp_path
     ):
+        """A log not being written to for a while is not an event. The box
+        already says when the last write was, and that number climbs on its
+        own; a toast for it interrupts to report that nothing happened."""
         log = written(tmp_path / "sniffles.log")
         WatchStore(conn).add(
-            kind=KIND_LOG, target=str(log), label="sniffles", profile="default"
+            kind=KIND_LOG, target=str(log), label="sniffles",
+            profile="default", session_id=session.session_id,
         )
         poller = pollers(deps, recorder)
-        await poller.poll_watched_logs()  # writing
+        await poller.poll_watched_logs()
 
         written(log, age_s=3600)  # nothing new for an hour
+        recorder.toasts.clear()
         await poller.poll_watched_logs()
-        assert [t for t in recorder.toasts if "no new output" in t] == [
-            "sniffles: no new output"
-        ]
+        assert recorder.toasts == []
 
-        await poller.poll_watched_logs()  # still idle: not a new event
-        assert len([t for t in recorder.toasts if "no new output" in t]) == 1
+        await poller.poll_watched_logs()  # and still nothing, however long
+        assert recorder.toasts == []
 
     async def test_a_vanished_log_says_so(
         self, conn, deps, recorder, session, tmp_path

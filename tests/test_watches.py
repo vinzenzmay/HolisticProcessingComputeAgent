@@ -13,13 +13,11 @@ import pytest
 from hpca.db import connect, init_db
 from hpca.slurm import JobDetail, JobStatus, parse_squeue_details
 from hpca.watches import (
-    FRESH_SECONDS,
     JOB_GONE,
     KIND_JOB,
     KIND_LOG,
     LOG_GONE,
-    LOG_IDLE,
-    LOG_WRITING,
+    LOG_PRESENT,
     WatchStore,
     apply_job_details,
     format_age,
@@ -83,7 +81,7 @@ class TestStore:
         poll cannot be navigated."""
         for name in ("a", "b", "c"):
             store.add(kind=KIND_LOG, target=f"/{name}.log", profile="p")
-        store.update(store.list(profile="p")[0].id, state=LOG_WRITING)
+        store.update(store.list(profile="p")[0].id, state=LOG_PRESENT)
         assert [w.target for w in store.list(profile="p")] == [
             "/a.log",
             "/b.log",
@@ -100,9 +98,9 @@ class TestStore:
         """"last write 4m ago" has to keep counting up when nothing happens."""
         watch = store.add(kind=KIND_LOG, target="/a.log", profile="p")
         store.update(
-            watch.id, state=LOG_WRITING, changed_at="2026-07-30T11:00:00+00:00"
+            watch.id, state=LOG_PRESENT, changed_at="2026-07-30T11:00:00+00:00"
         )
-        store.update(watch.id, state=LOG_WRITING)
+        store.update(watch.id, state=LOG_PRESENT)
         assert store.get(watch.id).changed_at == "2026-07-30T11:00:00+00:00"
 
     def test_unknown_kinds_are_refused(self, store):
@@ -132,17 +130,18 @@ class TestFormatting:
 
 
 class TestLogPolling:
-    def test_a_recently_written_log_is_writing(self, tmp_path):
+    def test_a_log_that_exists_reports_its_size_and_last_write(self, tmp_path):
         state, head, changed = log_fields(touch(tmp_path / "s.log", age_s=5), now=NOW)
-        assert state == LOG_WRITING
+        assert state == LOG_PRESENT
         assert head == "1 B"
         assert changed.startswith("2026-07-30T11:59:55")
 
-    def test_a_log_nothing_has_touched_for_a_while_is_idle(self, tmp_path):
-        state, _, _ = log_fields(
-            touch(tmp_path / "s.log", age_s=FRESH_SECONDS + 60), now=NOW
-        )
-        assert state == LOG_IDLE
+    def test_an_untouched_log_is_still_only_present(self, tmp_path):
+        """Age does not become a state. A job can be alive and not writing —
+        buffered output, a long compute phase — so the mtime cannot be read as
+        running-or-dead, and the box does not pretend otherwise."""
+        state, _, _ = log_fields(touch(tmp_path / "s.log", age_s=86_400), now=NOW)
+        assert state == LOG_PRESENT
 
     def test_a_missing_log_says_so_rather_than_raising(self, tmp_path):
         assert log_fields(tmp_path / "never.log", now=NOW)[0] == LOG_GONE
@@ -151,8 +150,8 @@ class TestLogPolling:
         log = touch(tmp_path / "s.log", age_s=5)
         watch = store.add(kind=KIND_LOG, target=str(log), profile="p")
         changes = poll_log_watches(store, [watch], now=NOW)
-        assert [c.new_state for c in changes] == [LOG_WRITING]
-        assert store.get(watch.id).state == LOG_WRITING
+        assert [c.new_state for c in changes] == [LOG_PRESENT]
+        assert store.get(watch.id).state == LOG_PRESENT
 
     def test_a_second_poll_with_nothing_new_reports_no_change(self, store, tmp_path):
         log = touch(tmp_path / "s.log", age_s=5)
@@ -161,15 +160,28 @@ class TestLogPolling:
         again = store.list(profile="p")
         assert poll_log_watches(store, again, now=NOW) == []
 
-    def test_the_moment_a_log_goes_quiet_is_a_reported_change(self, store, tmp_path):
-        """The signal the user is actually watching for: sniffles stopped."""
+    def test_a_log_going_quiet_is_not_a_change_at_all(self, store, tmp_path):
+        """It used to be: the box flipped writing → idle and toasted about it.
+
+        A log not being written to for a while is not an event. The box says
+        when the last write was and that number keeps climbing on its own; a
+        toast for it interrupts the user to tell them nothing happened.
+        """
         log = touch(tmp_path / "s.log", age_s=5)
         watch = store.add(kind=KIND_LOG, target=str(log), profile="p")
         poll_log_watches(store, [watch], now=NOW)
-        later = NOW + timedelta(seconds=FRESH_SECONDS + 30)
-        changes = poll_log_watches(store, store.list(profile="p"), now=later)
+        later = NOW + timedelta(days=1)
+        assert poll_log_watches(store, store.list(profile="p"), now=later) == []
+
+    def test_a_log_that_vanishes_is_still_a_change(self, store, tmp_path):
+        """The one thing a log poll can actually observe."""
+        log = touch(tmp_path / "s.log", age_s=5)
+        watch = store.add(kind=KIND_LOG, target=str(log), profile="p")
+        poll_log_watches(store, [watch], now=NOW)
+        log.unlink()
+        changes = poll_log_watches(store, store.list(profile="p"), now=NOW)
         assert [(c.old_state, c.new_state) for c in changes] == [
-            (LOG_WRITING, LOG_IDLE)
+            (LOG_PRESENT, LOG_GONE)
         ]
 
     def test_polling_ignores_job_watches(self, store):
@@ -267,15 +279,29 @@ class TestJobPolling:
 
 
 class TestBoxContents:
-    def test_a_live_log_box_says_how_long_ago_it_was_written(self, store, tmp_path):
+    def test_a_log_box_says_its_size_and_how_long_ago_it_was_written(
+        self, store, tmp_path
+    ):
         log = touch(tmp_path / "sniffles.log", age_s=12)
         watch = store.add(
             kind=KIND_LOG, target=str(log), label="sniffles", profile="p"
         )
         poll_log_watches(store, [watch], now=NOW)
         lines = watch_lines(store.get(watch.id), now=NOW)
-        assert lines[0].endswith("writing · 1 B")
+        # No state word: "writing"/"idle" were a claim about the job that the
+        # file's mtime cannot support. The last write is the whole message.
+        assert lines[0] == "○ 1 B"
         assert lines[1] == "last write 12s ago"
+
+    def test_a_stale_log_box_reads_the_same_but_for_the_clock(
+        self, store, tmp_path
+    ):
+        log = touch(tmp_path / "sniffles.log", age_s=90_000)
+        watch = store.add(kind=KIND_LOG, target=str(log), profile="p")
+        poll_log_watches(store, [watch], now=NOW)
+        lines = watch_lines(store.get(watch.id), now=NOW)
+        assert lines[0] == "○ 1 B"
+        assert lines[1].startswith("last write 1d")
 
     def test_a_box_is_two_lines_whatever_it_holds(self, store):
         watch = store.add(kind=KIND_JOB, target="7", profile="p")
@@ -297,16 +323,24 @@ class TestBoxContents:
         watch = store.add(kind=KIND_LOG, target="/data/deep/run.log", profile="p")
         assert watch.title == "run.log"
 
-    def test_state_picks_the_colour(self, store, tmp_path):
-        watch = store.add(
-            kind=KIND_LOG, target=str(touch(tmp_path / "a.log")), profile="p"
-        )
+    def test_a_log_is_never_coloured_as_live(self, store, tmp_path):
+        """Green would be the same unsupportable claim in another form."""
+        log = touch(tmp_path / "a.log")
+        watch = store.add(kind=KIND_LOG, target=str(log), profile="p")
         poll_log_watches(store, [watch], now=NOW)
-        assert watch_class(store.get(watch.id)) == "watch-live"
+        assert watch_class(store.get(watch.id)) == "watch-idle"
         poll_log_watches(
             store, store.list(profile="p"), now=NOW + timedelta(hours=1)
         )
         assert watch_class(store.get(watch.id)) == "watch-idle"
+
+    def test_a_vanished_log_is_coloured_dead(self, store, tmp_path):
+        log = touch(tmp_path / "a.log")
+        watch = store.add(kind=KIND_LOG, target=str(log), profile="p")
+        poll_log_watches(store, [watch], now=NOW)
+        log.unlink()
+        poll_log_watches(store, store.list(profile="p"), now=NOW)
+        assert watch_class(store.get(watch.id)) == "watch-dead"
 
 
 class TestPeek:

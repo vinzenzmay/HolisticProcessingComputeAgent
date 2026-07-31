@@ -68,7 +68,6 @@ from hpca.watches import (
     KIND_JOB,
     KIND_LOG,
     LOG_GONE,
-    LOG_IDLE,
     Watch,
     WatchStore,
     apply_job_details,
@@ -416,20 +415,17 @@ class Pollers:
             deps.emit(Notify(severity="warning", text=f"Log watch failed: {e}"))
             return
         for change in changes:
-            # Only the transitions the user is watching *for*. The first poll
-            # of a new watch moves it off "" into a state, which is not news.
-            if change.old_state and change.new_state in (LOG_IDLE, LOG_GONE):
+            # A vanished file is the only thing a log poll can report, and the
+            # only one worth interrupting for. There used to be a "no new
+            # output" toast as well; it fired whenever a log had simply not
+            # been written to for a while, which is not an event — the box
+            # already says when the last write was, and a job between log
+            # lines is not news.
+            if change.old_state and change.new_state == LOG_GONE:
                 deps.emit(
                     Notify(
                         severity="warning",
-                        text=(
-                            f"{change.watch.title}: "
-                            + (
-                                "the file is gone"
-                                if change.new_state == LOG_GONE
-                                else "no new output"
-                            )
-                        ),
+                        text=f"{change.watch.title}: the file is gone",
                     )
                 )
         if changes:
