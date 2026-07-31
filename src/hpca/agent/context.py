@@ -17,6 +17,7 @@ from hpca.skills import Skill
 from hpca.slurm import SlurmClient
 from hpca.symbols import SymbolIndex
 from hpca.trash import TrashManager
+from hpca.watches import WatchStore
 
 
 @dataclass
@@ -30,6 +31,8 @@ class ToolContext:
     slurm: SlurmClient | None = None
     jobs: JobStore | None = None
     job_log_dir: Path | None = None
+    # Logs and jobs pinned to the right column by the watch tools (§3.3).
+    watches: WatchStore | None = None
     llm: object | None = None  # for tools that run their own firewalled LLM call
     current_tool: str = ""  # set by the graph; names sub-agent calls in the log
     trash: TrashManager | None = None

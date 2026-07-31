@@ -152,6 +152,23 @@ MEMORY_GUIDANCE = (
 )
 
 
+# The tool schemas say what watch_log/watch_job do, not when they earn their
+# keep. Without this the model reports a job id and a log path in chat and
+# moves on, which leaves the user doing exactly the squeue-then-tail loop the
+# panel exists to end.
+WATCH_GUIDANCE = (
+    "The right-hand panel can pin things for the user to keep an eye on. "
+    "When you find a running job the user cares about, call watch_job with "
+    "its id; when you find the log a running tool is writing (a snakemake "
+    "run's log, a tool's own log file), call watch_log with its path. Both "
+    "give the user a live box — a job's Slurm state, a log's time since the "
+    "last write — so they can see at a glance whether the work is still "
+    "alive instead of asking you to check. Do this as soon as you have the "
+    "id or the path in hand, without being asked, and say that you did. "
+    "Watching costs the user nothing: they drop a box with one keypress."
+)
+
+
 SKILLS_GUIDANCE = (
     "The user has defined skills: written procedures for specific tasks. "
     "The list is kept out of this prompt to stay small — you are not shown "
@@ -187,6 +204,7 @@ def orchestrator_system_prompt(
     has_skills: bool = False,
     session_search: bool = False,
     memory_tool: bool = False,
+    watch_tools: bool = False,
 ) -> str:
     """System prompt for the orchestrator; the cacheable prompt *prefix*.
 
@@ -211,6 +229,8 @@ def orchestrator_system_prompt(
         SCRIPT_GUIDANCE,
         GROUNDED_ANSWERING_GUIDANCE,
     ]
+    if watch_tools:
+        parts.append(WATCH_GUIDANCE)
     if session_search:
         parts.append(SESSION_SEARCH_GUIDANCE)
     if memory_tool:

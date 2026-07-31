@@ -101,6 +101,28 @@ CREATE TABLE IF NOT EXISTS processes (
     -- would tell it the same thing twice.
     background INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS watches (
+    -- Things the user asked to keep an eye on: a log file, a Slurm job id.
+    -- Bound to a profile rather than a session — a watch describes the
+    -- machine, not the conversation. See hpca.watches.
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile TEXT NOT NULL DEFAULT '',
+    session_id TEXT NOT NULL DEFAULT '',   -- provenance: who registered it
+    kind TEXT NOT NULL,                    -- 'log' | 'job'
+    target TEXT NOT NULL,                  -- absolute path | Slurm job id
+    label TEXT NOT NULL DEFAULT '',
+    created_at TEXT,
+    state TEXT NOT NULL DEFAULT '',
+    -- The rendered halves of the panel box, filled by the poller.
+    head TEXT NOT NULL DEFAULT '',
+    detail TEXT NOT NULL DEFAULT '',
+    -- When the watched thing last moved (log mtime, job state change), not
+    -- when a poll noticed: the panel counts up from this.
+    changed_at TEXT NOT NULL DEFAULT '',
+    checked_at TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_watches_target
+    ON watches(profile, kind, target);
 CREATE TABLE IF NOT EXISTS command_usage (
     -- How often each slash command has been run, so the autocomplete menu can
     -- list the most-used first.

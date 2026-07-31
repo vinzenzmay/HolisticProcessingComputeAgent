@@ -225,7 +225,7 @@ class TestHistoryPersists:
                      f"2026-07-19T10:{i:02d}:00+00:00"),
                 )
             app._conn.commit()
-            app._process_signature = None
+            app._panel_keys = None
             await app.refresh_processes()
             await pilot.pause()
             labels = [
