@@ -9,6 +9,11 @@ default and ◆ thinking marking a backend that reasons before answering.
 offers "add llm to list (enter)" while the cursor is on a discovered endpoint,
 and "set default"/"toggle thinking mode"/"remove llm" only on a configured
 one; removal asks for confirmation.
+
+A scan that finds nothing reports itself differently depending on the right
+panel: a toast when a configured backend still answers (nothing *new* turned
+up), and the tunnel recipe in a window that waits for escape when none does —
+that text has to be retyped into a shell, so it must hold a selection.
 """
 
 from __future__ import annotations
@@ -38,6 +43,7 @@ from hpca.discover import (
 )
 from hpca.tui.backend_form import BackendFormScreen
 from hpca.tui.confirm_screen import ConfirmScreen
+from hpca.tui.inspect_screen import InspectScreen
 
 # Shown whenever thinking is switched on, because the setting looks like a
 # free upgrade and is not. Both numbers are measured on this site's backend.
@@ -138,6 +144,11 @@ class ManageLLMsScreen(Screen):
         super().__init__()
         self._discovered: list[DiscoveredBackend] = []
         self._reachable: dict[str, bool] = {}
+        # An empty scan means one of two very different things depending on
+        # whether anything in the catalog answers, so the verdict waits for
+        # the reachability probes even when the scan finishes first.
+        self._reachability_done = asyncio.Event()
+        self._help_pending = False
 
     def compose(self) -> ComposeResult:
         yield Static("Manage LLM backends", id="llm-title", classes="llm-panel-title")
@@ -236,21 +247,60 @@ class ManageLLMsScreen(Screen):
         self._set_status(
             f"scan finished: {len(discovered)} endpoint(s) found · F5 to rescan"
         )
-        # Nothing on localhost. On a workstation that means no tunnel yet —
-        # show how to create one (§4.6); node/port come from the manifests.
         if not discovered:
+            await self._report_empty_scan()
+
+    async def _report_empty_scan(self) -> None:
+        """Nothing on localhost — what that means depends on the right panel.
+
+        With a configured backend still answering, the scan simply turned up
+        nothing new and a toast says so. With none, this is the off-cluster
+        case (§4.6) and the user needs the tunnel recipe: that goes in a
+        window they can read at their own pace and select and copy from, not
+        a toast that dismisses itself and holds no selection.
+        """
+        await self._reachability_done.wait()  # the verdict reads the catalog
+        if not self.is_attached:
+            return  # screen was closed while the probes finished
+        if any(self._reachable.get(b.base_url) for b in self.app.settings.backends):
             self.app.notify(
-                offcluster_help(self.app.settings.endpoints.login_target()),
-                title="No LLM endpoints found",
-                timeout=30,
+                "Nothing new on localhost — the backends you already have are "
+                "on the right.",
+                title="No further LLM endpoints found",
             )
+            return
+        self._show_offcluster_help()
+
+    def _show_offcluster_help(self) -> None:
+        """Open the tunnel window — or park it until this screen is back on
+        top: a scan can finish while the add-backend form is open, and a modal
+        must not land on top of someone mid-typing."""
+        if self.app.screen is not self:
+            self._help_pending = True
+            return
+        self._help_pending = False
+        self.app.push_screen(
+            InspectScreen(
+                "No LLM endpoints found - [esc] closes",
+                offcluster_help(self.app.settings.endpoints.login_target()),
+            )
+        )
+
+    def on_screen_resume(self) -> None:
+        if self._help_pending:
+            self._show_offcluster_help()
 
     @work(group="llm-reach")
     async def reachability_worker(self) -> None:
-        for backend in list(self.app.settings.backends):
-            self._reachable[backend.base_url] = await is_reachable(
-                backend.base_url, api_key=backend.api_key
-            )
+        try:
+            for backend in list(self.app.settings.backends):
+                self._reachable[backend.base_url] = await is_reachable(
+                    backend.base_url, api_key=backend.api_key
+                )
+        finally:
+            # Even a cancelled or failed probe run has to release the scan:
+            # an unset event would leave _report_empty_scan waiting forever.
+            self._reachability_done.set()
         await self.refresh_configured()
 
     @work(group="llm-reprobe")

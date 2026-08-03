@@ -15,6 +15,7 @@ from hpca.tui import switch_llm as switch_module
 from hpca.tui.app import HpcaApp
 from hpca.tui.backend_form import BackendFormScreen
 from hpca.tui.confirm_screen import ConfirmScreen
+from hpca.tui.inspect_screen import InspectScreen
 from hpca.tui.manage_llms import ManageLLMsScreen
 from hpca.tui.switch_llm import SwitchLLMScreen
 
@@ -64,6 +65,22 @@ def fake_discovery(monkeypatch):
     monkeypatch.setattr(manage_module, "scan_local_ports", fake_scan)
     monkeypatch.setattr(manage_module, "is_reachable", fake_reachable)
     monkeypatch.setattr(switch_module, "is_reachable", fake_reachable)
+
+
+@pytest.fixture
+def empty_scan(monkeypatch):
+    """Nothing on localhost, and nothing configured answers either — what an
+    off-cluster workstation with no tunnel looks like."""
+
+    async def no_endpoints(*args, **kwargs):
+        return []
+
+    async def down(base_url, **kwargs):
+        return False
+
+    monkeypatch.setattr(manage_module, "scan_local_ports", no_endpoints)
+    monkeypatch.setattr(manage_module, "is_reachable", down)
+    monkeypatch.setattr(switch_module, "is_reachable", down)
 
 
 class TestQuitConfirm:
@@ -147,23 +164,98 @@ class TestManageScreen:
             assert any("ctx 192k" in t for t in labels)
             assert any("localhost:20001" in t for t in labels)
 
-    async def test_empty_scan_shows_tunnel_help(self, hpca_home, monkeypatch):
-        async def empty_scan(*args, **kwargs):
-            return []
+    async def test_empty_scan_shows_tunnel_help_in_a_readable_window(
+        self, hpca_home, empty_scan
+    ):
+        """Nothing configured and nothing found: the tunnel recipe is text the
+        user has to retype, so it opens in a window they can select and copy
+        from — and it stays there until they press escape."""
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40), notifications=True) as pilot:
+            await pilot.press("m")
+            manage = app.screen
+            await manage.workers.wait_for_complete()
+            for _ in range(8):  # worker -> push_screen -> mount -> render
+                await pilot.pause()
+            assert isinstance(app.screen, InspectScreen)
+            assert "ssh -fN" in app.screen.body_text()
+            assert not manage.query(Toast)  # not a toast: nothing to copy from
+            await pilot.press("escape")
+            await pilot.pause()
+            assert isinstance(app.screen, ManageLLMsScreen)
 
-        async def down(base_url, **kwargs):
-            return False
+    async def test_empty_scan_with_a_backend_up_says_no_further(
+        self, hpca_home, empty_scan, monkeypatch
+    ):
+        """The catalog already answers — the scan found nothing *new*, which is
+        a passing remark, not the off-cluster tunnel lecture."""
+        settings = Settings()
+        settings.backends = [
+            LLMBackend(model=QWEN.model, base_url=QWEN.base_url, max_model_len=192000)
+        ]
+        settings.save()
 
-        monkeypatch.setattr(manage_module, "scan_local_ports", empty_scan)
-        monkeypatch.setattr(manage_module, "is_reachable", down)
+        async def up(base_url, **kwargs):
+            return True
+
+        monkeypatch.setattr(manage_module, "is_reachable", up)
         app = HpcaApp(llm=FakeLLM())
         async with app.run_test(size=(120, 40), notifications=True) as pilot:
             await pilot.press("m")
             await app.screen.workers.wait_for_complete()
             for _ in range(8):  # notify -> call_later -> mount -> render
                 await pilot.pause()
+            assert isinstance(app.screen, ManageLLMsScreen)
             toasts = [str(toast.render()) for toast in app.screen.query(Toast)]
-            assert any("ssh -fN" in t for t in toasts)
+            assert any("No further LLM endpoints found" in t for t in toasts)
+            assert not any("ssh -fN" in t for t in toasts)
+
+    async def test_empty_scan_with_every_backend_down_still_helps(
+        self, hpca_home, empty_scan, monkeypatch
+    ):
+        """A configured but unreachable catalog is exactly the off-cluster
+        case: the entries are there, the tunnel behind them is not."""
+        settings = Settings()
+        settings.backends = [
+            LLMBackend(model=QWEN.model, base_url=QWEN.base_url, max_model_len=192000)
+        ]
+        settings.save()
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40), notifications=True) as pilot:
+            await pilot.press("m")
+            await app.screen.workers.wait_for_complete()
+            for _ in range(8):
+                await pilot.pause()
+            assert isinstance(app.screen, InspectScreen)
+            assert "ssh -fN" in app.screen.body_text()
+
+    async def test_help_waits_for_the_form_the_user_opened(
+        self, hpca_home, empty_scan, monkeypatch
+    ):
+        """The scan can finish while (a) has the manual form open; the help
+        window waits for the form rather than landing on top of it."""
+        import asyncio
+
+        async def slow_empty_scan(*args, **kwargs):
+            await asyncio.sleep(0.4)  # long enough to open the form first
+            return []
+
+        monkeypatch.setattr(manage_module, "scan_local_ports", slow_empty_scan)
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40), notifications=True) as pilot:
+            await pilot.press("m")
+            manage = app.screen
+            manage.add_manually()  # form on top before the scan reports back
+            await pilot.pause()
+            assert isinstance(app.screen, BackendFormScreen)
+            await manage.workers.wait_for_complete()
+            for _ in range(8):
+                await pilot.pause()
+            assert isinstance(app.screen, BackendFormScreen)  # not interrupted
+            await pilot.press("escape")
+            for _ in range(8):
+                await pilot.pause()
+            assert isinstance(app.screen, InspectScreen)
 
     async def test_enter_on_left_configures_and_persists(
         self, hpca_home, fake_discovery
