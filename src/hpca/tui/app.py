@@ -1290,6 +1290,7 @@ class HpcaApp(App):
         # database, because it is what decides where the databases are.
         self._dbcache: DbCache | None = None
         self._syncing_db_cache = False
+        self._db_sync_incomplete = False
         self._saver_ctx = None
         # Event-loop lag, measured (specs-core-process.md §8). The case for
         # moving the agent into its own process is that synchronous work on
@@ -1427,6 +1428,8 @@ class HpcaApp(App):
         )
         if not cache.acquire() and self.settings.database.local_cache:
             self.notify(f"Databases: {cache.reason}", severity="warning")
+        for warning in cache.drain_warnings():
+            self.notify(f"Databases: {warning}", severity="warning")
         return cache
 
     async def _sync_db_cache(self) -> None:
@@ -1442,7 +1445,19 @@ class HpcaApp(App):
             return
         self._syncing_db_cache = True
         try:
-            await asyncio.to_thread(cache.sync)
+            complete = await asyncio.to_thread(cache.sync)
+            for warning in cache.drain_warnings():
+                self.notify(f"Databases: {warning}", severity="warning")
+            # Say it once when syncing starts failing, not on every tick: a
+            # database that cannot reach home for long means the app dir's
+            # copy is quietly falling behind, and dbcache.log alone proved
+            # too easy to miss.
+            if not complete and not self._db_sync_incomplete:
+                self.notify(
+                    "Database sync to home is failing; see dbcache.log",
+                    severity="warning",
+                )
+            self._db_sync_incomplete = not complete
         except Exception as e:
             self.notify(f"Database sync to home failed: {e}", severity="warning")
         finally:

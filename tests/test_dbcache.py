@@ -128,6 +128,51 @@ class TestCopyDatabase:
         copy_database(tmp_path / "src.db", tmp_path / "dst.db")
         assert not (tmp_path / "dst.db-wal").exists()
 
+    def test_a_failing_copy_leaves_the_destination_untouched(self, tmp_path):
+        # The copy lands in a temp file renamed over the destination only
+        # once complete — an interrupted sync must not tear the only other
+        # copy (seen in the field as a home file with its first page zeroed).
+        make_db(tmp_path / "dst.db", rows=("old",))
+        (tmp_path / "src.db").write_bytes(b"this is not a database")
+
+        with pytest.raises(sqlite3.DatabaseError):
+            copy_database(tmp_path / "src.db", tmp_path / "dst.db")
+
+        assert read_notes(tmp_path / "dst.db") == ["old"]
+        assert not list(tmp_path.glob("*.backup-tmp"))
+
+    def test_a_leftover_temp_file_does_not_block_the_copy(self, tmp_path):
+        # A hard kill mid-copy leaves the temp file behind; the next copy
+        # must replace it, not trip over it.
+        make_db(tmp_path / "src.db", rows=("a",))
+        (tmp_path / "dst.db.backup-tmp").write_bytes(b"half-written garbage")
+        copy_database(tmp_path / "src.db", tmp_path / "dst.db")
+        assert read_notes(tmp_path / "dst.db") == ["a"]
+
+    def test_a_corrupt_destination_is_quarantined_not_buried(self, tmp_path):
+        make_db(tmp_path / "src.db", rows=("fresh",))
+        (tmp_path / "dst.db").write_bytes(b"\x00" * 4096 + b"salvageable")
+
+        aside = copy_database(tmp_path / "src.db", tmp_path / "dst.db")
+
+        assert aside is not None and aside.name.startswith("dst.db.corrupt-")
+        assert aside.read_bytes() == b"\x00" * 4096 + b"salvageable"
+        assert read_notes(tmp_path / "dst.db") == ["fresh"]
+
+    def test_an_intact_destination_is_not_quarantined(self, tmp_path):
+        make_db(tmp_path / "src.db", rows=("new",))
+        make_db(tmp_path / "dst.db", rows=("old",))
+        assert copy_database(tmp_path / "src.db", tmp_path / "dst.db") is None
+        assert not list(tmp_path.glob("*.corrupt-*"))
+
+    def test_an_empty_destination_is_not_condemned(self, tmp_path):
+        # sqlite treats a zero-byte file as a database with no tables yet;
+        # only a non-empty file without the magic is evidence of corruption.
+        make_db(tmp_path / "src.db", rows=("a",))
+        (tmp_path / "dst.db").write_bytes(b"")
+        assert copy_database(tmp_path / "src.db", tmp_path / "dst.db") is None
+        assert not list(tmp_path.glob("*.corrupt-*"))
+
     def test_copies_sqlite_vec_virtual_tables(self, tmp_path):
         # rag.db holds vec0 tables; the backup API is page-level, so it does
         # not need the extension loaded on either connection.
@@ -539,3 +584,75 @@ def _orphan_the_lease(home) -> None:
     lease = json.loads((home / "db.lease").read_text())
     lease["pid"] = _dead_pid()
     (home / "db.lease").write_text(json.dumps(lease))
+
+
+def _torn(payload: bytes = b"leftover page data" * 200) -> bytes:
+    """What the field corruption looked like: exactly the first 4096-byte
+    page zeroed, every later page still carrying data."""
+    return b"\x00" * 4096 + payload
+
+
+class TestCorruptHomeCopy:
+    """A torn write on the network filesystem can destroy home's copy while
+    the local one stays good. That file used to block seed, recovery and
+    every sync-back at once ("file is not a database"); now it is moved
+    aside and life goes on."""
+
+    def test_recovery_replaces_it_with_the_surviving_local_copy(
+        self, home, local
+    ):
+        (home / "hpca.db").write_bytes(_torn())
+        make_db(local / "hpca.db", rows=("unsynced",))
+
+        cache = DbCache(home, local_dir=local)
+        assert cache.acquire() is True
+
+        assert read_notes(home / "hpca.db") == ["unsynced"]
+        assert list(home.glob("hpca.db.corrupt-*"))
+
+    def test_sync_back_replaces_it_with_the_local_copy(self, home, local):
+        make_db(home / "hpca.db", rows=("a",))
+        cache = DbCache(home, local_dir=local)
+        cache.acquire()
+        (home / "hpca.db").write_bytes(_torn())  # torn under a running app
+
+        conn = sqlite3.connect(cache.path_for("hpca.db"))
+        conn.execute("INSERT INTO notes (text) VALUES ('b')")
+        conn.commit()
+        conn.close()
+
+        assert cache.sync() is True
+        assert read_notes(home / "hpca.db") == ["a", "b"]
+
+    def test_seed_moves_it_aside_and_starts_afresh(self, home, local):
+        # No local copy survives to prefer, so there is nothing to seed
+        # from: the app starts this database empty, and the torn file is
+        # kept for offline recovery instead of blocking every later sync.
+        (home / "hpca.db").write_bytes(_torn())
+
+        cache = DbCache(home, local_dir=local)
+        assert cache.acquire() is True
+
+        assert not (local / "hpca.db").exists()
+        assert not (home / "hpca.db").exists()
+        assert list(home.glob("hpca.db.corrupt-*"))
+
+    def test_the_torn_bytes_are_kept_for_offline_recovery(self, home, local):
+        (home / "hpca.db").write_bytes(_torn(b"the old sessions"))
+        make_db(local / "hpca.db", rows=("unsynced",))
+
+        DbCache(home, local_dir=local).acquire()
+
+        (aside,) = home.glob("hpca.db.corrupt-*")
+        assert aside.read_bytes() == _torn(b"the old sessions")
+
+    def test_the_user_is_told_once(self, home, local):
+        (home / "hpca.db").write_bytes(_torn())
+        make_db(local / "hpca.db", rows=("unsynced",))
+
+        cache = DbCache(home, local_dir=local)
+        cache.acquire()
+
+        warnings = cache.drain_warnings()
+        assert any("hpca.db" in w and "corrupt" in w for w in warnings)
+        assert cache.drain_warnings() == []

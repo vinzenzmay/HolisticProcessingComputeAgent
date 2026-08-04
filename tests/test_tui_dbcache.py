@@ -368,3 +368,26 @@ def _dead_pid() -> int:
     child = subprocess.Popen([sys.executable, "-c", ""])
     child.wait()
     return child.pid
+
+
+class TestCorruptHomeCopy:
+    async def test_the_user_is_told_at_startup(self, home, local):
+        # A torn write destroyed home's copy (first page zeroed). The app
+        # must quarantine it, start the database afresh and say so as a
+        # toast — dbcache.log alone proved too easy to miss.
+        (home / "hpca.db").write_bytes(b"\x00" * 4096 + b"leftovers" * 100)
+        messages = []
+        app = HpcaApp(llm=FakeLLM())
+        original = HpcaApp.notify
+        app.notify = lambda message, **kw: (
+            messages.append(message),
+            original(app, message, **kw),
+        )[1]
+
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+
+        assert any("corrupt" in m for m in messages)
+        assert list(home.glob("hpca.db.corrupt-*"))
+        # The exit sync then writes a fresh, healthy copy under the old name.
+        sqlite3.connect(home / "hpca.db").execute("PRAGMA schema_version")
