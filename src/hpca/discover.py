@@ -31,6 +31,7 @@ LIKELY_PORTS = (
 TCP_TIMEOUT_S = 0.25
 PROBE_TIMEOUT_S = 2.0
 SCAN_CHUNK = 1024  # ports probed concurrently per batch
+RETRY_CHUNK = 8  # timed-out ports rechecked per batch, after the storm
 
 
 def ordered_ports(priority: list[int] = ()) -> list[int]:
@@ -166,12 +167,23 @@ async def probe_endpoint(
     return _parse_models(base_url, response)
 
 
-async def _port_open(host: str, port: int) -> bool:
+async def _port_open(host: str, port: int) -> bool | None:
+    """True: connected; False: refused/unreachable; None: timed out.
+
+    None is deliberately not False. A closed loopback port refuses
+    instantly, so a timeout usually means the connect *succeeded* but its
+    completion callback sat behind the chunk's own thousand-connect storm —
+    on a CPU-starved node that backlog alone exceeds TCP_TIMEOUT_S, and it
+    is precisely the live ports that pay it (refusals complete inline).
+    ``scan_local_ports`` rechecks None ports once the storm has drained.
+    """
     try:
         _, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port), timeout=TCP_TIMEOUT_S
         )
-    except (OSError, asyncio.TimeoutError):
+    except asyncio.TimeoutError:
+        return None
+    except OSError:
         return False
     writer.close()
     try:
@@ -205,6 +217,16 @@ async def scan_local_ports(
         chunk = port_list[start : start + SCAN_CHUNK]
         results = await asyncio.gather(*(_port_open(host, p) for p in chunk))
         open_ports = [p for p, is_open in zip(chunk, results) if is_open]
+        # Timed-out ports are rare (closed loopback ports refuse instantly)
+        # and suspicious (see _port_open): recheck them in small batches so
+        # each connect's callback is serviced well inside its own deadline.
+        unsure = [p for p, is_open in zip(chunk, results) if is_open is None]
+        for retry_start in range(0, len(unsure), RETRY_CHUNK):
+            batch = unsure[retry_start : retry_start + RETRY_CHUNK]
+            retried = await asyncio.gather(
+                *(_port_open(host, p) for p in batch)
+            )
+            open_ports.extend(p for p, is_open in zip(batch, retried) if is_open)
         for probe_results in await asyncio.gather(
             *(
                 probe_endpoint(f"http://{host}:{port}/v1", api_keys=api_keys)

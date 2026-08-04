@@ -221,6 +221,26 @@ class TestScanLocalPorts:
             for b in backends
         )
 
+    async def test_timed_out_port_is_rechecked(self, live_stub, monkeypatch):
+        # On a CPU-starved node the chunk's own connect storm delays the live
+        # port's completion past TCP_TIMEOUT_S while every closed port still
+        # refuses instantly — so it is precisely the live port that reads
+        # closed. The scan must treat that timeout as "unsure" and recheck it
+        # after the storm, not drop it.
+        real = discover._port_open
+        starved = []
+
+        async def starved_once(host, port):
+            if port == live_stub and not starved:
+                starved.append(port)
+                return None  # what the preflight yields when it times out
+            return await real(host, port)
+
+        monkeypatch.setattr(discover, "_port_open", starved_once)
+        backends = await scan_local_ports(range(live_stub - 3, live_stub + 4))
+        assert starved, "stub port never hit the simulated timeout"
+        assert any(str(live_stub) in b.base_url for b in backends)
+
     async def test_all_closed_is_empty(self):
         # ports 47-53 in the reserved low range are extremely unlikely bound
         assert await scan_local_ports(range(47, 53)) == []
@@ -333,8 +353,9 @@ class TestIncrementalDiscovery:
         # production 1024 the chunk holding the stub opens a thousand
         # concurrent connections, and with the suite running in parallel the
         # event loop cannot service them inside TCP_TIMEOUT_S: the stub's own
-        # connect times out and the scan reports nothing, failing on how busy
-        # the machine is rather than on the code.
+        # connect times out and the hit would only land via the timeout
+        # recheck, making the timing depend on how busy the machine is
+        # rather than on the code.
         monkeypatch.setattr(discover, "SCAN_CHUNK", 8)
         progress_calls = []
         found_at_progress: list[int] = []
