@@ -82,6 +82,28 @@ Every copy in both directions uses the **sqlite online-backup API**
 After each backup the destination gets `PRAGMA wal_checkpoint(TRUNCATE)` so the
 file left in home is standalone.
 
+The backup lands in a sibling temp file (`<name>.backup-tmp`) that is renamed
+over the destination only once complete. Backing up straight into the
+destination proved able to destroy it: an interrupted write on the network
+filesystem left a home copy with exactly its first page zeroed (BIH cluster,
+2026-08-04), and the backup API then refused that file in *both* directions
+("file is not a database") — one torn file blocked seed, recovery and every
+later sync-back at once. The rename is atomic, so the destination is only ever
+its old self or the finished copy.
+
+**Corrupt-file quarantine:** a file under a database's name that is non-empty
+but does not start with sqlite's 16-byte magic is moved aside to
+`<name>.corrupt-<timestamp>` rather than overwritten or trusted — the torn
+bytes stay recoverable offline (`.recover` can salvage rows from the intact
+later pages). This fires in two places: a corrupt sync/recovery *destination*
+is quarantined just before the fresh copy is renamed in; a corrupt seed
+*source* is quarantined so the app starts that database afresh instead of
+carrying the blockage through the whole run. Each quarantine logs an ERROR to
+`dbcache.log` and appends a one-line notice to `DbCache.warnings`, which the
+app drains into toasts (`drain_warnings()`) at startup and after each sync
+tick. An empty file is *not* condemned — sqlite treats it as a database with
+no tables yet.
+
 ### 2.4 Lifecycle
 
 **Startup** (`DbCache.acquire()`):
@@ -142,7 +164,12 @@ crash and never to data loss:
   `sync()` never raises: one unreadable database costs only its own copy, and
   an unwritable lease costs only the heartbeat. The log has a file handler and
   `propagate = False` — a TUI owns the terminal, and logging's last-resort
-  handler writes `WARNING`+ to stderr, which would shred the display;
+  handler writes `WARNING`+ to stderr, which would shred the display. The app
+  additionally toasts once when sync-back *starts* failing (and again if it
+  recovers and fails anew) — a home copy quietly falling behind for hours
+  proved too easy to miss in the log alone;
+- a corrupt home copy ⇒ quarantined to `<name>.corrupt-<timestamp>`, replaced
+  by the local copy (or started afresh if there is none), toasted (§2.3);
 - `settings.database.local_cache = false` ⇒ inactive, no lease, no copies.
 
 ## 3. Configuration

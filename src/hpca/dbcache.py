@@ -87,7 +87,51 @@ def local_dir_for(
     return base / f"hpca-{os.getuid()}-{digest}"
 
 
-def copy_database(src: Path, dst: Path) -> None:
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+def _is_sqlite(path: Path) -> bool:
+    """Whether ``path`` could be a sqlite database at all.
+
+    Empty counts as yes — sqlite treats a zero-byte file as a database with
+    no tables yet. Unreadable counts as yes too: failing to read the header
+    says nothing about the content, and quarantining must fire only on
+    evidence.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(16)
+    except OSError:
+        return True
+    return head == b"" or head == _SQLITE_MAGIC
+
+
+def quarantine_corrupt(path: Path) -> Path:
+    """Move a file that is not a sqlite database out of the database's name.
+
+    Renamed, not deleted: the corruption seen in the field zeroed exactly the
+    first page and left every later one intact, so the bytes are worth an
+    offline ``.recover``. The ERROR is deliberate — this is the moment a
+    database was found destroyed, and it must not read like routine sync
+    noise.
+    """
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    aside = path.with_name(f"{path.name}.corrupt-{stamp}")
+    n = 0
+    while aside.exists():
+        n += 1
+        aside = path.with_name(f"{path.name}.corrupt-{stamp}.{n}")
+    os.replace(path, aside)
+    logger.error(
+        "%s is not a sqlite database (torn write, or an uncoordinated "
+        "writer); moved it to %s so a fresh copy can take its place",
+        path,
+        aside,
+    )
+    return aside
+
+
+def copy_database(src: Path, dst: Path) -> Path | None:
     """Copy one sqlite database with the online-backup API.
 
     Not ``shutil.copy``: the backup API is page-level and transactionally
@@ -97,22 +141,43 @@ def copy_database(src: Path, dst: Path) -> None:
     ``-wal``/``-shm`` sidecars to copy along — and it carries ``rag.db``'s
     ``vec0`` virtual tables without the sqlite-vec extension being loaded,
     because it copies pages rather than rows.
+
+    The backup lands in a sibling temp file that is renamed over ``dst`` only
+    once complete. Backing up straight into ``dst`` proved able to destroy
+    it: an interrupted write on a network filesystem left a home copy with
+    its first page zeroed, and the backup API then refused that file in both
+    directions ("file is not a database") — one torn file blocked seed,
+    recovery and every later sync-back. The rename is atomic, so ``dst`` is
+    only ever its old self or the finished copy. If ``dst`` already is such
+    a torn file it is moved aside (see ``quarantine_corrupt``) rather than
+    silently buried under the fresh copy; the quarantined path is returned
+    so callers can tell the user.
     """
     src, dst = Path(src), Path(dst)
     if not src.exists():
         raise FileNotFoundError(src)
     dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.name + ".backup-tmp")
+    tmp.unlink(missing_ok=True)  # a killed copy may have left one behind
     source = sqlite3.connect(src)
     try:
-        target = sqlite3.connect(dst)
+        target = sqlite3.connect(tmp)
         try:
             source.backup(target)
             # Leave the destination standalone: another node may read it.
             target.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         finally:
             target.close()
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     finally:
         source.close()
+    quarantined = None
+    if dst.exists() and not _is_sqlite(dst):
+        quarantined = quarantine_corrupt(dst)
+    os.replace(tmp, dst)
+    return quarantined
 
 
 def _pid_alive(pid: int) -> bool:
@@ -203,6 +268,9 @@ class DbCache:
         self.active = False
         # Why local mode was declined, for the toast. Empty while it is on.
         self.reason = ""
+        # Things the user should be told, not just the log: today, that a
+        # corrupt home copy was quarantined. Drained by the app for toasts.
+        self.warnings: list[str] = []
         self._configured_dir = Path(local_dir) if local_dir is not None else None
         self._local: Path | None = None
         self._holds_lease = False
@@ -285,7 +353,12 @@ class DbCache:
                 if not src.exists():
                     continue
                 try:
-                    copy_database(src, self.home / name)
+                    aside = copy_database(src, self.home / name)
+                    if aside is not None:
+                        self.warnings.append(
+                            f"home copy of {name} was corrupt; moved it to "
+                            f"{aside.name} and synced a fresh copy"
+                        )
                 except Exception:
                     # One unreadable database must not cost the others their
                     # sync; the next tick tries again.
@@ -297,6 +370,17 @@ class DbCache:
                 logger.exception("could not refresh the lease heartbeat")
                 complete = False
             return complete
+
+    def drain_warnings(self) -> list[str]:
+        """Notices the user should see, cleared on read.
+
+        The log has the tracebacks; these are the one-line versions the app
+        can toast. Under the lock because ``sync()`` appends from a worker
+        thread while the UI drains.
+        """
+        with self._lock:
+            out, self.warnings = self.warnings, []
+            return out
 
     def release(self) -> None:
         """Final sync, then hand local mode back. Idempotent."""
@@ -331,9 +415,15 @@ class DbCache:
             if not src.exists():
                 continue
             try:
-                copy_database(src, self.home / name)
+                aside = copy_database(src, self.home / name)
                 recovered.add(name)
                 logger.info("recovered %s from %s", name, src)
+                if aside is not None:
+                    self.warnings.append(
+                        f"home copy of {name} was corrupt; moved it to "
+                        f"{aside.name} and recovered the local copy in its "
+                        f"place"
+                    )
             except Exception:
                 logger.exception("could not recover %s from %s", name, src)
         return recovered
@@ -352,6 +442,16 @@ class DbCache:
                 copy_database(src, self._local / name)
             except Exception:
                 logger.exception("could not seed %s from %s", name, src)
+                if not _is_sqlite(src):
+                    # The home copy itself is destroyed and there is no local
+                    # copy to prefer. Move it aside so the app can start this
+                    # database afresh — leaving it would also block every
+                    # sync-back for the rest of the run.
+                    aside = quarantine_corrupt(src)
+                    self.warnings.append(
+                        f"home copy of {name} is corrupt; moved it to "
+                        f"{aside.name} and starting this database afresh"
+                    )
 
     # ------------------------------------------------------------------ lease
 
