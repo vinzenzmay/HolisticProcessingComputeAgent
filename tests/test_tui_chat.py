@@ -431,6 +431,8 @@ class UsageLLM(FakeLLM):
         response.usage = {
             "prompt_tokens": self._prompt_tokens,
             "completion_tokens": 20,
+            # what LLMClient.chat always stamps: the request's wall clock
+            "request_seconds": 0.5,
         }
         return response
 
@@ -450,6 +452,18 @@ async def test_context_bar_reports_measured_usage(hpca_home):
         assert "8,000 / 32,000" in bar.text
         assert "(25%)" in bar.text
         assert "~" not in bar.text  # measured, so not marked as an estimate
+
+
+async def test_context_bar_shows_the_turn_speed(hpca_home):
+    """The same usage report that drives the meter carries the turn's speed:
+    completion tokens over the request wall clock (20 over 0.5s here)."""
+    from hpca.tui.context_bar import ContextBar
+
+    app = HpcaApp(llm=UsageLLM([respond_json("ok")], prompt_tokens=8000))
+    async with app.run_test(size=(120, 40)) as pilot:
+        await submit_chat(app, pilot, "hello")
+        bar = app.query_one("#context-bar", ContextBar)
+        assert "· 40 tok/s" in bar.text
 
 
 async def test_context_window_discovered_from_the_backend(hpca_home):

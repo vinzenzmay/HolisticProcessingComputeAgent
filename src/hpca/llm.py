@@ -16,6 +16,7 @@ Design notes for the small-model reality (§1):
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
@@ -152,10 +153,12 @@ class LLMClient:
             enable_thinking=enable_thinking,
             stream=False,
         )
+        started = time.perf_counter()
         try:
             response = await self._client.post("chat/completions", json=payload)
         except httpx.HTTPError as e:
             raise LLMError(f"LLM request failed: {e}") from e
+        elapsed = time.perf_counter() - started
         if response.status_code != 200:
             raise LLMError(
                 f"LLM request failed ({response.status_code}): {response.text[:500]}"
@@ -170,11 +173,18 @@ class LLMClient:
                 "Structured output truncated at max_tokens "
                 f"(model looped?): {message.get('content') or '':.120}"
             )
+        # "request_seconds" is ours, not the backend's: OpenAI-style bodies
+        # carry token counts but no timing, and without streaming the wall
+        # clock around the request is the only speed measurement there is.
+        # It rides in usage so the existing per-decision reporting (decide ->
+        # on_usage -> context bar, and the chat logs) carries it for free.
+        usage = dict(data.get("usage") or {})
+        usage["request_seconds"] = elapsed
         return ChatResponse(
             content=message.get("content") or "",
             reasoning=message.get("reasoning"),
             finish_reason=choice.get("finish_reason"),
-            usage=data.get("usage") or {},
+            usage=usage,
         )
 
     async def chat_stream(

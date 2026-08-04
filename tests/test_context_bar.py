@@ -98,3 +98,40 @@ class TestWidgetState:
         assert "window unknown" in bar.text
         bar.set_window(32_000)
         assert "8,000 / 32,000" in bar.text
+
+
+class TestSpeed:
+    def test_appended_to_the_measured_line(self):
+        bar = ContextBar()
+        bar.set_window(32_000)
+        bar.set_used(8_000)
+        bar.set_speed(28.07)
+        assert "· 28 tok/s" in bar.text
+
+    def test_slow_turns_keep_a_decimal(self):
+        # Sub-10 rates (a big model, a loaded backend) round to uselessness
+        # as integers; that is exactly where the decimal carries information.
+        bar = ContextBar()
+        bar.set_used(8_000)
+        bar.set_speed(3.14)
+        assert "3.1 tok/s" in bar.text
+
+    def test_waits_for_a_measured_fill(self):
+        # Before the first reply the line says so; a speed with no fill to
+        # hang off would imply a turn that never happened.
+        bar = ContextBar()
+        bar.set_window(32_000)
+        bar.set_speed(28.0)
+        assert "no reply yet" in bar.text
+        assert "tok/s" not in bar.text
+
+    def test_none_and_reset_both_clear_it(self):
+        bar = ContextBar()
+        bar.set_used(8_000)
+        bar.set_speed(28.0)
+        bar.set_speed(None)
+        assert "tok/s" not in bar.text
+        bar.set_speed(28.0)
+        bar.reset()
+        bar.set_used(8_000)
+        assert "tok/s" not in bar.text

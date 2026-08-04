@@ -108,6 +108,7 @@ class ContextBar(Static):
         self._window: int | None = None
         self._measured = False
         self._estimated = False
+        self._speed: float | None = None
         self._text = ""
 
     @property
@@ -138,12 +139,25 @@ class ContextBar(Static):
         self._estimated = True
         self._refresh()
 
+    def set_speed(self, tokens_per_s: float | None) -> None:
+        """Completion tokens over the last request's wall time; None clears.
+
+        Whole-request throughput, not the backend's decode rate: the wall
+        time includes prompt prefill and the network, so a long-context turn
+        with a short answer reads well below the backend's own eval rate.
+        Without streaming timing data that is the honest number for "how
+        fast are my turns", and its sag is itself informative — it is how a
+        filling window or a loaded backend becomes visible."""
+        self._speed = tokens_per_s
+        self._refresh()
+
     def reset(self) -> None:
         """A different session's context is a different number; showing the
         previous one until the next reply would be a lie."""
         self._used = 0
         self._measured = False
         self._estimated = False
+        self._speed = None
         self._refresh()
 
     def _refresh(self) -> None:
@@ -156,6 +170,14 @@ class ContextBar(Static):
                 self._used, self._window, estimated=self._estimated
             )
             level = severity(self._used, self._window)
+            if self._speed:
+                # One decimal only where it carries information (slow turns).
+                rate = (
+                    f"{self._speed:.1f}"
+                    if self._speed < 10
+                    else f"{self._speed:,.0f}"
+                )
+                self._text += f" · {rate} tok/s"
         self.update(Content(self._text))
         self.set_class(level == "warn", "context-warn")
         self.set_class(level == "danger", "context-danger")

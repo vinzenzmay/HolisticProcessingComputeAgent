@@ -56,6 +56,17 @@ class TestChat:
         assert seen["model"] == "test-model"
         assert seen["messages"] == [{"role": "user", "content": "hi"}]
 
+    async def test_usage_carries_request_timing(self):
+        # OpenAI-style bodies hold token counts but no timing, so the client
+        # stamps the request's wall clock into usage — the speed readout's
+        # only data source. The backend's own counts pass through untouched.
+        client = make_client(
+            lambda request: httpx.Response(200, json=completion_body())
+        )
+        response = await client.chat([{"role": "user", "content": "hi"}])
+        assert response.usage["completion_tokens"] == 2
+        assert response.usage["request_seconds"] > 0
+
 
     async def test_parses_response(self):
         def handler(request):

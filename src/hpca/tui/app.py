@@ -1275,6 +1275,10 @@ class HpcaApp(App):
         # to a session that ran off-screen shows its current fill, not a stale
         # zero or another session's count.
         self._context_used: dict[str, int] = {}
+        # Last decision's generation speed per session (completion tokens over
+        # request wall time) — kept alongside the context number and shown on
+        # the same bar, since both describe "the last model call".
+        self._turn_speed: dict[str, float] = {}
         self._refreshing_watchers = False
         # The right column's row keys as last painted; identical keys mean the
         # repaint can update text in place instead of rebuilding under the
@@ -3300,6 +3304,7 @@ class HpcaApp(App):
         # Stage-2 leftover: drop this session's stored context number, and any
         # live turn defensively, so nothing leaks past the delete.
         self._context_used.pop(session.session_id, None)
+        self._turn_speed.pop(session.session_id, None)
         self._turns.pop(session.session_id, None)
         self._drafts.pop(session.session_id, None)  # unsent text goes too
         self.session_store.delete(session.session_id)
@@ -4709,7 +4714,16 @@ class HpcaApp(App):
         visibly fills the bar as it works. The count is stored per session
         ALWAYS — a background turn silently updates its own number so switching
         to it later shows the current fill — but the visible meter moves only
-        when the reporting session is the one on screen (decision 9)."""
+        when the reporting session is the one on screen (decision 9).
+
+        The same report carries the turn's speed (completion tokens over the
+        request's wall clock, measured by our client since OpenAI-style
+        bodies hold no timing) — stored and displayed under the same
+        per-session rules."""
+        completion = usage.get("completion_tokens")
+        seconds = usage.get("request_seconds")
+        if completion and seconds:
+            self._turn_speed[session_id] = completion / seconds
         prompt_tokens = usage.get("prompt_tokens")
         if not prompt_tokens:
             return
@@ -4722,6 +4736,7 @@ class HpcaApp(App):
         bar = self._context_bar()
         if bar is not None:
             bar.set_used(int(prompt_tokens))
+            bar.set_speed(self._turn_speed.get(session_id))
 
     def _context_bar(self) -> ContextBar | None:
         found = self.query("#context-bar")
@@ -4742,6 +4757,12 @@ class HpcaApp(App):
         used = self._context_used.get(session_id) if session_id else None
         if used:
             bar.set_used(used)
+        # The speed always tracks the bound session (None clears): unlike the
+        # fill it has no estimate/reset dance to preserve, and a stale rate
+        # from the previously shown session would read as this one's.
+        bar.set_speed(
+            self._turn_speed.get(session_id) if session_id else None
+        )
 
     async def _discover_context_window(self) -> None:
         """Ask the backend how big its window is, and remember it.
