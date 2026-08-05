@@ -121,12 +121,15 @@ class TestPlanNotice:
         assert plan.connect is None
         assert "Qwen/Qwen3.6-35B-A3B-FP8" in plan.notice
         assert "API key" in plan.notice
-        assert "ctrl+l" in plan.notice
+        # (m), not ctrl+l: the endpoint was never added to the catalog, and
+        # ctrl+l only lists the catalog — it would be a dead end.
+        assert "(m)" in plan.notice
+        assert "ctrl+l" not in plan.notice
 
     def test_many_llms_notice_offers_picker(self):
         a, b = llm("A", 20001), llm("B", 20003)
         plan = plan_auto_connect(ClusterEndpoints([a, b], None))
-        assert plan.notice == "2 cluster LLMs discovered — ctrl+l to pick one"
+        assert plan.notice == "2 cluster LLMs discovered — press (m) to pick one"
 
     def test_preferred_miss_with_single_locked_still_notices(self):
         locked = llm("27B", 20003, needs_key=True)

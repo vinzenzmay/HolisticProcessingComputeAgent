@@ -6,6 +6,7 @@ import pytest
 from textual.widgets import Input, ListView
 from textual.widgets._toast import Toast
 
+from hpca.cluster_endpoints import ClusterEndpoints
 from hpca.config import LLMBackend, Settings
 from hpca.discover import DiscoveredBackend
 from hpca.llm import ChatResponse
@@ -65,6 +66,27 @@ def fake_discovery(monkeypatch):
     monkeypatch.setattr(manage_module, "scan_local_ports", fake_scan)
     monkeypatch.setattr(manage_module, "is_reachable", fake_reachable)
     monkeypatch.setattr(switch_module, "is_reachable", fake_reachable)
+
+
+# What a manifest declares: a named model on a compute node's own IP, behind a
+# key. No localhost scan can reach that address.
+CLUSTER_LOCKED = DiscoveredBackend(
+    base_url="http://172.16.33.208:20001/v1",
+    model="Qwen/Qwen3.6-35B-A3B-FP8",
+    max_model_len=128000,
+    needs_key=True,
+)
+
+
+@pytest.fixture
+def on_cluster(monkeypatch):
+    """Slurm present and one locked LLM in the endpoints dir."""
+
+    async def cluster(*args, **kwargs):
+        return ClusterEndpoints(llms=[CLUSTER_LOCKED], embedding=None)
+
+    monkeypatch.setattr(manage_module, "discover_cluster_endpoints", cluster)
+    monkeypatch.setattr(HpcaApp, "_detect_slurm", lambda self: object())
 
 
 @pytest.fixture
@@ -163,6 +185,61 @@ class TestManageScreen:
             assert any("Qwen/Qwen3.6-27B-FP8" in t for t in labels)
             assert any("ctx 192k" in t for t in labels)
             assert any("localhost:20001" in t for t in labels)
+
+    async def test_a_cluster_endpoint_reaches_the_left_panel(
+        self, hpca_home, empty_scan, on_cluster
+    ):
+        """The bug: startup announced a locked cluster LLM and then it existed
+        nowhere in the UI. It sits on a compute node's IP, so the localhost
+        scan cannot see it — the manifest pass has to put it on the left."""
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("m")
+            await app.screen.workers.wait_for_complete()
+            await pilot.pause()
+            left = app.screen.query_one("#llm-discovered", ListView)
+            labels = [str(item.query_one("Label").content) for item in left.children]
+            assert any(CLUSTER_LOCKED.model in t for t in labels)
+            assert any("172.16.33.208:20001" in t for t in labels)
+
+    async def test_a_cluster_hit_is_not_the_offcluster_case(
+        self, hpca_home, empty_scan, on_cluster
+    ):
+        """An empty localhost scan is normal ON the cluster — the endpoint is
+        reached directly. The tunnel lecture would be nonsense there."""
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40), notifications=True) as pilot:
+            await pilot.press("m")
+            await app.screen.workers.wait_for_complete()
+            for _ in range(8):
+                await pilot.pause()
+            assert isinstance(app.screen, ManageLLMsScreen)
+            assert not any(
+                "ssh -fN" in str(toast.render()) for toast in app.screen.query(Toast)
+            )
+
+    async def test_enter_on_a_locked_cluster_row_asks_for_the_key(
+        self, hpca_home, empty_scan, on_cluster
+    ):
+        """It cannot be saved as-is (no key), and the manifest already names the
+        model — so the form opens with the name filled in and only the key to
+        type."""
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("m")
+            await app.screen.workers.wait_for_complete()
+            await pilot.pause()
+            left = app.screen.query_one("#llm-discovered", ListView)
+            left.focus()
+            left.index = 0
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, BackendFormScreen)
+            assert (
+                app.screen.query_one("#backend-model", Input).value
+                == CLUSTER_LOCKED.model
+            )
+            assert app.settings.backends == []  # nothing saved without a key
 
     async def test_empty_scan_shows_tunnel_help_in_a_readable_window(
         self, hpca_home, empty_scan
