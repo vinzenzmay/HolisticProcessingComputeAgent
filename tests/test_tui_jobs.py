@@ -39,13 +39,29 @@ class FakeLLM:
 
 
 class FakeRun:
+    """Scripted sacct/squeue output, with the last answer left standing.
+
+    A running app polls jobs on its own 5s timer, so a test that also calls
+    poll_jobs by hand can see one more sacct call than it scripted — which
+    happens only when the steps before it take longer than the interval, i.e.
+    under load. Repeating the last response keeps that extra call from running
+    the script dry (poll_jobs swallows the IndexError as "polling failed" and
+    leaves the state untouched). An empty script still raises: a test that
+    scripts nothing means slurm is not supposed to be called at all.
+    """
+
     def __init__(self, responses):
         self.responses = list(responses)
         self.calls: list[list[str]] = []
+        self._last = None
 
     async def __call__(self, argv):
         self.calls.append(argv)
-        return self.responses.pop(0)
+        if self.responses:
+            self._last = self.responses.pop(0)
+        elif self._last is None:
+            raise IndexError(f"FakeRun: no scripted response for {argv}")
+        return self._last
 
 
 def respond_json(text="done"):
