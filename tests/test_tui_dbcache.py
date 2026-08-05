@@ -258,6 +258,21 @@ class TestLogging:
             fresh_dbcache_logger.error("probe")
         assert "probe" in (home / "dbcache.log").read_text()
 
+    async def test_a_first_run_creates_the_app_dir_it_logs_into(
+        self, monkeypatch, tmp_path, local, fresh_dbcache_logger
+    ):
+        # First launch on a fresh account: nothing has written settings yet, so
+        # the app dir does not exist — and this logger is the first thing
+        # startup touches. Opening a FileHandler under a missing directory took
+        # the app down before the UI existed.
+        virgin = tmp_path / "never-run"
+        monkeypatch.setenv("HPCA_HOME", str(virgin))
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            assert app.is_running
+        assert (virgin / "dbcache.log").exists()
+
 
 class TestFallback:
     async def test_disabled_setting_keeps_the_databases_in_home(self, home, local):
