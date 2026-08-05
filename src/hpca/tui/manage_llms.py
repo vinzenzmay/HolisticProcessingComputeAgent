@@ -195,18 +195,33 @@ class ManageLLMsScreen(Screen):
         the LLM role is listed — the embeddings server is auto-wired to RAG and
         is not a backend anyone picks. Best-effort like startup's auto-connect:
         a missing dir, a dead squeue or an unreachable node just means no rows,
-        never an error on top of the screen.
+        never an error on top of the screen — but never in silence either. An
+        empty left panel on a cluster node with servers running is exactly the
+        outcome that needs explaining, and autoconnect.log is where discovery
+        already writes the reason it dropped each manifest.
         """
+        # Imported here, not at module scope: app.py imports this module.
+        from hpca.tui.app import _autoconnect_logger
+
+        logger = _autoconnect_logger()
         try:
             slurm = getattr(self.app, "slurm", None)
-            if slurm is not None:
+            if slurm is None:
+                logger.info("manage-llms: no Slurm here — manifest pass skipped")
+            else:
                 endpoints = await discover_cluster_endpoints(
                     self.app.settings.endpoints.dir_path(),
                     slurm,
                     api_keys=self.app.settings.llm_api_keys,
                 )
                 self._cluster = list(endpoints.llms)
+                logger.info(
+                    "manage-llms: %d cluster LLM(s) for the left panel: %s",
+                    len(self._cluster),
+                    [b.model for b in self._cluster] or "none",
+                )
         except Exception:  # discovery must never break the screen
+            logger.exception("manage-llms: cluster discovery failed")
             self._cluster = []
         finally:
             # Even a failed pass has to release the verdict: an unset event

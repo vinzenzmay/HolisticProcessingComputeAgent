@@ -6,7 +6,9 @@ The MockTransport routes by request host:port so distinct endpoints answer
 differently; the fake slurm just returns a preset state dict or raises.
 """
 
+import getpass
 import json
+import logging
 
 import httpx
 import pytest
@@ -27,12 +29,16 @@ IP = "172.16.33.208"
 
 
 def write_manifest(dir_path, jobid, port, model, role="llm", **overrides):
-    """Write a manifest JSON at ``<jobid>-<port>.json`` and return its path."""
+    """Write a manifest JSON at ``<jobid>-<port>.json`` and return its path.
+
+    Owned by whoever runs the tests unless a test overrides ``user``: reaping
+    is now restricted to our own manifests, so "mine" is the default case.
+    """
     data = {
         "role": role,
         "model": model,
         "jobid": jobid,
-        "user": "mayv_c",
+        "user": getpass.getuser(),
         "node": "hpc-gpu-8",
         "ip": IP,
         "port": port,
@@ -44,6 +50,40 @@ def write_manifest(dir_path, jobid, port, model, role="llm", **overrides):
     path = dir_path / f"{jobid}-{port}.json"
     path.write_text(json.dumps(data))
     return path
+
+
+class _Capture(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.messages: list[str] = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.messages)
+
+
+@pytest.fixture
+def discovery_log():
+    """Capture ``hpca.autoconnect`` records straight off the logger.
+
+    Not caplog: the TUI attaches a file handler to this logger and turns
+    propagation off — process-wide and for good — so whether a record ever
+    reaches the root handler caplog listens on depends on which tests ran
+    first in this worker.
+    """
+    logger = logging.getLogger("hpca.autoconnect")
+    handler = _Capture()
+    level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        yield handler
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(level)
 
 
 def models_body(model_id, max_model_len=131072):
@@ -148,6 +188,30 @@ class TestReadManifests:
     def test_nonexistent_dir_is_empty(self, tmp_path):
         assert read_manifests(tmp_path / "nope") == []
 
+    def test_a_rejected_file_names_itself_and_the_field(
+        self, tmp_path, discovery_log
+    ):
+        """Three servers running and an empty left panel looked exactly like
+        "nothing launched" — the log has to separate "no files" from "files I
+        threw away", and say which field lost them."""
+        (tmp_path / "incomplete-2.json").write_text(
+            json.dumps({"role": "llm", "jobid": "9", "ip": IP, "port": 1})
+        )
+        assert read_manifests(tmp_path) == []
+        assert "incomplete-2.json" in discovery_log.text
+        assert "missing model" in discovery_log.text
+
+    def test_an_empty_dir_says_so_rather_than_blaming_a_file(
+        self, tmp_path, discovery_log
+    ):
+        assert read_manifests(tmp_path) == []
+        assert "holds no manifests" in discovery_log.text
+        assert "rejected" not in discovery_log.text
+
+    def test_a_missing_dir_is_not_an_empty_one(self, tmp_path, discovery_log):
+        assert read_manifests(tmp_path / "nope") == []
+        assert "no endpoints dir" in discovery_log.text
+
     def test_optional_defaults(self, tmp_path):
         (tmp_path / "min-3.json").write_text(
             json.dumps(
@@ -198,6 +262,31 @@ class TestDiscover:
             tmp_path, FakeSlurm({}), transport=make_transport({})
         )
         assert result.llms == []
+        assert not path.exists()
+
+    async def test_another_users_manifest_is_never_deleted(
+        self, tmp_path, discovery_log
+    ):
+        """The endpoints dir is shared. Reaping is only ever an optimisation —
+        an endpoint that does not answer is skipped anyway — so one bad squeue
+        reading must not be able to delete the group's discovery."""
+        path = write_manifest(
+            tmp_path, "GONE", 20001, "Model/M", user="someone_else"
+        )
+        result = await discover_cluster_endpoints(
+            tmp_path, FakeSlurm({}), transport=make_transport({})
+        )
+        assert result.llms == []  # still not surfaced: the job is gone
+        assert path.exists()
+        assert "skipping" in discovery_log.text
+
+    async def test_an_unowned_manifest_is_still_reapable(self, tmp_path):
+        # Written before manifests carried a user; nobody can claim it, and
+        # leaving it forever would be the old bug in reverse.
+        path = write_manifest(tmp_path, "GONE", 20001, "Model/M", user="")
+        await discover_cluster_endpoints(
+            tmp_path, FakeSlurm({}), transport=make_transport({})
+        )
         assert not path.exists()
 
     async def test_no_reap_keeps_file(self, tmp_path):

@@ -14,6 +14,7 @@ the property that lets the core stop caring which session is on screen.
 
 from __future__ import annotations
 
+import getpass
 import json
 import logging
 
@@ -116,11 +117,12 @@ class FakeSlurm:
 
 
 def write_manifest(dir_path, jobid, port, model, role="llm", **overrides):
+    # Owned by whoever runs the tests: only our own manifests are reapable.
     data = {
         "role": role,
         "model": model,
         "jobid": jobid,
-        "user": "mayv_c",
+        "user": getpass.getuser(),
         "node": "hpc-gpu-8",
         "ip": IP,
         "port": port,
