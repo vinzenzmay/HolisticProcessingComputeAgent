@@ -76,16 +76,21 @@ def plan_auto_connect(
 
     notice: str | None = None
     if connect is None:
+        # Both notices point at (m), not ctrl+l: ctrl+l switches the open
+        # session between backends already in the catalog, and a discovered
+        # endpoint we declined to connect to was never added to it. The
+        # manage-LLMs screen is the one that lists discoveries and can take a
+        # key for a locked one.
         if len(choices) > 1:
             notice = (
-                f"{len(choices)} cluster LLMs discovered — ctrl+l to pick one"
+                f"{len(choices)} cluster LLMs discovered — press (m) to pick one"
             )
         elif len(choices) == 1:
             # One LLM found but not connectable: it is key-locked and no pool
             # key unlocked it (a lone connectable one would have connected).
             notice = (
                 f"Found {choices[0].model} on the cluster — "
-                "it needs an API key (ctrl+l to add one)"
+                "it needs an API key (press (m) to add one)"
             )
 
     embedding_base_url = (

@@ -1,10 +1,16 @@
 """Manage-LLMs screen (m): discover, configure, and pick backend LLMs.
 
-Two columns: the left lists endpoints discovered by a localhost port scan
-(run when the screen opens — on this HPC setup every backend is an
-SSH-tunneled local port); the right lists the configured catalog from
-settings, each labeled ● connected / ○ disconnected, ★ marking the active
-default and ◆ thinking marking a backend that reasons before answering.
+Two columns: the left lists discovered endpoints, the right lists the
+configured catalog from settings, each labeled ● connected / ○ disconnected,
+★ marking the active default and ◆ thinking marking a backend that reasons
+before answering.
+
+Discovery runs two ways at once, because a backend can be reached two ways.
+On the cluster it is at its node's own ``ip:port`` and is declared by a
+manifest in the shared endpoints dir (§4.4) — no port scan can find that, so
+those are read and probed directly. Off the cluster the same server is an
+SSH-tunneled local port, which only a localhost scan finds. Both feed the same
+left panel; whichever finds nothing simply contributes nothing.
 ←/→ switch panels. Key bindings live on the panel widgets, so the footer only
 offers "add llm to list (enter)" while the cursor is on a discovered endpoint,
 and "set default"/"toggle thinking mode"/"remove llm" only on a configured
@@ -32,6 +38,7 @@ from textual.widgets import Footer, Label, ListItem, ListView, Static
 from urllib.parse import urlparse
 
 from hpca.autoconnect import offcluster_help
+from hpca.cluster_endpoints import discover_cluster_endpoints
 from hpca.config import LLMBackend
 from hpca.discover import (
     KEY_REQUIRED,
@@ -143,11 +150,19 @@ class ManageLLMsScreen(Screen):
     def __init__(self) -> None:
         super().__init__()
         self._discovered: list[DiscoveredBackend] = []
+        # Manifest-declared cluster endpoints, kept apart from the port-scan
+        # results: the two workers finish independently and the scan replaces
+        # its own list wholesale when it does.
+        self._cluster: list[DiscoveredBackend] = []
         self._reachable: dict[str, bool] = {}
         # An empty scan means one of two very different things depending on
         # whether anything in the catalog answers, so the verdict waits for
         # the reachability probes even when the scan finishes first.
         self._reachability_done = asyncio.Event()
+        # ...and the same for the cluster pass: "the scan found nothing" only
+        # means "off the cluster" once the manifest pass has had its say.
+        self._cluster_done = asyncio.Event()
+        self._scan_finished = False
         self._help_pending = False
 
     def compose(self) -> ComposeResult:
@@ -165,10 +180,43 @@ class ManageLLMsScreen(Screen):
     async def on_mount(self) -> None:
         await self.refresh_configured()
         self.query_one("#llm-discovered", ListView).focus()
+        self.cluster_worker()
         self.scan_worker()
         self.reachability_worker()
 
     # ------------------------------------------------------------ populate
+
+    @work(group="llm-cluster")
+    async def cluster_worker(self) -> None:
+        """Read the endpoints dir and probe what it declares (§4.4).
+
+        This is the only way a cluster endpoint reaches this screen: it lives
+        on a compute node's own IP, which the localhost scan cannot see. Only
+        the LLM role is listed — the embeddings server is auto-wired to RAG and
+        is not a backend anyone picks. Best-effort like startup's auto-connect:
+        a missing dir, a dead squeue or an unreachable node just means no rows,
+        never an error on top of the screen.
+        """
+        try:
+            slurm = getattr(self.app, "slurm", None)
+            if slurm is not None:
+                endpoints = await discover_cluster_endpoints(
+                    self.app.settings.endpoints.dir_path(),
+                    slurm,
+                    api_keys=self.app.settings.llm_api_keys,
+                )
+                self._cluster = list(endpoints.llms)
+        except Exception:  # discovery must never break the screen
+            self._cluster = []
+        finally:
+            # Even a failed pass has to release the verdict: an unset event
+            # would leave _report_empty_scan waiting forever.
+            self._cluster_done.set()
+        if not self.is_attached:
+            return
+        await self.refresh_discovered()
+        if self._scan_finished:  # the scan already printed its count
+            self._set_status(self._scan_summary())
 
     @work(thread=True, exclusive=True, group="llm-scan")
     def scan_worker(self) -> None:
@@ -241,27 +289,36 @@ class ManageLLMsScreen(Screen):
         if not self.is_attached:
             return  # screen was closed while the scan finished
         self._discovered = discovered
+        self._scan_finished = True
         await self.refresh_discovered()
         if self.app.settings.remember_llm_ports(b.base_url for b in discovered):
             self.app.settings.save()  # next scan starts with these ports
-        self._set_status(
-            f"scan finished: {len(discovered)} endpoint(s) found · F5 to rescan"
-        )
+        self._set_status(self._scan_summary())
         if not discovered:
             await self._report_empty_scan()
 
-    async def _report_empty_scan(self) -> None:
-        """Nothing on localhost — what that means depends on the right panel.
+    def _scan_summary(self) -> str:
+        return (
+            f"scan finished: {len(self._rows())} endpoint(s) found · F5 to rescan"
+        )
 
-        With a configured backend still answering, the scan simply turned up
+    async def _report_empty_scan(self) -> None:
+        """Nothing on localhost — what that means depends on the rest.
+
+        The manifest pass may still have found the cluster's own endpoints, in
+        which case nothing is wrong and there is nothing to say. Otherwise:
+        with a configured backend still answering, the scan simply turned up
         nothing new and a toast says so. With none, this is the off-cluster
         case (§4.6) and the user needs the tunnel recipe: that goes in a
         window they can read at their own pace and select and copy from, not
         a toast that dismisses itself and holds no selection.
         """
+        await self._cluster_done.wait()  # a cluster hit means nothing is wrong
         await self._reachability_done.wait()  # the verdict reads the catalog
         if not self.is_attached:
             return  # screen was closed while the probes finished
+        if self._cluster:
+            return
         if any(self._reachable.get(b.base_url) for b in self.app.settings.backends):
             self.app.notify(
                 "Nothing new on localhost — the backends you already have are "
@@ -338,12 +395,28 @@ class ManageLLMsScreen(Screen):
             for b in self.app.settings.backends
         )
 
+    def _rows(self) -> list[DiscoveredBackend]:
+        """Everything discovered, cluster first — a manifest-declared endpoint
+        is the one the user is meant to connect to, and it is named, where a
+        locked port-scan hit is an anonymous sentinel. Deduped on
+        (base_url, model): on a login node with a tunnel to the very server the
+        manifest names, both passes report the same row."""
+        rows: list[DiscoveredBackend] = []
+        seen: set[tuple[str, str]] = set()
+        for backend in [*self._cluster, *self._discovered]:
+            key = (backend.base_url, backend.model)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(backend)
+        return rows
+
     async def refresh_discovered(self) -> None:
         discovered_list = self.query_one("#llm-discovered", ListView)
         previous_index = discovered_list.index
         await discovered_list.clear()
         items = []
-        for backend in self._discovered:
+        for backend in self._rows():
             if self._is_configured(backend):
                 continue
             item = ListItem(Label(Content(backend.describe())))
@@ -393,8 +466,12 @@ class ManageLLMsScreen(Screen):
 
     async def action_rescan(self) -> None:
         self._discovered = []
+        self._cluster = []
+        self._cluster_done = asyncio.Event()
+        self._scan_finished = False
         await self.refresh_discovered()
         self._set_status("rescanning…")
+        self.cluster_worker()
         self.scan_worker()
 
     @on(ListView.Selected)
@@ -421,9 +498,15 @@ class ManageLLMsScreen(Screen):
         # A bare key-locked endpoint came through the scan as "(api key
         # required)" with no real model name — open the form to collect the key
         # (and let it auto-fill the model), rather than saving the placeholder.
+        # A cluster manifest, though, names the model behind the 401: prefill
+        # it, so the user only has to supply the key.
         if discovered.needs_key:
             self.app.push_screen(
-                BackendFormScreen(base_url=discovered.base_url, editable_url=False),
+                BackendFormScreen(
+                    base_url=discovered.base_url,
+                    model="" if discovered.model == KEY_REQUIRED else discovered.model,
+                    editable_url=False,
+                ),
                 self._on_backend_form,
             )
             return
@@ -452,15 +535,19 @@ class ManageLLMsScreen(Screen):
         learned_key = settings.remember_llm_key(backend.api_key)
         settings.save()
         self._reachable[backend.base_url] = True  # just probed, or user-asserted
-        # Save-time guard: drop any sentinel still sitting at this base_url so
+        # Save-time guard: drop any locked row still sitting at this base_url so
         # the just-configured endpoint can't be added again. The (base_url,
-        # model) dedup misses it because the sentinel model differs from the
-        # real one; this closes the force-save / bad-key path too.
-        self._discovered = [
-            b
-            for b in self._discovered
-            if not (b.model == KEY_REQUIRED and b.base_url == backend.base_url)
-        ]
+        # model) dedup misses it because the model it displayed — the KEY_REQUIRED
+        # sentinel from the scan, or the manifest's name for a cluster endpoint —
+        # can differ from what the form finally saved; this closes the
+        # force-save / bad-key path too.
+        def _superseded(b: DiscoveredBackend) -> bool:
+            return b.base_url == backend.base_url and (
+                b.model == KEY_REQUIRED or b.model == backend.model or b.needs_key
+            )
+
+        self._discovered = [b for b in self._discovered if not _superseded(b)]
+        self._cluster = [b for b in self._cluster if not _superseded(b)]
         await self.refresh_discovered()
         await self.refresh_configured()
         self.notify(f"Configured {backend.model}")

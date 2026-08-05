@@ -642,7 +642,7 @@ class TestAutoConnect:
             ),
         )
         await h.registry.auto_connect()
-        assert h.notices[-1].text == "2 cluster LLMs discovered — ctrl+l to pick one"
+        assert h.notices[-1].text == "2 cluster LLMs discovered — press (m) to pick one"
         assert h.settings.backends == []  # nothing joined the catalog
 
     async def test_a_locked_endpoint_asks_for_a_key(self, home, tmp_path):

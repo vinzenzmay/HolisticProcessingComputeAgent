@@ -183,9 +183,15 @@ def _file_logger(name: str, filename: str) -> logging.Logger:
     The handler is attached on first use (idempotent) and does not propagate:
     a TUI owns the terminal, so nothing may reach the root logger — whose
     last-resort handler writes to stderr and would shred the display.
+
+    The app dir is created here rather than assumed: on a first run nothing has
+    written settings yet, and these loggers are the first thing startup touches
+    — a missing dir used to take the app down with a FileNotFoundError before
+    the UI existed.
     """
     logger = logging.getLogger(name)
     if not any(isinstance(h, logging.FileHandler) for h in logger.handlers):
+        app_dir().mkdir(parents=True, exist_ok=True)
         handler = logging.FileHandler(app_dir() / filename)
         handler.setFormatter(
             logging.Formatter("%(asctime)s %(levelname)s %(message)s")
