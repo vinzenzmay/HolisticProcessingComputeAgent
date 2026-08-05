@@ -326,7 +326,12 @@ class TestMemoryScopeBudget:
 
     def test_endpoints_defaults(self):
         endpoints = Settings().endpoints
-        assert endpoints.endpoints_dir == "~/.hpca/endpoints"
+        # The shared group dir, so every HPCA on the cluster sees every
+        # endpoint without per-user configuration.
+        assert (
+            endpoints.endpoints_dir
+            == "/data/cephfs-1/work/groups/cubi/tools/hpca_connections"
+        )
         assert endpoints.preferred_models == []
         assert endpoints.login_host == "hpc-login-2.cubi.bihealth.org"
         assert endpoints.login_user is None
@@ -336,7 +341,13 @@ class TestEndpointsSettings:
     def test_dir_path_expands_user(self, monkeypatch):
         monkeypatch.setenv("HOME", "/home/someone")
         s = Settings()
+        s.endpoints.endpoints_dir = "~/.hpca/endpoints"
         assert str(s.endpoints.dir_path()) == "/home/someone/.hpca/endpoints"
+
+    def test_default_dir_path_is_the_shared_group_dir(self):
+        assert str(Settings().endpoints.dir_path()) == (
+            "/data/cephfs-1/work/groups/cubi/tools/hpca_connections"
+        )
 
     def test_dir_path_honors_override(self, tmp_path):
         s = Settings()

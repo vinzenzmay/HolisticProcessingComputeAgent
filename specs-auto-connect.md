@@ -102,10 +102,13 @@ These were tested live and are load-bearing assumptions:
 
 Each vLLM process writes one JSON file **once its real port is bound**:
 
-- **Location (single-user, now):** `~/.hpca/endpoints/`
-  **TODO (multi-user):** move to a group-readable path under
-  `/data/cephfs-1/work/groups/cubi/...` (`0750` dir / `0640` files). Make the
-  dir **configurable** (see §6).
+- **Location:** `/data/cephfs-1/work/groups/cubi/tools/hpca_connections`
+  — a **shared** group dir (`0755`, inside a group-only `tools/` parent), so
+  everyone's HPCA sees everyone's endpoints. Manifests are written `0644`;
+  only the dir owner can currently write, i.e. others *use* the servers but do
+  not publish their own (give the dir `3775` — setgid + sticky — if teammates
+  should host too). The path is configurable both ways: `endpoints_dir` in
+  settings (§6) and `$HPCA_ENDPOINTS_DIR` for the launch scripts.
 - **Filename / key:** `<jobid>-<port>.json`. The embeddings sidecar runs *inside*
   the 35B's job so it shares `$SLURM_JOB_ID`; the port disambiguates the two
   endpoints. (SLURM liveness still keys on `jobid`, so an LLM and its sidecar are
@@ -159,8 +162,8 @@ Surviving entries become backends (direct `ip:port` base URLs, no tunnel).
 - **Direct-first**, assuming on-cluster: connect straight to `ip:port` (short
   timeout, e.g. the existing `TCP_TIMEOUT_S = 0.25`). Verified to work from login
   and compute nodes.
-- **Off-cluster:** the manifest dir (a cluster/workstation path) is the
-  *workstation's* `~/.hpca`, which is empty — so this layer finds nothing and
+- **Off-cluster:** the manifest dir is a cephfs path that does not exist on the
+  workstation, so this layer finds nothing and
   **falls through to the existing `localhost` scan** (`scan_local_ports`), which
   picks up a tunnel the user has already created. If that too is empty, show the
   help message (§4.6).
@@ -200,7 +203,7 @@ Couldn't connect to a backend directly.
 On your workstation? Create a tunnel, then press 'r' to rescan.
 
   1. On the cluster, list running endpoints:
-       cat ~/.hpca/endpoints/*.json
+       cat /data/cephfs-1/work/groups/cubi/tools/hpca_connections/*.json
   2. From your workstation, forward BOTH the LLM and the embeddings server
      (they may be on different nodes) — one ssh, two -L forwards:
 
@@ -243,8 +246,10 @@ Suggested order; write tests first for each Python unit.
 
 ## 6. Config additions
 
-- `endpoints_dir: str` — manifest directory. Default `~/.hpca/endpoints`.
-  (Set to the cephfs group path for multi-user.)
+- `endpoints_dir: str` — manifest directory. Default
+  `/data/cephfs-1/work/groups/cubi/tools/hpca_connections` (the shared group
+  dir). Also names the dir in the off-cluster help text, so the command it
+  prints matches what this app reads.
 - `preferred_models: list[str]` — optional ordered model-id substrings for full
   auto-connect. Default `[]` (→ rule (c)).
 - Login-host + username for the off-cluster template (there may already be a
@@ -272,8 +277,15 @@ Suggested order; write tests first for each Python unit.
 
 ## 8. Open items / future
 
-- **Multi-user:** move `endpoints_dir` to a group-readable cephfs path; verify
-  perms so the JSONs are group-readable but the dir isn't world-writable.
+- ~~**Multi-user:** move `endpoints_dir` to a group-readable cephfs path.~~
+  **Done (2026-08-05, v0.15.0):** default is
+  `/data/cephfs-1/work/groups/cubi/tools/hpca_connections`, `0755` inside a
+  group-only parent; `write_manifest.sh` writes there (`$HPCA_ENDPOINTS_DIR`
+  overrides) and chmods each manifest `0644`. Still open underneath it:
+  **multi-user hosting** — the dir is not group-writable, so only its owner
+  can publish or reap manifests. Others' HPCA degrades cleanly (the reap
+  `unlink` is already `except OSError: pass`), but a teammate's own vLLM job
+  cannot announce itself until the dir gets `3775`.
 - **Embeddings availability:** with decision (i), RAG needs the 35B up. Revisit
   as (ii) co-locate-on-every-chat-model or (iii) standalone job if RAG must be
   available under any model. No downstream change required — the manifest already

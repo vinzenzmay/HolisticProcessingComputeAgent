@@ -282,7 +282,10 @@ class ManageLLMsScreen(Screen):
         self.app.push_screen(
             InspectScreen(
                 "No LLM endpoints found - [esc] closes",
-                offcluster_help(self.app.settings.endpoints.login_target()),
+                offcluster_help(
+                    self.app.settings.endpoints.login_target(),
+                    self.app.settings.endpoints.endpoints_dir,
+                ),
             )
         )
 
