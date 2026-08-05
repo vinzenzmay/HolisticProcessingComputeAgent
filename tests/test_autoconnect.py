@@ -139,12 +139,21 @@ class TestPlanNotice:
 
 class TestOffclusterHelp:
     def test_includes_login_target_and_ports(self):
-        msg = offcluster_help("mayv_c@hpc-login-2.cubi.bihealth.org")
+        msg = offcluster_help(
+            "mayv_c@hpc-login-2.cubi.bihealth.org", "/shared/hpca_connections"
+        )
         assert "mayv_c@hpc-login-2.cubi.bihealth.org" in msg
-        assert "~/.hpca/endpoints" in msg
         assert "20000" in msg  # the embeddings forward
         assert "ssh" in msg and "-L" in msg
 
+    def test_shows_the_configured_endpoints_dir(self):
+        # The dir is configurable, so the "list running endpoints" step must
+        # name the one this app actually reads, not a hard-coded path.
+        msg = offcluster_help("host", "/data/cephfs-1/work/groups/cubi/tools/eps")
+        assert "/data/cephfs-1/work/groups/cubi/tools/eps/*.json" in msg
+
     def test_bare_host_when_no_user(self):
-        msg = offcluster_help("hpc-login-2.cubi.bihealth.org")
+        msg = offcluster_help(
+            "hpc-login-2.cubi.bihealth.org", "/shared/hpca_connections"
+        )
         assert "hpc-login-2.cubi.bihealth.org" in msg

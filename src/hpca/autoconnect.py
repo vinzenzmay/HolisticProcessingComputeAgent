@@ -99,19 +99,20 @@ def plan_auto_connect(
     )
 
 
-def offcluster_help(login_target: str) -> str:
+def offcluster_help(login_target: str, endpoints_dir: str) -> str:
     """The generic tunnel template (§4.6) shown when nothing connects directly.
 
-    ``login_target`` is ``user@host`` (or bare ``host``). node/port stay
-    placeholders the user fills from the manifests — HPCA reads no remote files
-    and spawns no SSH.
+    ``login_target`` is ``user@host`` (or bare ``host``); ``endpoints_dir`` is
+    the configured manifest dir, named verbatim so the listed command matches
+    what this app actually reads. node/port stay placeholders the user fills
+    from the manifests — HPCA reads no remote files and spawns no SSH.
     """
     return (
         "Couldn't connect to a backend directly.\n"
         "On your workstation? Create a tunnel, then rescan.\n"
         "\n"
         "  1. On the cluster, list running endpoints:\n"
-        "       cat ~/.hpca/endpoints/*.json\n"
+        f"       cat {endpoints_dir}/*.json\n"
         "  2. From your workstation, forward BOTH the LLM and the embeddings\n"
         "     server (they may be on different nodes) — one ssh, two -L forwards:\n"
         "\n"

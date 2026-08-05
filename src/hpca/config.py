@@ -136,9 +136,16 @@ class EndpointsSettings(_Section):
     scripts) from ``endpoints_dir`` and connects directly. Off the cluster
     that dir is empty, so it falls through to the localhost scan and prints an
     SSH-tunnel template built from ``login_host``/``login_user``.
+
+    The default is the shared group directory: manifests written by anyone on
+    the team are visible to everyone's HPCA, so a user connects to a server
+    they did not launch without configuring anything. Job ids are unique
+    cluster-wide, so manifests from different users cannot collide. Point this
+    somewhere private (and set ``HPCA_ENDPOINTS_DIR`` for the launch scripts)
+    to opt out.
     """
 
-    endpoints_dir: str = "~/.hpca/endpoints"
+    endpoints_dir: str = "/data/cephfs-1/work/groups/cubi/tools/hpca_connections"
     # Optional ordered model-id substrings for full auto-connect to the top
     # available match; empty => the "auto if one, list if many" default.
     preferred_models: list[str] = []
