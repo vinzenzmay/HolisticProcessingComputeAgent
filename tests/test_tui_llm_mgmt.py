@@ -586,10 +586,20 @@ class TestIncrementalScanUI:
         self, hpca_home, monkeypatch
     ):
         import asyncio
+        import threading
+
+        # The sweep is held open by an event rather than a sleep: the point is
+        # that the panel fills WHILE the scan runs, so the scan must not be
+        # able to finish behind the assertions — a timed sleep raced a loaded
+        # box and let it. It must be a *threading* event: scan_worker is a
+        # thread worker running its own event loop, so an asyncio.Event
+        # belonging to this loop would never be woken there. The timeout is a
+        # backstop, so a broken test fails instead of wedging the suite.
+        finish_sweep = threading.Event()
 
         async def streaming_scan(*args, progress=None, on_found=None, **kwargs):
             on_found(QWEN)  # found early in the sweep
-            await asyncio.sleep(0.5)  # rest of the port range
+            await asyncio.to_thread(finish_sweep.wait, 30)  # rest of the range
             on_found(MINI)
             return [QWEN, MINI]
 
@@ -609,13 +619,20 @@ class TestIncrementalScanUI:
                     for w in app.screen.workers
                 )
 
-            for _ in range(50):  # wait for the early hit, max ~0.5s
-                await pilot.pause()
-                if len(left.children) > 0:
-                    break
-                await asyncio.sleep(0.01)
-            assert scan_running(), "scan should still be sweeping"
-            assert len(left.children) == 1  # QWEN visible before scan ends
+            # Bounded only against a hang; the scan is blocked either way, so a
+            # slow machine just takes more passes to render the early hit.
+            try:
+                for _ in range(500):
+                    await pilot.pause()
+                    if len(left.children) > 0:
+                        break
+                    await asyncio.sleep(0.01)
+                assert scan_running(), "scan should still be sweeping"
+                assert len(left.children) == 1  # QWEN visible before scan ends
+            finally:
+                # Release it even on failure: a held-open sweep would turn a
+                # readable assertion error into a hang at app teardown.
+                finish_sweep.set()
             await app.screen.workers.wait_for_complete()
             await pilot.pause()
             assert len(left.children) == 2
