@@ -311,13 +311,20 @@ class TestManageScreen:
     ):
         """The scan can finish while (a) has the manual form open; the help
         window waits for the form rather than landing on top of it."""
-        import asyncio
+        import threading
 
-        async def slow_empty_scan(*args, **kwargs):
-            await asyncio.sleep(0.4)  # long enough to open the form first
+        # The scan is held open by a gate rather than a sleep: "the form is up
+        # before the scan reports" is the whole point of the test, and on a
+        # loaded box a wall-clock margin loses that race and fails here. A
+        # threading gate, not an asyncio one — the scan runs in its own thread
+        # and its own event loop, so blocking it is what the real scan does.
+        reported = threading.Event()
+
+        async def gated_empty_scan(*args, **kwargs):
+            reported.wait()
             return []
 
-        monkeypatch.setattr(manage_module, "scan_local_ports", slow_empty_scan)
+        monkeypatch.setattr(manage_module, "scan_local_ports", gated_empty_scan)
         app = HpcaApp(llm=FakeLLM())
         async with app.run_test(size=(120, 40), notifications=True) as pilot:
             await pilot.press("m")
@@ -325,6 +332,7 @@ class TestManageScreen:
             manage.add_manually()  # form on top before the scan reports back
             await pilot.pause()
             assert isinstance(app.screen, BackendFormScreen)
+            reported.set()
             await manage.workers.wait_for_complete()
             for _ in range(8):
                 await pilot.pause()
