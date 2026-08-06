@@ -220,6 +220,48 @@ class TestTail:
         assert build_entries([USER_MSG, ANSWER], [], start=2) == []
 
 
+class TestIndex:
+    """Entries that ARE a thread message carry its index, so activating one in
+    the chat (rewind: fork / roll back) can name the exact cut point."""
+
+    def test_user_and_assistant_entries_carry_their_message_index(self):
+        entries = build_entries([USER_MSG, STEP, ANSWER, USER_MSG, ANSWER], [])
+        by_kind = [(e.kind, e.index) for e in entries]
+        assert ("user", 0) in by_kind
+        assert ("assistant", 2) in by_kind
+        assert ("user", 3) in by_kind
+        assert ("assistant", 4) in by_kind
+
+    def test_event_entries_carry_their_index_too(self):
+        event = {"role": "user", "content": "[process 3 exited] ok"}
+        entries = build_entries([USER_MSG, ANSWER, event], [])
+        assert (entries[2].kind, entries[2].index) == ("event", 2)
+
+    def test_synthetic_entries_carry_no_index(self):
+        # The thinking box folds several messages; recall rides its user
+        # message. Neither is one message, so neither names a cut point.
+        messages = [
+            {
+                "role": "user",
+                "content": "hi",
+                "api_content": "hi\n\n<memory-context>\nnote\n</memory-context>",
+            },
+            STEP,
+            ANSWER,
+        ]
+        entries = build_entries(messages, [])
+        assert [e.kind for e in entries] == ["user", "recall", "thinking", "assistant"]
+        assert entries[1].index == -1  # recall
+        assert entries[2].index == -1  # thinking
+
+    def test_a_tail_keeps_absolute_indices(self):
+        entries = build_entries([USER_MSG, ANSWER, USER_MSG, ANSWER], [], start=2)
+        assert [(e.kind, e.index) for e in entries] == [
+            ("user", 2),
+            ("assistant", 3),
+        ]
+
+
 class TestSummary:
     def test_summary_counts_steps_and_reasoning(self):
         entry = Entry(kind="thinking", text="", steps=2, reasoning_chars=1500)

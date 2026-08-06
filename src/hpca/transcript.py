@@ -85,6 +85,11 @@ class Entry:
     # thinking: the ordered parts, kept structured so an expanded box can show
     # each one as its own collapsible element (``text`` folds them for the log).
     parts: list[Step] = field(default_factory=list)
+    # The message index this entry IS (user/assistant/event), or -1 for
+    # entries that are not one thread message (thinking folds several, recall
+    # rides its user message, live rows predate the graph copy). What the chat
+    # rewind (fork / roll back) uses to name its cut point.
+    index: int = -1
 
     def summary(self) -> str:
         """One-line gist, for the collapsed box: only what is actually there."""
@@ -250,16 +255,16 @@ def build_entries(
             continue
         if role == ASSISTANT:
             flush()  # the answer closes the box that produced it
-            entries.append(Entry(kind=ASSISTANT, text=content))
+            entries.append(Entry(kind=ASSISTANT, text=content, index=index))
         elif is_tool_message(message):
             pending.append(Step(kind="step", text=content))
             steps += 1
         elif is_event_message(message):
             flush()
-            entries.append(Entry(kind=EVENT, text=content))
+            entries.append(Entry(kind=EVENT, text=content, index=index))
         else:
             flush()
-            entries.append(Entry(kind=USER, text=content))
+            entries.append(Entry(kind=USER, text=content, index=index))
             recalled = recalled_text(message)
             if recalled:
                 entries.append(Entry(kind=RECALL, text=recalled))

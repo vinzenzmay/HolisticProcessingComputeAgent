@@ -352,10 +352,11 @@ class TestRollback:
         assert "corrected" in sent
         assert "oops typo" not in sent
 
-    async def test_a_fold_reaching_past_the_rollback_is_pulled_back(self, tools):
+    async def test_a_fold_reaching_past_the_rollback_is_dropped(self, tools):
         """A rollback can cut away messages the summary already stands for.
-        The fold marker must come back with them, or the folded view starts
-        past the end of the history and swallows what is typed next."""
+        The fold goes with them: a summary of trimmed messages would reinject
+        exactly what the rollback removed (the messages it also covered are
+        still there raw, so nothing is lost — folding can be redone)."""
         from hpca.agent.graph import rollback_thread
 
         llm = FakeLLM([respond_json("answered"), "a summary", respond_json("ok")])
@@ -366,11 +367,148 @@ class TestRollback:
         values = (
             await graph.aget_state({"configurable": {"thread_id": "s1"}})
         ).values
-        assert values["compacted"]["upto"] == 1
+        assert values["compacted"] is None
         # and the next message is really seen by the model
         await run_turn(graph, session_id="s1", user_text="what now?")
         sent = [str(m["content"]) for m in llm.calls[-1]["messages"]]
         assert any("what now?" == m for m in sent)
+        # the summary of the trimmed turn is not
+        assert not any("a summary" in m for m in sent)
+
+    async def test_a_fold_short_of_the_rollback_is_kept(self, tools):
+        from hpca.agent.graph import rollback_thread
+
+        llm = FakeLLM(
+            [respond_json("a1"), "a summary", respond_json("a2")]
+        )
+        graph = make_graph(llm, tools)
+        await run_turn(graph, session_id="s1", user_text="q1")
+        await compact_now(graph, session_id="s1", llm=llm)  # upto == 2
+        await run_turn(graph, session_id="s1", user_text="q2")  # -> 4 messages
+        await rollback_thread(graph, session_id="s1", keep=2)
+        values = (
+            await graph.aget_state({"configurable": {"thread_id": "s1"}})
+        ).values
+        assert values["compacted"]["upto"] == 2  # untouched: it covers kept msgs
+
+    async def test_rollback_drops_thinking_and_calls_of_trimmed_messages(self, tools):
+        """Reasoning and call records are anchored by message index. Left in
+        place after a rollback they would re-attach to whatever future messages
+        take those indices, showing another turn's working under this one."""
+        from hpca.agent.graph import rollback_thread
+
+        llm = FakeLLM(
+            [
+                respond_json("a1"),  # turn one: plain answer
+                tool_json("echo", text="hi"),  # turn two: a call ...
+                respond_json("a2"),  # ... then the answer
+            ],
+            reasoning=["thinking one", "thinking two", "thinking three"],
+        )
+        graph = make_graph(llm, tools)
+        await run_turn(graph, session_id="s1", user_text="q1")  # msgs 0-1
+        await run_turn(graph, session_id="s1", user_text="q2")  # msgs 2-4
+
+        await rollback_thread(graph, session_id="s1", keep=2)
+        values = (
+            await graph.aget_state({"configurable": {"thread_id": "s1"}})
+        ).values
+        assert all(t["after"] < 2 for t in values["thinking"])
+        assert values["calls"] == []
+
+
+class TestFork:
+    """Rewind (§ chat rewind): copy a thread's first ``keep`` messages into a
+    fresh thread, so a conversation can branch from before the point it went
+    wrong while the original stays whole."""
+
+    async def _two_turns(self, tools):
+        llm = FakeLLM(
+            [
+                respond_json("a1"),
+                tool_json("echo", text="hi"),
+                respond_json("a2"),
+            ],
+            reasoning=["r1", "r2", "r3"],
+        )
+        graph = make_graph(llm, tools)
+        await run_turn(graph, session_id="src", user_text="q1")  # msgs 0-1
+        await run_turn(graph, session_id="src", user_text="q2")  # msgs 2-4
+        return graph, llm
+
+    async def test_fork_copies_the_first_keep_messages(self, tools):
+        from hpca.agent.graph import fork_thread, thread_message_count
+
+        graph, _ = await self._two_turns(tools)
+        copied = await fork_thread(
+            graph, source_session_id="src", target_session_id="dst", keep=2
+        )
+        assert [m["content"] for m in copied] == ["q1", "a1"]
+        assert await thread_message_count(graph, session_id="dst") == 2
+        # the source is untouched
+        assert await thread_message_count(graph, session_id="src") == 5
+
+    async def test_fork_trims_thinking_and_calls_to_the_cut(self, tools):
+        from hpca.agent.graph import fork_thread
+
+        graph, _ = await self._two_turns(tools)
+        await fork_thread(
+            graph, source_session_id="src", target_session_id="dst", keep=2
+        )
+        values = (
+            await graph.aget_state({"configurable": {"thread_id": "dst"}})
+        ).values
+        assert all(t["after"] < 2 for t in values.get("thinking", []))
+        assert values.get("calls", []) == []
+
+    async def test_the_fork_continues_independently(self, tools):
+        from hpca.agent.graph import fork_thread, thread_message_count
+
+        graph, llm = await self._two_turns(tools)
+        await fork_thread(
+            graph, source_session_id="src", target_session_id="dst", keep=2
+        )
+        llm._outputs.append(respond_json("branched"))
+        result = await run_turn(graph, session_id="dst", user_text="try again")
+        assert result.reply == "branched"
+        # the fork's model call saw the copied turn but not the trimmed one
+        sent = [str(m["content"]) for m in llm.calls[-1]["messages"]]
+        assert any("q1" == m for m in sent)
+        assert not any("q2" == m for m in sent)
+        # and the source did not grow
+        assert await thread_message_count(graph, session_id="src") == 5
+
+    async def test_a_fold_past_the_cut_is_not_copied(self, tools):
+        from hpca.agent.graph import fork_thread
+
+        llm = FakeLLM([respond_json("a1"), respond_json("a2"), "a summary"])
+        graph = make_graph(llm, tools)
+        await run_turn(graph, session_id="src", user_text="q1")
+        await run_turn(graph, session_id="src", user_text="q2")
+        await compact_now(graph, session_id="src", llm=llm)  # upto == 4
+        await fork_thread(
+            graph, source_session_id="src", target_session_id="dst", keep=2
+        )
+        values = (
+            await graph.aget_state({"configurable": {"thread_id": "dst"}})
+        ).values
+        assert not values.get("compacted")
+
+    async def test_a_fold_inside_the_cut_is_copied(self, tools):
+        from hpca.agent.graph import fork_thread
+
+        llm = FakeLLM([respond_json("a1"), "a summary", respond_json("a2")])
+        graph = make_graph(llm, tools)
+        await run_turn(graph, session_id="src", user_text="q1")
+        await compact_now(graph, session_id="src", llm=llm)  # upto == 2
+        await run_turn(graph, session_id="src", user_text="q2")
+        await fork_thread(
+            graph, source_session_id="src", target_session_id="dst", keep=2
+        )
+        values = (
+            await graph.aget_state({"configurable": {"thread_id": "dst"}})
+        ).values
+        assert values["compacted"]["upto"] == 2
 
 
 class TestDecisionFailure:

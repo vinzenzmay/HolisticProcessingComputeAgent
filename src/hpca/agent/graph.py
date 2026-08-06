@@ -571,27 +571,74 @@ async def thread_message_count(graph, *, session_id: str) -> int:
 
 
 async def rollback_thread(graph, *, session_id: str, keep: int) -> list[Message]:
-    """Drop everything a turn appended, keeping the first ``keep`` messages.
+    """Drop everything after the first ``keep`` messages.
 
-    Used when the user aborts a turn mid-flight (§ interrupt): the interrupted
-    user message and any partial tool traffic must leave the thread so the
-    re-edited prompt starts from a clean history. Returns the surviving
-    messages. Relies on the TRUNCATE_TO sentinel the messages reducer honours.
+    Two callers: aborting a turn mid-flight (§ interrupt), where the
+    interrupted user message and any partial tool traffic must leave the
+    thread so the re-edited prompt starts from a clean history — and the chat
+    rewind, where the user trims a conversation back to before it went wrong.
+    Returns the surviving messages. Relies on the TRUNCATE_TO sentinel the
+    reducers honour.
 
-    A fold that reached past ``keep`` is pulled back with the messages: the
-    compaction marker is an index into this list, and one left pointing beyond
-    its end would make the model's view (``[summary] + messages[upto:]``) skip
-    everything typed afterwards.
+    Reasoning and call records anchored to trimmed messages go with them:
+    anchors are message indices, so a stale one would re-attach to whatever
+    future message takes that index. They are appended in anchor order, which
+    is what lets a positional truncation express "every anchor past the cut".
+
+    A fold that reached past ``keep`` is dropped outright: its summary stands
+    (partly) for messages the rollback removed, and a view built from it would
+    reinject exactly what the user cut away. The messages it also covered are
+    still there raw, so nothing is lost — folding can be redone.
     """
     config = {"configurable": {"thread_id": session_id}}
     update: dict = {"messages": {TRUNCATE_TO: keep}}
-    before = await graph.aget_state(config)
-    compacted = (before.values or {}).get("compacted")
+    before = (await graph.aget_state(config)).values or {}
+    for key in ("thinking", "calls"):
+        anchored = before.get(key) or []
+        surviving = sum(1 for record in anchored if record["after"] < keep)
+        if surviving < len(anchored):
+            update[key] = {TRUNCATE_TO: surviving}
+    compacted = before.get("compacted")
     if compacted and compacted["upto"] > keep:
-        update["compacted"] = {**compacted, "upto": keep}
+        update["compacted"] = None
     await graph.aupdate_state(config, update)
     snapshot = await graph.aget_state(config)
     return list((snapshot.values or {}).get("messages", []))
+
+
+async def fork_thread(
+    graph, *, source_session_id: str, target_session_id: str, keep: int
+) -> list[Message]:
+    """Copy the first ``keep`` messages of one thread into a fresh one.
+
+    The chat rewind's non-destructive half: the fork branches from before the
+    point the conversation went wrong while the source stays whole. Values are
+    copied, not checkpoints — the target must be a thread nothing has written
+    to, so its reducers see the copy as the first append. Returns the copied
+    messages.
+
+    The same trimming rules as ``rollback_thread``: reasoning/call records
+    anchored past the cut stay behind, and a fold reaching past it is not
+    copied (its summary stands for messages the fork excludes). What is NOT
+    copied on purpose: the plan checklist (it encodes the direction being
+    branched away from) and the transient turn fields.
+    """
+    source = {"configurable": {"thread_id": source_session_id}}
+    values = (await graph.aget_state(source)).values or {}
+    kept = list(values.get("messages", []))[:keep]
+    update: dict = {
+        "messages": kept,
+        "thinking": [t for t in values.get("thinking") or [] if t["after"] < keep],
+        "calls": [c for c in values.get("calls") or [] if c["after"] < keep],
+    }
+    compacted = values.get("compacted")
+    if compacted and compacted["upto"] <= keep:
+        update["compacted"] = dict(compacted)
+    # As START, like every out-of-band write (see compact_now): no node
+    # produced it, and on a virgin thread there is no prior writer to infer.
+    target = {"configurable": {"thread_id": target_session_id}}
+    await graph.aupdate_state(target, update, as_node=START)
+    return kept
 
 
 async def run_turn(
