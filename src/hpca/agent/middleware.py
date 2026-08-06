@@ -6,23 +6,68 @@ construction and retries only handle semantic errors (unknown tool, invalid
 arguments); without it, a format instruction is appended and JSON parse errors
 are retried too. Every validation failure is fed back verbatim so the model
 can correct itself, a bounded number of times.
+
+Two things here defend against the same constrained-decoding artifact, which
+is worth stating once. Inside a JSON *string* every character is legal, so a
+grammar cannot reject anything the model writes there. A model part-way
+through a long ``list[str]`` that decides it is done with the array and starts
+on the next key emits ``"timeout_s: 60"`` as one more element instead: the
+array swallows the key, no error is raised anywhere, and the string surfaces
+as a line of the script (a real run_bash failure — ``line 98: timeout_s::
+command not found`` — after a ~100-line heredoc).
+
+So: **array-valued arguments come last in every tool's params model**, leaving
+no key for the model to reach for while it is still inside the array
+(``test_middleware.TestArgumentOrder`` enforces it); and ``_strip_key_echo``
+below removes such an element when one appears anyway.
+
+The second is not a belt for the first's braces. Measured against the live 27B
+backend after the reordering, a run_bash heredoc still produced a trailing
+``timeout_s:`` element in 1 of 4 generations — the model repeats the key at the
+end of the arguments out of habit, whether or not the grammar has one left to
+give it. Ordering lowers the rate; the strip is what makes it not matter.
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, get_args, get_origin
 
 from pydantic import BaseModel, ValidationError
 
 from hpca.agent.tools import Tool, ToolRegistry
-from hpca.llm import Message
+from hpca.llm import Message, TruncatedOutput
+
+logger = logging.getLogger("hpca.agent.middleware")
 
 DEFAULT_MAX_RETRIES = 3
 # Caps a runaway generation. Reasoning models spend this budget on thinking
 # before the JSON decision, so it is roomier than a decision alone needs.
+#
+# Measured on the live 27B at the default (thinking OFF, hpca.config), writing
+# a document through create_file: ~12 completion tokens per line — 500 for 35
+# lines, 2400 for 197 — so this holds a ~330-line file, and ~270 with thinking
+# turned on for a backend. That is past any specs.md worth writing in one
+# call, and a longer one now degrades into a split write rather than a dead
+# turn (see MAX_TRUNCATION_RETRIES). Raising it would only double how long a
+# genuinely looping generation hangs before anyone finds out — and loops are
+# not rare here: 1 of 4 run_bash generations in that same probe.
 MAX_DECISION_TOKENS = 4096
+# A cut-off decision is worth exactly one more try. Both causes are expensive
+# to retry — a looping model burns the whole cap again — and the second
+# attempt is told to write less, so a third would be the same answer twice.
+MAX_TRUNCATION_RETRIES = 1
+TRUNCATION_FEEDBACK = (
+    "[validation error] Your last call was cut off at the token limit before "
+    "it was finished, so nothing could be run. Make this one smaller. If you "
+    "were writing a file, write it in parts: call create_file with the first "
+    "part, then add each further part with edit_file — put the file's current "
+    "last line in old_lines, and that same line followed by the new lines in "
+    "new_lines. Do not simply send the same thing again."
+)
 
 
 class DecisionError(Exception):
@@ -45,6 +90,11 @@ class ToolCall:
     arguments: BaseModel
     reasoning: str = ""
     usage: dict = field(default_factory=dict)
+    # What had to be repaired to make this call valid (``_strip_key_echo``).
+    # Carried to the call record and the approval prompt: a silent repair is
+    # indistinguishable from a backend that never misbehaved, and the user
+    # approving a script has to be told a line was taken out of it.
+    repairs: list[str] = field(default_factory=list)
 
     async def execute(self, ctx: Any) -> str:
         return await self.tool.handler(self.arguments, ctx)
@@ -178,6 +228,61 @@ def _example_value(annotation: Any, description: str) -> Any:
     return f"<{description}>"
 
 
+# A trailing array element that is really the next argument: an optionally
+# quoted key, a colon, and a value. The value must be JSON — that is what the
+# model was mid-way through writing — which is what keeps prose out of range:
+# a heredoc ending on `name: the tool` does not match, `"name": "x"` does.
+_KEY_ECHO = re.compile(
+    r'^\s*"?(?P<key>[A-Za-z_][A-Za-z0-9_]*)"?\s*:\s*(?P<value>.*?),?\s*$'
+)
+
+
+def _is_echo(element: str, siblings: set[str]) -> str:
+    """The argument this element is an echo of, or "" if it is a real line."""
+    match = _KEY_ECHO.match(element)
+    if match is None or match["key"] not in siblings:
+        return ""
+    value = match["value"]
+    if value:
+        try:
+            json.loads(value)
+        except json.JSONDecodeError:
+            return ""  # `timeout_s: soon` is prose, not a swallowed argument
+    return match["key"]
+
+
+def _strip_key_echo(params: type[BaseModel], arguments: dict) -> list[str]:
+    """Drop trailing string-array elements that echo one of the *other*
+    arguments, in place. Returns one note per element dropped.
+
+    See the module docstring for what produces them. The check is deliberately
+    narrow — last element only, a sibling field's exact name, a JSON value, and
+    never the only element left — because the cost of a false positive is a
+    line quietly missing from a file the user asked for. Anything dropped is
+    reported rather than swallowed.
+    """
+    notes: list[str] = []
+    for name, field_info in params.model_fields.items():
+        if get_origin(field_info.annotation) is not list:
+            continue
+        value = arguments.get(name)
+        if not isinstance(value, list):
+            continue
+        siblings = set(params.model_fields) - {name}
+        while len(value) > 1 and isinstance(value[-1], str):
+            echoed = _is_echo(value[-1], siblings)
+            if not echoed:
+                break
+            dropped = value.pop()
+            notes.append(
+                f"dropped a trailing {name} element that echoed the "
+                f"{echoed} argument: {dropped!r}"
+            )
+    for note in notes:  # a repair is also how a backend regression shows up
+        logger.warning("%s: %s", params.__name__, note)
+    return notes
+
+
 def _parse(raw: str, tools: ToolRegistry) -> Decision:
     """Parse and validate one model output; raises ValueError with feedback text."""
     try:
@@ -200,13 +305,19 @@ def _parse(raw: str, tools: ToolRegistry) -> Decision:
             tool = tools.get(str(data.get("tool")))
         except KeyError as e:
             raise ValueError(str(e)) from e
+        raw_arguments = data.get("arguments") or {}
+        repairs = (
+            _strip_key_echo(tool.params, raw_arguments)
+            if isinstance(raw_arguments, dict)
+            else []
+        )
         try:
-            arguments = tool.params.model_validate(data.get("arguments") or {})
+            arguments = tool.params.model_validate(raw_arguments)
         except ValidationError as e:
             raise ValueError(
                 f"Invalid arguments for tool {tool.name!r}:\n{e}"
             ) from e
-        return ToolCall(tool=tool, arguments=arguments)
+        return ToolCall(tool=tool, arguments=arguments, repairs=repairs)
     raise ValueError(
         f'Unknown action {action!r}: use "respond" or "tool_call".'
     )
@@ -241,10 +352,24 @@ async def decide(
 
     attempts = max_retries + 1
     last_error = ""
+    truncations = 0
     for _ in range(attempts):
-        response = await llm.chat(
-            conversation, json_schema=schema, max_tokens=max_tokens
-        )
+        try:
+            response = await llm.chat(
+                conversation, json_schema=schema, max_tokens=max_tokens
+            )
+        except TruncatedOutput:
+            # Nothing came back to feed the model verbatim — the fragment is
+            # its own unfinished call — so the feedback says what happened and
+            # what to do instead, and rides the user role like every other
+            # retry (system messages are rejected after position 0).
+            if truncations >= MAX_TRUNCATION_RETRIES:
+                raise
+            truncations += 1
+            conversation = conversation + [
+                {"role": "user", "content": TRUNCATION_FEEDBACK}
+            ]
+            continue
         raw = response.content
         try:
             return _annotate(_parse(raw, tools), response)

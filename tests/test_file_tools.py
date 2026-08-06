@@ -3,7 +3,7 @@
 import pytest
 
 from hpca.agent.context import ToolContext
-from hpca.agent.file_tools import add_file_tools
+from hpca.agent.file_tools import add_file_tools, edit_preview
 from hpca.agent.tools import ToolRegistry
 from hpca.config import Settings
 from hpca.db import connect, init_db
@@ -31,13 +31,13 @@ def tools():
     return add_file_tools(ToolRegistry())
 
 
-async def call(tools, name, ctx, **kwargs):
-    tool = tools.get(name)
+async def call(tools, tool_name, ctx, **kwargs):
+    tool = tools.get(tool_name)
     return await tool.handler(tool.params.model_validate(kwargs), ctx)
 
 
-def gates(tools, name, ctx, **kwargs):
-    tool = tools.get(name)
+def gates(tools, tool_name, ctx, **kwargs):
+    tool = tools.get(tool_name)
     return tool.gates(tool.params.model_validate(kwargs), ctx)
 
 
@@ -224,8 +224,39 @@ class TestRestoreFile:
         f.write_text("something new")
         result = await call(tools, "restore_file", ctx, path=str(f))
         assert "already exists" in result
+        assert "move_file" in result  # the way out is named, not left to guess
         assert f.read_text() == "something new"
         assert ctx.trash.list()  # the backup is kept, not consumed
+
+    async def test_an_edit_is_undone_by_moving_aside_then_restoring(
+        self, tools, ctx, tmp_path
+    ):
+        # edit_file leaves the previous content in the trash under the *same*
+        # path, so a restore only becomes possible once the edited file is out
+        # of the way — and it has to be moved, not deleted: deleting it would
+        # trash it under that same path and become the newer entry.
+        f = tmp_path / "run.sh"
+        f.write_text("echo before\n")
+        ctx.registry.register("run_sh", f)
+        aside = tmp_path / "aside"
+        aside.mkdir()
+        ctx.registry.register("aside", aside)
+        await call(
+            tools,
+            "edit_file",
+            ctx,
+            registry_key="run_sh",
+            old_lines=["echo before"],
+            new_lines=["echo after"],
+        )
+        assert "already exists" in await call(tools, "restore_file", ctx, path=str(f))
+        await call(
+            tools, "move_file", ctx, source_key="run_sh", dest_dir_key="aside"
+        )
+        result = await call(tools, "restore_file", ctx, path=str(f))
+        assert "Restored" in result
+        assert f.read_text() == "echo before\n"
+        assert (aside / "run.sh").read_text() == "echo after\n"
 
     async def test_unbacked_deletion_reported_as_unrecoverable(
         self, tools, ctx, tmp_path
@@ -371,6 +402,311 @@ class TestCopyFile:
         assert "a.txt_copy" in result
 
 
+class TestEditFile:
+    """Replace an exact run of lines in place, without re-sending the file."""
+
+    @pytest.fixture
+    def script(self, ctx, tmp_path):
+        path = tmp_path / "run.sh"
+        path.write_text("#!/bin/bash\nset -euo pipefail\necho one\necho two\n")
+        ctx.registry.register("run_sh", path)
+        return path
+
+    async def test_replaces_the_matched_lines_and_leaves_the_rest(
+        self, tools, ctx, script
+    ):
+        result = await call(
+            tools,
+            "edit_file",
+            ctx,
+            registry_key="run_sh",
+            old_lines=["echo one"],
+            new_lines=["echo ONE", "echo one-and-a-half"],
+        )
+        assert script.read_text() == (
+            "#!/bin/bash\nset -euo pipefail\necho ONE\necho one-and-a-half\necho two\n"
+        )
+        assert "Edited" in result and str(script) in result
+
+    async def test_empty_new_lines_deletes_the_old_ones(self, tools, ctx, script):
+        result = await call(
+            tools,
+            "edit_file",
+            ctx,
+            registry_key="run_sh",
+            old_lines=["echo one"],
+            new_lines=[],
+        )
+        assert script.read_text() == "#!/bin/bash\nset -euo pipefail\necho two\n"
+        assert "1 line deleted" in result
+
+    async def test_a_multi_line_block_matches_across_lines(self, tools, ctx, script):
+        await call(
+            tools,
+            "edit_file",
+            ctx,
+            registry_key="run_sh",
+            old_lines=["echo one", "echo two"],
+            new_lines=["echo both"],
+        )
+        assert script.read_text() == "#!/bin/bash\nset -euo pipefail\necho both\n"
+
+    async def test_the_previous_content_goes_to_the_trash(self, tools, ctx, script):
+        await call(
+            tools,
+            "edit_file",
+            ctx,
+            registry_key="run_sh",
+            old_lines=["echo two"],
+            new_lines=["echo three"],
+        )
+        entries = ctx.trash.list()
+        assert [e.original_path for e in entries] == [script]
+        assert "echo two" in entries[0].trashed_path.read_text()
+        assert "echo three" in script.read_text()  # the file itself is the edited one
+
+    async def test_no_match_leaves_the_file_alone(self, tools, ctx, script):
+        before = script.read_text()
+        result = await call(
+            tools,
+            "edit_file",
+            ctx,
+            registry_key="run_sh",
+            old_lines=["echo nothing like this"],
+            new_lines=["echo x"],
+        )
+        assert "NOT edited" in result
+        assert script.read_text() == before
+        assert ctx.trash.list() == []  # nothing was overwritten, nothing backed up
+
+    async def test_no_match_points_at_a_line_that_does_occur(self, tools, ctx, script):
+        # The usual near-miss: right line, wrong indentation or trailing space.
+        result = await call(
+            tools,
+            "edit_file",
+            ctx,
+            registry_key="run_sh",
+            old_lines=["    echo one"],
+            new_lines=["echo x"],
+        )
+        assert "NOT edited" in result
+        assert "line 3" in result
+
+    async def test_an_ambiguous_match_is_refused(self, tools, ctx, tmp_path):
+        path = tmp_path / "twice.sh"
+        path.write_text("echo hi\necho mid\necho hi\n")
+        ctx.registry.register("twice", path)
+        result = await call(
+            tools,
+            "edit_file",
+            ctx,
+            registry_key="twice",
+            old_lines=["echo hi"],
+            new_lines=["echo bye"],
+        )
+        assert "NOT edited" in result and "2 times" in result
+        assert path.read_text() == "echo hi\necho mid\necho hi\n"
+
+    async def test_subpath_edits_a_file_inside_a_registered_directory(
+        self, tools, ctx, tmp_path
+    ):
+        d = tmp_path / "run"
+        d.mkdir()
+        (d / "conf.yaml").write_text("threads: 4\nmem: 8G\n")
+        ctx.registry.register("run_dir", d)
+        await call(
+            tools,
+            "edit_file",
+            ctx,
+            registry_key="run_dir",
+            subpath="conf.yaml",
+            old_lines=["threads: 4"],
+            new_lines=["threads: 16"],
+        )
+        assert (d / "conf.yaml").read_text() == "threads: 16\nmem: 8G\n"
+
+    async def test_a_directory_key_says_to_use_subpath(self, tools, ctx, tmp_path):
+        d = tmp_path / "run"
+        d.mkdir()
+        ctx.registry.register("run_dir", d)
+        result = await call(
+            tools,
+            "edit_file",
+            ctx,
+            registry_key="run_dir",
+            old_lines=["x"],
+            new_lines=["y"],
+        )
+        assert "NOT edited" in result and "subpath" in result
+
+    async def test_a_binary_file_is_refused(self, tools, ctx, tmp_path):
+        path = tmp_path / "data.bin"
+        path.write_bytes(b"\x00\x01\x82\xff binary")
+        ctx.registry.register("bin", path)
+        result = await call(
+            tools,
+            "edit_file",
+            ctx,
+            registry_key="bin",
+            old_lines=["x"],
+            new_lines=["y"],
+        )
+        assert "NOT edited" in result
+        assert path.read_bytes() == b"\x00\x01\x82\xff binary"
+
+    async def test_a_missing_subpath_is_a_useful_error(self, tools, ctx, tmp_path):
+        d = tmp_path / "run"
+        d.mkdir()
+        ctx.registry.register("run_dir", d)
+        result = await call(
+            tools,
+            "edit_file",
+            ctx,
+            registry_key="run_dir",
+            subpath="ghost.txt",
+            old_lines=["x"],
+            new_lines=["y"],
+        )
+        assert "No such path" in result
+
+    async def test_unknown_key_raises(self, tools, ctx):
+        with pytest.raises(UnknownKeyError):
+            await call(
+                tools,
+                "edit_file",
+                ctx,
+                registry_key="nope",
+                old_lines=["x"],
+                new_lines=["y"],
+            )
+
+
+class TestEditSyntaxGate:
+    """§5.2's mandatory gate must not be reachable around: an edit rewrites a
+    script's content exactly as create_script does."""
+
+    @pytest.fixture
+    def script(self, ctx, tmp_path):
+        path = tmp_path / "run.sh"
+        path.write_text("if true; then\n  echo ok\nfi\n")
+        ctx.registry.register("run_sh", path)
+        return path
+
+    async def test_an_edit_that_breaks_the_syntax_is_not_applied(
+        self, tools, ctx, script
+    ):
+        before = script.read_text()
+        result = await call(
+            tools,
+            "edit_file",
+            ctx,
+            registry_key="run_sh",
+            old_lines=["fi"],
+            new_lines=[],  # drops the closing fi
+        )
+        assert "NOT edited" in result
+        assert script.read_text() == before
+        assert ctx.trash.list() == []  # never overwritten, so never backed up
+
+    async def test_a_valid_edit_to_a_script_still_applies(self, tools, ctx, script):
+        result = await call(
+            tools,
+            "edit_file",
+            ctx,
+            registry_key="run_sh",
+            old_lines=["  echo ok"],
+            new_lines=["  echo fine"],
+        )
+        assert "Edited" in result
+        assert "echo fine" in script.read_text()
+
+    async def test_a_non_script_file_is_not_syntax_checked(self, tools, ctx, tmp_path):
+        # A dangling `if` is broken bash, but a .txt file is not bash and must
+        # not be held to bash's rules.
+        path = tmp_path / "notes.txt"
+        path.write_text("first\nsecond\n")
+        ctx.registry.register("notes", path)
+        await call(
+            tools,
+            "edit_file",
+            ctx,
+            registry_key="notes",
+            old_lines=["second"],
+            new_lines=["if true; then"],
+        )
+        assert path.read_text() == "first\nif true; then\n"
+
+
+class TestEditGating:
+    async def test_an_edit_gates_as_destructive(self, tools, ctx, tmp_path):
+        path = tmp_path / "run.sh"
+        path.write_text("echo one\n")
+        ctx.registry.register("run_sh", path)
+        assert gates(
+            tools,
+            "edit_file",
+            ctx,
+            registry_key="run_sh",
+            old_lines=["echo one"],
+            new_lines=["echo two"],
+        )
+
+    async def test_an_unresolvable_key_is_not_gated(self, tools, ctx):
+        # A dud call goes to the error-feedback loop, not to the user.
+        assert not gates(
+            tools, "edit_file", ctx, registry_key="nope", old_lines=["x"], new_lines=["y"]
+        )
+
+    async def test_the_description_shows_the_path_and_the_backup(
+        self, tools, ctx, tmp_path
+    ):
+        path = tmp_path / "run.sh"
+        path.write_text("echo one\n")
+        ctx.registry.register("run_sh", path)
+        tool = tools.get("edit_file")
+        text = tool.describe_call(
+            tool.params.model_validate(
+                {
+                    "registry_key": "run_sh",
+                    "old_lines": ["echo one"],
+                    "new_lines": ["echo two"],
+                }
+            ),
+            ctx,
+        )
+        assert str(path) in text
+        assert "trash" in text
+
+    async def test_the_description_warns_when_there_is_no_backup(
+        self, tools, ctx, tmp_path
+    ):
+        ctx.trash = TrashManager(tmp_path / "trash", backup_limit_bytes=2)
+        path = tmp_path / "big.txt"
+        path.write_text("many bytes here")
+        ctx.registry.register("big", path)
+        tool = tools.get("edit_file")
+        text = tool.describe_call(
+            tool.params.model_validate(
+                {"registry_key": "big", "old_lines": ["many"], "new_lines": ["few"]}
+            ),
+            ctx,
+        )
+        assert "NO BACKUP" in text
+
+
+class TestEditPreview:
+    """What the approval prompt and the chat call box show for one edit."""
+
+    def test_the_lines_are_shown_as_a_diff(self, ctx):
+        text = edit_preview(
+            {"old_lines": ["echo one", "echo two"], "new_lines": ["echo both"]}, ctx
+        )
+        assert text.splitlines() == ["- echo one", "- echo two", "+ echo both"]
+
+    def test_a_deletion_shows_only_removed_lines(self, ctx):
+        assert edit_preview({"old_lines": ["gone"], "new_lines": []}, ctx) == "- gone"
+
+
 class TestDescribeCall:
     async def test_delete_description_shows_resolved_path(self, tools, ctx, tmp_path):
         f = tmp_path / "x.txt"
@@ -418,3 +754,116 @@ class TestDescribeCall:
             ctx,
         )
         assert str(d / "old.log") in text
+
+
+class TestCreateFile:
+    """Writing a document — specs, a README, a config — without a shell.
+
+    Before this, ``create_script`` could only write into the scripts dir under
+    a language suffix and ``edit_file`` needs a file to already exist, so the
+    only way to author a markdown file was a `cat << 'EOF'` heredoc through
+    run_bash: a hundred lines of prose funnelled through bash quoting.
+    """
+
+    async def test_writes_the_lines_into_the_registered_directory(
+        self, tools, ctx, tmp_path
+    ):
+        ctx.registry.register("project", tmp_path)
+        await call(
+            tools, "create_file", ctx,
+            dir_key="project",
+            name="specs.md",
+            content_lines=["# locus-cutter", "", "## Why"],
+        )
+        assert (tmp_path / "specs.md").read_text() == "# locus-cutter\n\n## Why\n"
+
+    async def test_the_new_file_comes_back_with_a_key(self, tools, ctx, tmp_path):
+        ctx.registry.register("project", tmp_path)
+        result = await call(
+            tools, "create_file", ctx,
+            dir_key="project", name="specs.md", content_lines=["hi"],
+        )
+        keys = [key for key, path in ctx.registry.list().items()
+                if path == tmp_path / "specs.md"]
+        assert keys and keys[0] in result
+
+    async def test_an_existing_file_is_not_overwritten(self, tools, ctx, tmp_path):
+        ctx.registry.register("project", tmp_path)
+        (tmp_path / "specs.md").write_text("the real specs\n")
+        result = await call(
+            tools, "create_file", ctx,
+            dir_key="project", name="specs.md", content_lines=["junk"],
+        )
+        assert "NOT created" in result and "edit_file" in result
+        assert (tmp_path / "specs.md").read_text() == "the real specs\n"
+
+    async def test_a_subdirectory_is_created_on_the_way(self, tools, ctx, tmp_path):
+        ctx.registry.register("project", tmp_path)
+        await call(
+            tools, "create_file", ctx,
+            dir_key="project", name="docs/specs.md", content_lines=["hi"],
+        )
+        assert (tmp_path / "docs" / "specs.md").read_text() == "hi\n"
+
+    async def test_a_name_escaping_the_directory_is_refused(
+        self, tools, ctx, tmp_path
+    ):
+        target = tmp_path / "project"
+        target.mkdir()
+        ctx.registry.register("project", target)
+        result = await call(
+            tools, "create_file", ctx,
+            dir_key="project", name="../escaped.md", content_lines=["hi"],
+        )
+        assert "NOT created" in result
+        assert not (tmp_path / "escaped.md").exists()
+
+    async def test_an_absolute_name_is_refused(self, tools, ctx, tmp_path):
+        ctx.registry.register("project", tmp_path)
+        result = await call(
+            tools, "create_file", ctx,
+            dir_key="project", name="/tmp/escaped.md", content_lines=["hi"],
+        )
+        assert "NOT created" in result
+
+    async def test_a_file_key_is_not_a_directory(self, tools, ctx, tmp_path):
+        f = tmp_path / "reads.bam"
+        f.write_text("x")
+        ctx.registry.register("reads", f)
+        result = await call(
+            tools, "create_file", ctx,
+            dir_key="reads", name="specs.md", content_lines=["hi"],
+        )
+        assert "NOT created" in result and "directory" in result
+
+    async def test_a_script_faces_the_same_content_gate(self, tools, ctx, tmp_path):
+        # §5.2 is mandatory: a second way to put content into a script file
+        # must not be a second way around the syntax/docs gate.
+        ctx.registry.register("project", tmp_path)
+        result = await call(
+            tools, "create_file", ctx,
+            dir_key="project", name="qc.py", content_lines=["def broken(:"],
+        )
+        assert "NOT created" in result and "SyntaxError" in result
+        assert not (tmp_path / "qc.py").exists()
+
+    async def test_a_valid_script_is_written(self, tools, ctx, tmp_path):
+        ctx.registry.register("project", tmp_path)
+        result = await call(
+            tools, "create_file", ctx,
+            dir_key="project", name="qc.py", content_lines=["print('ok')"],
+        )
+        assert "NOT created" not in result
+        assert (tmp_path / "qc.py").read_text() == "print('ok')\n"
+
+    async def test_creating_a_file_is_not_a_destructive_call(
+        self, tools, ctx, tmp_path
+    ):
+        # It refuses to overwrite, so there is nothing for the §5.3 gate to
+        # protect — and a doc write that stops for approval is a doc write the
+        # agent stops doing.
+        ctx.registry.register("project", tmp_path)
+        assert not gates(
+            tools, "create_file", ctx,
+            dir_key="project", name="specs.md", content_lines=["hi"],
+        )

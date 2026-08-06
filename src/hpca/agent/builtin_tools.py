@@ -27,9 +27,10 @@ from __future__ import annotations
 import re
 import sys
 import time
+from pathlib import Path
 from typing import Callable, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from hpca.agent.context import ToolContext
 from hpca.agent.tools import Tool, ToolRegistry
@@ -38,10 +39,23 @@ from hpca.registry import RegistryError
 from hpca.verify_code import format_gate_failure, format_gate_warnings, verify_script
 
 SCRIPT_SUFFIX = {"bash": ".sh", "python": ".py", "R": ".R", "snakemake": ".smk"}
+# Which checker a file on disk answers to, read off its suffix — how edit_file
+# decides whether the content it is about to write is a script §5.2 must gate.
+# Anything else (.txt, .yaml, .csv) has no checker and is left to itself.
+KIND_BY_SUFFIX = {suffix: kind for kind, suffix in SCRIPT_SUFFIX.items()}
 RUN_TIMEOUT_DEFAULT = 60
 RUN_TIMEOUT_MAX = 600
 RUN_OUTPUT_LINES = 60  # per stream, before the model is pointed at the log
 RUN_OUTPUT_CHARS = 4000
+# The same bound, applied to what goes *in*. run_bash always accepted a script
+# of any size, and what the live model does with that is not write a longer
+# look-around: asked for a design document with only run_bash available, it
+# put all 5-8k characters of it into ONE array element — the long-string case
+# `content_lines` exists to avoid — and nothing checked it beyond `bash -n`,
+# because run_bash skips §5.2's code-vs-docs gate that create_script faces.
+# 2000 characters is several times the longest genuine look-around (twenty
+# bounded finds is ~1200) and far below any document.
+RUN_SCRIPT_MAX_CHARS = 2000
 INTERPRETER = {
     ".sh": ["bash"],
     ".py": [sys.executable],
@@ -135,6 +149,51 @@ def _strict_bash(lines: list[str]) -> list[str]:
     return [strict, *lines]
 
 
+async def check_script_content(
+    kind: str, path: Path, content: str, ctx: ToolContext, *, refusal: str
+) -> tuple[str, list[str]]:
+    """§5.2's mandatory gate on one script's content: the syntax check first,
+    then the semantic code-vs-docs check against the indexed symbols.
+
+    Returns the model-facing refusal (empty when the content passes) and the
+    warnings a successful result should carry. ``path`` must already hold
+    ``content`` — the checkers read the file — and what happens to it either
+    way is the caller's: create_script unlinks a script it will not keep,
+    edit_file checks a scratch copy so the real file is never left broken.
+
+    Shared rather than duplicated because the gate is what makes §5.2
+    *mandatory*: a second way to put content into a script file would be a
+    second way around it.
+    """
+    check = await syntax_check(kind, path)
+    if not check.ok:
+        return (
+            f"{refusal}: {check.checker} found syntax errors — fix them and "
+            f"try again:\n{check.errors}"
+        ), []
+    warnings: list[str] = []
+    if check.skipped:
+        warnings.append(check.errors)
+    if ctx.symbols is not None:
+        # Learn the flags of the external programs this script drives before
+        # judging it. Without this the gate below has nothing to check for
+        # exactly the tools that matter (minimap2, samtools, ...), because
+        # index_docs is explicit-only and nothing ever calls it (§5.2, §5.6).
+        from hpca.agent.doc_tools import autoindex_script_commands
+
+        await autoindex_script_commands(kind, content, ctx)
+    if ctx.symbols is not None and ctx.symbols.count() > 0:
+        # semantic code-vs-docs gate (§5.2): mismatches block, gaps only warn
+        reports = verify_script(kind, content, index=ctx.symbols)
+        mismatches = [r for r in reports if r.status == "mismatch"]
+        if mismatches:
+            return format_gate_failure(mismatches, refusal=refusal), []
+        not_indexed = [r for r in reports if r.status == "not_indexed"]
+        if not_indexed:
+            warnings.append(format_gate_warnings(not_indexed))
+    return "", warnings
+
+
 async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
     ctx.scripts_dir.mkdir(parents=True, exist_ok=True)
     path = ctx.scripts_dir / f"{args.registry_key}{SCRIPT_SUFFIX[args.kind]}"
@@ -157,34 +216,12 @@ async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
         lines = _strict_bash(lines)
     content = "\n".join(lines) + "\n"
     path.write_text(content)
-    check = await syntax_check(args.kind, path)
-    if not check.ok:
-        path.unlink(missing_ok=True)
-        return (
-            f"Script NOT created: {check.checker} found syntax errors — fix "
-            f"the script and call create_script again:\n{check.errors}"
-        )
-    warnings: list[str] = []
-    if check.skipped:
-        warnings.append(check.errors)
-    if ctx.symbols is not None:
-        # Learn the flags of the external programs this script drives before
-        # judging it. Without this the gate below has nothing to check for
-        # exactly the tools that matter (minimap2, samtools, ...), because
-        # index_docs is explicit-only and nothing ever calls it (§5.2, §5.6).
-        from hpca.agent.doc_tools import autoindex_script_commands
-
-        await autoindex_script_commands(args.kind, content, ctx)
-    if ctx.symbols is not None and ctx.symbols.count() > 0:
-        # semantic code-vs-docs gate (§5.2): mismatches block, gaps only warn
-        reports = verify_script(args.kind, content, index=ctx.symbols)
-        mismatches = [r for r in reports if r.status == "mismatch"]
-        if mismatches:
-            path.unlink(missing_ok=True)
-            return format_gate_failure(mismatches)
-        not_indexed = [r for r in reports if r.status == "not_indexed"]
-        if not_indexed:
-            warnings.append(format_gate_warnings(not_indexed))
+    refused, warnings = await check_script_content(
+        args.kind, path, content, ctx, refusal="Script NOT created"
+    )
+    if refused:
+        path.unlink(missing_ok=True)  # never keep a script that failed the gate
+        return refused
     ctx.registry.register(args.registry_key, path)
     note = f" ({'; '.join(warnings)})" if warnings else ""
     strict = (
@@ -306,18 +343,53 @@ async def start_background_script(
 
 
 class RunBashParams(BaseModel):
-    # An array of lines, not one string: the live model reliably fills string
-    # arrays but mangles \n escapes in long strings under guided decoding.
-    content_lines: list[str] = Field(
-        min_length=1,
-        description="Bash script content as an array of lines, one per line",
-    )
+    # timeout_s before the lines, because nothing may follow a long array —
+    # see the argument-order rule in hpca.agent.middleware.
     timeout_s: int = Field(
         default=RUN_TIMEOUT_DEFAULT,
         ge=1,
         le=RUN_TIMEOUT_MAX,
         description=f"Seconds to wait before killing it (max {RUN_TIMEOUT_MAX})",
     )
+    # An array of lines, not one string: the live model reliably fills string
+    # arrays but mangles \n escapes in long strings under guided decoding.
+    content_lines: list[str] = Field(
+        min_length=1,
+        description=(
+            "Bash script content as an array of lines, one per line "
+            f"(a short look-around script, at most {RUN_SCRIPT_MAX_CHARS} "
+            "characters — write files with create_file, not with this)"
+        ),
+    )
+
+    @field_validator("content_lines")
+    @classmethod
+    def _short_enough_to_be_a_look_around(cls, lines: list[str]) -> list[str]:
+        """Refuse a script that is really a file being written.
+
+        A validator rather than a check in the handler, so the call never
+        becomes a pending tool call: the model gets this back inside the same
+        decision and can call the right tool instead, and manual mode never
+        asks the user to approve a script that was going to be refused. The
+        message has to carry the whole route out, because it is the only thing
+        the model gets.
+        """
+        size = sum(len(line) + 1 for line in lines)
+        if size <= RUN_SCRIPT_MAX_CHARS:
+            return lines
+        raise ValueError(
+            f"this script is {size} characters and run_bash takes at most "
+            f"{RUN_SCRIPT_MAX_CHARS}: it is for looking around, not for "
+            "writing files. To WRITE a file — notes, a specs document, a "
+            "config — call create_file with the content as content_lines. To "
+            "RUN real work, call create_script (it is syntax- and "
+            "docs-checked), then start_background_script, or run_bash with "
+            "{its_key}. If the content is too long for one call, write the "
+            "first part with create_file, then add each further part with "
+            "edit_file: put the file's current last line in old_lines, and "
+            "that same line followed by the new lines in new_lines. Or, if "
+            "this really is a look-around, make it shorter."
+        )
 
 
 # ----------------------------------------------------- run_bash destructiveness
@@ -423,6 +495,61 @@ def _tail(text: str, stream: str, register: Callable[[], str]) -> str:
     return f"{stream}:\n{body}{note}"
 
 
+# How many distinct failing lines to quote, and how many neighbours each keeps.
+# A script without `set -e` can fail on every line; the first few are the ones
+# worth reading, and the rest are usually the same mistake repeated.
+CITED_LINES = 5
+CITED_CONTEXT = 1
+
+
+def _cited_lines(script_lines: list[str], stderr: str, path: Path) -> str:
+    """The script lines bash's messages point at, numbered, with neighbours.
+
+    Without this a failure says "line 98" to a model that cannot see line 98 —
+    the script is a throwaway file it never reads back — so its only available
+    fix is to rewrite the whole thing. For the hundred-line heredoc that is
+    both the most expensive move and the one most likely to reproduce whatever
+    broke it.
+
+    Quoted whatever the exit code, because run_bash is deliberately lenient
+    (no ``set -euo pipefail``, unlike create_script): a command that fails
+    mid-script leaves the exit code to whatever ran last, so "exit 0" and a
+    broken line are not mutually exclusive.
+
+    Only bash's own messages about *this* script count — they carry its path,
+    and `awk: line 3` or a Python traceback's "line 12" number something else
+    entirely.
+    """
+    marker = re.compile(rf"{re.escape(str(path))}: line (\d+):")
+    numbers = sorted(
+        {
+            int(match)
+            for match in marker.findall(stderr)
+            if 1 <= int(match) <= len(script_lines)
+        }
+    )[:CITED_LINES]
+    if not numbers:
+        return ""
+    wanted = {
+        neighbour
+        for number in numbers
+        for neighbour in range(number - CITED_CONTEXT, number + CITED_CONTEXT + 1)
+        if 1 <= neighbour <= len(script_lines)
+    }
+    width = len(str(max(wanted)))
+    quoted: list[str] = []
+    previous = 0
+    for number in sorted(wanted):
+        if previous and number > previous + 1:
+            quoted.append("  ...")  # a jump, not a run of lines
+        quoted.append(
+            f"{'>' if number in numbers else ' '} {number:{width}} | "
+            f"{script_lines[number - 1]}"
+        )
+        previous = number
+    return "The script lines bash's messages point at:\n" + "\n".join(quoted)
+
+
 def _run_output(record, ctx: ToolContext, hint: str) -> str:
     """Both streams, bounded, each registering its log only if it was cut."""
     parts = [
@@ -473,7 +600,12 @@ async def run_bash(args: RunBashParams, ctx: ToolContext) -> str:
         ["bash", str(path)], name=name, timeout_s=args.timeout_s
     )
     record = await ctx.runner.wait(record.pid)
-    output = _run_output(record, ctx, "bash")
+    cited = _cited_lines(
+        lines, record.stderr_path.read_text(errors="replace"), path
+    )
+    output = "\n\n".join(
+        part for part in [_run_output(record, ctx, "bash"), cited] if part
+    )
     if record.state == "killed":
         return (
             f"TIMED OUT after {args.timeout_s}s and was killed. Narrow it "

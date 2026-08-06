@@ -142,6 +142,24 @@ class TestToolCalls:
         assert "content_lines" not in call.text
         assert "timeout_s" in call.text  # the other arguments still say how
 
+    def test_edited_lines_are_shown_as_the_diff_not_as_json(self):
+        calls = [
+            {
+                "after": 1,
+                "tool": "edit_file",
+                "arguments": {
+                    "registry_key": "run_sh",
+                    "old_lines": ["echo one"],
+                    "new_lines": ["echo two"],
+                },
+                "script": "- echo one\n+ echo two",
+            }
+        ]
+        call = build_entries([USER_MSG, STEP, ANSWER], [], calls)[1].parts[0]
+        assert "- echo one\n+ echo two" in call.text
+        assert "old_lines" not in call.text and "new_lines" not in call.text
+        assert "run_sh" in call.text  # which file is still an argument
+
     def test_details_are_shown_when_the_tool_resolved_the_call(self):
         calls = [
             {

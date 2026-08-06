@@ -59,6 +59,19 @@ class LLMError(Exception):
     """Any failure talking to the LLM backend."""
 
 
+class TruncatedOutput(LLMError):
+    """Structured output stopped at max_tokens, so there is nothing to parse.
+
+    Its own type because the caller can act on this one, unlike an HTTP 500.
+    Two very different things share the shape: constrained decoding looping
+    (unbounded digit runs), and a call that was simply too long to finish —
+    which is what writing a file's content into a tool call looks like when it
+    does not fit. Both were seen live on the 27B; the caller decides what to
+    do about it (hpca.agent.middleware retries once, telling the model to
+    write the file in parts).
+    """
+
+
 @dataclass
 class ChatResponse:
     content: str
@@ -169,9 +182,10 @@ class LLMClient:
         if json_schema is not None and choice.get("finish_reason") == "length":
             # Constrained decoding can loop (e.g. unbounded digit runs) until
             # max_tokens; the truncated output cannot be valid JSON.
-            raise LLMError(
+            raise TruncatedOutput(
                 "Structured output truncated at max_tokens "
-                f"(model looped?): {message.get('content') or '':.120}"
+                f"(looping, or too long to finish?): "
+                f"{message.get('content') or '':.120}"
             )
         # "request_seconds" is ours, not the backend's: OpenAI-style bodies
         # carry token counts but no timing, and without streaming the wall

@@ -383,6 +383,25 @@ the orchestrator's or another subagent's context.
   the pydantic error text is appended to the conversation and the model retries
   (bounded, `max_retries` in settings, default 3). Combined with constrained decoding
   (§2), retries handle semantic errors only.
+* **Argument order:** array-valued arguments come **last** in every tool's schema,
+  and nothing else may follow them. Constrained decoding cannot reject anything
+  written inside a JSON *string*, so a model part-way through a long `list[str]`
+  that decides it is done and starts on the next key emits `"timeout_s: 60"` as one
+  more element instead — the array swallows the key and no error is raised anywhere.
+  A live `run_bash` failed exactly this way (`line 98: timeout_s:: command not
+  found`) after writing a ~100-line document through a heredoc. Ordering the schema
+  leaves no key to reach for; the middleware also drops such an element when it
+  appears anyway (last element, exact sibling field name, JSON value), and reports
+  the repair with the call rather than silently shortening a script. Both are
+  needed: measured against the live 27B backend *after* reordering, a `run_bash`
+  heredoc still produced a trailing `timeout_s:` element in 1 of 4 generations —
+  the model repeats the key out of habit, not because the grammar offered it.
+* **Cut-off decisions:** a decision that stops at `max_tokens` is retried once with
+  guidance to write the file in parts, rather than killing the turn (before this it
+  raised out of the retry loop entirely — `LLMError` is not `DecisionError` — and
+  ended the turn). The cap stays 4096: measured live at the default (thinking off),
+  a document costs ~12 completion tokens per line, so 4096 holds ~330 lines, and
+  raising it would mainly double how long a looping generation hangs.
 * **Path registry:** a named map `{key → absolute path/URI}` per profile+session,
   stored in sqlite. Tools accept **keys**, middleware resolves to real paths and
   errors out on unknown keys (error fed back for retry). New paths discovered by
@@ -444,13 +463,21 @@ Core tools:
 
 * `create_script(kind: bash|python|R|snakemake, registry_key, content)` — writes the
   script, immediately syntax-checks it (§5.2), registers the path.
-* `run_bash(content_lines, timeout_s)` — runs *and blocks*, returning captured
+* `run_bash(timeout_s, content_lines)` — runs *and blocks*, returning captured
   output as the tool result. Writes a throwaway script, `bash -n`-checks it, and
   runs it through the same tracked runner (it is not a free-form shell — see
   below). A `{registry_key}` in a line expands to the registered path, which is
   how a *kept* script is run synchronously: `{my_script} --flag`. Only keys that
   exist are substituted, so `awk '{print $1}'` and `${VAR}` survive untouched;
-  an unmatched `{…}` is named in the result if the run then fails.
+  an unmatched `{…}` is named in the result if the run then fails. Its script is
+  bounded at 2000 characters — the same acknowledgement its output bound already
+  makes, applied on the way in. Over that, the call is refused *in validation*, so
+  it never becomes a pending call the user could be asked to approve, and the model
+  is pointed at `create_file` (a document) or `create_script` (work to run). This is
+  what keeps run_bash from being used as a file-writing tool, which is the one thing
+  it is measurably bad at: asked for a design document with only run_bash available,
+  the live model put all 5–8k characters into a single array element and skipped the
+  §5.2 gate that `create_script` faces.
   *(The design had a second blocking tool, `run_script(registry_key, args)`, for
   registered scripts. It was removed: splitting the two by where the script came
   from gave the model two tools advertising one job, while `{key}` expansion
@@ -476,10 +503,34 @@ Core tools:
   `search_docs` the embedding path for prose questions, `ask_docs` the firewalled
   doc-researcher sub-loop (§4.2).
 * File operations (`move_file`, `copy_file`, `delete_file`, `restore_file`,
-  `read_file`) — destructive ones gated per §5.3. There is **no** `list_dir` tool:
-  registry keys are listed by `list_paths`, and directory contents are read via
-  `run_bash`. `restore_file` is the one file tool taking a path instead of a key:
-  the key died with the file.
+  `read_file`, `create_file`, `edit_file`) — destructive ones gated per §5.3. There is **no**
+  `list_dir` tool: registry keys are listed by `list_paths`, and directory contents
+  are read via `run_bash`. `restore_file` is the one file tool taking a path instead
+  of a key: the key died with the file.
+* `create_file(dir_key, name, content_lines)` — writes a **new** text file into a
+  registered directory, one array element per line. It exists because prose had no
+  tool: `create_script` writes only into the scripts dir under a language suffix and
+  `edit_file` needs a file to already exist, so authoring a `specs.md` meant a
+  `cat << 'EOF'` heredoc through `run_bash` — a hundred lines of documentation
+  squeezed through bash quoting, where one stray line costs the file. It creates and
+  does not overwrite (an existing path is refused and pointed at `edit_file`), which
+  keeps it non-destructive by construction: writing a document never stops for
+  approval. A file whose suffix names a script language faces §5.2's gate on a
+  scratch copy exactly as `edit_file` does — a second way to put content into a
+  script file must not be a second way around the gate.
+* `edit_file(registry_key, subpath, old_lines, new_lines)` — replaces one run of
+  whole lines in place, so changing a 400-line script costs the two lines rather
+  than the file twice (once read, once rewritten). Matching is whole-line and must
+  be unique: no match and an ambiguous match are both refused with the line numbers
+  that nearly matched, never guessed at. It is the only tool besides `create_script`
+  that writes file content, and is held to the same rules as everything else that
+  overwrites: the previous version is copied to the trash first (§5.3 — a *copy*,
+  not a hardlink, because the file survives the write), the call always gates, and
+  when the file is a script the edited content faces §5.2's syntax and code-vs-docs
+  gate — run on a scratch copy, so a refused edit leaves the real file untouched
+  rather than momentarily broken. Undo is `move_file` the edited file aside, then
+  `restore_file` the path; deleting it instead would trash the *edited* version
+  under that same path and restore would bring back what was being undone.
 
 All subprocess execution goes through **one internal runner** (timeouts, output
 capture, cwd tracking, env control). There is deliberately **no free-form shell tool
@@ -577,7 +628,9 @@ gate (§5.3) or actual submission proceed.
     them) and fully protect against the unlink. Fall back to copy only if the trash
     dir is on a different filesystem.
   * *Content-overwriting operations* (in-place edits, overwrites): make a real copy
-    first (this is the rarer case).
+    first (this is the rarer case) — `TrashManager.backup()`, used by `edit_file`.
+    A hardlink is no good here: the file survives the operation and is rewritten
+    through the same inode, which the "backup" would follow.
   * Trash entries carry a TTL (`trash_ttl_days`, default 7) and are cleaned up on
     app start. Recovery is reached by *asking the agent*: the `restore_file` tool
     wraps `TrashManager.list()`/`.restore()`, taking the file's original path (or

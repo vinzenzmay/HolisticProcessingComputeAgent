@@ -350,6 +350,70 @@ class TestRunBash:
         assert "1\n" in ctx.registry.resolve(key).read_text()
 
 
+class TestRunBashFailingLines:
+    """A bash message names a line number; the script is a throwaway file the
+    model never reads back, so the line itself has to come with it."""
+
+    async def test_the_line_bash_points_at_is_quoted_back(self, tools, ctx):
+        result = await call(
+            tools, "run_bash", ctx,
+            content_lines=["echo one", "not_a_command_xyz"],
+        )
+        assert "FAILED" in result
+        assert "> 2 | not_a_command_xyz" in result
+
+    async def test_neighbouring_lines_come_with_it(self, tools, ctx):
+        result = await call(
+            tools, "run_bash", ctx,
+            content_lines=["echo one", "not_a_command_xyz"],
+        )
+        assert "1 | echo one" in result
+
+    async def test_a_mid_script_failure_is_quoted_though_the_run_exits_zero(
+        self, tools, ctx
+    ):
+        # run_bash is lenient by design, so a failed command in the middle
+        # leaves the exit code to whatever ran last. Without the quote, "exit
+        # 0" is all the model would see.
+        result = await call(
+            tools, "run_bash", ctx,
+            content_lines=["not_a_command_xyz", "echo carried on"],
+        )
+        assert "exit 0" in result
+        assert "> 1 | not_a_command_xyz" in result
+
+    async def test_a_successful_run_quotes_nothing(self, tools, ctx):
+        result = await call(tools, "run_bash", ctx, content_lines=["echo fine"])
+        assert "|" not in result
+
+    async def test_a_failure_with_no_line_reference_is_unchanged(self, tools, ctx):
+        result = await call(
+            tools, "run_bash", ctx, content_lines=["echo oops >&2", "exit 2"]
+        )
+        assert "FAILED, exit 2" in result
+        assert "point at" not in result
+
+    async def test_another_program_numbering_its_own_input_is_not_quoted(
+        self, tools, ctx
+    ):
+        # "line 1" here is python's, about its own -c source, not the script's.
+        result = await call(
+            tools, "run_bash", ctx,
+            content_lines=["python3 -c 'import nosuchmodule_xyz'"],
+        )
+        assert "FAILED" in result
+        assert "|" not in result
+
+    async def test_the_quoted_line_is_the_expanded_one(self, tools, ctx, tmp_path):
+        # What ran is what is quoted: `{key}` resolved, as the script has it.
+        ctx.registry.register("data", tmp_path / "data")
+        result = await call(
+            tools, "run_bash", ctx,
+            content_lines=["not_a_command_xyz {data}"],
+        )
+        assert f"not_a_command_xyz {tmp_path / 'data'}" in result
+
+
 class TestRunBashKeyInterpolation:
     """`{key}` in a run_bash line expands to the registered path, which is how
     a kept script is run now that run_script is gone — and it keeps the
@@ -537,3 +601,51 @@ class TestBashFailFast:
         )
         assert "still-running" in result  # did not abort at the missing tool
         assert "exit 0" in result
+
+
+class TestRunBashLengthLimit:
+    """run_bash is for looking around, not for writing files.
+
+    Measured live: asked for a design document with only run_bash available,
+    the model puts the whole thing into ONE array element of 5-8k characters —
+    the long-string case the array-of-lines design exists to avoid — and the
+    §5.2 code-vs-docs gate never sees it, because run_bash only runs `bash -n`.
+    The limit is what routes that work to create_file/create_script instead.
+    """
+
+    def params(self, lines):
+        from hpca.agent.builtin_tools import RunBashParams
+
+        return RunBashParams.model_validate({"content_lines": lines})
+
+    def test_a_look_around_script_is_fine(self):
+        lines = ["find /data -maxdepth 3 -iname '*.bam' 2>/dev/null | head -20"] * 20
+        assert self.params(lines).content_lines == lines
+
+    def test_a_script_over_the_limit_is_refused_before_it_can_run(self):
+        import pytest as _pytest
+        from pydantic import ValidationError
+
+        from hpca.agent.builtin_tools import RUN_SCRIPT_MAX_CHARS
+
+        with _pytest.raises(ValidationError) as caught:
+            self.params(["echo " + "x" * 200] * 40)
+        message = str(caught.value)
+        assert str(RUN_SCRIPT_MAX_CHARS) in message
+        assert "create_file" in message and "create_script" in message
+
+    def test_the_refusal_says_how_to_write_a_file_too_long_for_one_call(self):
+        import pytest as _pytest
+        from pydantic import ValidationError
+
+        with _pytest.raises(ValidationError) as caught:
+            self.params(["x" * 3000])
+        assert "edit_file" in str(caught.value)
+
+    def test_one_pathological_element_counts_the_same_as_many(self):
+        # The live failure shape: the whole document as a single string.
+        import pytest as _pytest
+        from pydantic import ValidationError
+
+        with _pytest.raises(ValidationError):
+            self.params(["cat << 'EOF' > specs.md\n" + "line\n" * 1000])
