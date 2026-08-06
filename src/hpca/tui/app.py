@@ -1719,16 +1719,24 @@ class HpcaApp(App):
         self._update_command_menu(event.text_area.text)
 
     def _update_command_menu(self, draft: str) -> None:
-        """List the chat commands above the entry while one is being typed:
+        """List the chat commands above the entry while one is being *named*:
         substring match (so "/skill" finds every command with "skill" in it),
-        most-used first, and ↑/↓ selectable (see ChatInput)."""
+        most-used first, and ↑/↓ selectable (see ChatInput).
+
+        Only while it is being named. Whitespace after the name means the
+        command is settled and what follows is its arguments — or, after a
+        shift+enter, the body of a multi-line message. The menu has nothing
+        left to offer there, and an open menu owns ↑/↓: leaving it up made
+        every draft that opens with "/" untraversable for as long as it was
+        being written, which is exactly when those keys are wanted.
+        """
         menu = self.query_one("#command-menu", Static)
         stripped = draft.lstrip()
-        if not stripped.startswith(("/", "\\")):
+        typed = stripped[1:]
+        if not stripped.startswith(("/", "\\")) or any(c.isspace() for c in typed):
             menu.display = False
             self._command_matches = []
             return
-        typed = stripped[1:].split(maxsplit=1)[0] if stripped[1:] else ""
         matches = self._matching_commands(typed)
         if not matches:  # typed something that matches no command: show nothing
             menu.display = False
