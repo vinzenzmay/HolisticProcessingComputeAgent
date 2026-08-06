@@ -601,3 +601,51 @@ class TestBashFailFast:
         )
         assert "still-running" in result  # did not abort at the missing tool
         assert "exit 0" in result
+
+
+class TestRunBashLengthLimit:
+    """run_bash is for looking around, not for writing files.
+
+    Measured live: asked for a design document with only run_bash available,
+    the model puts the whole thing into ONE array element of 5-8k characters —
+    the long-string case the array-of-lines design exists to avoid — and the
+    §5.2 code-vs-docs gate never sees it, because run_bash only runs `bash -n`.
+    The limit is what routes that work to create_file/create_script instead.
+    """
+
+    def params(self, lines):
+        from hpca.agent.builtin_tools import RunBashParams
+
+        return RunBashParams.model_validate({"content_lines": lines})
+
+    def test_a_look_around_script_is_fine(self):
+        lines = ["find /data -maxdepth 3 -iname '*.bam' 2>/dev/null | head -20"] * 20
+        assert self.params(lines).content_lines == lines
+
+    def test_a_script_over_the_limit_is_refused_before_it_can_run(self):
+        import pytest as _pytest
+        from pydantic import ValidationError
+
+        from hpca.agent.builtin_tools import RUN_SCRIPT_MAX_CHARS
+
+        with _pytest.raises(ValidationError) as caught:
+            self.params(["echo " + "x" * 200] * 40)
+        message = str(caught.value)
+        assert str(RUN_SCRIPT_MAX_CHARS) in message
+        assert "create_file" in message and "create_script" in message
+
+    def test_the_refusal_says_how_to_write_a_file_too_long_for_one_call(self):
+        import pytest as _pytest
+        from pydantic import ValidationError
+
+        with _pytest.raises(ValidationError) as caught:
+            self.params(["x" * 3000])
+        assert "edit_file" in str(caught.value)
+
+    def test_one_pathological_element_counts_the_same_as_many(self):
+        # The live failure shape: the whole document as a single string.
+        import pytest as _pytest
+        from pydantic import ValidationError
+
+        with _pytest.raises(ValidationError):
+            self.params(["cat << 'EOF' > specs.md\n" + "line\n" * 1000])

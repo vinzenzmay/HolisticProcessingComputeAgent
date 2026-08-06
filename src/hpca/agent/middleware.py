@@ -63,8 +63,10 @@ MAX_TRUNCATION_RETRIES = 1
 TRUNCATION_FEEDBACK = (
     "[validation error] Your last call was cut off at the token limit before "
     "it was finished, so nothing could be run. Make this one smaller. If you "
-    "were writing a file, write it in parts: create_file with the first part, "
-    "then edit_file to add the rest. Do not simply send the same thing again."
+    "were writing a file, write it in parts: call create_file with the first "
+    "part, then add each further part with edit_file — put the file's current "
+    "last line in old_lines, and that same line followed by the new lines in "
+    "new_lines. Do not simply send the same thing again."
 )
 
 

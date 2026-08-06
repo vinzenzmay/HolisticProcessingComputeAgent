@@ -569,6 +569,34 @@ class TestCallState:
         assert "timeout_s" in result.calls[0]["details"]
         assert result.calls[0]["script"] == "ls /data"  # shown is what ran
 
+    async def test_a_call_refused_by_validation_never_becomes_a_call(self, tools):
+        # Why run_bash's length limit is a validator and not a check in the
+        # handler: the model corrects itself inside the same decision, so
+        # nothing is recorded, nothing is gated, and manual mode never asks
+        # the user to approve a script that was going to be refused.
+        from hpca.agent.builtin_tools import RUN_SCRIPT_MAX_CHARS, run_bash
+        from hpca.agent.builtin_tools import RunBashParams
+
+        tools.register(
+            Tool(
+                name="run_bash",
+                description="Run bash",
+                params=RunBashParams,
+                handler=run_bash,
+            )
+        )
+        llm = FakeLLM(
+            [
+                tool_json("run_bash", content_lines=["x" * (RUN_SCRIPT_MAX_CHARS + 1)]),
+                tool_json("echo", text="wrote it with the right tool"),
+                respond_json("done"),
+            ]
+        )
+        graph = make_graph(llm, tools)
+        result = await run_turn(graph, session_id="c3c", user_text="write specs")
+        assert [call["tool"] for call in result.calls] == ["echo"]
+        assert result.reply == "done"
+
     async def test_a_denied_call_is_recorded_too(self, tools):
         # What was refused is exactly what the user may want to look at again.
         llm = FakeLLM([tool_json("delete", target="results/"), respond_json("ok")])

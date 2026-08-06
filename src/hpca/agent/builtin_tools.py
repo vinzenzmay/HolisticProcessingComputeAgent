@@ -30,7 +30,7 @@ import time
 from pathlib import Path
 from typing import Callable, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from hpca.agent.context import ToolContext
 from hpca.agent.tools import Tool, ToolRegistry
@@ -47,6 +47,15 @@ RUN_TIMEOUT_DEFAULT = 60
 RUN_TIMEOUT_MAX = 600
 RUN_OUTPUT_LINES = 60  # per stream, before the model is pointed at the log
 RUN_OUTPUT_CHARS = 4000
+# The same bound, applied to what goes *in*. run_bash always accepted a script
+# of any size, and what the live model does with that is not write a longer
+# look-around: asked for a design document with only run_bash available, it
+# put all 5-8k characters of it into ONE array element — the long-string case
+# `content_lines` exists to avoid — and nothing checked it beyond `bash -n`,
+# because run_bash skips §5.2's code-vs-docs gate that create_script faces.
+# 2000 characters is several times the longest genuine look-around (twenty
+# bounded finds is ~1200) and far below any document.
+RUN_SCRIPT_MAX_CHARS = 2000
 INTERPRETER = {
     ".sh": ["bash"],
     ".py": [sys.executable],
@@ -346,8 +355,41 @@ class RunBashParams(BaseModel):
     # arrays but mangles \n escapes in long strings under guided decoding.
     content_lines: list[str] = Field(
         min_length=1,
-        description="Bash script content as an array of lines, one per line",
+        description=(
+            "Bash script content as an array of lines, one per line "
+            f"(a short look-around script, at most {RUN_SCRIPT_MAX_CHARS} "
+            "characters — write files with create_file, not with this)"
+        ),
     )
+
+    @field_validator("content_lines")
+    @classmethod
+    def _short_enough_to_be_a_look_around(cls, lines: list[str]) -> list[str]:
+        """Refuse a script that is really a file being written.
+
+        A validator rather than a check in the handler, so the call never
+        becomes a pending tool call: the model gets this back inside the same
+        decision and can call the right tool instead, and manual mode never
+        asks the user to approve a script that was going to be refused. The
+        message has to carry the whole route out, because it is the only thing
+        the model gets.
+        """
+        size = sum(len(line) + 1 for line in lines)
+        if size <= RUN_SCRIPT_MAX_CHARS:
+            return lines
+        raise ValueError(
+            f"this script is {size} characters and run_bash takes at most "
+            f"{RUN_SCRIPT_MAX_CHARS}: it is for looking around, not for "
+            "writing files. To WRITE a file — notes, a specs document, a "
+            "config — call create_file with the content as content_lines. To "
+            "RUN real work, call create_script (it is syntax- and "
+            "docs-checked), then start_background_script, or run_bash with "
+            "{its_key}. If the content is too long for one call, write the "
+            "first part with create_file, then add each further part with "
+            "edit_file: put the file's current last line in old_lines, and "
+            "that same line followed by the new lines in new_lines. Or, if "
+            "this really is a look-around, make it shorter."
+        )
 
 
 # ----------------------------------------------------- run_bash destructiveness

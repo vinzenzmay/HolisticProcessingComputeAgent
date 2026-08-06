@@ -469,7 +469,15 @@ Core tools:
   below). A `{registry_key}` in a line expands to the registered path, which is
   how a *kept* script is run synchronously: `{my_script} --flag`. Only keys that
   exist are substituted, so `awk '{print $1}'` and `${VAR}` survive untouched;
-  an unmatched `{…}` is named in the result if the run then fails.
+  an unmatched `{…}` is named in the result if the run then fails. Its script is
+  bounded at 2000 characters — the same acknowledgement its output bound already
+  makes, applied on the way in. Over that, the call is refused *in validation*, so
+  it never becomes a pending call the user could be asked to approve, and the model
+  is pointed at `create_file` (a document) or `create_script` (work to run). This is
+  what keeps run_bash from being used as a file-writing tool, which is the one thing
+  it is measurably bad at: asked for a design document with only run_bash available,
+  the live model put all 5–8k characters into a single array element and skipped the
+  §5.2 gate that `create_script` faces.
   *(The design had a second blocking tool, `run_script(registry_key, args)`, for
   registered scripts. It was removed: splitting the two by where the script came
   from gave the model two tools advertising one job, while `{key}` expansion
