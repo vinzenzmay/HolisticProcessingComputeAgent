@@ -6,6 +6,20 @@ construction and retries only handle semantic errors (unknown tool, invalid
 arguments); without it, a format instruction is appended and JSON parse errors
 are retried too. Every validation failure is fed back verbatim so the model
 can correct itself, a bounded number of times.
+
+Two things here defend against the same constrained-decoding artifact, which
+is worth stating once. Inside a JSON *string* every character is legal, so a
+grammar cannot reject anything the model writes there. A model part-way
+through a long ``list[str]`` that decides it is done with the array and starts
+on the next key emits ``"timeout_s: 60"`` as one more element instead: the
+array swallows the key, no error is raised anywhere, and the string surfaces
+as a line of the script (a real run_bash failure — ``line 98: timeout_s::
+command not found`` — after a ~100-line heredoc).
+
+So: **array-valued arguments come last in every tool's params model**, leaving
+no key for the model to reach for while it is still inside the array
+(``test_middleware.TestArgumentOrder`` enforces it); and ``_strip_key_echo``
+below removes such an element when one appears anyway.
 """
 
 from __future__ import annotations

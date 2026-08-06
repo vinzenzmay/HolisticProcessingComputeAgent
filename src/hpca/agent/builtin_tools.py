@@ -334,17 +334,19 @@ async def start_background_script(
 
 
 class RunBashParams(BaseModel):
-    # An array of lines, not one string: the live model reliably fills string
-    # arrays but mangles \n escapes in long strings under guided decoding.
-    content_lines: list[str] = Field(
-        min_length=1,
-        description="Bash script content as an array of lines, one per line",
-    )
+    # timeout_s before the lines, because nothing may follow a long array —
+    # see the argument-order rule in hpca.agent.middleware.
     timeout_s: int = Field(
         default=RUN_TIMEOUT_DEFAULT,
         ge=1,
         le=RUN_TIMEOUT_MAX,
         description=f"Seconds to wait before killing it (max {RUN_TIMEOUT_MAX})",
+    )
+    # An array of lines, not one string: the live model reliably fills string
+    # arrays but mangles \n escapes in long strings under guided decoding.
+    content_lines: list[str] = Field(
+        min_length=1,
+        description="Bash script content as an array of lines, one per line",
     )
 
 

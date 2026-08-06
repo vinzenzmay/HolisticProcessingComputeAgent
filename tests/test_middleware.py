@@ -1,6 +1,7 @@
 """Tests for hpca.agent: tool registry and the validation/retry middleware (§4.3)."""
 
 import json
+from typing import get_origin
 
 import pytest
 from pydantic import BaseModel, Field
@@ -375,3 +376,38 @@ class TestInlineRefs:
     def test_unknown_ref_left_alone(self):
         schema = {"properties": {"a": {"$ref": "#/$defs/Missing"}}}
         assert inline_refs(schema)["properties"]["a"] == {"$ref": "#/$defs/Missing"}
+
+
+def full_registry() -> ToolRegistry:
+    """Every tool the app assembles (see ``hpca.core.service``)."""
+    from hpca.agent.builtin_tools import default_tool_registry
+    from hpca.agent.doc_tools import add_ask_docs, add_doc_tools
+    from hpca.agent.file_tools import add_file_tools
+    from hpca.agent.job_tools import add_job_tools
+    from hpca.agent.memory_tools import add_memory_tools
+    from hpca.agent.modes import add_plan_tool
+    from hpca.agent.skill_tools import add_skill_tools
+    from hpca.agent.watch_tools import add_watch_tools
+
+    registry = add_ask_docs(add_doc_tools(add_file_tools(default_tool_registry())))
+    add_job_tools(registry)
+    add_watch_tools(registry)
+    add_skill_tools(registry)
+    add_memory_tools(registry)
+    add_plan_tool(registry)
+    return registry
+
+
+class TestArgumentOrder:
+    """Array-valued arguments come last (see ``middleware`` module docstring)."""
+
+    def test_no_scalar_argument_follows_an_array_one(self):
+        offenders = []
+        for tool in full_registry():
+            after_array = ""
+            for name, field in tool.params.model_fields.items():
+                if get_origin(field.annotation) is list:
+                    after_array = after_array or name
+                elif after_array:
+                    offenders.append(f"{tool.name}.{name} follows {after_array}")
+        assert offenders == []
