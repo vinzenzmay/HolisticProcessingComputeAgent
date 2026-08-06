@@ -411,3 +411,87 @@ class TestArgumentOrder:
                 elif after_array:
                     offenders.append(f"{tool.name}.{name} follows {after_array}")
         assert offenders == []
+
+
+class LinesParams(BaseModel):
+    timeout_s: int = Field(default=60)
+    label: str = Field(default="")
+    content_lines: list[str] = Field(min_length=1)
+
+
+async def lines_handler(args, ctx):
+    return "\n".join(args.content_lines)
+
+
+@pytest.fixture
+def lines_tools():
+    registry = ToolRegistry()
+    registry.register(
+        Tool(
+            name="run_bash",
+            description="Run bash",
+            params=LinesParams,
+            handler=lines_handler,
+        )
+    )
+    return registry
+
+
+class TestKeyEcho:
+    """A next-key the grammar swallowed into a string array (see the module
+    docstring) is dropped before the arguments are validated."""
+
+    async def call(self, lines_tools, lines, **rest):
+        llm = FakeLLM([tool_json("run_bash", content_lines=lines, **rest)])
+        return await decide(llm, USER, lines_tools)
+
+    async def test_trailing_sibling_key_dropped(self, lines_tools):
+        decision = await self.call(
+            lines_tools, ["echo hi", "EOF", "timeout_s: 60"]
+        )
+        assert decision.arguments.content_lines == ["echo hi", "EOF"]
+
+    async def test_the_drop_is_reported_not_silent(self, lines_tools):
+        decision = await self.call(
+            lines_tools, ["echo hi", "EOF", "timeout_s: 60"]
+        )
+        assert decision.repairs == [
+            "dropped a trailing content_lines element that echoed the "
+            "timeout_s argument: 'timeout_s: 60'"
+        ]
+
+    async def test_quoted_echo_dropped(self, lines_tools):
+        decision = await self.call(lines_tools, ["echo hi", '"timeout_s": 60'])
+        assert decision.arguments.content_lines == ["echo hi"]
+
+    async def test_several_trailing_echoes_dropped(self, lines_tools):
+        decision = await self.call(
+            lines_tools, ["echo hi", '"label": "x"', "timeout_s: 60"]
+        )
+        assert decision.arguments.content_lines == ["echo hi"]
+
+    async def test_a_line_naming_no_argument_is_kept(self, lines_tools):
+        decision = await self.call(lines_tools, ["echo hi", "note: 60"])
+        assert decision.arguments.content_lines == ["echo hi", "note: 60"]
+        assert decision.repairs == []
+
+    async def test_a_line_whose_value_is_not_json_is_kept(self, lines_tools):
+        # YAML-ish prose in a heredoc; the echo always carries a JSON value.
+        decision = await self.call(lines_tools, ["cat <<EOF", "timeout_s: soon"])
+        assert decision.arguments.content_lines == ["cat <<EOF", "timeout_s: soon"]
+
+    async def test_an_echo_that_is_not_last_is_kept(self, lines_tools):
+        decision = await self.call(
+            lines_tools, ["echo hi", "timeout_s: 60", "echo bye"]
+        )
+        assert len(decision.arguments.content_lines) == 3
+
+    async def test_the_only_element_is_kept(self, lines_tools):
+        # Emptying the array would turn a repair into a validation failure.
+        decision = await self.call(lines_tools, ["timeout_s: 60"])
+        assert decision.arguments.content_lines == ["timeout_s: 60"]
+
+    async def test_a_real_argument_is_untouched(self, lines_tools):
+        decision = await self.call(lines_tools, ["echo hi"], timeout_s=120)
+        assert decision.arguments.timeout_s == 120
+        assert decision.arguments.content_lines == ["echo hi"]

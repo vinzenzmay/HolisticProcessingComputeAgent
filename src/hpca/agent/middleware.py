@@ -25,6 +25,8 @@ below removes such an element when one appears anyway.
 from __future__ import annotations
 
 import json
+import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, get_args, get_origin
 
@@ -32,6 +34,8 @@ from pydantic import BaseModel, ValidationError
 
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.llm import Message
+
+logger = logging.getLogger("hpca.agent.middleware")
 
 DEFAULT_MAX_RETRIES = 3
 # Caps a runaway generation. Reasoning models spend this budget on thinking
@@ -59,6 +63,11 @@ class ToolCall:
     arguments: BaseModel
     reasoning: str = ""
     usage: dict = field(default_factory=dict)
+    # What had to be repaired to make this call valid (``_strip_key_echo``).
+    # Carried to the call record and the approval prompt: a silent repair is
+    # indistinguishable from a backend that never misbehaved, and the user
+    # approving a script has to be told a line was taken out of it.
+    repairs: list[str] = field(default_factory=list)
 
     async def execute(self, ctx: Any) -> str:
         return await self.tool.handler(self.arguments, ctx)
@@ -192,6 +201,61 @@ def _example_value(annotation: Any, description: str) -> Any:
     return f"<{description}>"
 
 
+# A trailing array element that is really the next argument: an optionally
+# quoted key, a colon, and a value. The value must be JSON — that is what the
+# model was mid-way through writing — which is what keeps prose out of range:
+# a heredoc ending on `name: the tool` does not match, `"name": "x"` does.
+_KEY_ECHO = re.compile(
+    r'^\s*"?(?P<key>[A-Za-z_][A-Za-z0-9_]*)"?\s*:\s*(?P<value>.*?),?\s*$'
+)
+
+
+def _is_echo(element: str, siblings: set[str]) -> str:
+    """The argument this element is an echo of, or "" if it is a real line."""
+    match = _KEY_ECHO.match(element)
+    if match is None or match["key"] not in siblings:
+        return ""
+    value = match["value"]
+    if value:
+        try:
+            json.loads(value)
+        except json.JSONDecodeError:
+            return ""  # `timeout_s: soon` is prose, not a swallowed argument
+    return match["key"]
+
+
+def _strip_key_echo(params: type[BaseModel], arguments: dict) -> list[str]:
+    """Drop trailing string-array elements that echo one of the *other*
+    arguments, in place. Returns one note per element dropped.
+
+    See the module docstring for what produces them. The check is deliberately
+    narrow — last element only, a sibling field's exact name, a JSON value, and
+    never the only element left — because the cost of a false positive is a
+    line quietly missing from a file the user asked for. Anything dropped is
+    reported rather than swallowed.
+    """
+    notes: list[str] = []
+    for name, field_info in params.model_fields.items():
+        if get_origin(field_info.annotation) is not list:
+            continue
+        value = arguments.get(name)
+        if not isinstance(value, list):
+            continue
+        siblings = set(params.model_fields) - {name}
+        while len(value) > 1 and isinstance(value[-1], str):
+            echoed = _is_echo(value[-1], siblings)
+            if not echoed:
+                break
+            dropped = value.pop()
+            notes.append(
+                f"dropped a trailing {name} element that echoed the "
+                f"{echoed} argument: {dropped!r}"
+            )
+    for note in notes:  # a repair is also how a backend regression shows up
+        logger.warning("%s: %s", params.__name__, note)
+    return notes
+
+
 def _parse(raw: str, tools: ToolRegistry) -> Decision:
     """Parse and validate one model output; raises ValueError with feedback text."""
     try:
@@ -214,13 +278,19 @@ def _parse(raw: str, tools: ToolRegistry) -> Decision:
             tool = tools.get(str(data.get("tool")))
         except KeyError as e:
             raise ValueError(str(e)) from e
+        raw_arguments = data.get("arguments") or {}
+        repairs = (
+            _strip_key_echo(tool.params, raw_arguments)
+            if isinstance(raw_arguments, dict)
+            else []
+        )
         try:
-            arguments = tool.params.model_validate(data.get("arguments") or {})
+            arguments = tool.params.model_validate(raw_arguments)
         except ValidationError as e:
             raise ValueError(
                 f"Invalid arguments for tool {tool.name!r}:\n{e}"
             ) from e
-        return ToolCall(tool=tool, arguments=arguments)
+        return ToolCall(tool=tool, arguments=arguments, repairs=repairs)
     raise ValueError(
         f'Unknown action {action!r}: use "respond" or "tool_call".'
     )

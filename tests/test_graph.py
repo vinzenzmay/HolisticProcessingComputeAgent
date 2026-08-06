@@ -539,6 +539,36 @@ class TestCallState:
         result = await run_turn(graph, session_id="c3", user_text="list data")
         assert result.calls[0]["script"] == "ls /data"
 
+    async def test_a_repaired_call_says_what_was_taken_out(self, tools):
+        # The middleware drops a swallowed argument out of a script (see
+        # middleware._strip_key_echo); approving a script silently shortened
+        # is approving something other than what was shown.
+        class ScriptParams(BaseModel):
+            timeout_s: int = Field(default=60)
+            content_lines: list[str] = Field(description="The script")
+
+        async def script_handler(args, ctx):
+            return "ran"
+
+        tools.register(
+            Tool(
+                name="run_bash",
+                description="Run bash",
+                params=ScriptParams,
+                handler=script_handler,
+            )
+        )
+        llm = FakeLLM(
+            [
+                tool_json("run_bash", content_lines=["ls /data", "timeout_s: 60"]),
+                respond_json("done"),
+            ]
+        )
+        graph = make_graph(llm, tools)
+        result = await run_turn(graph, session_id="c3b", user_text="list data")
+        assert "timeout_s" in result.calls[0]["details"]
+        assert result.calls[0]["script"] == "ls /data"  # shown is what ran
+
     async def test_a_denied_call_is_recorded_too(self, tools):
         # What was refused is exactly what the user may want to look at again.
         llm = FakeLLM([tool_json("delete", target="results/"), respond_json("ok")])

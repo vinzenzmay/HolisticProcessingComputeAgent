@@ -287,6 +287,9 @@ def build_graph(
                 "pending_tool": {
                     "tool": decision.tool.name,
                     "arguments": decision.arguments.model_dump(),
+                    # What the middleware had to repair to make the call valid;
+                    # shown with the call rather than swallowed.
+                    "repairs": decision.repairs,
                 },
                 "tool_rounds": rounds + 1,
                 **thinking,
@@ -311,7 +314,14 @@ def build_graph(
         # there was never one). Built here because both readings — the prompt
         # below and the record — must describe the same call.
         preview = script_preview(tool.name, pending["arguments"], context)
-        details = _describe(tool, arguments, context)
+        # A repair rides with the description: it is part of what this call is,
+        # and the user judging a script has to be told a line was taken out of
+        # it — the preview above already shows the shortened version.
+        details = "\n".join(
+            part
+            for part in [_describe(tool, arguments, context), *pending.get("repairs", [])]
+            if part
+        )
         call = {
             "after": len(state.get("messages", [])),
             "tool": tool.name,
