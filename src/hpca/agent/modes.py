@@ -50,7 +50,14 @@ EXECUTION_TOOLS = frozenset(
     {"start_background_script", "run_bash", "submit_job"}
 )
 
-SCRIPT_PREVIEW_CHARS = 4000
+# How much of a script the preview keeps. It was 4000, which cut an ordinary
+# hundred-line document mid-word: a user in manual mode was approving a script
+# whose tail they could not see, and the record the chat keeps of what ran was
+# missing the same part. Neither surface needs the cap for layout — the
+# approval prompt scrolls, the chat box collapses — so what is left is the
+# checkpoint, where every call is stored with the turn. Generous, not
+# unbounded, and what remains is cut out of the MIDDLE (see ``_clip``).
+SCRIPT_PREVIEW_CHARS = 40_000
 
 # Tools whose call *is* a registered script: the file behind the key is the
 # thing that would run, so it is what the user judges the call by. Every other
@@ -342,9 +349,20 @@ def script_preview(tool_name: str, arguments: dict, ctx: Any) -> str | None:
 
 
 def _clip(text: str) -> str:
+    """Bound a preview by taking the middle out, never the end.
+
+    A heredoc's last lines are what say whether it was closed properly, and a
+    script's last command is usually the one that matters; a head-only clip
+    throws away exactly the part worth checking. Whole lines on both sides, so
+    the two halves still read as script.
+    """
     if len(text) <= SCRIPT_PREVIEW_CHARS:
         return text
-    return text[:SCRIPT_PREVIEW_CHARS] + "\n... [clipped]"
+    half = SCRIPT_PREVIEW_CHARS // 2
+    head = text[:half].rsplit("\n", 1)[0]
+    tail = text[len(text) - half :].split("\n", 1)[-1]
+    omitted = len(text) - len(head) - len(tail)
+    return f"{head}\n... [{omitted:,} characters omitted] ...\n{tail}"
 
 
 # ------------------------------------------------------------- update_plan

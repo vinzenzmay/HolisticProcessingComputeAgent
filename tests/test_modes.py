@@ -21,6 +21,7 @@ from hpca.agent.modes import (
     next_mode,
     render_checklist,
     requires_execution_approval,
+    SCRIPT_PREVIEW_CHARS,
     script_preview,
     skipped_message,
 )
@@ -243,6 +244,24 @@ class TestScriptPreview:
             ctx,
         )
         assert preview.splitlines() == ["- bwa mem", "+ bwa-mem2 mem"]
+
+    def test_a_long_script_is_shown_whole(self, ctx):
+        # The prompt scrolls and the chat box collapses, so there is no layout
+        # reason to cut a script the user is being asked to approve.
+        lines = [f"echo {n}" for n in range(500)]
+        preview = script_preview("run_bash", {"content_lines": lines}, ctx)
+        assert preview.splitlines() == lines
+
+    def test_a_pathological_script_keeps_its_head_and_its_tail(self, ctx):
+        # Some cap has to exist — the call is checkpointed with every turn —
+        # but a heredoc's last lines are what say whether it was closed
+        # properly, which is exactly what cutting the tail throws away.
+        lines = [f"echo {n}" for n in range(SCRIPT_PREVIEW_CHARS)]
+        preview = script_preview("run_bash", {"content_lines": lines}, ctx)
+        assert len(preview) < SCRIPT_PREVIEW_CHARS + 200
+        assert preview.startswith("echo 0\n")
+        assert preview.endswith(f"echo {SCRIPT_PREVIEW_CHARS - 1}")
+        assert "omitted" in preview
 
     def test_a_registry_key_pointing_at_data_is_not_a_script(self, ctx):
         # read_file, delete_file and friends take a registry key too. Their
