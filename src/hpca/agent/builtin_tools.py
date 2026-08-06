@@ -453,6 +453,61 @@ def _tail(text: str, stream: str, register: Callable[[], str]) -> str:
     return f"{stream}:\n{body}{note}"
 
 
+# How many distinct failing lines to quote, and how many neighbours each keeps.
+# A script without `set -e` can fail on every line; the first few are the ones
+# worth reading, and the rest are usually the same mistake repeated.
+CITED_LINES = 5
+CITED_CONTEXT = 1
+
+
+def _cited_lines(script_lines: list[str], stderr: str, path: Path) -> str:
+    """The script lines bash's messages point at, numbered, with neighbours.
+
+    Without this a failure says "line 98" to a model that cannot see line 98 —
+    the script is a throwaway file it never reads back — so its only available
+    fix is to rewrite the whole thing. For the hundred-line heredoc that is
+    both the most expensive move and the one most likely to reproduce whatever
+    broke it.
+
+    Quoted whatever the exit code, because run_bash is deliberately lenient
+    (no ``set -euo pipefail``, unlike create_script): a command that fails
+    mid-script leaves the exit code to whatever ran last, so "exit 0" and a
+    broken line are not mutually exclusive.
+
+    Only bash's own messages about *this* script count — they carry its path,
+    and `awk: line 3` or a Python traceback's "line 12" number something else
+    entirely.
+    """
+    marker = re.compile(rf"{re.escape(str(path))}: line (\d+):")
+    numbers = sorted(
+        {
+            int(match)
+            for match in marker.findall(stderr)
+            if 1 <= int(match) <= len(script_lines)
+        }
+    )[:CITED_LINES]
+    if not numbers:
+        return ""
+    wanted = {
+        neighbour
+        for number in numbers
+        for neighbour in range(number - CITED_CONTEXT, number + CITED_CONTEXT + 1)
+        if 1 <= neighbour <= len(script_lines)
+    }
+    width = len(str(max(wanted)))
+    quoted: list[str] = []
+    previous = 0
+    for number in sorted(wanted):
+        if previous and number > previous + 1:
+            quoted.append("  ...")  # a jump, not a run of lines
+        quoted.append(
+            f"{'>' if number in numbers else ' '} {number:{width}} | "
+            f"{script_lines[number - 1]}"
+        )
+        previous = number
+    return "The script lines bash's messages point at:\n" + "\n".join(quoted)
+
+
 def _run_output(record, ctx: ToolContext, hint: str) -> str:
     """Both streams, bounded, each registering its log only if it was cut."""
     parts = [
@@ -503,7 +558,12 @@ async def run_bash(args: RunBashParams, ctx: ToolContext) -> str:
         ["bash", str(path)], name=name, timeout_s=args.timeout_s
     )
     record = await ctx.runner.wait(record.pid)
-    output = _run_output(record, ctx, "bash")
+    cited = _cited_lines(
+        lines, record.stderr_path.read_text(errors="replace"), path
+    )
+    output = "\n\n".join(
+        part for part in [_run_output(record, ctx, "bash"), cited] if part
+    )
     if record.state == "killed":
         return (
             f"TIMED OUT after {args.timeout_s}s and was killed. Narrow it "
