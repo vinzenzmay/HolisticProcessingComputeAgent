@@ -397,10 +397,11 @@ the orchestrator's or another subagent's context.
   heredoc still produced a trailing `timeout_s:` element in 1 of 4 generations —
   the model repeats the key out of habit, not because the grammar offered it.
 * **Cut-off decisions:** a decision that stops at `max_tokens` is retried once with
-  guidance to write the file in parts, rather than killing the turn. The cap is
-  8192: measured live with thinking on, a 30-line document costs ~1200 completion
-  tokens (~800 of them reasoning), so the previous 4096 put an ordinary ~100-line
-  specs.md right at the ceiling.
+  guidance to write the file in parts, rather than killing the turn (before this it
+  raised out of the retry loop entirely — `LLMError` is not `DecisionError` — and
+  ended the turn). The cap stays 4096: measured live at the default (thinking off),
+  a document costs ~12 completion tokens per line, so 4096 holds ~330 lines, and
+  raising it would mainly double how long a looping generation hangs.
 * **Path registry:** a named map `{key → absolute path/URI}` per profile+session,
   stored in sqlite. Tools accept **keys**, middleware resolves to real paths and
   errors out on unknown keys (error fed back for retry). New paths discovered by

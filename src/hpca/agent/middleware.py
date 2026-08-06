@@ -45,13 +45,17 @@ logger = logging.getLogger("hpca.agent.middleware")
 
 DEFAULT_MAX_RETRIES = 3
 # Caps a runaway generation. Reasoning models spend this budget on thinking
-# before the JSON decision, so it is roomier than a decision alone needs — and
-# a decision that writes a file's content spends it twice over. Measured on
-# the live 27B backend with thinking on: a 30-line document costs ~1200
-# completion tokens, ~800 of them reasoning, so the old 4096 put a ~100-line
-# specs.md right at the ceiling. Doubling buys documents of a few hundred
-# lines while still bounding the loop this exists for.
-MAX_DECISION_TOKENS = 8192
+# before the JSON decision, so it is roomier than a decision alone needs.
+#
+# Measured on the live 27B at the default (thinking OFF, hpca.config), writing
+# a document through create_file: ~12 completion tokens per line — 500 for 35
+# lines, 2400 for 197 — so this holds a ~330-line file, and ~270 with thinking
+# turned on for a backend. That is past any specs.md worth writing in one
+# call, and a longer one now degrades into a split write rather than a dead
+# turn (see MAX_TRUNCATION_RETRIES). Raising it would only double how long a
+# genuinely looping generation hangs before anyone finds out — and loops are
+# not rare here: 1 of 4 run_bash generations in that same probe.
+MAX_DECISION_TOKENS = 4096
 # A cut-off decision is worth exactly one more try. Both causes are expensive
 # to retry — a looping model burns the whole cap again — and the second
 # attempt is told to write less, so a third would be the same answer twice.

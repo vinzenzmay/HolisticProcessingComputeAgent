@@ -66,9 +66,9 @@ class TruncatedOutput(LLMError):
     Two very different things share the shape: constrained decoding looping
     (unbounded digit runs), and a call that was simply too long to finish —
     which is what writing a file's content into a tool call looks like when it
-    does not fit. Measured on the live 27B backend with thinking on, a 30-line
-    document costs ~1200 completion tokens, so a document of a few hundred
-    lines reaches any sane cap honestly.
+    does not fit. Both were seen live on the 27B; the caller decides what to
+    do about it (hpca.agent.middleware retries once, telling the model to
+    write the file in parts).
     """
 
 
