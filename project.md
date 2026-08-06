@@ -89,9 +89,14 @@ Terminals in 2026 are assumed wider than 80 columns
     queued one) puts its text back in the entry — appended on its own line to
     whatever is already being written, so nothing typed is lost — which is how
     a command is re-sent with one word changed. Enter on a thinking box expands
-    it, and on anything else (the agent's replies, background events, recalled
-    memory) simply hands focus to the entry. `(b)` go back in conversation to
-    this point, `(c)` copy content to clipboard.
+    it into its parts — each block of reasoning, each tool call with the script
+    or command it would run, and each result — every one its own collapsible
+    row, so the script the agent wrote and the call it made stay readable long
+    after the approval prompt that showed them is answered (and are there at all
+    in auto mode, where no prompt showed them). Enter on anything else (the
+    agent's replies, background events, recalled memory) simply hands focus to
+    the entry. `(b)` go back in conversation to this point, `(c)` copy content
+    to clipboard.
   * *Watch (right column):* a box the user asked for, pinned by the agent's
     `watch_log` / `watch_job` tools — see *Watches* below. **Enter** flashes
     the last 300 characters of the log (a toast that expires, not a screen to

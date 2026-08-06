@@ -201,14 +201,16 @@ def parse(env: Envelope) -> Message:
 
 
 class Part(_Model):
-    """One ordered piece of a turn's working: reasoning, or a tool step.
+    """One ordered piece of a turn's working: reasoning, a tool call, or the
+    result it returned.
 
     The wire twin of `hpca.transcript.Step`. Not that class: this module stays
     importable without the agent side, and `transcript` pulls in the LLM types.
     """
 
-    kind: str  # reasoning | step
+    kind: str  # reasoning | call | step
     text: str
+    tool: str = ""  # call: the tool named
 
 
 class Entry(_Model):

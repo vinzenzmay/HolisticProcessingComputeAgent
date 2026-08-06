@@ -103,7 +103,90 @@ class TestParts:
             assert part.text.strip() in box.text
 
 
+class TestToolCalls:
+    """The call is shown next to its result: what the approval prompt shows
+    for a gated call stays readable in the chat once the prompt is gone."""
+
+    def test_call_part_precedes_its_result(self):
+        calls = [
+            {
+                "after": 1,
+                "tool": "list_dir",
+                "arguments": {"registry_key": "cohort"},
+            }
+        ]
+        box = build_entries([USER_MSG, STEP, ANSWER], [], calls)[1]
+        assert [p.kind for p in box.parts] == ["call", "step"]
+        assert box.parts[0].label() == "list_dir (call)"
+        assert "cohort" in box.parts[0].text
+
+    def test_call_comes_after_the_reasoning_that_produced_it(self):
+        thinking = [{"after": 1, "reasoning": "List it first."}]
+        calls = [{"after": 1, "tool": "list_dir", "arguments": {}}]
+        box = build_entries([USER_MSG, STEP, ANSWER], thinking, calls)[1]
+        assert [p.kind for p in box.parts] == ["reasoning", "call", "step"]
+
+    def test_script_is_carried_in_the_call_part(self):
+        calls = [
+            {
+                "after": 1,
+                "tool": "run_bash",
+                "arguments": {"content_lines": ["ls /data"], "timeout_s": 30},
+                "script": "ls /data",
+            }
+        ]
+        box = build_entries([USER_MSG, STEP, ANSWER], [], calls)[1]
+        call = box.parts[0]
+        assert "ls /data" in call.text
+        # the script is the block below, not repeated as a JSON argument
+        assert "content_lines" not in call.text
+        assert "timeout_s" in call.text  # the other arguments still say how
+
+    def test_details_are_shown_when_the_tool_resolved_the_call(self):
+        calls = [
+            {
+                "after": 1,
+                "tool": "delete_file",
+                "arguments": {"registry_key": "scratch"},
+                "details": "rm /scratch/old.bam\n(12 bytes; will be recoverable)",
+            }
+        ]
+        box = build_entries([USER_MSG, STEP, ANSWER], [], calls)[1]
+        assert "rm /scratch/old.bam" in box.parts[0].text
+
+    def test_calls_do_not_inflate_the_step_count(self):
+        calls = [{"after": 1, "tool": "list_dir", "arguments": {}}]
+        box = build_entries([USER_MSG, STEP, ANSWER], [], calls)[1]
+        assert box.steps == 1  # one tool step, shown as call + result
+
+    def test_call_left_behind_by_a_rollback_is_passed_over(self):
+        # An interrupted turn's messages are truncated; a call anchored past
+        # the end has no result to sit before, and must not surface alone.
+        calls = [{"after": 5, "tool": "run_bash", "script": "rm -rf /tmp/x"}]
+        entries = build_entries([USER_MSG, ANSWER], [], calls)
+        assert kinds(entries) == ["user", "assistant"]
+
+    def test_call_is_written_into_the_folded_text(self):
+        calls = [{"after": 1, "tool": "run_bash", "script": "ls /data"}]
+        box = build_entries([USER_MSG, STEP, ANSWER], [], calls)[1]
+        assert "ls /data" in box.text  # the session log writes this block
+
+    def test_calls_are_optional(self):
+        box = build_entries([USER_MSG, STEP, ANSWER], [])[1]
+        assert [p.kind for p in box.parts] == ["step"]
+
+
 class TestTail:
+    def test_calls_outside_the_tail_are_left_out(self):
+        messages = [USER_MSG, ANSWER, USER_MSG, STEP, ANSWER]
+        calls = [
+            {"after": 1, "tool": "first_call", "arguments": {}},
+            {"after": 3, "tool": "second_call", "arguments": {}},
+        ]
+        entries = build_entries(messages, [], calls, start=2)
+        assert "second_call" in entries[1].text
+        assert "first_call" not in entries[1].text
+
     def test_start_selects_one_turn_keeping_absolute_anchors(self):
         messages = [USER_MSG, ANSWER, USER_MSG, STEP, ANSWER]
         thinking = [

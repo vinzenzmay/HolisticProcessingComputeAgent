@@ -83,6 +83,22 @@ def _resolve(provider, thread_id):
     return provider(thread_id) if takes_arg else provider()
 
 
+def _describe(tool, arguments, context) -> str:
+    """The tool's own description of this call — resolved paths, flagged
+    commands — or "" when it has none.
+
+    Best-effort: this runs for every call, not only gated ones (the record the
+    chat reads is built from it too), and a tool that cannot describe a call
+    must not be the reason the call does not happen.
+    """
+    if tool.describe_call is None:
+        return ""
+    try:
+        return tool.describe_call(arguments, context) or ""
+    except Exception:
+        return ""
+
+
 def _thread_id(config) -> str | None:
     """The thread_id (session_id) the graph was invoked with, from the node's
     LangGraph ``config``. Every per-session dependency resolves off this — the
@@ -96,6 +112,13 @@ class AgentState(TypedDict, total=False):
     # out of `messages` so it is never fed back to the model, only shown and
     # logged (§4.2 context firewall).
     thinking: Annotated[list[dict], _append]
+    # What each tool was actually called with — {"after", "tool", "arguments",
+    # and optionally "script"/"details"} — anchored to its result's message
+    # index. Same firewall and the same reason: the model made the call, so
+    # echoing the script back would spend the window on it twice; the user did
+    # not, and after the approval prompt is answered this is the only place the
+    # script survives (see hpca.transcript.call_text).
+    calls: Annotated[list[dict], _append]
     pending_tool: dict | None
     tool_rounds: int
     # The progress checklist: list of {"text": str, "done": bool}.
@@ -274,6 +297,23 @@ def build_graph(
             # so a tool's own model calls are logged under its name
             context.current_tool = tool.name
         mode = mode_for(thread_id)
+        # What this call was: recorded for every tool, not only the gated ones,
+        # so the chat can show the script and the command after the fact (the
+        # approval prompt is gone the moment it is answered, and in auto mode
+        # there was never one). Built here because both readings — the prompt
+        # below and the record — must describe the same call.
+        preview = script_preview(tool.name, pending["arguments"], context)
+        details = _describe(tool, arguments, context)
+        call = {
+            "after": len(state.get("messages", [])),
+            "tool": tool.name,
+            "arguments": pending["arguments"],
+        }
+        if preview:
+            call["script"] = preview
+        if details:
+            call["details"] = details
+        recorded = {"calls": [call]}
         # Full-auto is the one mode that waives the destructive gate (§3.5);
         # every other mode keeps §5.3's "always ask".
         destructive = tool.gates(arguments, context) and destructive_approval_required(
@@ -289,11 +329,10 @@ def build_graph(
                 "description": tool.description,
                 "kind": "destructive" if destructive else "execution",
             }
-            preview = script_preview(tool.name, pending["arguments"], context)
             if preview:
                 payload["script"] = preview
-            if tool.describe_call is not None:
-                payload["details"] = tool.describe_call(arguments, context)
+            if details:
+                payload["details"] = details
             verdict = interrupt(payload)
             approved = (
                 bool(verdict.get("approved"))
@@ -307,15 +346,19 @@ def build_graph(
                 str(verdict.get("reason", "")) if isinstance(verdict, dict) else ""
             )
             if not approved:
+                # Refused calls are recorded like any other: what the user
+                # turned down is exactly what they may want to read again.
                 if execution:
-                    return _tool_message(skipped_message(tool.name, reason))
-                return _tool_message(denied_message(tool.name, reason))
+                    return _tool_message(skipped_message(tool.name, reason)) | recorded
+                return _tool_message(denied_message(tool.name, reason)) | recorded
         try:
             output = await tool.handler(arguments, context)
             content = f"[tool result] {tool.name}: {output}"
         except Exception as e:  # surfaced to the model, never crashes the graph
-            return _tool_message(f"[tool error] {tool.name}: {type(e).__name__}: {e}")
-        update = _tool_message(content)
+            return _tool_message(
+                f"[tool error] {tool.name}: {type(e).__name__}: {e}"
+            ) | recorded
+        update = _tool_message(content) | recorded
         if tool.name == "update_plan":
             # The checklist lives in the checkpointed state, not in the tool:
             # that is what makes it survive restarts and prompt re-injection.
@@ -423,6 +466,8 @@ class TurnResult:
     interrupt: dict | None
     messages: list[Message] = field(default_factory=list)
     thinking: list[dict] = field(default_factory=list)
+    # What each tool was called with, anchored to its result (AgentState.calls).
+    calls: list[dict] = field(default_factory=list)
     # The plan checklist as of the end of this turn (None when none exists).
     plan: list[dict] | None = None
     # Index of the first message this turn appended: everything from here on
@@ -554,6 +599,7 @@ async def run_turn(
     result = await graph.ainvoke(payload, config)
     messages = result.get("messages", [])
     thinking = result.get("thinking", [])
+    calls = result.get("calls", [])
     interrupts = result.get("__interrupt__") or []
     plan = result.get("plan")
     if interrupts:
@@ -562,6 +608,7 @@ async def run_turn(
             interrupt=interrupts[0].value,
             messages=messages,
             thinking=thinking,
+            calls=calls,
             plan=plan,
             first_new=first_new,
         )
@@ -573,6 +620,7 @@ async def run_turn(
         interrupt=None,
         messages=messages,
         thinking=thinking,
+        calls=calls,
         plan=plan,
         first_new=first_new,
     )

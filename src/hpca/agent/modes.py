@@ -52,6 +52,12 @@ EXECUTION_TOOLS = frozenset(
 
 SCRIPT_PREVIEW_CHARS = 4000
 
+# Tools whose call *is* a registered script: the file behind the key is the
+# thing that would run, so it is what the user judges the call by. Every other
+# tool taking a registry key points at data — a file to read, delete, move —
+# and its contents are neither the call nor a script.
+SCRIPT_FILE_TOOLS = frozenset({"start_background_script", "submit_job"})
+
 
 def next_mode(mode: str) -> str:
     """The next mode in the cycle (manual → auto → full-auto → manual)."""
@@ -294,11 +300,16 @@ def denied_message(tool_name: str, reason: str = "") -> str:
 
 
 def script_preview(tool_name: str, arguments: dict, ctx: Any) -> str | None:
-    """The script/command behind an execution-gated call, for the approval
-    modal — the user decides on what would actually run, not on a JSON blob.
+    """The script or command behind a call: what would actually run, rather
+    than a JSON blob.
 
-    Best-effort and side-effect-free: the graph re-runs gating when a parked
-    turn resumes, so this must stay a pure read.
+    Shown in the approval prompt for a gated call, and recorded with every
+    call so the chat can still show it once that prompt is answered (see
+    ``hpca.transcript.call_text``).
+
+    Best-effort and side-effect-free: it runs on every call, and again when a
+    parked turn resumes and the graph re-runs gating, so it must stay a pure
+    read and must never raise.
 
     run_bash lines are shown with their ``{key}`` references expanded. The
     point of the modal is that the user approves what will actually run, and
@@ -310,6 +321,8 @@ def script_preview(tool_name: str, arguments: dict, ctx: Any) -> str | None:
         if "content_lines" in arguments:  # run_bash, create_script
             lines, _ = expand_keys(arguments["content_lines"], ctx)
             return _clip("\n".join(lines))
+        if tool_name not in SCRIPT_FILE_TOOLS:
+            return None
         key = arguments.get("registry_key")
         if key and ctx is not None and getattr(ctx, "registry", None) is not None:
             path = ctx.registry.resolve(key)

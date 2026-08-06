@@ -493,6 +493,129 @@ class TestThinkingState:
         ]
 
 
+class TestCallState:
+    """Every tool call is recorded next to its result, so the chat can show
+    what was run after the approval prompt that showed it is gone."""
+
+    async def test_call_is_recorded_with_its_arguments(self, tools):
+        llm = FakeLLM([tool_json("echo", text="hi"), respond_json("done")])
+        graph = make_graph(llm, tools)
+        result = await run_turn(graph, session_id="c1", user_text="echo hi")
+        assert result.calls == [
+            {"after": 1, "tool": "echo", "arguments": {"text": "hi"}}
+        ]
+        # 1 is the index its result took, so the two render together
+        assert result.messages[1]["content"].startswith("[tool result] echo")
+
+    async def test_calls_are_kept_out_of_the_messages(self, tools):
+        # The model already knows what it called; feeding a script back would
+        # cost the context window twice (§4.2).
+        llm = FakeLLM([tool_json("echo", text="hi"), respond_json("done")])
+        graph = make_graph(llm, tools)
+        result = await run_turn(graph, session_id="c2", user_text="echo hi")
+        assert all(
+            "[tool call]" not in m["content"] for m in result.messages
+        )
+
+    async def test_script_is_recorded_with_the_call(self, tools):
+        class ScriptParams(BaseModel):
+            content_lines: list[str] = Field(description="The script")
+
+        async def script_handler(args, ctx):
+            return "ran"
+
+        tools.register(
+            Tool(
+                name="run_bash",
+                description="Run bash",
+                params=ScriptParams,
+                handler=script_handler,
+            )
+        )
+        llm = FakeLLM(
+            [tool_json("run_bash", content_lines=["ls /data"]), respond_json("done")]
+        )
+        graph = make_graph(llm, tools)
+        result = await run_turn(graph, session_id="c3", user_text="list data")
+        assert result.calls[0]["script"] == "ls /data"
+
+    async def test_a_denied_call_is_recorded_too(self, tools):
+        # What was refused is exactly what the user may want to look at again.
+        llm = FakeLLM([tool_json("delete", target="results/"), respond_json("ok")])
+        graph = make_graph(llm, tools)
+        await run_turn(graph, session_id="c4", user_text="delete results")
+        result = await run_turn(
+            graph, session_id="c4", resume=Command(resume={"approved": False})
+        )
+        assert result.calls == [
+            {"after": 1, "tool": "delete", "arguments": {"target": "results/"}}
+        ]
+        assert "DENIED" in result.messages[1]["content"]
+
+    async def test_a_failing_tool_still_records_its_call(self, tools):
+        async def boom(args, ctx):
+            raise RuntimeError("no such path")
+
+        tools.register(
+            Tool(
+                name="boom", description="Fails", params=EchoParams, handler=boom
+            )
+        )
+        llm = FakeLLM([tool_json("boom", text="x"), respond_json("ok")])
+        graph = make_graph(llm, tools)
+        result = await run_turn(graph, session_id="c5", user_text="go")
+        assert result.calls[0]["tool"] == "boom"
+        assert result.messages[1]["content"].startswith("[tool error]")
+
+    async def test_details_are_recorded_when_the_tool_describes_the_call(self, tools):
+        tools.register(
+            Tool(
+                name="described",
+                description="Has a described call",
+                params=EchoParams,
+                handler=echo_handler,
+                describe_call=lambda args, ctx: f"resolves to /real/{args.text}",
+            )
+        )
+        llm = FakeLLM([tool_json("described", text="bam"), respond_json("ok")])
+        graph = make_graph(llm, tools)
+        result = await run_turn(graph, session_id="c6", user_text="go")
+        assert result.calls[0]["details"] == "resolves to /real/bam"
+
+    async def test_a_broken_describe_call_does_not_break_the_turn(self, tools):
+        def explode(args, ctx):
+            raise RuntimeError("cannot resolve")
+
+        tools.register(
+            Tool(
+                name="brittle",
+                description="Describes badly",
+                params=EchoParams,
+                handler=echo_handler,
+                describe_call=explode,
+            )
+        )
+        llm = FakeLLM([tool_json("brittle", text="x"), respond_json("ok")])
+        graph = make_graph(llm, tools)
+        result = await run_turn(graph, session_id="c7", user_text="go")
+        assert result.reply == "ok"
+        assert "details" not in result.calls[0]
+
+    async def test_calls_accumulate_across_turns(self, tools):
+        llm = FakeLLM(
+            [
+                tool_json("echo", text="one"),
+                respond_json("a"),
+                tool_json("echo", text="two"),
+                respond_json("b"),
+            ]
+        )
+        graph = make_graph(llm, tools)
+        await run_turn(graph, session_id="c8", user_text="first")
+        result = await run_turn(graph, session_id="c8", user_text="second")
+        assert [c["after"] for c in result.calls] == [1, 4]
+
+
 class TestNewThisTurn:
     async def test_first_new_marks_the_turns_own_messages(self, tools):
         llm = FakeLLM([respond_json("a"), respond_json("b")])
