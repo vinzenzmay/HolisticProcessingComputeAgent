@@ -146,6 +146,7 @@ def build_graph(
     on_evict: Callable[[list[Message]], Any] | None = None,
     on_usage: Callable[[str, dict], None] | None = None,
     mode_fn: Callable[..., str | None] | None = None,
+    on_step: Callable[[str, dict], None] | None = None,
 ):
     def client(thread_id):
         """The LLM client for the session running ``thread_id``. ``llm`` may be
@@ -181,6 +182,13 @@ def build_graph(
     # turn grows the prompt as it goes and that is exactly what fills a 32k
     # window. Two-arg (thread_id, usage) for the same per-session reason.
     report_usage = on_usage or (lambda *a: None)
+    # Each tool call, and the result it returns, at the moment it happens —
+    # {"kind": "call", …the call record…} then {"kind": "step", "text": …}.
+    # A turn can spend minutes in tools, and an activity line saying "running
+    # run_bash" does not say *what* it is running; this is what lets the chat
+    # show the work as it goes instead of only once the turn is over. Two-arg
+    # (thread_id, step) for the same per-session reason as the two above.
+    report_step = on_step or (lambda *a: None)
 
     def _view(state: AgentState) -> list[Message]:
         """The history as the model sees it: folded once compacted."""
@@ -322,6 +330,7 @@ def build_graph(
         # Manual mode gates execution tools too (§3.5) — same
         # interrupt/resume machinery, a different question to the user.
         execution = not destructive and requires_execution_approval(mode, tool.name)
+        approved, reason = True, ""
         if destructive or execution:
             payload = {
                 "tool": tool.name,
@@ -345,21 +354,28 @@ def build_graph(
             reason = (
                 str(verdict.get("reason", "")) if isinstance(verdict, dict) else ""
             )
-            if not approved:
-                # Refused calls are recorded like any other: what the user
-                # turned down is exactly what they may want to read again.
-                if execution:
-                    return _tool_message(skipped_message(tool.name, reason)) | recorded
-                return _tool_message(denied_message(tool.name, reason)) | recorded
-        try:
-            output = await tool.handler(arguments, context)
-            content = f"[tool result] {tool.name}: {output}"
-        except Exception as e:  # surfaced to the model, never crashes the graph
-            return _tool_message(
-                f"[tool error] {tool.name}: {type(e).__name__}: {e}"
-            ) | recorded
+        # Announced after the gate, never before it: a parked turn must not
+        # report a call the user has not answered for yet, and interrupt()
+        # re-runs this node from the top on resume — announcing above would
+        # then say it twice.
+        report_step(thread_id, {"kind": "call", **call})
+        ran = False
+        if not approved:
+            # Refused calls are recorded like any other: what the user turned
+            # down is exactly what they may want to read again.
+            content = (skipped_message if execution else denied_message)(
+                tool.name, reason
+            )
+        else:
+            try:
+                output = await tool.handler(arguments, context)
+                content = f"[tool result] {tool.name}: {output}"
+                ran = True
+            except Exception as e:  # surfaced to the model, never crashes the graph
+                content = f"[tool error] {tool.name}: {type(e).__name__}: {e}"
+        report_step(thread_id, {"kind": "step", "text": content})
         update = _tool_message(content) | recorded
-        if tool.name == "update_plan":
+        if ran and tool.name == "update_plan":
             # The checklist lives in the checkpointed state, not in the tool:
             # that is what makes it survive restarts and prompt re-injection.
             update["plan"] = [step.model_dump() for step in arguments.steps]

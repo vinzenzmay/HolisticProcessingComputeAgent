@@ -154,6 +154,20 @@ def call_text(call: dict) -> str:
     return "\n".join([head, *blocks]) if blocks else head
 
 
+def live_step(payload: dict) -> Step:
+    """The part one in-flight announcement renders as (see the graph's
+    ``on_step``): a call as it is made, or the result as it lands.
+
+    The same rendering the finished turn gets, so a step the user opened while
+    it was running reads identically once it is folded into its thinking box.
+    """
+    if payload.get("kind") == "call":
+        return Step(
+            kind="call", text=call_text(payload), tool=str(payload.get("tool") or "")
+        )
+    return Step(kind="step", text=str(payload.get("text", "")))
+
+
 def _clip(text: str) -> str:
     if len(text) <= ARGUMENTS_CHARS:
         return text

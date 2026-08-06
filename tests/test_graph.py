@@ -616,6 +616,114 @@ class TestCallState:
         assert [c["after"] for c in result.calls] == [1, 4]
 
 
+class TestLiveSteps:
+    """Each call and its result are announced as they happen, so the chat can
+    show the work while the turn runs instead of only once it is over."""
+
+    def collector(self):
+        steps: list[tuple[str, dict]] = []
+        return steps, lambda sid, step: steps.append((sid, step))
+
+    async def test_call_is_announced_before_its_result(self, tools):
+        steps, on_step = self.collector()
+        llm = FakeLLM([tool_json("echo", text="hi"), respond_json("done")])
+        graph = build_graph(
+            llm=llm, tools=tools, checkpointer=InMemorySaver(), on_step=on_step
+        )
+        await run_turn(graph, session_id="l1", user_text="echo hi")
+        assert [s["kind"] for _, s in steps] == ["call", "step"]
+        assert [sid for sid, _ in steps] == ["l1", "l1"]
+        assert steps[0][1]["tool"] == "echo"
+        assert steps[1][1]["text"] == "[tool result] echo: echo: hi"
+
+    async def test_the_call_is_announced_before_the_tool_runs(self, tools):
+        # The point of the whole thing: a long tool must be on screen while it
+        # is running, not after.
+        seen: list[list[str]] = []
+        steps, on_step = self.collector()
+
+        async def slow(args, ctx):
+            seen.append([s["kind"] for _, s in steps])  # what was announced by now
+            return "eventually"
+
+        tools.register(
+            Tool(name="slow", description="Takes a while", params=EchoParams,
+                 handler=slow)
+        )
+        llm = FakeLLM([tool_json("slow", text="x"), respond_json("done")])
+        graph = build_graph(
+            llm=llm, tools=tools, checkpointer=InMemorySaver(), on_step=on_step
+        )
+        await run_turn(graph, session_id="l2", user_text="go")
+        assert seen == [["call"]]
+
+    async def test_a_failing_tool_announces_the_error(self, tools):
+        steps, on_step = self.collector()
+
+        async def boom(args, ctx):
+            raise RuntimeError("no such path")
+
+        tools.register(
+            Tool(name="boom", description="Fails", params=EchoParams, handler=boom)
+        )
+        llm = FakeLLM([tool_json("boom", text="x"), respond_json("ok")])
+        graph = build_graph(
+            llm=llm, tools=tools, checkpointer=InMemorySaver(), on_step=on_step
+        )
+        await run_turn(graph, session_id="l3", user_text="go")
+        assert [s["kind"] for _, s in steps] == ["call", "step"]
+        assert steps[1][1]["text"].startswith("[tool error] boom")
+
+    async def test_a_gated_call_is_announced_once_and_only_after_the_answer(
+        self, tools
+    ):
+        # interrupt() re-runs the node from the top on resume, so announcing
+        # above the gate would say it twice — and would announce a call the
+        # user has not answered for yet.
+        steps, on_step = self.collector()
+        llm = FakeLLM([tool_json("delete", target="results/"), respond_json("gone")])
+        graph = build_graph(
+            llm=llm, tools=tools, checkpointer=InMemorySaver(), on_step=on_step
+        )
+        await run_turn(graph, session_id="l4", user_text="delete results")
+        assert steps == []  # parked on the gate: nothing has been done yet
+        await run_turn(
+            graph, session_id="l4", resume=Command(resume={"approved": True})
+        )
+        assert [s["kind"] for _, s in steps] == ["call", "step"]
+
+    async def test_a_refused_call_announces_the_refusal(self, tools):
+        steps, on_step = self.collector()
+        llm = FakeLLM([tool_json("delete", target="results/"), respond_json("ok")])
+        graph = build_graph(
+            llm=llm, tools=tools, checkpointer=InMemorySaver(), on_step=on_step
+        )
+        await run_turn(graph, session_id="l5", user_text="delete results")
+        await run_turn(
+            graph, session_id="l5", resume=Command(resume={"approved": False})
+        )
+        assert [s["kind"] for _, s in steps] == ["call", "step"]
+        assert "DENIED" in steps[1][1]["text"]
+
+    async def test_the_plan_still_lands_and_only_on_a_real_run(self, tools):
+        # update_plan writes its checklist into the state; a refused or failed
+        # call must not.
+        from hpca.agent.modes import add_plan_tool
+
+        add_plan_tool(tools)
+        llm = FakeLLM(
+            [
+                tool_json(
+                    "update_plan", steps=[{"text": "find the BAM", "done": False}]
+                ),
+                respond_json("planned"),
+            ]
+        )
+        graph = make_graph(llm, tools)
+        result = await run_turn(graph, session_id="l6", user_text="plan it")
+        assert result.plan == [{"text": "find the BAM", "done": False}]
+
+
 class TestNewThisTurn:
     async def test_first_new_marks_the_turns_own_messages(self, tools):
         llm = FakeLLM([respond_json("a"), respond_json("b")])

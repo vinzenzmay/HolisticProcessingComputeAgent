@@ -9,8 +9,10 @@ import asyncio
 import json
 
 import pytest
+from pydantic import BaseModel, Field
 from textual.widgets import ListView, Static
 
+from hpca.agent.tools import Tool, ToolRegistry
 from hpca.llm import ChatResponse
 from hpca.tui.app import (
     LLM_WAIT_ACTIVITY,
@@ -47,21 +49,87 @@ class BlockingLLM:
         return True
 
 
+class SlowTool:
+    """A tool that parks mid-run, so the turn genuinely sits in its "running
+    slow_tool" phase — the other half of what an interrupt has to cover."""
+
+    def __init__(self):
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    def reset(self):
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def handler(self, args, ctx):
+        self.entered.set()
+        await self.release.wait()
+        return "finished at last"
+
+
+SLOW_TOOL = SlowTool()
+
+
+class SlowParams(BaseModel):
+    text: str = Field(default="", description="ignored")
+
+
+def blocking_tools():
+    SLOW_TOOL.reset()
+    registry = ToolRegistry()
+    registry.register(
+        Tool(
+            name="slow_tool",
+            description="Takes its time",
+            params=SlowParams,
+            handler=SLOW_TOOL.handler,
+        )
+    )
+    return registry
+
+
+class ToolThenAnswerLLM:
+    """Calls the slow tool once, then answers."""
+
+    def __init__(self):
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self._calls = 0
+
+    async def chat(self, messages, *, json_schema=None, **kwargs):
+        if is_title_request(json_schema):
+            return ChatResponse(content=TITLE_REPLY)
+        self._calls += 1
+        if self._calls == 1:
+            return ChatResponse(
+                content=json.dumps(
+                    {"action": "tool_call", "tool": "slow_tool", "arguments": {}}
+                )
+            )
+        return ChatResponse(
+            content=json.dumps({"action": "respond", "response": "done"})
+        )
+
+    async def supports_constrained_decoding(self):
+        return True
+
+
 @pytest.fixture
 def hpca_home(monkeypatch, tmp_path):
     monkeypatch.setenv("HPCA_HOME", str(tmp_path))
     return tmp_path
 
 
-async def send_and_park(app, pilot, text):
-    """Submit a message and wait until the turn is parked on the LLM."""
+async def send_and_park(app, pilot, text, until=None):
+    """Submit a message and wait until the turn reaches the phase under test —
+    parked on the LLM by default, or on whatever ``until`` is set by."""
     await app.start_new_session()
     await pilot.pause()
     chat_input = app.query_one("#chat-input", ChatInput)
     chat_input.focus()
     chat_input.text = text
     await pilot.press("enter")
-    await asyncio.wait_for(app._llm.entered.wait(), timeout=5)
+    await asyncio.wait_for((until or app._llm.entered).wait(), timeout=5)
     await pilot.pause()
 
 
@@ -83,11 +151,36 @@ class TestArming:
             assert app.query(WorkingIndicator)  # sits at the end of the log
             app._llm.release.set()
 
-    def test_indicator_hints_at_interrupt_only_while_on_the_llm(self):
-        assert "enter to interrupt" in WorkingIndicator(LLM_WAIT_ACTIVITY)._frame_text()
-        # a tool step or plain "working" is not interruptible: no hint
-        assert "enter to interrupt" not in WorkingIndicator("run_bash")._frame_text()
-        assert "enter to interrupt" not in WorkingIndicator()._frame_text()
+    def test_the_hint_follows_what_can_actually_be_interrupted(self):
+        # Not the phase: a turn is abortable while it runs a tool just as much
+        # as while it waits on the model. What is not abortable is a spinner
+        # with no turn behind it — a silent backend call.
+        for activity in (LLM_WAIT_ACTIVITY, "running run_bash", "working"):
+            hint = WorkingIndicator(activity, interruptible=True)._frame_text()
+            assert "enter to interrupt" in hint, activity
+        assert "enter to interrupt" not in WorkingIndicator(LLM_WAIT_ACTIVITY)._frame_text()
+
+    async def test_a_turn_running_a_tool_is_interruptible(self, hpca_home):
+        # The phase a long script spends its minutes in — and the one a user
+        # most wants to stop.
+        app = HpcaApp(llm=ToolThenAnswerLLM(), tools=blocking_tools())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await send_and_park(app, pilot, "run the thing", until=SLOW_TOOL.entered)
+            assert app._active_turn().activity == "running slow_tool"
+            assert app._can_interrupt()
+            indicator = app.query_one(WorkingIndicator)
+            assert "enter to interrupt" in indicator._frame_text()
+
+            await select_working_indicator(app, pilot)
+            assert isinstance(app.screen, ConfirmScreen)
+            await pilot.press("y")
+            await pilot.pause()
+            SLOW_TOOL.release.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            # rolled back and handed back for editing, as from the LLM phase
+            assert app.active_session.session_id not in app._turns
+            assert app.query_one(ChatInput).text == "run the thing"
 
     async def test_no_dialog_when_not_waiting_on_the_llm(self, hpca_home):
         app = HpcaApp(llm=BlockingLLM())

@@ -100,6 +100,50 @@ class TestVerticalNavigation:
             assert app.focused is app.query_one("#chat-list", ListView)
             assert chat_input.text == WRAPPING_DRAFT  # draft kept
 
+    async def test_arrows_traverse_the_body_of_a_slash_command(self, hpca_home):
+        """The command menu takes ↑/↓ to move its selection. It must give them
+        back the moment the command is chosen — otherwise every draft that
+        opens with "/" (or "\\") is untraversable for as long as it is being
+        written, which is exactly when the user needs to move around in it."""
+        app = make_app()
+        async with app.run_test(size=(110, 30)) as pilot:
+            chat_input = await seed_chat(pilot, app)
+            chat_input.focus()
+            chat_input.text = "/plan write me a\nmulti-line request"
+            await pilot.pause()
+            assert not app.command_menu_active()  # past the name, into the body
+
+            chat_input.move_cursor(chat_input.document.end)
+            before = chat_input.cursor_location
+            await pilot.press("up")
+            await pilot.pause()
+            assert app.focused is chat_input
+            assert chat_input.cursor_location != before
+
+            await pilot.press("down")
+            await pilot.pause()
+            assert chat_input.cursor_location == before
+
+    async def test_arrows_still_pick_a_command_while_the_name_is_typed(
+        self, hpca_home
+    ):
+        # The other half of the same rule: while the name is still being typed
+        # the menu owns ↑/↓, and the draft must not move under them.
+        app = make_app()
+        async with app.run_test(size=(110, 30)) as pilot:
+            chat_input = await seed_chat(pilot, app)
+            chat_input.focus()
+            chat_input.text = "/skill"
+            await pilot.pause()
+            assert app.command_menu_active()
+            chat_input.move_cursor(chat_input.document.end)
+            before = chat_input.cursor_location
+
+            await pilot.press("down")
+            await pilot.pause()
+            assert app._command_index == 1  # the menu moved
+            assert chat_input.cursor_location == before  # the cursor did not
+
     async def test_down_then_up_round_trips_within_the_draft(self, hpca_home):
         app = make_app()
         async with app.run_test(size=(110, 30)) as pilot:

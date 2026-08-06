@@ -60,6 +60,23 @@ class TestMatching:
                 "skill-remove",
             }
 
+    async def test_the_menu_closes_once_the_command_is_chosen(self, hpca_home):
+        """A space after the name means the command is settled and what
+        follows is its arguments. The menu has nothing left to offer, and
+        keeping it open would hold on to ↑/↓ while the user writes the body."""
+        app = HpcaApp()
+        async with app.run_test(size=(120, 40)):
+            app._update_command_menu("/conclude")
+            assert app.command_menu_active()
+            for draft in (
+                "/conclude ",  # the space alone settles it
+                "/conclude what I learned today",
+                "/conclude first line\nsecond line",  # shift+enter body
+            ):
+                app._update_command_menu(draft)
+                assert not app.command_menu_active(), draft
+                assert not app.query_one("#command-menu").display
+
     async def test_no_match_hides_the_menu(self, hpca_home):
         app = HpcaApp()
         async with app.run_test(size=(120, 40)):

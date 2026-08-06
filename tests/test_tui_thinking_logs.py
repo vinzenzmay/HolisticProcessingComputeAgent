@@ -1,5 +1,6 @@
 """The thinking box in the chat window, and plain-text session logging."""
 
+import asyncio
 import json
 
 import pytest
@@ -9,7 +10,14 @@ from textual.widgets import ListView, Static
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.config import Settings
 from hpca.llm import ChatResponse
-from hpca.tui.app import ChatInput, DecisionBar, HpcaApp, StepBox, ThinkingBox
+from hpca.tui.app import (
+    ChatInput,
+    DecisionBar,
+    HpcaApp,
+    StepBox,
+    ThinkingBox,
+    WorkingIndicator,
+)
 
 
 def is_title_request(json_schema):
@@ -363,6 +371,104 @@ class TestToolCallBoxes:
             text = log_text(logs_dir)
             assert "[tool call] run_bash" in text
             assert "echo job-42" in text
+
+
+class TestLiveSteps:
+    """A turn shows its work while it works. The spinner alone says only that
+    something is happening, not what — and a tool can run for minutes."""
+
+    async def test_the_call_is_on_screen_while_the_tool_runs(self, hpca_home):
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def slow(args, ctx):
+            entered.set()
+            await release.wait()
+            return "eventually"
+
+        registry = ToolRegistry()
+        registry.register(
+            Tool(
+                name="scan_cohort",
+                description="Scans",
+                params=AskParams,
+                handler=slow,
+            )
+        )
+        app = HpcaApp(
+            llm=FakeLLM(
+                [
+                    tool_json("scan_cohort", question="how many BAMs?"),
+                    respond_json("four"),
+                ]
+            ),
+            tools=registry,
+        )
+        app.settings.agent.default_mode = "auto"
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            chat_input = app.query_one("#chat-input", ChatInput)
+            chat_input.focus()
+            chat_input.text = "count the BAMs"
+            await pilot.press("enter")
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            await pilot.pause()
+
+            # Mid-run: the call is already a row, and it says what is running.
+            steps = list(app.query(StepBox))
+            assert [s._step.label() for s in steps] == ["scan_cohort (call)"]
+            assert "how many BAMs?" in steps[0]._step.text
+            # and the spinner is still below it, where the turn continues
+            assert app.query(WorkingIndicator)
+
+            release.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            # Once the turn is over the rows fold into the turn's own box.
+            assert not app.query(WorkingIndicator)
+            assert [b._entry.summary() for b in app.query(ThinkingBox)] == ["1 step"]
+            assert list(app.query(StepBox)) == []
+
+    async def test_a_live_row_opens_without_a_box_above_it(self, hpca_home):
+        # The rows arrive before the thinking box that will own them exists;
+        # opening one mid-turn must not go looking for a parent that is not
+        # there yet.
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def slow(args, ctx):
+            entered.set()
+            await release.wait()
+            return "eventually"
+
+        registry = ToolRegistry()
+        registry.register(
+            Tool(name="scan", description="Scans", params=AskParams, handler=slow)
+        )
+        app = HpcaApp(
+            llm=FakeLLM([tool_json("scan", question="what?"), respond_json("this")]),
+            tools=registry,
+        )
+        app.settings.agent.default_mode = "auto"
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            chat_input = app.query_one("#chat-input", ChatInput)
+            chat_input.focus()
+            chat_input.text = "look"
+            await pilot.press("enter")
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            await pilot.pause()
+
+            chat_list = app.query_one("#chat-list", ListView)
+            chat_list.focus()
+            chat_list.index = 1  # the live call row
+            await pilot.press("enter")
+            await pilot.pause()
+            step = app.query_one(StepBox)
+            assert step.expanded
+            assert "what?" in str(step.content)
+
+            release.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
 
 
 class TestEntryStyling:
