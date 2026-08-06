@@ -93,7 +93,9 @@ SCRIPT_GUIDANCE = (
     "refuses an existing path, and create_script's key must be new, so it "
     "would leave the old file sitting there beside a second copy. Read the "
     "file first and copy the lines into old_lines exactly as they appear, "
-    "spacing and all."
+    "spacing and all. On a long file read_file shows one window at a time: "
+    "page through with start_line, as each result suggests, until you have "
+    "seen the exact region you will edit."
 )
 
 

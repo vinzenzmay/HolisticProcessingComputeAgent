@@ -581,6 +581,221 @@ class TestEditFile:
             )
 
 
+class TestEditRepairAndFuzz:
+    """Absorb model imperfection inside the tool (PI-style): repair the
+    arguments and climb a matching ladder instead of bouncing a near-miss back
+    for another round-trip plus a re-read of the file."""
+
+    @pytest.fixture
+    def notes(self, ctx, tmp_path):
+        # .txt on purpose: no §5.2 gate, these tests are about matching only
+        path = tmp_path / "notes.txt"
+        path.write_text("alpha\nbravo\ncharlie\n")
+        ctx.registry.register("notes", path)
+        return path
+
+    async def test_embedded_newlines_in_old_and_new_lines_are_split(
+        self, tools, ctx, notes
+    ):
+        # One array element holding two lines still means two lines.
+        result = await call(
+            tools, "edit_file", ctx,
+            registry_key="notes",
+            old_lines=["alpha\nbravo"],
+            new_lines=["one\ntwo", "three"],
+        )
+        assert notes.read_text() == "one\ntwo\nthree\ncharlie\n"
+        assert "2 lines → 3 lines" in result
+
+    async def test_numbered_listing_prefixes_are_stripped_when_all_carry_one(
+        self, tools, ctx, notes
+    ):
+        # A model copying read_file's numbered listing verbatim.
+        result = await call(
+            tools, "edit_file", ctx,
+            registry_key="notes",
+            old_lines=["2: bravo", "3: charlie"],
+            new_lines=["BRAVO"],
+        )
+        assert notes.read_text() == "alpha\nBRAVO\n"
+        assert "Edited" in result
+
+    async def test_a_partially_numbered_copy_is_not_stripped(
+        self, tools, ctx, notes
+    ):
+        # One prefixed line among plain ones is genuine content, not a copied
+        # listing — refuse rather than mangle.
+        before = notes.read_text()
+        result = await call(
+            tools, "edit_file", ctx,
+            registry_key="notes",
+            old_lines=["2: bravo", "charlie"],
+            new_lines=["x"],
+        )
+        assert "NOT edited" in result
+        assert notes.read_text() == before
+
+    async def test_genuine_numbered_content_matches_before_stripping(
+        self, tools, ctx, tmp_path
+    ):
+        # A YAML-ish "12: value" that really is in the file must match as-is;
+        # stripping is a fallback for lines that match nothing.
+        path = tmp_path / "map.txt"
+        path.write_text("11: ten\n12: twelve\n")
+        ctx.registry.register("map", path)
+        await call(
+            tools, "edit_file", ctx,
+            registry_key="map",
+            old_lines=["12: twelve"],
+            new_lines=["12: TWELVE"],
+        )
+        assert path.read_text() == "11: ten\n12: TWELVE\n"
+
+    async def test_trailing_whitespace_in_the_file_is_forgiven_and_applied(
+        self, tools, ctx, tmp_path
+    ):
+        # The model cannot even see a trailing space in the file; asking it to
+        # copy one is a wasted round-trip. new_lines land verbatim.
+        path = tmp_path / "pad.txt"
+        path.write_text("keep\nfix me  \nkeep too\n")
+        ctx.registry.register("pad", path)
+        result = await call(
+            tools, "edit_file", ctx,
+            registry_key="pad",
+            old_lines=["fix me"],
+            new_lines=["fixed"],
+        )
+        assert path.read_text() == "keep\nfixed\nkeep too\n"
+        assert "Edited" in result
+
+    async def test_smart_quotes_and_dashes_are_forgiven_and_applied(
+        self, tools, ctx, tmp_path
+    ):
+        # File written with typographic quotes/dashes, model sends ASCII.
+        path = tmp_path / "prose.txt"
+        path.write_text("start\nsay ‘hi’ — loudly\nend\n")
+        ctx.registry.register("prose", path)
+        await call(
+            tools, "edit_file", ctx,
+            registry_key="prose",
+            old_lines=["say 'hi' - loudly"],
+            new_lines=["say 'bye'"],
+        )
+        assert path.read_text() == "start\nsay 'bye'\nend\n"
+
+    async def test_leading_whitespace_is_still_meaning_not_fuzz(
+        self, tools, ctx, tmp_path
+    ):
+        # Indentation is meaning (Python); the ladder never strips it, the
+        # near-miss advice still points at the line.
+        path = tmp_path / "code.txt"
+        path.write_text("def f():\n    return 1\n")
+        ctx.registry.register("code", path)
+        result = await call(
+            tools, "edit_file", ctx,
+            registry_key="code",
+            old_lines=["return 1"],
+            new_lines=["return 2"],
+        )
+        assert "NOT edited" in result and "line 2" in result
+        assert path.read_text() == "def f():\n    return 1\n"
+
+    async def test_ambiguity_at_a_fuzzy_level_is_still_refused(
+        self, tools, ctx, tmp_path
+    ):
+        # Two lines that only differ in trailing whitespace both match at the
+        # rstrip level — that is 2 occurrences, not a rescue.
+        path = tmp_path / "twice.txt"
+        path.write_text("echo hi  \nmid\necho hi\t\n")
+        ctx.registry.register("twice", path)
+        before = path.read_text()
+        result = await call(
+            tools, "edit_file", ctx,
+            registry_key="twice",
+            old_lines=["echo hi"],
+            new_lines=["echo bye"],
+        )
+        assert "NOT edited" in result and "2 times" in result
+        assert path.read_text() == before
+
+    async def test_a_crlf_file_keeps_its_line_endings(self, tools, ctx, tmp_path):
+        path = tmp_path / "win.txt"
+        path.write_bytes(b"alpha\r\nbravo\r\ncharlie\r\n")
+        ctx.registry.register("win", path)
+        await call(
+            tools, "edit_file", ctx,
+            registry_key="win",
+            old_lines=["bravo"],
+            new_lines=["BRAVO"],
+        )
+        assert path.read_bytes() == b"alpha\r\nBRAVO\r\ncharlie\r\n"
+
+    async def test_a_bom_survives_the_edit(self, tools, ctx, tmp_path):
+        path = tmp_path / "bom.txt"
+        path.write_bytes("﻿alpha\nbravo\n".encode())
+        ctx.registry.register("bom", path)
+        await call(
+            tools, "edit_file", ctx,
+            registry_key="bom",
+            old_lines=["alpha"],
+            new_lines=["ALPHA"],
+        )
+        assert path.read_bytes() == "﻿ALPHA\nbravo\n".encode()
+
+    async def test_an_identical_replacement_is_an_error_not_a_write(
+        self, tools, ctx, notes
+    ):
+        result = await call(
+            tools, "edit_file", ctx,
+            registry_key="notes",
+            old_lines=["bravo"],
+            new_lines=["bravo"],
+        )
+        assert "NOT edited" in result and "identical" in result
+        assert ctx.trash.list() == []  # nothing written, nothing backed up
+
+    async def test_success_is_one_short_line_without_the_undo_lecture(
+        self, tools, ctx, notes
+    ):
+        result = await call(
+            tools, "edit_file", ctx,
+            registry_key="notes",
+            old_lines=["bravo"],
+            new_lines=["BRAVO"],
+        )
+        assert result == f"Edited {notes} at line 2: 1 line → 1 line."
+        assert ctx.trash.list()  # the backup itself is still kept
+
+    async def test_success_warns_only_when_no_backup_could_be_kept(
+        self, tools, ctx, tmp_path
+    ):
+        from hpca.trash import TrashManager
+
+        ctx.trash = TrashManager(tmp_path / "trash", backup_limit_bytes=2)
+        path = tmp_path / "big.txt"
+        path.write_text("more than two bytes\n")
+        ctx.registry.register("big", path)
+        result = await call(
+            tools, "edit_file", ctx,
+            registry_key="big",
+            old_lines=["more than two bytes"],
+            new_lines=["tiny"],
+        )
+        assert "NO backup" in result and "cannot be undone" in result
+
+    async def test_create_file_splits_embedded_newlines_too(
+        self, tools, ctx, tmp_path
+    ):
+        ctx.registry.register("project", tmp_path)
+        result = await call(
+            tools, "create_file", ctx,
+            dir_key="project", name="notes.md",
+            content_lines=["a\nb", "c"],
+        )
+        assert (tmp_path / "notes.md").read_text() == "a\nb\nc\n"
+        assert "3 lines" in result
+
+
 class TestEditSyntaxGate:
     """§5.2's mandatory gate must not be reachable around: an edit rewrites a
     script's content exactly as create_script does."""
