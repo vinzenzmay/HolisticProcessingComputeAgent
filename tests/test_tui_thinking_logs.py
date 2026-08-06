@@ -9,7 +9,7 @@ from textual.widgets import ListView, Static
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.config import Settings
 from hpca.llm import ChatResponse
-from hpca.tui.app import ChatInput, HpcaApp, StepBox, ThinkingBox
+from hpca.tui.app import ChatInput, DecisionBar, HpcaApp, StepBox, ThinkingBox
 
 
 def is_title_request(json_schema):
@@ -170,7 +170,8 @@ class TestThinkingBox:
     async def test_parts_are_individually_navigable_and_hold_the_highlight(
         self, hpca_home
     ):
-        # A turn with reasoning, a tool step, then more reasoning: three parts.
+        # A turn with reasoning, a tool call and its result, then more
+        # reasoning: four parts.
         app = HpcaApp(
             llm=FakeLLM(
                 [
@@ -192,20 +193,22 @@ class TestThinkingBox:
 
             steps = list(app.query(StepBox))
             assert [s._step.label() for s in steps] == [
-                "reasoning", "ask_docs", "reasoning"
+                "reasoning", "ask_docs (call)", "ask_docs", "reasoning"
             ]
             assert all(not s.expanded for s in steps)  # each revealed collapsed
             assert chat_list.index == 1  # highlight kept on the box
 
-            # Open the middle step (the tool) individually; the others stay shut.
+            # Open the tool's result individually; the others stay shut.
             await pilot.press("down")  # first reasoning
-            await pilot.press("down")  # the ask_docs step
-            assert chat_list.index == 3
+            await pilot.press("down")  # the ask_docs call
+            await pilot.press("down")  # the ask_docs result
+            assert chat_list.index == 4
             await pilot.press("enter")
             await pilot.pause()
-            assert steps[1].expanded and not steps[0].expanded and not steps[2].expanded
-            assert "binary alignment map" in str(steps[1].content)
-            assert chat_list.index == 3  # still on the same step
+            assert steps[2].expanded
+            assert not any(s.expanded for s in (steps[0], steps[1], steps[3]))
+            assert "binary alignment map" in str(steps[2].content)
+            assert chat_list.index == 4  # still on the same step
 
             # Collapse the box: every step row goes away, highlight back on it.
             chat_list.index = 1
@@ -238,6 +241,128 @@ class TestThinkingBox:
             await pilot.press("enter")  # open the step
             await pilot.pause()
             assert "Thought hard." in str(app.query_one(StepBox).content)
+
+
+async def expand_box(app, pilot, index=1):
+    """Open the thinking box at ``index`` and return its revealed step rows."""
+    chat_list = app.query_one("#chat-list", ListView)
+    chat_list.focus()
+    chat_list.index = index
+    await pilot.press("enter")
+    await pilot.pause()
+    return list(app.query(StepBox))
+
+
+class TestToolCallBoxes:
+    """The script and the command the agent ran stay readable in the chat
+    after the approval prompt that showed them is gone — and in auto mode,
+    where no prompt ever showed them."""
+
+    async def test_the_approved_script_stays_readable_in_the_chat(self, hpca_home):
+        # Manual mode: the prompt shows the script, the user runs it, and the
+        # prompt disappears. The script must not disappear with it.
+        app = HpcaApp(
+            llm=FakeLLM(
+                [
+                    tool_json("run_bash", content_lines=["echo cohort-listing"]),
+                    respond_json("four BAMs"),
+                ]
+            )
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "what is in the cohort?")
+            await pilot.press("y")  # run script
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert not app.query_one("#decision-bar", DecisionBar).display
+            steps = await expand_box(app, pilot)
+            assert [s._step.label() for s in steps] == ["run_bash (call)", "run_bash"]
+            # revealed collapsed: the script is a box you open, not a wall
+            assert all(not s.expanded for s in steps)
+            assert "echo cohort-listing" not in str(steps[0].content)
+
+            await pilot.press("down")  # onto the call row
+            await pilot.press("enter")  # open it
+            await pilot.pause()
+            assert steps[0].expanded
+            assert "echo cohort-listing" in str(steps[0].content)
+
+    async def test_a_skipped_script_is_still_there_to_read(self, hpca_home):
+        app = HpcaApp(
+            llm=FakeLLM(
+                [
+                    tool_json("run_bash", content_lines=["echo scratch-cleanup"]),
+                    respond_json("understood"),
+                ]
+            )
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "clean up")
+            await pilot.press("n")  # skip script
+            await pilot.pause()
+            await pilot.press("enter")  # without a reason
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            steps = await expand_box(app, pilot)
+            assert steps[0]._step.label() == "run_bash (call)"
+            assert "echo scratch-cleanup" in steps[0]._step.text
+            assert "SKIPPED" in steps[1]._step.text
+
+    async def test_auto_mode_shows_what_ran_unasked(self, hpca_home):
+        # Nothing gates here, so this box is the only account of what ran.
+        app = HpcaApp(
+            llm=FakeLLM(
+                [
+                    tool_json("run_bash", content_lines=["echo auto-run"]),
+                    respond_json("done looking"),
+                ]
+            )
+        )
+        app.settings.agent.default_mode = "auto"
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "check something")
+            assert not app.query_one("#decision-bar", DecisionBar).display
+            steps = await expand_box(app, pilot)
+            assert "echo auto-run" in steps[0]._step.text
+
+    async def test_the_script_survives_reopening_the_session(self, hpca_home):
+        app = HpcaApp(
+            llm=FakeLLM(
+                [
+                    tool_json("run_bash", content_lines=["echo still-here"]),
+                    respond_json("nothing queued"),
+                ]
+            )
+        )
+        app.settings.agent.default_mode = "auto"
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "anything running?")
+            session = app.active_session
+            await app.start_new_session()
+            await pilot.pause()
+            await app.open_session(session)
+            await pilot.pause()
+            steps = await expand_box(app, pilot)
+            await pilot.press("down")  # onto the call row
+            await pilot.press("enter")  # open it
+            await pilot.pause()
+            assert "echo still-here" in str(steps[0].content)
+
+    async def test_the_call_is_written_to_the_session_log(self, logs_dir):
+        app = HpcaApp(
+            llm=FakeLLM(
+                [
+                    tool_json("run_bash", content_lines=["echo job-42"]),
+                    respond_json("it failed"),
+                ]
+            )
+        )
+        app.settings.agent.default_mode = "auto"
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "why did job 42 fail?")
+            text = log_text(logs_dir)
+            assert "[tool call] run_bash" in text
+            assert "echo job-42" in text
 
 
 class TestEntryStyling:

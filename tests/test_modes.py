@@ -21,6 +21,7 @@ from hpca.agent.modes import (
     next_mode,
     render_checklist,
     requires_execution_approval,
+    script_preview,
     skipped_message,
 )
 from hpca.agent.tools import Tool, ToolRegistry
@@ -201,6 +202,44 @@ class TestHelpers:
         for mode in (*MODES, None):
             assert continue_nudge_for(mode, "here is my answer") is None
             assert continue_nudge_for(mode, "Let me dig into the source.") is not None
+
+
+class TestScriptPreview:
+    """What the approval prompt — and now every recorded call — shows as the
+    thing that would run."""
+
+    @pytest.fixture
+    def ctx(self, tmp_path):
+        import types
+
+        script = tmp_path / "align.sh"
+        script.write_text("#!/usr/bin/env bash\nbwa mem ref.fa in.fq\n")
+
+        class Registry:
+            def resolve(self, key):
+                return script
+
+        return types.SimpleNamespace(registry=Registry())
+
+    def test_written_lines_are_the_script(self, ctx):
+        preview = script_preview(
+            "run_bash", {"content_lines": ["ls /data", "wc -l"]}, ctx
+        )
+        assert preview == "ls /data\nwc -l"
+
+    def test_a_registered_script_being_run_is_shown(self, ctx):
+        preview = script_preview(
+            "start_background_script", {"registry_key": "align", "args": "-t 4"}, ctx
+        )
+        assert "bwa mem ref.fa in.fq" in preview
+        assert "align.sh (args: -t 4)" in preview
+
+    def test_a_registry_key_pointing_at_data_is_not_a_script(self, ctx):
+        # read_file, delete_file and friends take a registry key too. Their
+        # target is data, not something that runs: dumping its contents would
+        # neither describe the call nor be what the user needs to judge it.
+        for tool in ("read_file", "delete_file", "move_file", "copy_file"):
+            assert script_preview(tool, {"registry_key": "align"}, ctx) is None
 
 
 class TestManualMode:

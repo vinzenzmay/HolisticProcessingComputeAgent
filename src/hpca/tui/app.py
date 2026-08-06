@@ -536,7 +536,11 @@ class StepBox(Static):
     with no special-casing."""
 
     def __init__(self, step: Step, *, expanded: bool = False) -> None:
-        super().__init__(classes="chat-step")
+        # A call is marked apart from the reasoning and results around it: it
+        # is the row that holds the script, and the one the user comes back to
+        # the log to read.
+        classes = "chat-step chat-step-call" if step.kind == "call" else "chat-step"
+        super().__init__(classes=classes)
         self._step = step
         self._collapsed = not expanded
         self._render_step()
@@ -1067,6 +1071,11 @@ class HpcaApp(App):
         color: $text-muted;
         margin-left: 2;
         padding: 0 1;
+    }
+    /* The call rows carry the script and the command; a rule down their left
+       edge picks them out of a long turn without framing them like a message. */
+    .chat-step-call {
+        border-left: outer $warning;
     }
     .chat-error {
         border: round $error;
@@ -2158,7 +2167,9 @@ class HpcaApp(App):
         self.hide_working()
         await self._log_turn(result, log, session)
         if self._is_active_session(session):
-            await self._set_chat_messages(result.messages, result.thinking)
+            await self._set_chat_messages(
+                result.messages, result.thinking, result.calls
+            )
             await self.refresh_watchers()
         else:
             # The reply belongs to a session the user has left: never yank
@@ -2205,7 +2216,7 @@ class HpcaApp(App):
         in tool vocabulary.
         """
         entries = build_entries(
-            result.messages, result.thinking, start=result.first_new
+            result.messages, result.thinking, result.calls, start=result.first_new
         )
         if log is not None:
             for entry in entries:
@@ -3393,7 +3404,9 @@ class HpcaApp(App):
         )
         values = snapshot.values or {}
         await self._set_chat_messages(
-            values.get("messages", []), values.get("thinking", [])
+            values.get("messages", []),
+            values.get("thinking", []),
+            values.get("calls", []),
         )
         self._show_context_estimate(values)
         self._updated.discard(session.session_id)  # its news is now on screen
@@ -4036,7 +4049,10 @@ class HpcaApp(App):
         return [entry.text for entry in self._chat_entries]
 
     async def _set_chat_messages(
-        self, messages: list[dict], thinking: list[dict] | None = None
+        self,
+        messages: list[dict],
+        thinking: list[dict] | None = None,
+        calls: list[dict] | None = None,
     ) -> None:
         # Tolerates the screen already being gone: a queued turn can start and
         # land its reply while the app shuts down, and the entries are still
@@ -4048,7 +4064,7 @@ class HpcaApp(App):
         # Fresh entries mean the old id()-keyed expansion state is stale (and
         # a recycled id could wrongly re-open a new box); start clean.
         self._thinking_expanded.clear()
-        for entry in build_entries(messages, thinking or []):
+        for entry in build_entries(messages, thinking or [], calls or []):
             self._add_chat_entry(entry)
         # Messages typed while a turn ran may not be in this copy of the graph,
         # and the rebuild would erase them from under the user. Two kinds: the
