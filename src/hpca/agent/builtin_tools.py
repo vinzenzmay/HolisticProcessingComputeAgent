@@ -27,6 +27,7 @@ from __future__ import annotations
 import re
 import sys
 import time
+from pathlib import Path
 from typing import Callable, Literal
 
 from pydantic import BaseModel, Field
@@ -38,6 +39,10 @@ from hpca.registry import RegistryError
 from hpca.verify_code import format_gate_failure, format_gate_warnings, verify_script
 
 SCRIPT_SUFFIX = {"bash": ".sh", "python": ".py", "R": ".R", "snakemake": ".smk"}
+# Which checker a file on disk answers to, read off its suffix — how edit_file
+# decides whether the content it is about to write is a script §5.2 must gate.
+# Anything else (.txt, .yaml, .csv) has no checker and is left to itself.
+KIND_BY_SUFFIX = {suffix: kind for kind, suffix in SCRIPT_SUFFIX.items()}
 RUN_TIMEOUT_DEFAULT = 60
 RUN_TIMEOUT_MAX = 600
 RUN_OUTPUT_LINES = 60  # per stream, before the model is pointed at the log
@@ -135,6 +140,51 @@ def _strict_bash(lines: list[str]) -> list[str]:
     return [strict, *lines]
 
 
+async def check_script_content(
+    kind: str, path: Path, content: str, ctx: ToolContext, *, refusal: str
+) -> tuple[str, list[str]]:
+    """§5.2's mandatory gate on one script's content: the syntax check first,
+    then the semantic code-vs-docs check against the indexed symbols.
+
+    Returns the model-facing refusal (empty when the content passes) and the
+    warnings a successful result should carry. ``path`` must already hold
+    ``content`` — the checkers read the file — and what happens to it either
+    way is the caller's: create_script unlinks a script it will not keep,
+    edit_file checks a scratch copy so the real file is never left broken.
+
+    Shared rather than duplicated because the gate is what makes §5.2
+    *mandatory*: a second way to put content into a script file would be a
+    second way around it.
+    """
+    check = await syntax_check(kind, path)
+    if not check.ok:
+        return (
+            f"{refusal}: {check.checker} found syntax errors — fix them and "
+            f"try again:\n{check.errors}"
+        ), []
+    warnings: list[str] = []
+    if check.skipped:
+        warnings.append(check.errors)
+    if ctx.symbols is not None:
+        # Learn the flags of the external programs this script drives before
+        # judging it. Without this the gate below has nothing to check for
+        # exactly the tools that matter (minimap2, samtools, ...), because
+        # index_docs is explicit-only and nothing ever calls it (§5.2, §5.6).
+        from hpca.agent.doc_tools import autoindex_script_commands
+
+        await autoindex_script_commands(kind, content, ctx)
+    if ctx.symbols is not None and ctx.symbols.count() > 0:
+        # semantic code-vs-docs gate (§5.2): mismatches block, gaps only warn
+        reports = verify_script(kind, content, index=ctx.symbols)
+        mismatches = [r for r in reports if r.status == "mismatch"]
+        if mismatches:
+            return format_gate_failure(mismatches, refusal=refusal), []
+        not_indexed = [r for r in reports if r.status == "not_indexed"]
+        if not_indexed:
+            warnings.append(format_gate_warnings(not_indexed))
+    return "", warnings
+
+
 async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
     ctx.scripts_dir.mkdir(parents=True, exist_ok=True)
     path = ctx.scripts_dir / f"{args.registry_key}{SCRIPT_SUFFIX[args.kind]}"
@@ -157,34 +207,12 @@ async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
         lines = _strict_bash(lines)
     content = "\n".join(lines) + "\n"
     path.write_text(content)
-    check = await syntax_check(args.kind, path)
-    if not check.ok:
-        path.unlink(missing_ok=True)
-        return (
-            f"Script NOT created: {check.checker} found syntax errors — fix "
-            f"the script and call create_script again:\n{check.errors}"
-        )
-    warnings: list[str] = []
-    if check.skipped:
-        warnings.append(check.errors)
-    if ctx.symbols is not None:
-        # Learn the flags of the external programs this script drives before
-        # judging it. Without this the gate below has nothing to check for
-        # exactly the tools that matter (minimap2, samtools, ...), because
-        # index_docs is explicit-only and nothing ever calls it (§5.2, §5.6).
-        from hpca.agent.doc_tools import autoindex_script_commands
-
-        await autoindex_script_commands(args.kind, content, ctx)
-    if ctx.symbols is not None and ctx.symbols.count() > 0:
-        # semantic code-vs-docs gate (§5.2): mismatches block, gaps only warn
-        reports = verify_script(args.kind, content, index=ctx.symbols)
-        mismatches = [r for r in reports if r.status == "mismatch"]
-        if mismatches:
-            path.unlink(missing_ok=True)
-            return format_gate_failure(mismatches)
-        not_indexed = [r for r in reports if r.status == "not_indexed"]
-        if not_indexed:
-            warnings.append(format_gate_warnings(not_indexed))
+    refused, warnings = await check_script_content(
+        args.kind, path, content, ctx, refusal="Script NOT created"
+    )
+    if refused:
+        path.unlink(missing_ok=True)  # never keep a script that failed the gate
+        return refused
     ctx.registry.register(args.registry_key, path)
     note = f" ({'; '.join(warnings)})" if warnings else ""
     strict = (

@@ -21,9 +21,11 @@ from hpca.llm import Message
 
 TOOL_PREFIXES = ("[tool result]", "[tool error]")
 CALL_PREFIX = "[tool call]"
-# The script itself, rendered as its own block below the other arguments
-# rather than as a JSON list of lines nobody can read.
-SCRIPT_ARG_KEYS = ("content_lines",)
+# The lines themselves — a script's, or the two sides of an edit — rendered as
+# their own block below the other arguments rather than as a JSON list of lines
+# nobody can read. Which file was edited stays an argument; what changed does
+# not, because the block already says it.
+SCRIPT_ARG_KEYS = ("content_lines", "old_lines", "new_lines")
 # Arguments are a display aid, not a record: a pathological call must not push
 # a wall of JSON into the chat (the script block has its own cap upstream).
 ARGUMENTS_CHARS = 2000

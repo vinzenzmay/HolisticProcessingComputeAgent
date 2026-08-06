@@ -11,10 +11,18 @@ a deletion writes is only reachable by the user digging through the app dir by
 hand, which is exactly what happened the first time someone asked for a file
 back. It takes the original path rather than a registry key — the key is gone,
 dropped by the deletion that created the backup.
+
+``edit_file`` is the one tool here that writes content. It exists for the cost:
+without it the only way to change a 400-line script is to re-send all 400 lines
+through ``create_script``, paying for the file twice in one window. It is held
+to the same rules as everything else that overwrites — the previous content is
+backed up, the call gates, and a script's edited content faces §5.2's syntax
+and code-vs-docs gate before it lands.
 """
 
 from __future__ import annotations
 
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -247,13 +255,207 @@ async def restore_file(args: RestoreFileParams, ctx: ToolContext) -> str:
     except FileExistsError:
         return (
             f"Cannot restore {entry.original_path}: a file already exists "
-            "there. Move or rename that file first, then restore again — the "
-            "backup is still in the trash."
+            "there. Move or rename that file first with move_file, then "
+            "restore again — the backup is still in the trash. Undoing an edit "
+            "always lands here, because the backup and the edited file share a "
+            "path. Do not delete the file to clear the path: that trashes it "
+            "under the same path too, and the restore would then bring back "
+            "what you were undoing."
         )
     except OSError as exc:
         return f"Could not restore {entry.original_path}: {exc}"
     key = ctx.registry.register_auto(restored, hint=restored.name)
     return f"Restored {restored}, registered as {key!r}."
+
+
+class EditFileParams(BaseModel):
+    registry_key: str = Field(description="Registry key of the file to edit")
+    subpath: str = Field(
+        default="",
+        description=(
+            "Path relative to registry_key when it names a directory, e.g. "
+            "'config/run.yaml'. Leave empty to edit the key itself."
+        ),
+    )
+    # Line arrays for the same reason create_script takes them: the live model
+    # fills string arrays reliably and mangles \n escapes in long strings.
+    old_lines: list[str] = Field(
+        min_length=1,
+        description=(
+            "The exact consecutive lines to replace, copied from read_file "
+            "without their line numbers — indentation and spacing included. "
+            "Include enough surrounding lines that they occur only once."
+        ),
+    )
+    new_lines: list[str] = Field(
+        default_factory=list,
+        description=(
+            "The lines to put in their place, one string per line. Send an "
+            "empty array to delete the old lines."
+        ),
+    )
+
+
+def _find_runs(haystack: list[str], needle: list[str]) -> list[int]:
+    """Every index where ``needle`` occurs as a run of whole lines.
+
+    Whole lines, not a substring of the file: the model is asked for lines, so
+    matching them as lines is what makes "occurs twice" mean what it says — and
+    keeps ``fi`` from matching inside ``pipefail``.
+    """
+    span = len(needle)
+    return [
+        index
+        for index in range(len(haystack) - span + 1)
+        if haystack[index : index + span] == needle
+    ]
+
+
+def _near_miss(file_lines: list[str], old_lines: list[str]) -> str:
+    """Where the lines nearly match, for the usual whitespace near-miss.
+
+    A model that mis-indents its copy gets back "line 12" instead of a flat
+    "not found", which is the difference between fixing the call and re-reading
+    the whole file.
+    """
+    stripped = [line.strip() for line in file_lines]
+    wanted = [line.strip() for line in old_lines]
+    hits = _find_runs(stripped, wanted)
+    if not hits:
+        return ""
+    where = ", ".join(f"line {index + 1}" for index in hits[:5])
+    return (
+        f" The same text ignoring leading/trailing whitespace is at {where} — "
+        "read the file again and copy the indentation exactly."
+    )
+
+
+def _edit_target(args: EditFileParams, ctx: ToolContext) -> Path:
+    return _source(ctx, args.registry_key, args.subpath)
+
+
+def _edit_resolvable(args: EditFileParams, ctx: ToolContext) -> bool:
+    # Overwriting a file's content is destructive (§5.3), so every edit that
+    # can actually run gates; a dud key goes to the error-feedback loop instead
+    # of asking the user to approve something that will not happen.
+    try:
+        return _edit_target(args, ctx).is_file()
+    except Exception:
+        return False
+
+
+def _lines(count: int) -> str:
+    return f"{count} line" if count == 1 else f"{count} lines"
+
+
+def _change(args: EditFileParams) -> str:
+    """The size of the change, in the one phrasing the prompt and the result
+    both use: "3 lines → 2 lines", or "3 lines deleted" when nothing goes back."""
+    if not args.new_lines:
+        return f"{_lines(len(args.old_lines))} deleted"
+    return f"{_lines(len(args.old_lines))} → {_lines(len(args.new_lines))}"
+
+
+def _describe_edit(args: EditFileParams, ctx: ToolContext) -> str:
+    path = _edit_target(args, ctx)
+    size = path.stat().st_size if path.is_file() else 0
+    backed_up = ctx.trash is not None and size < ctx.trash.backup_limit_bytes
+    backup_note = (
+        "the current file is copied to trash first"
+        if backed_up
+        else "NO BACKUP (file exceeds the backup size limit) — irreversible"
+    )
+    return f"edit {path}\n({_change(args)}; {backup_note})"
+
+
+def edit_preview(arguments: dict, ctx: object = None) -> str:
+    """One edit as the user judges it: the lines out, then the lines in.
+
+    The whole file is not the call — the change is — so this is what the
+    approval prompt and the chat's call box show (see ``modes.script_preview``).
+    Reads nothing and never raises: it runs on every call, and again whenever a
+    parked turn resumes.
+    """
+    out = [f"- {line}" for line in arguments.get("old_lines") or []]
+    into = [f"+ {line}" for line in arguments.get("new_lines") or []]
+    return "\n".join(out + into)
+
+
+async def edit_file(args: EditFileParams, ctx: ToolContext) -> str:
+    """Replace an exact run of lines in a registered file.
+
+    The point is the file that stays: a one-line fix to a 400-line script costs
+    the two lines, not the script twice over (once read, once rewritten). What
+    it must not become is a way around the rest of §5: the previous content
+    goes to the trash exactly as a deletion's would, and when the file is a
+    script the edited content faces §5.2's gate before it is written — checked
+    on a scratch copy, so a refused edit leaves the real file untouched rather
+    than briefly broken.
+    """
+    from hpca.agent.builtin_tools import KIND_BY_SUFFIX, check_script_content
+
+    try:
+        path = _edit_target(args, ctx)
+    except ValueError as exc:
+        return str(exc)
+    if path.is_dir():
+        return (
+            f"NOT edited: {args.registry_key!r} is a directory. Pass subpath to "
+            "edit a file inside it."
+        )
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, OSError) as exc:
+        return f"NOT edited: {path} could not be read as text ({type(exc).__name__})."
+
+    file_lines = text.split("\n")
+    hits = _find_runs(file_lines, list(args.old_lines))
+    if not hits:
+        return (
+            f"NOT edited: those lines are not in {path}."
+            f"{_near_miss(file_lines, list(args.old_lines))}"
+        )
+    if len(hits) > 1:
+        where = ", ".join(f"line {index + 1}" for index in hits[:5])
+        return (
+            f"NOT edited: those lines occur {len(hits)} times in {path} ({where}), "
+            "so which one you mean is ambiguous. Call edit_file again with "
+            "enough surrounding lines to pick out the one you want."
+        )
+    start = hits[0]
+    after = start + len(args.old_lines)
+    edited = "\n".join(file_lines[:start] + list(args.new_lines) + file_lines[after:])
+
+    warnings: list[str] = []
+    kind = KIND_BY_SUFFIX.get(path.suffix)
+    if kind is not None:
+        # §5.2 on a scratch copy: the checkers read a file, and the real one
+        # must not spend even a moment holding content the gate would refuse.
+        ctx.scripts_dir.mkdir(parents=True, exist_ok=True)
+        scratch = ctx.scripts_dir / f"edit_{time.time_ns()}{path.suffix}"
+        scratch.write_text(edited)
+        try:
+            refused, warnings = await check_script_content(
+                kind, scratch, edited, ctx, refusal="NOT edited"
+            )
+        finally:
+            scratch.unlink(missing_ok=True)
+        if refused:
+            return refused
+
+    entry = _require_trash(ctx).backup(path)
+    path.write_text(edited)
+    extra = f" ({'; '.join(warnings)})" if warnings else ""
+    # Naming the undo, not just the backup: a copy the model does not know how
+    # to reach is a copy the user is told to go dig for by hand.
+    note = (
+        "The version before this edit is in the trash: to undo, move the "
+        "edited file aside with move_file, then restore_file this path."
+        if entry.trashed_path
+        else "NO backup was kept (the file is above the backup size limit), so "
+        "this cannot be undone."
+    )
+    return f"Edited {path} at line {start + 1}: {_change(args)}{extra}. {note}"
 
 
 class MoveFileParams(BaseModel):
@@ -383,6 +585,22 @@ def add_file_tools(registry: ToolRegistry) -> ToolRegistry:
             ),
             params=RestoreFileParams,
             handler=restore_file,
+        )
+    )
+    registry.register(
+        Tool(
+            name="edit_file",
+            description=(
+                "Change part of a registered text file in place: give the "
+                "exact lines to replace and what to put there, instead of "
+                "rewriting the whole file. Pass subpath to edit a file inside "
+                "a registered directory. Read the file first and copy the "
+                "lines from it exactly"
+            ),
+            params=EditFileParams,
+            handler=edit_file,
+            is_destructive_call=_edit_resolvable,
+            describe_call=_describe_edit,
         )
     )
     registry.register(

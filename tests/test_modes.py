@@ -234,6 +234,16 @@ class TestScriptPreview:
         assert "bwa mem ref.fa in.fq" in preview
         assert "align.sh (args: -t 4)" in preview
 
+    def test_an_edit_is_previewed_as_its_diff(self, ctx):
+        # edit_file's "what would run" is the change it would make; the whole
+        # file is neither the call nor something the user can judge it by.
+        preview = script_preview(
+            "edit_file",
+            {"registry_key": "align", "old_lines": ["bwa mem"], "new_lines": ["bwa-mem2 mem"]},
+            ctx,
+        )
+        assert preview.splitlines() == ["- bwa mem", "+ bwa-mem2 mem"]
+
     def test_a_registry_key_pointing_at_data_is_not_a_script(self, ctx):
         # read_file, delete_file and friends take a registry key too. Their
         # target is data, not something that runs: dumping its contents would

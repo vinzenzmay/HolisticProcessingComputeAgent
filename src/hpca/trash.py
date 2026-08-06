@@ -6,6 +6,10 @@ Lustre/GPFS support this) before the original is unlinked. A real copy is the
 fallback across filesystems. Files above the backup limit get *no* backup
 (quota!) — the confirmation modal must say so. Each trash entry directory
 carries a ``meta.json`` for listing, restore, and TTL cleanup.
+
+``backup`` is the other half: the same entry, written for a file that is about
+to be *overwritten in place* rather than removed. It always copies, because the
+file survives the operation and a hardlink would be rewritten along with it.
 """
 
 from __future__ import annotations
@@ -34,7 +38,22 @@ class TrashManager:
 
     def trash(self, path: Path) -> TrashEntry:
         """Back up (if under the limit) and remove the file."""
-        path = Path(path)
+        entry = self._keep(Path(path), link=True)
+        Path(path).unlink()
+        return entry
+
+    def backup(self, path: Path) -> TrashEntry:
+        """Keep a copy of a file that is about to be overwritten in place.
+
+        Deliberately a real copy, never a hardlink: the file itself stays and
+        is rewritten through the same inode, which a hardlinked "backup" would
+        follow. §5.3 puts content-overwriting operations on this more expensive
+        path for exactly that reason — it is the rarer case.
+        """
+        return self._keep(Path(path), link=False)
+
+    def _keep(self, path: Path, *, link: bool) -> TrashEntry:
+        """Write one trash entry for ``path``; the caller decides its fate."""
         size = path.stat().st_size  # raises FileNotFoundError for ghosts
         entry_dir = self._trash_dir / f"{time.time_ns()}"
         entry_dir.mkdir(parents=True)
@@ -42,13 +61,16 @@ class TrashManager:
         if size >= self.backup_limit_bytes:
             method = "none"
             trashed_path = None
-        else:
+        elif link:
             try:
                 os.link(path, trashed_path)
                 method = "hardlink"
             except OSError:  # cross-filesystem trash dir
                 shutil.copy2(path, trashed_path)
                 method = "copy"
+        else:
+            shutil.copy2(path, trashed_path)
+            method = "copy"
         entry = TrashEntry(
             original_path=path,
             trashed_path=trashed_path,
@@ -65,7 +87,6 @@ class TrashManager:
                 }
             )
         )
-        path.unlink()
         return entry
 
     def list(self) -> list[TrashEntry]:

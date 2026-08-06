@@ -476,10 +476,23 @@ Core tools:
   `search_docs` the embedding path for prose questions, `ask_docs` the firewalled
   doc-researcher sub-loop (§4.2).
 * File operations (`move_file`, `copy_file`, `delete_file`, `restore_file`,
-  `read_file`) — destructive ones gated per §5.3. There is **no** `list_dir` tool:
-  registry keys are listed by `list_paths`, and directory contents are read via
-  `run_bash`. `restore_file` is the one file tool taking a path instead of a key:
-  the key died with the file.
+  `read_file`, `edit_file`) — destructive ones gated per §5.3. There is **no**
+  `list_dir` tool: registry keys are listed by `list_paths`, and directory contents
+  are read via `run_bash`. `restore_file` is the one file tool taking a path instead
+  of a key: the key died with the file.
+* `edit_file(registry_key, subpath, old_lines, new_lines)` — replaces one run of
+  whole lines in place, so changing a 400-line script costs the two lines rather
+  than the file twice (once read, once rewritten). Matching is whole-line and must
+  be unique: no match and an ambiguous match are both refused with the line numbers
+  that nearly matched, never guessed at. It is the only tool besides `create_script`
+  that writes file content, and is held to the same rules as everything else that
+  overwrites: the previous version is copied to the trash first (§5.3 — a *copy*,
+  not a hardlink, because the file survives the write), the call always gates, and
+  when the file is a script the edited content faces §5.2's syntax and code-vs-docs
+  gate — run on a scratch copy, so a refused edit leaves the real file untouched
+  rather than momentarily broken. Undo is `move_file` the edited file aside, then
+  `restore_file` the path; deleting it instead would trash the *edited* version
+  under that same path and restore would bring back what was being undone.
 
 All subprocess execution goes through **one internal runner** (timeouts, output
 capture, cwd tracking, env control). There is deliberately **no free-form shell tool
@@ -577,7 +590,9 @@ gate (§5.3) or actual submission proceed.
     them) and fully protect against the unlink. Fall back to copy only if the trash
     dir is on a different filesystem.
   * *Content-overwriting operations* (in-place edits, overwrites): make a real copy
-    first (this is the rarer case).
+    first (this is the rarer case) — `TrashManager.backup()`, used by `edit_file`.
+    A hardlink is no good here: the file survives the operation and is rewritten
+    through the same inode, which the "backup" would follow.
   * Trash entries carry a TTL (`trash_ttl_days`, default 7) and are cleaned up on
     app start. Recovery is reached by *asking the agent*: the `restore_file` tool
     wraps `TrashManager.list()`/`.restore()`, taking the file's original path (or

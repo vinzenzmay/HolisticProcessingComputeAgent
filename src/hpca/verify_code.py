@@ -297,9 +297,11 @@ def commands_needing_docs(
     return pending
 
 
-def format_gate_failure(mismatches: list[SymbolReport]) -> str:
+def format_gate_failure(
+    mismatches: list[SymbolReport], *, refusal: str = "Script NOT created"
+) -> str:
     lines = [
-        "Script NOT created: the verification gate found API usage that "
+        f"{refusal}: the verification gate found API usage that "
         "contradicts the indexed documentation — fix and retry:"
     ]
     lines += [f"- {r.symbol}: {r.detail}" for r in mismatches]

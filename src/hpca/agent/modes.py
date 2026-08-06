@@ -314,6 +314,8 @@ def script_preview(tool_name: str, arguments: dict, ctx: Any) -> str | None:
     run_bash lines are shown with their ``{key}`` references expanded. The
     point of the modal is that the user approves what will actually run, and
     `rm -rf {scratch}` hides exactly the part they need to check.
+
+    For an edit the block is the diff, not the file: the change is the call.
     """
     from hpca.agent.builtin_tools import expand_keys
 
@@ -321,6 +323,10 @@ def script_preview(tool_name: str, arguments: dict, ctx: Any) -> str | None:
         if "content_lines" in arguments:  # run_bash, create_script
             lines, _ = expand_keys(arguments["content_lines"], ctx)
             return _clip("\n".join(lines))
+        if tool_name == "edit_file":
+            from hpca.agent.file_tools import edit_preview
+
+            return _clip(edit_preview(arguments, ctx)) or None
         if tool_name not in SCRIPT_FILE_TOOLS:
             return None
         key = arguments.get("registry_key")

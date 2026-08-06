@@ -76,7 +76,13 @@ SCRIPT_GUIDANCE = (
     "by single spaces, nothing else. Do NOT insert quotes, commas or `\\` "
     "line-continuations between arguments; a stray `\",` turns your command "
     "into garbage the tool rejects. Reference paths by their registered value "
-    "or write the literal path; do not leave a shell variable unset."
+    "or write the literal path; do not leave a shell variable unset. "
+    "To CHANGE a file that already exists — a script of yours, a config, a "
+    "sample sheet — call edit_file with just the lines to replace. Do not "
+    "re-send the whole file through create_script: its key must be new, so it "
+    "would leave the old file sitting there beside a second copy. Read the "
+    "file first and copy the lines into old_lines exactly as they appear, "
+    "spacing and all."
 )
 
 

@@ -58,6 +58,46 @@ class TestTrash:
             manager.trash(tmp_path / "ghost.txt")
 
 
+class TestBackup:
+    """``backup`` keeps the file — the copy is for an in-place overwrite."""
+
+    def test_file_stays_and_content_is_kept(self, manager, victim):
+        entry = manager.backup(victim)
+        assert victim.exists()
+        assert entry.trashed_path.read_text() == "precious content"
+        assert entry.original_path == victim
+
+    def test_a_real_copy_not_a_hardlink(self, manager, victim):
+        # A hardlink shares the inode, so writing the edited content through
+        # the original would rewrite the "backup" along with it.
+        entry = manager.backup(victim)
+        assert entry.method == "copy"
+        assert entry.trashed_path.stat().st_ino != victim.stat().st_ino
+        victim.write_text("edited in place")
+        assert entry.trashed_path.read_text() == "precious content"
+
+    def test_backup_is_listed_and_restorable(self, manager, victim):
+        manager.backup(victim)
+        entries = manager.list()
+        assert [e.original_path for e in entries] == [victim]
+        victim.unlink()  # the edited file moved aside
+        assert manager.restore(entries[0]) == victim
+        assert victim.read_text() == "precious content"
+
+    def test_oversized_file_gets_no_backup(self, tmp_path):
+        manager = TrashManager(tmp_path / "trash", backup_limit_bytes=4)
+        big = tmp_path / "big.bin"
+        big.write_text("way more than four bytes")
+        entry = manager.backup(big)
+        assert entry.method == "none"
+        assert entry.trashed_path is None
+        assert big.exists()
+
+    def test_missing_file_raises(self, manager, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            manager.backup(tmp_path / "ghost.txt")
+
+
 class TestListRestore:
     def test_list_entries(self, manager, victim):
         manager.trash(victim)
