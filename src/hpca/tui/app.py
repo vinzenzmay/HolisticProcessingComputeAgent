@@ -89,7 +89,7 @@ from hpca.logs import LoggedLLM, SessionLog, open_log
 from hpca.looplag import LoopLagProbe
 from hpca.rag import RagStore
 from hpca.transcript import ASSISTANT as ASSISTANT_ENTRY
-from hpca.transcript import THINKING, Entry, Step, build_entries
+from hpca.transcript import THINKING, Entry, Step, build_entries, live_step
 from hpca.transcript import USER as USER_ENTRY
 from hpca.profiles import DEFAULT_PROFILE, MemoryScope, Profile
 from hpca.registry import PathRegistry
@@ -613,10 +613,20 @@ class WorkingIndicator(Static):
     FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     INTERVAL = 0.08
 
-    def __init__(self, activity: str = "working", started: float | None = None) -> None:
+    def __init__(
+        self,
+        activity: str = "working",
+        started: float | None = None,
+        *,
+        interruptible: bool = False,
+    ) -> None:
         super().__init__(classes="chat-working")
         self._frame = 0
         self._activity = activity
+        # Whether enter on this line can abort what it is reporting. Not every
+        # spinner can be: a silent backend call (/conclude) has no turn to roll
+        # back, and neither does a background turn nobody typed.
+        self._interruptible = interruptible
         # Supplied by the caller for a turn already running (see TurnState);
         # minted here only for a one-off backend call that has no turn.
         self._started = monotonic() if started is None else started
@@ -647,15 +657,21 @@ class WorkingIndicator(Static):
         self._activity = activity
         self._render_frame()
 
+    def set_interruptible(self, interruptible: bool) -> None:
+        if interruptible == self._interruptible:
+            return
+        self._interruptible = interruptible
+        self._render_frame()
+
     def _advance(self) -> None:
         self._frame = (self._frame + 1) % len(self.FRAMES)
         self._render_frame()
 
     def _frame_text(self) -> str:
         elapsed = f" {self.elapsed}s" if self.elapsed else ""
-        # While parked on the model this line is selectable to abort the turn;
+        # A turn's own line is selectable to abort it, whatever phase it is in;
         # say so, mirroring the ThinkingBox's inline "(enter …)" hint.
-        hint = "  (enter to interrupt)" if self._activity == LLM_WAIT_ACTIVITY else ""
+        hint = "  (enter to interrupt)" if self._interruptible else ""
         return f"{self.FRAMES[self._frame]} {self._activity}…{elapsed}{hint}"
 
     def _render_frame(self) -> None:
@@ -1874,13 +1890,30 @@ class HpcaApp(App):
         return self._turns.get(self.active_session.session_id)
 
     def _can_interrupt(self) -> bool:
-        """Only while the active session's own user turn is parked on the LLM —
-        the one phase where telling the backend to stop makes sense, and the
-        only case with a prompt to hand back."""
+        """Any phase of the active session's own user turn — waiting on the
+        model, or running a tool.
+
+        It was once only the wait on the model, on the reasoning that stopping
+        the backend is the only thing an abort really does. That is not how a
+        turn spends its time: a script that runs for minutes, or a chain of
+        tool rounds gone astray, is exactly what a user wants to stop, and
+        refusing there left them watching a spinner they could not answer.
+
+        What cancelling mid-tool does NOT do is stop what the tool started: a
+        foreground script runs on under its own monitor (it is a task of the
+        app's, not of the turn's worker) until it exits or its own timeout
+        kills it, and a background script is meant to outlive the turn anyway.
+        Nothing is orphaned — every process stays in the process table and its
+        monitor still settles it — but the abort ends the *turn*, not the work
+        already in flight.
+
+        The two conditions that remain are what the abort *needs*: a message of
+        the user's own to hand back to the entry, and the point in the thread
+        to roll back to.
+        """
         ts = self._active_turn()
         return (
             ts is not None
-            and ts.activity == LLM_WAIT_ACTIVITY
             and ts.user_text is not None
             and ts.interrupt_keep is not None
         )
@@ -1899,7 +1932,7 @@ class HpcaApp(App):
                 self._fire_interrupt()
 
         self.push_screen(
-            ConfirmScreen("Interrupt the LLM and re-edit your last message?"),
+            ConfirmScreen("Interrupt this turn and re-edit your last message?"),
             resolved,
         )
 
@@ -2069,7 +2102,18 @@ class HpcaApp(App):
             activity = ts.activity if ts is not None else "working"
             started = ts.started if ts is not None else None
         if not chat_list.query(WorkingIndicator):
-            chat_list.append(ChatItem(WorkingIndicator(activity, started=started)))
+            chat_list.append(
+                ChatItem(
+                    WorkingIndicator(
+                        activity,
+                        started=started,
+                        # A labelled spinner is a silent backend call, not a
+                        # turn: there is nothing to abort. The turn's own is
+                        # re-asked each phase (see report_activity).
+                        interruptible=label is None and self._can_interrupt(),
+                    )
+                )
+            )
             chat_list.scroll_end(animate=False)
 
     @asynccontextmanager
@@ -2121,6 +2165,38 @@ class HpcaApp(App):
         ):
             for indicator in self.query(WorkingIndicator):
                 indicator.set_activity(activity)
+                # Re-asked each phase: interrupt_keep is captured a moment
+                # after the spinner appears, so the first frames of a turn can
+                # be drawn before there is anything to roll back to.
+                indicator.set_interruptible(self._can_interrupt())
+
+    def report_step(self, session_id: str, step: dict) -> None:
+        """One tool call, or the result it returned, the moment it happens.
+
+        The row goes in above the spinner, so a turn that spends minutes in
+        tools shows *what* it is doing while it does it rather than only once
+        it is over. These rows are running commentary, not the record: the
+        turn's own state is, and the rebuild at the end of the turn replaces
+        them with the folded thinking box they belong to.
+
+        Only for the session on screen — a background turn never writes into a
+        chat the user is not looking at (decision 7); its work is in the box
+        that turn's rebuild produces.
+        """
+        if (
+            self.active_session is None
+            or self.active_session.session_id != session_id
+        ):
+            return
+        chat_list = self._chat_list()
+        if chat_list is None:
+            return
+        rows = list(chat_list.children)
+        at = next(
+            (i for i, row in enumerate(rows) if row.query(WorkingIndicator)), len(rows)
+        )
+        chat_list.insert(at, [ChatItem(StepBox(live_step(step)))])
+        chat_list.scroll_end(animate=False)
 
     async def _agent_turn(
         self,
@@ -4295,13 +4371,17 @@ class HpcaApp(App):
         owner = position
         while owner > 0 and not rows[owner].query(ThinkingBox):
             owner -= 1
-        part_index = position - owner - 1
         box.toggle()
-        parent = rows[owner].query_one(ThinkingBox)
+        parent = rows[owner].query(ThinkingBox)
+        if not parent:
+            # A live row from the turn in flight (see report_step): it has no
+            # box above it yet, and the rebuild at the end of the turn is what
+            # gives it one. Opening it is all there is to do.
+            return
         state = self._thinking_expanded.setdefault(
-            id(parent.entry), _ThinkingExpansion()
+            id(parent.first(ThinkingBox).entry), _ThinkingExpansion()
         )
-        state.parts[part_index] = box.expanded
+        state.parts[position - owner - 1] = box.expanded
 
     # ---------------------------------------------------------- llm backends
 
@@ -4639,6 +4719,7 @@ class HpcaApp(App):
             max_model_len=self._max_model_len_for,
             on_usage=lambda sid, usage: self._on_usage(sid, usage),
             mode_fn=self._mode_for_turn,
+            on_step=lambda sid, step: self.report_step(sid, step),
         )
 
     # ------------------------------------------- per-turn dependency resolvers

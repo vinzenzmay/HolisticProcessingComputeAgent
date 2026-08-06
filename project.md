@@ -93,10 +93,20 @@ Terminals in 2026 are assumed wider than 80 columns
     or command it would run, and each result — every one its own collapsible
     row, so the script the agent wrote and the call it made stay readable long
     after the approval prompt that showed them is answered (and are there at all
-    in auto mode, where no prompt showed them). Enter on anything else (the
-    agent's replies, background events, recalled memory) simply hands focus to
-    the entry. `(b)` go back in conversation to this point, `(c)` copy content
-    to clipboard.
+    in auto mode, where no prompt showed them). Those rows do not wait for the
+    turn to end: each call appears the moment it is made and its result the
+    moment it lands, above the working line, so a turn that spends minutes in
+    tools shows *what* it is doing while it does it — and can be opened and
+    read while it runs. The turn's last act is to fold them into its box.
+    Enter on anything else (the agent's replies, background events, recalled
+    memory) simply hands focus to the entry. `(b)` go back in conversation to
+    this point, `(c)` copy content to clipboard.
+  * *Working line (center, while a turn runs):* names the step in flight and
+    counts up from the moment the turn started. **Enter** on it asks whether to
+    interrupt the turn and hand the message back to the entry for editing — in
+    any phase, waiting on the model or running a tool. It ends the turn, not
+    the work already started: a script keeps running under its own monitor
+    until it exits or times out.
   * *Watch (right column):* a box the user asked for, pinned by the agent's
     `watch_log` / `watch_job` tools — see *Watches* below. **Enter** flashes
     the last 300 characters of the log (a toast that expires, not a screen to
