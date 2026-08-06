@@ -12,12 +12,21 @@ hand, which is exactly what happened the first time someone asked for a file
 back. It takes the original path rather than a registry key — the key is gone,
 dropped by the deletion that created the backup.
 
-``edit_file`` is the one tool here that writes content. It exists for the cost:
-without it the only way to change a 400-line script is to re-send all 400 lines
-through ``create_script``, paying for the file twice in one window. It is held
-to the same rules as everything else that overwrites — the previous content is
-backed up, the call gates, and a script's edited content faces §5.2's syntax
-and code-vs-docs gate before it lands.
+``create_file`` and ``edit_file`` are the two tools here that write content,
+and they split "new file" from "change a file" rather than overlapping.
+``edit_file`` exists for the cost: without it the only way to change a
+400-line script is to re-send all 400 lines through ``create_script``, paying
+for the file twice in one window. ``create_file`` exists because prose had no
+tool at all — ``create_script`` writes only into the scripts dir under a
+language suffix — so a specs.md had to go through a ``cat << 'EOF'`` heredoc
+in run_bash.
+
+Both are held to the same rules as everything else that writes: a script's
+content faces §5.2's syntax and code-vs-docs gate before it lands, checked on
+a scratch copy so a refusal leaves nothing broken behind. ``edit_file``
+overwrites, so it also backs the previous content up and gates; ``create_file``
+refuses an existing path instead, which is what keeps it out of §5.3
+entirely.
 """
 
 from __future__ import annotations
@@ -458,6 +467,92 @@ async def edit_file(args: EditFileParams, ctx: ToolContext) -> str:
     return f"Edited {path} at line {start + 1}: {_change(args)}{extra}. {note}"
 
 
+class CreateFileParams(BaseModel):
+    dir_key: str = Field(
+        description="Registry key of the directory to create the file in"
+    )
+    name: str = Field(
+        description=(
+            "Name for the new file, e.g. 'specs.md'. May name a subdirectory "
+            "of it too, e.g. 'docs/specs.md'"
+        )
+    )
+    # Last, and an array of lines, for the two reasons the module and
+    # hpca.agent.middleware give: long strings get their \n escapes mangled,
+    # and nothing may follow a long array.
+    content_lines: list[str] = Field(
+        min_length=1,
+        description="File content as an array of lines, one string per line",
+    )
+
+
+async def create_file(args: CreateFileParams, ctx: ToolContext) -> str:
+    """Write a new text file into a registered directory.
+
+    The gap this fills is prose. ``create_script`` writes only into the scripts
+    dir under a language suffix, and ``edit_file`` needs a file to already
+    exist, so the one way to author a specs.md was a ``cat << 'EOF'`` heredoc
+    through run_bash — a hundred lines of documentation squeezed through bash
+    quoting, where a single stray line costs the whole file (that is exactly
+    how the swallowed-argument bug in hpca.agent.middleware surfaced).
+
+    It creates and does not overwrite: an existing path is refused and pointed
+    at edit_file. That keeps it non-destructive by construction — nothing for
+    §5.3 to gate, so writing a document does not stop for approval — and keeps
+    "change a file" as one tool rather than two ways in.
+    """
+    from hpca.agent.builtin_tools import KIND_BY_SUFFIX, check_script_content
+
+    base = ctx.registry.resolve(args.dir_key)
+    if not base.is_dir():
+        return (
+            f"NOT created: {args.dir_key!r} is a file, not a directory. Give "
+            "the key of the directory the file belongs in."
+        )
+    name = args.name.strip()
+    path = (base / name).resolve()
+    if Path(name).is_absolute() or not path.is_relative_to(base.resolve()):
+        return (
+            f"NOT created: {name!r} points outside {args.dir_key!r}. Give a "
+            "name relative to it, and register another directory if the file "
+            "belongs somewhere else."
+        )
+    if path.exists():
+        return (
+            f"NOT created: {path} already exists. To change it call edit_file "
+            "with the lines to replace; to replace it wholesale, delete_file "
+            "first (the old version stays recoverable from the trash)."
+        )
+    content = "\n".join(args.content_lines) + "\n"
+
+    warnings: list[str] = []
+    kind = KIND_BY_SUFFIX.get(path.suffix)
+    if kind is not None:
+        # §5.2 on a scratch copy, as edit_file does: a second way to put
+        # content into a script file must not be a second way around the gate,
+        # and a refused file must never have existed at the real path.
+        ctx.scripts_dir.mkdir(parents=True, exist_ok=True)
+        scratch = ctx.scripts_dir / f"new_{time.time_ns()}{path.suffix}"
+        scratch.write_text(content)
+        try:
+            refused, warnings = await check_script_content(
+                kind, scratch, content, ctx, refusal="NOT created"
+            )
+        finally:
+            scratch.unlink(missing_ok=True)
+        if refused:
+            return refused
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    key = ctx.registry.register_auto(path, hint=path.stem)
+    extra = f" ({'; '.join(warnings)})" if warnings else ""
+    return (
+        f"Created {path} ({_lines(len(args.content_lines))}), registered as "
+        f"{key!r}{extra}. Change it with edit_file, not by writing it again."
+    )
+
+
 class MoveFileParams(BaseModel):
     source_key: str = Field(description="Registry key of the file to move")
     subpath: str = Field(
@@ -585,6 +680,20 @@ def add_file_tools(registry: ToolRegistry) -> ToolRegistry:
             ),
             params=RestoreFileParams,
             handler=restore_file,
+        )
+    )
+    registry.register(
+        Tool(
+            name="create_file",
+            description=(
+                "Write a NEW text file — specs, notes, a README, a config — "
+                "into a registered directory, one array element per line. Use "
+                "this instead of echoing or heredoc'ing a file through "
+                "run_bash. It will not overwrite: to change a file that "
+                "exists, call edit_file"
+            ),
+            params=CreateFileParams,
+            handler=create_file,
         )
     )
     registry.register(

@@ -31,13 +31,13 @@ def tools():
     return add_file_tools(ToolRegistry())
 
 
-async def call(tools, name, ctx, **kwargs):
-    tool = tools.get(name)
+async def call(tools, tool_name, ctx, **kwargs):
+    tool = tools.get(tool_name)
     return await tool.handler(tool.params.model_validate(kwargs), ctx)
 
 
-def gates(tools, name, ctx, **kwargs):
-    tool = tools.get(name)
+def gates(tools, tool_name, ctx, **kwargs):
+    tool = tools.get(tool_name)
     return tool.gates(tool.params.model_validate(kwargs), ctx)
 
 
@@ -754,3 +754,116 @@ class TestDescribeCall:
             ctx,
         )
         assert str(d / "old.log") in text
+
+
+class TestCreateFile:
+    """Writing a document — specs, a README, a config — without a shell.
+
+    Before this, ``create_script`` could only write into the scripts dir under
+    a language suffix and ``edit_file`` needs a file to already exist, so the
+    only way to author a markdown file was a `cat << 'EOF'` heredoc through
+    run_bash: a hundred lines of prose funnelled through bash quoting.
+    """
+
+    async def test_writes_the_lines_into_the_registered_directory(
+        self, tools, ctx, tmp_path
+    ):
+        ctx.registry.register("project", tmp_path)
+        await call(
+            tools, "create_file", ctx,
+            dir_key="project",
+            name="specs.md",
+            content_lines=["# locus-cutter", "", "## Why"],
+        )
+        assert (tmp_path / "specs.md").read_text() == "# locus-cutter\n\n## Why\n"
+
+    async def test_the_new_file_comes_back_with_a_key(self, tools, ctx, tmp_path):
+        ctx.registry.register("project", tmp_path)
+        result = await call(
+            tools, "create_file", ctx,
+            dir_key="project", name="specs.md", content_lines=["hi"],
+        )
+        keys = [key for key, path in ctx.registry.list().items()
+                if path == tmp_path / "specs.md"]
+        assert keys and keys[0] in result
+
+    async def test_an_existing_file_is_not_overwritten(self, tools, ctx, tmp_path):
+        ctx.registry.register("project", tmp_path)
+        (tmp_path / "specs.md").write_text("the real specs\n")
+        result = await call(
+            tools, "create_file", ctx,
+            dir_key="project", name="specs.md", content_lines=["junk"],
+        )
+        assert "NOT created" in result and "edit_file" in result
+        assert (tmp_path / "specs.md").read_text() == "the real specs\n"
+
+    async def test_a_subdirectory_is_created_on_the_way(self, tools, ctx, tmp_path):
+        ctx.registry.register("project", tmp_path)
+        await call(
+            tools, "create_file", ctx,
+            dir_key="project", name="docs/specs.md", content_lines=["hi"],
+        )
+        assert (tmp_path / "docs" / "specs.md").read_text() == "hi\n"
+
+    async def test_a_name_escaping_the_directory_is_refused(
+        self, tools, ctx, tmp_path
+    ):
+        target = tmp_path / "project"
+        target.mkdir()
+        ctx.registry.register("project", target)
+        result = await call(
+            tools, "create_file", ctx,
+            dir_key="project", name="../escaped.md", content_lines=["hi"],
+        )
+        assert "NOT created" in result
+        assert not (tmp_path / "escaped.md").exists()
+
+    async def test_an_absolute_name_is_refused(self, tools, ctx, tmp_path):
+        ctx.registry.register("project", tmp_path)
+        result = await call(
+            tools, "create_file", ctx,
+            dir_key="project", name="/tmp/escaped.md", content_lines=["hi"],
+        )
+        assert "NOT created" in result
+
+    async def test_a_file_key_is_not_a_directory(self, tools, ctx, tmp_path):
+        f = tmp_path / "reads.bam"
+        f.write_text("x")
+        ctx.registry.register("reads", f)
+        result = await call(
+            tools, "create_file", ctx,
+            dir_key="reads", name="specs.md", content_lines=["hi"],
+        )
+        assert "NOT created" in result and "directory" in result
+
+    async def test_a_script_faces_the_same_content_gate(self, tools, ctx, tmp_path):
+        # §5.2 is mandatory: a second way to put content into a script file
+        # must not be a second way around the syntax/docs gate.
+        ctx.registry.register("project", tmp_path)
+        result = await call(
+            tools, "create_file", ctx,
+            dir_key="project", name="qc.py", content_lines=["def broken(:"],
+        )
+        assert "NOT created" in result and "SyntaxError" in result
+        assert not (tmp_path / "qc.py").exists()
+
+    async def test_a_valid_script_is_written(self, tools, ctx, tmp_path):
+        ctx.registry.register("project", tmp_path)
+        result = await call(
+            tools, "create_file", ctx,
+            dir_key="project", name="qc.py", content_lines=["print('ok')"],
+        )
+        assert "NOT created" not in result
+        assert (tmp_path / "qc.py").read_text() == "print('ok')\n"
+
+    async def test_creating_a_file_is_not_a_destructive_call(
+        self, tools, ctx, tmp_path
+    ):
+        # It refuses to overwrite, so there is nothing for the §5.3 gate to
+        # protect — and a doc write that stops for approval is a doc write the
+        # agent stops doing.
+        ctx.registry.register("project", tmp_path)
+        assert not gates(
+            tools, "create_file", ctx,
+            dir_key="project", name="specs.md", content_lines=["hi"],
+        )
