@@ -13,7 +13,7 @@ import httpx
 import pytest
 
 from hpca.config import LLMSettings
-from hpca.llm import ChatResponse, LLMClient, LLMError
+from hpca.llm import ChatResponse, LLMClient, LLMError, TruncatedOutput
 
 # ---------------------------------------------------------------- unit tests
 
@@ -139,10 +139,15 @@ class TestChat:
             )
 
         client = make_client(handler)
-        with pytest.raises(LLMError, match="truncat"):
+        # Its own type, because the caller can act on this one: a call cut off
+        # mid-write is worth one more try, an HTTP 500 is not.
+        with pytest.raises(TruncatedOutput, match="truncat"):
             await client.chat(
                 [{"role": "user", "content": "q"}], json_schema={"type": "object"}
             )
+
+    async def test_truncation_is_still_an_llm_error(self):
+        assert issubclass(TruncatedOutput, LLMError)
 
     async def test_truncated_plain_text_does_not_raise(self):
         def handler(request):

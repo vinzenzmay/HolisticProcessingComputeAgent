@@ -16,7 +16,7 @@ from hpca.agent.middleware import (
     inline_refs,
 )
 from hpca.agent.tools import Tool, ToolRegistry
-from hpca.llm import ChatResponse
+from hpca.llm import ChatResponse, TruncatedOutput
 
 
 class EchoParams(BaseModel):
@@ -107,7 +107,10 @@ class FakeLLM:
 
     async def chat(self, messages, *, json_schema=None, **kwargs):
         self.calls.append({"messages": list(messages), "json_schema": json_schema})
-        return ChatResponse(content=self._outputs.pop(0))
+        output = self._outputs.pop(0)
+        if isinstance(output, Exception):
+            raise output
+        return ChatResponse(content=output)
 
     async def supports_constrained_decoding(self):
         return self._supports_cd
@@ -260,6 +263,62 @@ class TestDecideLive:
         assert isinstance(decision, DirectResponse)
 
 
+@integration
+class TestLongArrayLive:
+    """The artifact the argument-order rule exists for, against a real
+    grammar: a model writing a long ``list[str]`` must reach the end of the
+    array without a swallowed key (see the module docstring).
+
+    Asserted on ``repairs`` rather than on the content, because that is the
+    difference the ordering makes — ``_strip_key_echo`` would clean the call
+    up either way, and a passing test with a non-empty ``repairs`` means the
+    grammar is still swallowing keys and only the net is catching them.
+    """
+
+    @pytest.fixture
+    def llm(self):
+        return LLMClient(
+            LLMSettings(
+                base_url=LIVE_URL,
+                model=LIVE_MODEL,
+                api_key=LIVE_KEY,
+                request_timeout_s=180,
+                enable_thinking=False,
+            )
+        )
+
+    @pytest.fixture
+    def tools(self):
+        from hpca.agent.builtin_tools import default_tool_registry
+        from hpca.agent.file_tools import add_file_tools
+
+        return add_file_tools(default_tool_registry()).subset(
+            ["run_bash", "create_file"]
+        )
+
+    async def test_a_long_document_arrives_without_a_swallowed_key(
+        self, tools, llm
+    ):
+        messages = [
+            {"role": "system", "content": RESPOND_VS_TOOL_GUIDANCE},
+            {
+                "role": "user",
+                "content": (
+                    "The directory key 'project' is registered. Write a design "
+                    "document to specs.md in it, at least 25 lines long, with "
+                    "sections: what the tool does, why it is needed, the "
+                    "command-line interface, and what was ruled out. Do it now "
+                    "in one tool call."
+                ),
+            },
+        ]
+        decision = await decide(llm, messages, tools)
+        assert isinstance(decision, ToolCall), decision
+        lines = getattr(decision.arguments, "content_lines", [])
+        assert len(lines) >= 10, lines  # a long array is the point
+        assert decision.repairs == []
+
+
 class TestNestedToolSchemas:
     """A tool whose params nest another model generates $ref/$defs pointing
     at the document root — which, once embedded as one branch of the decision
@@ -376,6 +435,30 @@ class TestInlineRefs:
     def test_unknown_ref_left_alone(self):
         schema = {"properties": {"a": {"$ref": "#/$defs/Missing"}}}
         assert inline_refs(schema)["properties"]["a"] == {"$ref": "#/$defs/Missing"}
+
+
+class TestTruncatedDecision:
+    """A decision cut off at max_tokens: nothing to parse, but not nothing to
+    say about it. Writing a file is the case that reaches the cap honestly."""
+
+    async def test_a_cut_off_call_is_retried_with_guidance(self, tools):
+        llm = FakeLLM(
+            [TruncatedOutput("truncated"), tool_json("echo", text="hi")]
+        )
+        decision = await decide(llm, USER, tools)
+        assert isinstance(decision, ToolCall)
+        feedback = llm.calls[1]["messages"][-1]
+        assert feedback["role"] == "user"  # never a system message (§4.3)
+        assert "cut off" in feedback["content"]
+        assert "parts" in feedback["content"]
+
+    async def test_it_is_retried_once_not_until_the_budget_runs_out(self, tools):
+        # A looping model would otherwise cost the full retry budget at the
+        # token cap each time — minutes of hang for an output nobody can use.
+        llm = FakeLLM([TruncatedOutput("truncated")] * 4)
+        with pytest.raises(TruncatedOutput):
+            await decide(llm, USER, tools)
+        assert len(llm.calls) == 2
 
 
 def full_registry() -> ToolRegistry:

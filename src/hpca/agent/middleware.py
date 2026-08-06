@@ -20,6 +20,12 @@ So: **array-valued arguments come last in every tool's params model**, leaving
 no key for the model to reach for while it is still inside the array
 (``test_middleware.TestArgumentOrder`` enforces it); and ``_strip_key_echo``
 below removes such an element when one appears anyway.
+
+The second is not a belt for the first's braces. Measured against the live 27B
+backend after the reordering, a run_bash heredoc still produced a trailing
+``timeout_s:`` element in 1 of 4 generations — the model repeats the key at the
+end of the arguments out of habit, whether or not the grammar has one left to
+give it. Ordering lowers the rate; the strip is what makes it not matter.
 """
 
 from __future__ import annotations
@@ -33,14 +39,29 @@ from typing import Any, get_args, get_origin
 from pydantic import BaseModel, ValidationError
 
 from hpca.agent.tools import Tool, ToolRegistry
-from hpca.llm import Message
+from hpca.llm import Message, TruncatedOutput
 
 logger = logging.getLogger("hpca.agent.middleware")
 
 DEFAULT_MAX_RETRIES = 3
 # Caps a runaway generation. Reasoning models spend this budget on thinking
-# before the JSON decision, so it is roomier than a decision alone needs.
-MAX_DECISION_TOKENS = 4096
+# before the JSON decision, so it is roomier than a decision alone needs — and
+# a decision that writes a file's content spends it twice over. Measured on
+# the live 27B backend with thinking on: a 30-line document costs ~1200
+# completion tokens, ~800 of them reasoning, so the old 4096 put a ~100-line
+# specs.md right at the ceiling. Doubling buys documents of a few hundred
+# lines while still bounding the loop this exists for.
+MAX_DECISION_TOKENS = 8192
+# A cut-off decision is worth exactly one more try. Both causes are expensive
+# to retry — a looping model burns the whole cap again — and the second
+# attempt is told to write less, so a third would be the same answer twice.
+MAX_TRUNCATION_RETRIES = 1
+TRUNCATION_FEEDBACK = (
+    "[validation error] Your last call was cut off at the token limit before "
+    "it was finished, so nothing could be run. Make this one smaller. If you "
+    "were writing a file, write it in parts: create_file with the first part, "
+    "then edit_file to add the rest. Do not simply send the same thing again."
+)
 
 
 class DecisionError(Exception):
@@ -325,10 +346,24 @@ async def decide(
 
     attempts = max_retries + 1
     last_error = ""
+    truncations = 0
     for _ in range(attempts):
-        response = await llm.chat(
-            conversation, json_schema=schema, max_tokens=max_tokens
-        )
+        try:
+            response = await llm.chat(
+                conversation, json_schema=schema, max_tokens=max_tokens
+            )
+        except TruncatedOutput:
+            # Nothing came back to feed the model verbatim — the fragment is
+            # its own unfinished call — so the feedback says what happened and
+            # what to do instead, and rides the user role like every other
+            # retry (system messages are rejected after position 0).
+            if truncations >= MAX_TRUNCATION_RETRIES:
+                raise
+            truncations += 1
+            conversation = conversation + [
+                {"role": "user", "content": TRUNCATION_FEEDBACK}
+            ]
+            continue
         raw = response.content
         try:
             return _annotate(_parse(raw, tools), response)

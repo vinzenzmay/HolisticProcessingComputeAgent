@@ -392,7 +392,15 @@ the orchestrator's or another subagent's context.
   found`) after writing a ~100-line document through a heredoc. Ordering the schema
   leaves no key to reach for; the middleware also drops such an element when it
   appears anyway (last element, exact sibling field name, JSON value), and reports
-  the repair with the call rather than silently shortening a script.
+  the repair with the call rather than silently shortening a script. Both are
+  needed: measured against the live 27B backend *after* reordering, a `run_bash`
+  heredoc still produced a trailing `timeout_s:` element in 1 of 4 generations —
+  the model repeats the key out of habit, not because the grammar offered it.
+* **Cut-off decisions:** a decision that stops at `max_tokens` is retried once with
+  guidance to write the file in parts, rather than killing the turn. The cap is
+  8192: measured live with thinking on, a 30-line document costs ~1200 completion
+  tokens (~800 of them reasoning), so the previous 4096 put an ordinary ~100-line
+  specs.md right at the ceiling.
 * **Path registry:** a named map `{key → absolute path/URI}` per profile+session,
   stored in sqlite. Tools accept **keys**, middleware resolves to real paths and
   errors out on unknown keys (error fed back for retry). New paths discovered by
