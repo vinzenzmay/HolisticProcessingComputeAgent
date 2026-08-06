@@ -85,10 +85,21 @@ Terminals in 2026 are assumed wider than 80 columns
 * **ESC** ends the current interaction / closes modal / returns focus.
 * Interactions are resolved via modal prompts or the bottom hotkey bar:
   * *Session (left column):* open into the center chat window.
-  * *Chat message (center):* **Enter** on one of your own messages (including a
-    queued one) puts its text back in the entry — appended on its own line to
-    whatever is already being written, so nothing typed is lost — which is how
-    a command is re-sent with one word changed. Enter on a thinking box expands
+  * *Chat message (center):* **Enter** on one of your own messages opens the
+    rewind dialog — the way a conversation is trimmed once the agent has gone
+    in an unwanted direction. **(f)** forks the session from just before that
+    message (the original stays whole, its turn can even keep running);
+    **(r)** rolls this conversation back to just before it (refused while a
+    turn runs, a decision is pending, or messages are queued — those all write
+    to the thread being cut); **(c / Enter)** copies its text back into the
+    entry — appended on its own line to whatever is already being written, so
+    nothing typed is lost — which is how a command is re-sent with one word
+    changed, and Enter-Enter keeps the old copy reflex working. Fork and
+    rollback both hand the message back to the entry, ready to re-edit; both
+    drop a compaction summary that covered trimmed messages (the raw history
+    it stood for is still there, so folding can be redone). A queued message
+    is not in the thread yet, so Enter on it copies directly.
+    Enter on a thinking box expands
     it into its parts — each block of reasoning, each tool call with the script
     or command it would run, and each result — every one its own collapsible
     row, so the script the agent wrote and the call it made stay readable long
@@ -99,8 +110,7 @@ Terminals in 2026 are assumed wider than 80 columns
     tools shows *what* it is doing while it does it — and can be opened and
     read while it runs. The turn's last act is to fold them into its box.
     Enter on anything else (the agent's replies, background events, recalled
-    memory) simply hands focus to the entry. `(b)` go back in conversation to
-    this point, `(c)` copy content to clipboard.
+    memory) simply hands focus to the entry. `(c)` copy content to clipboard.
   * *Working line (center, while a turn runs):* names the step in flight and
     counts up from the moment the turn started. **Enter** on it asks whether to
     interrupt the turn and hand the message back to the entry for editing — in

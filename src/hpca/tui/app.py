@@ -34,6 +34,7 @@ from hpca.agent.graph import (
     build_graph,
     compact_now,
     deliver_event,
+    fork_thread,
     rollback_thread,
     run_turn,
     thread_message_count,
@@ -148,6 +149,7 @@ from hpca.tui.memory_screens import (
 )
 from hpca.tui.profiles_screen import ProfilePickerScreen, ProfilesScreen
 from hpca.tui.rename_screen import RenameScreen
+from hpca.tui.rewind_screen import COPY, FORK, ROLLBACK, RewindScreen
 from hpca.tui.settings_screen import SettingsScreen
 from hpca.tui.switch_llm import SwitchLLMScreen
 from hpca.watches import (
@@ -4316,7 +4318,14 @@ class HpcaApp(App):
             return
         entry = getattr(event.item, "data_entry", None)
         if entry is not None and entry.kind in OWN_MESSAGE_KINDS:
-            self.reuse_message(entry.text)
+            if entry.kind == "user" and entry.index >= 0:
+                # A message that is really in the thread names a cut point:
+                # offer the rewind (fork / roll back / copy).
+                self._offer_rewind(entry)
+            else:
+                # Queued text and the live row of a turn still in flight are
+                # not in the thread (yet); copying is all there is.
+                self.reuse_message(entry.text)
         else:
             # Anything else in the log: Enter just moves to the input.
             self.focus_chat_input()
@@ -4337,6 +4346,144 @@ class HpcaApp(App):
             draft += "\n"
         chat_input.text = draft + text
         self.focus_chat_input()  # focused, cursor behind the reused text
+
+    # ---------------------------------------------------------- chat rewind
+
+    def _offer_rewind(self, entry: Entry) -> None:
+        """Enter on one of the user's own thread messages: fork the session
+        from just before it, roll this conversation back to just before it,
+        or copy the text into the entry (the old behavior, still on Enter).
+
+        The session is captured now — the dialog can sit open across a
+        session switch, and the choice belongs to the conversation it was
+        made in, not to whichever one is on screen when it lands.
+        """
+        session = self.active_session
+        if session is None:
+            return
+
+        def resolved(choice: str | None) -> None:
+            if choice == COPY:
+                self.reuse_message(entry.text)
+            elif choice == FORK:
+                self.run_worker(
+                    self._fork_session_at(session, entry), group="sessions"
+                )
+            elif choice == ROLLBACK:
+                self.run_worker(
+                    self._rollback_session_to(session, entry), group="sessions"
+                )
+
+        self.push_screen(RewindScreen(entry.text), resolved)
+
+    def _rewind_blocker(self, session_id: str) -> str | None:
+        """Why this session's thread cannot be truncated right now, or None.
+
+        Everything here would write to (or is parked inside) the thread the
+        rollback is about to cut: a running turn appends as it works, an
+        unanswered approval holds a graph interrupt whose resume would land on
+        indices that no longer exist, and queued messages start turns of their
+        own the moment the session is free.
+        """
+        if session_id in self._turns:
+            return "a turn is running — wait, or interrupt it first"
+        if (
+            session_id in self._awaiting_approval
+            or session_id in self._pending_decision
+        ):
+            return "a decision is pending — answer it first"
+        if self.queued_texts_for(session_id):
+            return "queued messages are waiting to run"
+        return None
+
+    async def _rollback_session_to(self, session: Session, entry: Entry) -> None:
+        """Trim the conversation to just before one of the user's own
+        messages, and hand that message back to the entry — the same landing
+        the interrupt gives (edit it, send again), reached deliberately."""
+        if not self._is_active_session(session):
+            # Switched away while the dialog sat open. Rolling back a thread
+            # the user is not looking at invites surprises; asking again from
+            # inside that session is cheap.
+            self.notify(f"Not rolled back — “{session.title}” is no longer open.")
+            return
+        blocker = self._rewind_blocker(session.session_id)
+        if blocker is not None:
+            self.notify(f"Cannot roll back: {blocker}", severity="warning")
+            return
+        try:
+            await rollback_thread(
+                self.graph, session_id=session.session_id, keep=entry.index
+            )
+        except Exception as e:
+            self.notify(f"Rollback failed: {e}", severity="error")
+            return
+        if self._log is not None:
+            self._log.write(
+                "conversation rolled back",
+                f"to before message {entry.index}: {entry.text[:120]}",
+            )
+        # The measured fill described the untrimmed thread; re-derive from
+        # what is left, exactly as reopening the session would.
+        self._context_used.pop(session.session_id, None)
+        snapshot = await self.graph.aget_state(
+            {"configurable": {"thread_id": session.session_id}}
+        )
+        values = snapshot.values or {}
+        await self._set_chat_messages(
+            values.get("messages", []),
+            values.get("thinking", []),
+            values.get("calls", []),
+        )
+        self._show_context_estimate(values)
+        self.reuse_message(entry.text)
+        self.notify("Rolled back — edit your message and send again.")
+
+    async def _fork_session_at(self, session: Session, entry: Entry) -> None:
+        """Copy the conversation up to just before one of the user's own
+        messages into a new session and open it there, message ready to edit.
+
+        The source is left exactly as it is — a turn it is running can even
+        finish in the background. No busy gate for the same reason: the copy
+        reads a checkpoint snapshot and only ever writes to the new thread.
+        """
+        fork = self.session_store.create(
+            profile=session.profile,
+            title=f"{session.title} (fork)",
+            mode=session.mode,
+            backend=session.backend,
+        )
+        try:
+            await fork_thread(
+                self.graph,
+                source_session_id=session.session_id,
+                target_session_id=fork.session_id,
+                keep=entry.index,
+            )
+        except Exception as e:
+            self.session_store.delete(fork.session_id)
+            self.notify(f"Fork failed: {e}", severity="error")
+            return
+
+        # Path aliases the copied history mentions must resolve in the fork
+        # too, or the agent re-reads a conversation full of names it cannot
+        # use. Jobs and processes are NOT copied: they record real work, which
+        # belongs to the session that started it (see SessionStore.delete).
+        def copy_aliases(conn):
+            conn.execute(
+                "INSERT OR IGNORE INTO path_registry "
+                "(profile, session_id, key, path) "
+                "SELECT profile, ?, key, path FROM path_registry "
+                "WHERE profile = ? AND session_id = ?",
+                (fork.session_id, session.profile, session.session_id),
+            )
+            conn.commit()
+
+        await self._db(copy_aliases)
+        await self._reload_sessions()
+        await self.open_session(fork)
+        self._focus_column("chat")
+        self.reuse_message(entry.text)
+        self.notify(f"Forked “{session.title}” — this copy stops before that message.")
 
     async def _toggle_thinking(self, item: ChatItem, box: ThinkingBox) -> None:
         """Expand a thinking box into its parts (or fold them away again),

@@ -1,10 +1,12 @@
 """Reusing one of your own past messages.
 
-Enter on a message you sent puts its text back in the entry, to send again or
-edit into the next one — the usual case being a command that needs one word
-changed. Messages that are not yours (the agent's replies, background events,
-recalled memory) are not text you would re-send, so Enter on those does what it
-always did: hand focus to the entry.
+Enter on a message you sent opens the rewind dialog (see test_tui_rewind);
+copy sits on Enter there, so the old reflex — activate the message, hit Enter
+again — still puts its text back in the entry, to send again or edit into the
+next one. A queued message is not in the thread yet, so Enter on it skips the
+dialog and copies directly. Messages that are not yours (the agent's replies,
+background events, recalled memory) are not text you would re-send, so Enter
+on those does what it always did: hand focus to the entry.
 """
 
 import json
@@ -15,6 +17,7 @@ from textual.widgets import ListView
 from hpca.llm import ChatResponse
 from hpca.transcript import Entry
 from hpca.tui.app import ChatInput, HpcaApp
+from hpca.tui.rewind_screen import RewindScreen
 
 
 def is_title_request(json_schema):
@@ -67,6 +70,10 @@ async def press_enter_on(app, pilot, index):
     await pilot.pause()
     await pilot.press("enter")
     await pilot.pause()
+    if isinstance(app.screen, RewindScreen):
+        # A message in the thread offers the rewind first; copy is on Enter.
+        await pilot.press("enter")
+        await pilot.pause()
 
 
 async def test_enter_on_your_own_message_puts_it_back_in_the_entry(hpca_home):

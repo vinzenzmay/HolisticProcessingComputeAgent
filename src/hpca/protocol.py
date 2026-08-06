@@ -225,6 +225,9 @@ class Entry(_Model):
     steps: int = 0
     reasoning_chars: int = 0
     parts: list[Part] = Field(default_factory=list)
+    # The message index this entry IS, or -1 (see the transcript original).
+    # What a UI needs to offer the chat rewind on a message the user sent.
+    index: int = -1
 
 
 class SessionRow(_Model):

@@ -143,10 +143,26 @@ class TestClicking:
         app = make_app()
         async with app.run_test(size=(110, 30)) as pilot:
             await chat_app(pilot, app)
+            agent_message = app.query_one("#chat-list", ListView).children[-1]
+            await plain_click(app, agent_message)
+            await pilot.pause()
+            assert app.focused.id == "chat-input"
+
+    async def test_a_plain_click_on_your_own_message_offers_the_rewind(self, hpca_home):
+        """Clicking activates like Enter does, so a message you sent opens the
+        rewind dialog (see test_tui_rewind) rather than pasting silently."""
+        from hpca.tui.rewind_screen import RewindScreen
+
+        app = make_app()
+        async with app.run_test(size=(110, 30)) as pilot:
+            await chat_app(pilot, app)
             user_message = app.query_one("#chat-list", ListView).children[0]
             await plain_click(app, user_message)
             await pilot.pause()
-            assert app.focused.id == "chat-input"
+            assert isinstance(app.screen, RewindScreen)
+            await pilot.press("escape")
+            await pilot.pause()
+            assert not isinstance(app.screen, RewindScreen)
 
     async def test_a_plain_click_toggles_the_thinking_box_once(self, hpca_home):
         app = make_app()
