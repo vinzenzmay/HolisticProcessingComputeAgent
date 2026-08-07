@@ -444,6 +444,20 @@ def _edit_target(args: EditFileParams, ctx: ToolContext) -> Path:
     return _source(ctx, args.registry_key, args.subpath)
 
 
+def edit_target_path(args: EditFileParams, ctx: ToolContext) -> Path | None:
+    """The file an edit_file call would touch, or None when it cannot resolve.
+
+    The graph's per-file approval memory (§3.5 auto mode) keys on this: two
+    calls that resolve to the same path are edits of the same file, whatever
+    mix of key and subpath the model used to name it. Swallows resolution
+    errors — an unresolvable call never skips a gate, it just fails normally.
+    """
+    try:
+        return _edit_target(args, ctx).resolve()
+    except Exception:
+        return None
+
+
 def _edit_resolvable(args: EditFileParams, ctx: ToolContext) -> bool:
     # Overwriting a file's content is destructive (§5.3), so every edit that
     # can actually run gates; a dud key goes to the error-feedback loop instead
@@ -456,6 +470,29 @@ def _edit_resolvable(args: EditFileParams, ctx: ToolContext) -> bool:
 
 def _lines(count: int) -> str:
     return f"{count} line" if count == 1 else f"{count} lines"
+
+
+def _tbd_note(content: str) -> str:
+    """The unfinished-work reminder for a skeleton-then-fill write.
+
+    The guidance teaches `TBD: ...` placeholder lines; this is the tool's
+    side of that protocol. A 27B filling ten sections loses count (measured:
+    sections left as TBD, or the model answering 'done' with two remaining),
+    and the fix that costs nothing until it matters is the result naming what
+    is left after every write.
+    """
+    remaining = [
+        (i + 1, line.strip())
+        for i, line in enumerate(content.split("\n"))
+        if line.lstrip().startswith("TBD")
+    ]
+    if not remaining:
+        return ""
+    line_no, text = remaining[0]
+    return (
+        f" {len(remaining)} placeholder line(s) still to fill, next at "
+        f"line {line_no}: {text!r}."
+    )
 
 
 def _change(args: EditFileParams) -> str:
@@ -608,7 +645,10 @@ async def edit_file(args: EditFileParams, ctx: ToolContext) -> str:
         else " NO backup was kept (the file is above the backup size limit), "
         "so this cannot be undone."
     )
-    return f"Edited {path} at line {start + 1}: {_change(args)}{extra}.{no_backup}"
+    return (
+        f"Edited {path} at line {start + 1}: {_change(args)}{extra}."
+        f"{no_backup}{_tbd_note(edited)}"
+    )
 
 
 class CreateFileParams(BaseModel):
@@ -696,7 +736,8 @@ async def create_file(args: CreateFileParams, ctx: ToolContext) -> str:
     extra = f" ({'; '.join(warnings)})" if warnings else ""
     return (
         f"Created {path} ({_lines(len(content_lines))}), registered as "
-        f"{key!r}{extra}. Change it with edit_file, not by writing it again."
+        f"{key!r}{extra}. Change it with edit_file, not by writing it "
+        f"again.{_tbd_note(content)}"
     )
 
 
@@ -836,8 +877,10 @@ def add_file_tools(registry: ToolRegistry) -> ToolRegistry:
                 "Write a NEW text file — specs, notes, a README, a config — "
                 "into a registered directory, one array element per line. Use "
                 "this instead of echoing or heredoc'ing a file through "
-                "run_bash. It will not overwrite: to change a file that "
-                "exists, call edit_file"
+                "run_bash. Past ~150 lines send a skeleton (headings + one "
+                "`TBD: ...` line each) and fill per section with edit_file. "
+                "It will not overwrite: to change a file that exists, call "
+                "edit_file"
             ),
             params=CreateFileParams,
             handler=create_file,

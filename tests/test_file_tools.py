@@ -1082,3 +1082,88 @@ class TestCreateFile:
             tools, "create_file", ctx,
             dir_key="project", name="specs.md", content_lines=["hi"],
         )
+
+
+class TestEditTargetPath:
+    """edit_target_path is the per-file approval key (§3.5): it must resolve
+    exactly what edit_file would touch, and never raise."""
+
+    def test_resolves_a_registered_file(self, ctx, tmp_path):
+        from hpca.agent.file_tools import EditFileParams, edit_target_path
+
+        target = tmp_path / "a.txt"
+        target.write_text("x\n")
+        ctx.registry.register("a", target)
+        args = EditFileParams(registry_key="a", old_lines=["x"], new_lines=["y"])
+        assert edit_target_path(args, ctx) == target.resolve()
+
+    def test_resolves_a_subpath_to_the_same_key_as_a_direct_key(self, ctx, tmp_path):
+        from hpca.agent.file_tools import EditFileParams, edit_target_path
+
+        sub = tmp_path / "dir" / "b.txt"
+        sub.parent.mkdir()
+        sub.write_text("x\n")
+        ctx.registry.register("dir", tmp_path / "dir")
+        ctx.registry.register("bfile", sub)
+        by_sub = EditFileParams(
+            registry_key="dir", subpath="b.txt", old_lines=["x"], new_lines=["y"]
+        )
+        by_key = EditFileParams(registry_key="bfile", old_lines=["x"], new_lines=["y"])
+        assert edit_target_path(by_sub, ctx) == edit_target_path(by_key, ctx)
+
+    def test_unresolvable_returns_none_instead_of_raising(self, ctx):
+        from hpca.agent.file_tools import EditFileParams, edit_target_path
+
+        args = EditFileParams(registry_key="nope", old_lines=["x"], new_lines=["y"])
+        assert edit_target_path(args, ctx) is None
+
+
+class TestPlaceholderTracking:
+    """Skeleton-then-fill's other half: after every write the result names
+    how many `TBD` placeholder lines remain, so the model cannot lose count."""
+
+    async def test_create_with_placeholders_counts_them(self, ctx, tmp_path):
+
+        tools = add_file_tools(ToolRegistry())
+        ctx.registry.register("ws", tmp_path)
+        result = await call(
+            tools,
+            "create_file",
+            ctx,
+            dir_key="ws",
+            name="plan.md",
+            content_lines=["# t", "## A", "TBD: A", "## B", "TBD: B"],
+        )
+        assert "2 placeholder line(s) still to fill" in result
+        assert "line 3" in result and "TBD: A" in result
+
+    async def test_filling_the_last_placeholder_reports_nothing(self, ctx, tmp_path):
+        tools = add_file_tools(ToolRegistry())
+        target = tmp_path / "plan.md"
+        target.write_text("## A\nTBD: A\n")
+        ctx.registry.register("plan", target)
+        result = await call(
+            tools,
+            "edit_file",
+            ctx,
+            registry_key="plan",
+            old_lines=["TBD: A"],
+            new_lines=["done content"],
+        )
+        assert "placeholder" not in result
+
+    async def test_filling_one_of_two_names_the_next(self, ctx, tmp_path):
+        tools = add_file_tools(ToolRegistry())
+        target = tmp_path / "plan.md"
+        target.write_text("## A\nTBD: A\n## B\nTBD: B\n")
+        ctx.registry.register("plan", target)
+        result = await call(
+            tools,
+            "edit_file",
+            ctx,
+            registry_key="plan",
+            old_lines=["TBD: A"],
+            new_lines=["content A"],
+        )
+        assert "1 placeholder line(s) still to fill" in result
+        assert "TBD: B" in result

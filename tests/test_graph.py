@@ -1193,3 +1193,155 @@ class TestCompactNow:
             await compact_now(graph, session_id="s1", llm=llm)
         values = await self.state(graph, "s1")
         assert not values.get("compacted")  # nothing half-applied
+
+
+# ---------------------------------------------------------- per-file approval
+
+
+from hpca.agent.context import ToolContext  # noqa: E402
+from hpca.agent.file_tools import add_file_tools  # noqa: E402
+from hpca.db import connect, init_db  # noqa: E402
+from hpca.runner import ProcessRunner  # noqa: E402
+from hpca.registry import PathRegistry  # noqa: E402
+from hpca.config import Settings  # noqa: E402
+from hpca.trash import TrashManager  # noqa: E402
+
+
+class TestPerFileEditApproval:
+    """§3.5 auto mode: one approval covers a FILE's later edit_file calls.
+
+    The consent is per path, not per diff — a skeleton-then-fill write must
+    cost one gate, not one per section. Manual mode keeps every prompt, and a
+    refusal must never be remembered as standing permission.
+    """
+
+    def make(self, tmp_path, mode="auto"):
+        conn = connect(tmp_path / "hpca.db")
+        init_db(conn)
+        context = ToolContext(
+            registry=PathRegistry(conn, profile="default", session_id="s1"),
+            runner=ProcessRunner(conn, session_id="s1", log_dir=tmp_path / "logs"),
+            settings=Settings(),
+            scripts_dir=tmp_path / "scripts",
+            trash=TrashManager(tmp_path / "trash", backup_limit_bytes=1024 * 1024),
+        )
+        notes = tmp_path / "notes.md"
+        notes.write_text("alpha\nbeta\ngamma\n")
+        other = tmp_path / "other.md"
+        other.write_text("delta\n")
+        context.registry.register("notes", notes)
+        context.registry.register("other", other)
+        return context, notes, other, conn
+
+    def edit(self, key, old, new):
+        return tool_json(
+            "edit_file", registry_key=key, old_lines=[old], new_lines=[new]
+        )
+
+    async def test_second_edit_to_approved_file_skips_the_gate(self, tmp_path):
+        context, notes, _, conn = self.make(tmp_path)
+        llm = FakeLLM(
+            [
+                self.edit("notes", "alpha", "ALPHA"),
+                respond_json("first done"),
+                self.edit("notes", "beta", "BETA"),
+                respond_json("second done"),
+            ]
+        )
+        graph = build_graph(
+            llm=llm,
+            tools=add_file_tools(ToolRegistry()),
+            checkpointer=InMemorySaver(),
+            mode_fn=lambda: "auto",
+            ctx=context,
+        )
+        first = await run_turn(graph, session_id="s1", user_text="edit notes")
+        assert first.interrupt is not None  # the first edit still gates
+        resumed = await run_turn(
+            graph, session_id="s1", resume=Command(resume={"approved": True})
+        )
+        assert resumed.reply == "first done"
+        assert "ALPHA" in notes.read_text()
+        # Second edit to the SAME file: no gate, straight through.
+        second = await run_turn(graph, session_id="s1", user_text="edit again")
+        assert second.interrupt is None
+        assert second.reply == "second done"
+        assert "BETA" in notes.read_text()
+        conn.close()
+
+    async def test_a_different_file_still_gates(self, tmp_path):
+        context, _, other, conn = self.make(tmp_path)
+        llm = FakeLLM(
+            [
+                self.edit("notes", "alpha", "ALPHA"),
+                respond_json("done"),
+                self.edit("other", "delta", "DELTA"),
+            ]
+        )
+        graph = build_graph(
+            llm=llm,
+            tools=add_file_tools(ToolRegistry()),
+            checkpointer=InMemorySaver(),
+            mode_fn=lambda: "auto",
+            ctx=context,
+        )
+        await run_turn(graph, session_id="s1", user_text="edit notes")
+        await run_turn(
+            graph, session_id="s1", resume=Command(resume={"approved": True})
+        )
+        third = await run_turn(graph, session_id="s1", user_text="edit other")
+        assert third.interrupt is not None  # other.md was never approved
+        assert third.interrupt["tool"] == "edit_file"
+        conn.close()
+
+    async def test_a_refusal_is_not_remembered(self, tmp_path):
+        context, notes, _, conn = self.make(tmp_path)
+        llm = FakeLLM(
+            [
+                self.edit("notes", "alpha", "ALPHA"),
+                respond_json("ok, leaving it"),
+                self.edit("notes", "beta", "BETA"),
+            ]
+        )
+        graph = build_graph(
+            llm=llm,
+            tools=add_file_tools(ToolRegistry()),
+            checkpointer=InMemorySaver(),
+            mode_fn=lambda: "auto",
+            ctx=context,
+        )
+        await run_turn(graph, session_id="s1", user_text="edit notes")
+        await run_turn(
+            graph, session_id="s1", resume=Command(resume={"approved": False})
+        )
+        again = await run_turn(graph, session_id="s1", user_text="try again")
+        assert again.interrupt is not None  # "no" was not standing permission
+        assert "alpha" in notes.read_text()  # and nothing was written
+        conn.close()
+
+    async def test_manual_mode_keeps_gating_every_edit(self, tmp_path):
+        context, notes, _, conn = self.make(tmp_path)
+        llm = FakeLLM(
+            [
+                self.edit("notes", "alpha", "ALPHA"),
+                respond_json("first done"),
+                self.edit("notes", "beta", "BETA"),
+            ]
+        )
+        graph = build_graph(
+            llm=llm,
+            tools=add_file_tools(ToolRegistry()),
+            checkpointer=InMemorySaver(),
+            mode_fn=lambda: "manual",
+            ctx=context,
+        )
+        await run_turn(graph, session_id="s1", user_text="edit notes")
+        await run_turn(
+            graph, session_id="s1", resume=Command(resume={"approved": True})
+        )
+        # Manual mode exists to show every call: the approval memory is
+        # recorded (it carries into auto), but manual itself asks again.
+        second = await run_turn(graph, session_id="s1", user_text="again")
+        assert second.interrupt is not None
+        assert notes.resolve() in context.approved_edit_paths
+        conn.close()

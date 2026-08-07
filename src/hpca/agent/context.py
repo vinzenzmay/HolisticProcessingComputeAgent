@@ -47,3 +47,8 @@ class ToolContext:
     skills: list[Skill] = field(default_factory=list)
     # Commands whose docs could not be fetched; probed at most once per session
     doc_probe_failed: set[str] = field(default_factory=set)
+    # Files the user has already approved an edit_file on, as resolved paths.
+    # In auto mode the consent covers the file, not the single diff: further
+    # edit_file calls to the same path run without re-gating (§3.5), so a
+    # section-by-section fill of a long document costs one approval, not ten.
+    approved_edit_paths: set[Path] = field(default_factory=set)

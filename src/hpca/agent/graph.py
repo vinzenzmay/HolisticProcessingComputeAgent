@@ -39,6 +39,7 @@ from hpca.agent.modes import (
     script_preview,
     skipped_message,
 )
+from hpca.agent.file_tools import edit_target_path
 from hpca.agent.prompts import orchestrator_system_prompt
 from hpca.agent.tools import ToolRegistry
 from hpca.llm import Message
@@ -337,6 +338,17 @@ def build_graph(
         destructive = tool.gates(arguments, context) and destructive_approval_required(
             mode
         )
+        # One approval per FILE, not per diff (§3.5, auto only): once the user
+        # has said yes to an edit_file on a path, further edit_file calls to
+        # that same path run ungated — otherwise filling a long document
+        # section by section stops for the same answer ten times. Manual mode
+        # is exempt on purpose: it exists to show every call.
+        if destructive and tool.name == "edit_file" and mode == "auto":
+            target = edit_target_path(arguments, context)
+            if target is not None and target in getattr(
+                context, "approved_edit_paths", ()
+            ):
+                destructive = False
         # Manual mode gates execution tools too (§3.5) — same
         # interrupt/resume machinery, a different question to the user.
         execution = not destructive and requires_execution_approval(mode, tool.name)
@@ -364,6 +376,14 @@ def build_graph(
             reason = (
                 str(verdict.get("reason", "")) if isinstance(verdict, dict) else ""
             )
+            # Remember an approved edit's file so auto mode skips the gate for
+            # its later edits (above). Recorded in any gating mode — approval
+            # in manual carries when the user then switches to auto — but a
+            # refusal records nothing: "no" means no this time, not never ask.
+            if approved and destructive and tool.name == "edit_file":
+                target = edit_target_path(arguments, context)
+                if target is not None and hasattr(context, "approved_edit_paths"):
+                    context.approved_edit_paths.add(target)
         # Announced after the gate, never before it: a parked turn must not
         # report a call the user has not answered for yet, and interrupt()
         # re-runs this node from the top on resume — announcing above would
@@ -380,6 +400,11 @@ def build_graph(
             try:
                 output = await tool.handler(arguments, context)
                 content = f"[tool result] {tool.name}: {output}"
+                # A repaired call's result must SAY it was repaired — a
+                # salvaged half-write that reads like a clean success leaves
+                # the model believing the file is complete.
+                for repair in pending.get("repairs") or []:
+                    content += f"\n[repaired] {repair}"
                 ran = True
             except Exception as e:  # surfaced to the model, never crashes the graph
                 content = f"[tool error] {tool.name}: {type(e).__name__}: {e}"
