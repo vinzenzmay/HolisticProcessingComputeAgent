@@ -67,9 +67,16 @@ class TruncatedOutput(LLMError):
     (unbounded digit runs), and a call that was simply too long to finish —
     which is what writing a file's content into a tool call looks like when it
     does not fit. Both were seen live on the 27B; the caller decides what to
-    do about it (hpca.agent.middleware retries once, telling the model to
-    write the file in parts).
+    do about it. ``partial`` carries the whole cut-off generation, because a
+    too-long file write is salvageable: everything up to the last complete
+    line is real work (hpca.agent.middleware._salvage_truncated_call), and
+    without the fragment the only option is to throw the tokens away and
+    retry.
     """
+
+    def __init__(self, message: str, partial: str = ""):
+        super().__init__(message)
+        self.partial = partial
 
 
 @dataclass
@@ -185,7 +192,8 @@ class LLMClient:
             raise TruncatedOutput(
                 "Structured output truncated at max_tokens "
                 f"(looping, or too long to finish?): "
-                f"{message.get('content') or '':.120}"
+                f"{message.get('content') or '':.120}",
+                partial=message.get("content") or "",
             )
         # "request_seconds" is ours, not the backend's: OpenAI-style bodies
         # carry token counts but no timing, and without streaming the wall

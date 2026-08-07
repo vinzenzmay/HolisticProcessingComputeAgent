@@ -450,7 +450,9 @@ class TestTruncatedDecision:
         feedback = llm.calls[1]["messages"][-1]
         assert feedback["role"] == "user"  # never a system message (§4.3)
         assert "cut off" in feedback["content"]
-        assert "parts" in feedback["content"]
+        # the recovery it teaches is skeleton-then-fill, not resending
+        assert "skeleton" in feedback["content"]
+        assert "edit_file" in feedback["content"]
 
     async def test_it_is_retried_once_not_until_the_budget_runs_out(self, tools):
         # A looping model would otherwise cost the full retry budget at the
@@ -578,3 +580,81 @@ class TestKeyEcho:
         decision = await self.call(lines_tools, ["echo hi"], timeout_s=120)
         assert decision.arguments.timeout_s == 120
         assert decision.arguments.content_lines == ["echo hi"]
+
+
+class TestTruncationSalvage:
+    """A cut-off create_file/edit_file is salvaged, not thrown away: the
+    complete prefix runs, the repair note says the write is partial."""
+
+    @pytest.fixture
+    def file_tools(self):
+        from hpca.agent.file_tools import add_file_tools
+
+        return add_file_tools(ToolRegistry())
+
+    def truncated_create(self, n_lines, tail='"cut off mid-str'):
+        lines = ",".join(f'"line {i}"' for i in range(n_lines))
+        return (
+            '{"action":"tool_call","tool":"create_file","arguments":'
+            '{"dir_key":"workspace","name":"specs.md","content_lines":['
+            + lines + "," + tail
+        )
+
+    async def test_create_file_prefix_is_salvaged(self, file_tools):
+        llm = FakeLLM([TruncatedOutput("t", partial=self.truncated_create(40))])
+        decision = await decide(llm, USER, file_tools)
+        assert isinstance(decision, ToolCall)
+        assert decision.tool.name == "create_file"
+        assert decision.arguments.content_lines[:40] == [f"line {i}" for i in range(40)]
+        assert decision.arguments.content_lines[-1].startswith("TBD")
+        assert decision.repairs and "INCOMPLETE" in decision.repairs[0]
+        assert len(llm.calls) == 1  # no retry was spent
+
+    async def test_edit_file_new_lines_prefix_is_salvaged(self, file_tools):
+        new = ",".join(f'"new {i}"' for i in range(20))
+        partial = (
+            '{"action":"tool_call","tool":"edit_file","arguments":'
+            '{"registry_key":"specs","subpath":"","old_lines":["TBD: Build"],'
+            '"new_lines":[' + new + ',"cut'
+        )
+        llm = FakeLLM([TruncatedOutput("t", partial=partial)])
+        decision = await decide(llm, USER, file_tools)
+        assert isinstance(decision, ToolCall)
+        assert decision.tool.name == "edit_file"
+        assert list(decision.arguments.old_lines) == ["TBD: Build"]
+        assert len(decision.arguments.new_lines) == 21
+        assert decision.arguments.new_lines[-1].startswith("TBD")
+        assert decision.repairs and "TBD marker" in decision.repairs[0]
+
+    async def test_cut_inside_old_lines_is_not_salvaged(self, file_tools):
+        partial = (
+            '{"action":"tool_call","tool":"edit_file","arguments":'
+            '{"registry_key":"specs","subpath":"","old_lines":["TBD: Bu'
+        )
+        llm = FakeLLM([TruncatedOutput("t", partial=partial), respond_json("ok")])
+        # cut inside old_lines: no way to know the target lines, so no
+        # salvage — the normal retry runs and the second decision answers
+        decision = await decide(llm, USER, file_tools)
+        assert isinstance(decision, DirectResponse)
+        assert len(llm.calls) == 2  # retried instead of salvaging
+
+    async def test_too_few_lines_take_the_retry_not_the_salvage(self, file_tools):
+        llm = FakeLLM(
+            [
+                TruncatedOutput("t", partial=self.truncated_create(3)),
+                TruncatedOutput("t", partial=self.truncated_create(3)),
+            ]
+        )
+        with pytest.raises(TruncatedOutput):
+            await decide(llm, USER, file_tools)
+        assert len(llm.calls) == 2  # one retry, then surfaced
+
+    async def test_garbage_partial_is_not_salvaged(self, file_tools):
+        llm = FakeLLM(
+            [
+                TruncatedOutput("t", partial='{"acti'),
+                TruncatedOutput("t", partial=""),
+            ]
+        )
+        with pytest.raises(TruncatedOutput):
+            await decide(llm, USER, file_tools)

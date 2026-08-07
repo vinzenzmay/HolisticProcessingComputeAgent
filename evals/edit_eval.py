@@ -70,8 +70,16 @@ def _system_prompt() -> str:
         from hpca.agent.prompts import RESPOND_VS_TOOL_GUIDANCE as guidance
     except Exception:
         guidance = _FALLBACK_GUIDANCE
+    # Production always carries the file-writing guidance
+    # (orchestrator_system_prompt includes SCRIPT_GUIDANCE); measuring
+    # without it handicaps whichever side is checked out. Each side gets its
+    # own version's text — that IS the production difference under test.
+    try:
+        from hpca.agent.prompts import SCRIPT_GUIDANCE as script_guidance
+    except Exception:
+        script_guidance = ""
     return (
-        f"{guidance}\n\n"
+        f"{guidance}\n\n{script_guidance}\n\n"
         "You are working on files in a workspace. The relevant paths are "
         "already registered in the path registry under the keys named in the "
         "task; do not call register_path. Read a file with read_file before "
@@ -150,6 +158,9 @@ class Task:
     # scripted decisions for --dry-run: the fake model emits these in order,
     # then responds "DONE".
     fake_calls: list[dict] = field(default_factory=list)
+    # decision budget override; None = the global MAX_DECISIONS. Multi-part
+    # writes (skeleton + one edit per section) legitimately need more calls.
+    max_decisions: int | None = None
 
 
 def _edit(key: str, old: list[str], new: list[str]) -> dict:
@@ -581,6 +592,157 @@ def build_hard_tasks() -> list[Task]:
         )
     )
 
+    # H4. Write a LONG specs document — the real-session failure this tier
+    # exists for (see specs_test transcript, 2026-08-06): a ~12-decision plan
+    # is 250+ lines, past what one create_file call can carry under the
+    # 4096-token decision cap, so a one-shot write truncates and dies. The
+    # winning shape is skeleton-then-fill. Modeled on the cut_locus session.
+    specs_sections = [
+        "Purpose and scope",
+        "Command-line interface",
+        "Region parsing",
+        "Read selection",
+        "Trimming logic",
+        "Sequence collection",
+        "Output format",
+        "Error handling",
+        "Build system",
+        "Test strategy",
+    ]
+    # The decisions the document must carry — in the real session these were
+    # agreed one by one in the grilling; the write-down is transcription plus
+    # elaboration, not invention. Each entry: (decision text for the prompt,
+    # phrase list of which at least one must appear in the file).
+    specs_decisions = [
+        ("flags -a/--alignments, -f/--reference, -r/--region", ["--region"]),
+        (
+            "region like chr3:24,489,125-24,501,081 — commas are stripped",
+            ["comma"],
+        ),
+        (
+            "FASTA to stdout, ONE entry per unique QNAME, sorted "
+            "lexicographically by read name",
+            ["lexicograph"],
+        ),
+        (
+            "trim extents = union over ALL alignments of a QNAME that "
+            "overlap the region (supplementary/secondary only widen the "
+            "window), walked via the CIGAR strings",
+            ["CIGAR"],
+        ),
+        (
+            "insertions on the region border are included; soft-clipped "
+            "bases outside the kept span are excluded",
+            ["soft-clip", "soft clip"],
+        ),
+        (
+            "sequence comes from the primary alignment; if no primary is in "
+            "the region, follow the SA tag to fetch it",
+            ["SA tag"],
+        ),
+        (
+            "reverse-complement reverse-strand reads back to original "
+            "sequencing orientation",
+            ["reverse-complement", "reverse complement"],
+        ),
+        (
+            "no reads in region: empty stdout, a warning on stderr, exit 0",
+            ["stderr"],
+        ),
+        (
+            "build with CMake + GCC against htslib from the samtools conda "
+            "env",
+            ["CMake"],
+        ),
+        (
+            "Catch2 unit tests for the CIGAR walker and region parser, bash "
+            "integration tests with minimap2-aligned synthetic reads",
+            ["Catch2"],
+        ),
+    ]
+    specs_prompt = (
+        "Write the implementation plan specs.md for the cut_locus tool into "
+        "the workspace directory (registered as 'workspace'). cut_locus is a "
+        "C++ tool that extracts trimmed read sequences from CRAM alignments "
+        "for one genomic region. The plan was already agreed as follows — "
+        "every one of these decisions must be in the document, elaborated "
+        "with enough implementation detail to build from (data flow, edge "
+        "cases, examples): "
+        + "; ".join(text for text, _ in specs_decisions)
+        + ". Structure it as exactly these ten '## ' sections in this "
+        "order: "
+        + ", ".join(specs_sections)
+        + ". A plan this size is far too long for one call — write it "
+        "incrementally, and finish only when every section is filled."
+    )
+
+    def _specs_ok(ws: Path) -> bool:
+        path = ws / "specs.md"
+        if not path.is_file():
+            return False
+        text = path.read_text()
+        if len(text.split("\n")) < 150 or "TBD" in text:
+            return False
+        lowered = text.lower()
+        # every agreed decision landed (any of its marker phrases), and every
+        # section exists — case-insensitive; the tooling is under test, not
+        # heading capitalization or prose stamina
+        decisions_ok = all(
+            any(p.lower() in lowered for p in phrases)
+            for _, phrases in specs_decisions
+        )
+        sections_ok = all(
+            f"## {title.lower()}" in lowered for title in specs_sections
+        )
+        return decisions_ok and sections_ok
+
+    def _specs_fake_calls() -> list[dict]:
+        skeleton = ["# cut_locus — implementation plan"]
+        for title in specs_sections:
+            skeleton += [f"## {title}", f"TBD: {title}"]
+        calls = [
+            {
+                "action": "tool_call",
+                "tool": "create_file",
+                "arguments": {
+                    "dir_key": "workspace",
+                    "name": "specs.md",
+                    "content_lines": skeleton,
+                },
+            }
+        ]
+        for title, (decision, _) in zip(specs_sections, specs_decisions):
+            body = [f"- {decision}"] + [
+                f"- {title} detail line {i + 1}" for i in range(15)
+            ]
+            calls.append(
+                {
+                    "action": "tool_call",
+                    "tool": "edit_file",
+                    "arguments": {
+                        "registry_key": "workspace",
+                        "subpath": "specs.md",
+                        "old_lines": [f"TBD: {title}"],
+                        "new_lines": body,
+                    },
+                }
+            )
+        return calls
+
+    tasks.append(
+        Task(
+            name="long_specs_write",
+            prompt=specs_prompt,
+            files={},
+            check=_specs_ok,
+            fake_calls=_specs_fake_calls(),
+            # production parity: graph.MAX_TOOL_ROUNDS is 30 — a 16 cap sat
+            # exactly where skeleton + ten fills + a retry lands, so runs
+            # died on the harness, not on the tooling
+            max_decisions=30,
+        )
+    )
+
     # H3. The line to replace contains typographic quotes and an en-dash.
     # A model that transcribes them as ASCII used to get "NOT edited" and
     # loop; fuzzy matching absorbs the transcription.
@@ -650,7 +812,7 @@ def _is_failed_edit(tool_name: str, result: str) -> bool:
     return result.startswith("NOT ") or "[tool error]" in result
 
 
-async def run_task(task: Task, llm, tools: ToolRegistry) -> dict:
+async def run_task(task: Task, llm, tools: ToolRegistry, keep: bool = False) -> dict:
     workdir = Path(tempfile.mkdtemp(prefix=f"hpca_eval_{task.name}_"))
     workspace = workdir / "workspace"
     workspace.mkdir()
@@ -680,7 +842,7 @@ async def run_task(task: Task, llm, tools: ToolRegistry) -> dict:
             {"role": "system", "content": _system_prompt()},
             {"role": "user", "content": task.prompt},
         ]
-        for _ in range(MAX_DECISIONS):
+        for _ in range(task.max_decisions or MAX_DECISIONS):
             try:
                 decision = await decide(llm, messages, tools)
             except DecisionError as exc:
@@ -696,6 +858,10 @@ async def run_task(task: Task, llm, tools: ToolRegistry) -> dict:
             try:
                 # handlers called directly: no HITL gate in this harness
                 result = await decision.tool.handler(decision.arguments, ctx)
+                # mirror graph.py: a repaired (e.g. salvaged) call's result
+                # must tell the model what actually happened
+                for repair in getattr(decision, "repairs", None) or []:
+                    result = f"{result}\n[repaired] {repair}"
             except Exception as exc:
                 result = f"[tool error] {decision.tool.name}: {type(exc).__name__}: {exc}"
             if _is_failed_edit(decision.tool.name, result):
@@ -718,7 +884,18 @@ async def run_task(task: Task, llm, tools: ToolRegistry) -> dict:
                 conn.close()
             except Exception:
                 pass
-        shutil.rmtree(workdir, ignore_errors=True)
+        if keep:
+            # diagnosis mode: leave the workspace, dump the conversation
+            try:
+                (workdir / "transcript.json").write_text(
+                    json.dumps(locals().get("messages") or [], indent=1)
+                )
+            except Exception:
+                pass
+            metrics["workdir"] = str(workdir)
+            print(f"      kept: {workdir}")
+        else:
+            shutil.rmtree(workdir, ignore_errors=True)
     return metrics
 
 
@@ -798,6 +975,14 @@ async def main() -> int:
         help="run every task once against a scripted fake model (no backend)",
     )
     parser.add_argument(
+        "--only", default="", help="run only tasks whose name contains this"
+    )
+    parser.add_argument(
+        "--keep",
+        action="store_true",
+        help="keep each run's workdir and dump transcript.json into it",
+    )
+    parser.add_argument(
         "--tier",
         choices=["core", "hard", "all"],
         default="core",
@@ -813,6 +998,11 @@ async def main() -> int:
     }[args.tier]
     if args.tasks:
         tasks = tasks[: args.tasks]
+    if args.only:
+        tasks = [t for t in tasks if args.only in t.name]
+        if not tasks:
+            print(f"no task matches --only {args.only!r}")
+            return 2
     tools = _eval_tool_registry()
 
     live = None
@@ -825,7 +1015,7 @@ async def main() -> int:
         for task in tasks:
             for rep in range(repeats):
                 llm = FakeLLM(task.fake_calls) if args.dry_run else live
-                metrics = await run_task(task, llm, tools)
+                metrics = await run_task(task, llm, tools, keep=args.keep)
                 metrics["repeat"] = rep
                 runs.append(metrics)
                 status = "ok " if metrics["success"] else "FAIL"

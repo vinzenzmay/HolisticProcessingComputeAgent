@@ -75,6 +75,9 @@ mean_failed_edits are the headline numbers).
 - `--tier core|hard|all` — task tier (default core).
 - `--repeats N` — repeats per task (default 3; dry-run always runs 1).
 - `--tasks N` — only the first N tasks (quick smoke).
+- `--only SUBSTR` — only tasks whose name contains SUBSTR.
+- `--keep` — keep each run's workdir and dump `transcript.json` into it
+  (diagnosis: read what the model actually saw and wrote).
 - `--label name` — recorded in the output JSON.
 - Exit codes: 0 ok; 2 backend unreachable or 401.
 

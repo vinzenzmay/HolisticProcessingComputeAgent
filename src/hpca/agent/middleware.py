@@ -62,11 +62,24 @@ MAX_DECISION_TOKENS = 4096
 MAX_TRUNCATION_RETRIES = 1
 TRUNCATION_FEEDBACK = (
     "[validation error] Your last call was cut off at the token limit before "
-    "it was finished, so nothing could be run. Make this one smaller. If you "
-    "were writing a file, write it in parts: call create_file with the first "
-    "part, then add each further part with edit_file — put the file's current "
-    "last line in old_lines, and that same line followed by the new lines in "
-    "new_lines. Do not simply send the same thing again."
+    "it was finished, so nothing could be run. Do not send the same thing "
+    "again — it will be cut off again. When writing a file: if it does not "
+    "exist yet, create_file only a skeleton (headings, each with one "
+    "placeholder line `TBD: ...`); then fill ONE section per edit_file call, "
+    "at most ~80 new lines each. For anything else, make this call smaller."
+)
+
+# A salvaged write below this is not worth the confusion it costs: the model
+# handles "continue from line N" well, but not "continue from line 3".
+MIN_SALVAGE_LINES = 10
+# Planted at the end of every salvaged write. This is what keeps a salvaged
+# one-shot from silently losing its tail (measured: models declared 'done'
+# with 5 of 10 sections): the marker is a `TBD` placeholder, so the tool
+# results keep counting it until the model has actually replaced it with the
+# missing content — the same tracking loop a skeleton write gets for free.
+SALVAGE_MARKER = (
+    "TBD: the write was cut off at the token limit here — replace this line "
+    "with the missing rest, one section per edit_file call"
 )
 
 
@@ -329,6 +342,163 @@ def _annotate(decision: Decision, response: Any) -> Decision:
     return decision
 
 
+def _scalar_arg(partial: str, key: str) -> str | None:
+    """A complete string-valued argument out of a JSON fragment, or None."""
+    m = re.search(rf'"{key}"\s*:\s*("(?:[^"\\]|\\.)*")', partial)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1))
+    except ValueError:
+        return None
+
+
+def _array_start(partial: str, key: str) -> int | None:
+    """Offset just past the ``[`` of ``"key": [``, or None."""
+    m = re.search(rf'"{key}"\s*:\s*\[', partial)
+    return m.end() if m else None
+
+
+def _scan_strings(text: str, start: int) -> tuple[list[str], bool]:
+    """Complete string elements of a JSON array, scanning from ``start``.
+
+    Returns (elements, closed): closed means the ``]`` was reached, i.e. the
+    array did not truncate here. A non-string element or decode failure stops
+    the scan — everything before it is still complete and usable.
+    """
+    decoder = json.JSONDecoder()
+    items: list[str] = []
+    i = start
+    n = len(text)
+    while True:
+        while i < n and text[i] in " \t\r\n,":
+            i += 1
+        if i >= n:
+            return items, False
+        if text[i] == "]":
+            return items, True
+        try:
+            value, i = decoder.raw_decode(text, i)
+        except ValueError:
+            return items, False
+        if not isinstance(value, str):
+            return items, False
+        items.append(value)
+
+
+def _trim_degenerate_tail(lines: list[str]) -> list[str]:
+    """Drop a looping generation's junk tail from salvaged lines.
+
+    The other way a generation hits max_tokens (hpca.llm.TruncatedOutput) is
+    degeneration: the model repeats a near-empty element until the cap.
+    Seen live: a salvaged specs write ending in ~200 lines of '  ,'. Real
+    content cut short has a normal last line; a loop has a tail of dull or
+    identical ones — strip both, then let MIN_SALVAGE_LINES judge the rest.
+    """
+    trimmed = list(lines)
+
+    def dull(s: str) -> bool:
+        return not s.strip(" \t,.|;:-_=*#")
+
+    while trimmed and dull(trimmed[-1]):
+        trimmed.pop()
+    # a run of identical trailing lines is the loop's other signature
+    if len(trimmed) >= 6 and len(set(trimmed[-6:])) == 1:
+        repeated = trimmed[-1]
+        while trimmed and trimmed[-1] == repeated:
+            trimmed.pop()
+    return trimmed
+
+
+def _salvage_truncated_call(partial: str, tools: ToolRegistry) -> ToolCall | None:
+    """A cut-off create_file/edit_file rebuilt from its complete prefix.
+
+    A too-long file write dies at max_tokens with hundreds of perfectly good
+    lines already generated; retrying regenerates (and usually re-truncates)
+    all of them. Everything up to the last complete array element is real
+    work, so run that and tell the model to continue — measured live
+    (specs-eval, 2026-08-07), the retry path lost the whole file two times in
+    three, while a salvaged prefix turns the same failure into forward
+    progress. The arrays-last argument rule (module docstring) is what makes
+    the prefix parseable: every scalar argument is complete before the final
+    array begins. Anything else — unknown tool, truncation inside edit_file's
+    old_lines, fewer than MIN_SALVAGE_LINES lines — returns None and takes
+    the normal retry.
+    """
+    m = re.search(r'"tool"\s*:\s*"(create_file|edit_file)"', partial)
+    if not m:
+        return None
+    tool_name = m.group(1)
+    try:
+        tool = tools.get(tool_name)
+    except Exception:
+        return None
+
+    if tool_name == "create_file":
+        dir_key = _scalar_arg(partial, "dir_key")
+        name = _scalar_arg(partial, "name")
+        start = _array_start(partial, "content_lines")
+        if not dir_key or not name or start is None:
+            return None
+        lines, closed = _scan_strings(partial, start)
+        # closed means the array was fine and the cut hit something else —
+        # too odd a state to guess at, let the retry handle it.
+        if closed:
+            return None
+        lines = _trim_degenerate_tail(lines)
+        if len(lines) < MIN_SALVAGE_LINES:
+            return None
+        args: dict = {
+            "dir_key": dir_key,
+            "name": name,
+            "content_lines": lines + [SALVAGE_MARKER],
+        }
+        note = (
+            f"this call was cut off at the token limit; the {len(lines)} "
+            f"complete lines generated before the cut were written, the rest "
+            f"were lost, and a TBD marker line was appended where the file "
+            f"stops (after {lines[-1]!r}). The file is INCOMPLETE: replace "
+            "the marker with the missing content, one section per edit_file "
+            "call, at most ~80 new lines each."
+        )
+    else:
+        registry_key = _scalar_arg(partial, "registry_key")
+        old_start = _array_start(partial, "old_lines")
+        if not registry_key or old_start is None:
+            return None
+        old_lines, old_closed = _scan_strings(partial, old_start)
+        if not old_closed or not old_lines:
+            return None  # cut inside old_lines: no way to know the target
+        new_start = _array_start(partial, "new_lines")
+        if new_start is None or new_start <= old_start:
+            return None
+        new_lines, new_closed = _scan_strings(partial, new_start)
+        if new_closed:
+            return None
+        new_lines = _trim_degenerate_tail(new_lines)
+        if len(new_lines) < MIN_SALVAGE_LINES:
+            return None
+        args = {
+            "registry_key": registry_key,
+            "subpath": _scalar_arg(partial, "subpath") or "",
+            "old_lines": old_lines,
+            "new_lines": new_lines + [SALVAGE_MARKER],
+        }
+        note = (
+            f"this call was cut off at the token limit; the {len(new_lines)} "
+            f"complete replacement lines generated before the cut were "
+            f"applied, the rest were lost, and a TBD marker line was placed "
+            f"where the text stops (after {new_lines[-1]!r}). Replace the "
+            "marker with the missing content, at most ~80 new lines per call."
+        )
+
+    try:
+        arguments = tool.params.model_validate(args)
+    except ValidationError:
+        return None
+    return ToolCall(tool=tool, arguments=arguments, repairs=[note])
+
+
 async def decide(
     llm: Any,
     messages: list[Message],
@@ -358,11 +528,18 @@ async def decide(
             response = await llm.chat(
                 conversation, json_schema=schema, max_tokens=max_tokens
             )
-        except TruncatedOutput:
-            # Nothing came back to feed the model verbatim — the fragment is
-            # its own unfinished call — so the feedback says what happened and
-            # what to do instead, and rides the user role like every other
-            # retry (system messages are rejected after position 0).
+        except TruncatedOutput as exc:
+            # First choice: salvage. A cut-off file write's complete prefix
+            # is real work — running it beats regenerating (and usually
+            # re-truncating) the whole thing. The repair note rides on the
+            # ToolCall so the result the model sees says the write is partial.
+            salvaged = _salvage_truncated_call(getattr(exc, "partial", ""), tools)
+            if salvaged is not None:
+                return salvaged
+            # Otherwise: nothing came back to feed the model verbatim — the
+            # fragment is its own unfinished call — so the feedback says what
+            # happened and what to do instead, and rides the user role like
+            # every other retry (system messages are rejected after pos 0).
             if truncations >= MAX_TRUNCATION_RETRIES:
                 raise
             truncations += 1

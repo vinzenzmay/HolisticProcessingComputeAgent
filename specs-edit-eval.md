@@ -85,7 +85,39 @@ proving the plumbing. Keep tasks representative of real cluster files — the
 hard tier earns its name from realism (long generated configs, Windows-edited
 ini), not from puzzle construction.
 
-## 3. What it deliberately is not
+## 3. The long-write problem (v0.19.0)
+
+A real session (the cut_locus grilling, 2026-08-06) surfaced the next
+failure class: a 12-decision specs.md is 250+ lines, more than one
+create_file call fits under the 4096-token decision cap, so the write
+truncated and the turn died with nothing on disk. Fixes, in order of load
+they carry:
+
+- **Truncated-call salvage** (`middleware._salvage_truncated_call`): a
+  cut-off create_file/edit_file is not retried wholesale — the complete
+  prefix of its final line-array runs, with a `TBD` marker line planted
+  where the text stops and a repair note in the result. Arrays-last argument
+  ordering is what makes the prefix parseable. Degenerate loop tails
+  (`'  ,' × 200`, the other way generations hit the cap) are trimmed, not
+  written.
+- **Placeholder tracking** (`file_tools._tbd_note`): every create/edit
+  result counts remaining `TBD` lines and names the next one — the tool side
+  of the skeleton-then-fill protocol, and what keeps a 27B from declaring
+  "done" two placeholders early.
+- **Skeleton-then-fill guidance**, kept deliberately small: one sentence in
+  SCRIPT_GUIDANCE and the create_file description; the reactive
+  TRUNCATION_FEEDBACK (costs nothing until it fires) teaches the same shape.
+
+Measured on `long_specs_write` (hard tier; transcription of ten agreed
+decisions into a ten-section specs.md, 6 reps): v0.18.1 lost the ENTIRE
+write to double-truncation in 3 of 6 runs (dead turn, no file); v0.19.0
+produced a substantial specs.md in 6 of 6, fully complete in 3, the rest one
+section short or with an honest TBD marker left. The residual incompleteness
+is long-horizon instruction compliance of the 27B — one interactive
+"section X is missing" turn in practice — not tool mechanics; do not try to
+prompt it away with more standing text.
+
+## 4. What it deliberately is not
 
 - Not part of the default or live pytest suites — it costs real generations
   and minutes of wall time; it runs only when someone asks for an assessment.
