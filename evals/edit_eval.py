@@ -503,6 +503,117 @@ def build_tasks() -> list[Task]:
     return tasks
 
 
+def _deep_file() -> str:
+    # 700 lines; the only interesting line sits at ~400, past any window the
+    # old head/tail read_file could show for a file this long. Its exact value
+    # and inline comment are NOT in the prompt, so the model must actually see
+    # the line to copy it.
+    lines = ["# pipeline stage table — generated"]
+    for i in range(2, 701):
+        if i == 400:
+            lines.append("chunk_size = 4096      # stage K: io tuning, keep power of two")
+        else:
+            lines.append(f"stage_{i:03d} = pass")
+    return "\n".join(lines) + "\n"
+
+
+def build_hard_tasks() -> list[Task]:
+    """Tier 'hard': realistic shapes the old tooling structurally mishandled.
+
+    Same tasks run against both baseline and treatment — the point is that
+    these are ordinary cluster files (long generated configs, Windows-edited
+    ini, prose with typographic quotes), not synthetic gotchas.
+    """
+    tasks: list[Task] = []
+
+    # H1. Edit deep inside a 700-line file. The old read_file showed
+    # head/tail with the middle omitted and had no offset, so the region
+    # around line 400 was unreachable; paging makes it reachable.
+    tasks.append(
+        Task(
+            name="deep_edit_700",
+            prompt=(
+                "The generated pipeline config is registered as 'pipeline'. "
+                "Somewhere in it a line sets chunk_size. Double the value on "
+                "that line, and keep its inline comment exactly as it is. The "
+                "file is long — page through it until you have actually seen "
+                "the line before editing."
+            ),
+            files={"pipeline": ("pipeline.cfg", _deep_file())},
+            check=lambda ws: "chunk_size = 8192      # stage K: io tuning, keep power of two"
+            in (ws / "pipeline.cfg").read_text(),
+            fake_calls=[
+                _read("pipeline"),
+                _edit(
+                    "pipeline",
+                    ["chunk_size = 4096      # stage K: io tuning, keep power of two"],
+                    ["chunk_size = 8192      # stage K: io tuning, keep power of two"],
+                ),
+            ],
+        )
+    )
+
+    # H2. CRLF file where success requires the line endings to SURVIVE the
+    # edit byte-for-byte (the old write path rewrote the file with LF).
+    crlf_body = (
+        b"[cluster]\r\n"
+        b"queue = short\r\n"
+        b"max_jobs = 8\r\n"
+        b"notify = none\r\n"
+    )
+    tasks.append(
+        Task(
+            name="crlf_preserved",
+            prompt=(
+                "The config is registered as 'clusterconf'. Change max_jobs = 8 "
+                "to max_jobs = 32. The file comes from a Windows tool; it must "
+                "keep its CRLF line endings."
+            ),
+            files={"clusterconf": ("cluster.ini", crlf_body)},
+            check=lambda ws: (
+                b"max_jobs = 32\r\n" in (ws / "cluster.ini").read_bytes()
+                and b"queue = short\r\n" in (ws / "cluster.ini").read_bytes()
+            ),
+            fake_calls=[
+                _read("clusterconf"),
+                _edit("clusterconf", ["max_jobs = 8"], ["max_jobs = 32"]),
+            ],
+        )
+    )
+
+    # H3. The line to replace contains typographic quotes and an en-dash.
+    # A model that transcribes them as ASCII used to get "NOT edited" and
+    # loop; fuzzy matching absorbs the transcription.
+    smart = (
+        "# report strings\n"
+        "title = “Weekly QC – node health”\n"
+        "footer = plain\n"
+    )
+    tasks.append(
+        Task(
+            name="smart_quote_line",
+            prompt=(
+                "The file is registered as 'report'. On the title line, "
+                "change the word Weekly to Daily, leaving the rest of the "
+                "line as it is."
+            ),
+            files={"report": ("report.cfg", smart)},
+            check=lambda ws: "Daily QC" in (ws / "report.cfg").read_text()
+            and "Weekly" not in (ws / "report.cfg").read_text(),
+            fake_calls=[
+                _read("report"),
+                _edit(
+                    "report",
+                    ["title = “Weekly QC – node health”"],
+                    ["title = “Daily QC – node health”"],
+                ),
+            ],
+        )
+    )
+
+    return tasks
+
+
 # --------------------------------------------------------------- fake model
 
 
@@ -686,9 +797,20 @@ async def main() -> int:
         action="store_true",
         help="run every task once against a scripted fake model (no backend)",
     )
+    parser.add_argument(
+        "--tier",
+        choices=["core", "hard", "all"],
+        default="core",
+        help="core: the original 12 tasks; hard: shapes the old tooling "
+        "structurally mishandled; all: both",
+    )
     args = parser.parse_args()
 
-    tasks = build_tasks()
+    tasks = {
+        "core": build_tasks(),
+        "hard": build_hard_tasks(),
+        "all": build_tasks() + build_hard_tasks(),
+    }[args.tier]
     if args.tasks:
         tasks = tasks[: args.tasks]
     tools = _eval_tool_registry()

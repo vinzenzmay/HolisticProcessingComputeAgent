@@ -255,8 +255,12 @@ class ReadFileParams(BaseModel):
             "suggested"
         ),
     )
+    # Default 200, not 100: measured on the live 27B, a mid-file edit in a
+    # 700-line file cost 7 paging reads at 100 lines a page — the model
+    # follows the continuation hint faithfully, so the page size is the whole
+    # cost. 200 halves it while a page stays ~2k tokens.
     max_lines: int = Field(
-        default=100, ge=10, le=500, description="Line budget for the output"
+        default=200, ge=10, le=500, description="Line budget for the output"
     )
 
 
@@ -316,7 +320,8 @@ async def read_file(args: ReadFileParams, ctx: ToolContext) -> str:
         return body
     return (
         f"{body}\n... [file continues: lines {end + 1}-{total}; call "
-        f"read_file again with start_line={end + 1}]"
+        f"read_file again with start_line={end + 1}, and max_lines up to 500 "
+        "to see more per call]"
     )
 
 
