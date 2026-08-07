@@ -246,8 +246,21 @@ class ReadFileParams(BaseModel):
             "'src/main.py'. Leave empty to read the key itself."
         ),
     )
+    start_line: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "1-indexed line to start reading from; page through a long file "
+            "by repeating the call with the start_line the previous result "
+            "suggested"
+        ),
+    )
+    # Default 200, not 100: measured on the live 27B, a mid-file edit in a
+    # 700-line file cost 7 paging reads at 100 lines a page — the model
+    # follows the continuation hint faithfully, so the page size is the whole
+    # cost. 200 halves it while a page stays ~2k tokens.
     max_lines: int = Field(
-        default=100, ge=10, le=500, description="Line budget for the output"
+        default=200, ge=10, le=500, description="Line budget for the output"
     )
 
 
@@ -290,15 +303,25 @@ async def read_file(args: ReadFileParams, ctx: ToolContext) -> str:
     if path.is_dir():
         return _list_dir(path, key, args.max_lines)
     lines = path.read_text(errors="replace").splitlines()
-    if len(lines) <= args.max_lines:
-        return "\n".join(lines)
-    # §4.3 output size control: head/tail, never the full dump
-    head = args.max_lines // 2
-    tail = args.max_lines - head
-    return "\n".join(
-        lines[:head]
-        + [f"... [{len(lines) - head - tail} lines omitted] ..."]
-        + lines[-tail:]
+    total = len(lines)
+    if args.start_line > total:
+        return (
+            f"start_line={args.start_line} is past the end of {key!r}: it has "
+            f"{total} lines. Call read_file again with start_line <= {total}."
+        )
+    # §4.3 output size control: a contiguous window, never the full dump.
+    # Head/tail with the middle omitted made the region a model wanted to
+    # edit literally unreadable (and the omission marker got copied into
+    # edit_file old_lines); paging with start_line replaces it.
+    start = args.start_line - 1
+    end = start + args.max_lines
+    body = "\n".join(lines[start:end])
+    if end >= total:
+        return body
+    return (
+        f"{body}\n... [file continues: lines {end + 1}-{total}; call "
+        f"read_file again with start_line={end + 1}, and max_lines up to 500 "
+        "to see more per call]"
     )
 
 
@@ -646,8 +669,10 @@ def default_tool_registry() -> ToolRegistry:
         Tool(
             name="read_file",
             description=(
-                "Read a registered file (head/tail truncated). If the key is a "
-                "directory, lists it; pass subpath to read a file inside it."
+                "Read a registered file, paged: returns up to max_lines from "
+                "start_line and tells you where to continue if the file goes "
+                "on. If the key is a directory, lists it; pass subpath to "
+                "read a file inside it."
             ),
             params=ReadFileParams,
             handler=read_file,

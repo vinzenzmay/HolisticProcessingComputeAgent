@@ -94,15 +94,55 @@ class TestReadFile:
         result = await call(tools, "read_file", ctx, registry_key="data")
         assert "line1" in result and "line2" in result
 
-    async def test_long_file_truncated_head_tail(self, tools, ctx, tmp_path):
+    async def test_long_file_returns_contiguous_window_with_hint(
+        self, tools, ctx, tmp_path
+    ):
         f = tmp_path / "big.txt"
         f.write_text("\n".join(f"line{i}" for i in range(1000)))
         ctx.registry.register("big", f)
         result = await call(tools, "read_file", ctx, registry_key="big", max_lines=20)
-        assert "line0" in result
-        assert "line999" in result
-        assert "line500" not in result
-        assert "omitted" in result
+        # Contiguous head window, no middle omission — the model pages instead.
+        assert "line0" in result and "line19" in result
+        assert "line20" not in result
+        assert "line999" not in result
+        assert "file continues: lines 21-1000" in result
+        assert "start_line=21" in result
+
+    async def test_paging_window_with_start_line(self, tools, ctx, tmp_path):
+        f = tmp_path / "big.txt"
+        f.write_text("\n".join(f"line{i}" for i in range(1000)))
+        ctx.registry.register("big", f)
+        result = await call(
+            tools, "read_file", ctx, registry_key="big",
+            start_line=501, max_lines=10,
+        )
+        assert result.splitlines()[0] == "line500"
+        assert "line509" in result
+        assert "file continues: lines 511-1000" in result
+        assert "start_line=511" in result
+
+    async def test_start_line_beyond_eof_is_instructive(self, tools, ctx, tmp_path):
+        f = tmp_path / "big.txt"
+        f.write_text("\n".join(f"line{i}" for i in range(50)))
+        ctx.registry.register("big", f)
+        result = await call(
+            tools, "read_file", ctx, registry_key="big", start_line=100
+        )
+        assert "50" in result and "start_line" in result
+
+    async def test_start_line_with_small_remainder_no_hint(
+        self, tools, ctx, tmp_path
+    ):
+        f = tmp_path / "big.txt"
+        f.write_text("\n".join(f"line{i}" for i in range(100)))
+        ctx.registry.register("big", f)
+        result = await call(
+            tools, "read_file", ctx, registry_key="big",
+            start_line=91, max_lines=20,
+        )
+        assert result.splitlines()[0] == "line90"
+        assert "line99" in result
+        assert "file continues" not in result
 
     async def test_unknown_key_raises_with_available(self, tools, ctx, tmp_path):
         ctx.registry.register("known", tmp_path / "k.txt")

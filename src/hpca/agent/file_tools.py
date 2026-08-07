@@ -31,7 +31,9 @@ entirely.
 
 from __future__ import annotations
 
+import re
 import time
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 
@@ -320,6 +322,105 @@ def _find_runs(haystack: list[str], needle: list[str]) -> list[int]:
     ]
 
 
+# The repair-and-fuzz layer below exists to absorb model imperfection inside
+# the tool instead of bouncing errors back into the retry loop: the live model
+# (a mid-size Qwen behind constrained decoding) reliably produces *almost*
+# right arguments — an embedded "\n" inside one array element, line numbers
+# copied straight from read_file's numbered listing, a smart quote where the
+# file has ASCII — and every bounce costs a round-trip plus, usually, a full
+# re-read of the file.
+
+def _split_embedded_newlines(lines: list[str]) -> list[str]:
+    """One string per line, even when the model packed several into one.
+
+    The params ask for arrays of lines, but a model that thinks in blocks
+    sometimes sends ["a\\nb"] for two lines. The intent is unambiguous, so
+    split rather than refuse.
+    """
+    out: list[str] = []
+    for line in lines:
+        out.extend(line.split("\n"))
+    return out
+
+
+# A line-number prefix as read_file (or `cat -n`, or an editor) renders it:
+# optional indent, digits, then ":", a tab, or "|" — e.g. "12: x", "12\tx",
+# " 12 | x".
+_LINE_NUMBER_PREFIX = re.compile(r"^\s*\d+\s*(?::|\t|\|)\s?")
+
+
+def _strip_line_number_prefixes(lines: list[str]) -> list[str] | None:
+    """The lines without a copied numbered-listing prefix, or None.
+
+    Only fires when EVERY element carries the prefix — one numbered line in
+    ten is genuine content (a dict entry, a timestamp), ten in ten is a model
+    copying a numbered listing. The caller additionally tries the unstripped
+    lines first, so genuine content that actually matches is never mangled.
+    """
+    if not all(_LINE_NUMBER_PREFIX.match(line) for line in lines):
+        return None
+    return [_LINE_NUMBER_PREFIX.sub("", line, count=1) for line in lines]
+
+
+# Fuzzy normalization, per line (modelled on PI's normalizeForFuzzyMatch):
+# smart quotes → ASCII quotes, Unicode dashes (U+2010..U+2015, minus U+2212)
+# → "-", special spaces (NBSP and friends) → " ". Applied after NFKC, which
+# already folds most compatibility characters.
+_FUZZY_TRANSLATE = str.maketrans(
+    {
+        # smart single quotes U+2018..U+201B
+        **dict.fromkeys(map(ord, "\u2018\u2019\u201a\u201b"), "'"),
+        # smart double quotes U+201C..U+201F
+        **dict.fromkeys(map(ord, "\u201c\u201d\u201e\u201f"), '"'),
+        # hyphen, non-breaking hyphen, figure/en/em dash, horizontal bar, minus
+        **dict.fromkeys(
+            map(ord, "\u2010\u2011\u2012\u2013\u2014\u2015\u2212"), "-"
+        ),
+        # NBSP, en/em-family spaces, narrow NBSP, math space, ideographic space
+        **dict.fromkeys(
+            map(
+                ord,
+                "\u00a0\u2002\u2003\u2004\u2005\u2006\u2007\u2008"
+                "\u2009\u200a\u202f\u205f\u3000",
+            ),
+            " ",
+        ),
+    }
+)
+
+
+def _fuzzy_line(line: str) -> str:
+    """A line as fuzzy matching sees it. Leading whitespace survives on
+    purpose: indentation is meaning (Python), trailing whitespace never is."""
+    return (
+        unicodedata.normalize("NFKC", line).translate(_FUZZY_TRANSLATE).rstrip()
+    )
+
+
+# The matching ladder, strictest first: exact; trailing whitespace stripped;
+# full fuzzy. A unique match at ANY level applies the edit — asking the model
+# to fix a trailing space it cannot even see is a wasted round-trip.
+_MATCH_LEVELS = (None, str.rstrip, _fuzzy_line)
+
+
+def _match_ladder(file_lines: list[str], old_lines: list[str]) -> list[int]:
+    """Hit indices at the strictest level that matches at all.
+
+    Ambiguity is judged at the level that matched: two exact occurrences are
+    two occurrences, and never get "rescued" by a looser level seeing three.
+    """
+    for transform in _MATCH_LEVELS:
+        if transform is None:
+            hay, needle = file_lines, old_lines
+        else:
+            hay = [transform(line) for line in file_lines]
+            needle = [transform(line) for line in old_lines]
+        hits = _find_runs(hay, needle)
+        if hits:
+            return hits
+    return []
+
+
 def _near_miss(file_lines: list[str], old_lines: list[str]) -> str:
     """Where the lines nearly match, for the usual whitespace near-miss.
 
@@ -359,10 +460,29 @@ def _lines(count: int) -> str:
 
 def _change(args: EditFileParams) -> str:
     """The size of the change, in the one phrasing the prompt and the result
-    both use: "3 lines → 2 lines", or "3 lines deleted" when nothing goes back."""
-    if not args.new_lines:
-        return f"{_lines(len(args.old_lines))} deleted"
-    return f"{_lines(len(args.old_lines))} → {_lines(len(args.new_lines))}"
+    both use: "3 lines → 2 lines", or "3 lines deleted" when nothing goes back.
+    Counted after embedded-\\n repair, so the numbers match what lands."""
+    old = _split_embedded_newlines(list(args.old_lines))
+    new = _split_embedded_newlines(list(args.new_lines))
+    if not new:
+        return f"{_lines(len(old))} deleted"
+    return f"{_lines(len(old))} → {_lines(len(new))}"
+
+
+def _read_for_edit(path: Path) -> tuple[str, str, str]:
+    """(LF-normalized text, bom, dominant line ending) of ``path``.
+
+    Matching happens on LF-normalized, BOM-less text — the model copies lines
+    out of read_file and never sees a BOM or a \\r — and the write restores
+    both, so an edit does not silently re-terminate a CRLF file.
+    """
+    raw = path.read_bytes().decode()
+    bom, text = ("\ufeff", raw[1:]) if raw.startswith("\ufeff") else ("", raw)
+    # Dominant = first: a file that opens with \r\n is a CRLF file, whatever a
+    # stray later line does (mirrors PI's detectLineEnding).
+    crlf, lf = text.find("\r\n"), text.find("\n")
+    ending = "\r\n" if crlf != -1 and lf != -1 and crlf < lf else "\n"
+    return text.replace("\r\n", "\n").replace("\r", "\n"), bom, ending
 
 
 def _describe_edit(args: EditFileParams, ctx: ToolContext) -> str:
@@ -413,16 +533,28 @@ async def edit_file(args: EditFileParams, ctx: ToolContext) -> str:
             "edit a file inside it."
         )
     try:
-        text = path.read_text()
+        text, bom, ending = _read_for_edit(path)
     except (UnicodeDecodeError, OSError) as exc:
         return f"NOT edited: {path} could not be read as text ({type(exc).__name__})."
 
+    # Repair before matching: embedded \n split always (the intent is
+    # unambiguous), numbered-prefix stripping only as a fallback when the
+    # lines as sent match nothing — genuine "12: x" content that IS in the
+    # file matches first and is never mangled.
+    old_lines = _split_embedded_newlines(list(args.old_lines))
+    new_lines = _split_embedded_newlines(list(args.new_lines))
     file_lines = text.split("\n")
-    hits = _find_runs(file_lines, list(args.old_lines))
+    hits = _match_ladder(file_lines, old_lines)
+    if not hits:
+        stripped = _strip_line_number_prefixes(old_lines)
+        if stripped is not None:
+            hits = _match_ladder(file_lines, stripped)
+            if hits:
+                old_lines = stripped
     if not hits:
         return (
             f"NOT edited: those lines are not in {path}."
-            f"{_near_miss(file_lines, list(args.old_lines))}"
+            f"{_near_miss(file_lines, old_lines)}"
         )
     if len(hits) > 1:
         where = ", ".join(f"line {index + 1}" for index in hits[:5])
@@ -431,9 +563,18 @@ async def edit_file(args: EditFileParams, ctx: ToolContext) -> str:
             "so which one you mean is ambiguous. Call edit_file again with "
             "enough surrounding lines to pick out the one you want."
         )
+    # A unique fallback-level match applies: the file's own lines outside the
+    # run are untouched (whole-line replacement, so nothing gets normalized
+    # that the edit did not touch), and new_lines land verbatim.
     start = hits[0]
-    after = start + len(args.old_lines)
-    edited = "\n".join(file_lines[:start] + list(args.new_lines) + file_lines[after:])
+    after = start + len(old_lines)
+    edited = "\n".join(file_lines[:start] + new_lines + file_lines[after:])
+    if edited == text:
+        return (
+            f"NOT edited: the replacement produces identical content — "
+            "old_lines and new_lines are the same. If you meant to change "
+            "something else, re-read the file and edit that."
+        )
 
     warnings: list[str] = []
     kind = KIND_BY_SUFFIX.get(path.suffix)
@@ -453,18 +594,21 @@ async def edit_file(args: EditFileParams, ctx: ToolContext) -> str:
             return refused
 
     entry = _require_trash(ctx).backup(path)
-    path.write_text(edited)
+    # Write back what the file was, not what matching needed: dominant line
+    # ending and BOM restored, so an edit never re-terminates a CRLF file.
+    out = edited.replace("\n", ending) if ending != "\n" else edited
+    path.write_bytes((bom + out).encode())
     extra = f" ({'; '.join(warnings)})" if warnings else ""
-    # Naming the undo, not just the backup: a copy the model does not know how
-    # to reach is a copy the user is told to go dig for by hand.
-    note = (
-        "The version before this edit is in the trash: to undo, move the "
-        "edited file aside with move_file, then restore_file this path."
+    # One short line on success (§ result-message diet): the standing undo
+    # lecture cost tokens on every edit; the trash behavior itself is
+    # unchanged, and only the irreversible case still warns.
+    no_backup = (
+        ""
         if entry.trashed_path
-        else "NO backup was kept (the file is above the backup size limit), so "
-        "this cannot be undone."
+        else " NO backup was kept (the file is above the backup size limit), "
+        "so this cannot be undone."
     )
-    return f"Edited {path} at line {start + 1}: {_change(args)}{extra}. {note}"
+    return f"Edited {path} at line {start + 1}: {_change(args)}{extra}.{no_backup}"
 
 
 class CreateFileParams(BaseModel):
@@ -523,7 +667,10 @@ async def create_file(args: CreateFileParams, ctx: ToolContext) -> str:
             "with the lines to replace; to replace it wholesale, delete_file "
             "first (the old version stays recoverable from the trash)."
         )
-    content = "\n".join(args.content_lines) + "\n"
+    # Same embedded-\n repair as edit_file: the array is lines, but a model
+    # that packs a block into one element still means the lines it contains.
+    content_lines = _split_embedded_newlines(list(args.content_lines))
+    content = "\n".join(content_lines) + "\n"
 
     warnings: list[str] = []
     kind = KIND_BY_SUFFIX.get(path.suffix)
@@ -548,7 +695,7 @@ async def create_file(args: CreateFileParams, ctx: ToolContext) -> str:
     key = ctx.registry.register_auto(path, hint=path.stem)
     extra = f" ({'; '.join(warnings)})" if warnings else ""
     return (
-        f"Created {path} ({_lines(len(args.content_lines))}), registered as "
+        f"Created {path} ({_lines(len(content_lines))}), registered as "
         f"{key!r}{extra}. Change it with edit_file, not by writing it again."
     )
 

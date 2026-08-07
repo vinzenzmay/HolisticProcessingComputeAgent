@@ -1,0 +1,870 @@
+#!/usr/bin/env python
+"""Standalone eval: how well does the live LLM drive HPCA's edit_file /
+read_file / create_file tools?
+
+Runs each task in a fresh temp workspace with a real ToolContext (real
+PathRegistry, TrashManager, ProcessRunner), a bounded decision loop through
+hpca.agent.middleware.decide, and tool handlers called DIRECTLY (no HITL
+gating). Designed to be run twice — once from a worktree of main (baseline)
+and once from the treatment branch — so it touches only stable HPCA APIs and
+degrades gracefully when minor details differ.
+
+Usage:
+    python evals/edit_eval.py --out results.json --repeats 3 [--tasks N]
+                              [--label name] [--dry-run]
+
+Exit codes: 0 ok, 2 backend unreachable/unauthorized.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import inspect
+import json
+import os
+import shutil
+import sys
+import tempfile
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable
+
+# Make `import hpca` work when run from a repo checkout without installation.
+_REPO_SRC = Path(__file__).resolve().parent.parent / "src"
+if _REPO_SRC.is_dir() and str(_REPO_SRC) not in sys.path:
+    sys.path.insert(0, str(_REPO_SRC))
+
+try:
+    import httpx
+except ImportError:
+    httpx = None  # only needed for live runs
+
+from hpca.agent.context import ToolContext
+from hpca.agent.middleware import DecisionError, DirectResponse, ToolCall, decide
+from hpca.agent.tools import ToolRegistry
+from hpca.config import Settings
+from hpca.registry import PathRegistry
+from hpca.runner import ProcessRunner
+from hpca.trash import TrashManager
+
+LIVE_URL = os.environ.get("HPCA_TEST_LLM_URL", "http://localhost:20001/v1")
+LIVE_KEY = os.environ.get("HPCA_TEST_LLM_KEY")
+
+MAX_DECISIONS = 8
+
+# ------------------------------------------------------------------ prompts
+
+_FALLBACK_GUIDANCE = (
+    "You are an assistant with tools. Tools perform real actions. "
+    "Use a tool only when the user asks for an action a tool performs. "
+    "For conversation, questions, and greetings, always answer directly "
+    'with {"action": "respond", ...} — never route your own words through a tool.'
+)
+
+
+def _system_prompt() -> str:
+    """Match HPCA's own prompt style; fall back if the constant moved."""
+    try:
+        from hpca.agent.prompts import RESPOND_VS_TOOL_GUIDANCE as guidance
+    except Exception:
+        guidance = _FALLBACK_GUIDANCE
+    return (
+        f"{guidance}\n\n"
+        "You are working on files in a workspace. The relevant paths are "
+        "already registered in the path registry under the keys named in the "
+        "task; do not call register_path. Read a file with read_file before "
+        "editing it, make the change with edit_file (or create_file for a new "
+        "file), and when the change is done answer directly with a short "
+        "confirmation. Copy old_lines exactly as they appear in the file, "
+        "including indentation and spacing, without line numbers."
+    )
+
+
+# ------------------------------------------------------------- tool wiring
+
+
+def _eval_tool_registry() -> ToolRegistry:
+    """read_file + edit_file + create_file, via the same add_* wiring HPCA uses."""
+    from hpca.agent.builtin_tools import default_tool_registry
+    from hpca.agent.file_tools import add_file_tools
+
+    registry = add_file_tools(default_tool_registry())
+    wanted = ["read_file", "edit_file", "create_file"]
+    try:
+        return registry.subset(wanted)
+    except Exception:
+        # subset() may differ across branches; rebuild by hand.
+        slim = ToolRegistry()
+        for name in wanted:
+            slim.register(registry.get(name))
+        return slim
+
+
+def _filtered_kwargs(cls, **kwargs):
+    """Drop kwargs the dataclass/init on this branch does not know about."""
+    params = inspect.signature(cls).parameters
+    return {k: v for k, v in kwargs.items() if k in params}
+
+
+def _make_context(workdir: Path) -> ToolContext:
+    from hpca.db import connect, init_db
+
+    conn = connect(workdir / "hpca.db")
+    init_db(conn)
+    ctx = ToolContext(
+        **_filtered_kwargs(
+            ToolContext,
+            registry=PathRegistry(
+                conn, **_filtered_kwargs(PathRegistry, profile="eval", session_id="eval")
+            ),
+            runner=ProcessRunner(
+                conn,
+                **_filtered_kwargs(
+                    ProcessRunner, session_id="eval", log_dir=workdir / "logs"
+                ),
+            ),
+            settings=Settings(),
+            scripts_dir=workdir / "scripts",
+            session_id="eval",
+            trash=TrashManager(workdir / "trash", backup_limit_bytes=1024 * 1024),
+        )
+    )
+    ctx._eval_conn = conn  # keep alive; closed with the workspace
+    return ctx
+
+
+# ------------------------------------------------------------------- tasks
+
+
+@dataclass
+class Task:
+    name: str
+    prompt: str
+    # registry key -> (file name, content). Content written verbatim (bytes
+    # when bytes are given, e.g. CRLF fixtures).
+    files: dict[str, tuple[str, str | bytes]]
+    # predicate on the workspace dir: did the task succeed?
+    check: Callable[[Path], bool]
+    # scripted decisions for --dry-run: the fake model emits these in order,
+    # then responds "DONE".
+    fake_calls: list[dict] = field(default_factory=list)
+
+
+def _edit(key: str, old: list[str], new: list[str]) -> dict:
+    return {
+        "action": "tool_call",
+        "tool": "edit_file",
+        "arguments": {"registry_key": key, "old_lines": old, "new_lines": new},
+    }
+
+
+def _read(key: str) -> dict:
+    return {"action": "tool_call", "tool": "read_file", "arguments": {"registry_key": key}}
+
+
+BIG_FILE_HEADER = "# run manifest — generated, do not hand-edit sections A/B\n"
+
+
+def _big_file() -> str:
+    lines = [BIG_FILE_HEADER.rstrip("\n")]
+    for i in range(1, 299):
+        if i == 150:
+            lines.append("threads = 4        # section C: tunables")
+        else:
+            lines.append(f"entry_{i:03d} = value_{i:03d}")
+    return "\n".join(lines) + "\n"
+
+
+def build_tasks() -> list[Task]:
+    tasks: list[Task] = []
+
+    # 1. simple one-line replacement in a small script
+    small_sh = (
+        "#!/bin/bash\n"
+        "set -euo pipefail\n"
+        'echo "starting run"\n'
+        "sleep 1\n"
+        'echo "done"\n'
+    )
+    tasks.append(
+        Task(
+            name="simple_replace",
+            prompt=(
+                "The bash script is registered as 'runner'. Change the line "
+                "echo \"starting run\" so it says \"starting run v2\" instead."
+            ),
+            files={"runner": ("runner.sh", small_sh)},
+            check=lambda ws: 'echo "starting run v2"' in (ws / "runner.sh").read_text(),
+            fake_calls=[
+                _read("runner"),
+                _edit("runner", ['echo "starting run"'], ['echo "starting run v2"']),
+            ],
+        )
+    )
+
+    # 2. replacement in the middle of a ~300-line file
+    tasks.append(
+        Task(
+            name="middle_of_large_file",
+            prompt=(
+                "The manifest is registered as 'manifest'. Somewhere in the "
+                "middle there is a line setting threads = 4. Change it to "
+                "threads = 16, keeping the trailing comment exactly as it is."
+            ),
+            files={"manifest": ("manifest.cfg", _big_file())},
+            check=lambda ws: "threads = 16        # section C: tunables"
+            in (ws / "manifest.cfg").read_text(),
+            fake_calls=[
+                _read("manifest"),
+                _edit(
+                    "manifest",
+                    ["threads = 4        # section C: tunables"],
+                    ["threads = 16        # section C: tunables"],
+                ),
+            ],
+        )
+    )
+
+    # 3. edit in a CRLF file
+    crlf = b"[settings]\r\nretries = 2\r\ntimeout = 30\r\nverbose = false\r\n"
+    tasks.append(
+        Task(
+            name="crlf_file",
+            prompt=(
+                "The Windows-style config is registered as 'winconf'. Change "
+                "retries = 2 to retries = 5. The file uses CRLF line endings."
+            ),
+            files={"winconf": ("settings.ini", crlf)},
+            check=lambda ws: b"retries = 5" in (ws / "settings.ini").read_bytes(),
+            fake_calls=[
+                _read("winconf"),
+                # read_text() applies universal newlines, so handlers see LF
+                _edit("winconf", ["retries = 2"], ["retries = 5"]),
+            ],
+        )
+    )
+
+    # 4. edit near unicode (smart quotes / en-dash in comments)
+    uni = (
+        "# “Results” for samples 3–7 (en-dash), don’t touch the header\n"
+        "sample_range = 3-7\n"
+        "normalize = false\n"
+    )
+    tasks.append(
+        Task(
+            name="unicode_context",
+            prompt=(
+                "The file is registered as 'unifile'. Change normalize = false "
+                "to normalize = true. Leave the comment line untouched."
+            ),
+            files={"unifile": ("analysis.cfg", uni)},
+            check=lambda ws: "normalize = true" in (ws / "analysis.cfg").read_text()
+            and "don’t touch" in (ws / "analysis.cfg").read_text(),
+            fake_calls=[
+                _read("unifile"),
+                _edit("unifile", ["normalize = false"], ["normalize = true"]),
+            ],
+        )
+    )
+
+    # 5. append-to-end idiom
+    hosts = "node01\nnode02\nnode03\n"
+    tasks.append(
+        Task(
+            name="append_to_end",
+            prompt=(
+                "The host list is registered as 'hosts'. Add a new line "
+                "node04 at the end of the file, after node03."
+            ),
+            files={"hosts": ("hosts.txt", hosts)},
+            check=lambda ws: (ws / "hosts.txt").read_text().rstrip("\n").split("\n")
+            == ["node01", "node02", "node03", "node04"],
+            fake_calls=[
+                _read("hosts"),
+                _edit("hosts", ["node03"], ["node03", "node04"]),
+            ],
+        )
+    )
+
+    # 6. multi-line block replacement
+    block_sh = (
+        "#!/bin/bash\n"
+        "module load samtools\n"
+        "samtools sort in.bam -o sorted.bam\n"
+        "samtools index sorted.bam\n"
+        "samtools flagstat sorted.bam > stats.txt\n"
+        'echo "pipeline done"\n'
+    )
+    tasks.append(
+        Task(
+            name="multiline_block",
+            prompt=(
+                "The script is registered as 'pipeline'. Replace the three "
+                "samtools lines (sort, index, flagstat) with a single line: "
+                "samtools sort -@ 8 in.bam -o sorted.bam && samtools index sorted.bam"
+            ),
+            files={"pipeline": ("pipeline.sh", block_sh)},
+            check=lambda ws: (
+                "samtools sort -@ 8 in.bam -o sorted.bam && samtools index sorted.bam"
+                in (ws / "pipeline.sh").read_text()
+                and "flagstat" not in (ws / "pipeline.sh").read_text()
+            ),
+            fake_calls=[
+                _read("pipeline"),
+                _edit(
+                    "pipeline",
+                    [
+                        "samtools sort in.bam -o sorted.bam",
+                        "samtools index sorted.bam",
+                        "samtools flagstat sorted.bam > stats.txt",
+                    ],
+                    [
+                        "samtools sort -@ 8 in.bam -o sorted.bam && samtools index sorted.bam"
+                    ],
+                ),
+            ],
+        )
+    )
+
+    # 7. duplicated similar blocks — needs disambiguation
+    dup = (
+        "[stage: align]\n"
+        "threads = 8\n"
+        "mem_gb = 16\n"
+        "\n"
+        "[stage: call]\n"
+        "threads = 8\n"
+        "mem_gb = 16\n"
+    )
+    def _check_dup(ws: Path) -> bool:
+        text = (ws / "stages.cfg").read_text()
+        call_part = text.split("[stage: call]")[-1]
+        align_part = text.split("[stage: call]")[0]
+        return "mem_gb = 64" in call_part and "mem_gb = 16" in align_part
+
+    tasks.append(
+        Task(
+            name="duplicate_blocks",
+            prompt=(
+                "The stage config is registered as 'stages'. Both stages "
+                "currently have mem_gb = 16. Change mem_gb to 64 for the "
+                "'call' stage ONLY; leave the 'align' stage at 16."
+            ),
+            files={"stages": ("stages.cfg", dup)},
+            check=_check_dup,
+            fake_calls=[
+                _read("stages"),
+                _edit(
+                    "stages",
+                    ["[stage: call]", "threads = 8", "mem_gb = 16"],
+                    ["[stage: call]", "threads = 8", "mem_gb = 64"],
+                ),
+            ],
+        )
+    )
+
+    # 8. indentation-sensitive Python edit (goes through py_compile gate)
+    py = (
+        "def process(items):\n"
+        "    results = []\n"
+        "    for item in items:\n"
+        "        if item.valid:\n"
+        "            results.append(item.value)\n"
+        "    return results\n"
+    )
+    tasks.append(
+        Task(
+            name="python_indent",
+            prompt=(
+                "The Python file is registered as 'pyfile'. Inside the loop, "
+                "change results.append(item.value) to "
+                "results.append(item.value * 2), keeping the code valid."
+            ),
+            files={"pyfile": ("process.py", py)},
+            check=lambda ws: "            results.append(item.value * 2)"
+            in (ws / "process.py").read_text(),
+            fake_calls=[
+                _read("pyfile"),
+                _edit(
+                    "pyfile",
+                    ["            results.append(item.value)"],
+                    ["            results.append(item.value * 2)"],
+                ),
+            ],
+        )
+    )
+
+    # 9. delete-lines edit
+    dbg = (
+        "input = load()\n"
+        "print('DEBUG: loaded', input)\n"
+        "print('DEBUG: type', type(input))\n"
+        "result = transform(input)\n"
+        "save(result)\n"
+    )
+    tasks.append(
+        Task(
+            name="delete_lines",
+            prompt=(
+                "The file is registered as 'debugfile'. Delete the two DEBUG "
+                "print lines; keep everything else exactly as it is."
+            ),
+            files={"debugfile": ("job.txt", dbg)},
+            check=lambda ws: (ws / "job.txt").read_text()
+            == "input = load()\nresult = transform(input)\nsave(result)\n",
+            fake_calls=[
+                _read("debugfile"),
+                _edit(
+                    "debugfile",
+                    [
+                        "print('DEBUG: loaded', input)",
+                        "print('DEBUG: type', type(input))",
+                    ],
+                    [],
+                ),
+            ],
+        )
+    )
+
+    # 10. create a new small file with create_file
+    tasks.append(
+        Task(
+            name="create_new_file",
+            prompt=(
+                "The workspace directory is registered as 'workspace'. Create "
+                "a new file named NOTES.md in it with exactly two lines: a "
+                "heading '# Run notes' and a line 'Started 2026-08-06.'"
+            ),
+            files={},
+            check=lambda ws: (ws / "NOTES.md").is_file()
+            and "# Run notes" in (ws / "NOTES.md").read_text()
+            and "Started 2026-08-06." in (ws / "NOTES.md").read_text(),
+            fake_calls=[
+                {
+                    "action": "tool_call",
+                    "tool": "create_file",
+                    "arguments": {
+                        "dir_key": "workspace",
+                        "name": "NOTES.md",
+                        "content_lines": ["# Run notes", "Started 2026-08-06."],
+                    },
+                }
+            ],
+        )
+    )
+
+    # 11. edit a config value
+    yaml = (
+        "cluster:\n"
+        "  partition: gpu\n"
+        "  gres: gpu:1\n"
+        "run:\n"
+        "  epochs: 10\n"
+        "  batch_size: 32\n"
+    )
+    tasks.append(
+        Task(
+            name="config_value",
+            prompt=(
+                "The YAML config is registered as 'runconf'. Change epochs "
+                "from 10 to 50. Keep the YAML indentation intact."
+            ),
+            files={"runconf": ("run.yaml", yaml)},
+            check=lambda ws: "  epochs: 50" in (ws / "run.yaml").read_text(),
+            fake_calls=[
+                _read("runconf"),
+                _edit("runconf", ["  epochs: 10"], ["  epochs: 50"]),
+            ],
+        )
+    )
+
+    # 12. trailing-space discrepancy planted in the file: the natural copy of
+    # old_lines has no trailing space, so the first attempt near-misses.
+    trap = "alpha = 1\nbeta = 2 \ngamma = 3\n"  # note trailing space on beta
+    tasks.append(
+        Task(
+            name="trailing_space_trap",
+            prompt=(
+                "The file is registered as 'trapfile'. Change beta = 2 to "
+                "beta = 7."
+            ),
+            files={"trapfile": ("params.txt", trap)},
+            check=lambda ws: "beta = 7" in (ws / "params.txt").read_text()
+            and "beta = 2" not in (ws / "params.txt").read_text(),
+            fake_calls=[
+                _read("trapfile"),
+                _edit("trapfile", ["beta = 2 "], ["beta = 7"]),
+            ],
+        )
+    )
+
+    return tasks
+
+
+def _deep_file() -> str:
+    # 700 lines; the only interesting line sits at ~400, past any window the
+    # old head/tail read_file could show for a file this long. Its exact value
+    # and inline comment are NOT in the prompt, so the model must actually see
+    # the line to copy it.
+    lines = ["# pipeline stage table — generated"]
+    for i in range(2, 701):
+        if i == 400:
+            lines.append("chunk_size = 4096      # stage K: io tuning, keep power of two")
+        else:
+            lines.append(f"stage_{i:03d} = pass")
+    return "\n".join(lines) + "\n"
+
+
+def build_hard_tasks() -> list[Task]:
+    """Tier 'hard': realistic shapes the old tooling structurally mishandled.
+
+    Same tasks run against both baseline and treatment — the point is that
+    these are ordinary cluster files (long generated configs, Windows-edited
+    ini, prose with typographic quotes), not synthetic gotchas.
+    """
+    tasks: list[Task] = []
+
+    # H1. Edit deep inside a 700-line file. The old read_file showed
+    # head/tail with the middle omitted and had no offset, so the region
+    # around line 400 was unreachable; paging makes it reachable.
+    tasks.append(
+        Task(
+            name="deep_edit_700",
+            prompt=(
+                "The generated pipeline config is registered as 'pipeline'. "
+                "Somewhere in it a line sets chunk_size. Double the value on "
+                "that line, and keep its inline comment exactly as it is. The "
+                "file is long — page through it until you have actually seen "
+                "the line before editing."
+            ),
+            files={"pipeline": ("pipeline.cfg", _deep_file())},
+            check=lambda ws: "chunk_size = 8192      # stage K: io tuning, keep power of two"
+            in (ws / "pipeline.cfg").read_text(),
+            fake_calls=[
+                _read("pipeline"),
+                _edit(
+                    "pipeline",
+                    ["chunk_size = 4096      # stage K: io tuning, keep power of two"],
+                    ["chunk_size = 8192      # stage K: io tuning, keep power of two"],
+                ),
+            ],
+        )
+    )
+
+    # H2. CRLF file where success requires the line endings to SURVIVE the
+    # edit byte-for-byte (the old write path rewrote the file with LF).
+    crlf_body = (
+        b"[cluster]\r\n"
+        b"queue = short\r\n"
+        b"max_jobs = 8\r\n"
+        b"notify = none\r\n"
+    )
+    tasks.append(
+        Task(
+            name="crlf_preserved",
+            prompt=(
+                "The config is registered as 'clusterconf'. Change max_jobs = 8 "
+                "to max_jobs = 32. The file comes from a Windows tool; it must "
+                "keep its CRLF line endings."
+            ),
+            files={"clusterconf": ("cluster.ini", crlf_body)},
+            check=lambda ws: (
+                b"max_jobs = 32\r\n" in (ws / "cluster.ini").read_bytes()
+                and b"queue = short\r\n" in (ws / "cluster.ini").read_bytes()
+            ),
+            fake_calls=[
+                _read("clusterconf"),
+                _edit("clusterconf", ["max_jobs = 8"], ["max_jobs = 32"]),
+            ],
+        )
+    )
+
+    # H3. The line to replace contains typographic quotes and an en-dash.
+    # A model that transcribes them as ASCII used to get "NOT edited" and
+    # loop; fuzzy matching absorbs the transcription.
+    smart = (
+        "# report strings\n"
+        "title = “Weekly QC – node health”\n"
+        "footer = plain\n"
+    )
+    tasks.append(
+        Task(
+            name="smart_quote_line",
+            prompt=(
+                "The file is registered as 'report'. On the title line, "
+                "change the word Weekly to Daily, leaving the rest of the "
+                "line as it is."
+            ),
+            files={"report": ("report.cfg", smart)},
+            check=lambda ws: "Daily QC" in (ws / "report.cfg").read_text()
+            and "Weekly" not in (ws / "report.cfg").read_text(),
+            fake_calls=[
+                _read("report"),
+                _edit(
+                    "report",
+                    ["title = “Weekly QC – node health”"],
+                    ["title = “Daily QC – node health”"],
+                ),
+            ],
+        )
+    )
+
+    return tasks
+
+
+# --------------------------------------------------------------- fake model
+
+
+class FakeLLM:
+    """Scripted model for --dry-run: emits each queued decision once, then
+    responds DONE. Satisfies the two methods decide() uses."""
+
+    def __init__(self, calls: list[dict]):
+        self._queue = list(calls)
+
+    async def supports_constrained_decoding(self) -> bool:
+        return False
+
+    async def chat(self, messages, json_schema=None, max_tokens=None):
+        if self._queue:
+            payload = self._queue.pop(0)
+        else:
+            payload = {"action": "respond", "response": "DONE"}
+
+        class _Resp:
+            content = json.dumps(payload)
+            reasoning = ""
+            usage = {"completion_tokens": 0}
+
+        return _Resp()
+
+
+# ---------------------------------------------------------------- run loop
+
+
+def _is_failed_edit(tool_name: str, result: str) -> bool:
+    if tool_name not in ("edit_file", "create_file"):
+        return False
+    return result.startswith("NOT ") or "[tool error]" in result
+
+
+async def run_task(task: Task, llm, tools: ToolRegistry) -> dict:
+    workdir = Path(tempfile.mkdtemp(prefix=f"hpca_eval_{task.name}_"))
+    workspace = workdir / "workspace"
+    workspace.mkdir()
+    metrics = {
+        "task": task.name,
+        "success": False,
+        "tool_calls": 0,
+        "failed_edits": 0,
+        "decisions": 0,
+        "completion_tokens": 0,
+        "wall_s": 0.0,
+        "error": "",
+    }
+    started = time.monotonic()
+    try:
+        ctx = _make_context(workdir)
+        ctx.registry.register("workspace", workspace)
+        for key, (fname, content) in task.files.items():
+            path = workspace / fname
+            if isinstance(content, bytes):
+                path.write_bytes(content)
+            else:
+                path.write_text(content)
+            ctx.registry.register(key, path)
+
+        messages = [
+            {"role": "system", "content": _system_prompt()},
+            {"role": "user", "content": task.prompt},
+        ]
+        for _ in range(MAX_DECISIONS):
+            try:
+                decision = await decide(llm, messages, tools)
+            except DecisionError as exc:
+                metrics["error"] = f"DecisionError: {exc}"
+                break
+            metrics["decisions"] += 1
+            usage = getattr(decision, "usage", None) or {}
+            metrics["completion_tokens"] += int(usage.get("completion_tokens") or 0)
+            if isinstance(decision, DirectResponse):
+                break
+            assert isinstance(decision, ToolCall)
+            metrics["tool_calls"] += 1
+            try:
+                # handlers called directly: no HITL gate in this harness
+                result = await decision.tool.handler(decision.arguments, ctx)
+            except Exception as exc:
+                result = f"[tool error] {decision.tool.name}: {type(exc).__name__}: {exc}"
+            if _is_failed_edit(decision.tool.name, result):
+                metrics["failed_edits"] += 1
+            messages = messages + [
+                {"role": "user", "content": f"[tool result] {decision.tool.name}: {result}"}
+            ]
+            if task.check(workspace):
+                # model already succeeded; one more decision would only spend
+                # tokens, so stop here.
+                break
+        metrics["success"] = bool(task.check(workspace))
+    except Exception as exc:
+        metrics["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        metrics["wall_s"] = round(time.monotonic() - started, 2)
+        conn = getattr(locals().get("ctx"), "_eval_conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        shutil.rmtree(workdir, ignore_errors=True)
+    return metrics
+
+
+# ------------------------------------------------------------ live backend
+
+
+def discover_backend() -> tuple[str, str]:
+    """Return (url, model) or exit(2) with a clear message."""
+    if httpx is None:
+        print("httpx is not installed; cannot reach the backend.", file=sys.stderr)
+        sys.exit(2)
+    headers = {"Authorization": f"Bearer {LIVE_KEY}"} if LIVE_KEY else {}
+    try:
+        resp = httpx.get(f"{LIVE_URL}/models", timeout=5, headers=headers)
+    except Exception as exc:
+        print(
+            f"LLM backend at {LIVE_URL} is unreachable ({exc}). "
+            "Set HPCA_TEST_LLM_URL, or use --dry-run.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if resp.status_code == 401:
+        print(
+            f"LLM backend at {LIVE_URL} answered 401 Unauthorized. "
+            "Export HPCA_TEST_LLM_KEY with a valid key.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if resp.status_code != 200:
+        print(
+            f"LLM backend at {LIVE_URL} answered {resp.status_code}.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    model = os.environ.get("HPCA_TEST_LLM_MODEL")
+    if not model:
+        data = resp.json().get("data", [])
+        if not data:
+            print(f"Backend at {LIVE_URL} serves no models.", file=sys.stderr)
+            sys.exit(2)
+        model = data[0]["id"]
+    return LIVE_URL, model
+
+
+def make_live_llm():
+    from hpca.config import LLMSettings
+    from hpca.llm import LLMClient
+
+    url, model = discover_backend()
+    print(f"Backend: {url}  model: {model}")
+    return LLMClient(
+        LLMSettings(
+            **_filtered_kwargs(
+                LLMSettings,
+                base_url=url,
+                model=model,
+                api_key=LIVE_KEY,
+                request_timeout_s=180,
+                enable_thinking=False,
+            )
+        )
+    )
+
+
+# --------------------------------------------------------------------- CLI
+
+
+async def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--out", default="results.json", help="JSON output path")
+    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--tasks", type=int, default=None, help="run only the first N tasks")
+    parser.add_argument("--label", default="", help="label recorded in the JSON (e.g. baseline)")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="run every task once against a scripted fake model (no backend)",
+    )
+    parser.add_argument(
+        "--tier",
+        choices=["core", "hard", "all"],
+        default="core",
+        help="core: the original 12 tasks; hard: shapes the old tooling "
+        "structurally mishandled; all: both",
+    )
+    args = parser.parse_args()
+
+    tasks = {
+        "core": build_tasks(),
+        "hard": build_hard_tasks(),
+        "all": build_tasks() + build_hard_tasks(),
+    }[args.tier]
+    if args.tasks:
+        tasks = tasks[: args.tasks]
+    tools = _eval_tool_registry()
+
+    live = None
+    if not args.dry_run:
+        live = make_live_llm()
+    repeats = 1 if args.dry_run else args.repeats
+
+    runs: list[dict] = []
+    try:
+        for task in tasks:
+            for rep in range(repeats):
+                llm = FakeLLM(task.fake_calls) if args.dry_run else live
+                metrics = await run_task(task, llm, tools)
+                metrics["repeat"] = rep
+                runs.append(metrics)
+                status = "ok " if metrics["success"] else "FAIL"
+                print(
+                    f"[{status}] {task.name:<24} rep {rep}: "
+                    f"{metrics['tool_calls']} calls, "
+                    f"{metrics['failed_edits']} failed edits, "
+                    f"{metrics['decisions']} decisions, "
+                    f"{metrics['wall_s']}s"
+                    + (f"  error: {metrics['error']}" if metrics["error"] else "")
+                )
+    finally:
+        if live is not None:
+            try:
+                await live.close()
+            except Exception:
+                pass
+
+    n = len(runs)
+    successes = sum(1 for r in runs if r["success"])
+    summary = {
+        "label": args.label or ("dry-run" if args.dry_run else "live"),
+        "n_runs": n,
+        "success_rate": round(successes / n, 3) if n else 0.0,
+        "mean_failed_edits": round(sum(r["failed_edits"] for r in runs) / n, 3) if n else 0.0,
+        "mean_tool_calls": round(sum(r["tool_calls"] for r in runs) / n, 3) if n else 0.0,
+        "mean_decisions": round(sum(r["decisions"] for r in runs) / n, 3) if n else 0.0,
+        "total_completion_tokens": sum(r["completion_tokens"] for r in runs),
+        "total_wall_s": round(sum(r["wall_s"] for r in runs), 1),
+    }
+    out = {"summary": summary, "runs": runs}
+    Path(args.out).write_text(json.dumps(out, indent=2) + "\n")
+
+    print("\n=== summary ===")
+    for key, value in summary.items():
+        print(f"{key:>24}: {value}")
+    print(f"\nWrote {args.out}")
+    return 0 if successes == n or not args.dry_run else 1
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))
