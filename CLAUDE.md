@@ -22,6 +22,14 @@ Terminal AI agent (Textual TUI) for HPC Slurm clusters. Design doc: [project.md]
 A dev machine often has live tunnels on ports 20000 (embeddings) / 20001 (LLM), so
 "something answers on localhost" is normal and does not mean tests should use it.
 
+## Assessing file-tool changes
+
+Any change touching edit_file/read_file/create_file, the middleware retry
+loop, or editing guidance gets measured, not eyeballed: run the live eval in
+`evals/edit_eval.py` as baseline-ref-vs-working-tree — recipe and the
+v0.17.0→v0.18.0 reference numbers in specs-edit-eval.md. Like test-live it
+costs real generations; run it deliberately, never as part of a default suite.
+
 ## Where the databases are
 
 `hpca.db`, `checkpoints.db` and `rag.db` are *kept* in the app dir, but while

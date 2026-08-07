@@ -1,9 +1,17 @@
 # edit_eval — how well the live model drives edit_file / read_file / create_file
 
-`edit_eval.py` runs ~12 file-editing tasks (one-line replacement, mid-file
-edits in a ~300-line file, CRLF, unicode context, append idiom, multi-line
-block, duplicated-block disambiguation, Python indentation, line deletion,
-create_file, config value, planted trailing-space trap) against the live LLM
+This is the standing instrument for assessing any change to the file tools,
+the editing guidance, or the backend — method, measured v0.17.0→v0.18.0
+results, and the quick "baseline ref vs working tree" recipe live in
+[specs-edit-eval.md](../specs-edit-eval.md).
+
+`edit_eval.py` runs file-editing tasks in two tiers — `--tier core` (default;
+12 everyday tasks: one-line replacement, mid-file edits in a ~300-line file,
+CRLF, unicode context, append idiom, multi-line block, duplicated-block
+disambiguation, Python indentation, line deletion, create_file, config value,
+planted trailing-space trap), `--tier hard` (shapes the old tooling
+structurally mishandled: an edit deep in a 700-line file, byte-preserved CRLF,
+a typographic-quote line), or `--tier all` — against the live LLM
 through HPCA's real middleware decision loop and real tool handlers (real
 ToolContext, PathRegistry, TrashManager) in a throwaway temp workspace per
 run. HITL gating is bypassed: handlers are called directly.
@@ -64,7 +72,17 @@ mean_failed_edits are the headline numbers).
 
 ## Options
 
+- `--tier core|hard|all` — task tier (default core).
 - `--repeats N` — repeats per task (default 3; dry-run always runs 1).
 - `--tasks N` — only the first N tasks (quick smoke).
 - `--label name` — recorded in the output JSON.
 - Exit codes: 0 ok; 2 backend unreachable or 401.
+
+## A negative result to remember
+
+The `smart_quote_line` hard task was built to catch a model transcribing
+typographic quotes/dashes as ASCII — and it never fired: Qwen3.6-27B copies
+them faithfully, and the task passed 3/3 even on the pre-fuzzy v0.17.0 code.
+The trap (and the fuzzy ladder's unicode level it was meant to justify) is
+insurance for other backends, perhaps not needed at all; don't grow that
+machinery without a measured failure first.
