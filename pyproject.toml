@@ -1,6 +1,6 @@
 [project]
 name = "hpca"
-version = "0.19.0"
+dynamic = ["version"]
 description = "HolisticProcessingComputeAgent - terminal AI agent for HPC Slurm clusters"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -28,6 +28,9 @@ hpca = "hpca.__main__:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/hpca/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hpca"]
