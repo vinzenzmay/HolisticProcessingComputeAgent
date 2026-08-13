@@ -83,7 +83,12 @@ def _source(ctx: ToolContext, key: str, subpath: str) -> Path:
 
 
 class RegisterPathParams(BaseModel):
-    key: str = Field(description="New registry key for this path")
+    key: str = Field(
+        description=(
+            "Registry key for this path; reusing a key is allowed only when "
+            "nothing exists at the path it points at (fixing a typo)"
+        )
+    )
     path: str = Field(
         description="Absolute path exactly as the user wrote it — copy verbatim"
     )
@@ -100,17 +105,29 @@ async def register_path(args: RegisterPathParams, ctx: ToolContext) -> str:
     either way, and the result says which case this is: a key pointing at
     nothing is a real state (read_file and create_file report it in the same
     terms), not a silent one that turns into a confusing failure later.
+
+    The cost of taking the typo is that the key is spent, and there is no
+    unregister tool — so the registry lets a second call repoint a key whose
+    path does not exist (nothing is behind it to protect). The result says so
+    explicitly, naming the path that was dropped, because "Registered ..."
+    alone reads the same whether the correction landed or was ignored.
     """
     path = Path(args.path)
-    ctx.registry.register(args.key, path)
+    replaced = ctx.registry.register(args.key, path)
+    note = (
+        f" It previously pointed at {replaced}, where nothing exists, so that "
+        "registration is gone."
+        if replaced is not None
+        else ""
+    )
     if not path.exists():
         return (
-            f"Registered {args.key!r}, but nothing exists at {path} yet. If "
-            "the user meant a path that is already there, check the spelling "
+            f"Registered {args.key!r}, but nothing exists at {path} yet.{note} "
+            "If the user meant a path that is already there, check the spelling "
             "against their message; otherwise create it before reading it."
         )
     kind = "directory" if path.is_dir() else "file"
-    return f"Registered {kind} as {args.key!r}."
+    return f"Registered {kind} as {args.key!r}.{note}"
 
 
 class DeleteFileParams(BaseModel):
@@ -861,7 +878,10 @@ def add_file_tools(registry: ToolRegistry) -> ToolRegistry:
     registry.register(
         Tool(
             name="register_path",
-            description="Register a path (the user's, or one you found) under a new key",
+            description=(
+                "Register a path (the user's, or one you found) under a key; "
+                "call it again with the same key to correct a mistyped path"
+            ),
             params=RegisterPathParams,
             handler=register_path,
         )

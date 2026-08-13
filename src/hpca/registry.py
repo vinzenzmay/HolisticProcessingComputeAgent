@@ -36,7 +36,23 @@ class PathRegistry:
         self._profile = profile
         self._session_id = session_id
 
-    def register(self, key: str, path: Path | str) -> None:
+    def register(self, key: str, path: Path | str) -> Path | None:
+        """Bind a key to an absolute path; returns the dead path it replaced.
+
+        A key whose registered path exists is a real handle and stays
+        protected: pointing it somewhere else raises, so the model cannot
+        quietly rename someone else's file out from under a later call.
+
+        A key whose registered path does *not* exist names nothing, so this
+        overwrites it and returns the path that was there. That is the only
+        way back from a mistyped registration: register_path takes a path
+        before it exists (a typo looks exactly like an output that is not
+        written yet), there is no unregister tool, and without this the typo
+        would burn the key for the rest of the session.
+
+        Returns None when the key was free, or already pointed at this exact
+        path (an idempotent re-registration, not a repoint).
+        """
         if not KEY_RE.match(key):
             raise RegistryError(
                 f"Invalid registry key {key!r}: use lowercase letters, digits, "
@@ -48,17 +64,21 @@ class PathRegistry:
         existing = self._get(key)
         if existing is not None:
             if existing == path:
-                return
-            raise RegistryError(
-                f"Key {key!r} is already registered for {existing}; "
-                "pick a different key"
-            )
+                return None
+            if existing.exists():
+                raise RegistryError(
+                    f"Key {key!r} is already registered for {existing}; "
+                    "pick a different key"
+                )
+            self._point(key, path)
+            return existing
         self._conn.execute(
             "INSERT INTO path_registry (profile, session_id, key, path) "
             "VALUES (?, ?, ?, ?)",
             (self._profile, self._session_id, key, str(path)),
         )
         self._conn.commit()
+        return None
 
     def register_auto(self, path: Path | str, hint: str | None = None) -> str:
         """Register a tool-discovered path under a generated key (§4.3).
@@ -105,17 +125,19 @@ class PathRegistry:
         self._conn.commit()
 
     def reassign(self, key: str, path: Path | str) -> None:
-        """Point an existing key at a new absolute path (e.g. after a move)."""
+        """Point an existing key at a new absolute path (e.g. after a move).
+
+        Stays separate from ``register`` because it asserts the opposite
+        things: the key must already exist (a move that repoints a key nobody
+        registered is a bug, not a fresh registration), and the file behind it
+        is expected to be real — the mover knows the old path is stale, so the
+        does-it-exist check ``register`` applies would be wrong here.
+        """
         self.resolve(key)
         path = Path(path)
         if not path.is_absolute():
             raise RegistryError(f"Registry paths must be absolute, got {path!r}")
-        self._conn.execute(
-            "UPDATE path_registry SET path = ? "
-            "WHERE profile = ? AND session_id = ? AND key = ?",
-            (str(path), self._profile, self._session_id, key),
-        )
-        self._conn.commit()
+        self._point(key, path)
 
     def list(self) -> dict[str, Path]:
         rows = self._conn.execute(
@@ -124,6 +146,14 @@ class PathRegistry:
             (self._profile, self._session_id),
         ).fetchall()
         return {row["key"]: Path(row["path"]) for row in rows}
+
+    def _point(self, key: str, path: Path) -> None:
+        self._conn.execute(
+            "UPDATE path_registry SET path = ? "
+            "WHERE profile = ? AND session_id = ? AND key = ?",
+            (str(path), self._profile, self._session_id, key),
+        )
+        self._conn.commit()
 
     def _get(self, key: str) -> Path | None:
         row = self._conn.execute(

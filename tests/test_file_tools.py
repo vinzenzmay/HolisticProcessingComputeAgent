@@ -7,7 +7,7 @@ from hpca.agent.file_tools import add_file_tools, edit_preview
 from hpca.agent.tools import ToolRegistry
 from hpca.config import Settings
 from hpca.db import connect, init_db
-from hpca.registry import PathRegistry, UnknownKeyError
+from hpca.registry import PathRegistry, RegistryError, UnknownKeyError
 from hpca.runner import ProcessRunner
 from hpca.trash import TrashManager
 
@@ -70,6 +70,48 @@ class TestRegisterPath:
         result = await call(tools, "register_path", ctx, key="runs", path=str(d))
         assert "directory" in result
         assert "nothing exists" not in result
+        assert "previously pointed" not in result  # nothing was replaced
+
+    async def test_a_typo_can_be_corrected_under_the_same_key(
+        self, tools, ctx, tmp_path
+    ):
+        """The typo and the file that does exist are usually the same key in
+        the user's head, and there is no unregister tool: without this the key
+        stays pointed at nothing for the rest of the session."""
+        real = tmp_path / "reads.bam"
+        real.write_text("x")
+        typo = tmp_path / "raeds.bam"
+        await call(tools, "register_path", ctx, key="reads", path=str(typo))
+        result = await call(tools, "register_path", ctx, key="reads", path=str(real))
+        assert ctx.registry.resolve("reads") == real
+        # the correction is stated, not silent: the model just saw the same
+        # "Registered ..." sentence for a path that turned out to be wrong.
+        assert "file" in result
+        assert "previously pointed" in result
+        assert str(typo) in result
+
+    async def test_a_correction_onto_another_missing_path_says_both(
+        self, tools, ctx, tmp_path
+    ):
+        first = tmp_path / "one.log"
+        second = tmp_path / "two.log"
+        await call(tools, "register_path", ctx, key="out", path=str(first))
+        result = await call(tools, "register_path", ctx, key="out", path=str(second))
+        assert ctx.registry.resolve("out") == second
+        assert "nothing exists at" in result and str(second) in result
+        assert "previously pointed" in result and str(first) in result
+
+    async def test_a_key_pointing_at_a_real_file_is_not_repointed(
+        self, tools, ctx, tmp_path
+    ):
+        f = tmp_path / "a.txt"
+        f.write_text("x")
+        ctx.registry.register("x", f)
+        with pytest.raises(RegistryError, match="pick a different key"):
+            await call(
+                tools, "register_path", ctx, key="x", path=str(tmp_path / "b.txt")
+            )
+        assert ctx.registry.resolve("x") == f
 
 
 class TestDeleteFile:

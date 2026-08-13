@@ -38,15 +38,39 @@ class TestRegisterResolve:
         with pytest.raises(RegistryError, match="absolute"):
             registry.register("x", "relative/path.txt")
 
-    def test_duplicate_key_different_path_rejected(self, registry, tmp_path):
-        registry.register("x", tmp_path / "a.txt")
+    def test_duplicate_key_over_a_live_path_rejected(self, registry, tmp_path):
+        live = tmp_path / "a.txt"
+        live.write_text("x")
+        registry.register("x", live)
         with pytest.raises(RegistryError, match="already registered"):
             registry.register("x", tmp_path / "b.txt")
+        assert registry.resolve("x") == live
+
+    def test_duplicate_key_over_a_dead_path_repoints(self, registry, tmp_path):
+        """A key whose path does not exist names nothing, and there is no
+        unregister tool — so a mistyped registration must be correctable
+        rather than burning the key for the session."""
+        typo = tmp_path / "raeds.bam"
+        real = tmp_path / "reads.bam"
+        real.write_text("x")
+        registry.register("reads", typo)
+        replaced = registry.register("reads", real)
+        assert replaced == typo
+        assert registry.resolve("reads") == real
+
+    def test_repoint_returns_none_when_the_key_was_free(self, registry, tmp_path):
+        assert registry.register("x", tmp_path / "a.txt") is None
 
     def test_duplicate_key_same_path_is_idempotent(self, registry, tmp_path):
         registry.register("x", tmp_path / "a.txt")
-        registry.register("x", tmp_path / "a.txt")  # no error
+        assert registry.register("x", tmp_path / "a.txt") is None  # no error
         assert registry.resolve("x") == tmp_path / "a.txt"
+
+    def test_dead_path_repoint_still_checks_the_new_path(self, registry, tmp_path):
+        registry.register("x", tmp_path / "gone.txt")
+        with pytest.raises(RegistryError, match="absolute"):
+            registry.register("x", "rel/path.txt")
+        assert registry.resolve("x") == tmp_path / "gone.txt"
 
     def test_invalid_key_rejected(self, registry, tmp_path):
         with pytest.raises(RegistryError, match="key"):
@@ -83,6 +107,14 @@ class TestAutoRegister:
     def test_hint_defaults_to_filename(self, registry, tmp_path):
         key = registry.register_auto(tmp_path / "counts matrix.tsv")
         assert key == "counts_matrix.tsv"
+
+    def test_taken_key_with_a_dead_path_is_not_repointed(self, registry, tmp_path):
+        """register_auto looks the path up first and then walks to a free key,
+        so the repoint-over-a-dead-path rule never fires underneath it."""
+        registry.register("log", tmp_path / "gone.log")  # key taken, path dead
+        key = registry.register_auto(tmp_path / "b.log", hint="log")
+        assert key == "log_2"
+        assert registry.resolve("log") == tmp_path / "gone.log"
 
     def test_hint_is_slugified(self, registry, tmp_path):
         key = registry.register_auto(tmp_path / "x", hint="My Fancy Output!!")
