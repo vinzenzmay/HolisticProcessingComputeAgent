@@ -423,6 +423,12 @@ the orchestrator's or another subagent's context.
   errors out on unknown keys (error fed back for retry). New paths discovered by
   tools (e.g. output of a job) are auto-registered and announced to the model as
   their key. The model never has to reproduce a literal path correctly.
+  A key may point at something that does not exist **yet**: `register_path`
+  takes a path either way and says which case it is, because the path the agent
+  is about to create needs a key before the call that creates it. The tools
+  that resolve keys report the absence in those terms (`read_file` says nothing
+  is there; `create_file` simply makes the directory, as it already did for
+  intermediate ones) rather than raising a bare `FileNotFoundError`.
 * **Output size control:** long tool outputs are kept small before they reach the
   model. *As built,* this is per-tool truncation rather than a single generic
   middleware layer: `read_file` returns head/tail, `read_manpage`/`read_source`

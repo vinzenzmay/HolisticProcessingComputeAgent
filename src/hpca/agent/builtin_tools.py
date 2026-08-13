@@ -284,6 +284,16 @@ def _list_dir(path: Path, key: str, max_lines: int) -> str:
 async def read_file(args: ReadFileParams, ctx: ToolContext) -> str:
     path = ctx.registry.resolve(args.registry_key)
     key = args.registry_key
+    if not path.exists():
+        # A key may be registered ahead of the thing it names (register_path
+        # accepts a path that is not there yet), and a file registered earlier
+        # can be moved or deleted from under it. Say so plainly: without this
+        # the read raises a bare FileNotFoundError at the model.
+        return (
+            f"Nothing at {path} (registered as {key!r}). It was registered "
+            "before anything was created there, or it has since moved or been "
+            "deleted — create it, or register the path that is really there."
+        )
     if args.subpath:
         # Descend into a registered directory. Reject escapes and keep the
         # resolved file addressable next turn via its own auto-registered key.

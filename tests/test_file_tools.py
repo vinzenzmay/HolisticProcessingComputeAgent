@@ -49,12 +49,27 @@ class TestRegisterPath:
         assert "Registered" in result
         assert ctx.registry.resolve("input_bam") == f
 
-    async def test_missing_path_not_registered(self, tools, ctx, tmp_path):
-        result = await call(
-            tools, "register_path", ctx, key="ghost", path=str(tmp_path / "nope")
-        )
-        assert "NOT registered" in result
-        assert "ghost" not in ctx.registry.list()
+    async def test_a_path_that_does_not_exist_yet_is_still_registered(
+        self, tools, ctx, tmp_path
+    ):
+        """It is how the file the agent is about to create looks. Refusing it
+        left no key to name that file with in the call that would create it."""
+        target = tmp_path / "results" / "run.log"
+        result = await call(tools, "register_path", ctx, key="ghost", path=str(target))
+        assert ctx.registry.resolve("ghost") == target
+        # …and the model is told, so it does not read it expecting content.
+        assert "Registered" in result
+        assert "nothing exists at" in result
+        assert str(target) in result
+
+    async def test_an_existing_path_is_not_reported_as_missing(
+        self, tools, ctx, tmp_path
+    ):
+        d = tmp_path / "runs"
+        d.mkdir()
+        result = await call(tools, "register_path", ctx, key="runs", path=str(d))
+        assert "directory" in result
+        assert "nothing exists" not in result
 
 
 class TestDeleteFile:
@@ -1050,6 +1065,31 @@ class TestCreateFile:
             dir_key="reads", name="specs.md", content_lines=["hi"],
         )
         assert "NOT created" in result and "directory" in result
+
+    async def test_a_directory_key_registered_before_it_exists_is_created(
+        self, tools, ctx, tmp_path
+    ):
+        """register_path takes a directory that is not there yet, and the write
+        already makes missing parents — so refusing this only sent the model
+        into the retry loop for something the tool can just do."""
+        ctx.registry.register("results", tmp_path / "results")
+        result = await call(
+            tools, "create_file", ctx,
+            dir_key="results", name="notes.md", content_lines=["hi"],
+        )
+        assert (tmp_path / "results" / "notes.md").read_text() == "hi\n"
+        assert "Created" in result
+        assert "on the way" in result  # and the model is told it made the dir
+
+    async def test_writing_into_an_existing_directory_makes_no_such_claim(
+        self, tools, ctx, tmp_path
+    ):
+        ctx.registry.register("project", tmp_path)
+        result = await call(
+            tools, "create_file", ctx,
+            dir_key="project", name="notes.md", content_lines=["hi"],
+        )
+        assert "on the way" not in result
 
     async def test_a_script_faces_the_same_content_gate(self, tools, ctx, tmp_path):
         # §5.2 is mandatory: a second way to put content into a script file

@@ -149,6 +149,15 @@ class TestReadFile:
         with pytest.raises(UnknownKeyError, match="known"):
             await call(tools, "read_file", ctx, registry_key="nope")
 
+    async def test_a_key_pointing_at_nothing_says_so(self, tools, ctx, tmp_path):
+        """register_path takes a path before it exists, and a registered file
+        can be deleted from under its key. Either way the read must come back
+        as a sentence the model can act on, not a bare FileNotFoundError."""
+        ctx.registry.register("planned", tmp_path / "results" / "run.log")
+        result = await call(tools, "read_file", ctx, registry_key="planned")
+        assert "Nothing at" in result
+        assert "planned" in result
+
     async def test_directory_key_is_listed_not_an_error(self, tools, ctx, tmp_path):
         d = tmp_path / "tools"
         d.mkdir()

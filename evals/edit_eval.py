@@ -155,6 +155,11 @@ class Task:
     files: dict[str, tuple[str, str | bytes]]
     # predicate on the workspace dir: did the task succeed?
     check: Callable[[Path], bool]
+    # registry key -> relative name, registered but NOT created. A key may
+    # legitimately point at nothing: register_path takes a path before it
+    # exists, so the model meets one whenever it names a file it is about to
+    # write. Kept separate from `files` because the whole point is the absence.
+    missing: dict[str, str] = field(default_factory=dict)
     # scripted decisions for --dry-run: the fake model emits these in order,
     # then responds "DONE".
     fake_calls: list[dict] = field(default_factory=list)
@@ -773,6 +778,72 @@ def build_hard_tasks() -> list[Task]:
         )
     )
 
+    # H5. The target directory is registered but has never been created — what
+    # a path the user names for output that does not exist yet looks like.
+    # create_file makes missing parents anyway, so the only question is whether
+    # the tool lets the call through or bounces it into the retry loop.
+    tasks.append(
+        Task(
+            name="write_into_unmade_dir",
+            prompt=(
+                "The results directory for this run is registered as "
+                "'results'. Write a README.md in it with exactly these two "
+                "lines:\n"
+                "# Results\n"
+                "Populated by the nightly QC run."
+            ),
+            files={},
+            missing={"results": "results"},
+            check=lambda ws: (ws / "results" / "README.md").is_file()
+            and "nightly QC" in (ws / "results" / "README.md").read_text(),
+            fake_calls=[
+                {
+                    "action": "tool_call",
+                    "tool": "create_file",
+                    "arguments": {
+                        "dir_key": "results",
+                        "name": "README.md",
+                        "content_lines": [
+                            "# Results",
+                            "Populated by the nightly QC run.",
+                        ],
+                    },
+                }
+            ],
+        )
+    )
+
+    # H6. A file key that resolves to nothing. The model has to notice the file
+    # is not there and write it, rather than retry the read or invent content.
+    tasks.append(
+        Task(
+            name="read_key_pointing_at_nothing",
+            prompt=(
+                "The run notes are registered as 'notes', and the workspace "
+                "directory is registered as 'workspace'. Check the notes, and "
+                "if they have not been written yet create notes.txt in the "
+                "workspace containing exactly this line:\n"
+                "no output yet"
+            ),
+            files={},
+            missing={"notes": "notes.txt"},
+            check=lambda ws: (ws / "notes.txt").is_file()
+            and (ws / "notes.txt").read_text().strip() == "no output yet",
+            fake_calls=[
+                _read("notes"),
+                {
+                    "action": "tool_call",
+                    "tool": "create_file",
+                    "arguments": {
+                        "dir_key": "workspace",
+                        "name": "notes.txt",
+                        "content_lines": ["no output yet"],
+                    },
+                },
+            ],
+        )
+    )
+
     return tasks
 
 
@@ -837,6 +908,8 @@ async def run_task(task: Task, llm, tools: ToolRegistry, keep: bool = False) -> 
             else:
                 path.write_text(content)
             ctx.registry.register(key, path)
+        for key, fname in getattr(task, "missing", {}).items():
+            ctx.registry.register(key, workspace / fname)
 
         messages = [
             {"role": "system", "content": _system_prompt()},

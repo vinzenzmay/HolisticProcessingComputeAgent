@@ -83,7 +83,9 @@ Extending: add tasks to `build_tasks()` (core: everyday shapes) or
 `evals/edit_eval.py`, each with a `fake_calls` script so `--dry-run` keeps
 proving the plumbing. Keep tasks representative of real cluster files — the
 hard tier earns its name from realism (long generated configs, Windows-edited
-ini), not from puzzle construction.
+ini), not from puzzle construction. A task's `files` are written and
+registered; its `missing` keys are registered and deliberately *not* created,
+which is the only way to set up a key that resolves to nothing.
 
 ## 3. The long-write problem (v0.19.0)
 
@@ -117,7 +119,53 @@ is long-horizon instruction compliance of the 27B — one interactive
 "section X is missing" turn in practice — not tool mechanics; do not try to
 prompt it away with more standing text.
 
-## 4. What it deliberately is not
+## 4. Keys that point at nothing (v0.19.2)
+
+`register_path` used to refuse a path that did not exist, on the reasoning
+that a missing path is a typo. It is equally often the file the agent is about
+to write, and refusing left no key to name it with in the call that would have
+created it. It now registers either way and says which case it is; the two
+tools that meet such a key follow:
+
+- `read_file` names the absence instead of letting `read_text` raise a bare
+  `FileNotFoundError` into the loop.
+- `create_file` treats a `dir_key` that is not there yet as a directory to
+  make, not a call to refuse — it already made intermediate parents, so the
+  guard was rejecting work the tool does anyway.
+
+Two hard-tier tasks cover it: `write_into_unmade_dir` (the output directory is
+registered but never created) and `read_key_pointing_at_nothing` (a file key
+resolving to nothing; the model must notice and write the file).
+
+Measured v0.19.1 (baseline) vs working tree, 3 reps, Qwen3.6-27B via a local
+ollama (`qwen27_32k`, num_ctx 32000, temp 0.25):
+
+| Task | Metric | baseline | treatment |
+|---|---|---|---|
+| write_into_unmade_dir | success | 33.3% | 100% |
+| write_into_unmade_dir | failed edits / run | 2.0 | 0.0 |
+| write_into_unmade_dir | tool calls / run | 5.67 | 1.0 |
+| write_into_unmade_dir | completion tokens | 6485 | 356 |
+| read_key_pointing_at_nothing | success | 100% | 100% |
+| read_key_pointing_at_nothing | tool calls / run | 2.67 | 2.33 |
+
+The first is the whole point: refused at the door, the 27B spent its entire
+8-decision budget twice over and still left nothing on disk. The second is a
+**null result worth keeping** — a bare `FileNotFoundError` was already enough
+for this backend to recover from, so `read_file`'s sentence is a clarity fix,
+not a measured win; the call-count drop is inside the noise at 3 reps.
+
+Core tier over the same pair (12 tasks × 2) as a regression check: success
+100% treatment vs 95.8% baseline, failed edits 0.042 vs 0.167 — no regression.
+Read that delta as noise: the one baseline failure was a degenerate 214s
+generation on `simple_replace`, a path neither change touches.
+
+Backend note for whoever runs this next: the local ollama died mid-run once
+(`Server disconnected`, then connection refused for the remaining reps). It
+fails loudly in the per-run `error` field — discard those cells and re-run
+them rather than reading the summary, which happily averages a dead run in.
+
+## 5. What it deliberately is not
 
 - Not part of the default or live pytest suites — it costs real generations
   and minutes of wall time; it runs only when someone asks for an assessment.

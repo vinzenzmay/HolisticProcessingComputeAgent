@@ -90,13 +90,25 @@ class RegisterPathParams(BaseModel):
 
 
 async def register_path(args: RegisterPathParams, ctx: ToolContext) -> str:
+    """Give a path a key, whether or not anything is there yet.
+
+    A missing path used to be refused outright, on the reasoning that it is
+    almost always a typo. It is also, just as often, a path that does not
+    exist *yet* — the output directory a run will write, the specs.md the user
+    just asked for — and refusing left the model with no key for it, hence no
+    way to name it in the call that would have created it. So it registers
+    either way, and the result says which case this is: a key pointing at
+    nothing is a real state (read_file and create_file report it in the same
+    terms), not a silent one that turns into a confusing failure later.
+    """
     path = Path(args.path)
+    ctx.registry.register(args.key, path)
     if not path.exists():
         return (
-            f"Path NOT registered: {path} does not exist. Check the spelling "
-            "against the user's message, or ask the user."
+            f"Registered {args.key!r}, but nothing exists at {path} yet. If "
+            "the user meant a path that is already there, check the spelling "
+            "against their message; otherwise create it before reading it."
         )
-    ctx.registry.register(args.key, path)
     kind = "directory" if path.is_dir() else "file"
     return f"Registered {kind} as {args.key!r}."
 
@@ -688,7 +700,12 @@ async def create_file(args: CreateFileParams, ctx: ToolContext) -> str:
     from hpca.agent.builtin_tools import KIND_BY_SUFFIX, check_script_content
 
     base = ctx.registry.resolve(args.dir_key)
-    if not base.is_dir():
+    # Only a path that IS something else disqualifies the key. One that is not
+    # there yet does not: register_path takes a directory before it exists, and
+    # the write below already makes missing parents, so refusing here would
+    # bounce a call the tool can simply carry out — the retry loop is where the
+    # backend gets confused, which is the one place not to send it.
+    if base.exists() and not base.is_dir():
         return (
             f"NOT created: {args.dir_key!r} is a file, not a directory. Give "
             "the key of the directory the file belongs in."
@@ -730,12 +747,16 @@ async def create_file(args: CreateFileParams, ctx: ToolContext) -> str:
         if refused:
             return refused
 
+    made_dirs = not path.parent.exists()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content)
     key = ctx.registry.register_auto(path, hint=path.stem)
     extra = f" ({'; '.join(warnings)})" if warnings else ""
+    # Say when a directory had to be made: writing a file is one thing, and
+    # creating the tree it sits in is another the user may not have asked for.
+    made = f" (created {path.parent} on the way)" if made_dirs else ""
     return (
-        f"Created {path} ({_lines(len(content_lines))}), registered as "
+        f"Created {path} ({_lines(len(content_lines))}){made}, registered as "
         f"{key!r}{extra}. Change it with edit_file, not by writing it "
         f"again.{_tbd_note(content)}"
     )
