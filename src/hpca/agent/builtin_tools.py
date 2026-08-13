@@ -14,8 +14,10 @@ for work that outlives the turn; it alone reports back as a completion event
 The retired third tool was ``run_script`` (registered script, waits). Splitting
 on where the script came from bought nothing — its description advertised the
 same look-around job as ``run_bash``, so the model had two plausible tools for
-one move — while ``{key}`` expansion keeps the §4.3 "tools take keys, never
-literal paths" rule intact instead of carving an exception into it.
+one move — while ``{key}`` expansion runs a registered script without a second
+tool. (That expansion predates file tools accepting literal paths, and is still
+what the §4.3 guidance teaches: a brace reference is shorter than the path and
+survives the script being moved.)
 
 Handlers return strings for the model; exceptions (unknown registry keys,
 key conflicts) propagate and are surfaced as ``[tool error]`` messages by the
@@ -86,8 +88,7 @@ class CreateScriptParams(BaseModel):
     # An array of lines, not one string: the live model reliably fills string
     # arrays but mangles \n escapes in long strings under guided decoding.
     content_lines: list[str] = Field(
-        min_length=1,
-        description="Script content as an array of lines, one string per line",
+        min_length=1, description="Script content, one string per line"
     )
 
 
@@ -238,23 +239,17 @@ async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
 
 
 class ReadFileParams(BaseModel):
-    registry_key: str = Field(
-        description="Registry key or absolute path of the file to read"
-    )
+    registry_key: str = Field(description="Registry key or absolute path")
     subpath: str = Field(
         default="",
-        description=(
-            "Path relative to registry_key when it names a directory, e.g. "
-            "'src/main.py'. Leave empty to read the key itself."
-        ),
+        description="Path inside registry_key when it is a directory",
     )
     start_line: int = Field(
         default=1,
         ge=1,
         description=(
-            "1-indexed line to start reading from; page through a long file "
-            "by repeating the call with the start_line the previous result "
-            "suggested"
+            "1-indexed first line; page a long file with the start_line each "
+            "result suggests"
         ),
     )
     # Default 200, not 100: measured on the live 27B, a mid-file edit in a
@@ -397,9 +392,8 @@ class RunBashParams(BaseModel):
     content_lines: list[str] = Field(
         min_length=1,
         description=(
-            "Bash script content as an array of lines, one per line "
-            f"(a short look-around script, at most {RUN_SCRIPT_MAX_CHARS} "
-            "characters — write files with create_file, not with this)"
+            "Bash script, one line per element — a short look-around, at most "
+            f"{RUN_SCRIPT_MAX_CHARS} characters; write files with create_file"
         ),
     )
 
@@ -687,10 +681,8 @@ def default_tool_registry() -> ToolRegistry:
         Tool(
             name="read_file",
             description=(
-                "Read a registered file, paged: returns up to max_lines from "
-                "start_line and tells you where to continue if the file goes "
-                "on. If the key is a directory, lists it; pass subpath to "
-                "read a file inside it."
+                "Read a file, paged from start_line; a directory is listed "
+                "instead, and subpath reads a file inside it"
             ),
             params=ReadFileParams,
             handler=read_file,
@@ -701,9 +693,8 @@ def default_tool_registry() -> ToolRegistry:
             name="run_bash",
             description=(
                 "Run bash and wait for its output: look around (find files, "
-                "check a program, read a BAM header, list conda envs) or run a "
-                "registered script by writing {registry_key}, which expands to "
-                "its path. Use for anything you want the result of now"
+                "check a program, read a BAM header), or run a registered "
+                "script by writing {registry_key}, which expands to its path"
             ),
             params=RunBashParams,
             handler=run_bash,
@@ -715,10 +706,9 @@ def default_tool_registry() -> ToolRegistry:
         Tool(
             name="start_background_script",
             description=(
-                "Run a registered script as a tracked background process for "
-                "work that outlives this turn (a pipeline, a long tool run). "
-                "Returns a pid immediately, NOT the output; you are told when "
-                "it finishes. For output now, use run_bash"
+                "Run a registered script in the background, for work that "
+                "outlives this turn. Returns a pid, NOT the output; you are "
+                "told when it finishes"
             ),
             params=StartBackgroundScriptParams,
             handler=start_background_script,
