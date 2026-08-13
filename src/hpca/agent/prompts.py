@@ -16,22 +16,22 @@ in this order — the assembly below is unchanged — so a block can be measured
 by shortening it, not by deleting it.
 """
 
-# The opening clause is not throat-clearing, it is the load-bearing half.
-# Measured on the live 27B (edit_eval shift tier, 2026-08-13): shortened to
-# "Call a tool only to perform a real action; answer ... directly", the model
-# stopped acting on a plain "create this file at /abs/path" request in 5 of 6
-# generations — narrating the plan, asking the user to register the path,
-# saying "I cannot perform file operations at this time", and twice reporting
-# a file it had never written. Restoring "You are an assistant with tools"
-# brought the tool calls back. Same failure signature as the one recorded in
-# middleware.format_instruction: strip the assertion that it HAS tools and the
-# 27B concludes it has none. A restriction on when to call a tool only reads
-# correctly to a model that already believes it can.
+# This short form is measured, and the measurement has a cautionary tale in it.
+# It first looked as though cutting the old opening ("You are an assistant with
+# tools. Tools perform real actions.") had broken tool use: on a plain "create
+# this file at /abs/path" the 27B answered instead of acting, twice claiming it
+# had written a file it never wrote. That was the EVAL's fault — its system
+# prompt omitted PATH_WORKFLOW_GUIDANCE, so the model was being asked to pass a
+# path with the block that permits paths deleted (fixed in evals/edit_eval.py,
+# 2026-08-13). Re-measured with the real prompt, n=20 on that task: this text
+# 20/20 tool calls, all in one call. Two attempted "repairs" both made it worse
+# — restoring the opening clause, and rewording the path sentence to "pass it
+# straight to the tool" (17/20, the 3 failures including fabricated writes).
+# Leave it alone; a phantom regression is not a reason to add words back.
 RESPOND_VS_TOOL_GUIDANCE = (
-    "You are an assistant with tools. Tools perform real actions. Call a tool "
-    "whenever the user asks for an action a tool performs; answer conversation, "
-    'questions and greetings directly with {"action": "respond", ...} — never '
-    "route your own words through a tool."
+    "Call a tool only to perform a real action; answer conversation, questions "
+    'and greetings directly with {"action": "respond", ...} — never route your '
+    "own words through a tool."
 )
 
 
@@ -54,10 +54,9 @@ GROUNDED_ANSWERING_GUIDANCE = (
 # What survives is what the schemas cannot say: that keys exist at all, and
 # the brace expansion in run_bash lines.
 PATH_WORKFLOW_GUIDANCE = (
-    "File tools take a registry key or an absolute path. When you are given a "
-    "path, pass it straight to the tool — you do not need to register it "
-    "first. register_path only gives a long path a short key for later. In a "
-    "run_bash line a key is written in braces — `head -2 "
+    "File tools take a registry key or a literal absolute path, so use a path "
+    "you already have as it stands; register_path gives one a short key up "
+    "front. In a run_bash line a key is written in braces — `head -2 "
     "{ref_fasta}` — and expands to the real path; that is also how you run a "
     "script you created: `{my_script} --flag`."
 )
