@@ -16,10 +16,22 @@ in this order — the assembly below is unchanged — so a block can be measured
 by shortening it, not by deleting it.
 """
 
+# The opening clause is not throat-clearing, it is the load-bearing half.
+# Measured on the live 27B (edit_eval shift tier, 2026-08-13): shortened to
+# "Call a tool only to perform a real action; answer ... directly", the model
+# stopped acting on a plain "create this file at /abs/path" request in 5 of 6
+# generations — narrating the plan, asking the user to register the path,
+# saying "I cannot perform file operations at this time", and twice reporting
+# a file it had never written. Restoring "You are an assistant with tools"
+# brought the tool calls back. Same failure signature as the one recorded in
+# middleware.format_instruction: strip the assertion that it HAS tools and the
+# 27B concludes it has none. A restriction on when to call a tool only reads
+# correctly to a model that already believes it can.
 RESPOND_VS_TOOL_GUIDANCE = (
-    "Call a tool only to perform a real action; answer conversation, questions "
-    'and greetings directly with {"action": "respond", ...} — never route your '
-    "own words through a tool."
+    "You are an assistant with tools. Tools perform real actions. Call a tool "
+    "whenever the user asks for an action a tool performs; answer conversation, "
+    'questions and greetings directly with {"action": "respond", ...} — never '
+    "route your own words through a tool."
 )
 
 
