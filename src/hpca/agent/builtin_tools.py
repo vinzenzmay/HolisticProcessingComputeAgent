@@ -197,9 +197,20 @@ async def check_script_content(
 async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
     ctx.scripts_dir.mkdir(parents=True, exist_ok=True)
     path = ctx.scripts_dir / f"{args.registry_key}{SCRIPT_SUFFIX[args.kind]}"
-    if args.registry_key in ctx.registry:  # fail before writing anything
+    # Fail before writing anything: the script lands on disk before the key is
+    # registered, so a late refusal would leave the file behind. The test is
+    # the one Registry.register applies — a key whose path is gone names
+    # nothing, and refusing it would burn the key for the rest of the session.
+    taken = ctx.registry.get(args.registry_key)
+    if taken is not None and taken.exists():
+        if taken == path:
+            raise RegistryError(
+                f"Script {args.registry_key!r} already exists; change it with "
+                "edit_file rather than creating it again"
+            )
         raise RegistryError(
-            f"Key {args.registry_key!r} is already registered; pick a different key"
+            f"Key {args.registry_key!r} already names {taken}; pick a "
+            "different key"
         )
     lines = args.content_lines
     nonempty = [line for line in lines if line.strip()]
@@ -222,7 +233,8 @@ async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
     if refused:
         path.unlink(missing_ok=True)  # never keep a script that failed the gate
         return refused
-    ctx.registry.register(args.registry_key, path)
+    replaced = ctx.registry.register(args.registry_key, path)
+    stale = f" Replaced a stale registration of {replaced}." if replaced else ""
     note = f" ({'; '.join(warnings)})" if warnings else ""
     strict = (
         " Runs fail-fast (set -euo pipefail): a failed command stops the "
@@ -233,7 +245,7 @@ async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
         f"Created script {args.registry_key!r} ({args.kind}); "
         f"syntax check ok{note}. Start it with start_background_script, or run "
         f"it now with run_bash: {{{args.registry_key}}} expands to its "
-        f"path.{strict}"
+        f"path.{strict}{stale}"
     )
 
 

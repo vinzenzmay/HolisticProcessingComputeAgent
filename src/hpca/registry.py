@@ -173,6 +173,16 @@ class PathRegistry:
                 return literal, self.register_auto(literal, hint=hint)
         return self.resolve(value), value  # raises UnknownKeyError
 
+    def get(self, key: str) -> Path | None:
+        """The path a key names, or None when the key is free.
+
+        ``key in registry`` only answers whether the key is taken. A caller
+        that has to decide like :meth:`register` does — a key whose path no
+        longer exists names nothing and may be repointed — needs the path
+        itself to test.
+        """
+        return self._get(key)
+
     def __contains__(self, key: str) -> bool:
         return self._get(key) is not None
 

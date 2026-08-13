@@ -79,11 +79,46 @@ class TestCreateScript:
             tools, "create_script", ctx,
             kind="bash", registry_key="x", content_lines=["echo 1"],
         )
-        with pytest.raises(RegistryError, match="already registered"):
+        with pytest.raises(RegistryError, match="already exists"):
             await call(
                 tools, "create_script", ctx,
                 kind="bash", registry_key="x", content_lines=["echo 2"],
             )
+
+    async def test_key_naming_another_live_file_raises(self, tools, ctx, tmp_path):
+        other = tmp_path / "data.txt"
+        other.write_text("payload\n")
+        ctx.registry.register("x", other)
+        with pytest.raises(RegistryError, match="already names"):
+            await call(
+                tools, "create_script", ctx,
+                kind="bash", registry_key="x", content_lines=["echo 1"],
+            )
+        assert ctx.registry.resolve("x") == other
+
+    async def test_key_whose_script_is_gone_can_be_recreated(self, tools, ctx):
+        # A key naming a file that no longer exists names nothing. Refusing it
+        # would burn the key for the session, the trap Registry.register fixed.
+        await call(
+            tools, "create_script", ctx,
+            kind="bash", registry_key="x", content_lines=["echo 1"],
+        )
+        ctx.registry.resolve("x").unlink()
+        result = await call(
+            tools, "create_script", ctx,
+            kind="bash", registry_key="x", content_lines=["echo 2"],
+        )
+        assert "echo 2" in ctx.registry.resolve("x").read_text()
+        assert "stale" not in result  # same path back, so nothing was repointed
+
+    async def test_repointing_a_dead_key_is_reported(self, tools, ctx, tmp_path):
+        ctx.registry.register("x", tmp_path / "never_written.sh")
+        result = await call(
+            tools, "create_script", ctx,
+            kind="bash", registry_key="x", content_lines=["echo 1"],
+        )
+        assert "never_written.sh" in result
+        assert ctx.registry.resolve("x") == ctx.scripts_dir / "x.sh"
 
 
 class TestReadFile:
