@@ -388,6 +388,7 @@ def build_service(
             session_search="session_search" in tools.names(),
             memory_tool="memory" in tools.names(),
             watch_tools="watch_log" in tools.names(),
+            native_tools=settings.llm.tool_protocol == "native",
         )
 
     graph = build_graph(

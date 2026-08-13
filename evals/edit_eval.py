@@ -96,12 +96,22 @@ _SHIFT_SYSTEM_NOTE = (
 )
 
 
-def _system_prompt(note: str = "") -> str:
+def _system_prompt(note: str = "", native: bool = False) -> str:
     """Match HPCA's own prompt style; fall back if the constant moved."""
-    try:
-        from hpca.agent.prompts import RESPOND_VS_TOOL_GUIDANCE as guidance
-    except Exception:
-        guidance = _FALLBACK_GUIDANCE
+    # Production picks this block by protocol (orchestrator_system_prompt):
+    # under native an answer is plain text, so the envelope's
+    # {"action": "respond", ...} names a format the model cannot emit.
+    guidance = None
+    if native:
+        try:
+            from hpca.agent.prompts import RESPOND_VS_TOOL_GUIDANCE_NATIVE as guidance
+        except Exception:
+            guidance = None
+    if guidance is None:
+        try:
+            from hpca.agent.prompts import RESPOND_VS_TOOL_GUIDANCE as guidance
+        except Exception:
+            guidance = _FALLBACK_GUIDANCE
     # Production always carries the file-writing guidance
     # (orchestrator_system_prompt includes SCRIPT_GUIDANCE); measuring
     # without it handicaps whichever side is checked out. Each side gets its
@@ -141,6 +151,10 @@ except Exception:
         tool_name: str, arguments: dict, result: str, *, call_id: str = ""
     ) -> list[dict]:
         return [{"role": "user", "content": f"[tool result] {tool_name}: {result}"}]
+
+
+def _not_native() -> bool:
+    return False
 
 
 def _exchange(tool_name: str, arguments: dict, result: str, call_id: str) -> list[dict]:
@@ -1175,7 +1189,13 @@ async def run_task(task: Task, llm, tools: ToolRegistry, keep: bool = False) -> 
             bind(workspace)
 
         messages = [
-            {"role": "system", "content": _system_prompt(getattr(task, "system_note", ""))},
+            {
+                "role": "system",
+                "content": _system_prompt(
+                    getattr(task, "system_note", ""),
+                    native=bool(getattr(llm, "uses_native_tools", _not_native)()),
+                ),
+            },
             {"role": "user", "content": _render_prompt(task, workspace)},
         ]
         for _ in range(task.max_decisions or MAX_DECISIONS):

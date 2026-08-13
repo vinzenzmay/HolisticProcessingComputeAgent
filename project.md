@@ -461,6 +461,28 @@ the orchestrator's or another subagent's context.
   that copy (a create_file's content is already on disk; echoing it would store
   the file twice in context). Without it the model reconstructed what it had
   done purely from the result text and re-issued calls it had already made.
+* **How a call travels** is `settings.llm.tool_protocol`, and there are two
+  answers. `envelope` (default) is the hand-rolled decision object,
+  `{"action": "tool_call", "tool": …, "arguments": …}`, held to an `anyOf`
+  grammar by constrained decoding, with the tool list spelled out in prose
+  because a grammar constrains syntax and cannot say which tools exist. It
+  works on any OpenAI-compatible backend, which is why it is the default.
+  `native` puts the call on the backend's own tool-calling channel: the branch
+  choice becomes the backend's, the tool list moves out of the prompt into the
+  `tools` array the chat template renders, and the exchange becomes a real
+  assistant `tool_calls` message answered on the `tool` role. Argument
+  validation does not move — the array constrains shape, not meaning, so a
+  wrong key still returns through the same feedback loop, and on this channel
+  the complaint answers the call on the tool role, because a template handed a
+  call with no matching result renders a broken conversation.
+  It is a setting rather than a probe, unlike constrained decoding: the
+  protocol shapes the whole conversation rather than one request, so there is
+  nothing to fall back to mid-session, and it needs the server started for it
+  (vLLM: `--enable-auto-tool-choice --tool-call-parser hermes`). A backend
+  without it rejects the request rather than degrading quietly.
+  The call's id is checkpointed with the pending call, not just held in
+  memory: an approval parks the turn for as long as the user takes, and the id
+  is the only thing tying the result to the call it answers.
 * **Output size control:** long tool outputs are kept small before they reach the
   model. *As built,* this is per-tool truncation rather than a single generic
   middleware layer: `read_file` returns head/tail, `read_manpage`/`read_source`

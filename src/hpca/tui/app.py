@@ -1643,6 +1643,7 @@ class HpcaApp(App):
             session_search="session_search" in self._tools.names(),
             memory_tool="memory" in self._tools.names(),
             watch_tools="watch_log" in self._tools.names(),
+            native_tools=self.settings.llm.tool_protocol == "native",
         )
 
     def _recall_lines(

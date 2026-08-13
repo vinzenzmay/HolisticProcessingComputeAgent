@@ -13,6 +13,24 @@ RESPOND_VS_TOOL_GUIDANCE = (
     'with {"action": "respond", ...} — never route your own words through a tool.'
 )
 
+# The same rule for the native tool-calling protocol
+# (``settings.llm.tool_protocol``), where an answer is ordinary assistant text
+# and ``{"action": "respond", ...}`` names a format the model cannot emit —
+# leaving that clause in tells it to produce something the channel has no room
+# for. The last sentence is not a rewording: measured on the live 27B, the
+# native protocol's characteristic failure is narrating the edit instead of
+# making it (one read_file call, then "I have updated the file", with the file
+# untouched), which the envelope's explicit two-branch listing suppresses by
+# making "call a tool" the visibly available option.
+RESPOND_VS_TOOL_GUIDANCE_NATIVE = (
+    "You are an assistant with tools. Tools perform real actions. "
+    "Use a tool only when the user asks for an action a tool performs. "
+    "For conversation, questions, and greetings, answer directly in your own "
+    "words — never route them through a tool. Never describe an action you "
+    "have not performed: if the request needs a change made, call the tool "
+    "that makes it, and answer only once the tool has reported it done."
+)
+
 
 # Scoped deliberately: the earlier blanket "never answer from memory" made the
 # agent research its OWN tools before calling them, which is pure waste — their
@@ -230,6 +248,7 @@ def orchestrator_system_prompt(
     session_search: bool = False,
     memory_tool: bool = False,
     watch_tools: bool = False,
+    native_tools: bool = False,
 ) -> str:
     """System prompt for the orchestrator; the cacheable prompt *prefix*.
 
@@ -247,7 +266,10 @@ def orchestrator_system_prompt(
     parts = [
         "You are HPCA, a terminal assistant helping a scientist with data "
         "processing on an HPC cluster.",
-        RESPOND_VS_TOOL_GUIDANCE,
+        # Which protocol carries a call changes what "answer directly" looks
+        # like, so this one block varies with it; everything else is the same
+        # text either way.
+        RESPOND_VS_TOOL_GUIDANCE_NATIVE if native_tools else RESPOND_VS_TOOL_GUIDANCE,
         PATH_WORKFLOW_GUIDANCE,
         DISCOVERY_GUIDANCE,
         ENVIRONMENT_TOOL_GUIDANCE,
