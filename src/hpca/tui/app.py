@@ -152,6 +152,7 @@ from hpca.tui.rename_screen import RenameScreen
 from hpca.tui.rewind_screen import COPY, FORK, ROLLBACK, RewindScreen
 from hpca.tui.settings_screen import SettingsScreen
 from hpca.tui.switch_llm import SwitchLLMScreen
+from hpca.tui.termkeys import patch_alt_enter
 from hpca.watches import (
     KIND_JOB,
     KIND_LOG,
@@ -416,7 +417,8 @@ class ChatInput(TextArea):
     a long message is readable while it is being written.
 
     Enter sends; shift+enter, alt+enter or ctrl+j start a new line (terminals
-    that cannot report shift+enter still have the other two). Arrow keys move
+    that cannot report shift+enter still have the other two — and one bound to
+    send ESC CR for it lands on alt+enter, see hpca.tui.termkeys). Arrow keys move
     the text cursor and only hand focus on at the edges of the draft: ← at the
     very start leaves for the sessions column, → at the very end for the
     watchers column, ↑ on the first *visual* row leaves to browse the message
@@ -1210,6 +1212,7 @@ class HpcaApp(App):
         profile: str = "default",
     ) -> None:
         super().__init__()
+        patch_alt_enter()  # shift+enter via the ESC-CR terminal workaround
         self.settings = settings or Settings.load()
         self.profile = profile
         self._llm = llm
