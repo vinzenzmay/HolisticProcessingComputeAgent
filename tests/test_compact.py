@@ -187,3 +187,20 @@ class TestSidecarAwareEstimate:
         ]
         # 30 * 900 chars = ~6750 tokens; only ~37 by content alone
         assert compact.should_compact(messages, max_model_len=2000)
+
+
+class TestNativeCallsInTheSummarizerView:
+    def test_a_native_call_is_not_a_blank_line(self):
+        # Its content is empty by construction — the call is in tool_calls — so
+        # summarizing content alone would drop the action from the summary.
+        call = history_module.tool_exchange(
+            "edit_file", {"registry_key": "runner"}, "ok", call_id="c1"
+        )[0]
+        rendered = compact.transcript([call])
+        assert "edit_file" in rendered
+        assert "runner" in rendered
+
+    def test_ordinary_messages_are_unchanged(self):
+        assert compact.transcript(
+            [{"role": "user", "content": "align the reads"}]
+        ) == "user: align the reads"

@@ -169,6 +169,25 @@ def tool_exchange(
     ]
 
 
+def call_text(message: Message) -> str:
+    """A native call rendered as text, or "" for any other message.
+
+    The native encoding puts the call in ``tool_calls`` and leaves the content
+    empty, so anything that reads messages as text — the compaction
+    summarizer, a log line — sees a blank where an action was. This gives it
+    the call back in the envelope's own wording, which is also what the
+    envelope protocol's copy of the same call reads like.
+    """
+    calls = message.get("tool_calls") or []
+    if not calls:
+        return ""
+    rendered = []
+    for call in calls:
+        function = call.get("function") or {}
+        rendered.append(f"{function.get('name')}({function.get('arguments') or '{}'})")
+    return "[tool call] " + "; ".join(rendered)
+
+
 def is_tool_call_message(message: Message) -> bool:
     """Is this assistant message a call the agent made, rather than an answer?
 

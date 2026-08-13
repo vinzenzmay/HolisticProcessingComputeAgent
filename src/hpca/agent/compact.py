@@ -25,7 +25,7 @@ declared while compacting still frames the turns that follow it.
 
 from __future__ import annotations
 
-from hpca.agent.history import is_tool_call_message
+from hpca.agent.history import call_text, is_tool_call_message
 from hpca.llm import Message
 
 # Compact when the estimated prompt exceeds this share of the window. Leaves
@@ -125,7 +125,11 @@ def transcript(messages: list[Message]) -> str:
     for message in messages:
         if message["role"] == "system":
             continue
-        content = " ".join(str(message["content"]).split())
+        # A native-protocol call carries nothing in its content — the call is
+        # in tool_calls — so summarizing the content alone would hand the
+        # summarizer a blank assistant line where an action was. What the
+        # session did is exactly what a summary must not lose.
+        content = " ".join((call_text(message) or str(message["content"])).split())
         # An earlier summary already *is* the compressed form of a long stretch
         # of session. Cutting it at the per-message limit would throw away most
         # of what that fold decided to keep, so the second compaction of a
