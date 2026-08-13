@@ -7,9 +7,11 @@ entry, which the chat window shows as one collapsible box and the session log
 writes as one block.
 
 Reasoning and tool calls are anchored by the message index they produced
-(``after``), never fed back to the model, and live outside ``messages`` for
-exactly that reason: the model already knows what it called, and a script fed
-back verbatim would cost the window twice.
+(``after``) and live outside ``messages``. The reasoning is never fed back to
+the model at all; a call is, but only as the elided envelope
+:mod:`hpca.agent.history` builds — a script fed back verbatim would cost the
+window twice. The record here is the unelided one, which is what the user
+reads, so the message carrying the model's own copy is skipped when rendering.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 
+from hpca.agent.history import is_tool_call_message
 from hpca.llm import Message
 
 TOOL_PREFIXES = ("[tool result]", "[tool error]")
@@ -228,7 +231,8 @@ def build_entries(
     def open_calls(index: int) -> None:
         """The calls made at this point, shown before the result they produced.
 
-        A call is anchored to the index its result takes, and the two are
+        A call is anchored to the index of its own assistant message, whose
+        result is the message straight after it, and record and messages are
         written in one state update, so there is never one without the other.
         An anchor past the end of ``messages`` is a call a rolled-back turn
         left behind (see ``rollback_thread``) and is passed over here, exactly
@@ -252,6 +256,13 @@ def build_entries(
         open_calls(index)
         role, content = message["role"], str(message["content"])
         if role == "system":
+            continue
+        if is_tool_call_message(message):
+            # The model's own copy of a call it made (hpca.agent.history): it
+            # exists so the history has the shape the model was trained on, and
+            # is not an answer. The user reads the call from its anchored
+            # record instead — same call, arguments unelided — which
+            # ``open_calls`` has already put in the open thinking box.
             continue
         if role == ASSISTANT:
             flush()  # the answer closes the box that produced it

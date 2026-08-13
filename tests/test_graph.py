@@ -433,7 +433,7 @@ class TestFork:
         )
         graph = make_graph(llm, tools)
         await run_turn(graph, session_id="src", user_text="q1")  # msgs 0-1
-        await run_turn(graph, session_id="src", user_text="q2")  # msgs 2-4
+        await run_turn(graph, session_id="src", user_text="q2")  # msgs 2-5
         return graph, llm
 
     async def test_fork_copies_the_first_keep_messages(self, tools):
@@ -445,8 +445,9 @@ class TestFork:
         )
         assert [m["content"] for m in copied] == ["q1", "a1"]
         assert await thread_message_count(graph, session_id="dst") == 2
-        # the source is untouched
-        assert await thread_message_count(graph, session_id="src") == 5
+        # the source is untouched (q2's turn is four messages: the question,
+        # the call the model made, its result, the answer)
+        assert await thread_message_count(graph, session_id="src") == 6
 
     async def test_fork_trims_thinking_and_calls_to_the_cut(self, tools):
         from hpca.agent.graph import fork_thread
@@ -476,7 +477,7 @@ class TestFork:
         assert any("q1" == m for m in sent)
         assert not any("q2" == m for m in sent)
         # and the source did not grow
-        assert await thread_message_count(graph, session_id="src") == 5
+        assert await thread_message_count(graph, session_id="src") == 6
 
     async def test_a_fold_past_the_cut_is_not_copied(self, tools):
         from hpca.agent.graph import fork_thread
@@ -600,13 +601,16 @@ class TestThinkingState:
         )
         graph = make_graph(llm, tools)
         result = await run_turn(graph, session_id="t2", user_text="echo hi")
-        # 0: user, 1: tool result (from the first decision), 2: the answer
+        # 0: user, 1: the call the first decision made, 2: its result,
+        # 3: the answer. Each block of reasoning anchors to the message the
+        # decision that produced it went on to write.
         assert result.thinking == [
             {"after": 1, "reasoning": "I should echo first."},
-            {"after": 2, "reasoning": "Now I can answer."},
+            {"after": 3, "reasoning": "Now I can answer."},
         ]
-        assert result.messages[1]["content"].startswith("[tool result]")
-        assert result.messages[2]["role"] == "assistant"
+        assert result.messages[1]["role"] == "assistant"  # the call
+        assert result.messages[2]["content"].startswith("[tool result]")
+        assert result.messages[3]["role"] == "assistant"  # the answer
 
     async def test_no_reasoning_no_entries(self, tools):
         llm = FakeLLM([respond_json("hi")])
@@ -642,12 +646,15 @@ class TestCallState:
         assert result.calls == [
             {"after": 1, "tool": "echo", "arguments": {"text": "hi"}}
         ]
-        # 1 is the index its result took, so the two render together
-        assert result.messages[1]["content"].startswith("[tool result] echo")
+        # 1 is the index of the call's own assistant message, 2 its result:
+        # the record and the exchange it describes render together
+        assert '"tool": "echo"' in result.messages[1]["content"]
+        assert result.messages[2]["content"].startswith("[tool result] echo")
 
     async def test_calls_are_kept_out_of_the_messages(self, tools):
-        # The model already knows what it called; feeding a script back would
-        # cost the context window twice (§4.2).
+        # The rendered record (script block, resolved paths, repairs) is for
+        # the user and stays out of the window; what the model gets back is
+        # its own decision envelope, nothing more (§4.2, hpca.agent.history).
         llm = FakeLLM([tool_json("echo", text="hi"), respond_json("done")])
         graph = make_graph(llm, tools)
         result = await run_turn(graph, session_id="c2", user_text="echo hi")
@@ -746,7 +753,11 @@ class TestCallState:
         assert result.calls == [
             {"after": 1, "tool": "delete", "arguments": {"target": "results/"}}
         ]
-        assert "DENIED" in result.messages[1]["content"]
+        # The call the user refused is in the history as a call all the same —
+        # the refusal answers it, and a model that cannot see what it asked
+        # for cannot tell which of its options was turned down.
+        assert '"tool": "delete"' in result.messages[1]["content"]
+        assert "DENIED" in result.messages[2]["content"]
 
     async def test_a_failing_tool_still_records_its_call(self, tools):
         async def boom(args, ctx):
@@ -761,7 +772,7 @@ class TestCallState:
         graph = make_graph(llm, tools)
         result = await run_turn(graph, session_id="c5", user_text="go")
         assert result.calls[0]["tool"] == "boom"
-        assert result.messages[1]["content"].startswith("[tool error]")
+        assert result.messages[2]["content"].startswith("[tool error]")
 
     async def test_details_are_recorded_when_the_tool_describes_the_call(self, tools):
         tools.register(
@@ -809,7 +820,76 @@ class TestCallState:
         graph = make_graph(llm, tools)
         await run_turn(graph, session_id="c8", user_text="first")
         result = await run_turn(graph, session_id="c8", user_text="second")
-        assert [c["after"] for c in result.calls] == [1, 4]
+        # Four messages per tool turn now (user, call, result, answer), so the
+        # second turn's call sits at 5.
+        assert [c["after"] for c in result.calls] == [1, 5]
+
+
+class TestCallsInTheHistory:
+    """The model sees what it did: its own call, then the result answering it
+    (hpca.agent.history). Before this, a turn was a run of consecutive user
+    messages and the model had to infer its actions from the result text."""
+
+    async def test_the_call_precedes_its_result_in_the_thread(self, tools):
+        llm = FakeLLM([tool_json("echo", text="hi"), respond_json("done")])
+        graph = make_graph(llm, tools)
+        result = await run_turn(graph, session_id="h1", user_text="echo hi")
+        assert [m["role"] for m in result.messages] == [
+            "user",  # the question
+            "assistant",  # the call
+            "user",  # its result
+            "assistant",  # the answer
+        ]
+        assert json.loads(result.messages[1]["content"]) == {
+            "action": "tool_call",
+            "tool": "echo",
+            "arguments": {"text": "hi"},
+        }
+        assert result.messages[2]["content"] == "[tool result] echo: echo: hi"
+
+    async def test_the_next_decision_is_shown_the_call(self, tools):
+        # Not just stored: the whole point is that the round after a tool call
+        # sees the call in the conversation it is continuing.
+        llm = FakeLLM([tool_json("echo", text="hi"), respond_json("done")])
+        graph = make_graph(llm, tools)
+        await run_turn(graph, session_id="h2", user_text="echo hi")
+        sent = llm.calls[-1]["messages"]
+        assert [m["role"] for m in sent] == ["system", "user", "assistant", "user"]
+        assert '"tool": "echo"' in sent[2]["content"]
+
+    async def test_a_large_payload_is_elided_in_the_history(self, tools):
+        # A create_file call carries the whole file; echoing it verbatim would
+        # spend the window on it twice, on exactly the turns already tight.
+        class WriteParams(BaseModel):
+            path: str = Field(description="Where")
+            content_lines: list[str] = Field(description="The file")
+
+        async def write_handler(args, ctx):
+            return f"wrote {len(args.content_lines)} lines"
+
+        tools.register(
+            Tool(
+                name="create_file",
+                description="Write a file",
+                params=WriteParams,
+                handler=write_handler,
+            )
+        )
+        lines = [f"line {i}" for i in range(400)]
+        llm = FakeLLM(
+            [
+                tool_json("create_file", path="notes.md", content_lines=lines),
+                respond_json("written"),
+            ]
+        )
+        graph = make_graph(llm, tools)
+        result = await run_turn(graph, session_id="h3", user_text="write notes")
+        call = json.loads(result.messages[1]["content"])
+        assert call["arguments"]["path"] == "notes.md"  # the target survives
+        assert call["arguments"]["content_lines"][-1].endswith("more lines elided ...")
+        assert "line 399" not in result.messages[1]["content"]
+        # …while the record the user reads keeps every line
+        assert result.calls[0]["arguments"]["content_lines"] == lines
 
 
 class TestLiveSteps:
@@ -939,11 +1019,12 @@ class TestNewThisTurn:
         resumed = await run_turn(
             graph, session_id="n2", resume=Command(resume={"approved": True})
         )
-        # the resume logs only what it added: the tool result and the answer
+        # the resume logs only what it added: the call, its result, the answer
         new = [m["content"] for m in resumed.messages[resumed.first_new:]]
-        assert len(new) == 2
-        assert new[0].startswith("[tool result] delete")
-        assert new[1] == "gone"
+        assert len(new) == 3
+        assert '"tool": "delete"' in new[0]
+        assert new[1].startswith("[tool result] delete")
+        assert new[2] == "gone"
 
 
 class TestCompaction:

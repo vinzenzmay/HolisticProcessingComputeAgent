@@ -1,8 +1,11 @@
 """Tests for hpca.transcript: folding state into chat entries."""
 
+from hpca.agent.history import tool_call_message
 from hpca.transcript import Entry, build_entries
 
 USER_MSG = {"role": "user", "content": "which BAMs are in the cohort?"}
+# The model's own copy of the call that produced STEP (hpca.agent.history).
+CALL_MSG = tool_call_message("list_dir", {"registry_key": "cohort"})
 STEP = {"role": "user", "content": "[tool result] list_dir: 12 entries"}
 STEP2 = {"role": "user", "content": "[tool error] read_file: not found"}
 ANSWER = {"role": "assistant", "content": "Four BAMs match."}
@@ -192,6 +195,49 @@ class TestToolCalls:
     def test_calls_are_optional(self):
         box = build_entries([USER_MSG, STEP, ANSWER], [])[1]
         assert [p.kind for p in box.parts] == ["step"]
+
+
+class TestCallMessages:
+    """The model's own copy of a call (hpca.agent.history) is in ``messages``
+    so the history has the shape it was trained on. The user reads the call
+    from its anchored record instead — unelided, with the script — so the
+    message itself must never surface as a reply."""
+
+    def test_the_models_copy_of_a_call_is_not_shown_as_an_answer(self):
+        entries = build_entries([USER_MSG, CALL_MSG, STEP, ANSWER], [])
+        assert kinds(entries) == ["user", "thinking", "assistant"]
+        assert entries[2].text == "Four BAMs match."
+
+    def test_it_does_not_split_the_thinking_box(self):
+        # An assistant message closes the box that produced it; the call is
+        # mid-working, so a box holding two calls must stay one box.
+        messages = [USER_MSG, CALL_MSG, STEP, CALL_MSG, STEP2, ANSWER]
+        entries = build_entries(messages, [])
+        assert kinds(entries) == ["user", "thinking", "assistant"]
+        assert entries[1].steps == 2
+
+    def test_the_call_record_still_lands_before_its_result(self):
+        # Anchored to the index of the model's copy, which is the message
+        # right before the result it produced.
+        calls = [{"after": 1, "tool": "list_dir", "arguments": {"key": "cohort"}}]
+        thinking = [{"after": 1, "reasoning": "List it first."}]
+        box = build_entries([USER_MSG, CALL_MSG, STEP, ANSWER], thinking, calls)[1]
+        assert [p.kind for p in box.parts] == ["reasoning", "call", "step"]
+
+    def test_a_call_message_is_never_a_rewind_cut_point(self):
+        # Only real user messages name one; indices stay absolute either way.
+        entries = build_entries([USER_MSG, CALL_MSG, STEP, ANSWER], [])
+        assert [(e.kind, e.index) for e in entries if e.index >= 0] == [
+            ("user", 0),
+            ("assistant", 3),
+        ]
+
+    def test_an_answer_that_merely_mentions_the_format_is_still_an_answer(self):
+        quoted = {
+            "role": "assistant",
+            "content": 'Call it with {"action": "tool_call", "tool": "echo"} — but',
+        }
+        assert kinds(build_entries([USER_MSG, quoted], [])) == ["user", "assistant"]
 
 
 class TestTail:

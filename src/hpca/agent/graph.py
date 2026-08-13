@@ -24,6 +24,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from hpca.agent import compact
+from hpca.agent.history import tool_call_message
 from hpca.agent.middleware import (
     DecisionError,
     DirectResponse,
@@ -114,11 +115,13 @@ class AgentState(TypedDict, total=False):
     # logged (§4.2 context firewall).
     thinking: Annotated[list[dict], _append]
     # What each tool was actually called with — {"after", "tool", "arguments",
-    # and optionally "script"/"details"} — anchored to its result's message
-    # index. Same firewall and the same reason: the model made the call, so
-    # echoing the script back would spend the window on it twice; the user did
-    # not, and after the approval prompt is answered this is the only place the
-    # script survives (see hpca.transcript.call_text).
+    # and optionally "script"/"details"} — anchored to the message index of the
+    # call itself (the assistant message execute_tool appends, immediately
+    # followed by the result). Kept out of `messages` because the *full* record
+    # is here: the model's own copy of the call has its payload elided, and the
+    # user, who never made the call, needs the script in full — after the
+    # approval prompt is answered this is the only place it survives (see
+    # hpca.transcript.call_text).
     calls: Annotated[list[dict], _append]
     pending_tool: dict | None
     tool_rounds: int
@@ -324,6 +327,10 @@ def build_graph(
             if part
         )
         call = {
+            # The index the call's own assistant message is about to take —
+            # the first of the two this node appends, so the record and the
+            # message it describes share a position and the transcript can
+            # render the call where it happened.
             "after": len(state.get("messages", [])),
             "tool": tool.name,
             "arguments": pending["arguments"],
@@ -409,7 +416,7 @@ def build_graph(
             except Exception as e:  # surfaced to the model, never crashes the graph
                 content = f"[tool error] {tool.name}: {type(e).__name__}: {e}"
         report_step(thread_id, {"kind": "step", "text": content})
-        update = _tool_message(content) | recorded
+        update = _tool_exchange(tool.name, pending["arguments"], content) | recorded
         if ran and tool.name == "update_plan":
             # The checklist lives in the checkpointed state, not in the tool:
             # that is what makes it survive restarts and prompt re-injection.
@@ -490,12 +497,24 @@ def build_graph(
             "tool_rounds": 0,
         }
 
-    def _tool_message(content: str) -> dict:
-        # Tool results use the user role: vLLM/Qwen templates reject
+    def _tool_exchange(tool_name: str, arguments: dict, content: str) -> dict:
+        # Two messages, not one: the assistant message IS the call the model
+        # emitted (its own decision envelope, big payloads elided — see
+        # hpca.agent.history), and the result answers it. A history of nothing
+        # but results is a run of consecutive user messages in which the model
+        # has to infer its own actions from the echo in the result text; the
+        # pair is the shape agent-trained models were post-trained on.
+        #
+        # The result still uses the user role: vLLM/Qwen templates reject
         # mid-conversation system messages, and the native tool role requires
-        # the tool-call protocol we deliberately bypass (§4.3).
+        # the tool-call protocol we deliberately bypass (§4.3). ``content`` is
+        # passed through untouched — it is also a denial or a tool error, not
+        # only a "[tool result] …" line.
         return {
-            "messages": [{"role": "user", "content": content}],
+            "messages": [
+                tool_call_message(tool_name, arguments),
+                {"role": "user", "content": content},
+            ],
             "pending_tool": None,
         }
 

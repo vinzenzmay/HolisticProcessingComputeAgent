@@ -186,6 +186,27 @@ class TestApprovalFlow:
             assert any("deleted results/" in t for t in texts)
             assert any("it is gone" in t for t in texts)
 
+    async def test_the_models_own_call_is_not_drawn_as_a_reply(self, hpca_home):
+        # The thread now carries the call as an assistant message so the model
+        # sees what it did (hpca.agent.history). The chat shows it in the
+        # thinking box from the call record instead — a raw envelope in a
+        # reply bubble would read as the agent answering in JSON.
+        app = HpcaApp(
+            llm=FakeLLM(
+                [tool_json("delete", target="results/"), respond_json("it is gone")]
+            ),
+            tools=destructive_tools(),
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit_chat(app, pilot, "delete results")
+            await pilot.press("y")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            kinds = [entry.kind for entry in app._chat_entries]
+            assert kinds == ["user", "thinking", "assistant"]
+            assert app._chat_entries[-1].text == "it is gone"
+            assert not any('"action": "tool_call"' in t for t in chat_texts(app))
+
     async def test_reject_skips_tool(self, hpca_home):
         app = HpcaApp(
             llm=FakeLLM(
@@ -416,6 +437,8 @@ async def test_tool_traffic_is_not_indexed(hpca_home):
         contents = [r["content"] for r in rows]
         assert "please delete scratch" in contents
         assert not any("[tool result]" in c for c in contents)
+        # nor the model's own copy of the call, which is an assistant message
+        assert not any('"action": "tool_call"' in c for c in contents)
 
 
 class UsageLLM(FakeLLM):
