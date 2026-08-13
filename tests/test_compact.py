@@ -3,6 +3,7 @@
 import pytest
 
 from hpca.agent import compact
+from hpca.agent import history as history_module
 from hpca.llm import ChatResponse
 
 
@@ -38,12 +39,38 @@ class TestShouldCompact:
         assert not compact.should_compact(history(60), max_model_len=100_000)
 
 
+def tool_history(pairs):
+    """A history of completed tool rounds: call, result, call, result, ..."""
+    messages = []
+    for i in range(pairs):
+        messages += history_module.tool_exchange(
+            "read_file", {"registry_key": f"f{i}"}, f"12 lines from f{i}"
+        )
+    return messages
+
+
 class TestSplit:
     def test_keeps_a_recent_tail_verbatim(self):
         older, keep = compact.split(history(60))
         assert len(keep) >= compact.KEEP_RECENT
         assert older + keep == history(60)
         assert keep[-1]["content"].startswith("m59")
+
+    def test_the_tail_never_opens_on_an_orphaned_result(self):
+        # 38 rounds puts the budget boundary (keep = 76 // 3 = 25) between a
+        # call and its result; the cut steps back so the call comes along.
+        messages = tool_history(38)
+        older, keep = compact.split(messages)
+        assert history_module.is_tool_call_message(keep[0])
+        assert len(keep) == 26  # one more than the budget asked for
+        assert older + keep == messages
+
+    def test_an_aligned_boundary_is_left_alone(self):
+        messages = tool_history(39)  # keep = 78 // 3 = 26, already on a call
+        older, keep = compact.split(messages)
+        assert history_module.is_tool_call_message(keep[0])
+        assert len(keep) == 26
+        assert older + keep == messages
 
     def test_short_history_is_all_kept(self):
         older, keep = compact.split(history(5))
@@ -156,7 +183,7 @@ class TestSidecarAwareEstimate:
     def test_compaction_triggers_on_the_real_size(self):
         messages = [
             {"role": "user", "content": "short", "api_content": "x" * 900}
-            for _ in range(20)
+            for _ in range(30)  # past KEEP_RECENT, or there is nothing to fold
         ]
-        # 20 * 900 chars = ~4500 tokens; only ~25 by content alone
+        # 30 * 900 chars = ~6750 tokens; only ~37 by content alone
         assert compact.should_compact(messages, max_model_len=2000)

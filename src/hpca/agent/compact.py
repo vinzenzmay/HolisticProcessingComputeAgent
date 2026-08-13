@@ -25,13 +25,16 @@ declared while compacting still frames the turns that follow it.
 
 from __future__ import annotations
 
+from hpca.agent.history import is_tool_call_message
 from hpca.llm import Message
 
 # Compact when the estimated prompt exceeds this share of the window. Leaves
 # room for the system prompt, the reply, and the next few tool results.
 COMPACT_AT = 0.7
 # Keep at least this many recent messages verbatim, whatever the budget says.
-KEEP_RECENT = 12
+# Counted in messages, and one tool round is two of them since §4.3 (the call
+# as an assistant turn, then its result), so this is roughly twelve rounds.
+KEEP_RECENT = 24
 CHARS_PER_TOKEN = 4  # crude but model-independent; see profiles.estimate_tokens
 SUMMARY_PREFIX = "[earlier in this session]"
 # Marks the user's own instruction inside the summary message, so it survives
@@ -92,11 +95,20 @@ def should_compact(messages: list[Message], *, max_model_len: int | None) -> boo
 
 
 def split(messages: list[Message]) -> tuple[list[Message], list[Message]]:
-    """(to summarize, to keep verbatim). Keeps at least KEEP_RECENT."""
+    """(to summarize, to keep verbatim). Keeps at least KEEP_RECENT.
+
+    A call and its result are one unit (:func:`hpca.agent.history.tool_exchange`).
+    A cut landing between them would open the verbatim tail on a result whose
+    call was folded away — the orphaned-result shape §4.3 exists to remove — so
+    the boundary steps back to take the call along. The tail only ever grows.
+    """
     keep = max(KEEP_RECENT, len(messages) // 3)
     if len(messages) <= keep:
         return [], list(messages)
-    return list(messages[:-keep]), list(messages[-keep:])
+    cut = len(messages) - keep
+    if is_tool_call_message(messages[cut - 1]):
+        cut -= 1
+    return list(messages[:cut]), list(messages[cut:])
 
 
 def is_summary(message: Message) -> bool:

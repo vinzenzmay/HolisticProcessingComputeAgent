@@ -8,6 +8,7 @@ from langgraph.graph import START
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from hpca.agent import compact
 from hpca.agent.graph import MAX_TOOL_ROUNDS, build_graph, compact_now, run_turn
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.llm import ChatResponse
@@ -1071,7 +1072,8 @@ class TestCompaction:
         assert summarize_call["json_schema"] is None  # the summarizer is free-form
         # the decision saw a folded view: far fewer messages, summary first
         sent = decide_call["messages"]
-        assert len(sent) < 25
+        # the kept tail plus this turn's own messages, not the 40 primed ones
+        assert len(sent) < compact.KEEP_RECENT + 8
         assert any(
             "a summary of the earlier work" in str(m["content"]) for m in sent
         )
@@ -1162,7 +1164,8 @@ class TestCompaction:
         result = await run_turn(graph, session_id="s1", user_text="dig into this")
         assert result.reply == "here is what I found"
         final = llm.calls[-1]["messages"]
-        assert len(final) < 25  # folded, not the whole history
+        # folded, not the whole history: the tail plus this turn's tool rounds
+        assert len(final) < compact.KEEP_RECENT + 8
         assert any("a summary of the earlier work" in str(m["content"]) for m in final)
 
 
