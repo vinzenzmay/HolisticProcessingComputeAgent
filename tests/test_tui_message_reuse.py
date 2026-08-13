@@ -3,8 +3,8 @@
 Enter on a message you sent opens the rewind dialog (see test_tui_rewind);
 copy sits on Enter there, so the old reflex — activate the message, hit Enter
 again — still puts its text back in the entry, to send again or edit into the
-next one. A queued message is not in the thread yet, so Enter on it skips the
-dialog and copies directly. Messages that are not yours (the agent's replies,
+next one. A queued message opens its own dialog (see test_tui_queue), with
+copy on Enter for the same reason. Messages that are not yours (the agent's replies,
 background events, recalled memory) are not text you would re-send, so Enter
 on those does what it always did: hand focus to the entry.
 """
@@ -17,7 +17,7 @@ from textual.widgets import ListView
 from hpca.llm import ChatResponse
 from hpca.transcript import Entry
 from hpca.tui.app import ChatInput, HpcaApp
-from hpca.tui.rewind_screen import RewindScreen
+from hpca.tui.rewind_screen import QueuedScreen, RewindScreen
 
 
 def is_title_request(json_schema):
@@ -70,8 +70,8 @@ async def press_enter_on(app, pilot, index):
     await pilot.pause()
     await pilot.press("enter")
     await pilot.pause()
-    if isinstance(app.screen, RewindScreen):
-        # A message in the thread offers the rewind first; copy is on Enter.
+    if isinstance(app.screen, (RewindScreen, QueuedScreen)):
+        # Your own messages offer their dialog first; copy is on Enter in both.
         await pilot.press("enter")
         await pilot.pause()
 

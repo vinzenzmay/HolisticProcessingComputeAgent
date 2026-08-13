@@ -11,8 +11,11 @@ import json
 
 import pytest
 
+from textual.widgets import ListView
+
 from hpca.llm import ChatResponse
-from hpca.tui.app import ChatInput, HpcaApp
+from hpca.tui.app import ChatInput, HpcaApp, WorkingIndicator
+from hpca.tui.rewind_screen import QueuedScreen
 
 TITLE_REPLY = json.dumps({"title": "a test session"})
 
@@ -67,6 +70,32 @@ async def send(app, pilot, text):
     chat_input.text = text
     await pilot.press("enter")
     await pilot.pause()
+
+
+async def open_queued_dialog(app, pilot, text):
+    """Activate the first queued row showing ``text``, as the user would."""
+    chat_list = app.query_one("#chat-list", ListView)
+    row = next(
+        index
+        for index, item in enumerate(chat_list.children)
+        if getattr(getattr(item, "data_entry", None), "kind", None) == "queued"
+        and item.data_entry.text == text
+    )
+    chat_list.focus()
+    chat_list.index = row
+    await pilot.pause()
+    await pilot.press("enter")
+    await pilot.pause()
+    assert isinstance(app.screen, QueuedScreen)
+
+
+async def cancel_queued(app, pilot, text):
+    await open_queued_dialog(app, pilot, text)
+    await pilot.press("x")
+    # Not workers.wait_for_complete(): the turn this message queued behind is
+    # still being held open by the fake backend.
+    for _ in range(10):
+        await pilot.pause()
 
 
 class TestQueueing:
@@ -201,6 +230,167 @@ class TestQueueing:
             assert app._pending_work == []
             llm.gate.set()
             await app.workers.wait_for_complete()
+
+
+class TestCancelling:
+    """A queued message has not reached the model, so it can be taken back —
+    the same take-back a turn in flight gets from the working indicator, and
+    landing the same way, with the text in the entry to edit and send again."""
+
+    async def test_cancelling_drops_it_from_the_queue_and_the_log(self, hpca_home):
+        llm = SlowLLM()
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            session = app.active_session
+            await send(app, pilot, "first")
+            await send(app, pilot, "second")
+
+            await cancel_queued(app, pilot, "second")
+            assert app.queued_texts_for(session.session_id) == []
+            assert not any(e.kind == "queued" for e in app._chat_entries)
+            # Landed in the entry, as an interrupted turn's message does.
+            assert app.query_one("#chat-input", ChatInput).text == "second"
+
+            llm.gate.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert "second" not in llm.seen_user_texts  # it never ran
+
+    async def test_the_turn_it_waited_for_still_shows_as_running(self, hpca_home):
+        """Cancelling redraws the log, which clears the list the spinner is
+        appended to. Losing it there would say the agent had stopped, while the
+        turn the message queued behind is still waiting on the model."""
+        llm = SlowLLM()
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            session = app.active_session
+            await send(app, pilot, "first")
+            await send(app, pilot, "second")
+            before = next(iter(app.query(WorkingIndicator)))
+
+            await cancel_queued(app, pilot, "second")
+            after = list(app.query(WorkingIndicator))
+            assert len(after) == 1  # still there, and only one
+            assert session.session_id in app._turns
+            # Same step, and the same clock — not a spinner restarted at 0s.
+            assert after[0].activity == before.activity
+            assert after[0]._started == before._started
+            # Still the last row, below the messages.
+            rows = list(app.query_one("#chat-list", ListView).children)
+            assert rows[-1].query(WorkingIndicator)
+
+            llm.gate.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert not list(app.query(WorkingIndicator))  # gone when done
+
+    async def test_escape_leaves_it_queued(self, hpca_home):
+        llm = SlowLLM()
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            session = app.active_session
+            await send(app, pilot, "first")
+            await send(app, pilot, "second")
+
+            await open_queued_dialog(app, pilot, "second")
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app.queued_texts_for(session.session_id) == ["second"]
+            assert app.query_one("#chat-input", ChatInput).text == ""
+
+            llm.gate.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+    async def test_it_cancels_the_one_that_was_picked(self, hpca_home):
+        llm = SlowLLM()
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            session = app.active_session
+            await send(app, pilot, "first")
+            await send(app, pilot, "second")
+            await send(app, pilot, "third")
+
+            await cancel_queued(app, pilot, "second")
+            assert app.queued_texts_for(session.session_id) == ["third"]
+
+            llm.gate.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+    async def test_the_same_message_queued_twice_loses_one_copy(self, hpca_home):
+        """Rows are matched by position, not by text: cancelling a duplicate
+        must take back one of them, not both."""
+        llm = SlowLLM()
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            session = app.active_session
+            await send(app, pilot, "first")
+            await send(app, pilot, "again")
+            await send(app, pilot, "again")
+
+            await cancel_queued(app, pilot, "again")
+            assert app.queued_texts_for(session.session_id) == ["again"]
+            assert [e.kind for e in app._chat_entries].count("queued") == 1
+
+            llm.gate.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+    async def test_a_message_that_started_meanwhile_is_not_cancelled(self, hpca_home):
+        """The dialog can sit open long enough for the turn ahead to finish and
+        the queue to drain into it. Stopping the turn it became is the working
+        indicator's question, not this one."""
+        llm = SlowLLM(hold="second")  # "second" runs but never finishes
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            session = app.active_session
+            await send(app, pilot, "first")
+            await send(app, pilot, "second")
+            queued = next(e for e in app._chat_entries if e.kind == "queued")
+
+            llm.gate.set()  # "first" completes, "second" starts
+            for _ in range(20):
+                await pilot.pause()
+            assert llm.seen_user_texts[-1] == "second"
+
+            await app._cancel_queued(session, queued)
+            await pilot.pause()
+            assert ("user", "second") in [
+                (e.kind, e.text) for e in app._chat_entries
+            ]
+            assert app.query_one("#chat-input", ChatInput).text == ""
+
+            llm.never.set()
+            await app.workers.wait_for_complete()
+
+    async def test_a_session_switch_while_the_dialog_is_open_cancels_nothing(
+        self, hpca_home
+    ):
+        llm = SlowLLM()
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            session = app.active_session
+            await send(app, pilot, "first")
+            await send(app, pilot, "second")
+            queued = next(e for e in app._chat_entries if e.kind == "queued")
+
+            elsewhere = app.session_store.create(profile="default", title="second")
+            await app.open_session(elsewhere)
+            await pilot.pause()
+            await app._cancel_queued(session, queued)
+            assert app.queued_texts_for(session.session_id) == ["second"]
+
+            llm.gate.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
 
 
 class TestShutdown:

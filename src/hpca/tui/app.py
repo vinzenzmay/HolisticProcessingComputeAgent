@@ -149,7 +149,14 @@ from hpca.tui.memory_screens import (
 )
 from hpca.tui.profiles_screen import ProfilePickerScreen, ProfilesScreen
 from hpca.tui.rename_screen import RenameScreen
-from hpca.tui.rewind_screen import COPY, FORK, ROLLBACK, RewindScreen
+from hpca.tui.rewind_screen import (
+    COPY,
+    FORK,
+    ROLLBACK,
+    UNQUEUE,
+    QueuedScreen,
+    RewindScreen,
+)
 from hpca.tui.settings_screen import SettingsScreen
 from hpca.tui.switch_llm import SwitchLLMScreen
 from hpca.tui.termkeys import patch_alt_enter
@@ -666,6 +673,15 @@ class WorkingIndicator(Static):
             return
         self._interruptible = interruptible
         self._render_frame()
+
+    def clone(self) -> "WorkingIndicator":
+        """A fresh spinner in this one's state — same step, same clock, same
+        abort. Redrawing the log clears the list and so destroys the widget;
+        what has to survive that is the state, not the object.
+        """
+        return WorkingIndicator(
+            self._activity, self._started, interruptible=self._interruptible
+        )
 
     def _advance(self) -> None:
         self._frame = (self._frame + 1) % len(self.FRAMES)
@@ -4177,14 +4193,24 @@ class HpcaApp(App):
 
     async def _rerender_chat(self) -> None:
         """Redraw the chat from the entries already held, without rebuilding
-        them from the graph — used when only an entry's kind changed."""
+        them from the graph — used when only an entry's kind changed.
+
+        The spinner is not one of those entries: show_working appends it
+        straight to the list, so clearing the list takes it with it. It is
+        re-made at the end rather than dropped — a redraw while a turn is still
+        waiting on the model must not read as "the agent stopped".
+        """
         chat_list = self._chat_list()  # gone during shutdown; nothing to draw
         if chat_list is None:
             return
+        working = next(iter(chat_list.query(WorkingIndicator)), None)
+        spinner = working.clone() if working is not None else None
         await chat_list.clear()
         for entry in self._chat_entries:
             for item in self._entry_items(entry):
                 chat_list.append(item)
+        if spinner is not None:
+            chat_list.append(ChatItem(spinner))
         chat_list.scroll_end(animate=False)
 
     async def _append_chat(self, kind: str, text: str) -> None:
@@ -4325,9 +4351,13 @@ class HpcaApp(App):
                 # A message that is really in the thread names a cut point:
                 # offer the rewind (fork / roll back / copy).
                 self._offer_rewind(entry)
+            elif entry.kind == "queued":
+                # Not in the thread and not started: still take-back-able.
+                self._offer_queued(entry)
             else:
-                # Queued text and the live row of a turn still in flight are
-                # not in the thread (yet); copying is all there is.
+                # The live row of a turn still in flight: it is not in the
+                # thread (yet), and stopping it is the working indicator's
+                # job, so copying is all there is here.
                 self.reuse_message(entry.text)
         else:
             # Anything else in the log: Enter just moves to the input.
@@ -4378,6 +4408,76 @@ class HpcaApp(App):
                 )
 
         self.push_screen(RewindScreen(entry.text), resolved)
+
+    # ------------------------------------------------ cancel a queued message
+
+    def _offer_queued(self, entry: Entry) -> None:
+        """Enter on a message typed ahead of a running turn: take it back, or
+        copy it (see QueuedScreen).
+
+        The session is captured for the same reason the rewind captures it —
+        the dialog can sit open across a session switch, and a queue belongs to
+        the conversation it was filled in, not to whichever one is on screen
+        when the answer lands.
+        """
+        session = self.active_session
+        if session is None:
+            return
+
+        def resolved(choice: str | None) -> None:
+            if choice == COPY:
+                self.reuse_message(entry.text)
+            elif choice == UNQUEUE:
+                self.run_worker(
+                    self._cancel_queued(session, entry), group="sessions"
+                )
+
+        self.push_screen(QueuedScreen(entry.text), resolved)
+
+    async def _cancel_queued(self, session: Session, entry: Entry) -> None:
+        """Take a message back out of the queue: off the pending work, out of
+        the log, and into the entry to edit or send again — the same landing
+        the interrupt gives a turn it stops.
+
+        Which pending item this row *is* is worked out now rather than when the
+        dialog opened, because the turn ahead of it can finish while the dialog
+        sits open: that promotes the queued message in front to a running one
+        and shifts every position behind it. Position and not text, so that the
+        same message queued twice cancels one copy rather than both.
+        """
+        if not self._is_active_session(session):
+            self.notify(f"Not cancelled — “{session.title}” is no longer open.")
+            return
+        # By value, not identity: the log is rebuilt from scratch at the end of
+        # every turn, so the row on screen is rarely the object the dialog was
+        # opened on. Two queued rows that compare equal are interchangeable —
+        # same text, and neither has run.
+        index = (
+            self._chat_entries.index(entry)
+            if entry.kind == "queued" and entry in self._chat_entries
+            else None
+        )
+        waiting = [
+            work
+            for work in self._pending_work
+            if work.kind == "user" and work.session_id == session.session_id
+        ]
+        position = (
+            sum(1 for e in self._chat_entries[:index] if e.kind == "queued")
+            if index is not None
+            else None
+        )
+        if position is None or position >= len(waiting):
+            # It started while the dialog was open. Stopping the turn it became
+            # is a different question, asked from the working indicator.
+            self.notify(
+                "Too late — that message is already running.", severity="warning"
+            )
+            return
+        self._pending_work.remove(waiting[position])
+        del self._chat_entries[index]
+        await self._rerender_chat()
+        self.reuse_message(entry.text)
 
     def _rewind_blocker(self, session_id: str) -> str | None:
         """Why this session's thread cannot be truncated right now, or None.

@@ -98,7 +98,10 @@ Terminals in 2026 are assumed wider than 80 columns
     rollback both hand the message back to the entry, ready to re-edit; both
     drop a compaction summary that covered trimmed messages (the raw history
     it stood for is still there, so folding can be redone). A queued message
-    is not in the thread yet, so Enter on it copies directly.
+    is not in the thread yet — nothing to trim — so Enter on it offers the
+    take-back instead: **(x)** cancels it, dropping it from the queue and the
+    log and handing the text back to the entry exactly as an interrupt does,
+    and **(c / Enter)** copies it and leaves it queued.
     Enter on a thinking box expands
     it into its parts — each block of reasoning, each tool call with the script
     or command it would run, and each result — every one its own collapsible
@@ -216,7 +219,10 @@ shown in the transcript as `queued`, and started when the orchestrator frees up;
 the entry field clears immediately, so the next thought can be typed while the
 current one is still being answered. Queued work drains in arrival order, one item
 per pass, and shares the queue with background completions (§5.4) so both go
-through the same one-at-a-time discipline. A session parked on an approval holds
+through the same one-at-a-time discipline. A queued message can still be taken
+back — Enter on it, then **(x)** — right up until the orchestrator starts it;
+after that it is a turn, and stopping it is the interrupt's job (§ interrupt).
+A session parked on an approval holds
 only its own queued messages; other sessions keep draining. Slash commands are not
 turns — they act on the UI and run their own exclusive workers — so they are still
 refused while busy rather than queued.
