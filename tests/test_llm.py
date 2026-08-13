@@ -13,7 +13,14 @@ import httpx
 import pytest
 
 from hpca.config import LLMSettings
-from hpca.llm import ChatResponse, LLMClient, LLMError, TruncatedOutput
+from hpca.llm import (
+    PROBE_SCHEMA,
+    ChatResponse,
+    LLMClient,
+    LLMError,
+    TruncatedOutput,
+    wire_messages,
+)
 
 # ---------------------------------------------------------------- unit tests
 
@@ -286,6 +293,94 @@ class TestConstrainedDecodingProbe:
 
         client = make_client(handler, constrained_decoding="off")
         assert await client.supports_constrained_decoding() is False
+
+
+TOOL_SPEC = {
+    "type": "function",
+    "function": {
+        "name": "read_file",
+        "description": "Read a file",
+        "parameters": {"type": "object", "properties": {"key": {"type": "string"}}},
+    },
+}
+
+
+def tool_call_body(name="read_file", arguments='{"key": "cohort"}'):
+    body = completion_body(content=None, finish_reason="tool_calls")
+    body["choices"][0]["message"]["tool_calls"] = [
+        {"id": "call_1", "type": "function",
+         "function": {"name": name, "arguments": arguments}}
+    ]
+    return body
+
+
+class TestNativeTools:
+    async def test_tools_go_on_the_wire_instead_of_a_schema(self):
+        seen = {}
+
+        def handler(request):
+            seen.update(json.loads(request.content))
+            return httpx.Response(200, json=tool_call_body())
+
+        client = make_client(handler)
+        await client.chat(
+            [{"role": "user", "content": "read it"}],
+            json_schema=PROBE_SCHEMA,  # ignored: the two are alternatives
+            tools=[TOOL_SPEC],
+        )
+        assert seen["tools"] == [TOOL_SPEC]
+        assert seen["tool_choice"] == "auto"
+        assert "response_format" not in seen
+
+    async def test_tool_calls_come_back_on_the_response(self):
+        client = make_client(lambda r: httpx.Response(200, json=tool_call_body()))
+        response = await client.chat([], tools=[TOOL_SPEC])
+        assert response.tool_calls[0]["function"]["name"] == "read_file"
+        assert response.content == ""
+
+    async def test_no_tool_calls_without_tools(self):
+        client = make_client(lambda r: httpx.Response(200, json=completion_body()))
+        assert (await client.chat([])).tool_calls == []
+
+    async def test_a_cut_off_call_raises_truncated(self):
+        body = completion_body(content="", finish_reason="length")
+
+        client = make_client(lambda r: httpx.Response(200, json=body))
+        with pytest.raises(TruncatedOutput):
+            await client.chat([], tools=[TOOL_SPEC])
+
+    async def test_a_complete_call_at_the_cap_is_kept(self):
+        # finish_reason can be "length" with the call already parsed; throwing
+        # away work the backend handed us would be the worse failure.
+        body = tool_call_body()
+        body["choices"][0]["finish_reason"] = "length"
+        client = make_client(lambda r: httpx.Response(200, json=body))
+        assert (await client.chat([], tools=[TOOL_SPEC])).tool_calls
+
+    def test_protocol_is_a_setting_not_a_probe(self):
+        def handler(request):
+            raise AssertionError("no request expected")
+
+        assert not make_client(handler).uses_native_tools()
+        assert make_client(handler, tool_protocol="native").uses_native_tools()
+
+
+class TestWireMessages:
+    def test_only_role_and_content_by_default(self):
+        wired = wire_messages([{"role": "user", "content": "hi", "extra": "drop me"}])
+        assert wired == [{"role": "user", "content": "hi"}]
+
+    def test_tool_protocol_keys_survive(self):
+        calls = [{"id": "c1", "type": "function", "function": {"name": "x"}}]
+        wired = wire_messages(
+            [
+                {"role": "assistant", "content": "", "tool_calls": calls},
+                {"role": "tool", "content": "ok", "tool_call_id": "c1", "name": "x"},
+            ]
+        )
+        assert wired[0]["tool_calls"] == calls
+        assert wired[1]["tool_call_id"] == "c1"
+        assert wired[1]["name"] == "x"
 
 
 class TestModels:

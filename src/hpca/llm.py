@@ -33,19 +33,30 @@ Message = dict[str, Any]
 API_CONTENT_KEY = "api_content"
 
 
+# Keys the native tool-calling protocol needs on the wire: the assistant's
+# calls, and the id + name that tie a tool-role result back to one of them.
+# Passed through only when present, so an envelope-protocol history still
+# sends exactly role and content.
+TOOL_KEYS = ("tool_calls", "tool_call_id", "name")
+
+
 def wire_messages(messages: list[Message]) -> list[Message]:
     """Messages as sent to the backend: sidecar applied, extras dropped.
 
     Backends vary in how strictly they validate message objects, so only
-    ``role`` and ``content`` go on the wire.
+    ``role``, ``content`` and the tool-protocol keys go on the wire.
     """
-    return [
-        {
+    wire = []
+    for message in messages:
+        out = {
             "role": message["role"],
             "content": message.get(API_CONTENT_KEY) or message["content"],
         }
-        for message in messages
-    ]
+        for key in TOOL_KEYS:
+            if message.get(key) is not None:
+                out[key] = message[key]
+        wire.append(out)
+    return wire
 
 PROBE_SCHEMA = {
     "type": "object",
@@ -85,6 +96,9 @@ class ChatResponse:
     reasoning: str | None = None
     finish_reason: str | None = None
     usage: dict[str, Any] = field(default_factory=dict)
+    # Native tool calls, when the request offered tools and the model used
+    # them. Empty under the envelope protocol, where the call is in ``content``.
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -133,6 +147,7 @@ class LLMClient:
         temperature: float | None,
         enable_thinking: bool | None,
         stream: bool,
+        tools: list[dict] | None = None,
     ) -> dict[str, Any]:
         if enable_thinking is None:
             enable_thinking = self._settings.enable_thinking
@@ -141,7 +156,13 @@ class LLMClient:
             "messages": wire_messages(messages),
             "chat_template_kwargs": {"enable_thinking": enable_thinking},
         }
-        if json_schema is not None:
+        if tools is not None:
+            # Native protocol: the backend's parser produces the call, so
+            # there is no envelope to constrain — the two are alternatives,
+            # and vLLM rejects a response_format sent alongside tools.
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        elif json_schema is not None:
             payload["response_format"] = {
                 "type": "json_schema",
                 "json_schema": {"name": schema_name, "schema": json_schema},
@@ -163,6 +184,7 @@ class LLMClient:
         max_tokens: int | None = None,
         temperature: float | None = None,
         enable_thinking: bool | None = None,
+        tools: list[dict] | None = None,
     ) -> ChatResponse:
         payload = self._payload(
             messages,
@@ -172,6 +194,7 @@ class LLMClient:
             temperature=temperature,
             enable_thinking=enable_thinking,
             stream=False,
+            tools=tools,
         )
         started = time.perf_counter()
         try:
@@ -186,7 +209,17 @@ class LLMClient:
         data = response.json()
         choice = data["choices"][0]
         message = choice["message"]
-        if json_schema is not None and choice.get("finish_reason") == "length":
+        truncated = choice.get("finish_reason") == "length"
+        if tools is not None and truncated and not message.get("tool_calls"):
+            # Native protocol: the backend's parser emits nothing when the
+            # call was cut off mid-arguments, so there is no fragment to
+            # salvage — only the feedback-and-retry path applies.
+            raise TruncatedOutput(
+                "Tool call truncated at max_tokens: "
+                f"{message.get('content') or '':.120}",
+                partial=message.get("content") or "",
+            )
+        if json_schema is not None and truncated:
             # Constrained decoding can loop (e.g. unbounded digit runs) until
             # max_tokens; the truncated output cannot be valid JSON.
             raise TruncatedOutput(
@@ -207,6 +240,7 @@ class LLMClient:
             reasoning=message.get("reasoning"),
             finish_reason=choice.get("finish_reason"),
             usage=usage,
+            tool_calls=list(message.get("tool_calls") or []),
         )
 
     async def chat_stream(
@@ -287,6 +321,15 @@ class LLMClient:
                 window = entry.get("max_model_len")
                 return int(window) if window else None
         return None
+
+    def uses_native_tools(self) -> bool:
+        """Whether calls travel on the backend's own tool-calling channel.
+
+        A setting, not a probe: unlike constrained decoding there is nothing
+        to fall back to mid-session — the two protocols shape the whole
+        conversation, not one request — so the choice is made once, up front.
+        """
+        return self._settings.tool_protocol == "native"
 
     async def supports_constrained_decoding(self) -> bool:
         """Whether tool calls can use JSON-schema constrained decoding (§2).

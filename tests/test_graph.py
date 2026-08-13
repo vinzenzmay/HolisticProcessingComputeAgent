@@ -77,6 +77,80 @@ def make_graph(llm, tools):
     return build_graph(llm=llm, tools=tools, checkpointer=InMemorySaver())
 
 
+class NativeFakeLLM(FakeLLM):
+    """A backend on the native tool channel: outputs are calls or plain text."""
+
+    async def chat(self, messages, *, json_schema=None, tools=None, **kwargs):
+        self.calls.append({"messages": list(messages), "json_schema": json_schema})
+        output = self._outputs.pop(0)
+        if isinstance(output, str):
+            return ChatResponse(content=output)
+        return ChatResponse(content="", tool_calls=output)
+
+    def uses_native_tools(self):
+        return True
+
+
+def native_json(tool, call_id="call_1", **arguments):
+    return [
+        {
+            "id": call_id,
+            "type": "function",
+            "function": {"name": tool, "arguments": json.dumps(arguments)},
+        }
+    ]
+
+
+class TestNativeToolProtocol:
+    async def test_a_completed_call_becomes_an_assistant_tool_and_a_tool_result(
+        self, tools
+    ):
+        llm = NativeFakeLLM([native_json("echo", text="hi"), "done"])
+        result = await run_turn(
+            make_graph(llm, tools), session_id="n1", user_text="say hi"
+        )
+        assert result.reply == "done"
+        sent = llm.calls[1]["messages"]
+        call, answer = sent[-2], sent[-1]
+        assert call["role"] == "assistant"
+        assert call["tool_calls"][0]["function"]["name"] == "echo"
+        assert answer["role"] == "tool"
+        assert answer["tool_call_id"] == call["tool_calls"][0]["id"]
+        assert "echo: hi" in answer["content"]
+
+    async def test_the_id_survives_an_approval_interrupt(self, tools):
+        # The turn parks for as long as the user takes; without the id in the
+        # checkpointed state the resumed result answers no call at all.
+        llm = NativeFakeLLM(
+            [native_json("delete", call_id="call_del", target="results/"), "gone"]
+        )
+        graph = make_graph(llm, tools)
+        first = await run_turn(graph, session_id="n2", user_text="delete results")
+        assert first.interrupt is not None
+        resumed = await run_turn(
+            graph, session_id="n2", resume=Command(resume={"approved": True})
+        )
+        assert resumed.reply == "gone"
+        answer = llm.calls[1]["messages"][-1]
+        assert answer["role"] == "tool"
+        assert answer["tool_call_id"] == "call_del"
+        assert "deleted results/" in answer["content"]
+
+    async def test_a_denial_answers_the_call_on_the_tool_role(self, tools):
+        llm = NativeFakeLLM(
+            [native_json("delete", call_id="call_del", target="results/"), "ok"]
+        )
+        graph = make_graph(llm, tools)
+        await run_turn(graph, session_id="n3", user_text="delete results")
+        await run_turn(
+            graph, session_id="n3", resume=Command(resume={"approved": False})
+        )
+        answer = llm.calls[1]["messages"][-1]
+        assert answer["role"] == "tool" and answer["tool_call_id"] == "call_del"
+        assert "denied" in answer["content"].lower()
+        assert "deleted results/" not in answer["content"]
+
+
 class TestDirectResponse:
     async def test_assistant_message_appended(self, tools):
         llm = FakeLLM([respond_json("hello there")])

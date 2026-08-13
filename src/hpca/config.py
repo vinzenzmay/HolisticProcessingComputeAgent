@@ -44,6 +44,15 @@ class LLMSettings(_Section):
     api_key: str | None = None
     model: str = "qwen3-6b"
     constrained_decoding: Literal["auto", "on", "off"] = "auto"
+    # How a tool call travels. "envelope" is the hand-rolled JSON decision
+    # object under a grammar (§4.3), which works on any OpenAI-compatible
+    # backend. "native" uses the backend's own tool-calling channel — the
+    # shape agent-trained models were post-trained on, and it moves the tool
+    # listing out of the prompt into the chat template. It needs the server
+    # started for it (vLLM: --enable-auto-tool-choice --tool-call-parser
+    # hermes); a backend without it rejects the request rather than quietly
+    # degrading, which is why this is opt-in rather than probed.
+    tool_protocol: Literal["envelope", "native"] = "envelope"
     max_retries: int = 3
     request_timeout_s: int = 120
     # Reasoning models think in a separate channel, shown in the chat window's

@@ -14,6 +14,7 @@ from hpca.agent.history import (
     MAX_STRING_CHARS,
     elide_arguments,
     is_tool_call_message,
+    result_message,
     tool_exchange,
 )
 from hpca.agent.middleware import decision_schema
@@ -143,3 +144,47 @@ class TestElision:
         )[0]
         assert "more lines elided" in call["content"]
         assert len(call["content"]) < 400
+
+
+class TestNativeProtocol:
+    """The same pair, encoded for the backend's own tool channel."""
+
+    def test_the_call_rides_tool_calls_and_the_result_the_tool_role(self):
+        call, result = tool_exchange(
+            "read_file", {"registry_key": "cohort"}, "12 lines", call_id="call_1"
+        )
+        assert call["role"] == "assistant"
+        assert call["tool_calls"][0]["function"]["name"] == "read_file"
+        assert json.loads(call["tool_calls"][0]["function"]["arguments"]) == {
+            "registry_key": "cohort"
+        }
+        assert result["role"] == "tool"
+        assert result["content"] == "[tool result] read_file: 12 lines"
+
+    def test_the_id_ties_the_result_to_its_call(self):
+        call, result = tool_exchange("echo", {"text": "hi"}, "ok", call_id="abc")
+        assert call["tool_calls"][0]["id"] == "abc" == result["tool_call_id"]
+
+    def test_payloads_are_elided_on_this_channel_too(self):
+        # Not a protocol matter: the reason is that a create_file payload would
+        # otherwise sit in the window twice, whichever encoding carries it.
+        call = tool_exchange(
+            "create_file",
+            {"content_lines": [f"l{i}" for i in range(500)]},
+            "written",
+            call_id="c1",
+        )[0]
+        assert "more lines elided" in call["tool_calls"][0]["function"]["arguments"]
+
+    def test_a_native_call_is_recognised_as_a_call(self):
+        call, result = tool_exchange("echo", {"text": "hi"}, "ok", call_id="c1")
+        assert is_tool_call_message(call)  # or the transcript renders it as a reply
+        assert not is_tool_call_message(result)
+
+    def test_content_is_passed_through_untouched(self):
+        # What answers a call is also a denial or a tool error; relabelling one
+        # as a result is how a refused call reads as a successful one.
+        denial = result_message("delete_file", "[denied] the user said no", "c1")
+        assert denial["content"] == "[denied] the user said no"
+        assert denial["role"] == "tool"
+        assert result_message("echo", "[tool error] boom")["role"] == "user"

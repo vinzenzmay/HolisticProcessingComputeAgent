@@ -98,11 +98,74 @@ def tool_result_message(tool_name: str, result: str) -> Message:
     return {"role": "user", "content": f"[tool result] {tool_name}: {result}"}
 
 
-def tool_exchange(tool_name: str, arguments: dict, result: str) -> list[dict]:
+def native_call_message(tool_name: str, arguments: dict, call_id: str) -> Message:
+    """The assistant message for a call made on the backend's own channel.
+
+    The same pair, in the encoding the chat template understands: the call
+    rides ``tool_calls`` rather than the content, and its ``id`` is what ties
+    the result to it. Arguments are elided exactly as in the envelope copy —
+    the reason has nothing to do with the protocol, it is that a create_file
+    payload would otherwise sit in the window twice.
+    """
+    return {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "arguments": json.dumps(
+                        elide_arguments(arguments), ensure_ascii=False, default=str
+                    ),
+                },
+            }
+        ],
+    }
+
+
+def native_result_message(tool_name: str, content: str, call_id: str) -> Message:
+    """The tool-role message answering a native call, content verbatim."""
+    return {
+        "role": "tool",
+        "content": content,
+        "tool_call_id": call_id,
+        "name": tool_name,
+    }
+
+
+def call_message(tool_name: str, arguments: dict, call_id: str = "") -> Message:
+    """The assistant half of an exchange, in whichever protocol is in use.
+
+    ``call_id`` is what selects it, because only the native protocol has ids:
+    it is set when the decision came back on the backend's tool channel
+    (``LLMSettings.tool_protocol``) and empty otherwise.
+    """
+    if call_id:
+        return native_call_message(tool_name, arguments, call_id)
+    return tool_call_message(tool_name, arguments)
+
+
+def result_message(tool_name: str, content: str, call_id: str = "") -> Message:
+    """The result half, with ``content`` used exactly as given.
+
+    The caller owns the text: what answers a call is also a denial or a tool
+    error, not only a "[tool result] …" line, and this must not relabel one as
+    the other. Only the role and the id change with the protocol.
+    """
+    if call_id:
+        return native_result_message(tool_name, content, call_id)
+    return {"role": "user", "content": content}
+
+
+def tool_exchange(
+    tool_name: str, arguments: dict, result: str, *, call_id: str = ""
+) -> list[dict]:
     """The messages one completed tool call adds to the conversation."""
     return [
-        tool_call_message(tool_name, arguments),
-        tool_result_message(tool_name, result),
+        call_message(tool_name, arguments, call_id),
+        result_message(tool_name, f"[tool result] {tool_name}: {result}", call_id),
     ]
 
 
@@ -111,10 +174,14 @@ def is_tool_call_message(message: Message) -> bool:
 
     What separates the two in the stored history — the transcript renders the
     call from its own anchored record (see :mod:`hpca.transcript`), so this
-    copy is for the model only and must not surface as a reply.
+    copy is for the model only and must not surface as a reply. True for
+    either protocol's copy: the native one is an assistant message carrying
+    ``tool_calls``, the envelope one carries the decision object as content.
     """
     if message.get("role") != "assistant":
         return False
+    if message.get("tool_calls"):
+        return True
     content = str(message.get("content") or "").lstrip()
     if not content.startswith(CALL_PREFIX):
         return False

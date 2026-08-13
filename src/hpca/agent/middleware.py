@@ -103,6 +103,11 @@ class ToolCall:
     arguments: BaseModel
     reasoning: str = ""
     usage: dict = field(default_factory=dict)
+    # The backend's id for this call, under the native protocol. It is what
+    # ties the result message back to the call, so it has to survive the trip
+    # through the graph's pending_tool state. Empty under the envelope
+    # protocol, which has no ids.
+    call_id: str = ""
     # What had to be repaired to make this call valid (``_strip_key_echo``).
     # Carried to the call record and the approval prompt: a silent repair is
     # indistinguishable from a backend that never misbehaved, and the user
@@ -186,6 +191,46 @@ def decision_schema(tools: ToolRegistry) -> dict:
             }
         )
     return {"anyOf": branches}
+
+
+def tool_specs(tools: ToolRegistry) -> list[dict]:
+    """The tool list as the OpenAI ``tools`` array (native protocol).
+
+    Carries exactly what ``format_instruction`` spells out in prose — name,
+    description, argument schema — in the position the chat template puts it,
+    which is where an agent-trained model expects to find it. The schema is
+    the same ``inline_refs`` output the envelope grammar uses, so the two
+    protocols cannot drift apart on what an argument is.
+    """
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": inline_refs(tool.params.model_json_schema()),
+            },
+        }
+        for tool in tools
+    ]
+
+
+def native_instruction(tools: ToolRegistry) -> str:
+    """The standing instruction when the tools ride the native channel.
+
+    Everything ``format_instruction`` says about *shape* is the template's job
+    here, so only the part it cannot express survives: that a call is a real
+    action, and that answering is the other option. Deliberately short — but
+    not empty, which is the v0.20.0 lesson: text that has become false is
+    worth deleting, text that is merely long is not.
+    """
+    if len(tools) == 0:
+        return "You have no tools available in this context; answer directly."
+    return (
+        "Call a tool when you need to act on or look at the system, and "
+        "answer directly when you do not. A tool call really runs — it is "
+        "not a plan or a suggestion."
+    )
 
 
 def format_instruction(tools: ToolRegistry) -> str:
@@ -333,6 +378,61 @@ def _parse(raw: str, tools: ToolRegistry) -> Decision:
         return ToolCall(tool=tool, arguments=arguments, repairs=repairs)
     raise ValueError(
         f'Unknown action {action!r}: use "respond" or "tool_call".'
+    )
+
+
+def _parse_native(response: Any, tools: ToolRegistry) -> Decision:
+    """Build a decision from a native tool-calling response.
+
+    The branch choice is the backend's, not ours: a response with tool_calls
+    is a call, one without is an answer. Argument *validation* stays exactly
+    where it was — the tools array constrains shape, not meaning, so a wrong
+    key or a missing field still comes back through the same feedback loop.
+    """
+    calls = response.tool_calls or []
+    if not calls:
+        text = response.content or ""
+        if not text.strip():
+            raise ValueError(
+                "You returned neither a tool call nor an answer. Call a tool, "
+                "or reply with your answer as ordinary text."
+            )
+        return DirectResponse(text=text)
+    # More than one call in a response is possible on this channel; the graph
+    # runs one at a time (approval, tool-round accounting), so the rest would
+    # be silently dropped. Taking the first and saying so beats both.
+    function = (calls[0].get("function") or {})
+    try:
+        tool = tools.get(str(function.get("name")))
+    except KeyError as e:
+        raise ValueError(str(e)) from e
+    raw = function.get("arguments") or "{}"
+    if isinstance(raw, str):
+        try:
+            raw_arguments = json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"The arguments for {tool.name!r} were not valid JSON ({e})."
+            ) from e
+    else:
+        raw_arguments = raw
+    if not isinstance(raw_arguments, dict):
+        raise ValueError(f"The arguments for {tool.name!r} must be a JSON object.")
+    repairs = _strip_key_echo(tool.params, raw_arguments)
+    if len(calls) > 1:
+        repairs.append(
+            f"kept the first of {len(calls)} calls in one response; "
+            "the others were dropped"
+        )
+    try:
+        arguments = tool.params.model_validate(raw_arguments)
+    except ValidationError as e:
+        raise ValueError(f"Invalid arguments for tool {tool.name!r}:\n{e}") from e
+    return ToolCall(
+        tool=tool,
+        arguments=arguments,
+        repairs=repairs,
+        call_id=str(calls[0].get("id") or ""),
     )
 
 
@@ -499,6 +599,42 @@ def _salvage_truncated_call(partial: str, tools: ToolRegistry) -> ToolCall | Non
     return ToolCall(tool=tool, arguments=arguments, repairs=[note])
 
 
+def _no_native() -> bool:
+    return False
+
+
+def _retry_feedback(response: Any, error: str, native: bool) -> list[Message]:
+    """What a rejected decision adds to the conversation before the retry.
+
+    The model has to see what it wrote and why it was refused, in the shape it
+    wrote it in. On the native channel that means the assistant message keeps
+    its ``tool_calls`` and the complaint comes back on the tool role answering
+    it — a chat template that is handed a call with no matching result renders
+    a broken conversation, and some reject it outright. Only the first call is
+    echoed, matching what ``_parse_native`` would have kept.
+    """
+    if not native:
+        return [
+            {"role": "assistant", "content": response.content},
+            {"role": "user", "content": f"[validation error] {error}"},
+        ]
+    calls = response.tool_calls or []
+    if not calls:  # nothing came back to echo — say so on the user role
+        return [{"role": "user", "content": f"[validation error] {error}"}]
+    call = dict(calls[0])
+    call_id = str(call.get("id") or "call_retry")
+    call["id"] = call_id
+    return [
+        {"role": "assistant", "content": response.content or "", "tool_calls": [call]},
+        {
+            "role": "tool",
+            "content": f"[validation error] {error}",
+            "tool_call_id": call_id,
+            "name": str((call.get("function") or {}).get("name") or "unknown"),
+        },
+    ]
+
+
 async def decide(
     llm: Any,
     messages: list[Message],
@@ -508,25 +644,35 @@ async def decide(
     max_tokens: int | None = MAX_DECISION_TOKENS,
 ) -> Decision:
     """Ask the model for a decision, validating and retrying with feedback."""
-    constrained = await llm.supports_constrained_decoding()
-    schema = decision_schema(tools) if constrained else None
+    # Native protocol: the backend's own tool channel decides the branch and
+    # carries the tool list, so neither the envelope grammar nor its prose
+    # listing applies. getattr keeps every caller that passes a plain fake
+    # client working — there is nothing to ask, so the answer is "envelope".
+    native = bool(getattr(llm, "uses_native_tools", _no_native)())
+    if native:
+        schema = None
+    else:
+        constrained = await llm.supports_constrained_decoding()
+        schema = decision_schema(tools) if constrained else None
     # Backends like vLLM/Qwen only accept system messages at position 0, so
     # the tool instruction is merged into the leading system message.
     conversation = list(messages)
-    instruction = format_instruction(tools)
+    instruction = native_instruction(tools) if native else format_instruction(tools)
     if conversation and conversation[0]["role"] == "system":
         merged = conversation[0]["content"] + "\n\n" + instruction
         conversation[0] = {"role": "system", "content": merged}
     else:
         conversation.insert(0, {"role": "system", "content": instruction})
 
+    # Only passed when native, so existing callers see an unchanged call.
+    offered = {"tools": tool_specs(tools)} if native else {}
     attempts = max_retries + 1
     last_error = ""
     truncations = 0
     for _ in range(attempts):
         try:
             response = await llm.chat(
-                conversation, json_schema=schema, max_tokens=max_tokens
+                conversation, json_schema=schema, max_tokens=max_tokens, **offered
             )
         except TruncatedOutput as exc:
             # First choice: salvage. A cut-off file write's complete prefix
@@ -549,13 +695,11 @@ async def decide(
             continue
         raw = response.content
         try:
-            return _annotate(_parse(raw, tools), response)
+            parsed = _parse_native(response, tools) if native else _parse(raw, tools)
+            return _annotate(parsed, response)
         except ValueError as e:
             last_error = str(e)
-            conversation = conversation + [
-                {"role": "assistant", "content": raw},
-                {"role": "user", "content": f"[validation error] {last_error}"},
-            ]
+            conversation = conversation + _retry_feedback(response, last_error, native)
     raise DecisionError(
         f"No valid decision after {attempts} attempts; last error: {last_error}"
     )

@@ -137,8 +137,18 @@ try:
     from hpca.agent.history import tool_exchange
 except Exception:
 
-    def tool_exchange(tool_name: str, arguments: dict, result: str) -> list[dict]:
+    def tool_exchange(
+        tool_name: str, arguments: dict, result: str, *, call_id: str = ""
+    ) -> list[dict]:
         return [{"role": "user", "content": f"[tool result] {tool_name}: {result}"}]
+
+
+def _exchange(tool_name: str, arguments: dict, result: str, call_id: str) -> list[dict]:
+    """tool_exchange, tolerant of a baseline checkout that has no call_id."""
+    try:
+        return tool_exchange(tool_name, arguments, result, call_id=call_id)
+    except TypeError:
+        return tool_exchange(tool_name, arguments, result)
 
 
 def _arguments_dict(arguments) -> dict:
@@ -1194,8 +1204,13 @@ async def run_task(task: Task, llm, tools: ToolRegistry, keep: bool = False) -> 
                 metrics["failed_edits"] += 1
             if result.startswith("[tool error]"):
                 metrics["tool_errors"] += 1
-            messages = messages + tool_exchange(
-                decision.tool.name, _arguments_dict(decision.arguments), result
+            messages = messages + _exchange(
+                decision.tool.name,
+                _arguments_dict(decision.arguments),
+                result,
+                # empty unless the backend answered on its native tool channel,
+                # which is what makes the history use the tool role there
+                getattr(decision, "call_id", "") or "",
             )
             if task.check(workspace):
                 # model already succeeded; one more decision would only spend
@@ -1274,12 +1289,14 @@ def discover_backend() -> tuple[str, str]:
     return LIVE_URL, model
 
 
-def make_live_llm():
+def make_live_llm(tool_protocol: str = "envelope"):
     from hpca.config import LLMSettings
     from hpca.llm import LLMClient
 
     url, model = discover_backend()
-    print(f"Backend: {url}  model: {model}")
+    print(f"Backend: {url}  model: {model}  protocol: {tool_protocol}")
+    # _filtered_kwargs drops what this checkout's LLMSettings does not have, so
+    # a baseline without tool_protocol still runs (as envelope, which it is).
     return LLMClient(
         LLMSettings(
             **_filtered_kwargs(
@@ -1289,6 +1306,7 @@ def make_live_llm():
                 api_key=LIVE_KEY,
                 request_timeout_s=180,
                 enable_thinking=False,
+                tool_protocol=tool_protocol,
             )
         )
     )
@@ -1324,6 +1342,14 @@ async def main() -> int:
         "structurally mishandled; shift: what the key-only interface costs a "
         "model post-trained on paths; all: every tier",
     )
+    parser.add_argument(
+        "--tool-protocol",
+        choices=["envelope", "native"],
+        default="envelope",
+        help="how a tool call travels: the hand-rolled JSON envelope under a "
+        "grammar, or the backend's own tool-calling channel (needs the server "
+        "started with --enable-auto-tool-choice --tool-call-parser)",
+    )
     args = parser.parse_args()
 
     tasks = {
@@ -1343,7 +1369,7 @@ async def main() -> int:
 
     live = None
     if not args.dry_run:
-        live = make_live_llm()
+        live = make_live_llm(args.tool_protocol)
     repeats = 1 if args.dry_run else args.repeats
 
     runs: list[dict] = []
@@ -1375,6 +1401,7 @@ async def main() -> int:
     successes = sum(1 for r in runs if r["success"])
     summary = {
         "label": args.label or ("dry-run" if args.dry_run else "live"),
+        "tool_protocol": args.tool_protocol,
         "n_runs": n,
         "success_rate": round(successes / n, 3) if n else 0.0,
         "mean_failed_edits": round(sum(r["failed_edits"] for r in runs) / n, 3) if n else 0.0,

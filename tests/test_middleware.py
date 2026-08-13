@@ -214,6 +214,123 @@ class TestDecide:
         assert result == "echo: hi"
 
 
+class NativeLLM:
+    """A backend speaking the native tool-calling protocol.
+
+    Outputs are either a string (plain content, i.e. an answer) or a list of
+    tool_calls dicts, the two shapes an OpenAI-style response comes in.
+    """
+
+    def __init__(self, outputs):
+        self._outputs = list(outputs)
+        self.calls: list[dict] = []
+
+    async def chat(self, messages, *, json_schema=None, tools=None, **kwargs):
+        self.calls.append(
+            {"messages": list(messages), "json_schema": json_schema, "tools": tools}
+        )
+        output = self._outputs.pop(0)
+        if isinstance(output, Exception):
+            raise output
+        if isinstance(output, str):
+            return ChatResponse(content=output)
+        return ChatResponse(content="", tool_calls=output)
+
+    def uses_native_tools(self):
+        return True
+
+    async def supports_constrained_decoding(self):
+        raise AssertionError("the native protocol must not probe for a grammar")
+
+
+def native_call(tool="echo", call_id="call_1", **arguments):
+    return [
+        {
+            "id": call_id,
+            "type": "function",
+            "function": {"name": tool, "arguments": json.dumps(arguments)},
+        }
+    ]
+
+
+class TestDecideNative:
+    async def test_a_tool_call_carries_its_id(self, tools):
+        llm = NativeLLM([native_call("echo", text="hi")])
+        decision = await decide(llm, USER, tools)
+        assert isinstance(decision, ToolCall)
+        assert decision.tool.name == "echo"
+        assert decision.arguments.text == "hi"
+        assert decision.call_id == "call_1"
+
+    async def test_content_without_calls_is_an_answer(self, tools):
+        decision = await decide(NativeLLM(["four BAMs, all indexed"]), USER, tools)
+        assert isinstance(decision, DirectResponse)
+        assert decision.text == "four BAMs, all indexed"
+
+    async def test_tools_ride_the_array_not_the_grammar(self, tools):
+        llm = NativeLLM(["ok"])
+        await decide(llm, USER, tools)
+        call = llm.calls[0]
+        assert call["json_schema"] is None
+        assert [t["function"]["name"] for t in call["tools"]] == ["echo", "count"]
+        assert call["tools"][0]["function"]["description"] == "Echo text"
+
+    async def test_the_instruction_stops_listing_tools(self, tools):
+        # The tools array is the listing now. What survives in prose is only
+        # what it cannot say — that a call is a real action.
+        llm = NativeLLM(["ok"])
+        await decide(llm, [{"role": "system", "content": "Base prompt."}] + USER, tools)
+        system = llm.calls[0]["messages"][0]
+        assert system["role"] == "system"
+        assert "Base prompt." in system["content"]
+        assert '{"action"' not in system["content"]
+
+    async def test_invalid_arguments_retry_answers_on_the_tool_role(self, tools):
+        # A chat template handed a call with no matching result renders a
+        # broken conversation, so the complaint has to answer the call.
+        llm = NativeLLM([native_call("count", n=1000), native_call("count", n=5)])
+        decision = await decide(llm, USER, tools)
+        assert isinstance(decision, ToolCall)
+        assert decision.arguments.n == 5
+        retry = llm.calls[1]["messages"]
+        assert retry[-2]["role"] == "assistant" and retry[-2]["tool_calls"]
+        assert retry[-1]["role"] == "tool"
+        assert retry[-1]["tool_call_id"] == retry[-2]["tool_calls"][0]["id"]
+        assert "less than or equal to 100" in retry[-1]["content"]
+
+    async def test_unknown_tool_retries_with_the_available_names(self, tools):
+        llm = NativeLLM([native_call("delete_everything"), native_call("echo", text="x")])
+        assert isinstance(await decide(llm, USER, tools), ToolCall)
+        feedback = llm.calls[1]["messages"][-1]["content"]
+        assert "delete_everything" in feedback and "echo" in feedback
+
+    async def test_unparseable_arguments_retry(self, tools):
+        broken = [{"id": "c1", "type": "function",
+                   "function": {"name": "echo", "arguments": "{not json"}}]
+        llm = NativeLLM([broken, native_call("echo", text="ok")])
+        assert isinstance(await decide(llm, USER, tools), ToolCall)
+        assert "not valid JSON" in llm.calls[1]["messages"][-1]["content"]
+
+    async def test_an_empty_response_is_refused_not_answered(self, tools):
+        # "" is not an answer; without this it would end the turn silently.
+        llm = NativeLLM(["   ", native_call("echo", text="x")])
+        assert isinstance(await decide(llm, USER, tools), ToolCall)
+        assert "neither a tool call nor an answer" in (
+            llm.calls[1]["messages"][-1]["content"]
+        )
+
+    async def test_extra_calls_in_one_response_are_reported_not_dropped(self, tools):
+        # The graph runs one call at a time (approval, round accounting), so
+        # the rest go — but silently dropping them is how a half-done task
+        # looks finished.
+        both = native_call("echo", text="first") + native_call(
+            "echo", call_id="call_2", text="second"
+        )
+        decision = await decide(NativeLLM([both]), USER, tools)
+        assert decision.arguments.text == "first"
+        assert any("dropped" in repair for repair in decision.repairs)
+
+
 # --------------------------------------------------------- integration tests
 
 from hpca.config import LLMSettings  # noqa: E402

@@ -24,7 +24,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from hpca.agent import compact
-from hpca.agent.history import tool_call_message
+from hpca.agent.history import call_message, result_message
 from hpca.agent.middleware import (
     DecisionError,
     DirectResponse,
@@ -294,6 +294,11 @@ def build_graph(
                     # What the middleware had to repair to make the call valid;
                     # shown with the call rather than swallowed.
                     "repairs": decision.repairs,
+                    # The backend's id for this call under the native protocol
+                    # (empty otherwise). It has to be checkpointed: an approval
+                    # can park the turn for as long as the user takes, and the
+                    # result message is only tied to its call by this id.
+                    "call_id": decision.call_id,
                 },
                 "tool_rounds": rounds + 1,
                 **thinking,
@@ -416,7 +421,9 @@ def build_graph(
             except Exception as e:  # surfaced to the model, never crashes the graph
                 content = f"[tool error] {tool.name}: {type(e).__name__}: {e}"
         report_step(thread_id, {"kind": "step", "text": content})
-        update = _tool_exchange(tool.name, pending["arguments"], content) | recorded
+        update = _tool_exchange(
+            tool.name, pending["arguments"], content, pending.get("call_id") or ""
+        ) | recorded
         if ran and tool.name == "update_plan":
             # The checklist lives in the checkpointed state, not in the tool:
             # that is what makes it survive restarts and prompt re-injection.
@@ -497,7 +504,9 @@ def build_graph(
             "tool_rounds": 0,
         }
 
-    def _tool_exchange(tool_name: str, arguments: dict, content: str) -> dict:
+    def _tool_exchange(
+        tool_name: str, arguments: dict, content: str, call_id: str = ""
+    ) -> dict:
         # Two messages, not one: the assistant message IS the call the model
         # emitted (its own decision envelope, big payloads elided — see
         # hpca.agent.history), and the result answers it. A history of nothing
@@ -505,15 +514,16 @@ def build_graph(
         # has to infer its own actions from the echo in the result text; the
         # pair is the shape agent-trained models were post-trained on.
         #
-        # The result still uses the user role: vLLM/Qwen templates reject
-        # mid-conversation system messages, and the native tool role requires
-        # the tool-call protocol we deliberately bypass (§4.3). ``content`` is
-        # passed through untouched — it is also a denial or a tool error, not
-        # only a "[tool result] …" line.
+        # Under the envelope protocol the result rides the user role, because
+        # vLLM/Qwen templates reject mid-conversation system messages and the
+        # tool role belongs to the protocol that one bypasses (§4.3). Under the
+        # native protocol (``call_id`` set) it is a real tool-role message tied
+        # to the call by its id. ``content`` is passed through untouched either
+        # way — it is also a denial or a tool error, not only a result line.
         return {
             "messages": [
-                tool_call_message(tool_name, arguments),
-                {"role": "user", "content": content},
+                call_message(tool_name, arguments, call_id),
+                result_message(tool_name, content, call_id),
             ],
             "pending_tool": None,
         }
