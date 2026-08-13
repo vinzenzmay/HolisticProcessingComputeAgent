@@ -297,6 +297,65 @@ something else:
   The harness threads `decision.call_id` through, falling back for a baseline
   checkout that has neither.
 
+### 7.1 The example the schema could not give
+
+The first native run failed `simple_replace` in a way no metric named:
+1 tool call, 2 decisions, 0 failed edits, 0 tool errors, file untouched. It
+looked like the model narrating instead of acting. Replaying the kept
+transcript's last decision showed the opposite — it *did* call `edit_file`,
+with `old_lines` as a bare string where the schema wants a list of them:
+
+```
+"old_lines": "echo \"starting run\""      ← sent
+"old_lines": ["echo \"starting run\""]    ← required
+```
+
+Validation rejected it and the model answered in prose on the retry rather
+than correcting the shape, so the turn ended with a `DirectResponse` and the
+counters saw a task that simply stopped. 6 of 6 generations did this.
+
+The envelope protocol never had the problem because `format_instruction`
+shows a *filled* example per tool (`_example_args`), while the `tools` array
+carried only the JSON schema — and `"type": "array"` is not enough for a 27B.
+This is the same finding `_example_args` was written for. Putting that same
+example into each tool's `description` took `simple_replace` from 0/6 to 6/6.
+
+**Reading for the future: when a native-protocol task fails with no error and
+fewer calls than it should have, replay the transcript's last decision before
+believing the shape the metrics suggest.** A rejected call and a refusal to
+act are indistinguishable from the outside; they are not the same bug.
+
+### 7.2 Results (2026-08-13, Qwen3.6-27B-AWQ, same code both sides)
+
+core tier, 3 repeats, n=36 each:
+
+| | envelope | native |
+|---|---|---|
+| success | 0.944 | **0.972** |
+| failed edits / run | 0.056 | **0.028** |
+| tool calls / run | 2.028 | **1.944** |
+| completion tokens | **3292** | 4423 |
+| wall | 337.6s | **198.7s** |
+
+shift tier, 3 repeats, n=9 each: both **1.0**; calls/run 1.889 envelope vs
+1.667 native; 853 vs 1043 completion tokens.
+
+One failure against two at n=36 does not separate the two protocols, and
+should not be read as native winning. What the run does show is that they
+fail *differently*, which matters more than the rate:
+
+- The envelope's failure was a constrained-decoding loop: 223.9s of one run,
+  truncated at `max_tokens` mid-`edit_file`, the turn lost. That is two
+  thirds of its entire wall time in one run, and it is a tail the native
+  channel does not have — there is no grammar to loop. Excluding it, the
+  envelope is *faster* per run (3.25s vs 5.5s) and cheaper in tokens.
+- `middle_of_large_file` failed once on each side. That one is the task, not
+  the protocol.
+
+So: envelope stays the default because it runs on any OpenAI-compatible
+backend, and native is a setting worth turning on where the server supports
+it — a little more token spend for fewer calls and no grammar-loop tail.
+
 ## 8. What it deliberately is not
 
 - Not part of the default or live pytest suites — it costs real generations

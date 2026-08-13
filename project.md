@@ -483,6 +483,17 @@ the orchestrator's or another subagent's context.
   The call's id is checkpointed with the pending call, not just held in
   memory: an approval parks the turn for as long as the user takes, and the id
   is the only thing tying the result to the call it answers.
+  Each tool's description carries a **filled example** of its arguments on
+  both protocols. The `tools` array's JSON schema alone is not enough for a
+  27B: with the schema only, `edit_file` came back with `old_lines` as a bare
+  string instead of a list in 6 of 6 generations, and the model answered in
+  prose rather than fix the shape on the retry. Same example source
+  (`_example_args`) both ways, so the two cannot show different shapes.
+  Measured head to head (specs-edit-eval.md §7.2, n=36): the two are level on
+  success, and fail differently — the envelope's grammar can loop until
+  `max_tokens` (one run cost 224s and the turn), which is a tail the native
+  channel structurally lacks; native spends more completion tokens for fewer
+  tool calls.
 * **Output size control:** long tool outputs are kept small before they reach the
   model. *As built,* this is per-tool truncation rather than a single generic
   middleware layer: `read_file` returns head/tail, `read_manpage`/`read_source`
