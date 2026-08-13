@@ -54,9 +54,10 @@ GROUNDED_ANSWERING_GUIDANCE = (
 # What survives is what the schemas cannot say: that keys exist at all, and
 # the brace expansion in run_bash lines.
 PATH_WORKFLOW_GUIDANCE = (
-    "File tools take a registry key or a literal absolute path, so use a path "
-    "you already have as it stands; register_path gives one a short key up "
-    "front. In a run_bash line a key is written in braces — `head -2 "
+    "File tools take a registry key or an absolute path. When you are given a "
+    "path, pass it straight to the tool — you do not need to register it "
+    "first. register_path only gives a long path a short key for later. In a "
+    "run_bash line a key is written in braces — `head -2 "
     "{ref_fasta}` — and expands to the real path; that is also how you run a "
     "script you created: `{my_script} --flag`."
 )

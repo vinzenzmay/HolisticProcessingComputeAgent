@@ -110,7 +110,19 @@ def _system_prompt(note: str = "") -> str:
         from hpca.agent.prompts import SCRIPT_GUIDANCE as script_guidance
     except Exception:
         script_guidance = ""
-    return f"{guidance}\n\n{script_guidance}\n\n" + (note or _DEFAULT_SYSTEM_NOTE)
+    # Likewise PATH_WORKFLOW_GUIDANCE. Leaving it out was a real measurement
+    # bug, not a simplification: it is the block that says what a file tool's
+    # key argument accepts, so without it the shift tier judged the path
+    # changes with the guidance about paths removed — and the model, told
+    # nothing, sometimes answered instead of acting. Production always carries
+    # it (orchestrator_system_prompt), and each checkout supplies its own text.
+    try:
+        from hpca.agent.prompts import PATH_WORKFLOW_GUIDANCE as path_guidance
+    except Exception:
+        path_guidance = ""
+    return f"{guidance}\n\n{path_guidance}\n\n{script_guidance}\n\n" + (
+        note or _DEFAULT_SYSTEM_NOTE
+    )
 
 
 # ----------------------------------------------------------- history shape
