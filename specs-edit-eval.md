@@ -208,7 +208,72 @@ reproduces the bare `[tool result]` user turn verbatim. A baseline checkout
 without that module measures the old conversation shape; the treatment tree
 measures the new one.
 
-## 6. What it deliberately is not
+## 6. Moving the interface toward the model (v0.20.0)
+
+Four changes, each measured as its own rung against v0.19.2 on the cluster
+vLLM (`Qwen3.6-27B-AWQ`, :20001, constrained decoding ON), 3 reps unless a
+number says otherwise. Read this for the method as much as the numbers — most
+of what went wrong was measurement, not code.
+
+| change | measured effect |
+|---|---|
+| the model sees its own tool call (`agent/history.py`) | core failed edits 0.167 → 0.028, calls 2.222 → 2.028; nearly all of it on `python_indent` (4.67 → 2.33 calls, 2.0 → 0.33 failed) |
+| `register_path` repoints a dead key | **null at every rung** — the model never attempts a repoint, it invents a fresh key |
+| file tools take a literal path where they take a key | nothing on its own |
+| rewriting the guidance that change makes false | with it: `edit_by_literal_path` 3.33 → 2.00 calls, core 97% → 100%, `delete_lines` 72% → 88% (n=25) |
+
+The last two are ONE change. With the capability in and the text still saying
+"tools take registry KEYS, never literal paths", the model kept registering
+first and nothing moved. The win arrives only when the standing text stops
+contradicting the tool — and the same thing recurred one layer down, where
+SCRIPT_GUIDANCE still said "create_file with the directory's *key*" (11 of 20
+first decisions still registered; 12 of 20 went straight to the tool after).
+
+Keep change 2 on correctness grounds — a mistyped key is unusable for the rest
+of a session and there is no unregister tool — but do not claim a measured
+win for it.
+
+**A wide prompt cut was tried and rejected.** Halving the whole standing
+guidance (−47% of system prompt + tool listing) looked excellent at 3 reps —
+core 100%, fewest calls of any variant — and was wrong. At n=25 it took
+`delete_lines` from 72% to **52%**, including runs where the model answered
+instead of acting at all. Cutting text that had become *false* is worth a call
+per task; cutting text that was merely *long* (fail-fast scripts, no-heredoc,
+skeleton-then-fill) removed facts a 27B cannot guess. The two are
+indistinguishable if you count tokens and opposite in kind. Final state keeps
+the guidance at full length with the path block and one `create_file` phrase
+rewritten.
+
+**Three reps cannot measure a prompt change.** Every 3-rep signal here that
+was not a removed round-trip failed to replicate: a "core collapse" that was a
+backend stall (`LLMError` at exactly the 180s client timeout — check each
+run's `error` field before believing any drop), a "regression" that was the
+harness bug below, a 33%-vs-100% task gap that was 10/10 both sides at n=10.
+Tool-mechanics changes — a call the model no longer has to make — are
+deterministic enough for 3. Prompt changes shift how often a stochastic model
+*chooses* to act and need n≥20, cheaply had by sampling only the FIRST
+decision on one task instead of running whole tasks: build the task's
+messages, call `decide` N times, count which tool it picks. That probe settled
+every prompt question in this section; whole-task runs at n=3 got two of them
+backwards.
+
+**The harness bug worth remembering.** `_system_prompt` assembled
+RESPOND_VS_TOOL + SCRIPT guidance and omitted PATH_WORKFLOW_GUIDANCE — the one
+block that says what a file tool's key argument accepts. The shift tier was
+judging the key-or-path change with the guidance about paths deleted, and
+produced a confident, entirely artefactual regression: the model answered
+instead of acting, twice reporting a file it had never written. Two commits
+were written to repair that phantom; both measured worse than the untouched
+text and were reverted. **An eval that omits part of the production prompt
+does not measure a weaker system, it measures a different one.** When a block
+is added to `orchestrator_system_prompt`, add it here too.
+
+Also fixed while running this: the reachability probe allowed 5s, while a
+tunnelled cluster LLM answers `/models` in 3-8s when idle or loaded, so a
+whole stage died at the door reporting "unreachable" against a healthy
+backend. Now 30s, `HPCA_TEST_LLM_PROBE_TIMEOUT` overrides.
+
+## 7. What it deliberately is not
 
 - Not part of the default or live pytest suites — it costs real generations
   and minutes of wall time; it runs only when someone asks for an assessment.

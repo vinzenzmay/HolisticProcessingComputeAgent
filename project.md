@@ -429,6 +429,21 @@ the orchestrator's or another subagent's context.
   that resolve keys report the absence in those terms (`read_file` says nothing
   is there; `create_file` simply makes the directory, as it already did for
   intermediate ones) rather than raising a bare `FileNotFoundError`.
+  A key is no longer *required*, either: wherever a file tool takes a key it
+  also takes a literal absolute path, which it auto-registers on the way
+  through (`PathRegistry.resolve_or_register`; the HITL predicates resolve the
+  same way, so a delete by literal path still gates). Keys stay for brevity
+  and for naming things the user never spelled out — what went is the mandatory
+  register-then-call round-trip, which cost a tool call every time the agent
+  was handed a path and bought nothing. Measured: the 27B registered first in
+  19 of 20 generations under the old guidance, and none of that work was
+  needed. A registry key is an affordance, not a toll.
+* **The model sees its own actions.** A tool round appends the model's own call
+  as an assistant turn and then the result, rather than the result alone — the
+  shape agent-trained models are post-trained on. Large arguments are elided in
+  that copy (a create_file's content is already on disk; echoing it would store
+  the file twice in context). Without it the model reconstructed what it had
+  done purely from the result text and re-issued calls it had already made.
 * **Output size control:** long tool outputs are kept small before they reach the
   model. *As built,* this is per-tool truncation rather than a single generic
   middleware layer: `read_file` returns head/tail, `read_manpage`/`read_source`
