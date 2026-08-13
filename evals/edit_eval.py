@@ -51,6 +51,8 @@ from hpca.trash import TrashManager
 
 LIVE_URL = os.environ.get("HPCA_TEST_LLM_URL", "http://localhost:20001/v1")
 LIVE_KEY = os.environ.get("HPCA_TEST_LLM_KEY")
+# How long the /models reachability probe waits; see discover_backend.
+PROBE_TIMEOUT_S = float(os.environ.get("HPCA_TEST_LLM_PROBE_TIMEOUT", "30"))
 
 MAX_DECISIONS = 8
 
@@ -1223,7 +1225,13 @@ def discover_backend() -> tuple[str, str]:
         sys.exit(2)
     headers = {"Authorization": f"Bearer {LIVE_KEY}"} if LIVE_KEY else {}
     try:
-        resp = httpx.get(f"{LIVE_URL}/models", timeout=5, headers=headers)
+        # Generous on purpose. A cluster backend reached through an SSH tunnel
+        # answers /models in milliseconds when warm and in 3-8 seconds when the
+        # tunnel has been idle or the server is loaded — measured on the 27B
+        # box, 2026-08-13. A 5s probe turned that into "backend unreachable"
+        # and killed whole eval stages at the door while generations (180s
+        # timeout) would have been perfectly fine.
+        resp = httpx.get(f"{LIVE_URL}/models", timeout=PROBE_TIMEOUT_S, headers=headers)
     except Exception as exc:
         print(
             f"LLM backend at {LIVE_URL} is unreachable ({exc}). "
