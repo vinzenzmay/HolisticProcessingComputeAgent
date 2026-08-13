@@ -4,34 +4,13 @@ Empirically validated against the live Qwen3.6 backend: without the
 respond-vs-tool guidance the model routes its own words through action tools
 (e.g. wrapping a greeting in an ``echo`` call); with it, conversational turns
 reliably become direct responses.
-
-Every block here is paid on every turn of every session, so the standing budget
-is kept to facts a model cannot guess: what is site-specific (tools not on
-PATH), what is counter-intuitive (scripts run fail-fast, ``{key}`` expansion,
-run_bash is not for writing files), and what the tool schemas cannot say. The
-rationale that once explained each rule to a *reader* lives in these comments
-instead, where it costs no tokens; repetition of what a tool's own description
-already states was removed rather than restated. The blocks stay separate and
-in this order — the assembly below is unchanged — so a block can be measured
-by shortening it, not by deleting it.
 """
 
-# This short form is measured, and the measurement has a cautionary tale in it.
-# It first looked as though cutting the old opening ("You are an assistant with
-# tools. Tools perform real actions.") had broken tool use: on a plain "create
-# this file at /abs/path" the 27B answered instead of acting, twice claiming it
-# had written a file it never wrote. That was the EVAL's fault — its system
-# prompt omitted PATH_WORKFLOW_GUIDANCE, so the model was being asked to pass a
-# path with the block that permits paths deleted (fixed in evals/edit_eval.py,
-# 2026-08-13). Re-measured with the real prompt, n=20 on that task: this text
-# 20/20 tool calls, all in one call. Two attempted "repairs" both made it worse
-# — restoring the opening clause, and rewording the path sentence to "pass it
-# straight to the tool" (17/20, the 3 failures including fabricated writes).
-# Leave it alone; a phantom regression is not a reason to add words back.
 RESPOND_VS_TOOL_GUIDANCE = (
-    "Call a tool only to perform a real action; answer conversation, questions "
-    'and greetings directly with {"action": "respond", ...} — never route your '
-    "own words through a tool."
+    "You are an assistant with tools. Tools perform real actions. "
+    "Use a tool only when the user asks for an action a tool performs. "
+    "For conversation, questions, and greetings, always answer directly "
+    'with {"action": "respond", ...} — never route your own words through a tool.'
 )
 
 
@@ -40,19 +19,24 @@ RESPOND_VS_TOOL_GUIDANCE = (
 # schemas are already in this prompt. The hallucination risk is in the *external*
 # programs it drives from scripts (samtools, minimap2, ...), not in its toolbox.
 GROUNDED_ANSWERING_GUIDANCE = (
-    "Never state an EXTERNAL program's flags or syntax from memory — the "
-    "command-line tools you drive from scripts (samtools, minimap2, ...), "
-    "libraries, file formats, error messages: call ask_docs and relay its "
-    "cited answer. Your own tools need no research; their schemas are here, "
-    "so just call them."
+    "Your own tools need no research: you already have their schemas, so never "
+    "look up documentation before calling one — just call it. Grounding applies "
+    "to EXTERNAL software instead: command-line programs you invoke from scripts "
+    "(samtools, minimap2, bcftools, ...), libraries, file formats, and error "
+    "messages. Never state their flags or syntax from memory — call ask_docs and "
+    "relay its cited answer. Answer directly only for conversation and for "
+    "information already present in this conversation."
 )
 
 # The key-first drilling that used to open this block is gone: every file tool
 # now takes a literal absolute path wherever it takes a key
 # (PathRegistry.resolve_or_register), so "register first, then call" is no
 # longer true, and the register_path round-trip it mandated was pure tax.
-# What survives is what the schemas cannot say: that keys exist at all, and
-# the brace expansion in run_bash lines.
+# Measured (edit_eval, 2026-08-13): with the old text the 27B registered first
+# in 19 of 20 generations even though the path would have worked; with this
+# one it goes straight to the tool 20 of 20, one call instead of two.
+# This block ALONE was rewritten. A wider prompt cut measured worse — see
+# specs-edit-eval.md.
 PATH_WORKFLOW_GUIDANCE = (
     "File tools take a registry key or a literal absolute path, so use a path "
     "you already have as it stands; register_path gives one a short key up "
@@ -63,39 +47,60 @@ PATH_WORKFLOW_GUIDANCE = (
 
 # Without this the model has no idea it may look around: every file tool takes
 # a key, and keys came from the user's message, so "find X somewhere on this
-# system" looked impossible and it narrated instead of acting. (Literal paths
-# are accepted now, but nothing else tells it that looking is allowed.) The
-# package-manager probe this used to carry lives in ENVIRONMENT_TOOL_GUIDANCE,
-# which is the block about tools that are not on PATH.
+# system" looked impossible and it narrated instead of acting.
 DISCOVERY_GUIDANCE = (
-    "You can look around this system, and you should rather than guess or ask: "
-    "`find <dirs> -maxdepth <n> -iname '<pattern>' 2>/dev/null | head -20` "
-    "locates files, `command -v samtools` checks a program. Keep searches "
-    "bounded so they finish in seconds — likely roots rather than /, capped "
-    "depth, piped through head."
+    "You can look around this system, and you should rather than guess or ask. "
+    "Use run_bash for a one-shot check — it writes, runs and returns the "
+    "output of a small bash script in one step. Useful lines: "
+    "`find <dirs> -maxdepth <n> -iname '<pattern>' 2>/dev/null | head -20` to "
+    "locate files; `command -v samtools` to check a program. For a tool that "
+    "is not on PATH, first see which package managers this site actually has "
+    "(`command -v conda mamba micromamba spack module apptainer`) and query "
+    "only the ones that answered, or search the likely install roots directly "
+    "with find. Keep searches "
+    "bounded so they finish in seconds: start from likely roots rather than /, "
+    "cap the depth, pipe through head. Then register_path the paths it printed "
+    "and use them by key."
 )
 
 # The single most common way the agent burns its tool budget: it cannot run an
 # environment-managed tool and thrashes trying to activate one. The idiom that
 # ends that thrashing lives in ENVIRONMENT_TOOL_GUIDANCE below.
-#
-# This block is also the one home of the skeleton-then-fill protocol for a long
-# write (measured in v0.19.0: a 27B loses count filling ten sections, hence the
-# `TBD:` marker the tool result then ratchets down). create_file's own
-# description used to repeat it; it says only what create_file is for now.
 SCRIPT_GUIDANCE = (
-    "Run real work with create_script then start_background_script; use "
-    "run_bash when you want the output now. Bash scripts run fail-fast (`set "
-    "-euo pipefail` is added), so a failed command stops the script: never end "
-    "one with an unconditional `echo \"Done\"`, let the exit code report "
-    "success. Write each command plainly on one line: no added quotes, commas "
-    "or `\\` line-continuations between arguments. "
-    "To WRITE a file that is not a script — specs, notes, a config — call "
-    "create_file, never `echo` lines or a `cat << EOF` heredoc in run_bash, "
-    "which is for looking around and not for writing. Past ~150 lines, "
-    "create_file a skeleton — headings, each with one `TBD: ...` line — then "
-    "fill one section per edit_file call. To CHANGE a file that exists, read "
-    "the region and call edit_file with just the lines to replace."
+    "Run real work (a tool, a pipeline) with create_script then "
+    "start_background_script — those bash scripts run fail-fast (`set -euo "
+    "pipefail` is added), so a failed command stops the script and is reported "
+    "as failed. Because of that, never end a script with an unconditional "
+    "`echo \"Done\"`: let the exit code report success. Choose between the two "
+    "run tools by when you need the answer, not by what the script is: "
+    "start_background_script for work that outlives this turn (it returns a pid "
+    "and tells you later how it ended), run_bash when you want the output now — "
+    "a look-around check, or a kept script run with `{its_key}`. "
+    "Build each command plainly on one line — real flags and paths separated "
+    "by single spaces, nothing else. Do NOT insert quotes, commas or `\\` "
+    "line-continuations between arguments; a stray `\",` turns your command "
+    "into garbage the tool rejects. Reference paths by their registered value "
+    "or write the literal path; do not leave a shell variable unset. "
+    "To WRITE a file that is not a script — a specs or design document, "
+    "notes, a README, a config, a sample sheet — call create_file with the "
+    "directory's key, a name, and the content one line per array element. "
+    "Never build a file out of `echo` lines or a `cat << EOF` heredoc in "
+    "run_bash: the content then has to survive bash quoting, a single stray "
+    "line costs the whole file, and run_bash refuses a script that long "
+    "anyway — it is for looking around, not for writing. A file longer than "
+    "~150 lines does not fit in one call: create_file a skeleton instead — "
+    "headings, each with one `TBD: ...` placeholder line — then fill one "
+    "section per edit_file call (placeholder in old_lines, content in "
+    "new_lines). "
+    "To CHANGE a file that already exists — a script of yours, a config, a "
+    "sample sheet — call edit_file with just the lines to replace. Do not "
+    "re-send the whole file through create_script or create_file: create_file "
+    "refuses an existing path, and create_script's key must be new, so it "
+    "would leave the old file sitting there beside a second copy. Read the "
+    "file first and copy the lines into old_lines exactly as they appear, "
+    "spacing and all. On a long file read_file shows one window at a time: "
+    "page through with start_line, as each result suggests, until you have "
+    "seen the exact region you will edit."
 )
 
 
@@ -110,12 +115,14 @@ SCRIPT_GUIDANCE = (
 ENVIRONMENT_TOOL_GUIDANCE = (
     "Scientific tools here are usually NOT on PATH: they live in package "
     "environments or module trees, and which system manages them differs per "
-    "site. Assume nothing — not that a tool name works as typed, not that any "
-    "given package manager exists. Check (`command -v conda mamba micromamba "
-    "spack module apptainer`), then call the executable by its full binary "
-    "path in your script: the one form that works whatever installed it. A "
-    "`conda run -n <env>` wrapper needs that wrapper installed; do not "
-    "`source` an activate script."
+    "site (conda, mamba, micromamba, Spack, Lmod, containers). Assume nothing "
+    "— neither that a tool name works as typed, nor that any particular "
+    "package manager exists. Find the executable first (see below), then call "
+    "it by its full binary path in your script: that is the one form that "
+    "works whatever installed it. A wrapper like `conda run -n <env> <tool>` "
+    "only works if that wrapper is itself installed, so check with "
+    "`command -v conda` before relying on one. Do not try to `source` an "
+    "activate script: it is rarely where you expect and wastes a step."
 )
 
 
@@ -137,11 +144,12 @@ def environment_facts() -> str:
 # models ask the user to repeat themselves instead. The second half is the
 # Hermes "source-first limit": recall is what was SAID, not what currently IS.
 SESSION_SEARCH_GUIDANCE = (
-    "Past sessions are searchable with session_search: when the user refers to "
-    "an earlier conversation ('like last time', 'the pipeline we set up'), "
-    "search before asking them to repeat it. It shows what was SAID then — "
-    "never evidence about the current state of files, jobs, or the cluster; "
-    "check the system itself for that."
+    "Past sessions are searchable with session_search. When the user refers "
+    "to something from an earlier conversation ('like last time', 'the "
+    "pipeline we set up'), search before asking them to repeat it. "
+    "session_search shows what was said back then — never treat it as "
+    "evidence about the current state of files, jobs, or the cluster; check "
+    "the system itself for that."
 )
 
 
@@ -151,16 +159,20 @@ SESSION_SEARCH_GUIDANCE = (
 # actually asking for now — a failure mode small models are especially prone
 # to, since they weight instructions in context over the current request.
 MEMORY_GUIDANCE = (
-    "You have memory across sessions but cannot write it: use the memory tool "
-    "to FLAG durable facts, which the user reviews at /conclude. Flag "
-    "proactively — corrections and preferences first, then site facts, then "
-    "workarounds — whenever the user states a preference, corrects you, or "
-    "tells you a durable fact about this site. Write them as declarative "
-    "FACTS, not instructions to yourself: “the user prefers R over Python” is "
-    "right, “always answer in R” is wrong — an instruction gets re-read as a "
-    "standing order in a later session and overrides what is being asked then. "
-    "Do NOT flag task progress, file names, job ids, or anything stale in a "
-    "week; past sessions are searchable instead."
+    "You have memory that persists across sessions. You cannot write it "
+    "directly: use the memory tool to FLAG durable facts as you notice them, "
+    "and they are collected for the user to review together when the session "
+    "is concluded. Flag proactively when the user states a preference, "
+    "corrects you, or tells you a durable fact about this site — the best "
+    "memory is one that stops the user having to repeat themselves. "
+    "Priority: corrections and preferences first, then site facts, then "
+    "workarounds. Write memories as declarative FACTS, not instructions to "
+    "yourself: “the user prefers R over Python” is right, “always answer in "
+    "R” is wrong — an instruction gets re-read as a standing order in a "
+    "later session and overrides what is being asked then. Do NOT flag task "
+    "progress, what you did this session, file names, job ids, or anything "
+    "that will be stale in a week; past sessions are searchable instead. "
+    "Flag rather than agonize — the user has the final say at /conclude."
 )
 
 
@@ -169,21 +181,25 @@ MEMORY_GUIDANCE = (
 # moves on, which leaves the user doing exactly the squeue-then-tail loop the
 # panel exists to end.
 WATCH_GUIDANCE = (
-    "When you find a running job the user cares about call watch_job with its "
-    "id, and when you find the log a running tool is writing call watch_log "
-    "with its path. Both pin a live box in the right-hand panel — Slurm state, "
-    "time since the last write — so the user sees whether the work is alive "
-    "without asking you. Do it as soon as you have the id or path, unasked, "
-    "and say that you did."
+    "The right-hand panel can pin things for the user to keep an eye on. "
+    "When you find a running job the user cares about, call watch_job with "
+    "its id; when you find the log a running tool is writing (a snakemake "
+    "run's log, a tool's own log file), call watch_log with its path. Both "
+    "give the user a live box — a job's Slurm state, a log's time since the "
+    "last write — so they can see at a glance whether the work is still "
+    "alive instead of asking you to check. Do this as soon as you have the "
+    "id or the path in hand, without being asked, and say that you did. "
+    "Watching costs the user nothing: they drop a box with one keypress."
 )
 
 
 SKILLS_GUIDANCE = (
-    "The user has defined skills: written procedures for specific tasks, whose "
-    "names are not listed here. When a request seems to call for one, call "
-    "read_skill (any name returns the available skills) and follow the "
-    "procedure it gives back. A skill the user invokes with \"/<skill>\" is "
-    "handed to you inline; follow that."
+    "The user has defined skills: written procedures for specific tasks. "
+    "The list is kept out of this prompt to stay small — you are not shown "
+    "the names. When a request seems to call for a skill, call read_skill "
+    "(passing any name returns the available skills) and follow the procedure "
+    "it gives back. When the user invokes one directly with \"/<skill>\", its "
+    "procedure is handed to you inline; follow that."
 )
 
 

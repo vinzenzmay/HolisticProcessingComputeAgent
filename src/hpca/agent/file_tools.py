@@ -101,11 +101,13 @@ def _source(ctx: ToolContext, key: str, subpath: str, *, register: bool = True) 
 class RegisterPathParams(BaseModel):
     key: str = Field(
         description=(
-            "Short key for this path; reuse one only to fix a typo (nothing "
-            "exists at the old path)"
+            "Registry key for this path; reusing a key is allowed only when "
+            "nothing exists at the path it points at (fixing a typo)"
         )
     )
-    path: str = Field(description="Absolute path, copied verbatim")
+    path: str = Field(
+        description="Absolute path exactly as the user wrote it — copy verbatim"
+    )
 
 
 async def register_path(args: RegisterPathParams, ctx: ToolContext) -> str:
@@ -145,10 +147,15 @@ async def register_path(args: RegisterPathParams, ctx: ToolContext) -> str:
 
 
 class DeleteFileParams(BaseModel):
-    registry_key: str = Field(description="Registry key or absolute path")
+    registry_key: str = Field(
+        description="Registry key or absolute path of the file to delete"
+    )
     subpath: str = Field(
         default="",
-        description="Path inside registry_key when it is a directory",
+        description=(
+            "Path relative to registry_key when it names a directory, e.g. "
+            "'logs/run.err'. Leave empty to delete the key itself."
+        ),
     )
 
 
@@ -221,8 +228,9 @@ class RestoreFileParams(BaseModel):
     path: str = Field(
         default="",
         description=(
-            "Original path of the deleted file (its name alone also works); "
-            "empty lists the trash"
+            "Original path of the deleted file, as delete_file reported it "
+            "(its file name alone also works). Leave empty to list what is in "
+            "the trash."
         ),
     )
 
@@ -322,10 +330,15 @@ async def restore_file(args: RestoreFileParams, ctx: ToolContext) -> str:
 
 
 class EditFileParams(BaseModel):
-    registry_key: str = Field(description="Registry key or absolute path")
+    registry_key: str = Field(
+        description="Registry key or absolute path of the file to edit"
+    )
     subpath: str = Field(
         default="",
-        description="Path inside registry_key when it is a directory",
+        description=(
+            "Path relative to registry_key when it names a directory, e.g. "
+            "'config/run.yaml'. Leave empty to edit the key itself."
+        ),
     )
     # Line arrays for the same reason create_script takes them: the live model
     # fills string arrays reliably and mangles \n escapes in long strings.
@@ -333,14 +346,15 @@ class EditFileParams(BaseModel):
         min_length=1,
         description=(
             "The exact consecutive lines to replace, copied from read_file "
-            "without its line numbers, indentation and all; enough of them to "
-            "occur only once"
+            "without their line numbers — indentation and spacing included. "
+            "Include enough surrounding lines that they occur only once."
         ),
     )
     new_lines: list[str] = Field(
         default_factory=list,
         description=(
-            "The lines to put in their place; an empty array deletes them"
+            "The lines to put in their place, one string per line. Send an "
+            "empty array to delete the old lines."
         ),
     )
 
@@ -694,16 +708,23 @@ async def edit_file(args: EditFileParams, ctx: ToolContext) -> str:
 
 class CreateFileParams(BaseModel):
     dir_key: str = Field(
-        description="Registry key or absolute path of the directory"
+        description=(
+            "Registry key or absolute path of the directory to create the "
+            "file in"
+        )
     )
     name: str = Field(
-        description="Name for the new file, e.g. 'specs.md' or 'docs/specs.md'"
+        description=(
+            "Name for the new file, e.g. 'specs.md'. May name a subdirectory "
+            "of it too, e.g. 'docs/specs.md'"
+        )
     )
     # Last, and an array of lines, for the two reasons the module and
     # hpca.agent.middleware give: long strings get their \n escapes mangled,
     # and nothing may follow a long array.
     content_lines: list[str] = Field(
-        min_length=1, description="File content, one string per line"
+        min_length=1,
+        description="File content as an array of lines, one string per line",
     )
 
 
@@ -788,10 +809,15 @@ async def create_file(args: CreateFileParams, ctx: ToolContext) -> str:
 
 
 class MoveFileParams(BaseModel):
-    source_key: str = Field(description="Registry key or absolute path")
+    source_key: str = Field(
+        description="Registry key or absolute path of the file to move"
+    )
     subpath: str = Field(
         default="",
-        description="Path inside source_key when it is a directory",
+        description=(
+            "Path relative to source_key when it names a directory. Leave "
+            "empty to move the key itself."
+        ),
     )
     dest_dir_key: str = Field(
         description="Registry key or absolute path of the target directory"
@@ -844,10 +870,15 @@ async def move_file(args: MoveFileParams, ctx: ToolContext) -> str:
 
 
 class CopyFileParams(BaseModel):
-    source_key: str = Field(description="Registry key or absolute path")
+    source_key: str = Field(
+        description="Registry key or absolute path of the file to copy"
+    )
     subpath: str = Field(
         default="",
-        description="Path inside source_key when it is a directory",
+        description=(
+            "Path relative to source_key when it names a directory. Leave "
+            "empty to copy the key itself."
+        ),
     )
     dest_dir_key: str = Field(
         description="Registry key or absolute path of the target directory"
@@ -902,8 +933,8 @@ def add_file_tools(registry: ToolRegistry) -> ToolRegistry:
         Tool(
             name="register_path",
             description=(
-                "Give a path a short key; call again with the same key to "
-                "correct a mistyped path"
+                "Register a path (the user's, or one you found) under a key; "
+                "call it again with the same key to correct a mistyped path"
             ),
             params=RegisterPathParams,
             handler=register_path,
@@ -913,8 +944,8 @@ def add_file_tools(registry: ToolRegistry) -> ToolRegistry:
         Tool(
             name="delete_file",
             description=(
-                "Delete a file (trash-backed); subpath names a file inside "
-                "registry_key"
+                "Delete a registered file (trash-backed); pass subpath to "
+                "delete a file inside a registered directory"
             ),
             params=DeleteFileParams,
             handler=delete_file,
@@ -926,9 +957,9 @@ def add_file_tools(registry: ToolRegistry) -> ToolRegistry:
         Tool(
             name="restore_file",
             description=(
-                "Restore a file from the trash — deleted, or overwritten by "
-                "move/copy — by its original path; empty path lists what is "
-                "restorable"
+                "Restore a file deleted earlier (by delete_file, or overwritten "
+                "by move/copy) from the trash, using its original path; call "
+                "with an empty path to list what can be restored"
             ),
             params=RestoreFileParams,
             handler=restore_file,
@@ -938,9 +969,13 @@ def add_file_tools(registry: ToolRegistry) -> ToolRegistry:
         Tool(
             name="create_file",
             description=(
-                "Write a NEW text file — specs, notes, a config — into a "
-                "directory, one array element per line. It will not overwrite: "
-                "to change an existing file, call edit_file"
+                "Write a NEW text file — specs, notes, a README, a config — "
+                "into a registered directory, one array element per line. Use "
+                "this instead of echoing or heredoc'ing a file through "
+                "run_bash. Past ~150 lines send a skeleton (headings + one "
+                "`TBD: ...` line each) and fill per section with edit_file. "
+                "It will not overwrite: to change a file that exists, call "
+                "edit_file"
             ),
             params=CreateFileParams,
             handler=create_file,
@@ -950,9 +985,11 @@ def add_file_tools(registry: ToolRegistry) -> ToolRegistry:
         Tool(
             name="edit_file",
             description=(
-                "Change part of a text file in place: give the exact lines to "
-                "replace and what to put there, instead of rewriting the whole "
-                "file"
+                "Change part of a registered text file in place: give the "
+                "exact lines to replace and what to put there, instead of "
+                "rewriting the whole file. Pass subpath to edit a file inside "
+                "a registered directory. Read the file first and copy the "
+                "lines from it exactly"
             ),
             params=EditFileParams,
             handler=edit_file,
@@ -964,8 +1001,8 @@ def add_file_tools(registry: ToolRegistry) -> ToolRegistry:
         Tool(
             name="move_file",
             description=(
-                "Move a file into a directory; subpath names a file inside "
-                "source_key"
+                "Move a registered file into a registered directory; pass "
+                "subpath to move a file inside a registered directory"
             ),
             params=MoveFileParams,
             handler=move_file,
@@ -977,8 +1014,8 @@ def add_file_tools(registry: ToolRegistry) -> ToolRegistry:
         Tool(
             name="copy_file",
             description=(
-                "Copy a file into a directory; subpath names a file inside "
-                "source_key"
+                "Copy a registered file into a registered directory; pass "
+                "subpath to copy a file inside a registered directory"
             ),
             params=CopyFileParams,
             handler=copy_file,
