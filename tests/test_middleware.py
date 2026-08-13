@@ -273,7 +273,8 @@ class TestDecideNative:
         call = llm.calls[0]
         assert call["json_schema"] is None
         assert [t["function"]["name"] for t in call["tools"]] == ["echo", "count"]
-        assert call["tools"][0]["function"]["description"] == "Echo text"
+        assert call["tools"][0]["function"]["description"].startswith("Echo text")
+        assert "Example arguments" in call["tools"][0]["function"]["description"]
 
     async def test_the_instruction_stops_listing_tools(self, tools):
         # The tools array is the listing now. What survives in prose is only

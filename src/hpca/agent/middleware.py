@@ -201,13 +201,24 @@ def tool_specs(tools: ToolRegistry) -> list[dict]:
     which is where an agent-trained model expects to find it. The schema is
     the same ``inline_refs`` output the envelope grammar uses, so the two
     protocols cannot drift apart on what an argument is.
+
+    The filled example goes in the description because a JSON schema saying
+    ``"type": "array"`` is not enough for a 27B. Measured: on the native
+    channel without it, ``edit_file`` came back with ``old_lines`` as a bare
+    string rather than a list of them in 6 of 6 generations — the call was
+    right, its shape was not, and the model answered in prose rather than
+    correct itself on the retry. This is the same finding ``_example_args``
+    exists for on the envelope side, so both protocols show the same example.
     """
     return [
         {
             "type": "function",
             "function": {
                 "name": tool.name,
-                "description": tool.description,
+                "description": (
+                    f"{tool.description}\nExample arguments: "
+                    f"{json.dumps(_example_args(tool))}"
+                ),
                 "parameters": inline_refs(tool.params.model_json_schema()),
             },
         }

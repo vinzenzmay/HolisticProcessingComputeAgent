@@ -273,7 +273,31 @@ tunnelled cluster LLM answers `/models` in 3-8s when idle or loaded, so a
 whole stage died at the door reporting "unreachable" against a healthy
 backend. Now 30s, `HPCA_TEST_LLM_PROBE_TIMEOUT` overrides.
 
-## 7. What it deliberately is not
+## 7. Envelope vs native tool calling (v0.21.0)
+
+`--tool-protocol {envelope,native}` runs the same task set over either
+protocol (§4.3 in project.md), so the hand-rolled decision object can be
+compared against the backend's own tool-calling channel on identical code.
+`tool_protocol` is recorded in the summary block, because two result files
+that differ only in protocol are otherwise indistinguishable.
+
+Two things have to move together with the protocol or the comparison measures
+something else:
+
+- **The respond guidance.** `RESPOND_VS_TOOL_GUIDANCE` names
+  `{"action": "respond", ...}`, which under native is a format the model
+  cannot emit. Left in, the core tier ran 12/17 before the run was stopped,
+  and *every* failure had one shape: a single `read_file`, then prose claiming
+  the edit was made, with the file untouched. The envelope's two-branch
+  listing keeps "call a tool" visibly available; once that listing moves into
+  the `tools` array, the prose has to say it instead
+  (`RESPOND_VS_TOOL_GUIDANCE_NATIVE`).
+- **The history shape.** A native run must build its exchanges with the call
+  id, or the model is shown envelope-shaped history while calling natively.
+  The harness threads `decision.call_id` through, falling back for a baseline
+  checkout that has neither.
+
+## 8. What it deliberately is not
 
 - Not part of the default or live pytest suites — it costs real generations
   and minutes of wall time; it runs only when someone asks for an assessment.
