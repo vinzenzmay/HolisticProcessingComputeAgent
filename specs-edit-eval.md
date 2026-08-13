@@ -165,7 +165,50 @@ Backend note for whoever runs this next: the local ollama died mid-run once
 fails loudly in the per-run `error` field — discard those cells and re-run
 them rather than reading the summary, which happily averages a dead run in.
 
-## 5. What it deliberately is not
+## 5. The distribution-shift tier (`--tier shift`)
+
+HPCA's file tools take a *registry key* where every agent-trained model expects
+a *path*. The `shift` tier measures what that costs, in three tasks that are
+all winnable on the old code — the friction shows up as extra calls and
+`[tool error]` results, not as a rigged 0% baseline:
+
+- `repoint_stale_key` — the key is registered at a misspelled directory and the
+  user's message carries the real path. Old code: `register_path` on an
+  existing key raises `RegistryError` ("pick a different key"), so the model
+  must invent a second key for the same directory.
+- `edit_by_literal_path` / `create_by_literal_path` — the target is named only
+  by its literal absolute path and is registered under no key. Old code: a
+  `register_path` ceremony before the call that does the work.
+
+Harness API these needed, for whoever adds tasks next:
+
+- `Task.templated: bool` — opt-in `.format(workspace=...)` of the prompt, and
+  `{workspace}` substitution inside `fake_calls` arguments. Opt-in because
+  several prompts carry literal braces in shell snippets, and a formatting
+  crash would silently zero a task's success rate.
+- `Task.system_note: str` — replaces the task-facing half of the system prompt.
+  Core and hard keep `_DEFAULT_SYSTEM_NOTE` **byte-identical** (it forbids
+  `register_path`); the shift tier uses `_SHIFT_SYSTEM_NOTE`, which allows it.
+  Never edit the default — a character moves both older tiers' baselines.
+- `Task.unregistered: dict[str, str | bytes]` — files written into the
+  workspace and deliberately registered under no key (parents made). The only
+  way to set up a file reachable solely by its literal path.
+- `register_path` is now in the eval's tool subset for every tier.
+- Metric `tool_errors` (summary: `mean_tool_errors`) — results starting with
+  `[tool error]`, any tool. `failed_edits` only ever counted
+  edit_file/create_file, so refusals from the path layer were invisible.
+
+A `fake_calls` script must drive the route that works on **both** sides of a
+comparison (register a fresh key, then act), so `--dry-run` stays green when
+the harness is copied into a baseline worktree.
+
+The history shape is a hook, for the same reason: `hpca.agent.history.
+tool_exchange(tool_name, arguments, result)` is imported with a fallback that
+reproduces the bare `[tool result]` user turn verbatim. A baseline checkout
+without that module measures the old conversation shape; the treatment tree
+measures the new one.
+
+## 6. What it deliberately is not
 
 - Not part of the default or live pytest suites — it costs real generations
   and minutes of wall time; it runs only when someone asks for an assessment.

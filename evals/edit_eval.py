@@ -64,7 +64,37 @@ _FALLBACK_GUIDANCE = (
 )
 
 
-def _system_prompt() -> str:
+# The task-facing half of the system prompt. Byte-identical to what the core
+# and hard tiers have always been measured with — changing a character of it
+# moves their baselines, so a tier that needs different standing text says so
+# per task (``Task.system_note``) instead of editing this.
+_DEFAULT_SYSTEM_NOTE = (
+    "You are working on files in a workspace. The relevant paths are "
+    "already registered in the path registry under the keys named in the "
+    "task; do not call register_path. Read a file with read_file before "
+    "editing it, make the change with edit_file (or create_file for a new "
+    "file), and when the change is done answer directly with a short "
+    "confirmation. Copy old_lines exactly as they appear in the file, "
+    "including indentation and spacing, without line numbers."
+)
+
+# The 'shift' tier's note: there, a key may be wrong or absent and the task
+# hands the model a literal path, so forbidding register_path would make the
+# tasks unwinnable rather than measuring what they cost.
+_SHIFT_SYSTEM_NOTE = (
+    "You are working on files in a workspace. Some paths are already "
+    "registered in the path registry under the keys named in the task, but "
+    "the task may also give you a literal absolute path, or a key that turns "
+    "out to be wrong — you may call register_path to give a path you were "
+    "given a key. Read a file with read_file before editing it, make the "
+    "change with edit_file (or create_file for a new file), and when the "
+    "change is done answer directly with a short confirmation. Copy old_lines "
+    "exactly as they appear in the file, including indentation and spacing, "
+    "without line numbers."
+)
+
+
+def _system_prompt(note: str = "") -> str:
     """Match HPCA's own prompt style; fall back if the constant moved."""
     try:
         from hpca.agent.prompts import RESPOND_VS_TOOL_GUIDANCE as guidance
@@ -78,28 +108,49 @@ def _system_prompt() -> str:
         from hpca.agent.prompts import SCRIPT_GUIDANCE as script_guidance
     except Exception:
         script_guidance = ""
-    return (
-        f"{guidance}\n\n{script_guidance}\n\n"
-        "You are working on files in a workspace. The relevant paths are "
-        "already registered in the path registry under the keys named in the "
-        "task; do not call register_path. Read a file with read_file before "
-        "editing it, make the change with edit_file (or create_file for a new "
-        "file), and when the change is done answer directly with a short "
-        "confirmation. Copy old_lines exactly as they appear in the file, "
-        "including indentation and spacing, without line numbers."
-    )
+    return f"{guidance}\n\n{script_guidance}\n\n" + (note or _DEFAULT_SYSTEM_NOTE)
+
+
+# ----------------------------------------------------------- history shape
+
+# What one completed tool call adds to the conversation. Production is moving
+# from "a bare [tool result] user turn" to "the model's own call echoed back as
+# an assistant turn, then the result" — the shape agent-trained models are
+# post-trained on. The import decides which shape a run measures: on a baseline
+# checkout without hpca.agent.history it fails and the fallback below
+# reproduces today's single user message verbatim.
+try:
+    from hpca.agent.history import tool_exchange
+except Exception:
+
+    def tool_exchange(tool_name: str, arguments: dict, result: str) -> list[dict]:
+        return [{"role": "user", "content": f"[tool result] {tool_name}: {result}"}]
+
+
+def _arguments_dict(arguments) -> dict:
+    """decision.arguments as a plain dict, whatever it is on this branch."""
+    try:
+        return arguments.model_dump()
+    except Exception:
+        try:
+            return dict(arguments)
+        except Exception:
+            return {}
 
 
 # ------------------------------------------------------------- tool wiring
 
 
 def _eval_tool_registry() -> ToolRegistry:
-    """read_file + edit_file + create_file, via the same add_* wiring HPCA uses."""
+    """read_file + edit_file + create_file + register_path, via the same add_*
+    wiring HPCA uses. register_path is what a model reaches for when a key is
+    wrong or missing (the 'shift' tier); the core and hard tiers still tell it
+    not to, in prompt text that has not changed."""
     from hpca.agent.builtin_tools import default_tool_registry
     from hpca.agent.file_tools import add_file_tools
 
     registry = add_file_tools(default_tool_registry())
-    wanted = ["read_file", "edit_file", "create_file"]
+    wanted = ["read_file", "edit_file", "create_file", "register_path"]
     try:
         return registry.subset(wanted)
     except Exception:
@@ -160,12 +211,25 @@ class Task:
     # exists, so the model meets one whenever it names a file it is about to
     # write. Kept separate from `files` because the whole point is the absence.
     missing: dict[str, str] = field(default_factory=dict)
+    # relative name -> content, written into the workspace and deliberately
+    # NOT registered under any key. The only way to set up a file the model
+    # can reach solely by its literal absolute path.
+    unregistered: dict[str, str | bytes] = field(default_factory=dict)
     # scripted decisions for --dry-run: the fake model emits these in order,
     # then responds "DONE".
     fake_calls: list[dict] = field(default_factory=list)
     # decision budget override; None = the global MAX_DECISIONS. Multi-part
     # writes (skeleton + one edit per section) legitimately need more calls.
     max_decisions: int | None = None
+    # opt-in prompt templating: when True the prompt is .format()ed with the
+    # run's workspace path ({workspace}). Opt-in because several prompts carry
+    # literal braces in shell/config snippets, and a formatting crash would
+    # silently zero a task's success rate. Also substitutes {workspace} inside
+    # the fake_calls arguments, so a scripted route can name a literal path.
+    templated: bool = False
+    # per-task replacement for the task-facing half of the system prompt
+    # (_DEFAULT_SYSTEM_NOTE). Empty = the text core and hard have always used.
+    system_note: str = ""
 
 
 def _edit(key: str, old: list[str], new: list[str]) -> dict:
@@ -178,6 +242,22 @@ def _edit(key: str, old: list[str], new: list[str]) -> dict:
 
 def _read(key: str) -> dict:
     return {"action": "tool_call", "tool": "read_file", "arguments": {"registry_key": key}}
+
+
+def _register(key: str, path: str) -> dict:
+    return {
+        "action": "tool_call",
+        "tool": "register_path",
+        "arguments": {"key": key, "path": path},
+    }
+
+
+def _create(dir_key: str, name: str, lines: list[str]) -> dict:
+    return {
+        "action": "tool_call",
+        "tool": "create_file",
+        "arguments": {"dir_key": dir_key, "name": name, "content_lines": lines},
+    }
 
 
 BIG_FILE_HEADER = "# run manifest — generated, do not hand-edit sections A/B\n"
@@ -847,6 +927,118 @@ def build_hard_tasks() -> list[Task]:
     return tasks
 
 
+def build_shift_tasks() -> list[Task]:
+    """Tier 'shift': what HPCA's key-only tool interface costs a model that was
+    post-trained on file paths.
+
+    Every task here is winnable on the old code — the friction shows up as
+    extra tool calls and `[tool error]` results (the `tool_errors` metric), not
+    as a rigged 0% baseline. Each `fake_calls` script therefore drives the
+    route that works on BOTH sides: register a fresh key, then act.
+    """
+    tasks: list[Task] = []
+
+    readme_lines = ["# Results", "Populated by the nightly QC run."]
+
+    # S1. The key is there but points at a typo'd directory that does not
+    # exist; the user's message has the real path. Old code: register_path on
+    # an existing key raises RegistryError ("pick a different key"), which
+    # comes back as [tool error], and the model has to invent a second key for
+    # the same directory. New code: the repoint just works.
+    tasks.append(
+        Task(
+            name="repoint_stale_key",
+            prompt=(
+                "The results directory for this run is registered as 'outdir', "
+                "but that key points at a misspelling of the name and there is "
+                "nothing there. The real directory is {workspace}/results. "
+                "Write a README.md in the real results directory with exactly "
+                "these two lines:\n"
+                "# Results\n"
+                "Populated by the nightly QC run."
+            ),
+            files={},
+            missing={"outdir": "reslts"},
+            templated=True,
+            system_note=_SHIFT_SYSTEM_NOTE,
+            check=lambda ws: (ws / "results" / "README.md").is_file()
+            and "nightly QC" in (ws / "results" / "README.md").read_text()
+            and "# Results" in (ws / "results" / "README.md").read_text(),
+            fake_calls=[
+                _register("results_dir", "{workspace}/results"),
+                _create("results_dir", "README.md", readme_lines),
+            ],
+        )
+    )
+
+    # S2. A file nobody registered, named by its literal absolute path — the
+    # shape every agent-trained model expects. Old code: register_path first,
+    # then edit_file by key, two calls minimum. New code: edit_file takes the
+    # path where a key is expected, one call.
+    sampler = (
+        "[sampler]\n"
+        "seed = 17\n"
+        "max_reads = 1000\n"
+        "keep_duplicates = false\n"
+    )
+    tasks.append(
+        Task(
+            name="edit_by_literal_path",
+            prompt=(
+                "The sampler config is at {workspace}/conf/sampler.cfg. "
+                "Change max_reads = 1000 to max_reads = 5000, leaving the rest "
+                "of the file exactly as it is."
+            ),
+            files={},
+            unregistered={"conf/sampler.cfg": sampler},
+            templated=True,
+            system_note=_SHIFT_SYSTEM_NOTE,
+            check=lambda ws: "max_reads = 5000"
+            in (ws / "conf" / "sampler.cfg").read_text()
+            and "seed = 17" in (ws / "conf" / "sampler.cfg").read_text(),
+            fake_calls=[
+                _register("sampler", "{workspace}/conf/sampler.cfg"),
+                _edit("sampler", ["max_reads = 1000"], ["max_reads = 5000"]),
+            ],
+        )
+    )
+
+    # S3. Same shift for create_file: the target directory exists (an
+    # unregistered sibling file puts it on disk) and is named literally, so the
+    # only question is whether the write needs a key ceremony first.
+    tasks.append(
+        Task(
+            name="create_by_literal_path",
+            prompt=(
+                "The analysis outputs live in {workspace}/analysis. Create a "
+                "file named SUMMARY.md in that directory with exactly these "
+                "two lines:\n"
+                "# Analysis summary\n"
+                "All samples passed QC."
+            ),
+            files={},
+            unregistered={"analysis/inputs.txt": "sample_a\nsample_b\n"},
+            templated=True,
+            system_note=_SHIFT_SYSTEM_NOTE,
+            check=lambda ws: (ws / "analysis" / "SUMMARY.md").is_file()
+            and "# Analysis summary"
+            in (ws / "analysis" / "SUMMARY.md").read_text()
+            and "All samples passed QC."
+            in (ws / "analysis" / "SUMMARY.md").read_text(),
+            fake_calls=[
+                _register("analysis_dir", "{workspace}/analysis"),
+                _create(
+                    "analysis_dir",
+                    "SUMMARY.md",
+                    ["# Analysis summary", "All samples passed QC."],
+                ),
+            ],
+        )
+    )
+
+    return tasks
+
+
 # --------------------------------------------------------------- fake model
 
 
@@ -856,6 +1048,24 @@ class FakeLLM:
 
     def __init__(self, calls: list[dict]):
         self._queue = list(calls)
+
+    def bind_workspace(self, workspace: Path) -> None:
+        """Substitute {workspace} inside the scripted arguments.
+
+        Plain replacement, not .format(): scripted content lines carry braces
+        of their own and must survive untouched.
+        """
+
+        def _sub(value):
+            if isinstance(value, str):
+                return value.replace("{workspace}", str(workspace))
+            if isinstance(value, list):
+                return [_sub(v) for v in value]
+            if isinstance(value, dict):
+                return {k: _sub(v) for k, v in value.items()}
+            return value
+
+        self._queue = [_sub(call) for call in self._queue]
 
     async def supports_constrained_decoding(self) -> bool:
         return False
@@ -883,6 +1093,20 @@ def _is_failed_edit(tool_name: str, result: str) -> bool:
     return result.startswith("NOT ") or "[tool error]" in result
 
 
+def _render_prompt(task: Task, workspace: Path) -> str:
+    """The prompt as the model sees it, with {workspace} filled in.
+
+    Opt-in via Task.templated, and belt-and-braces even then: a stray brace in
+    a future prompt must not crash the run and silently zero its success rate.
+    """
+    if not getattr(task, "templated", False):
+        return task.prompt
+    try:
+        return task.prompt.format(workspace=str(workspace))
+    except (KeyError, IndexError, ValueError):
+        return task.prompt.replace("{workspace}", str(workspace))
+
+
 async def run_task(task: Task, llm, tools: ToolRegistry, keep: bool = False) -> dict:
     workdir = Path(tempfile.mkdtemp(prefix=f"hpca_eval_{task.name}_"))
     workspace = workdir / "workspace"
@@ -892,6 +1116,11 @@ async def run_task(task: Task, llm, tools: ToolRegistry, keep: bool = False) -> 
         "success": False,
         "tool_calls": 0,
         "failed_edits": 0,
+        # results that came back as [tool error]: the tool refused or raised.
+        # Broader than failed_edits (any tool, not just edit/create) — this is
+        # the friction a wrong-shaped interface generates, and it used to be
+        # invisible in the numbers.
+        "tool_errors": 0,
         "decisions": 0,
         "completion_tokens": 0,
         "wall_s": 0.0,
@@ -910,10 +1139,20 @@ async def run_task(task: Task, llm, tools: ToolRegistry, keep: bool = False) -> 
             ctx.registry.register(key, path)
         for key, fname in getattr(task, "missing", {}).items():
             ctx.registry.register(key, workspace / fname)
+        for name, content in getattr(task, "unregistered", {}).items():
+            path = workspace / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if isinstance(content, bytes):
+                path.write_bytes(content)
+            else:
+                path.write_text(content)
+        bind = getattr(llm, "bind_workspace", None)
+        if bind is not None:
+            bind(workspace)
 
         messages = [
-            {"role": "system", "content": _system_prompt()},
-            {"role": "user", "content": task.prompt},
+            {"role": "system", "content": _system_prompt(getattr(task, "system_note", ""))},
+            {"role": "user", "content": _render_prompt(task, workspace)},
         ]
         for _ in range(task.max_decisions or MAX_DECISIONS):
             try:
@@ -939,9 +1178,11 @@ async def run_task(task: Task, llm, tools: ToolRegistry, keep: bool = False) -> 
                 result = f"[tool error] {decision.tool.name}: {type(exc).__name__}: {exc}"
             if _is_failed_edit(decision.tool.name, result):
                 metrics["failed_edits"] += 1
-            messages = messages + [
-                {"role": "user", "content": f"[tool result] {decision.tool.name}: {result}"}
-            ]
+            if result.startswith("[tool error]"):
+                metrics["tool_errors"] += 1
+            messages = messages + tool_exchange(
+                decision.tool.name, _arguments_dict(decision.arguments), result
+            )
             if task.check(workspace):
                 # model already succeeded; one more decision would only spend
                 # tokens, so stop here.
@@ -1057,17 +1298,19 @@ async def main() -> int:
     )
     parser.add_argument(
         "--tier",
-        choices=["core", "hard", "all"],
+        choices=["core", "hard", "shift", "all"],
         default="core",
         help="core: the original 12 tasks; hard: shapes the old tooling "
-        "structurally mishandled; all: both",
+        "structurally mishandled; shift: what the key-only interface costs a "
+        "model post-trained on paths; all: every tier",
     )
     args = parser.parse_args()
 
     tasks = {
         "core": build_tasks(),
         "hard": build_hard_tasks(),
-        "all": build_tasks() + build_hard_tasks(),
+        "shift": build_shift_tasks(),
+        "all": build_tasks() + build_hard_tasks() + build_shift_tasks(),
     }[args.tier]
     if args.tasks:
         tasks = tasks[: args.tasks]
@@ -1096,6 +1339,7 @@ async def main() -> int:
                     f"[{status}] {task.name:<24} rep {rep}: "
                     f"{metrics['tool_calls']} calls, "
                     f"{metrics['failed_edits']} failed edits, "
+                    f"{metrics['tool_errors']} tool errors, "
                     f"{metrics['decisions']} decisions, "
                     f"{metrics['wall_s']}s"
                     + (f"  error: {metrics['error']}" if metrics["error"] else "")
@@ -1114,6 +1358,7 @@ async def main() -> int:
         "n_runs": n,
         "success_rate": round(successes / n, 3) if n else 0.0,
         "mean_failed_edits": round(sum(r["failed_edits"] for r in runs) / n, 3) if n else 0.0,
+        "mean_tool_errors": round(sum(r["tool_errors"] for r in runs) / n, 3) if n else 0.0,
         "mean_tool_calls": round(sum(r["tool_calls"] for r in runs) / n, 3) if n else 0.0,
         "mean_decisions": round(sum(r["decisions"] for r in runs) / n, 3) if n else 0.0,
         "total_completion_tokens": sum(r["completion_tokens"] for r in runs),
