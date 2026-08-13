@@ -281,3 +281,29 @@ backend. Now 30s, `HPCA_TEST_LLM_PROBE_TIMEOUT` overrides.
   contract, not the approval UX.
 - Not a benchmark of the model — the fixed reference is the task set; the
   thing under test is HPCA's tooling.
+
+### 6.1 Was the registry's premise ever true?
+
+The registry exists because "models mis-copy long paths". Measured directly
+(2026-08-13, same backend, n=20 first decisions): asked to read a
+161-character cluster path — `/data/cephfs-1/work/groups/cubi/projects/`
+`2026-01-15_scRNAseq_pilot/results/alignment/sample_A12_rep2/outs/`
+`filtered_feature_bc_matrix/barcodes_S12_L002_R1_001.tsv`, with repeated
+near-identical segments, a date, and sample ids that recur with suffixes —
+**20/20 byte-exact**. Constrained decoding gives no help there: inside a JSON
+string every character is legal, so the grammar cannot correct a typo. This
+model simply copies paths well.
+
+That does not make the registry pointless, it means it is justified by
+something else: a key resolves from sqlite whatever is in the window, while a
+long path that has scrolled out of a compacted conversation is gone. Keep the
+transcription argument out of the rationale; it is not what the numbers show.
+
+Exposure is unchanged by the key-or-path change, because the model transcribes
+a path exactly once either way — in v0.19 into `register_path`, now into the
+first tool call, whose result hands back the auto-registered key that the
+model then uses (verified in a kept transcript). What was lost is one warning:
+`create_file` with a literal directory path skips the registration step that
+used to say "nothing exists there yet", and it makes missing parents, so a
+typo lands the file somewhere plausible and reports success. Hence the caution
+in that result — the tool knows it is writing where nothing was.

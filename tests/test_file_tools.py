@@ -1121,7 +1121,27 @@ class TestCreateFile:
         )
         assert (tmp_path / "results" / "notes.md").read_text() == "hi\n"
         assert "Created" in result
-        assert "on the way" in result  # and the model is told it made the dir
+        # ...and the model is cautioned, not merely informed: this is the one
+        # file tool that will happily build a mistyped path instead of failing
+        # on it, so the result has to invite a spelling check.
+        assert "did not exist and was created" in result
+        assert "misspelled" in result
+        assert str(tmp_path / "results") in result
+
+    async def test_a_directory_given_as_a_literal_path_is_cautioned_too(
+        self, tools, ctx, tmp_path
+    ):
+        """The case the caution exists for. A literal dir path skips the
+        register_path step that used to say "nothing exists there yet", so
+        without it the only signal a typo gives is a success message."""
+        target = tmp_path / "reslts"  # the typo the user did not make
+        result = await call(
+            tools, "create_file", ctx,
+            dir_key=str(target), name="notes.md", content_lines=["hi"],
+        )
+        assert (target / "notes.md").is_file()
+        assert "did not exist and was created" in result
+        assert "misspelled" in result
 
     async def test_writing_into_an_existing_directory_makes_no_such_claim(
         self, tools, ctx, tmp_path
@@ -1131,7 +1151,7 @@ class TestCreateFile:
             tools, "create_file", ctx,
             dir_key="project", name="notes.md", content_lines=["hi"],
         )
-        assert "on the way" not in result
+        assert "did not exist and was created" not in result
 
     async def test_a_script_faces_the_same_content_gate(self, tools, ctx, tmp_path):
         # §5.2 is mandatory: a second way to put content into a script file

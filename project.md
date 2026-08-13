@@ -422,13 +422,30 @@ the orchestrator's or another subagent's context.
   stored in sqlite. Tools accept **keys**, middleware resolves to real paths and
   errors out on unknown keys (error fed back for retry). New paths discovered by
   tools (e.g. output of a job) are auto-registered and announced to the model as
-  their key. The model never has to reproduce a literal path correctly.
+  their key.
+  *What the registry is for* was originally "the model mis-copies long paths".
+  That premise did not survive measurement: asked to read a 161-character
+  cluster path (repeated segments, a date, sample ids with suffixes), the 27B
+  reproduced it byte-for-byte 20 times out of 20 — and constrained decoding
+  cannot help there, since inside a JSON string every character is legal. The
+  registry earns its place for a different reason: **durable naming**. A key
+  resolves from sqlite whatever is in the context window; a long path that has
+  scrolled out of a compacted conversation is simply gone, and the agent has to
+  ask or re-discover it. Sessions now turn context over faster (a tool round is
+  two messages, not one), so that argument got stronger, not weaker. Keys also
+  give a stable handle to something the user never spelled out — a job's output
+  directory, a file a script produced.
   A key may point at something that does not exist **yet**: `register_path`
   takes a path either way and says which case it is, because the path the agent
   is about to create needs a key before the call that creates it. The tools
   that resolve keys report the absence in those terms (`read_file` says nothing
-  is there; `create_file` simply makes the directory, as it already did for
+  is there; `create_file` makes the directory, as it already did for
   intermediate ones) rather than raising a bare `FileNotFoundError`.
+  `create_file` is the one file tool that will build a mistyped path instead of
+  failing on it — every other one needs its target to exist — so when it has to
+  create the directory it says so as a **caution** naming the path, inviting a
+  spelling check before ten more calls are built on the wrong tree. That is the
+  warning `register_path` used to give by refusing a path that was not there.
   A key is no longer *required*, either: wherever a file tool takes a key it
   also takes a literal absolute path, which it auto-registers on the way
   through (`PathRegistry.resolve_or_register`; the HITL predicates resolve the

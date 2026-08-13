@@ -798,13 +798,25 @@ async def create_file(args: CreateFileParams, ctx: ToolContext) -> str:
     path.write_text(content)
     key = ctx.registry.register_auto(path, hint=path.stem)
     extra = f" ({'; '.join(warnings)})" if warnings else ""
-    # Say when a directory had to be made: writing a file is one thing, and
-    # creating the tree it sits in is another the user may not have asked for.
-    made = f" (created {path.parent} on the way)" if made_dirs else ""
+    # A made directory is a caution, not a footnote. Every other file tool
+    # fails loudly on a mistyped path because the target has to exist already;
+    # this one silently makes whatever it is given, so a typo lands the file in
+    # a plausible-looking wrong place and reports success. Naming it is what
+    # gives the model — and the user reading the transcript — a chance to catch
+    # a misspelling before the next ten calls build on it. This replaces the
+    # warning register_path used to give when a directory was registered before
+    # it existed, which a literal dir path now skips (see specs-edit-eval.md §6).
+    made = (
+        f" NOTE: {path.parent} did not exist and was created. If you meant a "
+        "directory that is already there, the path is misspelled — check it "
+        "against what the user wrote before building on this file."
+        if made_dirs
+        else ""
+    )
     return (
-        f"Created {path} ({_lines(len(content_lines))}){made}, registered as "
+        f"Created {path} ({_lines(len(content_lines))}), registered as "
         f"{key!r}{extra}. Change it with edit_file, not by writing it "
-        f"again.{_tbd_note(content)}{registered_note(args.dir_key, dir_key)}"
+        f"again.{made}{_tbd_note(content)}{registered_note(args.dir_key, dir_key)}"
     )
 
 
