@@ -35,7 +35,7 @@ from pydantic import BaseModel, Field, field_validator
 from hpca.agent.context import ToolContext
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.checks import syntax_check
-from hpca.registry import RegistryError
+from hpca.registry import RegistryError, registered_note
 from hpca.verify_code import format_gate_failure, format_gate_warnings, verify_script
 
 SCRIPT_SUFFIX = {"bash": ".sh", "python": ".py", "R": ".R", "snakemake": ".smk"}
@@ -238,7 +238,9 @@ async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
 
 
 class ReadFileParams(BaseModel):
-    registry_key: str = Field(description="Registry key of the file to read")
+    registry_key: str = Field(
+        description="Registry key or absolute path of the file to read"
+    )
     subpath: str = Field(
         default="",
         description=(
@@ -282,8 +284,14 @@ def _list_dir(path: Path, key: str, max_lines: int) -> str:
 
 
 async def read_file(args: ReadFileParams, ctx: ToolContext) -> str:
-    path = ctx.registry.resolve(args.registry_key)
-    key = args.registry_key
+    path, key = ctx.registry.resolve_or_register(args.registry_key)
+    # Taken before the subpath descent below rebinds `key` to the inner file's
+    # own key: the note is about the argument the model passed, and a plain
+    # key + subpath call must read exactly as it always did.
+    note = registered_note(args.registry_key, key)
+    # A file's content is what the model copies edit_file's old_lines out of,
+    # so the note goes on its own line after it, never appended to a line.
+    tail = f"\n{note.strip()}" if note else ""
     if not path.exists():
         # A key may be registered ahead of the thing it names (register_path
         # accepts a path that is not there yet), and a file registered earlier
@@ -311,7 +319,7 @@ async def read_file(args: ReadFileParams, ctx: ToolContext) -> str:
         path = candidate
         key = ctx.registry.register_auto(path, hint=path.name)
     if path.is_dir():
-        return _list_dir(path, key, args.max_lines)
+        return _list_dir(path, key, args.max_lines) + tail
     lines = path.read_text(errors="replace").splitlines()
     total = len(lines)
     if args.start_line > total:
@@ -327,11 +335,11 @@ async def read_file(args: ReadFileParams, ctx: ToolContext) -> str:
     end = start + args.max_lines
     body = "\n".join(lines[start:end])
     if end >= total:
-        return body
+        return body + tail
     return (
         f"{body}\n... [file continues: lines {end + 1}-{total}; call "
         f"read_file again with start_line={end + 1}, and max_lines up to 500 "
-        "to see more per call]"
+        f"to see more per call]{tail}"
     )
 
 

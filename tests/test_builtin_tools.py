@@ -149,6 +149,54 @@ class TestReadFile:
         with pytest.raises(UnknownKeyError, match="known"):
             await call(tools, "read_file", ctx, registry_key="nope")
 
+    async def test_reads_a_literal_path_and_reports_its_new_key(
+        self, tools, ctx, tmp_path
+    ):
+        """A path the model just saw in `ls` output is usable as it stands —
+        no register_path round-trip first (§4.3, path-or-key)."""
+        f = tmp_path / "data.txt"
+        f.write_text("line1\nline2\n")
+        result = await call(tools, "read_file", ctx, registry_key=str(f))
+        assert "line1" in result and "line2" in result
+        assert ctx.registry.resolve("data.txt") == f
+        # The note is its own last line: the body above it is what the model
+        # copies edit_file's old_lines out of, and must stay untouched.
+        assert result.splitlines()[-1] == f"({f} is registered as 'data.txt')"
+
+    async def test_a_plain_key_read_carries_no_note(self, tools, ctx, tmp_path):
+        f = tmp_path / "data.txt"
+        f.write_text("line1\n")
+        ctx.registry.register("data", f)
+        assert await call(tools, "read_file", ctx, registry_key="data") == "line1"
+
+    async def test_key_and_subpath_read_carries_no_note(self, tools, ctx, tmp_path):
+        """The auto-registration a subpath already did is not a path argument,
+        so it must not start announcing itself."""
+        d = tmp_path / "run"
+        d.mkdir()
+        (d / "a.txt").write_text("inner\n")
+        ctx.registry.register("run_dir", d)
+        result = await call(
+            tools, "read_file", ctx, registry_key="run_dir", subpath="a.txt"
+        )
+        assert result == "inner"
+
+    async def test_literal_path_to_a_directory_is_listed(self, tools, ctx, tmp_path):
+        d = tmp_path / "tools"
+        d.mkdir()
+        (d / "run.sh").write_text("echo hi\n")
+        result = await call(tools, "read_file", ctx, registry_key=str(d))
+        assert "is a directory" in result
+        assert "run.sh" in result
+        assert "is registered as 'tools'" in result
+
+    async def test_a_relative_path_is_still_an_unknown_key(
+        self, tools, ctx, tmp_path
+    ):
+        ctx.registry.register("known", tmp_path / "k.txt")
+        with pytest.raises(UnknownKeyError, match="known"):
+            await call(tools, "read_file", ctx, registry_key="results/out.txt")
+
     async def test_a_key_pointing_at_nothing_says_so(self, tools, ctx, tmp_path):
         """register_path takes a path before it exists, and a registered file
         can be deleted from under its key. Either way the read must come back

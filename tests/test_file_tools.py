@@ -1249,3 +1249,144 @@ class TestPlaceholderTracking:
         )
         assert "1 placeholder line(s) still to fill" in result
         assert "TBD: B" in result
+
+
+class TestLiteralPaths:
+    """A key argument also takes a literal absolute path (§4.3, path-or-key).
+
+    The point is the round-trip a key costs: every agent corpus the model was
+    trained on has file tools that take paths, so a path it just saw in `ls`
+    output should be usable straight away. It gains a key on the way through,
+    which the result reports so the next call can be cheap.
+    """
+
+    async def test_edit_file_by_path_and_reports_the_key(self, tools, ctx, tmp_path):
+        target = tmp_path / "run.txt"
+        target.write_text("alpha\nbeta\n")
+        result = await call(
+            tools,
+            "edit_file",
+            ctx,
+            registry_key=str(target),
+            old_lines=["beta"],
+            new_lines=["gamma"],
+        )
+        assert target.read_text() == "alpha\ngamma\n"
+        assert "is registered as 'run.txt'" in result
+        assert ctx.registry.resolve("run.txt") == target
+
+    async def test_create_file_by_directory_path(self, tools, ctx, tmp_path):
+        result = await call(
+            tools,
+            "create_file",
+            ctx,
+            dir_key=str(tmp_path),
+            name="specs.md",
+            content_lines=["# specs"],
+        )
+        assert (tmp_path / "specs.md").read_text() == "# specs\n"
+        assert f"{tmp_path} is registered as" in result
+
+    async def test_delete_file_by_path(self, tools, ctx, tmp_path):
+        victim = tmp_path / "stale.log"
+        victim.write_text("stale")
+        result = await call(tools, "delete_file", ctx, registry_key=str(victim))
+        assert not victim.exists()
+        assert "recoverable" in result
+        # The key it got is dropped again by the deletion itself, so the result
+        # names none — nothing is left pointing at a file that is gone.
+        assert ctx.registry.list() == {}
+
+    async def test_delete_by_path_is_still_gated(self, tools, ctx, tmp_path):
+        """The HITL gate keys on resolvability, so it has to see paths too —
+        otherwise a literal path would be the way around §5.3."""
+        victim = tmp_path / "stale.log"
+        victim.write_text("stale")
+        assert gates(tools, "delete_file", ctx, registry_key=str(victim)) is True
+        # …and asking registers nothing: predicates stay side-effect free
+        assert ctx.registry.list() == {}
+
+    async def test_move_file_by_paths(self, tools, ctx, tmp_path):
+        source = tmp_path / "a.txt"
+        source.write_text("content")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        result = await call(
+            tools, "move_file", ctx,
+            source_key=str(source), dest_dir_key=str(dest),
+        )
+        assert (dest / "a.txt").read_text() == "content"
+        # the key follows the file, exactly as it does for a key-named move
+        assert ctx.registry.resolve("a.txt") == dest / "a.txt"
+        assert "'a.txt'" in result
+        assert f"{dest} is registered as" in result
+
+    async def test_copy_file_by_paths(self, tools, ctx, tmp_path):
+        source = tmp_path / "a.txt"
+        source.write_text("content")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        result = await call(
+            tools, "copy_file", ctx,
+            source_key=str(source), dest_dir_key=str(dest),
+        )
+        assert source.exists()
+        assert (dest / "a.txt").read_text() == "content"
+        assert "a.txt_copy" in result  # hint off the key, not off the whole path
+
+    async def test_path_inside_a_registered_directory_gets_its_own_key(
+        self, tools, ctx, tmp_path
+    ):
+        """A registered directory does not claim what is under it: the file
+        gets a key of its own and the directory key is untouched."""
+        ctx.registry.register("ws", tmp_path)
+        target = tmp_path / "run.txt"
+        target.write_text("alpha\n")
+        await call(
+            tools, "edit_file", ctx,
+            registry_key=str(target), old_lines=["alpha"], new_lines=["beta"],
+        )
+        assert ctx.registry.list() == {"ws": tmp_path, "run.txt": target}
+
+    async def test_a_key_wins_over_a_path(self, tools, ctx, tmp_path):
+        """Precedence is key-first, so a session's own names never change
+        meaning — and a key can never be shaped like a path anyway."""
+        named = tmp_path / "named.txt"
+        named.write_text("alpha\n")
+        ctx.registry.register("target", named)
+        result = await call(
+            tools, "edit_file", ctx,
+            registry_key="target", old_lines=["alpha"], new_lines=["beta"],
+        )
+        assert named.read_text() == "beta\n"
+        assert "is registered as" not in result  # nothing new was registered
+
+    async def test_tilde_is_expanded(self, tools, ctx, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        target = tmp_path / "notes.md"
+        target.write_text("alpha\n")
+        result = await call(
+            tools, "edit_file", ctx,
+            registry_key="~/notes.md", old_lines=["alpha"], new_lines=["beta"],
+        )
+        assert target.read_text() == "beta\n"
+        assert "is registered as 'notes.md'" in result
+
+    async def test_a_bare_name_still_errors_with_the_key_list(
+        self, tools, ctx, tmp_path
+    ):
+        ctx.registry.register("ws", tmp_path)
+        with pytest.raises(UnknownKeyError) as exc:
+            await call(
+                tools, "edit_file", ctx,
+                registry_key="ghost", old_lines=["a"], new_lines=["b"],
+            )
+        assert "ws" in str(exc.value)
+
+    async def test_a_relative_path_still_errors(self, tools, ctx, tmp_path):
+        ctx.registry.register("ws", tmp_path)
+        with pytest.raises(UnknownKeyError):
+            await call(
+                tools, "create_file", ctx,
+                dir_key="results/out", name="x.md", content_lines=["x"],
+            )

@@ -8,7 +8,12 @@ their message must name the available keys.
 import pytest
 
 from hpca.db import connect, init_db
-from hpca.registry import PathRegistry, RegistryError, UnknownKeyError
+from hpca.registry import (
+    PathRegistry,
+    RegistryError,
+    UnknownKeyError,
+    registered_note,
+)
 
 
 @pytest.fixture
@@ -119,6 +124,76 @@ class TestAutoRegister:
     def test_hint_is_slugified(self, registry, tmp_path):
         key = registry.register_auto(tmp_path / "x", hint="My Fancy Output!!")
         assert key == "my_fancy_output"
+
+
+class TestResolveOrRegister:
+    """A key or a literal absolute path — the one helper every file tool's
+    key argument goes through (§4.3, path-or-key)."""
+
+    def test_known_key_resolves_and_registers_nothing(self, registry, tmp_path):
+        registry.register("input_bam", tmp_path / "a.bam")
+        path, key = registry.resolve_or_register("input_bam")
+        assert (path, key) == (tmp_path / "a.bam", "input_bam")
+        assert list(registry.list()) == ["input_bam"]
+
+    def test_absolute_path_is_used_and_gains_a_key(self, registry, tmp_path):
+        target = tmp_path / "counts.tsv"
+        path, key = registry.resolve_or_register(str(target))
+        assert path == target
+        assert key == "counts.tsv"
+        assert registry.resolve(key) == target
+
+    def test_a_key_wins_over_a_path_that_looks_the_same(self, registry, tmp_path):
+        """Keys are checked first, so nothing a session already named can
+        change meaning — and KEY_RE keys cannot start with '/' anyway."""
+        registry.register("ref", tmp_path / "ref.fa")
+        assert registry.resolve_or_register("ref") == (tmp_path / "ref.fa", "ref")
+
+    def test_tilde_is_expanded(self, registry, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        path, key = registry.resolve_or_register("~/notes.md")
+        assert path == tmp_path / "notes.md"
+        assert registry.resolve(key) == tmp_path / "notes.md"
+
+    def test_same_path_twice_keeps_one_key(self, registry, tmp_path):
+        first = registry.resolve_or_register(str(tmp_path / "x.log"))[1]
+        second = registry.resolve_or_register(str(tmp_path / "x.log"))[1]
+        assert first == second
+        assert list(registry.list()) == [first]
+
+    def test_bare_name_still_raises_unknown_key(self, registry, tmp_path):
+        registry.register("input_bam", tmp_path / "a.bam")
+        with pytest.raises(UnknownKeyError) as exc:
+            registry.resolve_or_register("input_bm")
+        assert "input_bam" in str(exc.value)
+
+    def test_relative_path_still_raises_unknown_key(self, registry, tmp_path):
+        # As likely a mistyped key as a path; the key listing answers both.
+        registry.register("input_bam", tmp_path / "a.bam")
+        with pytest.raises(UnknownKeyError):
+            registry.resolve_or_register("results/counts.tsv")
+
+    def test_register_false_resolves_without_writing(self, registry, tmp_path):
+        """What the gating predicates use: they re-run when a parked turn
+        resumes, and a declined call must not leave a key behind."""
+        target = tmp_path / "a.bam"
+        path, key = registry.resolve_or_register(str(target), register=False)
+        assert path == target
+        assert key == str(target)
+        assert registry.list() == {}
+
+    def test_hint_names_the_key(self, registry, tmp_path):
+        _, key = registry.resolve_or_register(str(tmp_path / "x"), hint="output dir")
+        assert key == "output_dir"
+
+
+class TestRegisteredNote:
+    def test_empty_when_the_argument_was_a_key(self):
+        assert registered_note("ref", "ref") == ""
+
+    def test_names_path_and_key_when_a_path_was_registered(self):
+        note = registered_note("/data/ref.fa", "ref.fa")
+        assert "/data/ref.fa" in note and "'ref.fa'" in note
 
 
 class TestScoping:
