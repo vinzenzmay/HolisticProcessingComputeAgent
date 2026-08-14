@@ -11,10 +11,16 @@ from hpca.skills import load_own_skills, load_skills
 from hpca.tui.app import ChatInput, HpcaApp
 from hpca.tui.inspect_screen import InspectScreen
 from hpca.tui.skill_screens import SkillCreatorScreen, SkillPickerScreen
+from tests.conftest import wait_for_screen
 
 
 def is_title_request(json_schema):
     return bool(json_schema) and "title" in (json_schema.get("properties") or {})
+
+
+def is_draft_request(json_schema):
+    """The /skill-creator draft call — the only schema asking for a body."""
+    return bool(json_schema) and "body" in (json_schema.get("properties") or {})
 
 
 TITLE_REPLY = json.dumps({"title": "a test session"})
@@ -33,6 +39,32 @@ class FakeLLM:
 
     async def supports_constrained_decoding(self):
         return True
+
+
+class DraftingLLM(FakeLLM):
+    """A backend that also answers the /skill-creator draft call — with a
+    draft, or by falling over, depending on what the test is about."""
+
+    def __init__(self, draft=None, outputs=(), fail=False):
+        super().__init__(outputs)
+        self._draft = draft or {}
+        self._fail = fail
+        self.draft_prompts = []
+
+    async def chat(self, messages, *, json_schema=None, **kwargs):
+        if is_draft_request(json_schema):
+            self.draft_prompts.append(list(messages))
+            if self._fail:
+                raise RuntimeError("backend down")
+            return ChatResponse(content=json.dumps(self._draft))
+        return await super().chat(messages, json_schema=json_schema, **kwargs)
+
+
+NOTEBOOK_DRAFT = {
+    "name": "Jupyter Runs",
+    "description": "Start a notebook run and watch it to completion",
+    "body": "1. Submit with papermill.\n2. Poll squeue until it clears.",
+}
 
 
 def respond_json(text="done"):
@@ -146,6 +178,119 @@ class TestSkillCreator:
             await create_skill(app, pilot, "grilling", "d", GRILL_BODY)
             await create_skill(app, pilot, "grilling", "again", "other body")
             assert len(load_own_skills(app.profile)) == 1
+
+
+class TestSkillCreatorDraft:
+    """"/skill-creator <what it should do>" drafts first: the model fills the
+    same form, the user still edits it and still confirms the save."""
+
+    async def test_the_form_opens_pre_filled(self, hpca_home):
+        llm = DraftingLLM(NOTEBOOK_DRAFT)
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit(
+                app,
+                pilot,
+                "/skill-creator a skill that starts and monitors jupyter runs",
+            )
+            screen = await wait_for_screen(app, pilot, SkillCreatorScreen)
+            # The name is normalised into something invocable as /<skill>.
+            assert screen.query_one("#skill-name", Input).value == "jupyter-runs"
+            assert (
+                screen.query_one("#skill-description", Input).value
+                == "Start a notebook run and watch it to completion"
+            )
+            assert "papermill" in screen.query_one("#skill-body", TextArea).text
+
+    async def test_the_pre_filled_draft_saves_like_any_other_skill(self, hpca_home):
+        app = HpcaApp(llm=DraftingLLM(NOTEBOOK_DRAFT))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit(app, pilot, "/skill-creator monitor jupyter runs")
+            await wait_for_screen(app, pilot, SkillCreatorScreen)
+            await pilot.press("escape")
+            await pilot.pause()
+            await pilot.press("y")  # it still asks before writing
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            own = load_own_skills(app.profile)
+            assert [s.name for s in own] == ["jupyter-runs"]
+            assert "papermill" in own[0].body
+
+    async def test_the_request_and_the_conversation_reach_the_drafter(self, hpca_home):
+        llm = DraftingLLM(NOTEBOOK_DRAFT, outputs=[respond_json("use papermill")])
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit(app, pilot, "how do I run a notebook headless?")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            await submit(app, pilot, "/skill-creator turn that into a skill")
+            await wait_for_screen(app, pilot, SkillCreatorScreen)
+            prompt = _user_message(llm.draft_prompts[0])["content"]
+            assert "turn that into a skill" in prompt
+            assert "run a notebook headless" in prompt  # the conversation
+
+    async def test_the_spinner_names_the_wait(self, hpca_home):
+        """Drafting is a real generation; the user is told what it is for."""
+        import asyncio
+
+        from hpca.tui.app import WorkingIndicator
+
+        release = asyncio.Event()
+
+        class SlowLLM(DraftingLLM):
+            async def chat(self, messages, *, json_schema=None, **kwargs):
+                if is_draft_request(json_schema):
+                    await release.wait()
+                return await super().chat(messages, json_schema=json_schema, **kwargs)
+
+        app = HpcaApp(llm=SlowLLM(NOTEBOOK_DRAFT))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit(app, pilot, "/skill-creator monitor jupyter runs")
+            spinner = app.query_one(WorkingIndicator)
+            assert "drafting a skill" in spinner._frame_text()
+            release.set()
+            await wait_for_screen(app, pilot, SkillCreatorScreen)
+            await pilot.press("escape")
+            await pilot.pause()
+            await pilot.press("y")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            # …and it is gone once the form has been dealt with.
+            assert not app.query(WorkingIndicator)
+
+    async def test_a_bare_command_drafts_nothing(self, hpca_home):
+        """The old behaviour is untouched: no argument, no backend call."""
+        llm = DraftingLLM(NOTEBOOK_DRAFT)
+        app = HpcaApp(llm=llm)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit(app, pilot, "/skill-creator")
+            assert isinstance(app.screen, SkillCreatorScreen)
+            assert llm.draft_prompts == []
+            assert app.screen.query_one("#skill-name", Input).value == ""
+            assert app.screen.query_one("#skill-body", TextArea).text == ""
+
+    async def test_a_failed_draft_still_opens_the_form(self, hpca_home):
+        """A backend that will not draft must not eat the command."""
+        app = HpcaApp(llm=DraftingLLM(fail=True))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit(app, pilot, "/skill-creator monitor jupyter runs")
+            screen = await wait_for_screen(app, pilot, SkillCreatorScreen)
+            assert screen.query_one("#skill-name", Input).value == ""
+
+    async def test_an_empty_pre_filled_form_can_still_be_abandoned(self, hpca_home):
+        """Clearing every field and pressing escape cancels, draft or not."""
+        app = HpcaApp(llm=DraftingLLM(NOTEBOOK_DRAFT))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit(app, pilot, "/skill-creator monitor jupyter runs")
+            screen = await wait_for_screen(app, pilot, SkillCreatorScreen)
+            screen.query_one("#skill-name", Input).value = ""
+            screen.query_one("#skill-description", Input).value = ""
+            screen.query_one("#skill-body", TextArea).text = ""
+            await pilot.press("escape")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert not isinstance(app.screen, SkillCreatorScreen)
+            assert load_own_skills(app.profile) == []
 
 
 class TestSkillLevelSelection:

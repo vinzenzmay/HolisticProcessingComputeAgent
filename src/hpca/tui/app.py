@@ -76,6 +76,7 @@ from hpca.agent.prompts import (
     orchestrator_system_prompt,
 )
 from hpca.agent.reflect import Reflection, propose_reflections
+from hpca.agent.skill_drafter import SkillDraft, propose_skill
 from hpca.agent.skill_tools import add_skill_tools
 from hpca.agent.titler import propose_title
 from hpca.agent.struggle import (
@@ -329,7 +330,11 @@ COMMANDS = (
         "/compact [what to keep / what you do next] — fold this conversation "
         "into a summary and free the context",
     ),
-    ("skill-creator", "/skill-creator — add a skill (name, description, body) to this profile"),
+    (
+        "skill-creator",
+        "/skill-creator [what it should do] — add a skill (name, description, "
+        "body) to this profile; with a description the model drafts it first",
+    ),
     ("skills-list", "/skills-list — list this profile's skills"),
     ("skill-remove", "/skill-remove — remove one of this profile's skills"),
 )
@@ -2142,12 +2147,14 @@ class HpcaApp(App):
     async def _backend_working(self, label: str, *, session: "Session | None"):
         """Feedback around a silent backend (LLM) call. Chat-bottom spinner when
         `session` is the open, turn-free session; otherwise the sidebar row glyph.
-        Teardown is guaranteed, so an exception in the call can't strand it."""
+        Teardown is guaranteed, so an exception in the call can't strand it.
+
+        No session at all (a command run before the first one is opened, e.g.
+        /skill-creator) still gets the chat spinner: there is no row to mark,
+        and the alternative is a silent wait."""
         sid = session.session_id if session is not None else None
-        use_chat = (
-            session is not None
-            and self._is_active_session(session)
-            and sid not in self._turns
+        use_chat = sid is None or (
+            self._is_active_session(session) and sid not in self._turns
         )
         if use_chat:
             self.show_working(label)
@@ -2557,7 +2564,7 @@ class HpcaApp(App):
                 self._compact_worker(self.active_session, rest), exclusive=True
             )
         elif command == "skill-creator":
-            self.run_worker(self._skill_creator_worker(), exclusive=True)
+            self.run_worker(self._skill_creator_worker(rest), exclusive=True)
         elif command == "skills-list":
             self._show_skills_list()
         elif command == "skill-remove":
@@ -2633,13 +2640,49 @@ class HpcaApp(App):
 
     # ------------------------------------------------------------- skills (§5.1)
 
-    async def _skill_creator_worker(self) -> None:
+    async def _draft_skill(self, request: str) -> SkillDraft | None:
+        """The model's first draft for /skill-creator, or None if it failed.
+
+        Spinner-backed like every other silent backend call, so the wait
+        between the command and the form is accounted for on screen. Failure
+        is a warning, not an error: the empty form still opens behind it."""
+        session = self.active_session
+        messages = await self._session_messages(session) if session else []
+        try:
+            async with self._backend_working("drafting a skill", session=session):
+                return await propose_skill(
+                    self._labelled_llm("skill-creator", session=session),
+                    request,
+                    messages=messages,
+                    existing=summarize_skills(self.skills),
+                )
+        except Exception as e:
+            self.notify(
+                f"Could not draft that skill ({e}); opening an empty form.",
+                severity="warning",
+            )
+            return None
+
+    async def _skill_creator_worker(self, request: str = "") -> None:
         """/skill-creator: collect a skill in a form and write it at the level
         the user chose — global (every profile), profile (the one on screen),
-        or project (the working directory)."""
+        or project (the working directory).
+
+        With a ``request`` ("/skill-creator watch a jupyter run"), the model
+        drafts name, description and body first and the form opens pre-filled.
+        The draft is only a head start: the same form, the same edits, the
+        same confirmation. A failed draft opens the empty form rather than
+        losing the command."""
         from hpca.tui.skill_screens import SkillCreatorScreen
 
-        result = await self.push_screen_wait(SkillCreatorScreen())
+        draft = await self._draft_skill(request) if request else None
+        result = await self.push_screen_wait(
+            SkillCreatorScreen(
+                name=draft.name if draft else "",
+                description=draft.description if draft else "",
+                body=draft.body if draft else "",
+            )
+        )
         if result is None:
             return
         skill, level = result

@@ -89,3 +89,52 @@ them faithfully, and the task passed 3/3 even on the pre-fuzzy v0.17.0 code.
 The trap (and the fuzzy ladder's unicode level it was meant to justify) is
 insurance for other backends, perhaps not needed at all; don't grow that
 machinery without a measured failure first.
+
+---
+
+# skill_draft_eval — how well the live model drafts a skill from one line
+
+The instrument for `/skill-creator <what it should do>` (§5.1): ten requests a
+user would plausibly type, run through the real
+`hpca.agent.skill_drafter.propose_skill` against a live backend. Two of the ten
+carry a synthetic conversation, because "write a skill based on our
+conversation" is the case the feature exists for; one plants a job id and a
+one-off path in the request to check they do not end up in the skill.
+
+Each draft is graded on the five things the form actually needs — **invocable**
+(kebab-case name that survives as a slash command), **described** (a one-line
+description that is not the name again), **procedural** (a body with real
+steps, not a sentence), **on topic** (a concrete term the request implies shows
+up), **generalised** (today's ids and paths did not leak into name or body).
+
+```sh
+export HPCA_TEST_LLM_KEY=...   # if the endpoint is key-locked
+pixi run -e dev python evals/skill_draft_eval.py --dry-run     # plumbing only
+pixi run -e dev python evals/skill_draft_eval.py --repeats 2 --out results.json
+pixi run -e dev python evals/skill_draft_eval.py --show        # print each draft
+```
+
+Options: `--repeats N` (default 1), `--only SUBSTR`, `--label`, `--out`,
+`--show`, `--dry-run`. Exit codes as above: 0 ok, 2 backend unreachable or 401.
+
+## Measured, v0.21.0
+
+Qwen3.6-27B-AWQ, 10 tasks × 2 repeats: **20/20 on all five checks**, mean 9.2
+body lines, mean 7.3s per draft (total 146s). One draft per command is the
+whole cost, so the form appears in under ten seconds.
+
+## Two prompt findings from building it
+
+Both were failures the eval caught, fixed in `skill_drafter.SYSTEM_PROMPT`:
+
+- **"one line" is not a length.** Descriptions came back at 130-140 characters
+  and were being truncated mid-sentence into the form; asking for *at most 25
+  words* and raising the cleaner's cap to the schema's own 200 fixed it.
+- **Forbidding specifics in general does nothing; forbidding them where the
+  model is writing does.** "Today's job ids do not belong in the skill", placed
+  as a closing rule, still left `run17` in the body of 2 of 3 drafts as an
+  "e.g."; moving the constraint into the *body* bullet ("write a placeholder —
+  `<job-id>` — never the actual id from the request, not even as an example")
+  took it to 3/3, without the model dropping the real tools the conversation
+  had established (`papermill`, `--mem`, `cProfile`, `line_profiler` all
+  survive, parameterised).

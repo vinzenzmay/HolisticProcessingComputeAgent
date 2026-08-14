@@ -4,8 +4,11 @@ remove. Skills are per-profile procedure files; the app owns writing/deleting.
 ``SkillCreatorScreen`` collects a new skill in one form — name, description,
 level, then body, top to bottom — and dismisses a ``(Skill, level)`` pair (or
 ``None``). The level chooses where the skill is stored: global (every
-profile), profile (this one), or project (this directory). ``SkillPickerScreen``
-lists the removable skills and dismisses the chosen one for removal.
+profile), profile (this one), or project (this directory). The fields can be
+seeded with a model-written draft (``/skill-creator <what it should do>``);
+the form is the same either way, so a draft is edited and confirmed exactly
+like a hand-typed skill. ``SkillPickerScreen`` lists the removable skills and
+dismisses the chosen one for removal.
 """
 
 from __future__ import annotations
@@ -43,6 +46,10 @@ class SkillCreatorScreen(ModalScreen["tuple[Skill, SkillLevel] | None"]):
 
     A single form rather than several pop-ups — the fields are filled top to
     bottom (name → description → level → body), tab moves between them.
+
+    ``draft`` pre-fills those three fields with a model-written first draft.
+    A pre-filled form is not "already saved": escape still asks, and the
+    empty-form cancel only applies once the user has cleared every field.
     """
 
     # Save is resolved on escape ("Save skill? y/n") — no ctrl+s (reserved
@@ -66,13 +73,30 @@ class SkillCreatorScreen(ModalScreen["tuple[Skill, SkillLevel] | None"]):
     #skill-hint { color: $text-muted; margin: 1 0 0 0; }
     """
 
+    def __init__(
+        self,
+        *,
+        name: str = "",
+        description: str = "",
+        body: str = "",
+    ) -> None:
+        super().__init__()
+        self._name = name
+        self._description = description
+        self._body = body
+        self._drafted = bool(name or description or body)
+
     def compose(self) -> ComposeResult:
         with Vertical(id="skill-dialog"):
-            yield Static("New skill", id="skill-title")
+            title = "New skill — draft, edit it" if self._drafted else "New skill"
+            yield Static(title, id="skill-title")
             yield Static("name", classes="skill-field-label")
-            yield Input(placeholder="short-kebab-name", id="skill-name")
+            yield Input(
+                self._name, placeholder="short-kebab-name", id="skill-name"
+            )
             yield Static("description", classes="skill-field-label")
             yield Input(
+                self._description,
                 placeholder="one line — when should the agent use this?",
                 id="skill-description",
             )
@@ -87,7 +111,7 @@ class SkillCreatorScreen(ModalScreen["tuple[Skill, SkillLevel] | None"]):
                     "project — this directory only", id="level-project"
                 )
             yield Static("body (the procedure)", classes="skill-field-label")
-            yield TextArea(id="skill-body")
+            yield TextArea(self._body, id="skill-body")
             yield Static(
                 "(esc) save & close (asks first) · (tab) next field",
                 id="skill-hint",

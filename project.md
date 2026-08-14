@@ -205,8 +205,10 @@ in sync with the `RESERVED HOTKEYS` comment above `HpcaApp.BINDINGS`.
     summary is then written for it, and the brief itself stays in the folded view
     so it keeps framing the turns that follow. The chat is not rewritten; only the
     view the model receives is folded.
-  * `/skill-creator`, `/skills-list`, `/skill-remove` — manage this profile's
-    skills (see §5.1).
+  * `/skill-creator [WHAT IT SHOULD DO]`, `/skills-list`, `/skill-remove` — manage
+    this profile's skills (see §5.1). With a description, the model drafts name,
+    description and body from it (and the conversation so far) and the form opens
+    pre-filled; bare, the form opens empty as before.
   * `/<skill> [PROMPT]` — invoke a user-defined skill directly: its procedure is
     handed to the model inline for that turn (see §5.1). Unlike the built-in
     commands, this is a real turn — queued and run like any message, not an
@@ -545,6 +547,17 @@ skills exist; a skill body reaches the model just two ways, cheapest first:
    request seems to match one (passing any name returns the available skills, so it
    can still discover them without the list being spent on every turn). The tool is
    registered whenever any skill exists anywhere reachable.
+
+**Writing one is drafted, never automatic.** A blank creator form asks the user to
+be an author on the spot, which is why most profiles have no skills; `/skill-creator
+<what it should do>` instead spends one firewalled generation (`agent/skill_drafter`)
+on a first draft — name, description, body — from the request plus the conversation
+so far, and opens the *same* form pre-filled. The draft is a head start, not an
+author: the fields are ordinary editable fields, escape still asks before writing,
+and a backend that will not draft opens the empty form rather than eating the
+command. The name is normalised to a kebab-case handle before it reaches the form,
+since a name with spaces can never be invoked as `/<skill>`. Nothing here writes a
+skill without the user reading it — the same rule as memory (§6).
 
 Core tools:
 
