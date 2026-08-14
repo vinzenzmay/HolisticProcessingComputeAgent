@@ -26,6 +26,17 @@ backend after the reordering, a run_bash heredoc still produced a trailing
 ``timeout_s:`` element in 1 of 4 generations — the model repeats the key at the
 end of the arguments out of habit, whether or not the grammar has one left to
 give it. Ordering lowers the rate; the strip is what makes it not matter.
+
+``edit_file`` is the one tool the ordering rule cannot save, and it is worth
+being explicit about why. It needs *two* arrays — the lines out and the lines
+in — so whichever comes first has a key after it, and the model reaches for it:
+observed as ``new_lines**: [`` swallowed into ``old_lines`` in 6 of 12 failed
+edits in one real session. That form slipped past both defences at once — the
+markdown asterisks defeated the pattern, and ``[`` is not valid JSON — so the
+edit was reported as a content mismatch, and the agent spent three round-trips
+fixing indentation that was never wrong before abandoning ``edit_file`` for
+``sed -i``. Both holes are closed below; ``edit_file`` additionally recognises
+the shape itself, because a repair that fails must not fail silently.
 """
 
 from __future__ import annotations
@@ -38,6 +49,7 @@ from typing import Any, get_args, get_origin
 
 from pydantic import BaseModel, ValidationError
 
+from hpca.agent.history import ELIDED_MARKER
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.llm import Message, TruncatedOutput
 
@@ -301,17 +313,40 @@ def _example_value(annotation: Any, description: str) -> Any:
 # quoted key, a colon, and a value. The value must be JSON — that is what the
 # model was mid-way through writing — which is what keeps prose out of range:
 # a heredoc ending on `name: the tool` does not match, `"name": "x"` does.
+#
+# The key may arrive wrapped in markdown emphasis (`**new_lines**:`). The model
+# writes the key the way it writes prose, and under constrained decoding a `*`
+# at an illegal position is masked away, so the pair can survive lopsided —
+# hence `\**` on both sides rather than a balanced pair.
 _KEY_ECHO = re.compile(
-    r'^\s*"?(?P<key>[A-Za-z_][A-Za-z0-9_]*)"?\s*:\s*(?P<value>.*?),?\s*$'
+    r'^\s*\**"?(?P<key>[A-Za-z_][A-Za-z0-9_]*)"?\**\s*:\s*(?P<value>.*?),?\s*$'
 )
 
+# The value of an echoed *container* argument: the model got as far as opening
+# it. An unclosed bracket is never valid JSON, so these have to be admitted by
+# name — see `_is_echo`.
+_OPENED_CONTAINER = {"[", "{", "[]", "{}"}
 
-def _is_echo(element: str, siblings: set[str]) -> str:
-    """The argument this element is an echo of, or "" if it is a real line."""
+
+def _is_echo(element: str, siblings: dict[str, Any]) -> str:
+    """The argument this element is an echo of, or "" if it is a real line.
+
+    ``siblings`` maps each *other* field's name to its annotation, because
+    what counts as a plausible value depends on the field it would fill.
+    """
     match = _KEY_ECHO.match(element)
     if match is None or match["key"] not in siblings:
         return ""
-    value = match["value"]
+    value = match["value"].strip()
+    if value in _OPENED_CONTAINER:
+        # `new_lines: [` — the model closed one array and opened the next
+        # inside the string it was still writing. Only for a field that IS a
+        # container: `count: [` names no argument this model could be filling.
+        return (
+            match["key"]
+            if get_origin(siblings[match["key"]]) in (list, dict)
+            else ""
+        )
     if value:
         try:
             json.loads(value)
@@ -325,10 +360,10 @@ def _strip_key_echo(params: type[BaseModel], arguments: dict) -> list[str]:
     arguments, in place. Returns one note per element dropped.
 
     See the module docstring for what produces them. The check is deliberately
-    narrow — last element only, a sibling field's exact name, a JSON value, and
-    never the only element left — because the cost of a false positive is a
-    line quietly missing from a file the user asked for. Anything dropped is
-    reported rather than swallowed.
+    narrow — last element only, a sibling field's exact name, a JSON value or
+    the opening bracket of a container one, and never the only element left —
+    because the cost of a false positive is a line quietly missing from a file
+    the user asked for. Anything dropped is reported rather than swallowed.
     """
     notes: list[str] = []
     for name, field_info in params.model_fields.items():
@@ -337,7 +372,11 @@ def _strip_key_echo(params: type[BaseModel], arguments: dict) -> list[str]:
         value = arguments.get(name)
         if not isinstance(value, list):
             continue
-        siblings = set(params.model_fields) - {name}
+        siblings = {
+            other: info.annotation
+            for other, info in params.model_fields.items()
+            if other != name
+        }
         while len(value) > 1 and isinstance(value[-1], str):
             echoed = _is_echo(value[-1], siblings)
             if not echoed:
@@ -350,6 +389,45 @@ def _strip_key_echo(params: type[BaseModel], arguments: dict) -> list[str]:
     for note in notes:  # a repair is also how a backend regression shows up
         logger.warning("%s: %s", params.__name__, note)
     return notes
+
+
+def _elided_placeholder(value: Any) -> str:
+    """A marker from the model's own history found in an argument, or "".
+
+    Walks nested lists and dicts, because a payload one level down is where
+    these turn up: the argument the model copied back was a list of lines.
+    """
+    if isinstance(value, str):
+        found = ELIDED_MARKER.search(value)
+        return found.group(0) if found else ""
+    if isinstance(value, list):
+        return next((hit for hit in map(_elided_placeholder, value) if hit), "")
+    if isinstance(value, dict):
+        return next(
+            (hit for hit in map(_elided_placeholder, value.values()) if hit), ""
+        )
+    return ""
+
+
+def _reject_elided(arguments: Any) -> None:
+    """Refuse a call that carries the history's own elision marker as content.
+
+    ``history.elide`` names every cut so the model can tell a truncated
+    argument from a short one, but naming it does not stop the model copying
+    the name forward as if it were the content. Writing that to a file destroys
+    it, and silently: the call succeeds. Better a bounced decision, which is a
+    round-trip, than a file replaced by a sentence about how long it used to be.
+    """
+    marker = _elided_placeholder(arguments)
+    if not marker:
+        return
+    raise ValueError(
+        f"Your arguments contain {marker!r}, which is not content — it is the "
+        "placeholder this conversation puts in place of a long argument you "
+        "already sent, so copying it back would write it into the file. Send "
+        "the real lines. If they are too many for one call, write the first "
+        "part and add the rest with edit_file."
+    )
 
 
 def _parse(raw: str, tools: ToolRegistry) -> Decision:
@@ -380,6 +458,7 @@ def _parse(raw: str, tools: ToolRegistry) -> Decision:
             if isinstance(raw_arguments, dict)
             else []
         )
+        _reject_elided(raw_arguments)
         try:
             arguments = tool.params.model_validate(raw_arguments)
         except ValidationError as e:
@@ -430,6 +509,7 @@ def _parse_native(response: Any, tools: ToolRegistry) -> Decision:
     if not isinstance(raw_arguments, dict):
         raise ValueError(f"The arguments for {tool.name!r} must be a JSON object.")
     repairs = _strip_key_echo(tool.params, raw_arguments)
+    _reject_elided(raw_arguments)
     if len(calls) > 1:
         repairs.append(
             f"kept the first of {len(calls)} calls in one response; "

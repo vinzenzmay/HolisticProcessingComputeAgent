@@ -604,6 +604,13 @@ def full_registry() -> ToolRegistry:
 class TestArgumentOrder:
     """Array-valued arguments come last (see ``middleware`` module docstring)."""
 
+    # edit_file is the one tool that cannot obey the rule: it needs the lines
+    # out and the lines in, so the first array always has a key after it. What
+    # protects it is `_strip_key_echo` plus edit_file's own recognition of the
+    # shape. Any OTHER tool growing a second array is unprotected, and this is
+    # where that gets noticed — see the middleware module docstring.
+    KNOWN_TWO_ARRAY_TOOLS = {"edit_file"}
+
     def test_no_scalar_argument_follows_an_array_one(self):
         offenders = []
         for tool in full_registry():
@@ -613,6 +620,18 @@ class TestArgumentOrder:
                     after_array = after_array or name
                 elif after_array:
                     offenders.append(f"{tool.name}.{name} follows {after_array}")
+        assert offenders == []
+
+    def test_only_edit_file_takes_more_than_one_array(self):
+        offenders = []
+        for tool in full_registry():
+            arrays = [
+                name
+                for name, field in tool.params.model_fields.items()
+                if get_origin(field.annotation) is list
+            ]
+            if len(arrays) > 1 and tool.name not in self.KNOWN_TWO_ARRAY_TOOLS:
+                offenders.append(f"{tool.name}: {arrays}")
         assert offenders == []
 
 
@@ -698,6 +717,107 @@ class TestKeyEcho:
         decision = await self.call(lines_tools, ["echo hi"], timeout_s=120)
         assert decision.arguments.timeout_s == 120
         assert decision.arguments.content_lines == ["echo hi"]
+
+    async def test_an_opened_container_for_a_scalar_field_is_kept(self, lines_tools):
+        # `label` is a string: `label: [` names no argument the model could
+        # have been filling, so the line is content.
+        decision = await self.call(lines_tools, ["echo hi", "label: ["])
+        assert decision.arguments.content_lines == ["echo hi", "label: ["]
+        assert decision.repairs == []
+
+
+class EditLikeParams(BaseModel):
+    """Two arrays, as edit_file has — the shape the ordering rule cannot fix."""
+
+    registry_key: str = Field(default="k")
+    old_lines: list[str] = Field(min_length=1)
+    new_lines: list[str] = Field(default_factory=list)
+
+
+@pytest.fixture
+def edit_like_tools():
+    registry = ToolRegistry()
+    registry.register(
+        Tool(
+            name="edit_file",
+            description="Edit a file",
+            params=EditLikeParams,
+            handler=lines_handler,
+        )
+    )
+    return registry
+
+
+class TestOpenedArrayEcho:
+    """The `new_lines: [` case: the model closed one array and opened the next
+    inside the string it was still writing. Its value is an unclosed bracket,
+    which is never valid JSON, so it needs admitting by name."""
+
+    async def call(self, tools, old_lines, **rest):
+        llm = FakeLLM([tool_json("edit_file", old_lines=old_lines, **rest)])
+        return await decide(llm, USER, tools)
+
+    async def test_opened_array_echo_dropped(self, edit_like_tools):
+        decision = await self.call(
+            edit_like_tools, ["if won:", "    return", "new_lines: ["]
+        )
+        assert decision.arguments.old_lines == ["if won:", "    return"]
+
+    async def test_markdown_wrapped_echo_dropped(self, edit_like_tools):
+        # As observed live: the emphasis survives on one side only, because a
+        # `*` at an illegal position is masked away by constrained decoding.
+        decision = await self.call(
+            edit_like_tools, ["if won:", "    return", "new_lines**: ["]
+        )
+        assert decision.arguments.old_lines == ["if won:", "    return"]
+
+    async def test_the_drop_is_reported(self, edit_like_tools):
+        decision = await self.call(
+            edit_like_tools, ["if won:", "    return", "new_lines: ["]
+        )
+        assert decision.repairs == [
+            "dropped a trailing old_lines element that echoed the "
+            "new_lines argument: 'new_lines: ['"
+        ]
+
+    async def test_a_real_line_ending_in_a_bracket_is_kept(self, edit_like_tools):
+        # `items: [` in a YAML file names no sibling, so it is content.
+        decision = await self.call(edit_like_tools, ["config:", "items: ["])
+        assert decision.arguments.old_lines == ["config:", "items: ["]
+        assert decision.repairs == []
+
+
+class TestElidedPlaceholder:
+    """A marker from the model's own history, copied back as content."""
+
+    def test_marker_found_in_a_nested_list(self):
+        from hpca.agent.middleware import _elided_placeholder
+
+        found = _elided_placeholder(
+            {"content_lines": ["extends Node2D", "... 257 more lines elided ..."]}
+        )
+        assert found == "... 257 more lines elided ..."
+
+    def test_chars_marker_found(self):
+        from hpca.agent.middleware import _elided_placeholder
+
+        assert _elided_placeholder({"body": "abc... 812 more chars elided ..."})
+
+    def test_ordinary_content_is_not_a_marker(self):
+        from hpca.agent.middleware import _elided_placeholder
+
+        assert _elided_placeholder({"content_lines": ["# 257 more lines below"]}) == ""
+
+    def test_a_call_carrying_one_is_refused(self):
+        from hpca.agent.middleware import _reject_elided
+
+        with pytest.raises(ValueError, match="not content"):
+            _reject_elided({"content_lines": ["... 257 more lines elided ..."]})
+
+    def test_a_clean_call_passes(self):
+        from hpca.agent.middleware import _reject_elided
+
+        assert _reject_elided({"content_lines": ["echo hi"]}) is None
 
 
 class TestTruncationSalvage:

@@ -492,6 +492,54 @@ def _near_miss(file_lines: list[str], old_lines: list[str]) -> str:
     )
 
 
+# An element that is really the start of another argument — `new_lines: [`, or
+# the same wrapped in markdown emphasis. hpca.agent.middleware strips these
+# before the call gets here; this is what catches the ones it declines to
+# touch (the only element left, or not the last one).
+_ARG_ECHO = re.compile(r'^\s*\**"?(?P<key>[A-Za-z_][A-Za-z0-9_]*)"?\**\s*:\s*[\[{]?\s*$')
+
+
+def _swallowed_argument(old_lines: list[str]) -> str:
+    """An old_lines element that is really the next argument, or ""."""
+    for line in old_lines:
+        match = _ARG_ECHO.match(line)
+        if match and match["key"] in EditFileParams.model_fields:
+            return line
+    return ""
+
+
+def _anchor_hint(file_lines: list[str], old_lines: list[str]) -> str:
+    """Where the first old line sits, and what actually follows it.
+
+    The fallback when nothing else explains a miss. "Not found" tells a model
+    only that it was wrong somewhere in a block it cannot see; showing it the
+    file at its own anchor tells it *which* of its lines drifted, which is the
+    one thing that lets it fix the call instead of re-reading the whole file.
+    """
+    hits: list[int] = []
+    for transform in _MATCH_LEVELS:
+        prepare = transform or (lambda line: line)
+        needle = prepare(old_lines[0])
+        hits = [n for n, line in enumerate(file_lines) if prepare(line) == needle]
+        if hits:
+            break
+    if not hits:
+        return (
+            " Not even your first line is in the file, so old_lines is not a "
+            "copy of it — read the file again and copy the lines from the "
+            "result."
+        )
+    index = hits[0]
+    window = file_lines[index : index + min(len(old_lines) + 1, 8)]
+    shown = "\n".join(f"{index + n + 1}: {line}" for n, line in enumerate(window))
+    rest = len(hits) - 1
+    others = f" (and {rest} more place{'s' if rest > 1 else ''})" if rest else ""
+    return (
+        f" Your first line is at line {index + 1}{others}, but the lines after "
+        f"it are not the rest of your old_lines. The file there reads:\n{shown}"
+    )
+
+
 def _edit_target(args: EditFileParams, ctx: ToolContext) -> Path:
     # Read-only: the handler resolves for itself (it needs the key back), so
     # every caller left here is a predicate or a preview.
@@ -643,10 +691,23 @@ async def edit_file(args: EditFileParams, ctx: ToolContext) -> str:
             if hits:
                 old_lines = stripped
     if not hits:
-        return (
-            f"NOT edited: those lines are not in {path}."
-            f"{_near_miss(file_lines, old_lines)}"
+        # Order matters: name the fault we can prove. A swallowed argument is
+        # not a content mismatch, and saying "those lines are not in the file"
+        # when the real fault is the call sends the model off fixing
+        # indentation that was never wrong — three round-trips, in the session
+        # this branch was rewritten from, ending in `sed -i`.
+        swallowed = _swallowed_argument(old_lines)
+        if swallowed:
+            return (
+                f"NOT edited: old_lines contains {swallowed!r}, which is the "
+                "start of another argument, not a line of the file. Close "
+                "old_lines after the last file line, then start new_lines — "
+                "and send the edit again."
+            )
+        hint = _near_miss(file_lines, old_lines) or _anchor_hint(
+            file_lines, old_lines
         )
+        return f"NOT edited: those lines are not in {path}.{hint}"
     if len(hits) > 1:
         where = ", ".join(f"line {index + 1}" for index in hits[:5])
         return (
@@ -765,10 +826,16 @@ async def create_file(args: CreateFileParams, ctx: ToolContext) -> str:
             "belongs somewhere else."
         )
     if path.exists():
+        # Deliberately does NOT offer delete_file. It used to, and the model
+        # took it: delete-then-recreate became the normal way to change a
+        # file, which throws away every part the edit was not about and turns
+        # one edit into three calls. Naming a second route here is enough to
+        # make it the chosen one, so only the right route is named.
         return (
-            f"NOT created: {path} already exists. To change it call edit_file "
-            "with the lines to replace; to replace it wholesale, delete_file "
-            "first (the old version stays recoverable from the trash)."
+            f"NOT created: {path} already exists. Change it with edit_file — "
+            "put the lines you want gone in old_lines and their replacement "
+            "in new_lines; the rest of the file is kept as it is. Read it "
+            "first if you have not, so the lines you send match."
         )
     # Same embedded-\n repair as edit_file: the array is lines, but a model
     # that packs a block into one element still means the lines it contains.

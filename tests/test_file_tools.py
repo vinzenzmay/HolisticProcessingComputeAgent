@@ -757,6 +757,56 @@ class TestEditRepairAndFuzz:
         assert "NOT edited" in result and "line 2" in result
         assert path.read_text() == "def f():\n    return 1\n"
 
+    async def test_a_swallowed_argument_is_named_as_the_fault(
+        self, tools, ctx, tmp_path
+    ):
+        # The live failure: `new_lines**: [` ends up inside old_lines, so the
+        # run matches nothing. Reporting a content mismatch sends the model
+        # off fixing indentation that was never wrong.
+        path = tmp_path / "code.txt"
+        path.write_text("def f():\n    return 1\n")
+        ctx.registry.register("code", path)
+        result = await call(
+            tools, "edit_file", ctx,
+            registry_key="code",
+            old_lines=["def f():", "    return 1", "new_lines**: ["],
+            new_lines=["def f():", "    return 2"],
+        )
+        assert "NOT edited" in result
+        assert "another argument" in result and "new_lines" in result
+        assert "not in" not in result  # not reported as a content mismatch
+        assert path.read_text() == "def f():\n    return 1\n"
+
+    async def test_a_miss_past_the_first_line_shows_the_file_there(
+        self, tools, ctx, tmp_path
+    ):
+        # The first line is real, the rest drifted — point at the anchor and
+        # show what actually follows it.
+        path = tmp_path / "code.txt"
+        path.write_text("alpha\nbravo\ncharlie\ndelta\n")
+        ctx.registry.register("code", path)
+        result = await call(
+            tools, "edit_file", ctx,
+            registry_key="code",
+            old_lines=["bravo", "WRONG"],
+            new_lines=["bravo", "right"],
+        )
+        assert "NOT edited" in result
+        assert "line 2" in result and "charlie" in result
+        assert path.read_text() == "alpha\nbravo\ncharlie\ndelta\n"
+
+    async def test_a_miss_on_every_line_says_so(self, tools, ctx, tmp_path):
+        path = tmp_path / "code.txt"
+        path.write_text("alpha\nbravo\n")
+        ctx.registry.register("code", path)
+        result = await call(
+            tools, "edit_file", ctx,
+            registry_key="code",
+            old_lines=["nothing", "like it"],
+            new_lines=["x"],
+        )
+        assert "NOT edited" in result and "read the file again" in result
+
     async def test_ambiguity_at_a_fuzzy_level_is_still_refused(
         self, tools, ctx, tmp_path
     ):
@@ -1068,6 +1118,21 @@ class TestCreateFile:
         )
         assert "NOT created" in result and "edit_file" in result
         assert (tmp_path / "specs.md").read_text() == "the real specs\n"
+
+    async def test_the_refusal_does_not_offer_delete_and_recreate(
+        self, tools, ctx, tmp_path
+    ):
+        # It used to, and the model took the offer: delete-then-recreate
+        # became the normal way to change a file, throwing away every part
+        # the edit was not about. Naming a second route makes it the chosen
+        # one, so only edit_file is named.
+        ctx.registry.register("project", tmp_path)
+        (tmp_path / "specs.md").write_text("the real specs\n")
+        result = await call(
+            tools, "create_file", ctx,
+            dir_key="project", name="specs.md", content_lines=["junk"],
+        )
+        assert "delete_file" not in result
 
     async def test_a_subdirectory_is_created_on_the_way(self, tools, ctx, tmp_path):
         ctx.registry.register("project", tmp_path)

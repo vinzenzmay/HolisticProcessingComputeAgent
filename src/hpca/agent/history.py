@@ -31,6 +31,7 @@ role requires the tool-call protocol this design deliberately bypasses.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from hpca.llm import Message
@@ -41,6 +42,13 @@ MAX_LIST_ITEMS = 12
 KEEP_LIST_ITEMS = 3
 # Same for a long string argument (a here-doc script, a pasted block).
 MAX_STRING_CHARS = 400
+
+# The markers ``elide`` leaves behind, as a pattern. Naming the cut is only
+# half the defence: a model that reads its own call back can still copy the
+# marker forward as if it were content. It has happened — a `cat > f << EOF`
+# heredoc whose body was "... 257 more lines elided ..." ran, and truncated a
+# 266-line script to 46 bytes. ``middleware`` refuses any call carrying one.
+ELIDED_MARKER = re.compile(r"\.\.\. \d+ more (?:lines|chars) elided \.\.\.")
 
 CALL_ACTION = "tool_call"
 # What the assistant copy of a call starts with. Cheap prefix test for

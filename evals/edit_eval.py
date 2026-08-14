@@ -1159,6 +1159,10 @@ async def run_task(task: Task, llm, tools: ToolRegistry, keep: bool = False) -> 
         # the friction a wrong-shaped interface generates, and it used to be
         # invisible in the numbers.
         "tool_errors": 0,
+        # Malformed calls the middleware silently absorbed (_strip_key_echo).
+        # Not a failure — a repair is a failure that did not happen — but the
+        # only place a change to that layer is visible at all.
+        "repairs": 0,
         "decisions": 0,
         "completion_tokens": 0,
         "wall_s": 0.0,
@@ -1218,6 +1222,11 @@ async def run_task(task: Task, llm, tools: ToolRegistry, keep: bool = False) -> 
                 # must tell the model what actually happened
                 for repair in getattr(decision, "repairs", None) or []:
                     result = f"{result}\n[repaired] {repair}"
+                    # Counted, not just shown: a repair is a malformed call the
+                    # middleware absorbed, so it is the only visible measure of
+                    # a change to _strip_key_echo. Without this the swallowed
+                    # `new_lines: [` class moves nothing in the summary.
+                    metrics["repairs"] += 1
             except Exception as exc:
                 result = f"[tool error] {decision.tool.name}: {type(exc).__name__}: {exc}"
             if _is_failed_edit(decision.tool.name, result):
@@ -1426,6 +1435,7 @@ async def main() -> int:
         "success_rate": round(successes / n, 3) if n else 0.0,
         "mean_failed_edits": round(sum(r["failed_edits"] for r in runs) / n, 3) if n else 0.0,
         "mean_tool_errors": round(sum(r["tool_errors"] for r in runs) / n, 3) if n else 0.0,
+        "mean_repairs": round(sum(r.get("repairs", 0) for r in runs) / n, 3) if n else 0.0,
         "mean_tool_calls": round(sum(r["tool_calls"] for r in runs) / n, 3) if n else 0.0,
         "mean_decisions": round(sum(r["decisions"] for r in runs) / n, 3) if n else 0.0,
         "total_completion_tokens": sum(r["completion_tokens"] for r in runs),

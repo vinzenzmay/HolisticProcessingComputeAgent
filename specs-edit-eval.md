@@ -197,6 +197,12 @@ Harness API these needed, for whoever adds tasks next:
 - Metric `tool_errors` (summary: `mean_tool_errors`) — results starting with
   `[tool error]`, any tool. `failed_edits` only ever counted
   edit_file/create_file, so refusals from the path layer were invisible.
+- Metric `repairs` (summary: `mean_repairs`) — malformed calls
+  `middleware._strip_key_echo` absorbed. A repair is a failure that did not
+  happen, so it moves none of the other metrics: before this, a change to that
+  layer was measurable only by reading transcripts. Read it *with*
+  `mean_failed_edits`, not instead — repairs going up while failed edits go
+  down is the layer doing its job; both rising means the backend got worse.
 
 A `fake_calls` script must drive the route that works on **both** sides of a
 comparison (register a fresh key, then act), so `--dry-run` stays green when
