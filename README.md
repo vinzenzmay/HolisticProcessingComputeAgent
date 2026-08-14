@@ -34,8 +34,15 @@ embeddings.
 ## Run
 
 ```bash
-hpca            # or: python -m hpca
+hpca                 # inside an activated environment
+python -m hpca       # the same thing, through the module
+pixi run hpca        # with pixi — runs in the default environment, no activation
 ```
+
+`pixi run hpca` picks up the `hpca` console script from the editable install in
+the default environment, so it always runs the working tree's code. Add
+`-e dev` (`pixi run -e dev hpca`) to use the environment that also has the test
+dependencies.
 
 Configuration lives at `~/.HolisticProcessingComputeAgent/settings.json` and can be
 edited from the in-app config editor — press `c` while the sessions column is
