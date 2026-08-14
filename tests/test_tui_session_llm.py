@@ -167,3 +167,50 @@ class TestLabelledLLM:
             session = app.session_store.create(profile="default")  # no backend
             client = _unwrap(app._labelled_llm("conclude", session=session))
             assert client is app._llm
+
+
+class TestToolContextLLM:
+    """``ctx.llm`` is the door a tool's own firewalled sub-loop goes through:
+    ``ask_docs`` (the doc-researcher, §4.2) and ``explain_job_failure``. It has
+    to be the session's own backend for the same reason ``_labelled_llm`` does
+    — the bootstrap client is built from ``settings.llm``, which a session
+    pinning its own backend never updates, so it points at a default nothing is
+    serving (regression: ask_docs failed with "All connection attempts failed"
+    in a session whose chat was answering fine)."""
+
+    async def test_tool_ctx_llm_routes_to_the_sessions_backend(self, hpca_home):
+        with_backends()
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)):
+            blob = LLMBackend(
+                model="qwen-b", base_url="http://b/v1"
+            ).model_dump_json()
+            session = app.session_store.create(profile="default", backend=blob)
+            ctx = app._make_tool_ctx(session, None)
+            assert ctx.llm is app._client_for(session)
+            assert ctx.llm is not app._llm  # not the (possibly dead) bootstrap
+            assert ctx.llm._settings.model == "qwen-b"
+
+    async def test_logged_tool_ctx_llm_wraps_the_sessions_backend(self, hpca_home):
+        """The transcript-logging wrapper must not quietly reintroduce the
+        bootstrap client underneath the label."""
+        from hpca.logs import open_log
+
+        with_backends()
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)):
+            blob = LLMBackend(
+                model="qwen-b", base_url="http://b/v1"
+            ).model_dump_json()
+            session = app.session_store.create(profile="default", backend=blob)
+            log = open_log(app.settings, session)
+            assert log is not None  # logging is on by default
+            ctx = app._make_tool_ctx(session, log)
+            assert _unwrap(ctx.llm) is app._client_for(session)
+            assert _unwrap(ctx.llm)._settings.model == "qwen-b"
+
+    async def test_tool_ctx_llm_falls_back_to_bootstrap(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)):
+            session = app.session_store.create(profile="default")  # no backend
+            assert app._make_tool_ctx(session, None).llm is app._llm
