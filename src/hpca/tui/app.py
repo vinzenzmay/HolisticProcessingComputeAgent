@@ -3089,7 +3089,17 @@ class HpcaApp(App):
         keeps its own registry, runner and log however the UI moves on.
 
         ``skills`` is the running turn's frozen skill set; the on-screen
-        session (no turn) falls back to ``self.skills``."""
+        session (no turn) falls back to ``self.skills``.
+
+        ``ctx.llm`` is the session's *own* backend client — the same one chat
+        talks to — for the same reason ``_labelled_llm`` is: the bootstrap
+        client is built from ``settings.llm``, which nothing updates when a
+        session pins a backend of its own, so it keeps pointing at a default
+        that is usually not running. Tools that open a firewalled sub-loop
+        (``ask_docs`` → the doc-researcher, ``explain_job_failure``) are the
+        only readers of this field, and reaching the bootstrap client made
+        both of them fail to connect in a session whose chat was working."""
+        client = self._client_for(session)
         ctx = ToolContext(
             registry=PathRegistry(
                 self._conn, profile=session.profile, session_id=session.session_id
@@ -3107,7 +3117,7 @@ class HpcaApp(App):
             jobs=self.job_store,
             job_log_dir=app_dir() / "job_logs",
             watches=self.watch_store,
-            llm=self._llm,
+            llm=client,
             trash=self.trash,
             symbols=self.symbol_index,
             rag=self.rag_store,
@@ -3120,7 +3130,7 @@ class HpcaApp(App):
         )
         if log is not None:
             ctx.llm = LoggedLLM(
-                self._llm,
+                client,
                 log,
                 label=lambda: f"subagent:{ctx.current_tool or '?'}",
             )
