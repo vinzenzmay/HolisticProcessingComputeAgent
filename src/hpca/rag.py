@@ -45,6 +45,56 @@ def chunk_text(text: str, *, max_chars: int = DEFAULT_MAX_CHARS) -> list[str]:
     return chunks
 
 
+# A chunk this short that the model still refuses is not a length problem any
+# more, so splitting it further only multiplies requests. Dropped instead.
+MIN_CHARS = 100
+
+
+async def embed_fitting(embedder, chunks: list[str]) -> tuple[list[str], list[list]]:
+    """Embed ``chunks``, splitting any the model finds too long, in step.
+
+    ``chunk_text`` budgets in characters while the model budgets in tokens, and
+    the ratio between them is a property of the text: ~4 chars/token for prose,
+    barely 2 for the code blocks and API tables that make up most of a
+    reference manual. So a character budget that fits an English paragraph
+    overruns a 256-token embedder on a page of GDScript — and because one
+    request carries a whole document's chunks, a single overlong chunk used to
+    raise and discard the entire document. Indexing the Godot manual that way
+    kept 100 files out of 1597 and reported success.
+
+    Splitting is halving, driven by the server's own refusal rather than by a
+    guessed chars-per-token constant: divide and conquer over the list narrows
+    to the offending chunks in log time, then those are cut in half and retried
+    until they fit. Only ``InputTooLong`` recurses; a backend that is down or
+    broken propagates on the first try instead of being asked 2^n times.
+
+    Returns the chunks actually embedded — the split ones in place of their
+    oversized original — paired with their vectors, so callers store text and
+    vector that agree.
+    """
+    from hpca.embeddings import InputTooLong
+
+    if not chunks:
+        return [], []
+    try:
+        return chunks, await embedder.embed(chunks)
+    except InputTooLong:
+        pass
+    if len(chunks) > 1:
+        middle = len(chunks) // 2
+        left_text, left_vectors = await embed_fitting(embedder, chunks[:middle])
+        right_text, right_vectors = await embed_fitting(embedder, chunks[middle:])
+        return left_text + right_text, left_vectors + right_vectors
+    text = chunks[0]
+    if len(text) <= MIN_CHARS:
+        return [], []  # unsplittable and still refused: drop this one chunk
+    halves = chunk_text(text, max_chars=max(MIN_CHARS, len(text) // 2))
+    if len(halves) < 2:  # nothing to split on: cut the string itself
+        cut = len(text) // 2
+        halves = [text[:cut], text[cut:]]
+    return await embed_fitting(embedder, halves)
+
+
 @dataclass
 class Hit:
     text: str

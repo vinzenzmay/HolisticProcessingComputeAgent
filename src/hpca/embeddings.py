@@ -11,9 +11,34 @@ import httpx
 
 BATCH_SIZE = 64
 
+# What an OpenAI-compatible server says when the input overruns the model's
+# window. Matched on text because the status code alone does not distinguish
+# it from a malformed request, and only this case is worth re-trying smaller.
+_TOO_LONG_MARKERS = (
+    "maximum context length",
+    "longer than the maximum",
+    "reduce the length",
+    "too long",
+)
+
+
+def _is_too_long(detail: str) -> bool:
+    lowered = detail.lower()
+    return any(marker in lowered for marker in _TOO_LONG_MARKERS)
+
 
 class EmbeddingError(Exception):
     """Any failure talking to the embedding backend."""
+
+
+class InputTooLong(EmbeddingError):
+    """One of the texts is longer than the model's context window.
+
+    Told apart from the rest because it is the one embedding failure a caller
+    can do something about: the text can be split and tried again, whereas a
+    refused connection or a 500 only gets worse for being retried. See
+    ``hpca.rag.embed_fitting``.
+    """
 
 
 class EmbeddingClient:
@@ -51,10 +76,13 @@ class EmbeddingClient:
             except httpx.HTTPError as e:
                 raise EmbeddingError(f"Embedding request failed: {e}") from e
             if response.status_code != 200:
-                raise EmbeddingError(
-                    f"Embedding request failed ({response.status_code}): "
-                    f"{response.text[:300]}"
+                detail = response.text[:300]
+                message = (
+                    f"Embedding request failed ({response.status_code}): {detail}"
                 )
+                if response.status_code == 400 and _is_too_long(detail):
+                    raise InputTooLong(message)
+                raise EmbeddingError(message)
             data = sorted(response.json()["data"], key=lambda d: d["index"])
             vectors.extend(entry["embedding"] for entry in data)
         return vectors

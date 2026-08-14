@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 from hpca.agent.context import ToolContext
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.embeddings import EmbeddingError
-from hpca.rag import chunk_text
+from hpca.rag import chunk_text, embed_fitting
 from hpca.symbols import index_python_source, parse_help_flags, parse_manpage_flags
 from hpca.verify_code import basename, commands_needing_docs
 
@@ -279,14 +279,20 @@ async def search_docs(args: SearchDocsParams, ctx: ToolContext) -> str:
 
 
 async def _rag_index_text(ctx: ToolContext, source: str, text: str) -> int | str:
-    """Chunk+embed+store one document; chunk count, or an error string."""
+    """Chunk+embed+store one document; chunk count, or an error string.
+
+    Embedding goes through ``embed_fitting`` so a chunk the model finds too
+    long is split rather than taken as a verdict on the whole document (§5.6.2).
+    """
     chunks = chunk_text(text)
     if not chunks:
         return 0
     try:
-        vectors = await ctx.embedder.embed(chunks)
+        chunks, vectors = await embed_fitting(ctx.embedder, chunks)
     except EmbeddingError as e:
         return f"embedding backend error: {e}"
+    if not chunks:
+        return 0
     ctx.rag.clear_source(source)
     ctx.rag.add(source, chunks, vectors)
     return len(chunks)
@@ -332,7 +338,17 @@ async def index_docs(args: IndexDocsParams, ctx: ToolContext) -> str:
                 indexed += 1
         message = f"Indexed {indexed} documents from {args.target!r} for search."
         if problems:
-            message += " Problems: " + "; ".join(problems[:3])
+            # The count leads, and the examples follow it. Reporting only the
+            # first three read as a footnote on a success when in fact most of
+            # a manual had been dropped, which is how a 100-of-1597 index came
+            # to be announced as done.
+            message += (
+                f" {len(problems)} could NOT be indexed"
+                + (f" (of {indexed + len(problems)} found)" if indexed else "")
+                + ": "
+                + "; ".join(problems[:3])
+                + ("; ..." if len(problems) > 3 else "")
+            )
         return message
 
     indexed, missing, searchable = [], [], 0

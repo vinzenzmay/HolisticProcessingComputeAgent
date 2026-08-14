@@ -5,8 +5,8 @@ import json
 import httpx
 import pytest
 
-from hpca.embeddings import EmbeddingClient, EmbeddingError
-from hpca.rag import RagStore, chunk_text
+from hpca.embeddings import EmbeddingClient, EmbeddingError, InputTooLong
+from hpca.rag import RagStore, chunk_text, embed_fitting
 
 # ---------------------------------------------------------------- chunking
 
@@ -159,3 +159,85 @@ class TestRagStore:
 
     def test_empty_store_query(self, store):
         assert store.query(V["cats"], k=5) == []
+
+
+# ------------------------------------------------- oversized-chunk splitting
+
+
+class LengthCappedEmbedder:
+    """Stands in for a 256-token embedder: refuses any text over ``cap`` chars.
+
+    The refusal carries the wording a vLLM server uses, because that string is
+    what tells an over-length input apart from a dead backend.
+    """
+
+    def __init__(self, cap: int):
+        self.cap = cap
+        self.calls: list[list[str]] = []
+
+    async def embed(self, texts):
+        self.calls.append(list(texts))
+        for text in texts:
+            if len(text) > self.cap:
+                raise InputTooLong(
+                    "Embedding request failed (400): This model's maximum "
+                    "context length is 256 tokens. However, you requested 0 "
+                    "output tokens and your prompt contains at least 257 "
+                    "input tokens. Please reduce the length of the messages."
+                )
+        return [[float(len(t)), 0.0, 0.0] for t in texts]
+
+
+class DeadEmbedder:
+    def __init__(self):
+        self.calls = 0
+
+    async def embed(self, texts):
+        self.calls += 1
+        raise EmbeddingError("All connection attempts failed")
+
+
+class TestEmbedFitting:
+    async def test_short_chunks_pass_through_untouched(self):
+        embedder = LengthCappedEmbedder(cap=100)
+        chunks = ["one", "two", "three"]
+        text, vectors = await embed_fitting(embedder, chunks)
+        assert text == chunks
+        assert len(vectors) == 3
+        assert embedder.calls == [chunks]  # a single request, no splitting
+
+    async def test_one_oversized_chunk_does_not_lose_the_document(self):
+        """The regression: a whole document was dropped because one of its
+        chunks (a code block, an API table) overran the token window."""
+        embedder = LengthCappedEmbedder(cap=200)
+        text, vectors = await embed_fitting(
+            embedder, ["fine", "x" * 800, "also fine"]
+        )
+        assert len(text) == len(vectors)
+        assert "fine" in text and "also fine" in text  # neighbours survive
+        assert all(len(t) <= 200 for t in text)  # the big one came back split
+        assert "".join(t for t in text if set(t) == {"x"}) == "x" * 800
+
+    async def test_every_chunk_oversized_still_indexes(self):
+        embedder = LengthCappedEmbedder(cap=150)
+        text, vectors = await embed_fitting(embedder, ["y" * 900, "z" * 700])
+        assert len(text) == len(vectors) and text
+        assert all(len(t) <= 150 for t in text)
+
+    async def test_a_dead_backend_is_not_retried(self):
+        """Only InputTooLong recurses; anything else propagates at once, so a
+        backend that is down is asked once rather than 2^n times."""
+        embedder = DeadEmbedder()
+        with pytest.raises(EmbeddingError, match="connection attempts"):
+            await embed_fitting(embedder, ["a", "b", "c", "d"])
+        assert embedder.calls == 1
+
+    async def test_unsplittable_chunk_is_dropped_not_looped(self):
+        """A chunk under the floor that is still refused cannot be usefully
+        halved; it is dropped so indexing terminates."""
+        embedder = LengthCappedEmbedder(cap=1)
+        text, vectors = await embed_fitting(embedder, ["still too long"])
+        assert text == [] and vectors == []
+
+    async def test_empty_input(self):
+        assert await embed_fitting(LengthCappedEmbedder(cap=10), []) == ([], [])
