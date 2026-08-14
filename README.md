@@ -305,7 +305,45 @@ most clusters, but know it's there. And bandwidth is a non-issue (streamed
 tokens are kilobytes per second); the generation speed you see in the context
 bar is your workstation's GPU, not the tunnel.
 
-## Clipboard under tmux
+## Clipboard
+
+Copying (`ctrl+c` on a marked selection, or a chat entry's copy action) goes
+through several channels, and the notification tells you which one worked. On a
+local desktop session HPCA drives a native clipboard tool; otherwise it emits the
+OSC 52 escape, which asks the terminal itself to set the clipboard. If nothing
+reaches the clipboard, the text is written to `clipboard.txt` in the app dir.
+
+### GNOME Terminal (the Ubuntu default)
+
+GNOME Terminal — like every VTE-based terminal — does not implement OSC 52
+([GNOME/vte#2495](https://gitlab.gnome.org/GNOME/vte/-/issues/2495) has been open
+since 2018), so it drops the escape silently and copies end up in
+`clipboard.txt`. Install a clipboard helper and HPCA will use it directly:
+
+```bash
+sudo apt install wl-clipboard   # Wayland session (GNOME's default)
+sudo apt install xclip          # X11 session
+```
+
+Restart HPCA afterwards; copying then works with no further configuration.
+Pasting is unaffected either way — `ctrl+shift+v` is the terminal's own paste,
+which just types the text into HPCA.
+
+Without a helper, the no-install fallback is to hold **Shift** while dragging to
+select, then `ctrl+shift+c`. Shift bypasses HPCA's mouse capture and lets the
+terminal select natively, at the cost of copying the raw screen (borders and
+neighbouring columns included) rather than the marked text.
+
+Terminals that do support OSC 52 — Alacritty, kitty, foot, WezTerm, Ghostty —
+need none of this. They are also the only path that reaches *your* clipboard
+when HPCA runs over SSH, where a helper installed on the remote would copy to
+the remote machine.
+
+To pin the choice instead of relying on detection, set `mode = "command"` and
+`command = "wl-copy"` (or `"xclip -selection clipboard -i"`) in the `clipboard`
+section of the settings.
+
+### Under tmux
 
 For the system-clipboard path (OSC 52) to work inside tmux you need one of:
 
@@ -316,6 +354,9 @@ set -g allow-passthrough on
 ```
 
 The tmux paste-buffer fallback (`prefix + ]`) works regardless of these settings.
+On GNOME Terminal these settings change nothing on their own — the escape still
+has to be handled by the terminal at the end of the chain — so install
+`wl-clipboard` or `xclip` there as well.
 
 ## Development
 
