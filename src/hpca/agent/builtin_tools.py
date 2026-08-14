@@ -30,7 +30,7 @@ import time
 from pathlib import Path
 from typing import Callable, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
 from hpca.agent.context import ToolContext
 from hpca.agent.tools import Tool, ToolRegistry
@@ -75,6 +75,45 @@ KEY_PATTERN = rf"^{KEY_CHARS}$"
 _KEY_REF = re.compile(rf"(?<![$\\]){{({KEY_CHARS})}}")
 MAX_KEYS_IN_NOTE = 30
 
+# Authoring a file by redirecting a heredoc into it: `cat > f << EOF`, or the
+# same through tee. SCRIPT_GUIDANCE forbids this, and RUN_SCRIPT_MAX_CHARS
+# stops the long ones — but only in run_bash. create_script had neither, so it
+# became the way round: two of the file writes in one real session arrived as
+# `create_script` bodies of 2.5k and 3k characters, then were executed. The
+# content has to survive bash quoting on the way, one stray line costs the
+# whole file, and nothing checks the result is what was meant.
+# Authoring a file by heredoc takes too many forms to match in one pattern
+# (`cat > f << EOF`, `cat << EOF > f`, `tee f << EOF`, `cat << EOF | tee f`),
+# so the three things that together make it one are tested separately: a
+# heredoc, a command that emits its input, and somewhere for it to land. All
+# three must hold on the same line, which is what keeps `python3 << 'PYEOF'`
+# (a real look-around) and a bare `cat << EOF` (which just prints) out.
+_HEREDOC = re.compile(r"<<-?\s*['\"]?\w+")
+_EMITS_INPUT = re.compile(r"(?:^|[|;&]\s*)(?:cat|tee)\b")
+_LANDS_IN_A_FILE = re.compile(r">\s*\S|(?:^|[|;&]\s*)tee\b")
+# In-place edits. Refused in run_bash only: a look-around does not modify
+# files, while a real pipeline in create_script legitimately might.
+_IN_PLACE_EDIT = re.compile(r"(?:^|[|;&]\s*)sed\b[^|;&]*?(?:\s-i|\s--in-place)\b")
+
+
+def _heredoc_file_write(lines: list[str]) -> str:
+    """The line that authors a file through a heredoc, or ""."""
+    return next(
+        (
+            line
+            for line in lines
+            if _HEREDOC.search(line)
+            and _EMITS_INPUT.search(line)
+            and _LANDS_IN_A_FILE.search(line)
+        ),
+        "",
+    )
+
+
+def _in_place_edit(lines: list[str]) -> str:
+    """The line that edits a file in place, or ""."""
+    return next((line for line in lines if _IN_PLACE_EDIT.search(line)), "")
+
 
 class CreateScriptParams(BaseModel):
     kind: Literal["bash", "python", "R", "snakemake"] = Field(
@@ -89,6 +128,35 @@ class CreateScriptParams(BaseModel):
         min_length=1,
         description="Script content as an array of lines, one string per line",
     )
+
+    @field_validator("content_lines")
+    @classmethod
+    def _not_a_file_being_written(
+        cls, lines: list[str], info: ValidationInfo
+    ) -> list[str]:
+        """Refuse a script whose real job is to author a file.
+
+        Same reasoning as run_bash's size check, and a validator for the same
+        reason: the model gets this back inside the same decision and can call
+        create_file instead, rather than the user being asked to approve a
+        script that exists only to smuggle a document past create_file.
+
+        Bash only. `kind` is declared first, so it is already validated and
+        available here — and in Python `1 << 2` is a bit shift, not a heredoc.
+        """
+        if info.data.get("kind") != "bash":
+            return lines
+        offender = _heredoc_file_write(lines)
+        if not offender:
+            return lines
+        raise ValueError(
+            f"this script writes a file with a heredoc ({offender.strip()!r}), "
+            "which is what create_file is for — the content would have to "
+            "survive bash quoting, and one stray line costs the whole file. "
+            "Call create_file with the directory, a name, and the content as "
+            "content_lines. A script is for running work, not for carrying a "
+            "file's text."
+        )
 
 
 def expand_keys(lines: list[str], ctx: object) -> tuple[list[str], list[str]]:
@@ -427,6 +495,25 @@ class RunBashParams(BaseModel):
         message has to carry the whole route out, because it is the only thing
         the model gets.
         """
+        # A file write short enough to slip under the size cap is still a file
+        # write, and an in-place edit is not a look-around at all.
+        offender = _heredoc_file_write(lines)
+        if offender:
+            raise ValueError(
+                f"this script writes a file ({offender.strip()!r}). run_bash "
+                "is for looking around. To WRITE a file call create_file with "
+                "the content as content_lines; to CHANGE one call edit_file "
+                "with the lines to replace."
+            )
+        offender = _in_place_edit(lines)
+        if offender:
+            raise ValueError(
+                f"this script edits a file in place ({offender.strip()!r}). "
+                "Call edit_file instead: put the current lines in old_lines "
+                "and their replacement in new_lines. It backs the file up "
+                "first and tells you if the lines were not found, neither of "
+                "which sed does."
+            )
         size = sum(len(line) + 1 for line in lines)
         if size <= RUN_SCRIPT_MAX_CHARS:
             return lines
@@ -702,7 +789,9 @@ def default_tool_registry() -> ToolRegistry:
                 "Read a registered file, paged: returns up to max_lines from "
                 "start_line and tells you where to continue if the file goes "
                 "on. If the key is a directory, lists it; pass subpath to "
-                "read a file inside it."
+                "read a file inside it. Use this rather than cat, head, tail, "
+                "sed -n, wc or ls in run_bash — it numbers the lines, which is "
+                "what edit_file needs."
             ),
             params=ReadFileParams,
             handler=read_file,
@@ -715,7 +804,10 @@ def default_tool_registry() -> ToolRegistry:
                 "Run bash and wait for its output: look around (find files, "
                 "check a program, read a BAM header, list conda envs) or run a "
                 "registered script by writing {registry_key}, which expands to "
-                "its path. Use for anything you want the result of now"
+                "its path. Use for anything you want the result of now. Not "
+                "for files you already know the path of: read one with "
+                "read_file, write one with create_file, change one with "
+                "edit_file — those keep a backup and report what they did"
             ),
             params=RunBashParams,
             handler=run_bash,

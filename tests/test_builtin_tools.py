@@ -781,3 +781,88 @@ class TestRunBashLengthLimit:
 
         with _pytest.raises(ValidationError):
             self.params(["cat << 'EOF' > specs.md\n" + "line\n" * 1000])
+
+
+class TestRunBashIsNotAFileTool:
+    """A file write short enough to slip under the size cap is still a file
+    write, and a look-around does not edit files in place."""
+
+    def params(self, lines):
+        from hpca.agent.builtin_tools import RunBashParams
+
+        return RunBashParams.model_validate({"content_lines": lines})
+
+    def refusal(self, lines):
+        import pytest as _pytest
+        from pydantic import ValidationError
+
+        with _pytest.raises(ValidationError) as caught:
+            self.params(lines)
+        return str(caught.value)
+
+    def test_a_short_heredoc_write_is_refused(self):
+        # Under RUN_SCRIPT_MAX_CHARS, so only the shape catches it.
+        message = self.refusal(["cat > notes.md << 'EOF'", "hello", "EOF"])
+        assert "create_file" in message
+
+    def test_the_reverse_heredoc_order_is_also_caught(self):
+        assert "create_file" in self.refusal(["cat << 'EOF' > notes.md", "hi", "EOF"])
+
+    def test_tee_without_a_redirect_is_caught(self):
+        assert "create_file" in self.refusal(["tee /tmp/x.conf << 'EOF'", "a", "EOF"])
+
+    def test_sed_in_place_is_refused_and_names_edit_file(self):
+        message = self.refusal(["sed -i 's/a/b/g' /home/x/game.gd"])
+        assert "edit_file" in message and "old_lines" in message
+
+    def test_a_bare_heredoc_that_only_prints_is_fine(self):
+        lines = ["cat << 'EOF'", "just printing", "EOF"]
+        assert self.params(lines).content_lines == lines
+
+    def test_a_python_heredoc_look_around_still_works(self):
+        # The live session used exactly this to cross-check a scene file.
+        lines = ["python3 << 'PYEOF'", "print(1)", "PYEOF"]
+        assert self.params(lines).content_lines == lines
+
+    def test_reading_with_sed_n_is_not_an_in_place_edit(self):
+        lines = ["sed -n '196,202p' game.gd"]
+        assert self.params(lines).content_lines == lines
+
+    def test_an_ordinary_redirect_is_not_a_file_write(self):
+        lines = ["find /data -maxdepth 2 -name '*.bam' 2>/dev/null | head -20"]
+        assert self.params(lines).content_lines == lines
+
+
+class TestCreateScriptIsNotAFileTool:
+    """create_script was the way round run_bash's limits: two of the file
+    writes in one real session arrived as script bodies and were then run."""
+
+    def params(self, lines, kind="bash"):
+        from hpca.agent.builtin_tools import CreateScriptParams
+
+        return CreateScriptParams.model_validate(
+            {"kind": kind, "registry_key": "s", "content_lines": lines}
+        )
+
+    def test_a_heredoc_file_write_is_refused(self):
+        import pytest as _pytest
+        from pydantic import ValidationError
+
+        with _pytest.raises(ValidationError) as caught:
+            self.params(["cat > /home/x/menu.gd << 'GODOT'", "extends Control", "GODOT"])
+        assert "create_file" in str(caught.value)
+
+    def test_a_real_script_is_untouched(self):
+        lines = ["set -euo pipefail", "samtools view -c in.bam > count.txt"]
+        assert self.params(lines).content_lines == lines
+
+    def test_the_check_is_bash_only(self):
+        # In Python `<<` is a bit shift and `>` a comparison, so the shape
+        # means something else there and the check does not run.
+        import pytest as _pytest
+        from pydantic import ValidationError
+
+        smuggled = ["cat > out.txt << 'EOF'", "x", "EOF"]
+        with _pytest.raises(ValidationError):
+            self.params(smuggled, kind="bash")
+        assert self.params(smuggled, kind="python").content_lines == smuggled

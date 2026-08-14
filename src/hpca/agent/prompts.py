@@ -78,7 +78,9 @@ DISCOVERY_GUIDANCE = (
     "with find. Keep searches "
     "bounded so they finish in seconds: start from likely roots rather than /, "
     "cap the depth, pipe through head. Then register_path the paths it printed "
-    "and use them by key."
+    "and use them by key. That is where run_bash's part ends: once you know a "
+    "file's path, read it with read_file, which pages a long file and numbers "
+    "the lines — `cat` gives you neither and costs you the same round-trip."
 )
 
 # The single most common way the agent burns its tool budget: it cannot run an
@@ -103,10 +105,14 @@ SCRIPT_GUIDANCE = (
     "notes, a README, a config, a sample sheet — call create_file with the "
     "directory (its key or its path), a name, and the content one line per "
     "array element. "
-    "Never build a file out of `echo` lines or a `cat << EOF` heredoc in "
-    "run_bash: the content then has to survive bash quoting, a single stray "
+    "Never build a file out of `echo` lines or a `cat << EOF` heredoc — not "
+    "in run_bash and not in create_script, which both refuse it: the content "
+    "then has to survive bash quoting, a single stray "
     "line costs the whole file, and run_bash refuses a script that long "
-    "anyway — it is for looking around, not for writing. A file longer than "
+    "anyway — it is for looking around, not for writing. Never change a file "
+    "with `sed -i`, `>` or `tee` either; edit_file backs the file up and tells "
+    "you when the lines were not found, which is how you learn the edit missed "
+    "instead of assuming it landed. A file longer than "
     "~150 lines does not fit in one call: create_file a skeleton instead — "
     "headings, each with one `TBD: ...` placeholder line — then fill one "
     "section per edit_file call (placeholder in old_lines, content in "
