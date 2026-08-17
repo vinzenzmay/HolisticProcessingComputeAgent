@@ -50,7 +50,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     mode TEXT NOT NULL DEFAULT '',
     -- The LLM this session uses, as an LLMBackend JSON blob; '' falls back to
     -- the app's bootstrap client. Chosen at session creation.
-    backend TEXT NOT NULL DEFAULT ''
+    backend TEXT NOT NULL DEFAULT '',
+    -- Thinking effort (hpca.thinking): off | low | medium | xhigh. Empty means
+    -- "use agent.default_thinking", same convention as mode above.
+    thinking TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS path_registry (
     profile TEXT NOT NULL,
@@ -144,6 +147,7 @@ ADDED_COLUMNS = [
     ("processes", "background", "INTEGER NOT NULL DEFAULT 0"),
     ("sessions", "mode", "TEXT NOT NULL DEFAULT ''"),
     ("sessions", "backend", "TEXT NOT NULL DEFAULT ''"),
+    ("sessions", "thinking", "TEXT NOT NULL DEFAULT ''"),
     ("watches", "position", "INTEGER NOT NULL DEFAULT 0"),
 ]
 

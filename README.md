@@ -156,6 +156,34 @@ file that outlives the session — with no mode to enter and leave.
 New sessions start in `agent.default_mode` (settings, default `manual`); each
 session remembers its own mode across restarts.
 
+## Thinking effort
+
+Reasoning models can be told *how hard* to think. `/thinking` sets that for the
+current session — **off**, **low**, **medium** or **xhigh** — and the level is
+shown in the top row next to the context meter, so a session that is about to
+take its time says so. Like the mode it is per session, remembered across
+restarts, and takes effect on the next reply rather than the next session.
+
+`off` is the default and turns the thinking channel off entirely; it is what
+every turn did before this existed. The levels come from the model, not from
+HPCA: a Qwen3.8 backend accepts exactly `low`, `medium` and `xhigh` (there is no
+`high`), and on a backend that does not know the parameter at all only `off`
+behaves identically — the other levels are simply passed on for it to accept or
+reject.
+
+Thinking is slow and not automatically better: small models often route tools
+worse with it on, every decision in a turn pays for it, and the thinking comes
+out of the same token budget the agent needs to write its next tool call.
+Measured here on Qwen3.8-27B, one agent decision on a hard question: 74s with
+thinking off, 234s at `low`, 411s at `medium` — and at `xhigh` it spent the
+whole budget deliberating twice over and produced nothing, losing the turn after
+8 minutes.
+
+So treat `xhigh` as the one to avoid rather than the one to escalate to, despite
+being the server's own default whenever thinking is on. `low` and `medium` are
+the useful settings. New sessions start at `agent.default_thinking` (settings,
+default `off`).
+
 ## Skills
 
 Skills are user-defined procedure files — markdown (with optional YAML front

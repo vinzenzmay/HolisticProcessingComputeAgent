@@ -16,6 +16,8 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from hpca.thinking import ThinkingEffort
+
 APP_DIR_NAME = ".HolisticProcessingComputeAgent"
 
 
@@ -44,22 +46,54 @@ class LLMSettings(_Section):
     api_key: str | None = None
     model: str = "qwen3-6b"
     constrained_decoding: Literal["auto", "on", "off"] = "auto"
-    # How a tool call travels. "envelope" is the hand-rolled JSON decision
-    # object under a grammar (§4.3), which works on any OpenAI-compatible
-    # backend. "native" uses the backend's own tool-calling channel — the
-    # shape agent-trained models were post-trained on, and it moves the tool
-    # listing out of the prompt into the chat template. It needs the server
-    # started for it (vLLM: --enable-auto-tool-choice --tool-call-parser
-    # hermes); a backend without it rejects the request rather than quietly
-    # degrading, which is why this is opt-in rather than probed.
+    # How a tool call travels. "native" uses the backend's own tool-calling
+    # channel — the shape agent-trained models were post-trained on, and it
+    # moves the tool listing out of the prompt into the chat template.
+    # "envelope" is the hand-rolled JSON decision object under a grammar
+    # (§4.3), which works on any OpenAI-compatible backend, including one too
+    # old to have a tool-call parser.
+    #
+    # Envelope stays the default, and v0.22.0 is where that stopped being a
+    # portability argument and became a measured one. specs-edit-eval.md §7.3:
+    # on Qwen3.8-27B the shape error that made native lose on Qwen3.6 is gone
+    # and native is now correct — but over n=72 it costs 24.5% more completion
+    # tokens and 20.3% more wall for the same success rate, and §7.4 is the
+    # bigger reason: a cut-off long write cannot be salvaged on that channel,
+    # because the parser drops the fragment instead of returning it.
+    #
+    # Native is a supported, tested choice — set it here, or per backend
+    # below. It needs the server started for it (vLLM:
+    # --enable-auto-tool-choice plus a --tool-call-parser matching the model,
+    # which is qwen3_coder for the Qwen3.8 the cluster serves, not the hermes
+    # the Qwen3.6 notes named); a backend without it rejects the request with
+    # a 400 rather than quietly degrading, so the failure is loud and the fix
+    # is this setting (or the per-backend override on LLMBackend below).
+    #
+    # The parser is not a detail: it decides what a *cut-off* call looks like.
+    # qwen3_coder drops the argument the generation died inside and reports
+    # finish_reason "tool_calls" anyway — see middleware._hit_token_cap, which
+    # is what keeps that from costing the turn.
+    #
+    # Deliberately a setting and not a probe: the protocol shapes the whole
+    # conversation — the system prompt's respond-vs-tool guidance moves with
+    # it — so a verdict that arrives mid-session would leave the prompt
+    # describing a format the model can no longer emit. That mismatch is the
+    # most expensive bug this area has had (specs-edit-eval.md §7).
     tool_protocol: Literal["envelope", "native"] = "envelope"
     max_retries: int = 3
     request_timeout_s: int = 120
     # Reasoning models think in a separate channel, shown in the chat window's
-    # thinking box. Off by default: it is not generally better — small models
-    # often route tools worse with it on — and it is slow. Measured on
-    # Qwen3.6-27B: a turn took 133s thinking against 2.3s without. Per backend
-    # in the catalog below; this is whichever one is active.
+    # thinking box. This is only the fallback for a caller that expresses no
+    # opinion (the sub-agents that hard-code False, a bare client in a test):
+    # a chat turn's thinking comes from the *session's* effort level
+    # (`agent.default_thinking`, `/thinking`, hpca.thinking), which reaches the
+    # wire per request. It has to be per request and not a client property,
+    # because one client is shared by every session on the same backend
+    # (core.backends.client_for_backend keys them by base_url||model).
+    #
+    # Off by default, and worth keeping off: thinking is not generally better —
+    # small models often route tools worse with it on — and it is slow.
+    # Measured on Qwen3.6-27B: a turn took 133s thinking against 2.3s without.
     enable_thinking: bool = False
     # Tool calls allowed in one turn before the agent must stop and summarise.
     # Each run_bash call is one "look at the system" step; a real check needs
@@ -70,15 +104,23 @@ class LLMSettings(_Section):
 
 
 class AgentSettings(_Section):
-    """Interaction modes (§3.5): how much the agent may do unsupervised.
+    """What a session starts with, and falls back to if it never chose.
 
-    ``default_mode`` is what a new session starts in (and what sessions
-    that were never explicitly switched use): ``manual`` shows every script
-    to the user before it runs, ``auto`` works until the task is done, and
-    ``full-auto`` additionally waives the destructive-op approvals.
+    ``default_mode`` is the interaction mode (§3.5): ``manual`` shows every
+    script to the user before it runs, ``auto`` works until the task is done,
+    and ``full-auto`` additionally waives the destructive-op approvals.
+
+    ``default_thinking`` is the reasoning-effort dial (hpca.thinking), which
+    has the same lifecycle: stored per session, empty there meaning "whatever
+    this says", changeable mid-session with ``/thinking``. It defaults to
+    ``off`` so an upgrade changes nothing about how turns run — every level
+    above off costs a thinking pass before *every* decision in a turn, and the
+    server's own default once thinking is on is the slowest level (xhigh), so
+    "on" is not a defensible default for a dial the user has not touched.
     """
 
     default_mode: Literal["manual", "auto", "full-auto"] = "manual"
+    default_thinking: ThinkingEffort = "off"
 
 
 class ClusterSettings(_Section):
@@ -192,15 +234,27 @@ class DatabaseSettings(_Section):
 
 
 class LLMBackend(_Section):
-    """One entry of the configured backend catalog (manage-LLMs screen)."""
+    """One entry of the configured backend catalog (manage-LLMs screen).
+
+    There is no ``enable_thinking`` here any more. It was a per-backend flag on
+    the reasoning that thinking is a property of the model — true, but the
+    thing a user actually adjusts is how hard *this conversation* should think,
+    and answering that by editing the catalog changed every session on that
+    backend at once. It is now a per-session level (hpca.thinking, ``/thinking``).
+    Entries written before v0.22.0 still carry the key; ``extra="ignore"`` on
+    ``_Section`` drops it on load, so an old settings file needs no migration.
+    """
 
     model: str
     base_url: str
     api_key: str | None = None
     max_model_len: int | None = None
-    # Thinking is a property of the model, not of the session: a reasoning
-    # model may earn it while the next backend in the list does not.
-    enable_thinking: bool = False
+    # Whether this server can carry a call on its own tool channel is a
+    # property of how it was launched, not of the client — one entry may be a
+    # vLLM started with --enable-auto-tool-choice while the next is an older
+    # one that 400s on `tools`. None means "whatever llm.tool_protocol says",
+    # which is what every entry written before v0.22.0 has.
+    tool_protocol: Literal["envelope", "native"] | None = None
 
 
 def llm_settings_for(backend: LLMBackend, base: LLMSettings) -> LLMSettings:
@@ -211,7 +265,8 @@ def llm_settings_for(backend: LLMBackend, base: LLMSettings) -> LLMSettings:
     settings.base_url = backend.base_url
     settings.model = backend.model
     settings.api_key = backend.api_key
-    settings.enable_thinking = backend.enable_thinking
+    if backend.tool_protocol is not None:
+        settings.tool_protocol = backend.tool_protocol
     return settings
 
 
@@ -259,14 +314,8 @@ class Settings(_Section):
         self.llm.base_url = backend.base_url
         self.llm.model = backend.model
         self.llm.api_key = backend.api_key
-        self.llm.enable_thinking = backend.enable_thinking
-
-    def set_thinking(self, backend: LLMBackend, enabled: bool) -> None:
-        """Toggle a catalog entry's thinking mode — and the live client's, if
-        that entry is the one in use."""
-        backend.enable_thinking = enabled
-        if self.is_active(backend):
-            self.llm.enable_thinking = enabled
+        if backend.tool_protocol is not None:
+            self.llm.tool_protocol = backend.tool_protocol
 
     def remember_llm_ports(self, base_urls: Iterable[str]) -> bool:
         """Record ports that have served an LLM, so scans probe them first.

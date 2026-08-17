@@ -109,6 +109,7 @@ class ContextBar(Static):
         self._measured = False
         self._estimated = False
         self._speed: float | None = None
+        self._effort: str | None = None
         self._text = ""
 
     @property
@@ -116,6 +117,19 @@ class ContextBar(Static):
         """The line as displayed. Textual keeps rendered content private, so
         the widget reports its own state rather than tests reading internals."""
         return self._text
+
+    def set_effort(self, effort: str | None) -> None:
+        """The session's thinking level (hpca.thinking); None hides it.
+
+        It rides on this line, next to the fill and the speed, because it is
+        the third thing that explains what a turn is costing — and unlike the
+        mode it is invisible in the chat: a session left on xhigh looks
+        identical to one on off until the wait. Shown always, including at
+        ``off``, so the answer to "is this session thinking?" is on screen
+        rather than one command away.
+        """
+        self._effort = effort
+        self._refresh()
 
     def set_window(self, window: int | None) -> None:
         self._window = window
@@ -178,6 +192,10 @@ class ContextBar(Static):
                     else f"{self._speed:,.0f}"
                 )
                 self._text += f" · {rate} tok/s"
+        if self._effort:
+            # Last, and abbreviated: on a narrow terminal the right end of this
+            # line is the first thing to go, and the fill is what must survive.
+            self._text += f" · think {self._effort}"
         self.update(Content(self._text))
         self.set_class(level == "warn", "context-warn")
         self.set_class(level == "danger", "context-danger")

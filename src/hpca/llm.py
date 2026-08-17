@@ -4,10 +4,11 @@ Design notes for the small-model reality (§1):
 
 * The backend model may be a *reasoning* model (e.g. Qwen3.6). vLLM exposes
   thinking tokens in a separate ``reasoning`` field, which the TUI shows in
-  the collapsible thinking box. Whether to think at all is the
-  ``llm.enable_thinking`` setting — it buys better decisions for roughly 15x
-  the latency and 15x the completion tokens (measured on Qwen3.6-27B) — and
-  callers can override it per request.
+  the collapsible thinking box. Whether to think at all — and, on a model that
+  grades it, how hard — is decided by the caller per request and comes from
+  the session's effort level (hpca.thinking); ``llm.enable_thinking`` is only
+  the fallback when nobody says. Thinking buys better decisions for roughly
+  15x the latency and 15x the completion tokens (measured on Qwen3.6-27B).
 * Constrained decoding (``response_format`` with a JSON schema) makes tool
   calls syntactically valid *by construction*. Support is probed once against
   the backend when settings say ``auto``.
@@ -57,6 +58,22 @@ def wire_messages(messages: list[Message]) -> list[Message]:
                 out[key] = message[key]
         wire.append(out)
     return wire
+
+# Read timeout for a request that asked the model to think (LLMClient._timeout_for).
+#
+# Sized off the ceiling rather than off an average, because the ceiling is
+# knowable: a generation is bounded by max_tokens, so the longest a request can
+# take is max_tokens ÷ the backend's decode rate. The agent's own cap is
+# MAX_DECISION_TOKENS (4096), and the slowest rate measured on the cluster's
+# Qwen3.8-27B-FP8 is 17 tok/s (a loaded box: 4039 completion tokens in 233.6s,
+# stopping just short of the cap) — so ~240s is what a decision that runs to
+# the cap costs there. 600s is 2.5x that: the headroom for a busier hour on a
+# shared GPU, and still short enough that a genuinely dead backend is noticed
+# within the session rather than at the end of the day.
+#
+# Erring long is the cheap direction. A deadline that fires has already spent
+# every one of those seconds and thrown the generation away.
+THINKING_TIMEOUT_S = 600
 
 PROBE_SCHEMA = {
     "type": "object",
@@ -137,6 +154,39 @@ class LLMClient:
 
     # ------------------------------------------------------------- requests
 
+    def _thinking(self, enable_thinking: bool | None) -> bool:
+        """Whether this request will actually think: what the caller asked for,
+        else the client's setting. One resolution, read by both the payload and
+        the deadline below — they must not disagree about it."""
+        if enable_thinking is None:
+            return self._settings.enable_thinking
+        return enable_thinking
+
+    def _timeout_for(self, enable_thinking: bool | None) -> httpx.Timeout:
+        """The read timeout for one request: longer while the model is thinking.
+
+        ``request_timeout_s`` (120) sizes a non-thinking request and is not
+        moved, because it is also what makes a wedged backend fail fast. It
+        does not size a thinking one: measured against Qwen3.8-27B-FP8 on a
+        loaded box, one real agent decision on a hard question took 74s with
+        thinking off and MEASURE_PLACEHOLDER — so a thinking turn would have
+        died on an httpx read timeout, mid-generation, having already burned
+        every one of those seconds.
+
+        Keyed on thinking rather than on the effort level, so the backend that
+        was already slow before the dial existed — a reasoning model with
+        ``llm.enable_thinking`` on and no level chosen — gets the same
+        headroom instead of the deadline that never fitted it.
+
+        ``max`` rather than a plain constant, so a site that raised
+        ``request_timeout_s`` past this still gets what it configured.
+        """
+        if not self._thinking(enable_thinking):
+            return self._client.timeout
+        return httpx.Timeout(
+            max(self._settings.request_timeout_s, THINKING_TIMEOUT_S), connect=10
+        )
+
     def _payload(
         self,
         messages: list[Message],
@@ -148,14 +198,29 @@ class LLMClient:
         enable_thinking: bool | None,
         stream: bool,
         tools: list[dict] | None = None,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
-        if enable_thinking is None:
-            enable_thinking = self._settings.enable_thinking
         payload: dict[str, Any] = {
             "model": self._settings.model,
             "messages": wire_messages(messages),
-            "chat_template_kwargs": {"enable_thinking": enable_thinking},
+            "chat_template_kwargs": {
+                "enable_thinking": self._thinking(enable_thinking)
+            },
         }
+        if reasoning_effort is not None:
+            # Top level rather than inside chat_template_kwargs, although vLLM
+            # accepts it in both places (measured on Qwen3.8-27B-FP8, both
+            # produce the same injected prefix). Top level is the OpenAI
+            # parameter, so vLLM validates it against the model's own enum and
+            # a wrong level comes back as a 400 naming the accepted ones; the
+            # same string smuggled through chat_template_kwargs is handed to
+            # the Jinja template unchecked, where a typo means "no effort
+            # prefix" and looks exactly like it worked. There is no per-session
+            # default to fall back on here — the client is shared by every
+            # session on this backend — so the field appears only when the
+            # caller asks for it, and a backend that has never heard of
+            # reasoning_effort sees the request it always saw.
+            payload["reasoning_effort"] = reasoning_effort
         if tools is not None:
             # Native protocol: the backend's parser produces the call, so
             # there is no envelope to constrain — the two are alternatives,
@@ -185,6 +250,7 @@ class LLMClient:
         temperature: float | None = None,
         enable_thinking: bool | None = None,
         tools: list[dict] | None = None,
+        reasoning_effort: str | None = None,
     ) -> ChatResponse:
         payload = self._payload(
             messages,
@@ -195,10 +261,15 @@ class LLMClient:
             enable_thinking=enable_thinking,
             stream=False,
             tools=tools,
+            reasoning_effort=reasoning_effort,
         )
         started = time.perf_counter()
         try:
-            response = await self._client.post("chat/completions", json=payload)
+            response = await self._client.post(
+                "chat/completions",
+                json=payload,
+                timeout=self._timeout_for(enable_thinking),
+            )
         except httpx.HTTPError as e:
             raise LLMError(f"LLM request failed: {e}") from e
         elapsed = time.perf_counter() - started

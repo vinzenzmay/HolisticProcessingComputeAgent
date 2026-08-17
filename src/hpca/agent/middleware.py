@@ -1,11 +1,23 @@
 """Validation/retry middleware around every model decision (§4.3).
 
-The model answers with one JSON object — either a direct response or a tool
-call. With constrained decoding the JSON is syntactically valid by
-construction and retries only handle semantic errors (unknown tool, invalid
-arguments); without it, a format instruction is appended and JSON parse errors
-are retried too. Every validation failure is fed back verbatim so the model
-can correct itself, a bounded number of times.
+Every decision is either a direct response or a tool call, and two protocols
+carry that choice (``settings.llm.tool_protocol``). Under ``native`` the
+backend's own tool channel makes the choice, and ``_parse_native`` reads it
+off the response. Under ``envelope`` — the default — the model
+answers with one JSON object and ``_parse`` reads the branch out of it; with
+constrained decoding that JSON is syntactically valid by construction and
+retries only handle semantic errors (unknown tool, invalid arguments),
+without it a format instruction is appended and JSON parse errors are retried
+too. Either way, argument validation is the same code and every validation
+failure is fed back verbatim so the model can correct itself, a bounded
+number of times — only the *shape* of that feedback differs, because a chat
+template handed a call with no matching result renders a broken conversation
+(``_retry_feedback``).
+
+The notes below on constrained-decoding artifacts describe the envelope
+grammar, which is where they were measured; the repairs they justify
+(``_strip_key_echo``, array-valued arguments last) are applied on both paths,
+because the habit they correct is the model's and not the grammar's.
 
 Two things here defend against the same constrained-decoding artifact, which
 is worth stating once. Inside a JSON *string* every character is legal, so a
@@ -40,6 +52,7 @@ from pydantic import BaseModel, ValidationError
 
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.llm import Message, TruncatedOutput
+from hpca.thinking import wire_thinking
 
 logger = logging.getLogger("hpca.agent.middleware")
 
@@ -56,6 +69,24 @@ DEFAULT_MAX_RETRIES = 3
 # genuinely looping generation hangs before anyone finds out — and loops are
 # not rare here: 1 of 4 run_bash generations in that same probe.
 MAX_DECISION_TOKENS = 4096
+# Thinking is spent from that same budget before the decision starts, so a
+# level that thinks harder needs a bigger one or it eats the answer's room.
+# These are deliberately round multipliers rather than measured allowances:
+# what a decision costs is dominated by the task, not the level, so a
+# percentile fitted to any fixed task set would carry a precision it does not
+# have. Judgement, stated as such — the payload keeps roughly its own 4096
+# whatever the level, which is the property worth holding.
+DECISION_TOKEN_SCALE: dict[str, float] = {"medium": 1.5, "xhigh": 2.0}
+
+
+def decision_cap(effort: str | None) -> int:
+    """The completion-token cap for a decision at this thinking level.
+
+    ``off`` and ``low`` keep the base: neither spends enough deliberating to
+    crowd the payload (measured on Qwen3.8-27B, one hard decision — 327
+    completion tokens at off and 1341 at low, against a 4096 cap).
+    """
+    return int(MAX_DECISION_TOKENS * DECISION_TOKEN_SCALE.get(effort or "", 1.0))
 # A cut-off decision is worth exactly one more try. Both causes are expensive
 # to retry — a looping model burns the whole cap again — and the second
 # attempt is told to write less, so a third would be the same answer twice.
@@ -614,6 +645,48 @@ def _no_native() -> bool:
     return False
 
 
+def _hit_token_cap(response: Any, max_tokens: int | None) -> bool:
+    """Did this generation spend its entire budget?
+
+    The only trustworthy truncation signal on the native channel. A tool
+    parser reconstructs the call from whatever it managed to parse, so a
+    generation cut off mid-argument can still come back as a syntactically
+    perfect ``tool_calls`` entry with ``finish_reason: "tool_calls"`` — the
+    dropped argument is the only trace, and from the outside that is
+    indistinguishable from a model that forgot a field. The token count is
+    not ambiguous: a decision that stopped exactly at the cap did not stop
+    because it was finished.
+
+    Deliberately *not* consulted before validation. A complete call that
+    happens to end at the cap is real work and must be kept
+    (``test_a_complete_call_at_the_cap_is_kept``); this only reinterprets a
+    call that has already failed validation, where "you left a field out" and
+    "you ran out of room" are the two candidate explanations and the token
+    count picks between them.
+    """
+    if not max_tokens:
+        return False
+    usage = getattr(response, "usage", None) or {}
+    return int(usage.get("completion_tokens") or 0) >= max_tokens
+
+
+def uses_native_tools(llm: Any) -> bool:
+    """Whether this client carries calls on the backend's own tool channel.
+
+    The one place that question is answered, because two very different
+    callers ask it and they must not disagree: ``decide`` below, choosing how
+    to send the request, and the system-prompt builders, choosing which
+    respond-vs-tool guidance to include. A prompt that describes the envelope
+    while the request goes out natively is the failure specs-edit-eval.md §7
+    measured, so they read the same source.
+
+    ``getattr`` rather than a plain call: a fake client in a test has no
+    opinion on the protocol, and "envelope" is the answer that keeps every
+    such caller working.
+    """
+    return bool(getattr(llm, "uses_native_tools", _no_native)())
+
+
 def _retry_feedback(response: Any, error: str, native: bool) -> list[Message]:
     """What a rejected decision adds to the conversation before the retry.
 
@@ -652,14 +725,37 @@ async def decide(
     tools: ToolRegistry,
     *,
     max_retries: int = DEFAULT_MAX_RETRIES,
-    max_tokens: int | None = MAX_DECISION_TOKENS,
+    max_tokens: int | None = None,
+    effort: str | None = None,
 ) -> Decision:
-    """Ask the model for a decision, validating and retrying with feedback."""
+    """Ask the model for a decision, validating and retrying with feedback.
+
+    ``effort`` is the session's thinking level (hpca.thinking); ``None`` means
+    "say nothing about thinking", which is what a bare caller and every test
+    predating the dial get — the client then falls back to its settings.
+
+    ``max_tokens`` defaults to ``decision_cap(effort)``, so the cap moves with
+    the level: thinking is spent from the same budget before the decision
+    starts, and a level that deliberates harder would otherwise eat the room
+    the answer needs. Passing it explicitly overrides that entirely, which is
+    what the eval harness and the truncation tests do.
+
+    That thinking can exhaust the cap is measured, not theoretical — on
+    Qwen3.8-27B-FP8, one multi-part diagnostic question: ``low`` spent 4039 of
+    4096 and then answered in chat instead of calling a tool, ``medium`` was
+    rescued only by the truncation retry below, and ``xhigh`` ran the cap out
+    twice and failed outright. It is a token limit, not a time limit, so a
+    faster backend fails the same way sooner. The same question on another
+    run finished at every level inside 1400 tokens, which is the point: the
+    spread is the task's, not the level's, and the scale factors are set
+    accordingly (see ``DECISION_TOKEN_SCALE``).
+    """
+    if max_tokens is None:
+        max_tokens = decision_cap(effort)
     # Native protocol: the backend's own tool channel decides the branch and
     # carries the tool list, so neither the envelope grammar nor its prose
-    # listing applies. getattr keeps every caller that passes a plain fake
-    # client working — there is nothing to ask, so the answer is "envelope".
-    native = bool(getattr(llm, "uses_native_tools", _no_native)())
+    # listing applies.
+    native = uses_native_tools(llm)
     if native:
         schema = None
     else:
@@ -675,8 +771,18 @@ async def decide(
     else:
         conversation.insert(0, {"role": "system", "content": instruction})
 
-    # Only passed when native, so existing callers see an unchanged call.
-    offered = {"tools": tool_specs(tools)} if native else {}
+    # Extra chat() arguments, each added only when it applies, so a caller from
+    # before either feature — and every fake client in a test — sees exactly
+    # the call it always saw. tools only under the native protocol; the
+    # thinking pair only when a session actually has a level.
+    offered: dict[str, Any] = {"tools": tool_specs(tools)} if native else {}
+    if effort is not None:
+        enable_thinking, reasoning_effort = wire_thinking(effort)
+        offered["enable_thinking"] = enable_thinking
+        # Left out entirely at "off", so the request is byte-for-byte the one
+        # a pre-effort HPCA sent and a non-Qwen backend never sees the field.
+        if reasoning_effort is not None:
+            offered["reasoning_effort"] = reasoning_effort
     attempts = max_retries + 1
     last_error = ""
     truncations = 0
@@ -710,6 +816,29 @@ async def decide(
             return _annotate(parsed, response)
         except ValueError as e:
             last_error = str(e)
+            if native and _hit_token_cap(response, max_tokens):
+                # Not a shape error: a call that died at the cap. Some tool
+                # parsers (measured: vLLM's qwen3_coder, 2026-08-17) drop the
+                # argument they were part-way through and hand back the rest
+                # as a well-formed call — `create_file` arrives as
+                # {dir_key, name} with the 200 content_lines simply gone, and
+                # `finish_reason` says "tool_calls", not "length". Nothing in
+                # the response says truncation; only the token count does.
+                #
+                # Telling the model "content_lines: Field required" invites it
+                # to send the same too-long write again, which truncates
+                # again — the retry budget goes and the turn with it. The
+                # truncation feedback instead says to write a skeleton and
+                # fill it, which is the thing that actually finishes.
+                if truncations >= MAX_TRUNCATION_RETRIES:
+                    raise TruncatedOutput(
+                        f"Tool call truncated at max_tokens ({last_error})"
+                    ) from e
+                truncations += 1
+                conversation = conversation + [
+                    {"role": "user", "content": TRUNCATION_FEEDBACK}
+                ]
+                continue
             conversation = conversation + _retry_feedback(response, last_error, native)
     raise DecisionError(
         f"No valid decision after {attempts} attempts; last error: {last_error}"

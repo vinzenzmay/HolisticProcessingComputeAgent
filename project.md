@@ -322,6 +322,108 @@ Mode guidance is appended to the system prompt per render (§4.3), never stored,
 and the per-mode gating decision is made in the graph's `execute_tool` node —
 the same machinery as the destructive gate, with a different question.
 
+### 3.6 Thinking effort (off / low / medium / xhigh)
+
+The second per-session dial, with the same lifecycle as the mode: stored on the
+session (`sessions.thinking`, empty = the `agent.default_thinking` setting,
+default `off`), read fresh every graph round so a change reaches a turn already
+in flight, chosen through the `/thinking` chooser, and always visible — it rides
+the context bar at the top of the chat column, next to the fill and the
+generation speed. Implementation in `hpca.thinking`.
+
+`off` sends `enable_thinking: false` and **no** `reasoning_effort` at all, so a
+backend that has never heard of the parameter sees exactly the request HPCA
+always sent. The other three send both. The three levels are not ours to pick:
+vLLM validates `reasoning_effort` against the served model's own enum, and
+Qwen3.8 accepts only `low`, `medium` and `xhigh` — there is no `high` (a 400
+says so), and with thinking on and no level given the server defaults to
+`xhigh`, the slowest one. `thinking_budget`, which the chat template also
+accepts, is silently a no-op.
+
+Why per session rather than per request: mechanically the level is a prompt
+injection at **position 0**, before HPCA's own system prompt. xhigh prepends a
+"think carefully, validate key assumptions…" paragraph, low a two-line "keep it
+brief", medium nothing at all — measured against the cluster's Qwen3.8-27B-FP8,
+the same real decision costs 2659 prompt tokens at xhigh, 2647 at low and 2621
+at medium. Two levels therefore differ from the first token onward, so changing
+one throws away the session's whole prefix KV cache on a `--enable-prefix-caching`
+server. It is a setting a conversation is put into, not a knob turned per call.
+
+It replaced a per-**backend** `enable_thinking` toggle on the manage-LLMs
+screen. That flag answered "does this model reason?", where the question a user
+actually has is "how hard should *this conversation* think?" — and answering it
+by editing the catalog changed every session on that backend at once. Old
+settings files still carry the key on their catalog entries; it is ignored on
+load.
+
+The cost is real and is why `off` stays the default. On an idle backend an easy
+decision took 2.7s off against 17.2s low, 14.9s medium and 33.9s xhigh. The
+interesting measurement is the hard one — a multi-part diagnostic question, one
+full agent decision (system prompt, tool listing, 4096 cap), backend at ~17
+tok/s:
+
+| level | decision | requests | outcome |
+|---|---|---|---|
+| `off` | 74s | 1 | answered (1284 completion tokens) |
+| `low` | 234s | 1 | answered, but 4039 of the 4096 tokens went to thinking |
+| `medium` | 411s | 2 | first request truncated at the cap; the retry produced a tool call |
+| `xhigh` | 474s | 2 | **both requests truncated at the cap — the decision failed** |
+
+Every decision of a turn pays this, not just the first. Three things follow,
+and they are the operational content of the feature:
+
+* **The 120s `request_timeout_s` does not size a thinking request.** Each of
+  those generations ran ~237s — the cap divided by the decode rate — so all of
+  them would have died mid-flight on an httpx read timeout, having already
+  spent the time. The deadline is therefore raised per request when the request
+  thinks (`LLMClient._timeout_for`, `THINKING_TIMEOUT_S = 600`), and left alone
+  otherwise: 120s is also what makes a wedged backend fail fast, and every
+  other call would pay for a blanket increase.
+* **Thinking tokens come out of the decision cap, so the cap scales with the
+  level.** `decision_cap(effort)` (§4.3) keeps the base 4096 at `off` and
+  `low`, and applies ×1.5 at `medium` and ×2.0 at `xhigh`
+  (`DECISION_TOKEN_SCALE`). This is a token limit, not a time limit, so a
+  faster backend hits it the same way, only sooner.
+
+  The multipliers are round numbers, chosen rather than fitted, and that is
+  deliberate. The table above is one question: a second run of the same one
+  finished at *every* level inside 1400 completion tokens, and a third — an
+  easy decision — inside 400. What a decision costs is dominated by the task,
+  not by the level, so a percentile fitted to any fixed task set would carry a
+  precision it does not have. The intent is that the payload keeps roughly its
+  own 4096 whatever the level; the scale factors buy that and nothing more is
+  claimed for them.
+
+  **And at `xhigh` they do not buy it.** Measured on the write that provokes
+  the problem best — a 200-line `create_file`, which costs 3415–3732
+  completion tokens with thinking off, i.e. ~85% of the base cap before a
+  single thinking token:
+
+  | level | flat 4096 | scaled |
+  |---|---|---|
+  | `off` | 200 lines, 197.5s | 200 lines, 215.8s (cap unchanged) |
+  | `low` | 21-line skeleton, 271.0s | 6-line skeleton, 268.4s (cap unchanged) |
+  | `xhigh` | **turn lost**, 473.4s | **turn lost**, 947.4s |
+
+  Doubling `xhigh`'s budget did not rescue the turn; it spent the whole 8192
+  twice and failed the same way, for twice the wall time. The reason is that
+  thinking at this level is not sized by the task — it expands into whatever
+  budget is available — so headroom handed to the decision is taken by the
+  deliberation rather than left for the answer. `thinking_budget`, which would
+  bound the two separately, is a no-op on this server (hpca.thinking), so
+  there is no way to give the payload room that thinking cannot take.
+
+  What the scaling does buy is a smaller gap for `medium`, and what it costs is
+  exactly this: the cap also bounds how long a looping generation hangs, so
+  ×2.0 doubles the price of an `xhigh` failure. The `low` rows are the
+  reassuring ones — the cut-off-decision retry (§4.3) turns the same overrun
+  into a skeleton to fill rather than a dead turn, which is the behaviour the
+  feature is supposed to have.
+* **`xhigh` is still not a "try harder" setting to reach for.** It is the
+  slowest by a wide margin — ~237s per thinking generation against 19.5s for
+  the same decision at `off` — and a tool-heavy turn pays that on every round.
+  The chooser says so, and `off` remains the default.
+
 ## 4. Agent design
 
 ### 4.1 Framework
@@ -417,9 +519,12 @@ the orchestrator's or another subagent's context.
 * **Cut-off decisions:** a decision that stops at `max_tokens` is retried once with
   guidance to write the file in parts, rather than killing the turn (before this it
   raised out of the retry loop entirely — `LLMError` is not `DecisionError` — and
-  ended the turn). The cap stays 4096: measured live at the default (thinking off),
-  a document costs ~12 completion tokens per line, so 4096 holds ~330 lines, and
-  raising it would mainly double how long a looping generation hangs.
+  ended the turn). The base cap is 4096: measured live at the default (thinking
+  off), a document costs ~12 completion tokens per line, so 4096 holds ~330 lines,
+  and raising it would mainly double how long a looping generation hangs. It is a
+  base rather than a constant because thinking is spent from the same budget —
+  `decision_cap(effort)` applies ×1.5 at `medium` and ×2.0 at `xhigh` so the
+  payload keeps its own room whatever the level (§3.6).
 * **Path registry:** a named map `{key → absolute path/URI}` per profile+session,
   stored in sqlite. Tools accept **keys**, middleware resolves to real paths and
   errors out on unknown keys (error fed back for retry). New paths discovered by
@@ -468,7 +573,11 @@ the orchestrator's or another subagent's context.
   `{"action": "tool_call", "tool": …, "arguments": …}`, held to an `anyOf`
   grammar by constrained decoding, with the tool list spelled out in prose
   because a grammar constrains syntax and cannot say which tools exist. It
-  works on any OpenAI-compatible backend, which is why it is the default.
+  works on any OpenAI-compatible backend, including one too old to have a
+  tool-call parser — and as of v0.22.0 that portability is no longer the only
+  argument for it: re-measured on Qwen3.8 it is also cheaper, faster and the
+  only channel that can salvage a cut-off long write (specs-edit-eval.md
+  §7.3, §7.4).
   `native` puts the call on the backend's own tool-calling channel: the branch
   choice becomes the backend's, the tool list moves out of the prompt into the
   `tools` array the chat template renders, and the exchange becomes a real
@@ -478,13 +587,39 @@ the orchestrator's or another subagent's context.
   the complaint answers the call on the tool role, because a template handed a
   call with no matching result renders a broken conversation.
   It is a setting rather than a probe, unlike constrained decoding: the
-  protocol shapes the whole conversation rather than one request, so there is
-  nothing to fall back to mid-session, and it needs the server started for it
-  (vLLM: `--enable-auto-tool-choice --tool-call-parser hermes`). A backend
-  without it rejects the request rather than degrading quietly.
+  protocol shapes the whole conversation rather than one request — the system
+  prompt's respond-vs-tool guidance moves with it — so a verdict arriving
+  mid-session would leave the prompt describing a format the model can no
+  longer emit, which is the most expensive bug this area has had
+  (specs-edit-eval.md §7). It needs the server started for it
+  (vLLM: `--enable-auto-tool-choice` plus a `--tool-call-parser` matching the
+  model — `qwen3_coder` for the Qwen3.8 the cluster serves). A backend
+  without it rejects the request with a 400 rather than degrading quietly, and
+  the fix is `llm.tool_protocol`, or the per-entry `tool_protocol` override on
+  a backend in the catalog when only *some* of the servers in reach are old.
+  Because it can vary per backend, the two prompt builders ask the session's
+  client (`middleware.uses_native_tools`) rather than the global setting —
+  one source, so the prompt and the request can never disagree.
   The call's id is checkpointed with the pending call, not just held in
   memory: an approval parks the turn for as long as the user takes, and the id
   is the only thing tying the result to the call it answers.
+  **A cut-off call is invisible on this channel**, which is the one thing the
+  native protocol is genuinely worse at. The envelope raises `TruncatedOutput`
+  on `finish_reason: "length"` and salvages the complete prefix of a long
+  write. A tool parser instead reconstructs a call from whatever it managed to
+  parse: measured on vLLM's `qwen3_coder` (2026-08-17), a `create_file` cut
+  off inside its 200 `content_lines` comes back as a well-formed call of
+  `{dir_key, name}` — the array simply gone, `content` null, and
+  `finish_reason` reading `"tool_calls"`. Nothing says truncation except
+  `completion_tokens == max_tokens`. Read as a shape error it invites the same
+  too-long write again, and the turn dies on the retry budget (reproduced
+  live). So `middleware._hit_token_cap` reinterprets an argument-validation
+  failure that spent the whole budget as truncation, and routes it to the
+  skeleton-then-fill feedback instead. It is checked only *after* validation
+  fails, so a complete call that merely ends at the cap is still kept. There
+  is no salvage on this path — the fragment never arrives — which is why no
+  tool may take an optional array argument: a dropped one has to fail
+  validation, not execute silently as an empty list.
   Each tool's description carries a **filled example** of its arguments on
   both protocols. The `tools` array's JSON schema alone is not enough for a
   27B: with the schema only, `edit_file` came back with `old_lines` as a bare
@@ -967,7 +1102,7 @@ editor (`c`) and by hand. Sketch:
     "backup_limit_gb": 1,
     "trash_ttl_days": 7
   },
-  "agent": { "default_mode": "manual" },
+  "agent": { "default_mode": "manual", "default_thinking": "off" },
   "memory": {
     "system_prompt_token_cap": 2400,
     "rag_prefetch_chars": 800,

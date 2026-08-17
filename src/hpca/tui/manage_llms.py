@@ -2,8 +2,7 @@
 
 Two columns: the left lists discovered endpoints, the right lists the
 configured catalog from settings, each labeled ● connected / ○ disconnected,
-★ marking the active default and ◆ thinking marking a backend that reasons
-before answering.
+with ★ marking the active default.
 
 Discovery runs two ways at once, because a backend can be reached two ways.
 On the cluster it is at its node's own ``ip:port`` and is declared by a
@@ -13,8 +12,12 @@ SSH-tunneled local port, which only a localhost scan finds. Both feed the same
 left panel; whichever finds nothing simply contributes nothing.
 ←/→ switch panels. Key bindings live on the panel widgets, so the footer only
 offers "add llm to list (enter)" while the cursor is on a discovered endpoint,
-and "set default"/"toggle thinking mode"/"remove llm" only on a configured
-one; removal asks for confirmation.
+and "remove llm" only on a configured one; removal asks for confirmation.
+
+Thinking used to be toggled here, per catalog entry. It is a per-session level
+now (``/thinking``, hpca.thinking): what a user adjusts is how hard *this*
+conversation thinks, and a catalog flag answered that by changing every session
+on the backend at once.
 
 A scan that finds nothing reports itself differently depending on the right
 panel: a toast when a configured backend still answers (nothing *new* turned
@@ -51,16 +54,6 @@ from hpca.discover import (
 from hpca.tui.backend_form import BackendFormScreen
 from hpca.tui.confirm_screen import ConfirmScreen
 from hpca.tui.inspect_screen import InspectScreen
-
-# Shown whenever thinking is switched on, because the setting looks like a
-# free upgrade and is not. Both numbers are measured on this site's backend.
-THINKING_WARNING = (
-    "Thinking is not generally better. Small models often follow instructions "
-    "and route tools worse with it on, and it is slow: on Qwen3.6-27B here a "
-    "turn took 133s thinking against 2.3s without. Leave it off unless a "
-    "model clearly needs it for a hard question."
-)
-
 
 def _as_discovered(backend: LLMBackend) -> DiscoveredBackend:
     return DiscoveredBackend(
@@ -102,26 +95,22 @@ class DiscoveredList(ListView):
 
 
 class ConfiguredList(ListView):
-    """Right panel; set-default, remove and thinking only offered on an entry."""
+    """Right panel; removal is only offered on an entry."""
 
     # No "set default" — the LLM is chosen per session (at creation, or ctrl+l);
-    # this panel only adds/removes catalog entries and toggles their thinking.
+    # this panel only adds and removes catalog entries.
     BINDINGS = [
         Binding("escape", "close", "back", show=True),
-        Binding("t", "toggle_thinking", "toggle thinking mode", show=True),
         Binding("r", "remove_llm", "remove llm", show=True),
     ]
 
     def check_action(self, action: str, parameters) -> bool | None:
-        if action in ("remove_llm", "toggle_thinking"):
+        if action == "remove_llm":
             return self.highlighted_child is not None
         return True
 
     def action_remove_llm(self) -> None:
         self.screen.confirm_remove_selected()
-
-    def action_toggle_thinking(self) -> None:
-        self.screen.toggle_thinking_selected()
 
 
 class ManageLLMsScreen(Screen):
@@ -453,14 +442,13 @@ class ManageLLMsScreen(Screen):
                 marker, css = "● connected", "llm-connected"
             else:
                 marker, css = "○ disconnected", "llm-disconnected"
-            thinking = " │ ◆ thinking" if backend.enable_thinking else ""
             # Two lines: the name, then its state. On one line the state fell
             # off the right edge of the panel, which is where the markers live.
             item = ListItem(
                 Label(
                     Content(
                         f"{backend.model}\n"
-                        f"{marker}{thinking} │ {backend_details(backend)}"
+                        f"{marker} │ {backend_details(backend)}"
                     ),
                     classes=css,
                 )
@@ -570,25 +558,6 @@ class ManageLLMsScreen(Screen):
             # A new key landed in the pool — re-probe the remaining sentinels
             # in place; any it unlocks turn informative without a rescan.
             self._reprobe_discovered()
-
-    def toggle_thinking_selected(self) -> None:
-        configured_list = self.query_one("#llm-configured", ListView)
-        backend = getattr(configured_list.highlighted_child, "data_configured", None)
-        if backend is None:
-            return
-        enabled = not backend.enable_thinking
-        self.app.settings.set_thinking(backend, enabled)
-        self.app.settings.save()
-        if self.app.settings.is_active(backend):
-            self.app.reload_llm()  # the running client picks the new mode up
-        self.run_worker(self.refresh_configured(), group="llm-configured")
-        if enabled:
-            self.app.notify(
-                THINKING_WARNING, title=f"Thinking on for {backend.model}",
-                severity="warning", timeout=15,
-            )
-        else:
-            self.app.notify(f"Thinking off for {backend.model}")
 
     def confirm_remove_selected(self) -> None:
         configured_list = self.query_one("#llm-configured", ListView)

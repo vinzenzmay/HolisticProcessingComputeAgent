@@ -356,6 +356,86 @@ So: envelope stays the default because it runs on any OpenAI-compatible
 backend, and native is a setting worth turning on where the server supports
 it — a little more token spend for fewer calls and no grammar-loop tail.
 
+### 7.3 Re-measured on Qwen3.8-27B-FP8 (2026-08-17)
+
+The cluster moved to `Qwen3.8-27B-FP8` on vLLM with `--enable-auto-tool-choice
+--tool-call-parser qwen3_coder --reasoning-parser qwen3`, which is what
+prompted re-running §7.2. Two rounds, core tier, 3 repeats, **n=36 per
+protocol per round**, run **sequentially and in opposite orders** (round 1
+envelope→native, round 2 native→envelope) so that drift in cluster load
+cannot be mistaken for a protocol effect.
+
+| | envelope | native |
+|---|---|---|
+| round 1 success | **1.0** | 0.972 |
+| round 2 success | **1.0** | **1.0** |
+| pooled success (n=72) | **1.0** (0 failures) | 0.986 (1 failure) |
+| failed edits / run | 0.069 | **0.056** |
+| tool calls / run | 2.028 | **2.000** |
+| completion tokens | **6858** | 8541 (+24.5%) |
+| wall | **450.8s** | 542.2s (+20.3%) |
+
+**The §7.1 shape bug is gone.** Not one native run mis-shaped an argument —
+`old_lines` arrived as a list of strings every time. Some of that credit
+belongs to the parser rather than the model: `qwen3_coder` coerces each
+`<parameter=…>` block against the tool's JSON schema, so an argument declared
+`"type": "array"` is *built* as one.
+
+**Native is nevertheless not better here.** It never won a round, and the two
+differences that repeat in both orderings are the ones against it: ~24% more
+completion tokens and ~20% more wall time, for the same work. The likely cause
+is encoding — `qwen3_coder`'s XML-ish call is more verbose than the envelope's
+compact JSON, and the gap is ~11 completion tokens per decision, which is the
+right order of magnitude for it. A server running the `hermes` parser would be
+worth re-measuring before generalising this; it is a statement about *this*
+deployment, not about native tool calling.
+
+The envelope's own §7.2 tail — a constrained-decoding loop costing 224s — did
+not recur in either round.
+
+**Decision: envelope stays the default**, now on measured grounds rather than
+only portability. Native is correct, tested and one setting away
+(`llm.tool_protocol`, or the per-entry override on a backend in the catalog).
+
+### 7.4 What a cut-off call looks like on each channel
+
+The finding that matters more than the table, because it is a capability
+difference rather than a few percent. Probed directly (2026-08-17):
+
+```
+max_tokens=120   finish_reason=tool_calls   completion_tokens=120   args={dir_key, name}
+max_tokens=300   finish_reason=tool_calls   completion_tokens=300   args={dir_key, name}
+max_tokens=4096  finish_reason=tool_calls   completion_tokens=3716  args={dir_key, name, content_lines×200}
+```
+
+A `create_file` cut off inside `content_lines` does **not** report
+`finish_reason: "length"` and does not return the fragment. `qwen3_coder`
+drops the argument it was part-way through and hands back a syntactically
+perfect call of the arguments it did finish, with `content` null. The only
+trace is `completion_tokens == max_tokens`.
+
+Consequences, all reproduced live:
+
+- The envelope's salvage (§ commit 35a0ffd) **cannot** apply on this channel.
+  `_salvage_truncated_call` rebuilds a write from its prefix; here there is no
+  prefix to rebuild from.
+- Before the fix, the truncated call surfaced as an ordinary validation error
+  (`content_lines: Field required`). The model re-sent the same 200-line
+  write, truncated again, and the turn died on `DecisionError` — verified by
+  replaying one request with the guard disabled.
+- `middleware._hit_token_cap` now reinterprets *an argument validation that
+  failed having spent the entire token budget* as truncation, and feeds the
+  skeleton-then-fill message instead. Same request, same cap, after the fix:
+  a valid `create_file` of 31 lines (cap 400) and 13 lines (cap 1200) — the
+  model writes something that fits rather than losing the turn.
+- It is deliberately checked only *after* validation fails, so a complete call
+  that happens to end at the cap is still kept (§`test_a_complete_call_at_the
+  _cap_is_kept`).
+- This is why **no tool may declare an optional array argument**. Scanned at
+  the time of writing: none does. If one did, a dropped array would validate
+  as its default and the call would execute with the content silently missing
+  — the same failure, but acted on instead of caught.
+
 ## 8. What it deliberately is not
 
 - Not part of the default or live pytest suites — it costs real generations

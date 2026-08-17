@@ -57,6 +57,7 @@ SPEC_COMMANDS = {
     "confirm.resolve",
     "memory.resolve",
     "mode.set",
+    "thinking.set",
     "backend.set",
     "profile.set",
     "profile.save",

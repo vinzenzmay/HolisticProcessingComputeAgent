@@ -4,8 +4,8 @@ import json
 
 import pytest
 
-from hpca.config import (LLMBackend, Settings, SettingsError, app_dir,
-                         settings_path)
+from hpca.config import (LLMBackend, LLMSettings, Settings, SettingsError,
+                         app_dir, llm_settings_for, settings_path)
 
 
 class TestAppDir:
@@ -32,8 +32,9 @@ class TestDefaults:
         assert s.llm.constrained_decoding == "auto"
         assert s.llm.max_retries == 3
         assert s.llm.request_timeout_s == 120
-        # thinking is slow and not generally better: opt in, per backend
+        # thinking is slow and not generally better: opt in, per session
         assert s.llm.enable_thinking is False
+        assert s.agent.default_thinking == "off"
         # -1 = no cap by default; the user may set a positive bound
         assert s.llm.max_tool_rounds == -1
 
@@ -171,49 +172,86 @@ class TestBackendCatalog:
         # client behavior settings are not clobbered
         assert s.llm.max_retries == 3
 
-    def test_backends_default_to_not_thinking(self):
-        assert LLMBackend(model="m", base_url="http://localhost:9/v1") \
-            .enable_thinking is False
-
-    def test_activating_carries_the_backends_thinking_mode(self):
-        s = Settings()
-        thinker = LLMBackend(
-            model="reasoner", base_url="http://localhost:9/v1", enable_thinking=True
+    def test_a_backend_entrys_old_thinking_flag_is_dropped_not_rejected(self):
+        # Every settings file written before v0.22.0 has this key on its
+        # catalog entries. Loading one must not fail, and must not resurrect
+        # the per-backend switch either: thinking is a session level now.
+        backend = LLMBackend.model_validate(
+            {
+                "model": "m",
+                "base_url": "http://localhost:9/v1",
+                "enable_thinking": True,
+            }
         )
-        plain = LLMBackend(model="plain", base_url="http://localhost:8/v1")
-        s.activate_backend(thinker)
+        assert not hasattr(backend, "enable_thinking")
+
+    def test_activating_a_backend_leaves_thinking_alone(self):
+        # It used to be carried across from the entry. The client-level flag is
+        # only a fallback now, and the session's level is what decides.
+        s = Settings()
+        s.llm.enable_thinking = True
+        s.activate_backend(
+            LLMBackend(model="plain", base_url="http://localhost:8/v1")
+        )
         assert s.llm.enable_thinking is True
-        s.activate_backend(plain)  # the next backend does not inherit it
-        assert s.llm.enable_thinking is False
 
-    def test_set_thinking_on_the_active_backend_applies_at_once(self):
-        s = Settings()
-        backend = LLMBackend(model="m", base_url="http://localhost:9/v1")
-        s.backends = [backend]
-        s.activate_backend(backend)
-        s.set_thinking(backend, True)
-        assert backend.enable_thinking is True
-        assert s.llm.enable_thinking is True
-        s.set_thinking(backend, False)
-        assert s.llm.enable_thinking is False
+    def test_backends_default_to_the_global_tool_protocol(self):
+        # None, not "native": an entry written before v0.22.0 has no opinion,
+        # and must keep following whatever llm.tool_protocol says.
+        assert LLMBackend(model="m", base_url="http://localhost:9/v1") \
+            .tool_protocol is None
 
-    def test_set_thinking_on_an_inactive_backend_leaves_the_client_alone(self):
+    def test_activating_carries_a_backends_tool_protocol_override(self):
         s = Settings()
-        other = LLMBackend(model="other", base_url="http://localhost:8/v1")
-        s.set_thinking(other, True)
-        assert other.enable_thinking is True
-        assert s.llm.enable_thinking is False  # not the one in use
+        assert s.llm.tool_protocol == "envelope"
+        native_server = LLMBackend(
+            model="new", base_url="http://localhost:9/v1", tool_protocol="native"
+        )
+        s.activate_backend(native_server)
+        assert s.llm.tool_protocol == "native"
 
-    def test_thinking_mode_roundtrips(self, tmp_path):
+    def test_activating_a_backend_without_an_override_leaves_the_protocol(self):
+        # The override is one-way: an entry that says nothing must not reset a
+        # protocol the user chose globally, in either direction.
         s = Settings()
-        s.backends = [
-            LLMBackend(
-                model="m", base_url="http://localhost:9/v1", enable_thinking=True
-            )
-        ]
-        s.save(tmp_path / "settings.json")
-        loaded = Settings.load(tmp_path / "settings.json")
-        assert loaded.backends[0].enable_thinking is True
+        s.llm.tool_protocol = "native"
+        s.activate_backend(LLMBackend(model="m", base_url="http://localhost:9/v1"))
+        assert s.llm.tool_protocol == "native"
+
+    def test_per_session_settings_do_not_carry_a_thinking_flag(self):
+        # One client is shared by every session on a backend
+        # (core.backends.client_for_backend), so a thinking flag baked into its
+        # settings would be one session's choice imposed on the others.
+        base = LLMSettings()
+        base.enable_thinking = True
+        derived = llm_settings_for(
+            LLMBackend(model="m", base_url="http://localhost:8/v1"), base
+        )
+        assert derived.enable_thinking is True  # copied from base, not the entry
+
+    def test_per_session_settings_take_the_backends_protocol(self):
+        base = LLMSettings()
+        old_server = LLMBackend(
+            model="old", base_url="http://localhost:9/v1", tool_protocol="envelope"
+        )
+        assert llm_settings_for(old_server, base).tool_protocol == "envelope"
+        plain = LLMBackend(model="m", base_url="http://localhost:8/v1")
+        assert llm_settings_for(plain, base).tool_protocol == base.tool_protocol
+
+    def test_a_settings_file_with_the_old_backend_flag_still_loads(self, tmp_path):
+        # The whole-file version of the check above: an in-the-wild settings.json
+        # keeps working, minus the key.
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({
+            "backends": [{
+                "model": "m",
+                "base_url": "http://localhost:9/v1",
+                "enable_thinking": True,
+            }]
+        }))
+        loaded = Settings.load(path)
+        assert loaded.backends[0].model == "m"
+        assert "enable_thinking" not in loaded.model_dump()["backends"][0]
 
     def test_is_active(self):
         s = Settings()
