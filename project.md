@@ -35,10 +35,10 @@ sessions, and supervise running sub-processes and cluster jobs.
   login node, laptop, remote provider). HPCA only needs a `base_url` (+ optional API
   key).
 * **Standardize on the OpenAI-compatible chat completions API.** vLLM,
-  llama.cpp-server, Ollama, and commercial providers all speak it, so "local or remote
+  llama.cpp-server and commercial providers all speak it, so "local or remote
   LLM" is a single config switch, one code path.
 * Prefer backends that support **structured output / JSON-schema-constrained
-  decoding** (vLLM `guided_json`, llama.cpp grammars, Ollama `format`). Use it for all
+  decoding** (vLLM `guided_json`, llama.cpp grammars). Use it for all
   tool calls so they are syntactically valid *by construction*; retries then only
   handle semantic errors.
 * **Open question to verify before building the job tools:** does our site permit
