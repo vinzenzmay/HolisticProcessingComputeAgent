@@ -7,13 +7,17 @@ import pytest
 from pydantic import BaseModel, Field
 
 from hpca.agent.middleware import (
+    MAX_DECISION_TOKENS,
+    TRUNCATION_FEEDBACK,
     DecisionError,
     DirectResponse,
     ToolCall,
     decide,
+    decision_cap,
     decision_schema,
     format_instruction,
     inline_refs,
+    uses_native_tools,
 )
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.llm import ChatResponse, TruncatedOutput
@@ -106,7 +110,13 @@ class FakeLLM:
         self.calls: list[dict] = []
 
     async def chat(self, messages, *, json_schema=None, **kwargs):
-        self.calls.append({"messages": list(messages), "json_schema": json_schema})
+        self.calls.append(
+            {
+                "messages": list(messages),
+                "json_schema": json_schema,
+                "max_tokens": kwargs.get("max_tokens"),
+            }
+        )
         output = self._outputs.pop(0)
         if isinstance(output, Exception):
             raise output
@@ -224,17 +234,26 @@ class NativeLLM:
     def __init__(self, outputs):
         self._outputs = list(outputs)
         self.calls: list[dict] = []
+        # What the backend reports it spent. Only the silent-truncation tests
+        # care: reaching max_tokens is the sole trace a parser leaves when it
+        # drops the argument a generation died inside.
+        self.usage: dict = {}
 
     async def chat(self, messages, *, json_schema=None, tools=None, **kwargs):
         self.calls.append(
-            {"messages": list(messages), "json_schema": json_schema, "tools": tools}
+            {
+                "messages": list(messages),
+                "json_schema": json_schema,
+                "tools": tools,
+                "max_tokens": kwargs.get("max_tokens"),
+            }
         )
         output = self._outputs.pop(0)
         if isinstance(output, Exception):
             raise output
         if isinstance(output, str):
-            return ChatResponse(content=output)
-        return ChatResponse(content="", tool_calls=output)
+            return ChatResponse(content=output, usage=dict(self.usage))
+        return ChatResponse(content="", tool_calls=output, usage=dict(self.usage))
 
     def uses_native_tools(self):
         return True
@@ -335,7 +354,11 @@ class TestDecideNative:
 # --------------------------------------------------------- integration tests
 
 from hpca.config import LLMSettings  # noqa: E402
-from hpca.agent.prompts import RESPOND_VS_TOOL_GUIDANCE  # noqa: E402
+from hpca.agent.prompts import (  # noqa: E402
+    RESPOND_VS_TOOL_GUIDANCE,
+    RESPOND_VS_TOOL_GUIDANCE_NATIVE,
+    orchestrator_system_prompt,
+)
 from hpca.llm import LLMClient  # noqa: E402
 
 from tests.live_backend import LIVE_KEY, LIVE_MODEL, LIVE_URL, integration  # noqa: E402
@@ -776,3 +799,144 @@ class TestTruncationSalvage:
         )
         with pytest.raises(TruncatedOutput):
             await decide(llm, USER, file_tools)
+
+
+class TestUsesNativeTools:
+    """The single source both `decide` and the prompt builders read.
+
+    They must never disagree: a prompt that spells out the envelope's
+    {"action": "respond"} branch while the request goes out on the native
+    channel names a format the model cannot emit, which is what took the core
+    tier to 12/17 in specs-edit-eval.md §7.
+    """
+
+    def test_a_native_client_is_native(self):
+        assert uses_native_tools(NativeLLM([])) is True
+
+    def test_an_envelope_client_is_not(self):
+        assert uses_native_tools(FakeLLM([])) is False
+
+    def test_a_client_with_no_opinion_is_envelope(self):
+        # A fake in a TUI test has no protocol; "envelope" is the answer that
+        # keeps it working rather than an AttributeError at prompt-build time.
+        assert uses_native_tools(object()) is False
+
+    def test_the_prompt_follows_the_same_answer(self):
+        native = orchestrator_system_prompt(native_tools=uses_native_tools(NativeLLM([])))
+        envelope = orchestrator_system_prompt(native_tools=uses_native_tools(FakeLLM([])))
+        assert RESPOND_VS_TOOL_GUIDANCE_NATIVE in native
+        assert RESPOND_VS_TOOL_GUIDANCE not in native
+        assert RESPOND_VS_TOOL_GUIDANCE in envelope
+        assert RESPOND_VS_TOOL_GUIDANCE_NATIVE not in envelope
+
+
+class TestNativeSilentTruncation:
+    """A call that died at the cap, reported as a well-formed call.
+
+    Measured against vLLM's qwen3_coder parser (2026-08-17): a create_file
+    cut off part-way through content_lines comes back as
+    {"dir_key": ..., "name": ...} with finish_reason "tool_calls" and no
+    content. Only completion_tokens == max_tokens says what happened.
+    """
+
+    @pytest.fixture
+    def file_tools(self):
+        from hpca.agent.file_tools import add_file_tools
+
+        return add_file_tools(ToolRegistry())
+
+    def cut_off_call(self):
+        return [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "create_file",
+                    # content_lines: dropped by the parser, mid-generation
+                    "arguments": json.dumps({"dir_key": "work", "name": "notes.md"}),
+                },
+            }
+        ]
+
+    async def test_the_cap_turns_a_validation_error_into_truncation_feedback(
+        self, file_tools
+    ):
+        llm = NativeLLM([self.cut_off_call(), "done"])
+        llm.usage = {"completion_tokens": 4096}
+        await decide(llm, USER, file_tools, max_tokens=4096)
+        # The retry must not say "content_lines: Field required" — that invites
+        # the same too-long write again.
+        retry = llm.calls[1]["messages"][-1]
+        assert retry["role"] == "user"
+        assert retry["content"] == TRUNCATION_FEEDBACK
+
+    async def test_it_is_surfaced_once_the_truncation_budget_is_gone(
+        self, file_tools
+    ):
+        llm = NativeLLM([self.cut_off_call(), self.cut_off_call()])
+        llm.usage = {"completion_tokens": 4096}
+        with pytest.raises(TruncatedOutput):
+            await decide(llm, USER, file_tools, max_tokens=4096)
+
+    async def test_a_short_generation_is_still_an_ordinary_shape_error(
+        self, file_tools
+    ):
+        # Same missing field, but nowhere near the cap: the model really did
+        # forget it, so the verbatim validation error is the right feedback.
+        llm = NativeLLM([self.cut_off_call(), "done"])
+        llm.usage = {"completion_tokens": 40}
+        await decide(llm, USER, file_tools, max_tokens=4096)
+        retry = llm.calls[1]["messages"][-1]
+        assert retry["role"] == "tool"
+        assert "content_lines" in retry["content"]
+
+    async def test_a_valid_call_at_the_cap_is_still_kept(self, file_tools):
+        # _hit_token_cap only reinterprets an already-failed validation; a
+        # complete call that ends at the cap is real work.
+        llm = NativeLLM(
+            [
+                native_call(
+                    "create_file", dir_key="work", name="n.md", content_lines=["x"]
+                )
+            ]
+        )
+        llm.usage = {"completion_tokens": 4096}
+        decision = await decide(llm, USER, file_tools, max_tokens=4096)
+        assert isinstance(decision, ToolCall)
+
+
+class TestDecisionCap:
+    """The cap moves with the thinking level, because thinking is spent from it.
+
+    The multipliers are a judgement call, not a fitted number (see
+    DECISION_TOKEN_SCALE) — what these pin down is that the wiring works and
+    that an explicit cap still wins.
+    """
+
+    def test_off_and_low_keep_the_base(self):
+        assert decision_cap("off") == MAX_DECISION_TOKENS
+        assert decision_cap("low") == MAX_DECISION_TOKENS
+
+    def test_medium_and_xhigh_scale_up(self):
+        assert decision_cap("medium") == 6144
+        assert decision_cap("xhigh") == 8192
+
+    def test_no_level_is_the_base(self):
+        # A bare caller — every test predating the dial, and the aux callers.
+        assert decision_cap(None) == MAX_DECISION_TOKENS
+        assert decision_cap("") == MAX_DECISION_TOKENS
+
+    def test_an_unknown_level_does_not_inflate_the_cap(self):
+        # normalize_effort maps junk to "off"; the cap must not be the one
+        # place a hand-edited settings file can buy an 8k generation.
+        assert decision_cap("enormous") == MAX_DECISION_TOKENS
+
+    async def test_decide_sends_the_scaled_cap(self, tools):
+        llm = NativeLLM([respond_json("hi")])
+        await decide(llm, USER, tools, effort="xhigh")
+        assert llm.calls[0]["max_tokens"] == 8192
+
+    async def test_an_explicit_cap_still_wins(self, tools):
+        llm = NativeLLM([respond_json("hi")])
+        await decide(llm, USER, tools, effort="xhigh", max_tokens=512)
+        assert llm.calls[0]["max_tokens"] == 512

@@ -135,3 +135,42 @@ class TestSpeed:
         bar.reset()
         bar.set_used(8_000)
         assert "tok/s" not in bar.text
+
+
+class TestThinkingEffort:
+    """The session's thinking level, shown alongside the fill and the speed."""
+
+    def test_shown_before_the_first_reply(self):
+        # Unlike the fill, the level is known the moment a session is open —
+        # and "is this session about to think for two minutes?" is a question
+        # whose answer must not wait for the reply that proves it.
+        bar = ContextBar()
+        bar.set_window(32_000)
+        bar.set_effort("xhigh")
+        assert "no reply yet" in bar.text
+        assert "think xhigh" in bar.text
+
+    def test_appended_after_the_fill_and_the_speed(self):
+        bar = ContextBar()
+        bar.set_window(32_000)
+        bar.set_used(8_000)
+        bar.set_speed(28.0)
+        bar.set_effort("low")
+        assert bar.text.endswith("· think low")
+        assert bar.text.index("8,000") < bar.text.index("28 tok/s")
+        assert bar.text.index("28 tok/s") < bar.text.index("think low")
+
+    def test_off_is_shown_too(self):
+        # "off" is a state of the dial, not an absence of one: a user who has
+        # just turned thinking off needs to see that it took.
+        bar = ContextBar()
+        bar.set_used(8_000)
+        bar.set_effort("off")
+        assert "think off" in bar.text
+
+    def test_none_clears_it(self):
+        bar = ContextBar()
+        bar.set_used(8_000)
+        bar.set_effort("medium")
+        bar.set_effort(None)
+        assert "think" not in bar.text

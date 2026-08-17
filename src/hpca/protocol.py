@@ -417,6 +417,20 @@ class ModeSet(Command):
     mode: str
 
 
+class ThinkingSet(Command):
+    """The other per-session dial (hpca.thinking), carried like ModeSet.
+
+    Same shape and the same reason for it: the level a session reasons at is
+    the front-end's to change, and a remote front-end has no other way to say
+    so. A plain string for the same reason as ``mode`` above — which levels
+    exist is decided by the served model, so the protocol only carries it.
+    """
+
+    TYPE: ClassVar[str] = "thinking.set"
+    session_id: str
+    effort: str
+
+
 class BackendSet(Command):
     TYPE: ClassVar[str] = "backend.set"
     # An `LLMBackend` as JSON. Opaque on purpose: duplicating a settings model

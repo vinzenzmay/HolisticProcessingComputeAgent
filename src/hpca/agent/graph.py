@@ -150,6 +150,7 @@ def build_graph(
     on_evict: Callable[[list[Message]], Any] | None = None,
     on_usage: Callable[[str, dict], None] | None = None,
     mode_fn: Callable[..., str | None] | None = None,
+    effort_fn: Callable[..., str | None] | None = None,
     on_step: Callable[[str, dict], None] | None = None,
 ):
     def client(thread_id):
@@ -164,6 +165,13 @@ def build_graph(
     # (tests, bare graphs): behaves exactly like before.
     def mode_for(thread_id):
         return _resolve(mode_fn, thread_id)
+
+    # The session's thinking level (hpca.thinking), read per round for the same
+    # reason as the mode: /thinking must apply from the next decision on, not
+    # from the next turn. None = no dial (tests, bare graphs), and then nothing
+    # about thinking is put on the wire at all.
+    def effort_for(thread_id):
+        return _resolve(effort_fn, thread_id)
 
     def window_for(thread_id):
         return _resolve(max_model_len, thread_id)
@@ -267,6 +275,7 @@ def build_graph(
                     [system] + _view(state) + nudges,
                     tools,
                     max_retries=max_retries,
+                    effort=effort_for(thread_id),
                 )
             except DecisionError as e:
                 return _final(f"I failed to produce a valid action: {e}") | compaction
@@ -484,6 +493,7 @@ def build_graph(
                 [system] + _view(state) + [budget_note],
                 ToolRegistry(),  # no tools: respond-only
                 max_retries=max_retries,
+                effort=effort_for(thread_id),
             )
         except DecisionError:
             return _final(

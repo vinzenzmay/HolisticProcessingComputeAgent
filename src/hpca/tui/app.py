@@ -66,6 +66,7 @@ from hpca.agent.memory_context import (
     retrieved_line,
 )
 from hpca.agent.memory_tools import add_memory_tools
+from hpca.agent.middleware import uses_native_tools
 from hpca.agent.modes import (
     add_plan_tool,
     next_mode,
@@ -121,6 +122,7 @@ from hpca.skills import (
 from hpca.slurm import TERMINAL_STATES as SLURM_TERMINAL_STATES
 from hpca.slurm import SlurmClient
 from hpca.symbols import SymbolIndex
+from hpca.thinking import XHIGH_WARNING, normalize_effort
 from hpca.trash import TrashManager
 from hpca.tui.approval_screen import (
     approval_details,
@@ -161,6 +163,7 @@ from hpca.tui.rewind_screen import (
 from hpca.tui.settings_screen import SettingsScreen
 from hpca.tui.switch_llm import SwitchLLMScreen
 from hpca.tui.termkeys import patch_alt_enter
+from hpca.tui.thinking_screen import ThinkingScreen
 from hpca.watches import (
     KIND_JOB,
     KIND_LOG,
@@ -337,6 +340,11 @@ COMMANDS = (
     ),
     ("skills-list", "/skills-list — list this profile's skills"),
     ("skill-remove", "/skill-remove — remove one of this profile's skills"),
+    (
+        "thinking",
+        "/thinking — how hard this session's model reasons "
+        "(off / low / medium / xhigh)",
+    ),
 )
 # How the "/" menu marks its own commands apart from the profile's skills:
 # the built-in's name is bold, everything else is left alone. A plain ANSI
@@ -1648,7 +1656,14 @@ class HpcaApp(App):
             session_search="session_search" in self._tools.names(),
             memory_tool="memory" in self._tools.names(),
             watch_tools="watch_log" in self._tools.names(),
-            native_tools=self.settings.llm.tool_protocol == "native",
+            # Asked of the client that will actually carry the turn, not of
+            # the global setting: a session pinned to a backend whose entry
+            # overrides tool_protocol must be told about the protocol it is
+            # really using, or the prompt describes a format the channel has
+            # no room for (specs-edit-eval.md §7).
+            native_tools=uses_native_tools(
+                self._client_for(ts.session if ts is not None else None)
+            ),
         )
 
     def _recall_lines(
@@ -2523,6 +2538,57 @@ class HpcaApp(App):
         self.session_store.set_mode(session.session_id, mode)
         self._refresh_mode_bar()
 
+    # -------------------------------------------------------- thinking effort
+
+    def _thinking_of(self, session: Session | None) -> str:
+        """A session's thinking level (hpca.thinking); the configured default
+        when the session never chose one (or there is no session). Exactly the
+        shape of ``_mode_of`` — the two dials have the same lifecycle."""
+        if session is None:
+            return self.settings.agent.default_thinking
+        return session.thinking or self.settings.agent.default_thinking
+
+    def _thinking_for_turn(self, session_id: str) -> str:
+        """The level the graph puts on the wire this round. Read fresh from the
+        store so ``/thinking`` applies from the next decision, not the next
+        turn — the mid-turn switch costs the prefix cache, which is the price
+        of the change taking effect at all."""
+        fresh = self.session_store.get(session_id)
+        if fresh is not None:
+            return self._thinking_of(fresh)
+        ts = self._turns.get(session_id)
+        return self._thinking_of(ts.session if ts is not None else None)
+
+    def _choose_thinking(self) -> None:
+        """``/thinking``: put the four levels up and apply what is picked."""
+        session = self.active_session
+        if session is None:
+            self.notify("Open a session first — thinking is per session.",
+                        severity="warning")
+            return
+
+        def apply(effort: str | None) -> None:
+            if effort is None or self.active_session is not session:
+                # Cancelled, or the user switched away while the modal was up:
+                # applying it now would set the level on the wrong session.
+                return
+            session.thinking = effort
+            self.session_store.set_thinking(session.session_id, effort)
+            self._refresh_context_bar()
+            if effort == "xhigh":
+                # The headline is in the title, because a toast is read in the
+                # order it is laid out and this one has to land even if the
+                # body is skimmed. Longer timeout than the others: it is now a
+                # paragraph, and it is the one the user most needs to finish.
+                self.notify(
+                    XHIGH_WARNING, title="Thinking: xhigh — NOT USABLE",
+                    severity="warning", timeout=25,
+                )
+            else:
+                self.notify(f"Thinking effort for this session: {effort}")
+
+        self.push_screen(ThinkingScreen(self._thinking_of(session)), apply)
+
     def _mode_bar(self) -> ModeBar | None:
         found = self.query("#mode-bar")
         return found.first(ModeBar) if found else None
@@ -2569,6 +2635,8 @@ class HpcaApp(App):
             self._show_skills_list()
         elif command == "skill-remove":
             self.run_worker(self._skill_remove_worker(), exclusive=True)
+        elif command == "thinking":
+            self._choose_thinking()
         else:
             self.notify(f"Unknown command: /{command}", severity="warning")
 
@@ -3344,6 +3412,7 @@ class HpcaApp(App):
                     title=UNTITLED_SESSION,
                     mode=self.settings.agent.default_mode,
                     backend=backend,
+                    thinking=self.settings.agent.default_thinking,
                 )
             )
             await self._set_chat_messages([])
@@ -3545,6 +3614,7 @@ class HpcaApp(App):
         bar = self._context_bar()
         if bar is not None:
             bar.reset()
+            bar.set_effort(None)  # no session, no level to describe
         await self._set_chat_messages([])
         self.query_one("#chat-input", ChatInput).display = False
         self._refresh_mode_bar()
@@ -5023,6 +5093,7 @@ class HpcaApp(App):
             max_model_len=self._max_model_len_for,
             on_usage=lambda sid, usage: self._on_usage(sid, usage),
             mode_fn=self._mode_for_turn,
+            effort_fn=self._thinking_for_turn,
             on_step=lambda sid, step: self.report_step(sid, step),
         )
 
@@ -5177,6 +5248,14 @@ class HpcaApp(App):
         # from the previously shown session would read as this one's.
         bar.set_speed(
             self._turn_speed.get(session_id) if session_id else None
+        )
+        # Unconditional, unlike the fill: the level is a property of the
+        # session rather than a measurement of it, so it is known the moment
+        # one is open and there is no estimate to preserve.
+        bar.set_effort(
+            normalize_effort(self._thinking_of(self.active_session))
+            if self.active_session is not None
+            else None
         )
 
     async def _discover_context_window(self) -> None:

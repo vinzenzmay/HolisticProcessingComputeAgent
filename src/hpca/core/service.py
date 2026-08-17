@@ -43,6 +43,7 @@ from hpca.agent.graph import build_graph
 from hpca.agent.job_tools import add_job_tools
 from hpca.agent.memory_context import build_memory_context, compose_api_content
 from hpca.agent.memory_tools import add_memory_tools
+from hpca.agent.middleware import uses_native_tools
 from hpca.agent.modes import add_plan_tool
 from hpca.agent.prompts import (
     build_skill_directive,
@@ -388,7 +389,12 @@ def build_service(
             session_search="session_search" in tools.names(),
             memory_tool="memory" in tools.names(),
             watch_tools="watch_log" in tools.names(),
-            native_tools=settings.llm.tool_protocol == "native",
+            # Asked of the client that will actually carry the turn, not of
+            # the global setting: a session pinned to a backend whose entry
+            # overrides tool_protocol must be told about the protocol it is
+            # really using, or the prompt describes a format the channel has
+            # no room for (specs-edit-eval.md §7).
+            native_tools=uses_native_tools(backends.client_for(session_id)),
         )
 
     graph = build_graph(
@@ -405,6 +411,7 @@ def build_service(
         max_model_len=lambda sid: backends.max_model_len_for(sid),
         on_usage=lambda sid, usage: backends.note_usage(sid, usage),
         mode_fn=lambda sid: _mode_for(sessions, settings, sid),
+        effort_fn=lambda sid: _effort_for(sessions, settings, sid),
     )
 
     def prepare(session, *, user_text=None, forced_skill=None) -> TurnPlan:
@@ -492,6 +499,15 @@ def _mode_for(sessions, settings, session_id: str) -> str:
     session = sessions.get(session_id)
     stored = getattr(session, "mode", "") if session is not None else ""
     return stored or settings.agent.default_mode
+
+
+def _effort_for(sessions, settings, session_id: str) -> str:
+    """The session's thinking level (hpca.thinking). Read from the store per
+    round, not from a Session copy, so ``/thinking`` reaches a turn already in
+    flight — the same rule as the mode above."""
+    session = sessions.get(session_id)
+    stored = getattr(session, "thinking", "") if session is not None else ""
+    return stored or settings.agent.default_thinking
 
 
 def _make_tool_ctx(deps, session, log, *, skills, backends, tools) -> ToolContext:

@@ -178,6 +178,7 @@ One envelope in both directions:
 | `confirm.resolve` | `id`, `confirmed` — answers a `confirm.requested`; the core holds the continuation, only the yes/no crosses |
 | `memory.resolve` | `session_id`, `approved: [bool]` — answers a `memory.proposals` offer, positionally. The core holds the proposal objects; only the yes/no crosses, so a front-end cannot smuggle an edited memory back in an approval |
 | `mode.set` | `session_id`, `mode` |
+| `thinking.set` | `session_id`, `effort` — the other per-session dial (§3.6); a plain string for the same reason as `mode`, since which levels exist is the served model's business |
 | `backend.set` | `backend` (JSON blob), `session_id?` |
 | `profile.set` | `name` |
 | `profile.save` | `name`, `kind` (`memories\|archive`), `text` |

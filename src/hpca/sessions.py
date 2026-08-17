@@ -27,6 +27,12 @@ class Session:
     # back to the app's bootstrap client. Stored on the session so the choice
     # survives even if that backend is later removed from the catalog.
     backend: str = ""
+    # Thinking effort (hpca.thinking): off | low | medium | xhigh;
+    # "" = configured default. Per session for the same reason as ``mode``,
+    # plus one of its own: a level change re-writes the prompt's first tokens,
+    # so it invalidates the session's prefix KV cache and is not something to
+    # churn.
+    thinking: str = ""
 
 
 class SessionStore:
@@ -40,6 +46,7 @@ class SessionStore:
         title: str = "untitled",
         mode: str = "",
         backend: str = "",
+        thinking: str = "",
     ) -> Session:
         session = Session(
             session_id=str(uuid.uuid4()),
@@ -49,11 +56,13 @@ class SessionStore:
             checkpoint_ref="",
             mode=mode,
             backend=backend,
+            thinking=thinking,
         )
         session.checkpoint_ref = session.session_id
         self._conn.execute(
             "INSERT INTO sessions (session_id, profile, title, created_at, "
-            "checkpoint_ref, mode, backend) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "checkpoint_ref, mode, backend, thinking) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 session.session_id,
                 session.profile,
@@ -62,6 +71,7 @@ class SessionStore:
                 session.checkpoint_ref,
                 session.mode,
                 session.backend,
+                session.thinking,
             ),
         )
         self._conn.commit()
@@ -70,6 +80,13 @@ class SessionStore:
     def set_mode(self, session_id: str, mode: str) -> None:
         self._conn.execute(
             "UPDATE sessions SET mode = ? WHERE session_id = ?", (mode, session_id)
+        )
+        self._conn.commit()
+
+    def set_thinking(self, session_id: str, thinking: str) -> None:
+        self._conn.execute(
+            "UPDATE sessions SET thinking = ? WHERE session_id = ?",
+            (thinking, session_id),
         )
         self._conn.commit()
 
@@ -156,4 +173,5 @@ class SessionStore:
             checkpoint_ref=row["checkpoint_ref"],
             mode=row["mode"] if "mode" in row.keys() else "",
             backend=row["backend"] if "backend" in row.keys() else "",
+            thinking=row["thinking"] if "thinking" in row.keys() else "",
         )

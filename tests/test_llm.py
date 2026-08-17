@@ -361,8 +361,17 @@ class TestNativeTools:
         def handler(request):
             raise AssertionError("no request expected")
 
-        assert not make_client(handler).uses_native_tools()
-        assert make_client(handler, tool_protocol="native").uses_native_tools()
+        assert make_client(handler, tool_protocol="envelope").uses_native_tools() is False
+        assert make_client(handler, tool_protocol="native").uses_native_tools() is True
+
+    def test_envelope_is_the_default(self):
+        # Measured, not just portable (specs-edit-eval.md §7.3/§7.4): native is
+        # correct on Qwen3.8 but costs ~24% more tokens for the same success
+        # rate, and a cut-off long write cannot be salvaged on that channel.
+        def handler(request):
+            raise AssertionError("no request expected")
+
+        assert make_client(handler).uses_native_tools() is False
 
 
 class TestWireMessages:
@@ -518,3 +527,74 @@ class TestLiveThinking:
         # thinking would blow the probe's 20-token cap and read as "unsupported"
         async with self.client(enable_thinking=True) as llm:
             assert await llm.supports_constrained_decoding() is True
+
+
+@integration
+class TestLiveReasoningEffort:
+    """The four levels against the real backend (hpca.thinking).
+
+    Measured on Qwen3.8-27B-FP8 (vLLM, ``--reasoning-parser qwen3``): only
+    ``low``, ``medium`` and ``xhigh`` exist — ``high`` is a 400 saying so — and
+    the level is a prompt injection at position 0, which shows up as a
+    per-level difference in ``prompt_tokens`` for an otherwise identical
+    request. Both facts are asserted here rather than trusted, because both are
+    properties of the served model and would change with it.
+    """
+
+    QUESTION = [
+        {
+            "role": "user",
+            "content": "A cohort has 4 BAMs of 8 GB each. Disk for a 2x copy?",
+        }
+    ]
+
+    def client(self):
+        # The long deadline is the point of _timeout_for: at xhigh a single
+        # request outruns the 120s that sizes a non-thinking turn.
+        return LLMClient(
+            LLMSettings(base_url=LIVE_URL, model=LIVE_MODEL, api_key=LIVE_KEY)
+        )
+
+    @pytest.mark.parametrize("effort", ["low", "medium", "xhigh"])
+    async def test_every_level_is_accepted_and_thinks(self, effort):
+        async with self.client() as llm:
+            resp = await llm.chat(
+                self.QUESTION, max_tokens=4096, temperature=0,
+                enable_thinking=True, reasoning_effort=effort,
+            )
+            assert resp.reasoning
+            assert resp.content
+
+    async def test_off_sends_no_level_and_does_not_think(self):
+        async with self.client() as llm:
+            resp = await llm.chat(
+                self.QUESTION, max_tokens=2000, temperature=0,
+                enable_thinking=False, reasoning_effort=None,
+            )
+            assert not resp.reasoning
+
+    async def test_high_is_rejected_by_the_server(self):
+        # The reason there are three levels and not four: the name the OpenAI
+        # API suggests is the one this model does not have.
+        async with self.client() as llm:
+            with pytest.raises(LLMError) as excinfo:
+                await llm.chat(
+                    self.QUESTION, max_tokens=50, enable_thinking=True,
+                    reasoning_effort="high",
+                )
+            assert "400" in str(excinfo.value)
+
+    async def test_the_level_changes_the_prompt_prefix(self):
+        # Why the level is per session and not per request: it is prepended to
+        # the prompt, so two levels diverge from the first tokens and a switch
+        # costs the session's whole prefix KV cache.
+        sizes = {}
+        async with self.client() as llm:
+            for effort in ("low", "medium", "xhigh"):
+                resp = await llm.chat(
+                    self.QUESTION, max_tokens=4096, temperature=0,
+                    enable_thinking=True, reasoning_effort=effort,
+                )
+                sizes[effort] = resp.usage["prompt_tokens"]
+        # medium injects nothing at all; xhigh injects the longest preamble.
+        assert sizes["medium"] < sizes["low"] < sizes["xhigh"]
