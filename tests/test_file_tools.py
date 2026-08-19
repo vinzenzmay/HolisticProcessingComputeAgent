@@ -4,6 +4,7 @@ import pytest
 
 from hpca.agent.context import ToolContext
 from hpca.agent.file_tools import add_file_tools, edit_preview
+from hpca.agent.history import ELISION_SENTINEL, omitted_list
 from hpca.agent.tools import ToolRegistry
 from hpca.config import Settings
 from hpca.db import connect, init_db
@@ -820,8 +821,29 @@ class TestEditRepairAndFuzz:
             old_lines=["bravo"],
             new_lines=["BRAVO"],
         )
-        assert result == f"Edited {notes} at line 2: 1 line → 1 line."
+        assert result == (
+            f"Edited {notes} at line 2: 1 line → 1 line. "
+            "Do not read it back to check."
+        )
         assert ctx.trash.list()  # the backup itself is still kept
+
+    async def test_success_says_not_to_read_the_file_back(
+        self, tools, ctx, notes
+    ):
+        """The one clause the short line pays for.
+
+        Measured on the live 27B: a write that succeeds is followed by a
+        read_file on the file just written, purely to confirm it landed. The
+        result message is the only place that habit can be talked out of, and
+        the round trip it saves is worth the words it costs.
+        """
+        result = await call(
+            tools, "edit_file", ctx,
+            registry_key="notes",
+            old_lines=["bravo"],
+            new_lines=["BRAVO"],
+        )
+        assert "Do not read it back" in result
 
     async def test_success_warns_only_when_no_backup_could_be_kept(
         self, tools, ctx, tmp_path
@@ -1067,7 +1089,26 @@ class TestCreateFile:
             dir_key="project", name="specs.md", content_lines=["junk"],
         )
         assert "NOT created" in result and "edit_file" in result
+        # The refusal names the two ways forward and stops there. Offering
+        # read_file as a third only invited the model to fetch content it is
+        # about to replace anyway, and every word here is read on every call.
+        assert "read_file" not in result
         assert (tmp_path / "specs.md").read_text() == "the real specs\n"
+
+    async def test_success_says_not_to_read_the_file_back(
+        self, tools, ctx, tmp_path
+    ):
+        """See the same test on edit_file: the 27B confirms its own writes by
+        reading them back, which costs a round trip and puts the lines it just
+        sent back into the context. Nothing here may point at read_file as the
+        way to get the content back — that was the invitation."""
+        ctx.registry.register("project", tmp_path)
+        result = await call(
+            tools, "create_file", ctx,
+            dir_key="project", name="specs.md", content_lines=["hi"],
+        )
+        assert "Do not read it back" in result
+        assert "read_file" not in result
 
     async def test_a_subdirectory_is_created_on_the_way(self, tools, ctx, tmp_path):
         ctx.registry.register("project", tmp_path)
@@ -1410,3 +1451,120 @@ class TestLiteralPaths:
                 tools, "create_file", ctx,
                 dir_key="results/out", name="x.md", content_lines=["x"],
             )
+
+
+class TestElisionMarkerGuard:
+    """Content the model copied out of its own history is not content.
+
+    hpca.agent.history replaces a big payload in the assistant copy of a call
+    with a descriptor of what it left out. Asked to rewrite a file it had
+    written earlier, the model sent that descriptor back as the new
+    ``content_lines``: the marker landed on disk, the file shrank to what had
+    survived the elision, and the next rewrite elided *that*. Fifteen files in
+    one session, and nothing in the tools noticed, because a marker is
+    perfectly valid text. So both writing tools refuse it — except in
+    ``old_lines``, which is how an already-corrupted file gets repaired.
+    """
+
+    @pytest.fixture
+    def marker(self):
+        return omitted_list([f"line {n}" for n in range(97)])
+
+    async def test_create_file_refuses_a_payload_carrying_the_sentinel(
+        self, tools, ctx, tmp_path, marker
+    ):
+        ctx.registry.register("project", tmp_path)
+        result = await call(
+            tools, "create_file", ctx,
+            dir_key="project", name="specs.md",
+            content_lines=["# locus-cutter", marker],
+        )
+        assert "NOT created" in result
+        assert not (tmp_path / "specs.md").exists()
+
+    async def test_create_file_refuses_the_pre_0_23_3_wording_too(
+        self, tools, ctx, tmp_path
+    ):
+        """It survives in checkpointed sessions and in the files written from
+        one, so the guard has to know the marker it was corrupted with."""
+        ctx.registry.register("project", tmp_path)
+        result = await call(
+            tools, "create_file", ctx,
+            dir_key="project", name="specs.md",
+            content_lines=["# locus-cutter", "... 22 more lines elided ..."],
+        )
+        assert "NOT created" in result
+        assert not (tmp_path / "specs.md").exists()
+
+    async def test_the_refusal_names_the_offending_line(
+        self, tools, ctx, tmp_path, marker
+    ):
+        # The model has to be able to find it: it sent the payload, not a file.
+        ctx.registry.register("project", tmp_path)
+        result = await call(
+            tools, "create_file", ctx,
+            dir_key="project", name="specs.md",
+            content_lines=["# locus-cutter", "", marker],
+        )
+        assert "line 3" in result
+        # ...and is told where the real text is, rather than only that it lost.
+        assert "read_file" in result
+        # But the line is NOT quoted back, which every other refusal here does.
+        # Measured on the live 27B (evals/edit_eval.py, second_file_after_first):
+        # a refusal carrying the marker returned it to the context, the model
+        # built its next call out of the refusal it had just read, and that call
+        # was refused in the same words seventeen times until the decision
+        # budget ran out. The line number locates the line without reprinting
+        # the one string that must not go round again.
+        assert ELISION_SENTINEL not in result
+
+    async def test_edit_file_refuses_marker_carrying_new_lines(
+        self, tools, ctx, tmp_path, marker
+    ):
+        path = tmp_path / "specs.md"
+        path.write_text("# locus-cutter\n\n## Why\n")
+        before = path.read_bytes()
+        ctx.registry.register("specs", path)
+        result = await call(
+            tools, "edit_file", ctx,
+            registry_key="specs", old_lines=["## Why"], new_lines=[marker],
+        )
+        assert "NOT edited" in result
+        assert path.read_bytes() == before
+        assert ctx.trash.list() == []  # refused before anything was backed up
+
+    async def test_edit_file_accepts_marker_carrying_old_lines(
+        self, tools, ctx, tmp_path, marker
+    ):
+        """The repair path, and the reason old_lines is not guarded: a file
+        that already has the marker written into it can only be fixed by
+        matching that line and replacing it with the real content."""
+        path = tmp_path / "specs.md"
+        path.write_text(f"# locus-cutter\n{marker}\n")
+        ctx.registry.register("specs", path)
+        result = await call(
+            tools, "edit_file", ctx,
+            registry_key="specs",
+            old_lines=[marker],
+            new_lines=["## Why", "", "Because the reads are 150bp."],
+        )
+        assert "Edited" in result
+        assert path.read_text() == (
+            "# locus-cutter\n## Why\n\nBecause the reads are 150bp.\n"
+        )
+
+    async def test_prose_that_merely_talks_about_elision_is_written(
+        self, tools, ctx, tmp_path
+    ):
+        # The guard looks for the marker, not for the subject: a document may
+        # say "elided" as often as it likes.
+        ctx.registry.register("project", tmp_path)
+        result = await call(
+            tools, "create_file", ctx,
+            dir_key="project", name="notes.md",
+            content_lines=["3 lines elided from the log", "no marker here"],
+        )
+        assert "Created" in result
+        assert (tmp_path / "notes.md").read_text() == (
+            "3 lines elided from the log\nno marker here\n"
+        )

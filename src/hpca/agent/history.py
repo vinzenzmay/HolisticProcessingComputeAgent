@@ -23,6 +23,18 @@ are already tight. The point of the assistant message is that the model can
 see *what* it did — the tool, the target, the shape of the payload — not
 re-read the payload it just wrote.
 
+What an omitted payload is replaced *by* is the load-bearing part of that. It
+used to be a head of the real lines plus "... 97 more lines elided ...", which
+reads exactly like content — and models copied it back: asked to rewrite a file
+they had already written, they reproduced their own elided record as the new
+``content_lines``, so the marker landed on disk and the file shrank to the
+three kept lines. The next rewrite elided *that*, and the file converged on
+four. Nothing in the tools noticed, so the model concluded its own writer was
+truncating and burned a dozen rounds bisecting a bug that did not exist. So an
+omission is now named as one — a descriptor inside a sentinel no file line
+carries, with no copyable fragment of the payload in it — and the file tools
+refuse content that carries the sentinel back (``carries_elision_marker``).
+
 The result half rides the user role for the same reason it always has: vLLM /
 Qwen templates reject mid-conversation system messages, and the native tool
 role requires the tool-call protocol this design deliberately bypasses.
@@ -31,16 +43,41 @@ role requires the tool-call protocol this design deliberately bypasses.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from hpca.llm import Message
 
-# A list argument longer than this is a payload, not a parameter: it is cut to
-# a head plus a marker saying how much was left out.
-MAX_LIST_ITEMS = 12
-KEEP_LIST_ITEMS = 3
-# Same for a long string argument (a here-doc script, a pasted block).
-MAX_STRING_CHARS = 400
+# How many of the most recent calls keep their payload in the model's view.
+# This is the whole mechanism: a model that reproduces its own record does it
+# *immediately* — the next call, while it is still finishing the job the record
+# belongs to — so the record it reaches for is never an old one. Keeping the
+# recent few intact means there is nothing wrong to copy, and the window still
+# never carries more than a handful of payloads at once. Three covers
+# write-then-rewrite and write-a-second-file-like-the-first; beyond that the
+# model is on to something else and the payload is dead weight.
+KEEP_RECENT_CALLS = 3
+
+# What counts as a payload at all, now that folding is about age rather than
+# every write. Deliberately far above the old 12-item cap: at that size the
+# fold was firing on ordinary arguments — a 20-line edit, a 15-line config —
+# and paying the risk of a mangled record for a few hundred characters of
+# window. Only something that would genuinely cost to carry twice is worth
+# replacing with a description of itself.
+MAX_LIST_CHARS = 4000
+# Same for a long string argument (a here-doc script, a pasted block). A string
+# keeps its head, where a list does not: a cut string still reads as a
+# fragment, while a head of plausible file lines reads as the file.
+MAX_STRING_CHARS = 2000
+
+# What every omission is wrapped in. A doubled angle bracket is not something a
+# TSV row, a shell line or an R chunk carries, which is what makes the marker
+# both unmistakable to the model and cheap to detect if it comes back anyway.
+ELISION_SENTINEL = "<<HPCA:"
+ELISION_CLOSE = ">>"
+# The pre-0.23.3 marker, still sitting in checkpointed sessions and in the files
+# already written from one. Detected so the tool guard catches those too.
+_LEGACY_MARKER = re.compile(r"\.\.\. *\d+ more (?:lines|chars) elided *\.\.\.")
 
 CALL_ACTION = "tool_call"
 # What the assistant copy of a call starts with. Cheap prefix test for
@@ -48,26 +85,57 @@ CALL_ACTION = "tool_call"
 CALL_PREFIX = '{"action": "tool_call"'
 
 
+def omitted_list(value: list) -> str:
+    """The descriptor that stands in for a payload list.
+
+    Deliberately not a fragment of it: the model is told the shape of what it
+    wrote — how many lines, how many characters — and where the content still
+    lives, and is given nothing it could mistake for the lines themselves.
+    Losing sight of the first three lines costs it little; what it wrote is one
+    ``read_file`` away, and the file, unlike this record, is not a copy.
+    """
+    chars = sum(len(item) for item in value if isinstance(item, str))
+    return (
+        f"{ELISION_SENTINEL} {len(value)} lines ({chars} chars) written "
+        f"earlier, not repeated here{ELISION_CLOSE}"
+    )
+
+
 def elide(value: Any) -> Any:
     """One argument value, cut down to its shape.
 
-    Lists lose their tail, long strings their end, and the cut is *named* in
-    place ("… 812 more lines elided …") rather than silently applied: a model
-    reading its own call back must be able to tell an argument it truncated
-    from one it wrote short. Applied inside lists and dicts too, so a payload
-    nested one level down is not a way around the cap.
+    A payload list is replaced by a descriptor of it, a long string keeps its
+    head and says what follows it, and either way the cut is *named* rather
+    than silently applied: a model reading its own call back must be able to
+    tell an argument it truncated from one it wrote short. Applied inside lists
+    and dicts too, so a payload nested one level down is not a way around the
+    cap.
     """
     if isinstance(value, list):
-        if len(value) > MAX_LIST_ITEMS:
-            head = [elide(item) for item in value[:KEEP_LIST_ITEMS]]
-            return head + [f"... {len(value) - KEEP_LIST_ITEMS} more lines elided ..."]
+        if sum(len(item) for item in value if isinstance(item, str)) > MAX_LIST_CHARS:
+            return omitted_list(value)
         return [elide(item) for item in value]
     if isinstance(value, dict):
         return {key: elide(item) for key, item in value.items()}
     if isinstance(value, str) and len(value) > MAX_STRING_CHARS:
         dropped = len(value) - MAX_STRING_CHARS
-        return f"{value[:MAX_STRING_CHARS]}... {dropped} more chars elided ..."
+        return (
+            f"{value[:MAX_STRING_CHARS]}{ELISION_SENTINEL} {dropped} more "
+            f"chars written earlier, not repeated here{ELISION_CLOSE}"
+        )
     return value
+
+
+def carries_elision_marker(text: str) -> bool:
+    """Is this line something the history handed the model, not real content?
+
+    True for the sentinel above and for the pre-0.23.3 wording, which survives
+    in checkpointed sessions and in the files already written from one. The
+    file tools ask this of every line they are about to write: a payload
+    carrying either marker is the model quoting its own record back at itself,
+    and writing it puts the marker on disk (see the module docstring).
+    """
+    return ELISION_SENTINEL in text or bool(_LEGACY_MARKER.search(text))
 
 
 def elide_arguments(arguments: dict) -> dict:
@@ -76,13 +144,15 @@ def elide_arguments(arguments: dict) -> dict:
 
 
 def call_json(tool_name: str, arguments: dict) -> str:
-    """The decision envelope for this call, serialized as the model emits it."""
+    """The decision envelope for this call, serialized as the model emits it.
+
+    Stored whole. Folding is a property of the *view* now, not of the record
+    (see :func:`fold_old_payloads`), so what goes into the history is what the
+    model actually emitted — which is also what makes the fold reversible as
+    the conversation moves on.
+    """
     return json.dumps(
-        {
-            "action": CALL_ACTION,
-            "tool": tool_name,
-            "arguments": elide_arguments(arguments),
-        },
+        {"action": CALL_ACTION, "tool": tool_name, "arguments": arguments or {}},
         ensure_ascii=False,
         default=str,
     )
@@ -103,9 +173,9 @@ def native_call_message(tool_name: str, arguments: dict, call_id: str) -> Messag
 
     The same pair, in the encoding the chat template understands: the call
     rides ``tool_calls`` rather than the content, and its ``id`` is what ties
-    the result to it. Arguments are elided exactly as in the envelope copy —
-    the reason has nothing to do with the protocol, it is that a create_file
-    payload would otherwise sit in the window twice.
+    the result to it. Stored whole, like the envelope copy, and folded by the
+    same view function — the protocol changes where the arguments sit, not when
+    they are worth carrying.
     """
     return {
         "role": "assistant",
@@ -117,7 +187,7 @@ def native_call_message(tool_name: str, arguments: dict, call_id: str) -> Messag
                 "function": {
                     "name": tool_name,
                     "arguments": json.dumps(
-                        elide_arguments(arguments), ensure_ascii=False, default=str
+                        arguments or {}, ensure_ascii=False, default=str
                     ),
                 },
             }
@@ -157,6 +227,67 @@ def result_message(tool_name: str, content: str, call_id: str = "") -> Message:
     if call_id:
         return native_result_message(tool_name, content, call_id)
     return {"role": "user", "content": content}
+
+
+def _fold_call(message: Message) -> Message:
+    """One stored call message with its payload arguments replaced by a
+    description of them. Returned unchanged if it cannot be read as a call —
+    a fold is an optimisation, and losing a message to a parse error would not
+    be one.
+    """
+    if message.get("tool_calls"):
+        folded = []
+        for call in message["tool_calls"]:
+            function = dict(call.get("function") or {})
+            try:
+                arguments = json.loads(function.get("arguments") or "{}")
+            except (TypeError, ValueError):
+                folded.append(call)
+                continue
+            function["arguments"] = json.dumps(
+                elide_arguments(arguments), ensure_ascii=False, default=str
+            )
+            folded.append({**call, "function": function})
+        return {**message, "tool_calls": folded}
+    try:
+        envelope = json.loads(str(message.get("content") or ""))
+    except ValueError:
+        return message
+    if not isinstance(envelope, dict) or "arguments" not in envelope:
+        return message
+    envelope["arguments"] = elide_arguments(envelope["arguments"])
+    return {
+        **message,
+        "content": json.dumps(envelope, ensure_ascii=False, default=str),
+    }
+
+
+def fold_old_payloads(
+    messages: list[Message], *, keep_recent: int = KEEP_RECENT_CALLS
+) -> list[Message]:
+    """The stored history as the model should see it: recent calls whole, old
+    ones described.
+
+    Folding used to happen when the call was written, which meant the model's
+    record of what it had just done was already a summary by the time it
+    composed its next move — and a model that is mid-job reaches for exactly
+    that record. It reproduced the description as content, and the description
+    went to disk. Deferring the fold makes the problem disappear rather than
+    guarding against it: while the record is still being used it is intact, and
+    by the time it is folded the model has moved on and only needs to know that
+    something was written and roughly how much.
+
+    The stored history is never rewritten — same rule compaction follows. This
+    builds a view, so a call that folds on one turn is still whole in the
+    transcript, and a payload never has to be reconstructed to be shown.
+    """
+    calls = [index for index, m in enumerate(messages) if is_tool_call_message(m)]
+    whole = set(calls[-keep_recent:]) if keep_recent > 0 else set()
+    stale = set(calls) - whole
+    return [
+        _fold_call(message) if index in stale else message
+        for index, message in enumerate(messages)
+    ]
 
 
 def tool_exchange(

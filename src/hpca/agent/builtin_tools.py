@@ -33,6 +33,7 @@ from typing import Callable, Literal
 from pydantic import BaseModel, Field, field_validator
 
 from hpca.agent.context import ToolContext
+from hpca.agent.history import carries_elision_marker
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.checks import syntax_check
 from hpca.registry import RegistryError, registered_note
@@ -212,6 +213,29 @@ async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
             f"Key {args.registry_key!r} already names {taken}; pick a "
             "different key"
         )
+    for number, line in enumerate(args.content_lines, 1):
+        # The third way content reaches disk, and open to the same failure as
+        # create_file: what the session history leaves in place of an omitted
+        # payload (see ``hpca.agent.history``) reads enough like content that a
+        # model asked to rewrite a script it already wrote hands its own elided
+        # record back as the new lines. Refuse before the file is written —
+        # once the placeholder is on disk the script is gone, and every rewrite
+        # from then on elides what is left and shrinks it further.
+        if carries_elision_marker(line):
+            # The line itself is deliberately not quoted back; see the same
+            # refusal in hpca.agent.file_tools for the measurement that settled
+            # it. Quoting the placeholder returns it to the context, and the
+            # model composes its next call out of the refusal it just read.
+            return (
+                f"Script NOT created: line {number} of content_lines is not "
+                "script content, it is a placeholder the session history left "
+                "in place of a payload it did not keep, so what you sent is "
+                "your own record of an earlier call rather than the script. "
+                "Nothing was written. Do not send that line again. Re-derive "
+                "the script from what you built it from, or read the file it "
+                "came from back with read_file, and call create_script again "
+                "with the real lines."
+            )
     lines = args.content_lines
     nonempty = [line for line in lines if line.strip()]
     if len(nonempty) == 1 and nonempty[0].lstrip().startswith("#!"):

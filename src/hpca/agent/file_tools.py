@@ -41,6 +41,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from hpca.agent.context import ToolContext
+from hpca.agent.history import carries_elision_marker
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.registry import registered_note
 from hpca.trash import TrashEntry
@@ -395,6 +396,57 @@ def _split_embedded_newlines(lines: list[str]) -> list[str]:
     return out
 
 
+# The one check in this neighbourhood that refuses instead of repairing, and
+# for the opposite reason: an elision marker in a payload is not an argument
+# the tool can guess the intent of, it is the model quoting its own history
+# back at itself. hpca.agent.history replaces a large payload in the assistant
+# copy of a call with a descriptor of what it left out; a model asked to
+# rewrite a file it had written earlier was observed sending that descriptor
+# back as the new content, which put the marker on disk and shrank the file to
+# whatever had survived the elision — and since the marker is valid text,
+# nothing downstream noticed. So the check has to live here, in front of every
+# write, and it has to say *why* the content is being refused: from inside the
+# turn the marker reads like a line of the file.
+
+# How much of the offending line comes back quoted. Enough to recognise which
+# line it is, short enough that a long descriptor does not push the rest of the
+# refusal — the part that says what to do instead — off the end of the result.
+def _elision_refusal(
+    lines: list[str], *, refusal: str, field: str, outcome: str
+) -> str:
+    """The refusal for lines carrying an elision marker, or "" if they are clean.
+
+    Deliberately does NOT quote the offending line, which is the opposite of
+    what every other refusal in this module does. Measured on the live 27B
+    (evals/edit_eval.py, ``second_file_after_first``): a refusal that quoted the
+    marker put the marker back into the context, the model copied it out of the
+    refusal into its next call, and that call was refused in the same words —
+    seventeen times in one run, until the decision budget died. The quote is a
+    reinforcement loop, and the line number alone identifies the line just as
+    well.
+
+    What is left says the two things the model cannot work out from inside the
+    turn: that this came from its own record rather than from the file, and
+    that the file on disk is where the text still is. The heredoc escape is
+    named because documentation *about* the marker is a legitimate file to want
+    to write, and this check has no way to tell it apart.
+    """
+    for index, line in enumerate(lines):
+        if not carries_elision_marker(line):
+            continue
+        return (
+            f"{refusal}: {field} line {index + 1} is not file content — it is a "
+            "placeholder the session history left in place of a payload it did "
+            "not keep, so what you sent is your own record of an earlier call "
+            f"rather than the file. {outcome} Do not send that line again. Call "
+            "read_file on the file and send the lines it gives back, or "
+            "re-derive the content from whatever you built it from. If you did "
+            "mean this literal text — documentation about the placeholder "
+            "itself — write it with run_bash and a heredoc."
+        )
+    return ""
+
+
 # A line-number prefix as read_file (or `cat -n`, or an editor) renders it:
 # optional indent, digits, then ":", a tab, or "|" — e.g. "12: x", "12\tx",
 # " 12 | x".
@@ -634,6 +686,18 @@ async def edit_file(args: EditFileParams, ctx: ToolContext) -> str:
     # file matches first and is never mangled.
     old_lines = _split_embedded_newlines(list(args.old_lines))
     new_lines = _split_embedded_newlines(list(args.new_lines))
+    # new_lines only, and old_lines deliberately not: a file that already has a
+    # marker written into it is repaired by matching that line and replacing
+    # it, so old_lines has to be able to carry one. Guarding both would leave
+    # the corruption unfixable by the tool that caused it.
+    refused_marker = _elision_refusal(
+        new_lines,
+        refusal="NOT edited",
+        field="new_lines",
+        outcome="The file is unchanged.",
+    )
+    if refused_marker:
+        return refused_marker
     file_lines = text.split("\n")
     hits = _match_ladder(file_lines, old_lines)
     if not hits:
@@ -692,7 +756,10 @@ async def edit_file(args: EditFileParams, ctx: ToolContext) -> str:
     extra = f" ({'; '.join(warnings)})" if warnings else ""
     # One short line on success (§ result-message diet): the standing undo
     # lecture cost tokens on every edit; the trash behavior itself is
-    # unchanged, and only the irreversible case still warns.
+    # unchanged, and only the irreversible case still warns. The read-back
+    # clause is the one thing worth saying every time — see create_file, where
+    # the same measured habit of confirming a write with a read_file costs a
+    # round trip and re-inflates the context with lines the model just sent.
     no_backup = (
         ""
         if entry.trashed_path
@@ -702,7 +769,7 @@ async def edit_file(args: EditFileParams, ctx: ToolContext) -> str:
     return (
         f"Edited {path} at line {start + 1}: {_change(args)}{extra}"
         f"{registered_note(args.registry_key, key)}."
-        f"{no_backup}{_tbd_note(edited)}"
+        f" Do not read it back to check.{no_backup}{_tbd_note(edited)}"
     )
 
 
@@ -766,13 +833,25 @@ async def create_file(args: CreateFileParams, ctx: ToolContext) -> str:
         )
     if path.exists():
         return (
-            f"NOT created: {path} already exists. To change it call edit_file "
-            "with the lines to replace; to replace it wholesale, delete_file "
-            "first (the old version stays recoverable from the trash)."
+            f"NOT created: {path} already exists. Change it with edit_file; "
+            "to replace it wholesale, delete_file first (the old version stays "
+            "recoverable from the trash)."
         )
     # Same embedded-\n repair as edit_file: the array is lines, but a model
     # that packs a block into one element still means the lines it contains.
     content_lines = _split_embedded_newlines(list(args.content_lines))
+    # Ahead of the §5.2 scratch write below, not merely ahead of the real one:
+    # a refused file must never have existed at the target path, and there is
+    # nothing to gain from syntax-checking a payload that is not going to be
+    # written either way.
+    refused_marker = _elision_refusal(
+        content_lines,
+        refusal="NOT created",
+        field="content_lines",
+        outcome="Nothing was written.",
+    )
+    if refused_marker:
+        return refused_marker
     content = "\n".join(content_lines) + "\n"
 
     warnings: list[str] = []
@@ -813,10 +892,16 @@ async def create_file(args: CreateFileParams, ctx: ToolContext) -> str:
         if made_dirs
         else ""
     )
+    # The read-back clause is worth its words: measured on the live 27B, a
+    # successful create_file is routinely followed by a read_file on the file
+    # just written, purely to confirm the write landed. That is a round trip
+    # for nothing, and it pays for itself twice over in context — the file's
+    # content, which the model supplied a moment ago, comes straight back in.
     return (
         f"Created {path} ({_lines(len(content_lines))}), registered as "
-        f"{key!r}{extra}. Change it with edit_file, not by writing it "
-        f"again.{made}{_tbd_note(content)}{registered_note(args.dir_key, dir_key)}"
+        f"{key!r}{extra}. Change it with edit_file, not by writing it again. "
+        f"Do not read it back to check.{made}{_tbd_note(content)}"
+        f"{registered_note(args.dir_key, dir_key)}"
     )
 
 
