@@ -132,6 +132,29 @@ is treated as a crash.
 `sync()` and `release()` are serialised by a reentrant lock: both run on worker
 threads, and shutdown can begin while a periodic sync is still copying.
 
+**Saying so.** The final sync is the one the user waits on, and it has no face:
+the TUI has stopped painting and the shell prompt is not back yet, so a copy
+that takes NFS-minutes is indistinguishable from a hang. Textual dispatches
+`Unmount` with the alt screen still up, which is why the app stops application
+mode itself before releasing — anything printed before that is thrown away with
+the alt screen. On the terminal the user is left with:
+
+    please WAIT a moment while the chat log databases are being copied ...
+    chat log databases copied.
+
+Nothing is printed when local mode was never active: the databases are already
+home and `release()` returns at once.
+
+Leaving application mode also gives the terminal its signal handling back, so
+from that point Ctrl+C — the reflex this message exists to head off — really
+would kill the copy. The first press is answered rather than obeyed:
+
+    still copying — press Ctrl+C again to abort (the next start then finishes the copy)
+
+A second press restores the default handler and aborts, so a hung mount is
+never a trap. Aborting costs nothing permanent: the working dir and lease
+survive it, which is precisely the crash case recovery is built for.
+
 ### 2.5 Concurrency — the lease
 
 Whole-file sync-back is last-writer-wins over the **entire** database. Two
@@ -199,6 +222,7 @@ rather than exit-only.
   `Lease`, `DbCache`
 - `src/hpca/config.py` — new `DatabaseSettings` section
 - `src/hpca/tui/app.py` — `on_mount` wiring, sync timer, `on_unmount` release,
+  `_announce_final_db_sync` / `_write_to_terminal` / `_sync_interrupt_guard`,
   `_file_logger` (generalised out of `_autoconnect_logger`)
 - `src/hpca/db.py` — `checkpoints_db_path()` removed (its only caller now asks
   the cache); its rationale moved to `DB_NAMES`

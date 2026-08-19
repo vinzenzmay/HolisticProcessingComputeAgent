@@ -6,9 +6,10 @@ opens hpca.db, checkpoints.db and rag.db from a node-local working dir
 instead, syncs them back on a timer, and syncs-and-cleans-up on exit.
 See specs-db-local-cache.md and hpca.dbcache.
 """
-
 import json
 import logging
+import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -19,7 +20,12 @@ import pytest
 from hpca.config import Settings
 from hpca.dbcache import DB_NAMES
 from hpca.llm import ChatResponse
-from hpca.tui.app import HpcaApp
+from hpca.tui.app import (
+    DB_SYNC_DONE_MESSAGE,
+    DB_SYNC_INTERRUPT_MESSAGE,
+    DB_SYNC_WAIT_MESSAGE,
+    HpcaApp,
+)
 
 
 class FakeLLM:
@@ -406,3 +412,146 @@ class TestCorruptHomeCopy:
         assert list(home.glob("hpca.db.corrupt-*"))
         # The exit sync then writes a fresh, healthy copy under the old name.
         sqlite3.connect(home / "hpca.db").execute("PRAGMA schema_version")
+
+
+class TestExitMessage:
+    """Quitting on a cluster node ends in a copy home over NFS, which looks
+    like a hang: the TUI is gone and the shell prompt is not back. The app
+    leaves the alt screen first and says what the wait is for.
+    """
+
+    @pytest.fixture
+    def terminal(self, monkeypatch):
+        """Make the headless test driver look like a real terminal, and record
+        what reaches it — in order, application-mode stop included."""
+        from textual.drivers.headless_driver import HeadlessDriver
+
+        seen: list[str] = []
+        monkeypatch.setattr(
+            HeadlessDriver, "is_headless", property(lambda self: False)
+        )
+        monkeypatch.setattr(
+            HeadlessDriver, "write", lambda self, data: seen.append(data)
+        )
+        monkeypatch.setattr(
+            HeadlessDriver,
+            "stop_application_mode",
+            lambda self: seen.append("<stop-application-mode>"),
+        )
+        return seen
+
+    async def test_the_wait_is_explained_on_the_terminal(
+        self, home, local, terminal
+    ):
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 30)):
+            assert app._dbcache.active
+        assert any(DB_SYNC_WAIT_MESSAGE in text for text in terminal)
+
+    async def test_the_message_survives_the_tui(self, home, local, terminal):
+        # Textual dispatches Unmount with the alt screen still up, so the
+        # message would be wiped out with it unless application mode stops
+        # first. Anything after it is on the terminal the user is left with.
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 30)):
+            pass
+        stopped = terminal.index("<stop-application-mode>")
+        said = next(
+            i for i, text in enumerate(terminal) if DB_SYNC_WAIT_MESSAGE in text
+        )
+        assert stopped < said
+
+    async def test_it_is_said_before_the_copy_starts(self, home, local, terminal):
+        # Saying it afterwards would be no help at all.
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 30)):
+            cache = app._dbcache
+            original = cache.release
+            seen_at_release: list[list[str]] = []
+
+            def release():
+                seen_at_release.append(list(terminal))
+                original()
+
+            cache.release = release
+        assert any(DB_SYNC_WAIT_MESSAGE in text for text in seen_at_release[0])
+
+    async def test_and_the_end_of_the_wait_is_announced_too(
+        self, home, local, terminal
+    ):
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 30)):
+            pass
+        assert any(DB_SYNC_DONE_MESSAGE in text for text in terminal)
+        assert terminal.index(
+            next(t for t in terminal if DB_SYNC_DONE_MESSAGE in t)
+        ) > terminal.index(next(t for t in terminal if DB_SYNC_WAIT_MESSAGE in t))
+
+    async def test_nothing_is_said_when_nothing_is_copied(
+        self, home, local, terminal
+    ):
+        # Running straight from home has no exit copy to wait for.
+        settings = Settings()
+        settings.database.local_cache = False
+        app = HpcaApp(settings, llm=FakeLLM())
+        async with app.run_test(size=(120, 30)):
+            assert not app._dbcache.active
+        assert not any(DB_SYNC_WAIT_MESSAGE in text for text in terminal)
+
+    async def test_the_tui_still_says_nothing_to_a_real_terminal_run(
+        self, home, local
+    ):
+        # Without the terminal fixture the driver is headless: no writes, so
+        # the test suite's own output stays clean.
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 30)):
+            pass
+        assert not app._write_to_terminal("anything")
+
+
+class TestSyncInterrupt:
+    """The reflex the message exists to head off. Leaving application mode
+    gives Ctrl+C its meaning back, so the first press must not kill the copy.
+    """
+
+    def guarded_app(self, monkeypatch):
+        seen: list[str] = []
+        monkeypatch.setattr(
+            HpcaApp,
+            "_write_to_terminal",
+            lambda self, text: bool(seen.append(text)) or True,
+        )
+        return HpcaApp(llm=FakeLLM()), seen
+
+    def test_the_first_ctrl_c_is_answered_not_obeyed(self, home, local, monkeypatch):
+        app, seen = self.guarded_app(monkeypatch)
+        with app._sync_interrupt_guard(True):
+            os.kill(os.getpid(), signal.SIGINT)
+            time.sleep(0.05)  # let the handler run
+        assert any(DB_SYNC_INTERRUPT_MESSAGE in text for text in seen)
+
+    def test_a_second_ctrl_c_still_aborts(self, home, local, monkeypatch):
+        # A hung NFS mount must never become a trap.
+        app, _ = self.guarded_app(monkeypatch)
+        before = signal.getsignal(signal.SIGINT)
+        with app._sync_interrupt_guard(True):
+            os.kill(os.getpid(), signal.SIGINT)
+            time.sleep(0.05)
+            assert signal.getsignal(signal.SIGINT) is before
+
+    def test_the_handler_is_handed_back_afterwards(self, home, local, monkeypatch):
+        app, _ = self.guarded_app(monkeypatch)
+        before = signal.getsignal(signal.SIGINT)
+        with app._sync_interrupt_guard(True):
+            pass
+        assert signal.getsignal(signal.SIGINT) is before
+
+    def test_nothing_is_guarded_when_nothing_was_said(
+        self, home, local, monkeypatch
+    ):
+        # Without the local cache the terminal is still Textual's; touching
+        # signal handling there would be meddling.
+        app, _ = self.guarded_app(monkeypatch)
+        before = signal.getsignal(signal.SIGINT)
+        with app._sync_interrupt_guard(False):
+            assert signal.getsignal(signal.SIGINT) is before
