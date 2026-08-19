@@ -8,8 +8,9 @@ from textual.widgets._toast import Toast
 
 from hpca.cluster_endpoints import ClusterEndpoints
 from hpca.config import LLMBackend, Settings
-from hpca.discover import DiscoveredBackend
+from hpca.discover import KEY_REQUIRED, DiscoveredBackend
 from hpca.llm import ChatResponse
+from hpca.tui import app as app_module
 from hpca.tui import backend_form as backend_form_module
 from hpca.tui import manage_llms as manage_module
 from hpca.tui import switch_llm as switch_module
@@ -19,6 +20,8 @@ from hpca.tui.confirm_screen import ConfirmScreen
 from hpca.tui.inspect_screen import InspectScreen
 from hpca.tui.manage_llms import ManageLLMsScreen
 from hpca.tui.switch_llm import SwitchLLMScreen
+
+from tests.conftest import wait_for_screen
 
 
 class FakeLLM:
@@ -1097,3 +1100,103 @@ class TestKeyRegistry:
             # …and its arrival re-probed the leftover 51944 sentinel in place
             labels = await _wait_for_left_label(app, pilot, "qwen3.6:35B")
             assert any("qwen3.6:35B" in t for t in labels)
+
+
+# An open (keyless) cluster endpoint — what auto-connect connects to by itself.
+CLUSTER_OPEN = DiscoveredBackend(
+    base_url="http://172.16.33.208:20002/v1",
+    model="Qwen/Qwen3.6-27B-FP8",
+    max_model_len=128000,
+)
+
+
+class TestStartupBackendCheck:
+    """Startup ends by checking that a backend actually answers.
+
+    Nothing answering is the one startup state the rest of the UI cannot
+    show — settings name a backend either way — so it opens the screen that
+    fixes it instead of waiting for the first turn to fail.
+    """
+
+    @pytest.fixture
+    def startup_check(self, monkeypatch):
+        """Turn the check back on (the suite disables it) and say which
+        endpoints answer it — anything else comes back as unreachable."""
+
+        def usable(*base_urls: str):
+            async def probe(base_url, **kwargs):
+                if base_url not in base_urls:
+                    return []
+                return [DiscoveredBackend(base_url=base_url, model="a-model")]
+
+            monkeypatch.setattr(app_module, "probe_endpoint", probe)
+            monkeypatch.setattr(HpcaApp, "startup_backend_check", True)
+
+        return usable
+
+    async def test_opens_manage_llms_when_nothing_answers(
+        self, hpca_home, fake_discovery, startup_check
+    ):
+        startup_check()  # nothing is up
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await wait_for_screen(app, pilot, ManageLLMsScreen)
+
+    async def test_says_why_it_opened(
+        self, hpca_home, fake_discovery, startup_check
+    ):
+        startup_check()
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await wait_for_screen(app, pilot, ManageLLMsScreen)
+            await pilot.pause()
+            messages = [n.message for n in app._notifications]
+            assert any("No LLM backend is answering" in m for m in messages)
+
+    async def test_a_key_locked_backend_is_not_connected(
+        self, hpca_home, fake_discovery, monkeypatch
+    ):
+        """Up, but not for us: without a working key the first turn would 401
+        just as surely as if the tunnel were down, so it opens the screen."""
+
+        async def locked(base_url, **kwargs):
+            return [
+                DiscoveredBackend(
+                    base_url=base_url, model=KEY_REQUIRED, needs_key=True
+                )
+            ]
+
+        monkeypatch.setattr(app_module, "probe_endpoint", locked)
+        monkeypatch.setattr(HpcaApp, "startup_backend_check", True)
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await wait_for_screen(app, pilot, ManageLLMsScreen)
+
+    async def test_stays_out_of_the_way_when_the_backend_answers(
+        self, hpca_home, fake_discovery, startup_check
+    ):
+        startup_check(Settings().llm.base_url)  # the configured default is up
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert not isinstance(app.screen, ManageLLMsScreen)
+
+    async def test_an_auto_connected_cluster_llm_counts_as_connected(
+        self, hpca_home, fake_discovery, startup_check, monkeypatch
+    ):
+        """The check runs *after* auto-connect, not beside it: the backend it
+        probes is the one auto-connect just activated."""
+
+        async def cluster(*args, **kwargs):
+            return ClusterEndpoints(llms=[CLUSTER_OPEN], embedding=None)
+
+        monkeypatch.setattr(app_module, "discover_cluster_endpoints", cluster)
+        monkeypatch.setattr(HpcaApp, "_detect_slurm", lambda self: object())
+        startup_check(CLUSTER_OPEN.base_url)  # only the cluster node answers
+        app = HpcaApp(llm=FakeLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert app.settings.llm.base_url == CLUSTER_OPEN.base_url
+            assert not isinstance(app.screen, ManageLLMsScreen)

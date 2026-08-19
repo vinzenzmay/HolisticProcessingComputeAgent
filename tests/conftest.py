@@ -60,3 +60,23 @@ async def wait_for_screen(app, pilot, screen_type, *, timeout_s=10.0):
         f"{screen_type.__name__} never appeared within {timeout_s}s; "
         f"on screen: {type(app.screen).__name__}"
     )
+
+
+@pytest.fixture(autouse=True)
+def no_startup_backend_modal(monkeypatch):
+    """Keep the startup "no backend is answering" modal out of the unit tests.
+
+    The real app ends startup by probing the active backend and opening the
+    manage-LLMs screen when nothing answers (``_ensure_backend_connected``).
+    Under the suite nothing ever answers — settings point at a default
+    localhost URL and no server is running — so without this every TUI test
+    would find a modal on top of whatever it was driving, and would probe the
+    network to get it. Tests that cover the check turn it back on for their
+    own app instance.
+
+    Imported inside the fixture: most of the suite never touches the TUI, and
+    importing Textual for it at collection time is pure cost.
+    """
+    from hpca.tui.app import HpcaApp
+
+    monkeypatch.setattr(HpcaApp, "startup_backend_check", False)

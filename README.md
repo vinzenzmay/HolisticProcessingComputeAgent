@@ -129,6 +129,9 @@ your skills (invoke a skill with `/<skill>`; see *Skills* below).
   (see *Skills* below).
 * **Configurable LLM backends** — talk to any OpenAI-compatible endpoint (vLLM,
   llama.cpp-server, …); manage backends and switch per session from the TUI.
+  On startup HPCA connects to what the cluster has running; if nothing answers
+  — a first run, or a tunnel that is down — it opens the manage-LLMs screen
+  (`m`) right away rather than letting the first message fail.
 * **Clipboard that works under tmux** — system-clipboard copy via OSC 52 with a
   tmux paste-buffer fallback (see *Clipboard under tmux* below).
 
