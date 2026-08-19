@@ -291,6 +291,16 @@ WORKING_MARK = "⟳ "
 # in the chat log and confirming (see _maybe_interrupt_llm), so the message can
 # be re-edited and sent again.
 LLM_WAIT_ACTIVITY = "LLM processing"
+# How long a first escape stays armed for a second one to complete the stop
+# gesture (§ interrupt). A single escape has to keep meaning nothing: it is the
+# byte a terminal also sends as the prefix of arrow keys, bracketed paste and
+# the shift+enter workaround (hpca.tui.termkeys), so one of them arriving on
+# its own is not evidence the user wants the turn dead. Two in quick succession
+# are. A second is the conventional figure and the right order of magnitude
+# either way — long enough for two presses of the same finger without hurrying,
+# far too short for the next unrelated thing the user does to be read as the
+# other half of a stop.
+ESC_STOP_WINDOW = 1.0
 # The chat kinds that are the user's own words — what Enter on a message in the
 # log offers back for reuse. "queued" is the same text, typed ahead of a
 # running turn; everything else in the log (the agent's replies, background
@@ -728,8 +738,13 @@ class WorkingIndicator(Static):
     def _frame_text(self) -> str:
         elapsed = f" {self.elapsed}s" if self.elapsed else ""
         # A turn's own line is selectable to abort it, whatever phase it is in;
-        # say so, mirroring the ThinkingBox's inline "(enter …)" hint.
-        hint = "  (enter to interrupt)" if self._interruptible else ""
+        # say so, mirroring the ThinkingBox's inline "(enter …)" hint. Both
+        # routes are named because they are not interchangeable: enter has to
+        # be aimed at this line, which is the harder thing to do precisely when
+        # the agent is filling the log, while esc esc works from wherever the
+        # user already is. The two are armed by the same condition, so a line
+        # that offers them can honour both.
+        hint = "  (enter or esc esc to interrupt)" if self._interruptible else ""
         return f"{self.FRAMES[self._frame]} {self._activity}…{elapsed}{hint}"
 
     def _render_frame(self) -> None:
@@ -1261,6 +1276,15 @@ class HpcaApp(App):
         # return), so shift+tab is the binding that works everywhere.
         Binding("shift+tab", "cycle_mode", "agent mode", priority=True),
         Binding("ctrl+m", "cycle_mode", "agent mode", show=False),
+        # Stopping the agent, from wherever the user's hands already are
+        # (§ interrupt). Deliberately NOT priority: Textual checks priority
+        # bindings from the app downwards and across a modal, so a priority
+        # escape here would outrank every screen that already uses escape to
+        # mean "leave this prompt" — the approval bar's refusal among them.
+        # As a plain binding it is reached only when nothing nearer claimed
+        # the key, which on the main screen is always. check_action keeps it
+        # off the footer, and inert, unless there is a turn to stop.
+        Binding("escape", "stop_turn", "stop the agent", key_display="esc esc"),
     ]
 
     def __init__(
@@ -1333,6 +1357,11 @@ class HpcaApp(App):
         # that has no TurnState — a second source for the sidebar working glyph.
         self._busy_sessions: set[str] = set()
         self._interrupt_worker = None  # the rollback worker after a 3s hold
+        # When the last escape landed, so the next one can tell whether it is
+        # the second half of a stop gesture (see action_stop_turn). One number
+        # for the app, not one per session: it is a property of the keyboard,
+        # and the pair is over inside a second either way.
+        self._esc_armed_at: float | None = None
         # Work waiting for a session's orchestrator: messages the user typed
         # while that session's turn was running, and background completions
         # reporting in. Same-session turns still serialise — two on one
@@ -2113,6 +2142,48 @@ class HpcaApp(App):
             ConfirmScreen("Interrupt this turn and re-edit your last message?"),
             resolved,
         )
+
+    def action_stop_turn(self) -> None:
+        """Escape twice: stop whatever the agent is doing, without a dialog.
+
+        The doubling *is* the confirmation. One escape is too easy to arrive by
+        accident to end a turn on, and a yes/no screen on top of a deliberate
+        double press would only put a keystroke back into the gesture whose
+        whole point is being the shortest way out — the user has already said
+        it twice.
+
+        This is the same abort as enter on the working line, reached
+        differently, and the difference is the reason it exists: enter has to
+        be *aimed*, and aiming means leaving the entry, walking into the log
+        and landing on its last row. That is fine when the agent is quietly
+        waiting on the model and awkward when it is not — a turn stuck in a
+        retry loop, or one calling tool after tool, is writing rows into the
+        very list the user is trying to steer through. Escape needs no target.
+
+        What it stops is the turn, in any phase: the worker is cancelled, so
+        the cancellation lands at whatever the turn is currently awaiting — a
+        request out to the model, a tool, or the next attempt of middleware's
+        retry loop, which is the one place a turn can otherwise spin without
+        ever asking the user anything. What it does not stop is work the turn
+        merely started: a background script has its own monitor task and
+        outlives the turn by design (see ``_can_interrupt``).
+        """
+        now = monotonic()
+        first, self._esc_armed_at = self._esc_armed_at, now
+        if first is None or now - first > ESC_STOP_WINDOW:
+            # The opening press, or one too late to pair: escape goes on
+            # meaning what it has always meant in the chat window, which is
+            # nothing. Saying "press escape again" here would put a toast on
+            # screen every time a stray escape sequence reached us.
+            return
+        self._esc_armed_at = None  # spent: a third press opens a fresh pair
+        if not self._can_interrupt():
+            # Reachable in the sliver between a turn appearing and its rollback
+            # point being read. Silence is the one answer this key must never
+            # give, so it says which of the two it is, as enter does.
+            self.notify(self._no_interrupt_reason(), severity="warning")
+            return
+        self._fire_interrupt()
 
     def _fire_interrupt(self) -> None:
         """Capture what the interrupt needs and roll the turn back off the main
@@ -4569,6 +4640,16 @@ class HpcaApp(App):
             return in_chat and self.active_session is not None
         if action == "open_settings":
             return not in_chat
+        if action == "stop_turn":
+            # Only on the main screen, and only while the open session has a
+            # turn of its own in flight. Every modal already spends escape on
+            # dismissing itself, and a False here does not merely hide the
+            # binding — the key is left unconsumed, so escape stays the no-op
+            # it has always been in a chat window with nothing running.
+            # Offered from any column, not just the chat one: the whole point
+            # is that stopping the agent does not require getting somewhere
+            # first, and all three columns look at the same session.
+            return on_main_screen and self._active_turn() is not None
         if action == "command_palette":
             # Rebound from ctrl+p to bare "p" (COMMAND_PALETTE_BINDING). Only on
             # the sessions column, where no typing happens; elsewhere "p" must
