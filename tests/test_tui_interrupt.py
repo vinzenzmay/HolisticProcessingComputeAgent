@@ -17,6 +17,7 @@ from hpca.llm import ChatResponse
 from hpca.tui.app import (
     LLM_WAIT_ACTIVITY,
     ChatInput,
+    DecisionBar,
     HpcaApp,
     WorkingIndicator,
 )
@@ -284,3 +285,187 @@ class TestInterrupt:
             await pilot.pause()
             assert app._interrupt_worker is None
             assert not app.query(WorkingIndicator)  # the reply landed normally
+
+
+class DeleteParams(BaseModel):
+    target: str = Field(description="What to delete")
+
+
+async def delete_handler(args, ctx):
+    return f"deleted {args.target}"
+
+
+def destructive_tools():
+    registry = ToolRegistry()
+    registry.register(
+        Tool(
+            name="delete",
+            description="Delete something",
+            params=DeleteParams,
+            handler=delete_handler,
+            destructive=True,
+        )
+    )
+    return registry
+
+
+class ApprovalThenBlockLLM:
+    """Asks for a destructive tool first; the call that follows the approval
+    parks. That second call belongs to a turn of its own — the one the user is
+    left watching after answering the prompt."""
+
+    def __init__(self):
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self._calls = 0
+
+    async def chat(self, messages, *, json_schema=None, **kwargs):
+        if is_title_request(json_schema):
+            return ChatResponse(content=TITLE_REPLY)
+        self._calls += 1
+        if self._calls == 1:
+            return ChatResponse(
+                content=json.dumps(
+                    {
+                        "action": "tool_call",
+                        "tool": "delete",
+                        "arguments": {"target": "results/"},
+                    }
+                )
+            )
+        self.entered.set()
+        await self.release.wait()
+        return ChatResponse(
+            content=json.dumps({"action": "respond", "response": "done"})
+        )
+
+    async def supports_constrained_decoding(self):
+        return True
+
+
+class TestTheSpinnerStaysReachable:
+    """The user stops the agent by landing on the last line of the log and
+    pressing enter, so nothing may take that place while a turn runs."""
+
+    async def test_typing_ahead_does_not_bury_the_spinner(self, hpca_home):
+        app = HpcaApp(llm=BlockingLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await send_and_park(app, pilot, "first")
+            chat_input = app.query_one("#chat-input", ChatInput)
+            chat_input.focus()
+            chat_input.text = "and then this"
+            await pilot.press("enter")  # queued behind the running turn
+            await pilot.pause()
+
+            rows = app.query_one("#chat-list", ListView).children
+            assert list(rows[-1].query(WorkingIndicator)), "the spinner must stay last"
+            assert "and then this" in str(rows[-2].query_one(Static).content)
+
+            # and enter on that last line still means "stop", not "take back"
+            await select_working_indicator(app, pilot)
+            assert isinstance(app.screen, ConfirmScreen)
+            await pilot.press("n")
+            await pilot.pause()
+            app._llm.release.set()
+
+
+class TestStoppableAfterAnApproval:
+    async def test_the_resumed_turn_carries_the_same_anchor(self, hpca_home):
+        llm = ApprovalThenBlockLLM()
+        app = HpcaApp(llm=llm, tools=destructive_tools())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", ChatInput)
+            chat_input.focus()
+            chat_input.text = "delete results"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert app.query_one("#decision-bar", DecisionBar).display
+
+            await pilot.press("y")  # approve; the turn resumes and parks again
+            await asyncio.wait_for(llm.entered.wait(), timeout=5)
+            await pilot.pause()
+
+            # the resume has no user message of its own: it borrows the one
+            # that started the exchange, which is what the rollback needs.
+            ts = app._turns[app.active_session.session_id]
+            assert ts.user_text == "delete results"
+            assert ts.interrupt_keep is not None
+            assert app._can_interrupt()
+
+    async def test_the_spinner_after_an_approval_still_stops_the_turn(self, hpca_home):
+        llm = ApprovalThenBlockLLM()
+        app = HpcaApp(llm=llm, tools=destructive_tools())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", ChatInput)
+            chat_input.focus()
+            chat_input.text = "delete results"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            await pilot.press("y")
+            await asyncio.wait_for(llm.entered.wait(), timeout=5)
+            await pilot.pause()
+
+            session_id = app.active_session.session_id
+            await select_working_indicator(app, pilot)
+            assert isinstance(app.screen, ConfirmScreen)
+            await pilot.press("y")
+            await pilot.pause()
+            assert app._interrupt_worker is not None
+            await app._interrupt_worker.wait()
+            await pilot.pause()
+
+            # handed back for editing, and the whole exchange — message, tool
+            # call, tool result — is out of the thread again
+            assert chat_input.text == "delete results"
+            assert session_id not in app._turns
+            snap = await app.graph.aget_state(
+                {"configurable": {"thread_id": session_id}}
+            )
+            assert (snap.values or {}).get("messages", []) == []
+
+    async def test_the_anchor_is_dropped_once_the_exchange_ends(self, hpca_home):
+        llm = ApprovalThenBlockLLM()
+        app = HpcaApp(llm=llm, tools=destructive_tools())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", ChatInput)
+            chat_input.focus()
+            chat_input.text = "delete results"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            session_id = app.active_session.session_id
+            await pilot.press("y")
+            await asyncio.wait_for(llm.entered.wait(), timeout=5)
+            # it survives the turn that parked — the exchange is still running
+            assert session_id in app._interrupt_anchor
+            llm.release.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert session_id not in app._interrupt_anchor
+
+
+class TestItSaysWhyItCannot:
+    async def test_a_spinner_that_is_not_a_turn_says_so(self, hpca_home):
+        """A silent backend call (/conclude, compacting) has nothing to roll
+        back. Enter there used to do nothing at all, which reads as a key that
+        stopped working — at the one moment that must not happen."""
+        app = HpcaApp(llm=BlockingLLM())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            await pilot.pause()
+            seen = []
+            app.notify = lambda message, **kwargs: seen.append(message)
+            app.show_working("compacting context")
+            await pilot.pause()
+
+            await select_working_indicator(app, pilot)
+            assert not isinstance(app.screen, ConfirmScreen)
+            assert seen and "Nothing to interrupt" in seen[0]

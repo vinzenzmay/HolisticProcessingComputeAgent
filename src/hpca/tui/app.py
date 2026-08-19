@@ -1342,6 +1342,12 @@ class HpcaApp(App):
         # Sessions whose thread is parked on a destructive-op approval. Their
         # queued messages wait for the resume; other sessions are unaffected.
         self._awaiting_approval: set[str] = set()
+        # What an interrupt needs — (thread length before the message, the
+        # message) — kept per session for as long as the exchange lasts, not
+        # just for one turn. An approval ends the turn it parked; the resume
+        # starts a fresh one that carries no user message of its own, and
+        # without this it would be a turn nobody could stop (§ interrupt).
+        self._interrupt_anchor: dict[str, tuple[int, str]] = {}
         # The inline decision each session is waiting on, keyed by session_id:
         # {"kind": "approval", "payload": ..., "stage": ..., "reason": ...}.
         # Drives both the inline DecisionBar (shown only for the active
@@ -2077,6 +2083,15 @@ class HpcaApp(App):
             and ts.interrupt_keep is not None
         )
 
+    def _no_interrupt_reason(self) -> str:
+        """Why enter on this spinner did not offer to stop anything. The two
+        cases are genuinely different: a backend call is not a turn and never
+        becomes stoppable, while a turn a fraction of a second old is only not
+        stoppable *yet* — its rollback point is still being read."""
+        if self._active_turn() is None:
+            return "Nothing to interrupt here — this step is not a turn of yours."
+        return "Not stoppable yet — this turn is still starting. Try again."
+
     def _maybe_interrupt_llm(self) -> None:
         """Selecting the working indicator while the turn waits on the model
         offers to abort it. The confirm dialog can sit open long enough for the
@@ -2084,6 +2099,10 @@ class HpcaApp(App):
         returns before firing (callback form: a message handler is not a
         worker, so push_screen_wait is unavailable here)."""
         if not self._can_interrupt():
+            # Doing nothing at all reads as a broken key — and this is the key
+            # the user reaches for precisely when they want the agent to stop,
+            # so the one thing it must not be is silent.
+            self.notify(self._no_interrupt_reason(), severity="warning")
             return
 
         def resolved(confirmed: bool | None) -> None:
@@ -2119,6 +2138,7 @@ class HpcaApp(App):
             except (Exception, asyncio.CancelledError):
                 pass
         self._turns.pop(session.session_id, None)
+        self._interrupt_anchor.pop(session.session_id, None)  # this rollback is it
         self._refresh_session_row(session.session_id)  # clear the working marker
         self.hide_working()
         try:
@@ -2201,15 +2221,22 @@ class HpcaApp(App):
         log = open_log(self.settings, session)
         # Everything this turn owns lives in its own TurnState, keyed by
         # session, so a concurrent turn in another session never reads it.
+        # A resume (an answered approval) continues the exchange a user
+        # message started, so it inherits that message's interrupt anchor:
+        # stopping it rolls the thread back to the same point and hands the
+        # same text back. Without this the second half of every approved turn
+        # was a spinner enter did nothing to.
+        anchor = self._interrupt_anchor.get(session.session_id) if resume else None
         ts = TurnState(
             session=session,
             ctx=self._make_tool_ctx(session, log, skills=turn_skills),
             memory=turn_memory,
             skills=turn_skills,
             # A fresh user message can be interrupted and re-edited (§ interrupt);
-            # a resume/event has no prompt to hand back, so it arms nothing.
-            user_text=user_text,
-            interrupt_keep=None,  # filled once we know the pre-turn count
+            # a resume takes the anchor of the message it is still working on.
+            user_text=user_text if anchor is None else anchor[1],
+            # Filled once we know the pre-turn count — already known for a resume.
+            interrupt_keep=None if anchor is None else anchor[0],
         )
         self._turns[session.session_id] = ts
         # Light the sidebar in-flight marker — works whether or not this
@@ -2352,11 +2379,7 @@ class HpcaApp(App):
         chat_list = self._chat_list()
         if chat_list is None:
             return
-        rows = list(chat_list.children)
-        at = next(
-            (i for i, row in enumerate(rows) if row.query(WorkingIndicator)), len(rows)
-        )
-        chat_list.insert(at, [ChatItem(StepBox(live_step(step)))])
+        self._add_rows(chat_list, [ChatItem(StepBox(live_step(step)))])
         chat_list.scroll_end(animate=False)
 
     async def _agent_turn(
@@ -2380,6 +2403,10 @@ class HpcaApp(App):
                 keep = None
             if ts is not None:
                 ts.interrupt_keep = keep
+            if keep is not None:
+                # Outlives this turn: an approval splits one exchange into
+                # several, and each of them has to stay stoppable.
+                self._interrupt_anchor[session.session_id] = (keep, user_text)
         try:
             result = await run_turn(
                 self.graph,
@@ -2397,6 +2424,7 @@ class HpcaApp(App):
             else:
                 self._mark_session_updated(session)
             self.notify(str(e), severity="error")
+            self._interrupt_anchor.pop(session.session_id, None)
             return
         finally:
             # Drop this session's turn wholesale — everything the old finally
@@ -2428,7 +2456,11 @@ class HpcaApp(App):
             # user has switched away — never a modal over the other columns.
             self._awaiting_approval.add(session.session_id)
             await self._set_pending_decision(session, "approval", result.interrupt)
+            # The anchor stays: the exchange is not over, and the turn the
+            # answer starts is stopped by the same rollback as this one.
             return
+        # Answered for good: nothing left of this exchange to roll back to.
+        self._interrupt_anchor.pop(session.session_id, None)
         await self.maybe_title_session(session, result.messages, log=log)
 
     async def maybe_title_session(
@@ -3663,6 +3695,7 @@ class HpcaApp(App):
         # A parked thread and its inline decision go with the session.
         self._awaiting_approval.discard(session.session_id)
         self._pending_decision.pop(session.session_id, None)
+        self._interrupt_anchor.pop(session.session_id, None)
         # Stage-2 leftover: drop this session's stored context number, and any
         # live turn defensively, so nothing leaks past the delete.
         self._context_used.pop(session.session_id, None)
@@ -4462,9 +4495,28 @@ class HpcaApp(App):
         chat_list = self._chat_list()
         if chat_list is None:
             return  # screen already gone (shutdown); the entry is still kept
-        for item in self._entry_items(entry):
-            chat_list.append(item)
+        self._add_rows(chat_list, self._entry_items(entry))
         chat_list.scroll_end(animate=False)
+
+    def _add_rows(self, chat_list: ListView, items: list[ChatItem]) -> None:
+        """Append rows to the log, but always above the spinner.
+
+        The spinner is the log's last line and has to stay there: it is what
+        the user aims at to stop the turn (``browse_chat_messages`` lands on
+        the last row, and enter there interrupts). A message written while a
+        turn is in flight — a typed-ahead one queued behind it, an event, a
+        step — appended below it instead, and enter on that row then offered
+        to take back the queued message rather than to stop the agent.
+        """
+        rows = list(chat_list.children)
+        at = next(
+            (i for i, row in enumerate(rows) if row.query(WorkingIndicator)), None
+        )
+        if at is None:
+            for item in items:
+                chat_list.append(item)
+        else:
+            chat_list.insert(at, items)
 
     def _entry_items(self, entry: Entry) -> list[ChatItem]:
         """The ListView rows an entry renders as: one for most entries, but an
