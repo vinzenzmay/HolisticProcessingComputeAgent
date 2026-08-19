@@ -49,6 +49,13 @@ edited from the in-app config editor — press `c` while the sessions column is
 focused. The same directory holds the job database (`hpca.db`), agent profiles,
 skills, and the deletion trash.
 
+On a cluster node those databases actually run from node-local storage and are
+copied home when you quit, so the last thing HPCA prints is `please WAIT a
+moment while the chat log databases are being copied ...`. That pause is the
+copy, not a hang; leave it alone until it says `chat log databases copied.` A
+single Ctrl+C answers rather than aborts, and pressing it twice only postpones
+the copy to the next start.
+
 The TUI is a three-column layout — sessions (left), chat (middle), running
 processes and cluster jobs (right). A few of the top-level keys:
 

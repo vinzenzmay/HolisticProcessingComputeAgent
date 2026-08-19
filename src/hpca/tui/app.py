@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
-from contextlib import asynccontextmanager
+import signal
+from collections.abc import Iterator
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from os import environ as os_environ
@@ -233,6 +235,24 @@ def _dbcache_logger() -> logging.Logger:
     rather than surfaced, and recovery happens before the UI exists, so this
     file is where both leave their trail."""
     return _file_logger("hpca.dbcache", "dbcache.log")
+
+
+# Printed on the real terminal while the final sync runs. Until it finishes the
+# app looks hung — the TUI is gone and the shell prompt is not back yet — and
+# copying three databases home over NFS is seconds to minutes.
+DB_SYNC_WAIT_MESSAGE = (
+    "please WAIT a moment while the chat log databases are being copied ..."
+)
+
+# What one impatient Ctrl+C gets instead of killing the copy. A second press
+# still aborts: the working dir and its lease survive a kill, and the next
+# start recovers from them, so no chat log is lost either way.
+DB_SYNC_INTERRUPT_MESSAGE = (
+    "still copying — press Ctrl+C again to abort "
+    "(the next start then finishes the copy)"
+)
+
+DB_SYNC_DONE_MESSAGE = "chat log databases copied."
 
 
 
@@ -1545,6 +1565,86 @@ class HpcaApp(App):
         finally:
             self._syncing_db_cache = False
 
+    def _write_to_terminal(self, text: str) -> bool:
+        """Put text on the real terminal, outside the TUI. Best effort.
+
+        Nothing here is worth failing a shutdown over, and under a headless
+        driver (the tests) there is no terminal to write to.
+        """
+        driver = self._driver
+        if driver is None or driver.is_headless:
+            return False
+        try:
+            driver.write(text)
+            driver.flush()
+        except Exception:
+            _dbcache_logger().exception("could not write to the terminal")
+            return False
+        return True
+
+    def _announce_final_db_sync(self) -> bool:
+        """Leave the TUI early and say what the wait at the end is for.
+
+        The final sync copies the databases home over NFS, which takes long
+        enough to look like a hang: the TUI has stopped repainting and the
+        shell prompt is not back yet. Textual dispatches Unmount while the alt
+        screen is still up, so a message printed from here would be wiped out
+        along with it — stopping application mode first drops the terminal back
+        to the shell view, where the message stays put for as long as the copy
+        takes. Textual stops application mode again afterwards; it is
+        idempotent.
+
+        Returns whether the message went out — false when there is nothing to
+        wait for, because without the local cache the databases are already
+        home and ``release()`` returns immediately.
+        """
+        cache = self._dbcache
+        driver = self._driver
+        if cache is None or not cache.active:
+            return False
+        if driver is None or driver.is_headless:
+            return False
+        try:
+            driver.stop_application_mode()
+        except Exception:
+            _dbcache_logger().exception("could not leave application mode early")
+            return False
+        return self._write_to_terminal(f"\n{DB_SYNC_WAIT_MESSAGE}\n")
+
+    @contextmanager
+    def _sync_interrupt_guard(self, announced: bool) -> Iterator[None]:
+        """Answer the first Ctrl+C during the final sync instead of dying on it.
+
+        While the TUI runs, the terminal is in raw mode and Ctrl+C is not a
+        signal at all; leaving application mode hands signal handling back, so
+        from here on the impatient press that this message exists to prevent
+        really would kill the process mid-copy. The first press gets an answer,
+        a second one restores the default handler and aborts — a hung NFS mount
+        must not become a trap, and a kill costs nothing permanent: the working
+        dir survives it and the next start recovers from there.
+        """
+        if not announced:
+            yield
+            return
+
+        def on_interrupt(signum: int, frame: object) -> None:
+            signal.signal(signal.SIGINT, previous)
+            self._write_to_terminal(f"{DB_SYNC_INTERRUPT_MESSAGE}\n")
+
+        try:
+            previous = signal.signal(signal.SIGINT, on_interrupt)
+        except ValueError:
+            # Not the main thread; nobody's signal handling to borrow.
+            yield
+            return
+        try:
+            yield
+        finally:
+            try:
+                signal.signal(signal.SIGINT, previous)
+            except ValueError:  # pragma: no cover - see above
+                pass
+
     def _detect_slurm(self) -> SlurmClient | None:
         """Job tools are available when sbatch exists or a submit host is set."""
         submit_host = self.settings.cluster.submit_host
@@ -1569,7 +1669,11 @@ class HpcaApp(App):
         # should copy a quiesced database, and nothing may open a local file
         # after the working dir is removed.
         if self._dbcache is not None:
-            await asyncio.to_thread(self._dbcache.release)
+            announced = self._announce_final_db_sync()
+            with self._sync_interrupt_guard(announced):
+                await asyncio.to_thread(self._dbcache.release)
+            if announced:
+                self._write_to_terminal(f"{DB_SYNC_DONE_MESSAGE}\n")
         if getattr(self, "embedder", None) is not None:
             await self.embedder.close()
         if self._owns_llm and self._llm is not None:
