@@ -182,6 +182,16 @@ Surviving entries become backends (direct `ip:port` base URLs, no tunnel).
   - A locked LLM that no registry key unlocks **does not** auto-connect silently
     — it surfaces for the user to add a key (existing flow). Silent auto-connect
     only on an actual `200`.
+- **Nothing connected ⇒ open the manage-LLMs screen** (v0.23.0). Once discovery
+  and auto-connect have had their say, startup probes the *active* backend and,
+  if it does not answer usably, says so and pushes `manage_llms`. "Usably"
+  means real model rows for the key that backend carries — a `401` is up but
+  not for us, and the first turn would fail exactly as if it were down. This
+  covers the first run (nothing configured), the off-cluster case (tunnel down
+  — the screen shows the §4.6 template by itself), and a cluster endpoint that
+  needs a key. See `HpcaApp._ensure_backend_connected`; the check is a class
+  attribute (`startup_backend_check`) so the unit suite can switch a startup
+  modal off wholesale.
 
 ### 4.5 Embeddings wiring
 

@@ -47,7 +47,7 @@ from hpca.clipboard import ClipboardManager, CopyResult
 from hpca.cluster_endpoints import discover_cluster_endpoints
 from hpca import curator
 from hpca.config import LLMBackend, Settings, app_dir, llm_settings_for
-from hpca.discover import DiscoveredBackend
+from hpca.discover import KEY_REQUIRED, DiscoveredBackend, probe_endpoint
 from hpca.db import (
     DbIO,
     command_use_counts,
@@ -214,6 +214,11 @@ def _file_logger(name: str, filename: str) -> logging.Logger:
         logger.setLevel(logging.INFO)
         logger.propagate = False
     return logger
+
+
+NO_BACKEND_MESSAGE = (
+    "No LLM backend is answering — pick or configure one here (m reopens this)."
+)
 
 
 def _autoconnect_logger() -> logging.Logger:
@@ -1044,6 +1049,13 @@ class HpcaApp(App):
     # everywhere else.
     COMMAND_PALETTE_BINDING = "p"
 
+    # Whether startup ends by checking that the active backend actually answers
+    # and, when it does not, opening the manage-LLMs screen (see
+    # _ensure_backend_connected). On for the real app; the unit suite switches
+    # it off wholesale (tests/conftest.py) because a modal that lands on mount
+    # would ambush every TUI test, and the tests that cover it turn it back on.
+    startup_backend_check = True
+
     CSS = """
     #top-bar {
         dock: top;
@@ -1460,8 +1472,9 @@ class HpcaApp(App):
         self._refresh_context_bar()
         self.run_worker(self._discover_context_window(), group="llm-probe")
         # Pre-agent auto-connect: on the cluster, wire up whatever vLLM servers
-        # are live (spec §4). Best-effort and off the critical path.
-        self.run_worker(self._auto_connect_cluster(), group="auto-connect")
+        # are live (spec §4), then say so when that left us with nothing to
+        # talk to. Best-effort and off the critical path.
+        self.run_worker(self._startup_connect(), group="auto-connect")
         await self._reload_sessions()
         self.run_curator_if_due()
         self.set_interval(2.0, self.refresh_watchers)
@@ -4988,6 +5001,58 @@ class HpcaApp(App):
             self._auto_activate(plan.connect)
         elif plan.notice:
             self.notify(plan.notice)
+
+    async def _startup_connect(self) -> None:
+        """The whole pre-agent connection step, in order: discover and connect
+        what the cluster offers, then check that something actually answers."""
+        await self._auto_connect_cluster()
+        await self._ensure_backend_connected()
+
+    async def _ensure_backend_connected(self) -> None:
+        """Open the manage-LLMs screen when no backend answers on startup.
+
+        Without a live backend the app cannot do the one thing it is for, and
+        that used to show up only as a failed first turn — the settings say a
+        backend is configured, so nothing on screen looks wrong. This is the
+        moment to say otherwise: auto-connect has already had its say, so if
+        the active backend still does not answer, there is either nothing
+        configured yet (first run) or the tunnel to the cluster is down. Both
+        are fixed on the same screen, which lists the discovered endpoints,
+        takes a key for a locked one, and — off the cluster with no tunnel —
+        shows the ssh recipe by itself.
+
+        Only the *active* backend is probed: it is what a new session talks
+        to. Another catalog entry may well be up, and the screen shows it as
+        ● connected, one ctrl+l away.
+
+        "Answers" means a usable answer — model rows we can actually reach
+        with the key this backend carries. A server that 401s the key we have
+        (or that we have no key for) is up, but not for us, and the first turn
+        would fail exactly as if it were down. Hence the probe rather than
+        ``is_reachable``, which counts an unauthenticated 401 as reachable,
+        and hence no pool keys: a key that unlocks the endpoint but is not
+        the one on this backend does not make it usable.
+        """
+        if not self.startup_backend_check:
+            return
+        llm = self.settings.llm
+        if llm.base_url and llm.model:
+            try:
+                rows = await probe_endpoint(llm.base_url, api_key=llm.api_key)
+            except Exception:  # a probe must never take startup down
+                _autoconnect_logger().exception(
+                    "startup check: probing %s failed", llm.base_url
+                )
+                return
+            if any(row.model != KEY_REQUIRED for row in rows):
+                return
+        self.notify(NO_BACKEND_MESSAGE, severity="warning")
+        # The screen follows the notification only when nothing else is up: a
+        # probe takes a couple of seconds, and a modal landing under the hands
+        # of someone who has meanwhile opened a screen of their own (or is
+        # quitting) is worse than the notification on its own.
+        if self.is_running and len(self.screen_stack) == 1:
+            self.push_screen(ManageLLMsScreen())
 
     def _ensure_catalog(self, discovered: DiscoveredBackend) -> LLMBackend:
         """The catalog entry for a discovered endpoint, adding it if new."""
