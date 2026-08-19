@@ -23,6 +23,7 @@ import asyncio
 import inspect
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -165,6 +166,24 @@ def _exchange(tool_name: str, arguments: dict, result: str, call_id: str) -> lis
         return tool_exchange(tool_name, arguments, result)
 
 
+try:
+    from hpca.agent.history import fold_old_payloads
+except Exception:  # a baseline checkout that elides at write time instead
+    fold_old_payloads = None
+
+
+def _model_view(messages: list[dict]) -> list[dict]:
+    """What production actually sends, for the branch under test.
+
+    ``hpca.agent.graph._view`` folds the payloads of all but the most recent
+    calls before every decision; a harness that skipped that step would measure
+    a context no session ever sees. On a checkout from before the fold existed
+    this is the identity, which is correct for that branch — there the payload
+    was already gone, removed when the call was written.
+    """
+    return messages if fold_old_payloads is None else fold_old_payloads(messages)
+
+
 def _arguments_dict(arguments) -> dict:
     """decision.arguments as a plain dict, whatever it is on this branch."""
     try:
@@ -296,6 +315,68 @@ def _create(dir_key: str, name: str, lines: list[str]) -> dict:
         "tool": "create_file",
         "arguments": {"dir_key": dir_key, "name": name, "content_lines": lines},
     }
+
+
+# The annotation from the session the elision bug was found in, trimmed to the
+# three columns the task needs. Twenty-four clusters is past MAX_LIST_ITEMS, so
+# a create_file carrying them is elided in the model's copy of its own call —
+# which is the precondition the task exists to put the model in.
+_CLUSTER_ROWS = [
+    (0, "Cd8_eff_like", "Cd8"), (1, "Cd8_IRhi", "Cd8"), (2, "Cd8_eff_like", "Cd8"),
+    (3, "Cd8_eff_like", "Cd8"), (4, "Cd8_eff_like", "Cd8"), (5, "Cd8_IRhi", "Cd8"),
+    (6, "nCd8", "Cd8"), (7, "Cd8_eff_like", "Cd8"), (8, "nCd4", "Cd4"),
+    (9, "Tcm", "Cd8"), (10, "Cd8_IRhi", "Cd8"), (11, "Th17", "Cd4"),
+    (12, "Prolif", "Cd8"), (13, "T_helper", "Cd4"), (14, "Treg", "Cd4"),
+    (15, "Cd8_eff_like", "Cd8"), (16, "Cd8_eff_like", "Cd8"), (17, "Prolif", "Cd8"),
+    (18, "Prolif", "Cd8"), (19, "Cd8_eff_like", "Cd8"), (20, "Klrk1_Tcm", "unknown"),
+    (21, "Tpex", "Cd8"), (22, "T_helper", "Cd4"), (23, "Cd8_Cd160", "Cd8"),
+]
+
+# Both wordings, because the baseline checkout this is copied into emits the
+# old one. Matched here rather than imported from hpca so the same eval file
+# scores both branches — importing carries_elision_marker would crash on any
+# ref that predates it.
+_ELISION_IN_FILE = re.compile(r"<<HPCA:|\.\.\. *\d+ more (?:lines|chars) elided *\.\.\.")
+
+
+def _clusters_csv() -> str:
+    rows = "".join(f"{n},{cell},{lineage}\n" for n, cell, lineage in _CLUSTER_ROWS)
+    return "cluster_no,cell_type,lineage\n" + rows
+
+
+def _annotation_lines(lineage_filter: str = "") -> list[str]:
+    """The file the task asks for, as the scripted --dry-run route writes it."""
+    rows = [r for r in _CLUSTER_ROWS if not lineage_filter or r[2] == lineage_filter]
+    return [
+        "# cluster annotation, from clusters.csv",
+        "# cluster_no\tcell_type\tlineage",
+    ] + [f"{n}\t{cell}\t{lineage}" for n, cell, lineage in rows]
+
+
+def _data_rows(path: Path) -> list[str]:
+    return [
+        line
+        for line in path.read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+def _second_file_ok(ws: Path) -> bool:
+    """Both files written, and neither one carrying the placeholder that stands
+    in for the other's payload in the model's record of writing it.
+
+    The row counts are half the check and the marker is the other half: a file
+    can come out marker-free simply by being abandoned, and a file can come out
+    the right length with a marker sitting in the middle of it. Only both
+    together say the round trip through the model's own history was survived.
+    """
+    first, second = ws / "annotation.tsv", ws / "annotation_cd8.tsv"
+    if not (first.is_file() and second.is_file()):
+        return False
+    if any(_ELISION_IN_FILE.search(p.read_text()) for p in (first, second)):
+        return False
+    cd8 = sum(1 for _, _, lineage in _CLUSTER_ROWS if lineage == "Cd8")
+    return len(_data_rows(first)) >= len(_CLUSTER_ROWS) and len(_data_rows(second)) >= cd8
 
 
 BIG_FILE_HEADER = "# run manifest — generated, do not hand-edit sections A/B\n"
@@ -962,6 +1043,45 @@ def build_hard_tasks() -> list[Task]:
         )
     )
 
+    # H7. Writing a second file right after a first one — the shape that
+    # corrupted fifteen files in a real session (2026-08-19, the cluster
+    # annotation grilling). A create_file payload is elided out of the
+    # assistant copy of that call, so by the time the model composes the
+    # second file its own record of the first is a placeholder. Whether that
+    # placeholder can be mistaken for content is the whole question: when it
+    # could, the model copied it back as content_lines, the marker landed on
+    # disk, and the file collapsed to whatever had survived the elision —
+    # after which every rewrite elided the collapsed version and confirmed the
+    # loss. The source is a file the model must read rather than text in the
+    # prompt, because re-deriving from the prompt is the escape route the real
+    # session did not have.
+    tasks.append(
+        Task(
+            name="second_file_after_first",
+            prompt=(
+                "The cluster annotation is registered as 'clusters' "
+                "(comma-separated). The output directory is registered as "
+                "'workspace'. Write annotation.tsv in it: a two-line comment "
+                "header (lines starting with #) naming the source file and "
+                "the columns, then a tab-separated row for every cluster in "
+                "the source. When that file is finished, write a second file "
+                "annotation_cd8.tsv in the same directory, same layout, "
+                "containing only the clusters whose lineage is Cd8."
+            ),
+            files={"clusters": ("clusters.csv", _clusters_csv())},
+            check=_second_file_ok,
+            # A refusal is a legitimate route here — the treatment branch
+            # bounces a marker payload rather than writing it — so the budget
+            # has to leave room for the retry that follows one.
+            max_decisions=20,
+            fake_calls=[
+                _read("clusters"),
+                _create("workspace", "annotation.tsv", _annotation_lines()),
+                _create("workspace", "annotation_cd8.tsv", _annotation_lines("Cd8")),
+            ],
+        )
+    )
+
     return tasks
 
 
@@ -1200,7 +1320,7 @@ async def run_task(task: Task, llm, tools: ToolRegistry, keep: bool = False) -> 
         ]
         for _ in range(task.max_decisions or MAX_DECISIONS):
             try:
-                decision = await decide(llm, messages, tools)
+                decision = await decide(llm, _model_view(messages), tools)
             except DecisionError as exc:
                 metrics["error"] = f"DecisionError: {exc}"
                 break

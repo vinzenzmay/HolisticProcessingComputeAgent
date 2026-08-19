@@ -24,7 +24,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from hpca.agent import compact
-from hpca.agent.history import call_message, result_message
+from hpca.agent.history import call_message, fold_old_payloads, result_message
 from hpca.agent.middleware import (
     DecisionError,
     DirectResponse,
@@ -117,9 +117,11 @@ class AgentState(TypedDict, total=False):
     # What each tool was actually called with — {"after", "tool", "arguments",
     # and optionally "script"/"details"} — anchored to the message index of the
     # call itself (the assistant message execute_tool appends, immediately
-    # followed by the result). Kept out of `messages` because the *full* record
-    # is here: the model's own copy of the call has its payload elided, and the
-    # user, who never made the call, needs the script in full — after the
+    # followed by the result). Kept out of `messages` because this is the
+    # record the *user* reads, and it is never folded: `messages` keeps the
+    # call whole too, but the view sent to the model describes the payload of
+    # any but the most recent few (hpca.agent.history.fold_old_payloads), and
+    # the user, who never made the call, needs the script in full — after the
     # approval prompt is answered this is the only place it survives (see
     # hpca.transcript.call_text).
     calls: Annotated[list[dict], _append]
@@ -203,8 +205,17 @@ def build_graph(
     report_step = on_step or (lambda *a: None)
 
     def _view(state: AgentState) -> list[Message]:
-        """The history as the model sees it: folded once compacted."""
-        messages = list(state.get("messages", []))
+        """The history as the model sees it: folded once compacted, and with
+        the payloads of all but the most recent calls described rather than
+        repeated (hpca.agent.history.fold_old_payloads).
+
+        Both folds are views over a history that is never rewritten, and they
+        compose in this order for a reason: payloads go first so that what the
+        summarizer reads — and what ``_maybe_compact`` measures to decide
+        whether to summarize at all — is the size the window actually pays,
+        not the size before the cheapest possible saving.
+        """
+        messages = fold_old_payloads(list(state.get("messages", [])))
         compacted = state.get("compacted")
         if not compacted:
             return messages

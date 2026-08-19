@@ -129,6 +129,18 @@ Terminals in 2026 are assumed wider than 80 columns
     second half of an approved turn is as stoppable as the first. Enter on a
     line that genuinely cannot be stopped (a silent backend call such as
     `/conclude`) says so rather than doing nothing.
+    **Escape twice** (within a second) does the same abort from anywhere on the
+    main screen, with no dialog — the doubling is the confirmation. It is the
+    route that needs no aiming: enter has to land on this one row, which is the
+    awkward thing to do exactly when the agent is misbehaving and filling the
+    log, whereas the user's hands are already wherever they are. One escape on
+    its own still means nothing (terminals emit it as the prefix of arrow keys
+    and pastes), and on a modal or the approval bar escape keeps meaning "leave
+    this prompt" — the binding is deliberately not a priority one, so anything
+    nearer the user claims the key first. Because it cancels the turn's worker,
+    it lands wherever the turn is waiting: on the model, in a tool, or on the
+    next attempt of the decision retry loop (§4.3) — the one place a turn can
+    spin without ever asking the user anything.
   * *Watch (right column):* a box the user asked for, pinned by the agent's
     `watch_log` / `watch_job` tools — see *Watches* below. **Enter** flashes
     the last 300 characters of the log (a toast that expires, not a screen to
@@ -573,10 +585,26 @@ the orchestrator's or another subagent's context.
   needed. A registry key is an affordance, not a toll.
 * **The model sees its own actions.** A tool round appends the model's own call
   as an assistant turn and then the result, rather than the result alone — the
-  shape agent-trained models are post-trained on. Large arguments are elided in
-  that copy (a create_file's content is already on disk; echoing it would store
-  the file twice in context). Without it the model reconstructed what it had
-  done purely from the result text and re-issued calls it had already made.
+  shape agent-trained models are post-trained on. Without it the model
+  reconstructed what it had done purely from the result text and re-issued
+  calls it had already made. A create_file's content is already on disk, so
+  carrying it in that copy as well spends the window on the file twice — but
+  *when* it stops being carried is the whole design. Payloads are folded out by
+  age, not at the moment of writing: the last few calls keep theirs, and older
+  ones are replaced by a `<<HPCA: …>>` descriptor (`history.fold_old_payloads`,
+  a view over a history that is never rewritten, exactly as compaction is).
+  Folding at write time was a real bug — a model that reproduces its own record
+  does it *immediately*, while it is still finishing the job that record
+  belongs to, so it copied the descriptor back as `content_lines` and the
+  descriptor went to disk; the file collapsed to what had survived, and folding
+  *that* confirmed the loss on every retry. Deferring the fold removes the
+  failure instead of guarding against it, because the record in reach is
+  intact. The threshold moved with it (only genuinely large payloads are worth
+  describing at all), and the file tools still refuse content carrying the
+  sentinel — a few lines, no runtime cost, and the only thing standing between
+  an already-checkpointed session and the old behaviour. Measured on the live
+  27B (`second_file_after_first`, 10 reps): 0.8 success and two corrupted files
+  before, 1.0 and none after, with fewer tool calls per task.
 * **How a call travels** is `settings.llm.tool_protocol`, and there are two
   answers. `envelope` (default) is the hand-rolled decision object,
   `{"action": "tool_call", "tool": …, "arguments": …}`, held to an `anyOf`

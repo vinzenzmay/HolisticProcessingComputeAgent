@@ -436,7 +436,74 @@ Consequences, all reproduced live:
   as its default and the call would execute with the content silently missing
   — the same failure, but acted on instead of caught.
 
-## 8. What it deliberately is not
+## 8. Folding the model's own record (v0.23.3)
+
+A session on 2026-08-19 produced fifteen corrupted files. The model wrote a
+24-row annotation TSV, was asked for a second file like it, and sent back the
+placeholder that `hpca.agent.history` had put in place of its own payload —
+so the placeholder went to disk and the file collapsed to four lines. Folding
+*that* left four lines again, so every rewrite confirmed the loss, and the
+model concluded its own writer was truncating and spent a dozen rounds
+bisecting a bug that did not exist.
+
+New hard-tier task `second_file_after_first`: read a registered CSV, write a
+TSV from it, then write a second filtered TSV in the same layout. The source
+is a file rather than text in the prompt, because re-deriving from the prompt
+is the escape route the real session did not have. `check` requires both files
+and no placeholder in either — the row counts alone would pass an abandoned
+file, and the marker alone would pass a file of the right length with the
+marker in the middle.
+
+Three variants measured against v0.23.2, 10 reps each, Qwen3.8-27B, envelope:
+
+| Variant | success | failed edits/run | tool calls/task |
+|---|---|---|---|
+| v0.23.2 baseline | 0.8 | 0.2 | 5.6 |
+| fold at write time + refuse it back | 0.9 | 1.8 | 5.5 |
+| …with the marker no longer quoted in the refusal | 1.0 | 0.0 | 4.0 |
+| fold by age (shipped) | **1.0** | **0.0** | **3.4** |
+
+Two findings worth keeping, both invisible to the unit tests:
+
+**A refusal that quotes the offending line feeds the loop it is refusing.**
+The first treatment echoed the placeholder back inside its "NOT created"
+message, which returned it to the context; the model composed its next call
+out of the refusal it had just read and was refused in the same words —
+seventeen times in one run, until the decision budget died. Removing the quote
+and keeping only the line number took `mean_failed_edits` from 1.8 to 0.0.
+This is the retry-loop cost §1 is about, arriving through the one door nobody
+watches: the error message itself.
+
+**The skeleton-then-fill protocol was paying for the write-time fold all
+along.** `long_specs_write` (§3) writes a long specs.md and then edits it
+section by section, so it is the task most exposed to a change in what the
+model can see of its own writes — the reason it was checked at all. Measured
+separately, 3 reps:
+
+| | success | failed edits/run | tool calls |
+|---|---|---|---|
+| v0.23.2 baseline | 0/3 | 4.0 | 18.0 |
+| fold by age | 2/3 | 0.0 | 11.7 |
+
+The baseline never finishes it. Its `old_lines` stop matching because the
+record of what it wrote was folded away the moment it wrote it, so each edit
+is a guess at text it can no longer see — 4 rejected edits per run, 18 calls,
+no file. This is the same defect as the corrupted-TSV cascade seen from the
+other side: there the model copied the placeholder forward, here it cannot
+reconstruct what the placeholder replaced. §3 read the residue as "long-horizon
+instruction compliance of the 27B"; part of it was the tooling after all.
+
+The remaining 1-in-3 is the documented incompleteness — a section short, or an
+honest TBD left — and still not tool mechanics.
+
+**Guarding a failure is worth less than not having it.** Refusing the write
+prevented every corrupted file, but cost a livelock in 1 run of 10. Deferring
+the fold so recent calls keep their payloads removed the failure at its source
+and came out ahead of the baseline on friction as well — the guard stayed, but
+as a backstop for sessions checkpointed before the change, not as the
+correctness mechanism.
+
+## 9. What it deliberately is not
 
 - Not part of the default or live pytest suites — it costs real generations
   and minutes of wall time; it runs only when someone asks for an assessment.

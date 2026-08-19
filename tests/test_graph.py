@@ -10,6 +10,12 @@ from pydantic import BaseModel, Field
 
 from hpca.agent import compact
 from hpca.agent.graph import MAX_TOOL_ROUNDS, build_graph, compact_now, run_turn
+from hpca.agent.history import (
+    ELISION_SENTINEL,
+    KEEP_RECENT_CALLS,
+    MAX_LIST_CHARS,
+    is_tool_call_message,
+)
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.llm import ChatResponse
 
@@ -932,9 +938,9 @@ class TestCallsInTheHistory:
         assert [m["role"] for m in sent] == ["system", "user", "assistant", "user"]
         assert '"tool": "echo"' in sent[2]["content"]
 
-    async def test_a_large_payload_is_elided_in_the_history(self, tools):
-        # A create_file call carries the whole file; echoing it verbatim would
-        # spend the window on it twice, on exactly the turns already tight.
+    def register_writer(self, tools):
+        """A create_file, so a call in these tests can carry a real payload."""
+
         class WriteParams(BaseModel):
             path: str = Field(description="Where")
             content_lines: list[str] = Field(description="The file")
@@ -950,7 +956,21 @@ class TestCallsInTheHistory:
                 handler=write_handler,
             )
         )
-        lines = [f"line {i}" for i in range(400)]
+        # Past MAX_LIST_CHARS, or the fold would have nothing to fold: an
+        # ordinary twenty-line edit is deliberately below the budget.
+        lines = [f"line {i:03d} " + "-" * 40 for i in range(120)]
+        assert sum(len(line) for line in lines) > MAX_LIST_CHARS
+        return lines
+
+    async def test_the_payload_of_a_recent_call_reaches_the_model_whole(self, tools):
+        # The regression test for the bug this design exists to remove. The
+        # payload used to be replaced by a descriptor of itself the moment the
+        # call was stored, so the model's record of the file it had *just*
+        # written was already a summary when it composed its next move — and
+        # asked to rewrite the file, it copied the summary back as the new
+        # content, marker and all (see hpca.agent.history). While the job is
+        # still running the record has to be the thing itself.
+        lines = self.register_writer(tools)
         llm = FakeLLM(
             [
                 tool_json("create_file", path="notes.md", content_lines=lines),
@@ -958,13 +978,63 @@ class TestCallsInTheHistory:
             ]
         )
         graph = make_graph(llm, tools)
-        result = await run_turn(graph, session_id="h3", user_text="write notes")
-        call = json.loads(result.messages[1]["content"])
-        assert call["arguments"]["path"] == "notes.md"  # the target survives
-        assert call["arguments"]["content_lines"][-1].endswith("more lines elided ...")
-        assert "line 399" not in result.messages[1]["content"]
-        # …while the record the user reads keeps every line
+        await run_turn(graph, session_id="h3", user_text="write notes")
+        sent = llm.calls[-1]["messages"]  # the view the next decision was made on
+        call = next(m for m in sent if is_tool_call_message(m))
+        assert json.loads(call["content"])["arguments"]["content_lines"] == lines
+        assert ELISION_SENTINEL not in call["content"]
+
+    async def test_the_record_the_user_reads_keeps_every_line(self, tools):
+        # AgentState.calls is what the chat renders the step from, and it is
+        # never a view: whatever the model is shown, the user's copy of what
+        # was written stays complete.
+        lines = self.register_writer(tools)
+        llm = FakeLLM(
+            [
+                tool_json("create_file", path="notes.md", content_lines=lines),
+                respond_json("written"),
+            ]
+        )
+        graph = make_graph(llm, tools)
+        result = await run_turn(graph, session_id="h4", user_text="write notes")
         assert result.calls[0]["arguments"]["content_lines"] == lines
+        # …and so does the stored history the checkpoint holds, which is what
+        # makes the fold a view rather than a lossy rewrite.
+        stored = json.loads(result.messages[1]["content"])
+        assert stored["arguments"]["content_lines"] == lines
+
+    async def test_a_payload_is_folded_once_newer_calls_push_it_back(self, tools):
+        # The other half of the contract: once the model has moved on, the
+        # window stops paying for the file twice. KEEP_RECENT_CALLS newer calls
+        # are enough to age the write out, and what is left in its place says
+        # what was written without offering a line of it to copy.
+        lines = self.register_writer(tools)
+        llm = FakeLLM(
+            [
+                tool_json("create_file", path="notes.md", content_lines=lines),
+                *[
+                    tool_json("echo", text=f"then {i}")
+                    for i in range(KEEP_RECENT_CALLS)
+                ],
+                respond_json("written"),
+            ]
+        )
+        graph = make_graph(llm, tools)
+        await run_turn(graph, session_id="h5", user_text="write notes then echo")
+        sent = llm.calls[-1]["messages"]
+        calls = [m for m in sent if is_tool_call_message(m)]
+        assert len(calls) == KEEP_RECENT_CALLS + 1
+        arguments = json.loads(calls[0]["content"])["arguments"]
+        assert arguments["path"] == "notes.md"  # the target survives the fold
+        descriptor = arguments["content_lines"]
+        assert isinstance(descriptor, str)
+        assert descriptor.startswith(ELISION_SENTINEL)
+        assert f"{len(lines)} lines" in descriptor
+        assert not any(line in descriptor for line in lines)
+        assert lines[-1] not in calls[0]["content"]
+        # It was whole in the view the round after it was made, though: the
+        # fold is about age, and the same call is both things in one turn.
+        assert lines[-1] in llm.calls[1]["messages"][2]["content"]
 
 
 class TestLiveSteps:

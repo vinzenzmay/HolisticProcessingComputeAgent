@@ -4,6 +4,7 @@ import pytest
 
 from hpca.agent.builtin_tools import default_tool_registry
 from hpca.agent.context import ToolContext
+from hpca.agent.history import ELISION_SENTINEL, omitted_list
 from hpca.config import Settings
 from hpca.db import connect, init_db
 from hpca.registry import PathRegistry, RegistryError, UnknownKeyError
@@ -119,6 +120,60 @@ class TestCreateScript:
         )
         assert "never_written.sh" in result
         assert ctx.registry.resolve("x") == ctx.scripts_dir / "x.sh"
+
+    async def test_content_carrying_the_elision_marker_is_refused(self, tools, ctx):
+        """The model handing its own elided record back as script content is
+        the observed failure the marker exists to catch (see
+        hpca.agent.history): writing it puts the placeholder on disk in place
+        of the script, and every rewrite after that shrinks the file further."""
+        result = await call(
+            tools, "create_script", ctx,
+            kind="bash", registry_key="x",
+            content_lines=["echo start", omitted_list(["echo body"] * 40)],
+        )
+        assert "NOT created" in result
+        assert "line 2" in result  # which line, without reprinting it
+        # The refusal must not quote the placeholder back. Measured on the live
+        # 27B: a refusal carrying the marker put it into the context, the model
+        # composed its next call out of the refusal it had just read, and the
+        # same call was refused seventeen times until the decision budget died.
+        assert ELISION_SENTINEL not in result
+        # Nothing may reach disk, and the key must stay free for the retry.
+        assert not (ctx.scripts_dir / "x.sh").exists()
+        with pytest.raises(UnknownKeyError):
+            ctx.registry.resolve("x")
+
+    async def test_the_legacy_elision_wording_is_refused_too(self, tools, ctx):
+        """Pre-0.23.3 sessions and the files already written from one carry the
+        old marker, so the guard has to know that wording as well."""
+        result = await call(
+            tools, "create_script", ctx,
+            kind="bash", registry_key="x",
+            content_lines=["echo start", "... 22 more lines elided ..."],
+        )
+        assert "NOT created" in result
+        assert not (ctx.scripts_dir / "x.sh").exists()
+
+    async def test_the_refusal_names_the_offending_line(self, tools, ctx):
+        result = await call(
+            tools, "create_script", ctx,
+            kind="bash", registry_key="x",
+            content_lines=["echo one", "echo two", "... 7 more lines elided ..."],
+        )
+        assert "line 3 of content_lines" in result
+
+    async def test_a_script_that_merely_talks_about_elision_is_written(
+        self, tools, ctx
+    ):
+        """The guard looks for the marker itself, not for the words around it —
+        an ordinary script saying 'lines' and a number is not a placeholder."""
+        result = await call(
+            tools, "create_script", ctx,
+            kind="bash", registry_key="x",
+            content_lines=["echo 'skipping 22 more lines'", "echo done"],
+        )
+        assert "ok" in result.lower()
+        assert "skipping 22 more lines" in ctx.registry.resolve("x").read_text()
 
 
 class TestReadFile:
