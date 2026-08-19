@@ -474,6 +474,28 @@ and keeping only the line number took `mean_failed_edits` from 1.8 to 0.0.
 This is the retry-loop cost §1 is about, arriving through the one door nobody
 watches: the error message itself.
 
+**The skeleton-then-fill protocol was paying for the write-time fold all
+along.** `long_specs_write` (§3) writes a long specs.md and then edits it
+section by section, so it is the task most exposed to a change in what the
+model can see of its own writes — the reason it was checked at all. Measured
+separately, 3 reps:
+
+| | success | failed edits/run | tool calls |
+|---|---|---|---|
+| v0.23.2 baseline | 0/3 | 4.0 | 18.0 |
+| fold by age | 2/3 | 0.0 | 11.7 |
+
+The baseline never finishes it. Its `old_lines` stop matching because the
+record of what it wrote was folded away the moment it wrote it, so each edit
+is a guess at text it can no longer see — 4 rejected edits per run, 18 calls,
+no file. This is the same defect as the corrupted-TSV cascade seen from the
+other side: there the model copied the placeholder forward, here it cannot
+reconstruct what the placeholder replaced. §3 read the residue as "long-horizon
+instruction compliance of the 27B"; part of it was the tooling after all.
+
+The remaining 1-in-3 is the documented incompleteness — a section short, or an
+honest TBD left — and still not tool mechanics.
+
 **Guarding a failure is worth less than not having it.** Refusing the write
 prevented every corrupted file, but cost a livelock in 1 run of 10. Deferring
 the fold so recent calls keep their payloads removed the failure at its source
