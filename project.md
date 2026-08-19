@@ -119,7 +119,16 @@ Terminals in 2026 are assumed wider than 80 columns
     interrupt the turn and hand the message back to the entry for editing — in
     any phase, waiting on the model or running a tool. It ends the turn, not
     the work already started: a script keeps running under its own monitor
-    until it exits or times out.
+    until it exits or times out. It is the *last* line of the log for as long
+    as a turn runs — tool rows, typed-ahead messages and background events are
+    written above it — because "go to the end of the log and press enter" is
+    how the user stops the agent, and a row taking that place turned the stop
+    key into something else. It also survives an approval: answering a
+    destructive-op prompt starts a fresh turn on the same exchange, which
+    inherits the message and rollback point of the one that parked, so the
+    second half of an approved turn is as stoppable as the first. Enter on a
+    line that genuinely cannot be stopped (a silent backend call such as
+    `/conclude`) says so rather than doing nothing.
   * *Watch (right column):* a box the user asked for, pinned by the agent's
     `watch_log` / `watch_job` tools — see *Watches* below. **Enter** flashes
     the last 300 characters of the log (a toast that expires, not a screen to
