@@ -436,6 +436,14 @@ Consequences, all reproduced live:
   as its default and the call would execute with the content silently missing
   — the same failure, but acted on instead of caught.
 
+> **Reading this after v0.24.0:** the interface described below is gone. Every
+> file tool took a *registry key* then; they take a path now, and `register_path`
+> / `list_paths` / `dir_key` / `subpath` no longer exist. The measurements stand
+> as the record of what was true when they were taken — including the ones that
+> argued the registry was worth keeping — and specs-path-registry.md is where
+> the removal and its head-to-head live. The `shift` tier in particular measures
+> a friction that no longer has anything to rub against.
+
 ## 8. Folding the model's own record (v0.23.3)
 
 A session on 2026-08-19 produced fifteen corrupted files. The model wrote a

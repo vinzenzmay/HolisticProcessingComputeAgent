@@ -2037,7 +2037,12 @@ async def main() -> int:
         "hard": build_hard_tasks(),
         "shift": build_shift_tasks(),
         "paths": build_path_tasks(),
-        "all": build_tasks() + build_hard_tasks() + build_shift_tasks(),
+        # `all` is the standing regression set plus the long-context tier, and
+        # deliberately NOT shift: shift measured the friction of naming a file
+        # by key against naming it by path, and there is no longer a key to be
+        # on the other side of that. It still runs when asked for by name, as
+        # the record of what that interface cost.
+        "all": build_tasks() + build_hard_tasks() + build_path_tasks(),
     }[args.tier]
     if args.tasks:
         tasks = tasks[: args.tasks]
