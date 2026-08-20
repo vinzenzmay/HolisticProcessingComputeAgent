@@ -30,9 +30,16 @@ c config editor, r/t/d on a session, d unwatch, q quit. The one addition is
 ``e``/``E`` to open an entry, which the row design needs and the column design
 had no equivalent of.
 
-What is deliberately still missing: real data, mouse support, text selection,
-and approval prompts. Those are arguments *against* leaving Textual and this
-prototype is not the place to pretend they are solved.
+The message box edits the way an editor does: it wraps rather than overflowing,
+ctrl+arrow moves by word, ctrl+backspace and ctrl+delete cut one, and shift with
+any motion marks text. That last one also fixed a real annoyance — an escape
+sequence the key table did not know used to be read as the esc key followed by
+its letters, so reaching for shift+arrow threw you out of the box and into the
+chat. Escapes are now measured by shape and unknown ones are dropped whole.
+
+What is deliberately still missing: real data, mouse support, selecting text out
+of the *chat*, and approval prompts. Those are arguments *against* leaving
+Textual and this prototype is not the place to pretend they are solved.
 """
 
 from __future__ import annotations
@@ -144,15 +151,39 @@ KEYS = {
     f"{ESC}OD": "left",
     f"{ESC}[1;5A": "ctrl-up",
     f"{ESC}[1;5B": "ctrl-down",
+    f"{ESC}[1;5C": "ctrl-right",
+    f"{ESC}[1;5D": "ctrl-left",
     f"{ESC}[1;3A": "alt-up",
     f"{ESC}[1;3B": "alt-down",
+    f"{ESC}[1;3C": "ctrl-right",
+    f"{ESC}[1;3D": "ctrl-left",
+    f"{ESC}b": "ctrl-left",
+    f"{ESC}f": "ctrl-right",
+    # Shift is selection everywhere: plain, by word, and to the ends.
+    f"{ESC}[1;2A": "shift-up",
+    f"{ESC}[1;2B": "shift-down",
+    f"{ESC}[1;2C": "shift-right",
+    f"{ESC}[1;2D": "shift-left",
+    f"{ESC}[1;6C": "shift-ctrl-right",
+    f"{ESC}[1;6D": "shift-ctrl-left",
+    f"{ESC}[1;4C": "shift-ctrl-right",
+    f"{ESC}[1;4D": "shift-ctrl-left",
+    f"{ESC}[1;2H": "shift-home",
+    f"{ESC}[1;2F": "shift-end",
+    f"{ESC}[1;2~": "shift-home",
+    f"{ESC}[4;2~": "shift-end",
     f"{ESC}[5~": "pgup",
     f"{ESC}[6~": "pgdn",
     f"{ESC}[H": "home",
     f"{ESC}[F": "end",
+    f"{ESC}OH": "home",
+    f"{ESC}OF": "end",
     f"{ESC}[1~": "home",
     f"{ESC}[4~": "end",
     f"{ESC}[3~": "delete",
+    f"{ESC}[3;5~": "ctrl-delete",
+    f"{ESC}[3;3~": "ctrl-delete",
+    f"{ESC}\x7f": "ctrl-backspace",
     f"{ESC}[Z": "shift-tab",
     f"{ESC}\r": "alt-enter",
     ESC: "esc",
@@ -160,7 +191,8 @@ KEYS = {
     "\r": "enter",
     "\n": "enter",
     "\x7f": "backspace",
-    "\x08": "backspace",
+    "\x08": "ctrl-backspace",  # what most terminals send for ctrl+backspace
+    "\x17": "ctrl-backspace",  # and ctrl-w, for the terminals that do not
     "\x13": "ctrl-s",
     "\x15": "ctrl-u",
     "\x03": "quit",
@@ -168,62 +200,155 @@ KEYS = {
 }
 
 
+def _escape_len(text: str, at: int) -> int:
+    """How many characters the escape sequence starting at ``at`` occupies.
+
+    Measured by shape rather than looked up, so a sequence this prototype does
+    not know — a shift+alt+arrow from some other terminal, a bracketed paste
+    marker — is still consumed whole. Matching by table alone left the leading
+    ESC to be read as the esc key and the rest as typed letters, which is why
+    shift+arrow used to throw you out of the message box and into the chat.
+    """
+    n = len(text)
+    if at + 1 >= n:
+        return 1
+    nxt = text[at + 1]
+    if nxt == "[":
+        i = at + 2
+        while i < n and (text[i].isdigit() or text[i] in ";?<"):
+            i += 1
+        return min(n, i + 1) - at
+    if nxt == "O":
+        return min(n, at + 3) - at
+    if nxt == ESC:
+        return 1
+    return 2  # alt-<char>
+
+
 def decode(data: bytes) -> list[str]:
-    """One read into a list of key names, longest escape sequence first."""
+    """One read into a list of key names. Unknown escapes are dropped."""
     text = data.decode("utf-8", "replace")
     keys: list[str] = []
     at = 0
     while at < len(text):
-        for size in (6, 5, 4, 3, 2):
+        if text[at] == ESC:
+            size = _escape_len(text, at)
             chunk = text[at : at + size]
             if chunk in KEYS:
                 keys.append(KEYS[chunk])
-                at += size
-                break
-        else:
-            keys.append(KEYS.get(text[at], text[at]))
-            at += 1
+            elif size == 1:
+                keys.append("esc")
+            at += size
+            continue
+        keys.append(KEYS.get(text[at], text[at]))
+        at += 1
     return keys
 
 
 # -------------------------------------------------------------------- editor
 
 
+def _wrap_spans(text: str, width: int) -> list[tuple[int, int]]:
+    """Where one logical line breaks to fit ``width``, as ``(start, end)``.
+
+    Broken at a space where there is one and mid-run where there is not. The
+    spans partition the line exactly — nothing is dropped, not even the space
+    that caused the break — because the cursor is addressed by column, and a
+    swallowed character would leave a column with nowhere to stand.
+    """
+    if width < 1:
+        return [(0, len(text))]
+    spans: list[tuple[int, int]] = []
+    at, n = 0, len(text)
+    while at < n:
+        if n - at <= width:
+            spans.append((at, n))
+            break
+        cut = text.rfind(" ", at, at + width)
+        spans.append((at, cut + 1 if cut > at else at + width))
+        at = spans[-1][1]
+    if not spans:
+        return [(0, 0)]
+    if spans[-1][1] - spans[-1][0] == width:
+        spans.append((n, n))  # a full last line still needs a cursor slot
+    return spans
+
+
+def _reverse(text: str, ranges: list[tuple[int, int]]) -> str:
+    """``text`` with those column ranges highlighted, and nothing else moved."""
+    spans = sorted((a, b) for a, b in ranges if b > a)
+    if not spans:
+        return text
+    out: list[str] = []
+    at = 0
+    for start, end in spans:
+        start, end = max(start, at), min(end, len(text))
+        if end <= start:
+            continue
+        out.append(text[at:start])
+        out.append(REVERSE + text[start:end] + RESET)
+        at = end
+    out.append(text[at:])
+    return "".join(out)
+
+
 class Editor:
-    """A minimal multi-line text buffer with a cursor.
+    """A minimal multi-line text buffer with a cursor and a selection.
 
     Shared by the three places that need real typing — the message row, the
     config editor and a profile's learnings — because they differ only in what
     Enter means, which is the caller's business, not the buffer's.
+
+    ``wrap`` is the one place they genuinely differ: prose in the message row
+    has to fold at the box edge or the row overflows, while a JSON file edited
+    at column 90 must not reflow the twenty lines under it on every keystroke,
+    so the config editor scrolls sideways instead.
     """
 
-    def __init__(self, text: str = "") -> None:
+    def __init__(self, text: str = "", *, wrap: bool = False) -> None:
         self.lines = text.split("\n") or [""]
         self.row = 0
         self.col = 0
         self.offset = 0
+        self.wrap = wrap
+        self.anchor: tuple[int, int] | None = None
+        self._rev = 0
+        self._vis: list[tuple[int, int, int]] = []
+        self._vis_key: tuple | None = None
+        self._last_width = 60
 
     # ------------------------------------------------------------- content
 
     def text(self) -> str:
         return "\n".join(self.lines)
 
+    def _touch(self) -> None:
+        self._rev += 1
+
     def clear(self) -> None:
         self.lines = [""]
         self.row = self.col = self.offset = 0
+        self.anchor = None
+        self._touch()
 
     def insert(self, ch: str) -> None:
+        self.delete_selection()
         line = self.lines[self.row]
         self.lines[self.row] = line[: self.col] + ch + line[self.col :]
         self.col += 1
+        self._touch()
 
     def newline(self) -> None:
+        self.delete_selection()
         line = self.lines[self.row]
         self.lines[self.row : self.row + 1] = [line[: self.col], line[self.col :]]
         self.row += 1
         self.col = 0
+        self._touch()
 
     def backspace(self) -> None:
+        if self.delete_selection():
+            return
         if self.col:
             line = self.lines[self.row]
             self.lines[self.row] = line[: self.col - 1] + line[self.col :]
@@ -234,14 +359,59 @@ class Editor:
             self.lines[self.row - 1] = above + self.lines[self.row]
             del self.lines[self.row]
             self.row -= 1
+        self._touch()
 
     def delete(self) -> None:
+        if self.delete_selection():
+            return
         line = self.lines[self.row]
         if self.col < len(line):
             self.lines[self.row] = line[: self.col] + line[self.col + 1 :]
         elif self.row < len(self.lines) - 1:
             self.lines[self.row] += self.lines[self.row + 1]
             del self.lines[self.row + 1]
+        self._touch()
+
+    # ------------------------------------------------------------ selection
+
+    def sel_range(self) -> tuple[tuple[int, int], tuple[int, int]] | None:
+        """The marked region as ordered ``(row, col)`` ends, or None."""
+        if self.anchor is None:
+            return None
+        here = (self.row, self.col)
+        if self.anchor == here:
+            return None
+        return (self.anchor, here) if self.anchor < here else (here, self.anchor)
+
+    def selected(self) -> str:
+        span = self.sel_range()
+        if span is None:
+            return ""
+        (r1, c1), (r2, c2) = span
+        if r1 == r2:
+            return self.lines[r1][c1:c2]
+        parts = [self.lines[r1][c1:]] + self.lines[r1 + 1 : r2] + [self.lines[r2][:c2]]
+        return "\n".join(parts)
+
+    def delete_selection(self) -> bool:
+        """Remove what is marked, if anything. Every edit starts here, which is
+        what makes typing over a selection replace it the way it should."""
+        span = self.sel_range()
+        self.anchor = None
+        if span is None:
+            return False
+        (r1, c1), (r2, c2) = span
+        self.lines[r1 : r2 + 1] = [self.lines[r1][:c1] + self.lines[r2][c2:]]
+        self.row, self.col = r1, c1
+        self._touch()
+        return True
+
+    def _mark(self, extend: bool) -> None:
+        """Called before every motion: shift keeps an anchor, others drop it."""
+        if not extend:
+            self.anchor = None
+        elif self.anchor is None:
+            self.anchor = (self.row, self.col)
 
     # ---------------------------------------------------------- navigation
 
@@ -264,30 +434,133 @@ class Editor:
                 else:
                     self.col = len(self.lines[self.row])
 
+    def move_line(self, delta: int) -> None:
+        """Up and down by what is on the screen, not by logical line.
+
+        In a wrapped box the two differ: one typed sentence can be three rows,
+        and stepping over all three at once is the thing that makes a wrapped
+        box feel broken. Uses the width the last render used, which is the
+        width the line the user is looking at was folded at.
+        """
+        if not self.wrap:
+            self.move(delta, 0)
+            return
+        rows = self.visual(self._last_width)
+        index, offset = self.cursor_visual(self._last_width)
+        target = index + delta
+        if not 0 <= target < len(rows):
+            return
+        row, start, end = rows[target]
+        self.row = row
+        self.col = min(start + offset, end, len(self.lines[row]))
+
     def home(self) -> None:
         self.col = 0
 
     def end(self) -> None:
         self.col = len(self.lines[self.row])
 
+    def word_left(self) -> None:
+        if self.col == 0:
+            self.move(0, -1)
+            return
+        line = self.lines[self.row]
+        at = self.col
+        while at and line[at - 1] == " ":
+            at -= 1
+        while at and line[at - 1] != " ":
+            at -= 1
+        self.col = at
+
+    def word_right(self) -> None:
+        line = self.lines[self.row]
+        if self.col >= len(line):
+            self.move(0, 1)
+            return
+        at = self.col
+        while at < len(line) and line[at] == " ":
+            at += 1
+        while at < len(line) and line[at] != " ":
+            at += 1
+        self.col = at
+
+    def delete_word_left(self) -> None:
+        if self.delete_selection():
+            return
+        self.anchor = (self.row, self.col)
+        self.word_left()
+        self.delete_selection()
+
+    def delete_word_right(self) -> None:
+        if self.delete_selection():
+            return
+        self.anchor = (self.row, self.col)
+        self.word_right()
+        self.delete_selection()
+
+    # ------------------------------------------------------------- geometry
+
+    def visual(self, width: int) -> list[tuple[int, int, int]]:
+        """``(row, start, end)`` for every screen line. Cached per edit.
+
+        Rebuilt only when the text or the width changes, so holding a key down
+        costs one re-wrap per keystroke and nothing per line above it.
+        """
+        key = (width, self._rev, self.wrap)
+        if self._vis_key == key:
+            return self._vis
+        rows: list[tuple[int, int, int]] = []
+        for index, line in enumerate(self.lines):
+            if self.wrap:
+                rows += [(index, s, e) for s, e in _wrap_spans(line, width)]
+            else:
+                rows.append((index, 0, len(line)))
+        self._vis, self._vis_key = rows, key
+        return rows
+
+    def cursor_visual(self, width: int) -> tuple[int, int]:
+        """Which screen line the cursor sits on, and how far into it."""
+        rows = self.visual(width)
+        last = 0
+        for index, (row, start, end) in enumerate(rows):
+            if row != self.row:
+                continue
+            last = index
+            if start <= self.col < end:
+                return index, self.col - start
+        return last, self.col - rows[last][1]
+
+    def height(self, width: int) -> int:
+        return len(self.visual(width))
+
+    # ---------------------------------------------------------------- keys
+
     def handle(self, key: str) -> bool:
         """The keys every editor shares. False means "not mine"."""
-        if key == "backspace":
+        name, extend = key, False
+        if name.startswith("shift-") and name != "shift-tab":
+            name, extend = name[6:], True
+        motions = {
+            "left": lambda: self.move(0, -1),
+            "right": lambda: self.move(0, 1),
+            "up": lambda: self.move_line(-1),
+            "down": lambda: self.move_line(1),
+            "home": self.home,
+            "end": self.end,
+            "ctrl-left": self.word_left,
+            "ctrl-right": self.word_right,
+        }
+        if name in motions:
+            self._mark(extend)
+            motions[name]()
+        elif key == "backspace":
             self.backspace()
         elif key == "delete":
             self.delete()
-        elif key == "left":
-            self.move(0, -1)
-        elif key == "right":
-            self.move(0, 1)
-        elif key == "up":
-            self.move(-1, 0)
-        elif key == "down":
-            self.move(1, 0)
-        elif key == "home":
-            self.home()
-        elif key == "end":
-            self.end()
+        elif key == "ctrl-backspace":
+            self.delete_word_left()
+        elif key == "ctrl-delete":
+            self.delete_word_right()
         elif key == "ctrl-u":
             self.clear()
         elif len(key) == 1 and key.isprintable():
@@ -303,25 +576,47 @@ class Editor:
     ) -> list[str]:
         gutter = len(str(len(self.lines))) + 2 if numbers else 0
         body = max(4, width - gutter)
-        if self.row < self.offset:
-            self.offset = self.row
-        elif self.row >= self.offset + height:
-            self.offset = self.row - height + 1
-        self.offset = max(0, min(self.offset, max(0, len(self.lines) - height)))
-        # Horizontal scroll rather than wrapping: a JSON file edited at column
-        # 90 must not reflow the twenty lines under it every keystroke.
-        hoff = max(0, self.col - body + 2)
+        self._last_width = body
+        rows = self.visual(body)
+        cursor_row, cursor_col = self.cursor_visual(body)
+        if cursor_row < self.offset:
+            self.offset = cursor_row
+        elif cursor_row >= self.offset + height:
+            self.offset = cursor_row - height + 1
+        self.offset = max(0, min(self.offset, max(0, len(rows) - height)))
+        # A wrapped row already fits the box; only the sideways editors need an
+        # offset into the line.
+        hoff = 0 if self.wrap else max(0, cursor_col - body + 2)
+        span = self.sel_range() if focused else None
         out = []
-        for row in range(self.offset, self.offset + height):
-            if row >= len(self.lines):
+        for index in range(self.offset, self.offset + height):
+            if index >= len(rows):
                 out.append(" " * width)
                 continue
-            prefix = f"{DIM}{row + 1:>{gutter - 1}} {RESET}" if numbers else ""
-            text = _pad(self.lines[row][hoff : hoff + body], body)
-            if focused and row == self.row:
-                at = self.col - hoff
-                text = text[:at] + REVERSE + text[at : at + 1] + RESET + text[at + 1 :]
-            out.append(prefix + text)
+            row, start, end = rows[index]
+            if not numbers:
+                prefix = ""
+            elif index == 0 or rows[index - 1][0] != row:
+                prefix = f"{DIM}{row + 1:>{gutter - 1}} {RESET}"
+            else:
+                prefix = " " * gutter
+            text = _pad(self.lines[row][start:end][hoff : hoff + body], body)
+            marks: list[tuple[int, int]] = []
+            if span is not None:
+                (r1, c1), (r2, c2) = span
+                if r1 <= row <= r2:
+                    left = start + hoff
+                    lo = (c1 if row == r1 else 0) - left
+                    hi = (c2 if row == r2 else len(self.lines[row]) + 1) - left
+                    marks.append((lo, hi))
+            at = cursor_col - hoff
+            if (
+                focused
+                and index == cursor_row
+                and not any(a <= at < b for a, b in marks)
+            ):
+                marks.append((at, at + 1))
+            out.append(prefix + _reverse(text, marks))
         return out
 
 
@@ -552,6 +847,13 @@ class HelpOverlay(Overlay):
             [
                 ("enter", "send"),
                 ("alt-enter", "new line"),
+                ("↑ ↓", "move one screen line (long text wraps)"),
+                ("^← ^→", "jump a word (alt-← alt-→ also)"),
+                ("shift-← →", "mark text; shift-^← ^→ by the word"),
+                ("shift-↑ ↓", "mark whole lines; shift-home end to an end"),
+                ("^⌫", "delete the word before the cursor"),
+                ("^del", "delete the word after it"),
+                ("⌫ del", "delete the marked text, if any"),
                 ("^u", "clear"),
                 ("esc", "back to the chat"),
             ],
@@ -566,8 +868,11 @@ class HelpOverlay(Overlay):
         ),
     ]
 
-    def render(self, width: int, height: int) -> list[str]:
-        out = [BOLD + CYAN + _rule("keys", width) + RESET]
+    def __init__(self) -> None:
+        self.offset = 0
+
+    def _body(self, width: int) -> list[str]:
+        out = []
         for name, keys in self.SECTIONS:
             out.append(DIM + _pad(f"  {name}", width) + RESET)
             for key, label in keys:
@@ -577,14 +882,35 @@ class HelpOverlay(Overlay):
                 row = _pad(f"      {key:<12}{label}", width)
                 out.append(row[:6] + CYAN + row[6:18] + RESET + row[18:])
             out.append(" " * width)
+        return out
+
+    def render(self, width: int, height: int) -> list[str]:
+        body = self._body(width)
+        rows = max(1, height - 1)
+        self.offset = max(0, min(self.offset, max(0, len(body) - rows)))
+        more = len(body) > rows
+        tail = f"{self.offset + rows}/{len(body)}" if more else ""
+        out = [BOLD + CYAN + _rule("keys", width, tail) + RESET]
+        out += body[self.offset : self.offset + rows]
         while len(out) < height:
             out.append(" " * width)
         return out[:height]
 
     def handle(self, key: str, width: int, height: int) -> bool:
-        # Any key closes it. A list you opened by accident should not need the
-        # one key you were looking it up to find.
+        # Scrolls, because the list outgrew a short terminal. Anything else
+        # closes it: a list you opened by accident should not need the one key
+        # you were looking it up to find.
+        step = {"up": -1, "down": 1, "pgup": -(height - 2), "pgdn": height - 2}
+        if key in step:
+            self.offset += step[key]
+            return True
+        if key in ("home", "end"):
+            self.offset = 0 if key == "home" else 10**9
+            return True
         return False
+
+    def footer(self) -> list[tuple[str, str]]:
+        return [("↑↓", "scroll"), ("any key", "back")]
 
 
 class LlmOverlay(Overlay):
@@ -831,7 +1157,7 @@ class SessionState:
         self.size = size
         self.watch_count = watch_count
         self.index = index
-        self.draft = Editor()
+        self.draft = Editor(wrap=True)
         self._chat: Pane | None = None
         self._watchers: Pane | None = None
 
@@ -963,8 +1289,20 @@ class RowUI:
 
     # ------------------------------------------------------------- geometry
 
-    def _input_h(self) -> int:
-        return 1 + max(1, min(self.MAX_INPUT, len(self.input.lines)))
+    def _input_h(self, width: int) -> int:
+        """Screen rows the message box wants, title included.
+
+        Counted after wrapping, not from the number of typed lines: one long
+        sentence is several rows, and sizing the box from the logical count is
+        what let the text run off the edge of the row.
+        """
+        rows = self.input.height(self._input_body(width))
+        return 1 + max(1, min(self.MAX_INPUT, rows))
+
+    def _input_body(self, width: int) -> int:
+        """The width the message text is folded at — the marker column costs
+        two, and the editor is handed the rest."""
+        return max(4, width - 2)
 
     def _heights(self, height: int, width: int) -> list[int]:
         """How the rows split the screen.
@@ -977,7 +1315,7 @@ class RowUI:
         can use it.
         """
         avail = max(8, height - 2)  # header and footer
-        inp = self._input_h()
+        inp = self._input_h(width)
         quarter = max(2, avail // 4)
         inner = max(8, width - 2)
         top = max(2, min(1 + len(self.panes[0].flat(inner)), quarter))
@@ -1029,7 +1367,7 @@ class RowUI:
         title = _rule("message", width, right)
         out = [(BOLD + CYAN if focused else DIM) + title + RESET]
         rows = max(1, height - 1)
-        body = self.input.render(width - 2, rows, focused=focused)
+        body = self.input.render(self._input_body(width), rows, focused=focused)
         for index, line in enumerate(body):
             marker = "› " if index == 0 else "  "
             out.append((CYAN if focused else DIM) + marker + RESET + line)
@@ -1051,11 +1389,17 @@ class RowUI:
         """
         common = [("^↑^↓", "row"), ("?", "keys"), ("q", "quit")]
         if self.focus == INPUT:
+            # Ordered by what you would miss most: the footer drops whole
+            # pairs off the end, and "how do I get out of here" has to survive
+            # a narrow terminal.
             return [
                 ("enter", "send"),
-                ("alt-enter", "new line"),
-                ("^u", "clear"),
                 ("esc", "chat"),
+                ("alt-enter", "new line"),
+                ("^←→", "word"),
+                ("⇧←→", "select"),
+                ("^⌫ ^del", "cut word"),
+                ("^u", "clear"),
             ] + common
         rows = [("↑↓", "line"), ("e", "open"), ("E", "open all")]
         if self.focus == SESSIONS:
