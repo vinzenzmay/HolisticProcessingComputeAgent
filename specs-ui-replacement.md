@@ -156,6 +156,16 @@ list, and it is the bulk of the work.
    unknown escapes, which is the right default but means a paste arrives as
    raw keystrokes — a pasted newline submits the message mid-way. Paste must
    be bracketed on (`?2004h`), captured whole, and inserted literally.
+2b. **A key split across two reads decodes as garbage.** `decode()` consumes
+   its buffer to the end and keeps nothing back, so an escape sequence
+   straddling a read boundary is mis-measured: `escape_len` returns 3 for
+   `ESC O` even when only two bytes have arrived, and the next `read()` starts
+   mid-sequence. Worse, a lone trailing `ESC` from a split arrow key is decoded
+   as the escape key and **arms the stop gesture** — one half of a cursor
+   movement can begin killing the turn. Unreachable at 4096-byte reads today,
+   and reachable the moment paste starts delivering multi-KB payloads, so it is
+   fixed in the same milestone: `decode()` must return the undecodable tail and
+   the loop must prepend it to the next read.
 3. **Resize.** No `SIGWINCH` handling. The loop must re-read the terminal size
    and force a full repaint.
 4. **Newline in the box.** Textual needed `termkeys.patch_alt_enter()` to tell
@@ -486,6 +496,40 @@ comparison is like-for-like, and `looplag.py` already exists to record
 event-loop delay on both sides.
 
 ---
+
+## 8.1 Found while splitting the package
+
+M0 was the first close reading of all 2100 prototype lines since they were
+written. What it turned up, recorded against the milestone that owns each:
+
+- **`expanded` is keyed by position, not identity** (`Pane`). Correct today
+  because entries are only ever appended, and a landmine for M4: any insertion
+  that is not at the end silently reassigns which entries are open. `reorder()`
+  already hand-patches around it. M4 inserts live step rows, so M4 changes the
+  key to an identity — this is not optional there.
+- **`SessionState` imports `demo`**, lazily, to manufacture its own chat. The
+  one place the "no I/O" property is a fiction: the model layer calls a content
+  generator. M2's `ui/state.py` takes the chat as an argument instead, and the
+  lazy import goes.
+- **`flat()` and `expand_all()` are O(items) per keystroke** — `expand_all`
+  rebuilds the whole `expanded` set and then `_go_to` scans linearly, three
+  passes over every entry for one press. Invisible at 5000; the 100k row of §8
+  is where it shows. M10 decides whether an index is warranted.
+- **The key table is deliberately asymmetric and says so nowhere**: `ESC[1;3C/D`
+  (alt+←/→) fold onto `ctrl-left`/`ctrl-right` for word motion, while
+  `ESC[1;3A/B` stay `alt-up`/`alt-down` for reorder. Right, but it needs a
+  comment before someone "fixes" it.
+- **`Editor.cursor_visual` indexes `rows[-1]` unguarded.** Unreachable today —
+  `wrap_spans` always returns at least one span — and one arithmetic change from
+  being reachable.
+- **`HelpOverlay` pages four rows short** because `height - 2` is subtracted
+  twice. Cosmetic, shipped that way, left alone.
+
+Two things it checked that turned out to be *fine*, recorded so they are not
+re-investigated: the message box clamping to two rows on an 8-row terminal is a
+clamp and not a lie, because the editor scrolls to keep the cursor visible; and
+frames are byte-identical across the package split, verified over 234 frames at
+six terminal sizes.
 
 ## 9. Risks
 
