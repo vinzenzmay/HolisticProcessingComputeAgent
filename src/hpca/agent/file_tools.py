@@ -126,7 +126,9 @@ async def delete_file(args: DeleteFileParams, ctx: ToolContext) -> str:
     try:
         path = _existing(args.path, ctx)
     except ValueError as exc:
-        return str(exc)
+        # Prefixed like every other refusal here: "NOT <verb>" is the shape the
+        # model reads first, and a bare sentence reads like a result.
+        return f"NOT deleted: {exc}"
     entry = trash.trash(path)
     if entry.method == "none":
         return (
