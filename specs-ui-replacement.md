@@ -84,6 +84,58 @@ frames. That property is what makes the whole UI testable by calling `render()`
 and comparing strings, which the prototype's 221-check harness already relies
 on, and it is the single most valuable thing to protect during the port.
 
+### 3.1 The three layers, and what may know what
+
+```
+  run.py     asyncio: stdin, the Connection, SIGWINCH, terminal modes
+     │         knows about I/O. Knows nothing about rows or keys.
+  client.py  events -> state mutations; UI intents -> commands
+     │         knows the protocol. Draws nothing.
+  app.py     state -> frames; keys -> intents
+               knows rows and keys. Has never heard of a socket.
+```
+
+The rule that keeps this honest: **`app.py` must not import `hpca.protocol`.**
+If a `RowUI` method takes a `protocol.Entry`, the boundary has already leaked
+and the render tests start needing pydantic models to say anything. `client.py`
+translates; `ui/state.py` holds the plain dataclasses that both sides share.
+
+This is the same discipline `test_core_headless.py` enforces on the core, and it
+should be enforced the same way — by a test that imports `hpca.ui.app` in a
+clean interpreter and asserts `hpca.protocol` did not come with it.
+
+### 3.2 Event to state
+
+Each event has exactly one job. Anything not listed is dropped, per §4.2's rule
+that a client ignores what it cannot draw.
+
+| event | effect |
+|---|---|
+| `hello` | version check, profile into the header |
+| `session.rows` | rebuild the sessions pane, preserving cursor **by session id**, not by index — a row inserted above the cursor must not move the selection |
+| `chat.reset` | replace the open session's chat; only on open |
+| `chat.append` | append one entry; the *only* path by which a chat grows |
+| `turn.started` / `turn.finished` / `turn.failed` | the working row appears and goes; failure becomes an `error` entry |
+| `turn.activity` | the working row's label and `started_at`; a repeated activity must not restart the clock |
+| `turn.usage` / `context.estimate` | the context meter, measured beating estimated |
+| `decision.requested` / `decision.cleared` | the inline approval prompt for that session; a sidebar `!` for any other |
+| `confirm.requested` | the generic yes/no |
+| `panel.update` | the watchers pane, updated in place by row `key` so the cursor survives a repaint |
+| `memory.proposals` | the review queue |
+| `notify` | a toast |
+
+Two properties the UI must hold to, both of which the Textual app got wrong at
+some point and paid for:
+
+1. **Events are addressed and most are not for the visible session.** Every
+   handler starts by asking which session the event names. State for
+   non-visible sessions is updated silently — the sidebar marker is the only
+   thing that may change on screen.
+2. **The chat is append-only between resets.** No path may rebuild it from a
+   snapshot. The queued-message bugs in `test_tui_queue.py` — "survives the
+   transcript rebuild triggered by the finishing turn's reply" — are entirely
+   the consequence of a UI that rebuilt, and they disappear if nothing rebuilds.
+
 ---
 
 ## 4. What the prototype is missing
@@ -381,7 +433,9 @@ all bucket A. `test-live` keeps working throughout.
 
 The whole reason for the exercise, so it is measured rather than asserted. The
 prototype's claim is 0.015 ms per scroll+render at 5000 chat entries, flat in
-entry count, against Textual's 44 ms p95 at 300 messages.
+entry count, against Textual's 44 ms p95 at 300 messages — measured when the
+prototype was first written and recorded only in `8b790e7`'s commit message,
+which is why M10 re-takes both sides rather than trusting the number.
 
 Benchmarks to land as tests with thresholds:
 
