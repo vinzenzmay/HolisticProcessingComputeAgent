@@ -26,6 +26,7 @@ from hpca.protocol import (
     Shutdown,
     TurnInterrupt,
     TurnSubmit,
+    TurnUnqueue,
 )
 from hpca.sessions import SessionStore
 
@@ -174,6 +175,119 @@ class TestTurns:
 
     async def test_interrupting_nothing_is_harmless(self, service, session):
         await service.handle(TurnInterrupt(session_id=session.session_id))
+
+
+class TestTypeAhead:
+    """The queued-message channel: type ahead, see it, take it back.
+
+    In the Textual front-end the queue was UI state; here the scheduler owns
+    it, so everything the user can see or do about it has to cross the wire.
+    """
+
+    async def park(self, service, llm):
+        """Hold the model inside a turn so the next message has to queue."""
+        import asyncio
+
+        entered, release = asyncio.Event(), asyncio.Event()
+        answer = llm.chat
+
+        async def gated(messages, **kwargs):
+            entered.set()
+            await release.wait()
+            return await answer(messages, **kwargs)
+
+        llm.chat = gated
+        return entered, release
+
+    async def test_a_message_typed_during_a_turn_shows_up_as_queued(
+        self, service, session, llm
+    ):
+        import asyncio
+
+        entered, release = await self.park(service, llm)
+        await service.handle(TurnSubmit(session_id=session.session_id, text="first"))
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        queue = service.subscribe()
+        await service.handle(TurnSubmit(session_id=session.session_id, text="second"))
+
+        appended = [e for e in await drain(queue) if type(e).__name__ == "ChatAppend"]
+        assert [(e.entry.kind, e.entry.text) for e in appended] == [
+            ("queued", "second")
+        ]
+        # Named by the core, which is the only side that may name a row.
+        assert appended[0].entry.seq >= 1
+        release.set()
+        await service.stop()
+
+    async def test_a_message_that_starts_at_once_is_not_a_queued_row(
+        self, service, session
+    ):
+        # Nothing is waiting, so the turn starts — and a "queued" row would
+        # then have to be un-drawn a moment later.
+        queue = service.subscribe()
+        await service.handle(TurnSubmit(session_id=session.session_id, text="hi"))
+        assert "ChatAppend" not in kinds(await drain(queue))
+        await service.stop()
+
+    async def test_cancelling_hands_the_text_back(self, service, session, llm):
+        import asyncio
+
+        entered, release = await self.park(service, llm)
+        await service.handle(TurnSubmit(session_id=session.session_id, text="first"))
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        queue = service.subscribe()
+        await service.handle(TurnSubmit(session_id=session.session_id, text="second"))
+        row = [e for e in await drain(queue) if type(e).__name__ == "ChatAppend"][0]
+
+        # The UI cancels the row it was given, not a position it counted.
+        await service.handle(
+            TurnUnqueue(session_id=session.session_id, seq=row.entry.seq)
+        )
+        events = await drain(queue)
+        assert kinds(events) == ["TurnUnqueued"]
+        assert (events[0].seq, events[0].text) == (row.entry.seq, "second")
+        release.set()
+        await service.stop()
+
+    async def test_cancelling_a_row_that_already_started_says_so(
+        self, service, session
+    ):
+        # The turn ahead finished while the dialog was open. Refused the way
+        # every un-carry-out-able command is refused: a warning, no state
+        # change, and nothing for the UI to guess at.
+        queue = service.subscribe()
+        await service.handle(TurnUnqueue(session_id=session.session_id, seq=1))
+        events = await drain(queue)
+        assert kinds(events) == ["Notify"] and events[0].severity == "warning"
+        await service.stop()
+
+    async def test_the_queued_row_is_promoted_rather_than_redrawn(
+        self, service, session, llm
+    ):
+        # End to end: the row the user sees waiting is the row that becomes
+        # the message that ran — one name, two frames, no rebuild.
+        import asyncio
+
+        entered, release = await self.park(service, llm)
+        await service.handle(TurnSubmit(session_id=session.session_id, text="first"))
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        queue = service.subscribe()
+        await service.handle(TurnSubmit(session_id=session.session_id, text="second"))
+        row = [e for e in await drain(queue) if type(e).__name__ == "ChatAppend"][0]
+
+        release.set()
+        for _ in range(60):
+            events = await drain(queue)
+            updates = [e for e in events if type(e).__name__ == "ChatUpdate"]
+            if updates:
+                break
+            await _yield()
+        else:
+            raise AssertionError("the queued row was never promoted")
+        assert (updates[0].entry.seq, updates[0].entry.kind) == (
+            row.entry.seq, "user"
+        )
+        await service.stop()
 
 
 class TestFocus:

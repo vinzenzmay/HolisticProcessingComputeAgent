@@ -229,7 +229,9 @@ class Entry(_Model):
     only safe while it stays in step with the original, which a test asserts.
     """
 
-    kind: str  # user | assistant | thinking | error | event | recall
+    # queued is the one kind the thread has never seen: a message typed ahead
+    # of a running turn, drawn as chat because that is what it will become.
+    kind: str  # user | assistant | thinking | error | event | recall | queued
     text: str
     steps: int = 0
     reasoning_chars: int = 0
@@ -237,6 +239,22 @@ class Entry(_Model):
     # The message index this entry IS, or -1 (see the transcript original).
     # What a UI needs to offer the chat rewind on a message the user sent.
     index: int = -1
+    # What this ROW is called, so a later frame can revise it in place: see
+    # `ChatUpdate`. Assigned by the core, per session, monotonically from 1 —
+    # 0 means "not numbered", the way `Envelope.seq` uses it, and marks an
+    # entry nobody can send an update for.
+    #
+    # Not `index`, and the two must not be confused. `index` says which thread
+    # *message* an entry is and is -1 for the many entries that are not one
+    # (a thinking entry folds several, a queued entry has no message yet);
+    # `seq` names the row on screen and every row the core sends has one. A
+    # UI keys its rows on this and on nothing else — least of all on list
+    # position, which every fold and every rollback changes.
+    #
+    # Only meaningful within the current `ChatReset` generation: a reset
+    # renumbers from 1 and the UI drops what it had, which is what keeps a
+    # rollback or a fold from leaving the two sides numbering different rows.
+    seq: int = 0
 
 
 class SessionRow(_Model):
@@ -330,6 +348,73 @@ class SessionDelete(Command):
     session_id: str
 
 
+class _Rewind(Command):
+    """The shape both halves of the chat rewind share (§ chat rewind).
+
+    ``index`` is the entry index the cut is made at — the ``Entry.index`` the
+    core itself put on that message — and deliberately *not* the ``keep``
+    count `agent.graph.rollback_thread` and `fork_thread` take. The two are
+    the same number today, which is exactly why the conversion needs an owner
+    rather than happening twice: the UI is naming a message it was shown, the
+    graph wants a length, and if a turn has appended to the thread since the
+    rewind dialog opened, only the core can say whether that name still points
+    where the user thinks it does. So the wire carries the name, the core
+    resolves it into a length, and an index the thread no longer has is
+    refused rather than silently truncating somewhere else.
+
+    A command that cannot be carried out is refused with a warning `notify`
+    and no state change — the same channel every un-carry-out-able command
+    answers on. There is no "rejected" event, because a refusal is something
+    to tell the user, not state to render. Which conditions refuse *which* of
+    the two is not shared, and is stated on each below.
+    """
+
+    session_id: str
+    index: int
+
+
+class SessionFork(_Rewind):
+    """Branch this conversation into a new session, cut before ``index``.
+
+    Non-destructive: the source keeps its whole history. The new session's
+    title, profile, backend and mode are copied from the source by the core
+    and are not on the wire — a front-end that could name them could fork a
+    conversation into a profile the user never chose.
+
+    Deliberately allowed while the source is busy, unlike the rollback below.
+    Both can be aimed at a stale cut point, so that risk does not separate
+    them; the consequence does. A fork at a stale index leaves an extra
+    session the user deletes, and branching off *while* the agent works is the
+    case forking exists for: it only ever reads a checkpoint snapshot of the
+    source and only ever writes to a thread nothing else has touched.
+
+    Answered by `session.created`, which carries the new row, because the UI
+    has to *open* the fork: `session.rows` alone re-states the sidebar without
+    saying which line is new, and diffing two sidebars gets it wrong the
+    moment a background turn retitles something in between.
+    """
+
+    TYPE: ClassVar[str] = "session.fork"
+
+
+class SessionRollback(_Rewind):
+    """Trim this conversation back to before ``index``, in place.
+
+    Destructive and irreversible, which is why this half is gated and the
+    fork is not: refused while a turn is running on the session, while a
+    decision is unanswered, or while a message is queued behind it — see
+    `core.scheduler.TurnScheduler.rewind_blocker`, which is the core's answer
+    to "is it safe", and phrases it to be shown.
+
+    No reply of its own: what the UI needs afterwards is the trimmed
+    transcript, which is the ordinary `chat.reset` for that session, plus a
+    fresh `context.estimate` — the measured fill described a thread that no
+    longer exists.
+    """
+
+    TYPE: ClassVar[str] = "session.rollback"
+
+
 class SessionFocus(Command):
     """Which session the user is looking at; null when none is (§4.4).
 
@@ -352,6 +437,27 @@ class TurnSubmit(Command):
 class TurnInterrupt(Command):
     TYPE: ClassVar[str] = "turn.interrupt"
     session_id: str
+
+
+class TurnUnqueue(Command):
+    """Take a message back out of a session's type-ahead queue.
+
+    ``seq`` is the row: the `Entry.seq` the core put on the ``queued``
+    `chat.append` it sent when the message was accepted. Not the text (the
+    same message queued twice must lose one copy rather than both) and not a
+    position in the queue — the turn ahead can finish while the user is still
+    deciding, and every position behind it then shifts by one, so a position
+    that looks valid quietly names the neighbour. A core-issued row name
+    cannot drift: it either still refers to a waiting message or it does not.
+
+    A ``seq`` that is no longer queued is refused with a warning `notify` —
+    the message has already started, and stopping *that* is `turn.interrupt`,
+    a different question asked from a different place.
+    """
+
+    TYPE: ClassVar[str] = "turn.unqueue"
+    session_id: str
+    seq: int = 0
 
 
 class DecisionResolve(Command):
@@ -509,6 +615,19 @@ class JobCancel(Command):
     job_id: str
 
 
+class WatchPeek(Command):
+    """Enter on a watch box: what is this thing saying right now?
+
+    The only read-only command in §4.1, and it is still a command rather than
+    something the UI could work out for itself: the tail lives in a file on a
+    node the UI may not share, and a job's state costs an squeue call. Rule 2
+    of §4.2 (the UI never reads the database) makes that the core's errand.
+    """
+
+    TYPE: ClassVar[str] = "watch.peek"
+    watch_id: int
+
+
 class WatchDrop(Command):
     TYPE: ClassVar[str] = "watch.drop"
     watch_id: int
@@ -545,8 +664,34 @@ class SessionRows(Event):
     rows: list[SessionRow] = Field(default_factory=list)
 
 
+class SessionCreated(Event):
+    """A session the core has just made, and that the UI is expected to open.
+
+    The reply to `session.fork` (and the one `session.new` needs for the same
+    reason): both produce a conversation that exists only because the user
+    asked for it, and neither is finished until the front-end is looking at
+    it. Carries the whole `SessionRow` rather than a bare id so one frame is
+    enough to both open it and put it in the sidebar.
+
+    The `session.rows` that follows re-states the sidebar; this says which row
+    is the new one, which a list cannot — two forks of one conversation have
+    the same title, and a UI diffing sidebars would pick whichever it saw
+    first.
+    """
+
+    TYPE: ClassVar[str] = "session.created"
+    row: SessionRow
+
+
 class ChatReset(Event):
-    """The whole transcript, on open only — the snapshot before the deltas."""
+    """The whole transcript, on open only — the snapshot before the deltas.
+
+    Also re-bases the row numbering: the entries arrive carrying the `seq`
+    values every later `chat.append` and `chat.update` will use, and the UI
+    forgets the ones it held. That is what makes a rollback or a fold safe to
+    express — the rows it removed cannot be addressed afterwards by either
+    side.
+    """
 
     TYPE: ClassVar[str] = "chat.reset"
     session_id: str
@@ -559,6 +704,38 @@ class ChatAppend(Event):
     (§4.2)."""
 
     TYPE: ClassVar[str] = "chat.append"
+    session_id: str
+    entry: Entry
+
+
+class ChatUpdate(Event):
+    """A row that is already on screen, again — revised, in place.
+
+    The other half of "snapshot then delta" (§4.2 property 1), and what makes
+    the chat genuinely append-only between resets rather than append-mostly.
+    Three things need it, and they are one problem:
+
+    * a tool call that appears the moment it is made and gains its result
+      afterwards — `Part.done` already describes exactly this ("the same part
+      comes again filled in rather than a second part arriving after it"), and
+      until now there was no frame that could say so;
+    * a ``queued`` entry becoming an ordinary ``user`` one when its turn
+      starts, rather than a second row appearing and the first being guessed
+      away;
+    * anything a re-opened session's `chat.reset` has to keep addressable.
+
+    Carries the whole entry rather than a patch: rows are small, a diff would
+    need the core to model what the UI drew (the same argument `panel.update`
+    makes), and the entry names itself through `Entry.seq` — so there is one
+    place to get the row identity right instead of two that can disagree.
+
+    An update for a ``seq`` the UI does not have is to be dropped, never
+    turned into a new row: it means the client is out of step with a reset,
+    and inventing a row would hide that instead of letting the next reset fix
+    it.
+    """
+
+    TYPE: ClassVar[str] = "chat.update"
     session_id: str
     entry: Entry
 
@@ -601,6 +778,26 @@ class TurnFailed(Event):
     error: str
 
 
+class TurnUnqueued(Event):
+    """A typed-ahead message was taken back: drop its row, keep its text.
+
+    ``seq`` is the row to remove, echoed rather than left for the UI to
+    remember; a cancel that could not be carried out is a warning `notify` and
+    never this event, so seeing this at all means that row is gone.
+
+    ``text`` rides along because cancelling lands where an interrupt lands —
+    the message back in the entry box, to edit and send again — and the UI
+    cannot be trusted to still hold it: the answer can arrive after the user
+    has switched sessions, and the row it came from may have been redrawn
+    since.
+    """
+
+    TYPE: ClassVar[str] = "turn.unqueued"
+    session_id: str
+    seq: int
+    text: str
+
+
 class DecisionRequested(Event):
     """A turn parked at `interrupt()` and needs an answer.
 
@@ -628,6 +825,32 @@ class PanelUpdate(Event):
     profile: str = ""
     session_id: str | None = None
     rows: list[PanelRow] = Field(default_factory=list)
+
+
+class WatchPeeked(Event):
+    """The answer to a `watch.peek`: a log's tail, or a job's state line.
+
+    Deliberately not a `notify`, though the front-end may well draw it as a
+    toast. Three reasons. It answers a keypress rather than announcing
+    something the core decided to say, so it echoes ``reply_to``. It names the
+    watch: a job peek costs an squeue call and a database read, so two peeks
+    in a row genuinely can cross, and a bare string of text could then be
+    attributed to the wrong box. And `notify` carries a ``timeout`` — how long
+    a tail should stay on screen is a rendering decision, and a core reading a
+    file has no business making it.
+
+    A read that failed comes back as ordinary ``text`` ("(could not read …)",
+    see `watches.peek`) rather than as an error: what happened to the log is
+    exactly what the user pressed Enter to find out, and it belongs in the
+    same place the tail would have been.
+    """
+
+    TYPE: ClassVar[str] = "watch.peeked"
+    watch_id: int
+    title: str = ""  # the box's border title — what this is the tail *of*
+    # Already trimmed to a glance by the core (`watches.PEEK_CHARS`): the
+    # whole point of peeking is not to ship a gigabyte of progress bars.
+    text: str = ""
 
 
 class MemoryProposals(Event):

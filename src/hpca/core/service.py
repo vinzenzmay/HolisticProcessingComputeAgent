@@ -67,6 +67,8 @@ from hpca.protocol import (
     Shutdown,
     TurnInterrupt,
     TurnSubmit,
+    TurnUnqueue,
+    TurnUnqueued,
 )
 
 logger = logging.getLogger("hpca.core.service")
@@ -153,6 +155,10 @@ class AgentService:
                     Notify(severity="warning", text="That session is gone.")
                 )
                 return
+            # Whether it runs now or waits is the scheduler's answer, and so
+            # is saying so: a message that has to queue is drawn by the
+            # scheduler as a `queued` chat row, because only the scheduler
+            # knows when that row stops waiting (see TurnScheduler.drain).
             self._scheduler.submit_user(
                 command.session_id,
                 command.text,
@@ -162,6 +168,27 @@ class AgentService:
             return
         if isinstance(command, TurnInterrupt):
             await self._scheduler.interrupt(command.session_id)
+            return
+        if isinstance(command, TurnUnqueue):
+            text = self._scheduler.unqueue(command.session_id, command.seq)
+            if text is None:
+                # It started while the user was deciding. Stopping the turn it
+                # became is turn.interrupt — a different question, and one the
+                # UI must ask deliberately rather than have answered for it.
+                self._deps.emit(
+                    Notify(
+                        severity="warning",
+                        text="Too late — that message is already running.",
+                    )
+                )
+                return
+            self._deps.emit(
+                TurnUnqueued(
+                    session_id=command.session_id,
+                    seq=command.seq,
+                    text=text,
+                )
+            )
             return
         if isinstance(command, DecisionResolve):
             self._scheduler.resolve_decision(

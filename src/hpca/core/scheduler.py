@@ -48,8 +48,11 @@ from hpca.agent.graph import (
 )
 from hpca.core.deps import CoreDeps
 from hpca.protocol import (
+    ChatAppend,
+    ChatUpdate,
     DecisionCleared,
     DecisionRequested,
+    Entry,
     Notify,
     TurnActivity,
     TurnFailed,
@@ -102,6 +105,11 @@ class PendingWork:
     text: str
     kind: str  # "user" — typed and waiting | "event" — background completion
     forced_skill: Any = None
+    # The chat row this message is drawn as while it waits (`Entry.seq`), or 0
+    # for work that was never drawn: anything that started at once, and every
+    # background completion. It is what lets the promotion land in the row the
+    # user is already looking at, and what `unqueue` names a message by.
+    entry_seq: int = 0
 
 
 @dataclass
@@ -158,6 +166,9 @@ class TurnScheduler:
         # module docstring: this used to live in the UI and die with it.
         self._decisions: dict[str, dict] = {}
         self._shutting_down = False
+        # session_id -> the last chat row name handed out for it. See
+        # _next_entry_seq; the queue is the only thing minting rows today.
+        self._entry_seqs: dict[str, int] = {}
         # The coalesced drain scheduled by submit_event; see _schedule_drain.
         self._drain_task: asyncio.Task | None = None
 
@@ -176,6 +187,34 @@ class TurnScheduler:
             for work in self._pending
             if work.kind == "user" and work.session_id == session_id
         ]
+
+    def rewind_blocker(self, session_id: str) -> str | None:
+        """Why this session's thread cannot be *truncated* right now, or None.
+
+        For `session.rollback` only. Everything named here either writes to
+        the thread the cut is about to shorten or is parked inside it: a turn
+        in flight appends as it works, an unanswered approval holds a graph
+        interrupt whose resume would land on indices the cut removed, and a
+        queued message becomes a turn the moment the session is free.
+
+        `session.fork` is deliberately NOT gated by this, and re-gating it
+        would be a regression. Both can be aimed at a stale cut point — that
+        risk does not tell them apart — but what happens next does: a fork at
+        a stale index leaves an extra session the user deletes, while a
+        rollback at one destroys messages that cannot be recovered. Gate the
+        destructive half, leave the recoverable one open. Branching off while
+        the agent is mid-turn is also the case forking is most useful for.
+
+        The reason is returned rather than a bool because it is meant to be
+        read: it reaches the user as the text of a warning `notify`.
+        """
+        if session_id in self._turns:
+            return "a turn is running — wait, or interrupt it first"
+        if session_id in self._awaiting_approval or session_id in self._decisions:
+            return "a decision is pending — answer it first"
+        if self.queued_texts_for(session_id):
+            return "queued messages are waiting to run"
+        return None
 
     def pending_decisions(self) -> dict[str, dict]:
         """Every parked decision, for re-emitting when a client subscribes.
@@ -199,15 +238,72 @@ class TurnScheduler:
         makes typing ahead look like it worked.
         """
         queued = session_id in self._turns or session_id in self._awaiting_approval
-        self._pending.append(
-            PendingWork(
-                session_id=session_id,
-                text=text,
-                kind="user",
-                forced_skill=forced_skill,
-            )
+        work = PendingWork(
+            session_id=session_id,
+            text=text,
+            kind="user",
+            forced_skill=forced_skill,
         )
+        if queued:
+            # Drawn now, because "it looks like it worked" is the whole point
+            # of typing ahead — and drawn by the core, because the queue it is
+            # waiting in is state a front-end may not read (§4.2 rule 2). An
+            # ordinary chat row rather than an event of its own: it *is* a chat
+            # row, and the same row becomes the message that ran (see drain).
+            work.entry_seq = self._next_entry_seq(session_id)
+            self._deps.emit(
+                ChatAppend(
+                    session_id=session_id,
+                    entry=Entry(kind="queued", text=text, seq=work.entry_seq),
+                )
+            )
+        self._pending.append(work)
         return queued
+
+    def _next_entry_seq(self, session_id: str) -> int:
+        """The next chat row name for one session (`protocol.Entry.seq`).
+
+        Monotonic per session and never reused, so an update can only ever
+        find the row it means. It lives here because the queue is the only
+        thing minting rows today; when the transcript pipeline starts emitting
+        them it must take its numbers from this same counter — two allocators
+        would hand the same name to two rows — and at that point the counter
+        belongs on `CoreDeps`, beside `emit`.
+        """
+        nxt = self._entry_seqs.get(session_id, 0) + 1
+        self._entry_seqs[session_id] = nxt
+        return nxt
+
+    def unqueue(self, session_id: str, seq: int) -> str | None:
+        """Take one typed-ahead message back out. Returns its text, or None.
+
+        ``seq`` is the row it was drawn as — the `Entry.seq` on the ``queued``
+        `chat.append` this scheduler sent when it accepted the message. Named
+        rather than counted on purpose: the turn ahead can finish while the
+        user is deciding, and a queue *position* would then silently point at
+        the neighbour, cancelling a message nobody asked to cancel. A row name
+        either still refers to something waiting or it does not.
+
+        None means it no longer does — it started while the user was deciding.
+        A background completion can never be hit: it was never drawn, so it
+        carries no row name (and 0, "unnamed", matches nothing).
+        """
+        if seq <= 0:
+            return None
+        work = next(
+            (
+                w
+                for w in self._pending
+                if w.kind == "user"
+                and w.session_id == session_id
+                and w.entry_seq == seq
+            ),
+            None,
+        )
+        if work is None:
+            return None
+        self._pending.remove(work)
+        return work.text
 
     def submit_event(self, session_id: str, text: str) -> None:
         """A background completion reporting in — a finished process, a job
@@ -277,6 +373,22 @@ class TurnScheduler:
                 if item.kind == "user":
                     session = self._session_for(sid)
                     if session is not None:
+                        if item.entry_seq:
+                            # It was drawn as queued; the same row is now the
+                            # message that ran. An update rather than a second
+                            # row, and sent before the turn is announced, so
+                            # nothing is ever on screen as still waiting behind
+                            # a turn that is already itself.
+                            self._deps.emit(
+                                ChatUpdate(
+                                    session_id=sid,
+                                    entry=Entry(
+                                        kind="user",
+                                        text=item.text,
+                                        seq=item.entry_seq,
+                                    ),
+                                )
+                            )
                         self.start_turn(
                             session,
                             user_text=item.text,
@@ -489,6 +601,8 @@ class TurnScheduler:
         self._pending = [w for w in self._pending if w.session_id != session_id]
         self._decisions.pop(session_id, None)
         self._awaiting_approval.discard(session_id)
+        # Its rows went with it; nothing can address them again.
+        self._entry_seqs.pop(session_id, None)
 
     async def shutdown(self) -> None:
         """Stop accepting work and let in-flight turns unwind.

@@ -19,6 +19,8 @@ from hpca.protocol import (
     EVENTS,
     PROTOCOL_VERSION,
     ChatAppend,
+    ChatReset,
+    ChatUpdate,
     Command,
     CommandRun,
     Entry,
@@ -32,8 +34,16 @@ from hpca.protocol import (
     PanelUpdate,
     Part,
     ProtocolError,
+    SessionCreated,
+    SessionFork,
+    SessionRollback,
+    SessionRow,
     SessionRows,
     TurnSubmit,
+    TurnUnqueue,
+    TurnUnqueued,
+    WatchPeek,
+    WatchPeeked,
     decode,
     encode,
     parse,
@@ -49,9 +59,12 @@ SPEC_COMMANDS = {
     "session.rename",
     "session.retitle",
     "session.delete",
+    "session.fork",
+    "session.rollback",
     "session.focus",
     "turn.submit",
     "turn.interrupt",
+    "turn.unqueue",
     "decision.resolve",
     "command.run",
     "confirm.resolve",
@@ -68,6 +81,7 @@ SPEC_COMMANDS = {
     "skill.delete",
     "process.kill",
     "job.cancel",
+    "watch.peek",
     "watch.drop",
     "shutdown",
 }
@@ -75,16 +89,20 @@ SPEC_COMMANDS = {
 SPEC_EVENTS = {
     "hello",
     "session.rows",
+    "session.created",
     "chat.reset",
     "chat.append",
+    "chat.update",
     "turn.started",
     "turn.activity",
     "turn.usage",
     "turn.finished",
     "turn.failed",
+    "turn.unqueued",
     "decision.requested",
     "decision.cleared",
     "panel.update",
+    "watch.peeked",
     "memory.proposals",
     "confirm.requested",
     "context.estimate",
@@ -314,10 +332,18 @@ class TestPayloadShapes:
     def test_entry_mirrors_the_transcript_dataclass(self):
         # protocol.Entry is deliberately a copy rather than an import: this
         # module must stay free of the agent side. The copy is only safe if
-        # it stays in step, so the shape is asserted.
-        assert set(Entry.model_fields) == {
+        # it stays in step, so the shape is asserted — minus the fields that
+        # exist only on the wire, which are named here so that adding one is
+        # as deliberate an edit as dropping a rendered field would be.
+        assert set(Entry.model_fields) - {"seq"} == {
             field.name for field in dataclasses.fields(transcript.Entry)
         }
+
+    def test_the_wire_only_entry_field_is_the_row_name(self):
+        # `seq` has no transcript twin because the transcript has no concept
+        # of a row being revised: it is rebuilt, which is exactly the cost
+        # this protocol exists to delete.
+        assert "seq" not in {f.name for f in dataclasses.fields(transcript.Entry)}
 
     def test_part_mirrors_a_transcript_step(self):
         assert set(Part.model_fields) == {
@@ -352,6 +378,185 @@ class TestPayloadShapes:
         assert parse(decode(encode(answer.to_envelope()))).approved == [
             True, False, True
         ]
+
+
+class TestRewind:
+    """The chat rewind: what the UI is allowed to say about a cut point."""
+
+    def test_a_rewind_names_the_entry_it_cuts_at_not_a_message_count(self):
+        # The graph functions take `keep`; the wire carries `index`. The core
+        # owns the thread and issued that index in the first place, so it is
+        # the side that can still tell whether it means what the user saw once
+        # a turn has appended to the thread.
+        for command in (
+            SessionRollback(session_id="s1", index=4),
+            SessionFork(session_id="s1", index=4),
+        ):
+            assert set(command.to_envelope().payload) == {"session_id", "index"}
+            assert parse(decode(encode(command.to_envelope()))) == command
+
+    def test_a_fork_does_not_name_the_session_it_is_about_to_make(self):
+        # No title, no profile, no backend: the core copies all three off the
+        # source, and a front-end that could name them could fork a
+        # conversation into a profile the user never chose.
+        assert set(SessionFork.model_fields) == {"session_id", "index"}
+
+    def test_the_new_session_comes_back_whole(self):
+        # A fork has to be opened, so a bare id would cost either a second
+        # round trip or a diff of two sidebars before the UI could show it.
+        created = SessionCreated(
+            row=SessionRow(
+                session_id="s2",
+                title="a session (fork)",
+                profile="default",
+                mode="build",
+            ),
+            reply_to="c7",
+        )
+        back = parse(decode(encode(created.to_envelope())))
+        assert back == created
+        assert back.row.session_id == "s2"
+        assert back.reply_to == "c7"
+
+
+class TestPeek:
+    def test_a_peek_asks_by_watch_id_like_a_drop_does(self):
+        peek = WatchPeek(watch_id=3)
+        assert set(peek.to_envelope().payload) == {"watch_id"}
+        assert parse(decode(encode(peek.to_envelope()))) == peek
+
+    def test_the_tail_answers_the_box_it_was_asked_of(self):
+        # Not a `notify`: two boxes can be peeked in a row and a job peek costs
+        # an squeue call, so the answer has to say which box it belongs to.
+        peeked = WatchPeeked(
+            watch_id=3,
+            title="train.log",
+            text="epoch 4/10\nloss 0.31\n…",
+            reply_to="c7",
+        )
+        raw = encode(peeked.to_envelope())
+        assert raw.count(b"\n") == 1  # a log tail is multi-line by nature
+        assert parse(decode(raw)) == peeked
+
+    def test_a_peek_carries_no_severity_and_no_timeout(self):
+        # How long a tail stays on screen is the renderer's decision; a core
+        # reading a file has no business setting it.
+        assert set(WatchPeeked.model_fields) == {
+            "watch_id", "title", "text", "reply_to"
+        }
+
+
+class TestQueuedMessages:
+    def test_a_queued_message_is_an_ordinary_chat_entry(self):
+        # No queue-specific event: a message typed ahead is a chat row like any
+        # other, and `kind` is what makes it look like one that has not run.
+        entry = Entry(kind="queued", text="and then plot it")
+        event = ChatAppend(session_id="s1", entry=entry)
+        assert parse(decode(encode(event.to_envelope()))) == event
+        assert not [name for name in EVENTS if name.startswith("queue.")]
+
+    def test_a_queued_entry_is_not_a_thread_message(self):
+        # index stays -1: nothing has been written to the thread yet, so there
+        # is no cut point and the rewind must not be offered on it. Taking it
+        # back is `turn.unqueue`, which needs no thread surgery at all.
+        assert Entry(kind="queued", text="x").index == -1
+
+    def test_cancelling_names_the_message_by_its_row(self):
+        # By the seq the core put on its queued row: not by text (the same
+        # message queued twice must lose one copy rather than both) and not by
+        # position (the turn ahead can finish while the dialog is open, and a
+        # position then quietly names the neighbour instead).
+        cancel = TurnUnqueue(session_id="s1", seq=7)
+        assert set(cancel.to_envelope().payload) == {"session_id", "seq"}
+        assert parse(decode(encode(cancel.to_envelope()))) == cancel
+
+    def test_the_cancelled_text_comes_back_to_be_edited(self):
+        # Cancelling lands where an interrupt lands: the text in the entry box.
+        undone = TurnUnqueued(session_id="s1", seq=7, text="and then plot it")
+        assert parse(decode(encode(undone.to_envelope()))) == undone
+
+
+class TestChatAddressing:
+    """Naming a chat row, so a later frame can revise it in place.
+
+    Without this the only way to change a row that is already drawn is to send
+    the whole transcript again — the per-turn rebuild this protocol exists to
+    delete (§4.2 property 1).
+    """
+
+    def test_a_row_carries_the_name_the_core_gave_it(self):
+        entry = Entry(kind="assistant", text="done", seq=4)
+        assert parse(decode(encode(ChatAppend(
+            session_id="s1", entry=entry
+        ).to_envelope()))).entry.seq == 4
+
+    def test_an_unnamed_row_is_the_default(self):
+        # 0, like `Envelope.seq`, means "not numbered": an entry a test or a
+        # renderer built, never one the core sent.
+        assert Entry(kind="user", text="hi").seq == 0
+
+    def test_an_update_carries_the_whole_row_and_names_itself(self):
+        # No separate id field on the event: the entry it carries is the row,
+        # and `seq` inside it is which row. One place to get it wrong instead
+        # of two that can disagree.
+        update = ChatUpdate(
+            session_id="s1",
+            entry=Entry(
+                kind="thinking",
+                text="— step —\nread_file: 40 lines",
+                seq=4,
+                steps=1,
+                parts=[Part(kind="call", text="read_file", tool="read_file",
+                            result="40 lines", done=True)],
+            ),
+        )
+        assert set(update.to_envelope().payload) == {
+            "session_id", "entry", "reply_to"
+        }
+        assert parse(decode(encode(update.to_envelope()))) == update
+
+    def test_a_call_row_is_filled_in_under_its_own_seq(self):
+        # `Part.done` already documents this shape: the same part comes again
+        # with its result rather than a second row appearing below.
+        running = Entry(kind="thinking", text="read_file", seq=4,
+                        parts=[Part(kind="call", text="read_file")])
+        finished = running.model_copy(update={
+            "parts": [Part(kind="call", text="read_file", result="40 lines",
+                           done=True)]
+        })
+        assert finished.seq == running.seq
+        assert parse(decode(encode(ChatUpdate(
+            session_id="s1", entry=finished
+        ).to_envelope()))).entry.parts[0].done
+
+    def test_a_queued_row_keeps_its_seq_when_its_turn_starts(self):
+        # The promotion is an update, not a second row: same seq, new kind.
+        queued = Entry(kind="queued", text="and then plot it", seq=9)
+        started = queued.model_copy(update={"kind": "user"})
+        assert (started.seq, started.text) == (queued.seq, queued.text)
+
+    def test_a_reset_carries_the_names_the_updates_will_use(self):
+        # The snapshot has to agree with the deltas that follow, or a reopened
+        # session cannot be updated at all. Every entry brings its own seq, so
+        # nothing has to be derived from list position.
+        reset = ChatReset(
+            session_id="s1",
+            entries=[
+                Entry(kind="user", text="q1", seq=1, index=0),
+                Entry(kind="assistant", text="a1", seq=2, index=1),
+            ],
+        )
+        back = parse(decode(encode(reset.to_envelope())))
+        assert [e.seq for e in back.entries] == [1, 2]
+
+    def test_the_row_name_is_not_the_message_index(self):
+        # Two different numbers on purpose: `index` says which *thread
+        # message* an entry is (and is -1 for the many entries that are not
+        # one), while `seq` names the *row on screen*. A thinking entry folds
+        # several messages into one row; a queued entry is a row with no
+        # message at all.
+        folded = Entry(kind="thinking", text="…", seq=3)
+        assert (folded.seq, folded.index) == (3, -1)
 
 
 class TestWireFormat:

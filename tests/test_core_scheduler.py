@@ -113,6 +113,17 @@ def kinds(events):
     return [type(e).__name__ for e in events]
 
 
+def queued_seqs(events, session_id="s1"):
+    """The row names of the queued entries emitted for one session, in order."""
+    return [
+        e.entry.seq
+        for e in events
+        if type(e).__name__ == "ChatAppend"
+        and e.session_id == session_id
+        and e.entry.kind == "queued"
+    ]
+
+
 async def settle():
     """Let the drain that a finished turn schedules actually run."""
     for _ in range(6):
@@ -154,6 +165,178 @@ class TestSerialisation:
         assert sched.is_busy("s1") and not sched.is_busy("s2")
         graph_calls["gates"]["s1"].set()
         await settle()
+
+
+class TestQueuedRows:
+    """The queued-message channel: the row, its name, and taking it back.
+
+    In the Textual front-end the queue was UI state; here the scheduler owns
+    it, so everything the user can see or do about it has to be emitted. The
+    row's `Entry.seq` is what ties the three frames together — the append that
+    draws it, the update that promotes it, the unqueue that removes it.
+    """
+
+    async def start_and_queue(self, sched, graph_calls, *texts):
+        """Park a turn on s1 and queue ``texts`` behind it.
+
+        Their row names come out of the emitted events (`queued_seqs`), which
+        is also the only way the front-end can learn them.
+        """
+        graph_calls["gates"]["s1"] = asyncio.Event()
+        sched.submit_user("s1", "running")
+        await sched.drain()
+        await settle()
+        for text in texts:
+            sched.submit_user("s1", text)
+
+    async def test_a_message_typed_during_a_turn_gets_a_row_of_its_own(
+        self, sched, events, graph_calls
+    ):
+        graph_calls["gates"]["s1"] = asyncio.Event()
+        sched.submit_user("s1", "running")
+        await sched.drain()
+        await settle()
+        events.clear()
+        assert sched.submit_user("s1", "second") is True
+
+        appended = [e for e in events if type(e).__name__ == "ChatAppend"]
+        assert len(appended) == 1
+        entry = appended[0].entry
+        assert (entry.kind, entry.text) == ("queued", "second")
+        assert entry.seq >= 1  # named, so an update can find it later
+        graph_calls["gates"]["s1"].set()
+        await settle()
+
+    async def test_a_message_that_starts_at_once_gets_no_queued_row(
+        self, sched, events
+    ):
+        # Nothing is waiting, so the turn starts — and a "queued" row would
+        # have to be un-drawn a moment later.
+        assert sched.submit_user("s1", "hello") is False
+        await sched.drain()
+        await settle()
+        assert "ChatAppend" not in kinds(events)
+
+    async def test_every_row_gets_its_own_name_per_session(
+        self, sched, events, graph_calls
+    ):
+        graph_calls["gates"]["s1"] = asyncio.Event()
+        graph_calls["gates"]["s2"] = asyncio.Event()
+        for sid in ("s1", "s2"):
+            sched.submit_user(sid, "running")
+        await sched.drain()
+        await settle()
+        events.clear()
+        for sid in ("s1", "s2"):
+            sched.submit_user(sid, "second")
+            sched.submit_user(sid, "third")
+
+        rows = [e for e in events if type(e).__name__ == "ChatAppend"]
+        per_session: dict[str, list[int]] = {}
+        for row in rows:
+            per_session.setdefault(row.session_id, []).append(row.entry.seq)
+        # Monotonic and per session: two conversations number their own rows
+        # and never have to agree with each other.
+        assert all(seqs == sorted(set(seqs)) for seqs in per_session.values())
+        assert set(per_session) == {"s1", "s2"}
+        for gate in ("s1", "s2"):
+            graph_calls["gates"][gate].set()
+        await settle()
+
+    async def test_the_row_becomes_a_user_row_when_its_turn_starts(
+        self, sched, events, graph_calls
+    ):
+        # The promotion is an update to the same row, not a second row and a
+        # guess: `chat.update` carries the seq the append gave it.
+        graph_calls["gates"]["s1"] = asyncio.Event()
+        sched.submit_user("s1", "running")
+        await sched.drain()
+        await settle()
+        events.clear()
+        sched.submit_user("s1", "second")
+        seq = [e for e in events if type(e).__name__ == "ChatAppend"][0].entry.seq
+
+        events.clear()
+        graph_calls["gates"]["s1"].set()
+        await settle()
+        updates = [e for e in events if type(e).__name__ == "ChatUpdate"]
+        assert len(updates) == 1
+        assert (updates[0].entry.seq, updates[0].entry.kind) == (seq, "user")
+        assert updates[0].entry.text == "second"
+        # ...and it lands before the turn it belongs to is announced, so the
+        # row is never drawn as waiting behind a turn that is already itself.
+        assert kinds(events).index("ChatUpdate") < kinds(events).index("TurnStarted")
+
+    async def test_a_queued_message_comes_back_out_with_its_text(
+        self, sched, events, graph_calls
+    ):
+        await self.start_and_queue(sched, graph_calls, "second", "third")
+        seqs = queued_seqs(events)
+        assert sched.unqueue("s1", seqs[1]) == "third"
+        assert sched.queued_texts_for("s1") == ["second"]
+        graph_calls["gates"]["s1"].set()
+        await settle()
+
+    async def test_two_identical_messages_are_two_rows(
+        self, sched, events, graph_calls
+    ):
+        # The reason the wire carries a row name and not the text: cancelling
+        # by value would take both copies, or the wrong one.
+        await self.start_and_queue(sched, graph_calls, "same", "same")
+        first, second = queued_seqs(events)
+        assert first != second
+        assert sched.unqueue("s1", first) == "same"
+        assert sched.queued_texts_for("s1") == ["same"]
+        graph_calls["gates"]["s1"].set()
+        await settle()
+
+    async def test_a_row_that_is_no_longer_queued_is_refused(
+        self, sched, events, graph_calls
+    ):
+        # The turn ahead can finish while the dialog is open. A row name that
+        # no longer names a waiting message is None — "too late, it is already
+        # running" — and never a neighbour cancelled by accident, which is
+        # exactly what a queue *position* would have become.
+        await self.start_and_queue(sched, graph_calls, "second")
+        seq = queued_seqs(events)[0]
+        assert sched.unqueue("s1", seq) == "second"
+        assert sched.unqueue("s1", seq) is None  # gone, and stays gone
+        assert sched.unqueue("s1", 999) is None
+        assert sched.unqueue("s1", 0) is None  # 0 is "unnamed", never a row
+        graph_calls["gates"]["s1"].set()
+        await settle()
+
+    async def test_a_row_belongs_to_the_session_that_queued_it(
+        self, sched, events, graph_calls
+    ):
+        graph_calls["gates"]["s2"] = asyncio.Event()
+        sched.submit_user("s2", "running")
+        await sched.drain()
+        await settle()
+        await self.start_and_queue(sched, graph_calls, "second")
+        seq = queued_seqs(events, session_id="s1")[0]
+        # Two sessions number independently, so the same seq exists in both.
+        sched.submit_user("s2", "another session's")
+        assert sched.unqueue("s2", seq) != "second"
+        assert sched.queued_texts_for("s1") == ["second"]
+        for gate in ("s1", "s2"):
+            graph_calls["gates"][gate].set()
+        await settle()
+
+    async def test_a_background_completion_is_not_a_queued_row(
+        self, sched, events, graph_calls
+    ):
+        # Nobody typed it and no row was ever drawn for it, so it must not be
+        # retractable — and must not disturb the rows that are.
+        await self.start_and_queue(sched, graph_calls, "second")
+        events.clear()
+        sched.submit_event("s1", "a job finished")
+        assert "ChatAppend" not in kinds(events)
+        graph_calls["gates"]["s1"].set()
+        await settle()
+
+    async def test_unqueueing_from_a_session_with_no_queue_is_harmless(self, sched):
+        assert sched.unqueue("s1", 1) is None
 
 
 class TestEvents:
@@ -204,6 +387,58 @@ class TestEvents:
             "backend refused"
         )
         assert not sched.is_busy("s1")
+
+
+class TestRewindGate:
+    """When a thread may not be truncated (`session.rollback`).
+
+    The core is the only side that can answer this: every one of these states
+    lives here, and a front-end asking "is it safe to roll back?" from what it
+    last drew would be answering from a screenshot.
+
+    `session.fork` asks nothing of this gate — see `rewind_blocker`: the
+    destructive half is gated, the recoverable one is not.
+    """
+
+    async def test_a_settled_session_can_be_rolled_back(self, sched):
+        assert sched.rewind_blocker("s1") is None
+
+    async def test_not_while_a_turn_is_running(self, sched, graph_calls):
+        graph_calls["gates"]["s1"] = asyncio.Event()
+        sched.submit_user("s1", "x")
+        await sched.drain()
+        await settle()
+        assert "a turn is running" in (sched.rewind_blocker("s1") or "")
+        # Only its own session: another conversation is free to be cut while
+        # this one works.
+        assert sched.rewind_blocker("s2") is None
+        graph_calls["gates"]["s1"].set()
+        await settle()
+
+    async def test_not_while_a_decision_is_unanswered(self, sched, graph_calls):
+        # The resume would land on message indices the cut had removed.
+        graph_calls["results"]["s1"] = TurnResult(
+            reply=None, interrupt={"tool": "run_bash", "kind": "destructive"}
+        )
+        sched.submit_user("s1", "rm the scratch dir")
+        await sched.drain()
+        await settle()
+        assert "decision" in (sched.rewind_blocker("s1") or "")
+
+    async def test_not_while_a_message_is_still_queued(self, sched):
+        # It becomes a turn the moment the session is free, and would then
+        # append past the cut.
+        sched.submit_user("s1", "typed ahead")
+        assert "queued" in (sched.rewind_blocker("s1") or "")
+
+    async def test_the_gate_lifts_when_the_turn_ends(self, sched, graph_calls):
+        graph_calls["gates"]["s1"] = asyncio.Event()
+        sched.submit_user("s1", "x")
+        await sched.drain()
+        await settle()
+        graph_calls["gates"]["s1"].set()
+        await settle()
+        assert sched.rewind_blocker("s1") is None
 
 
 class TestApprovals:
