@@ -106,6 +106,19 @@ _SHIFT_SYSTEM_NOTE = (
 )
 
 
+# The task-facing note for a checkout with no registry: the same instructions
+# in the vocabulary that branch has. Kept beside _DEFAULT_SYSTEM_NOTE rather
+# than edited into it, because editing that constant moves the core and hard
+# baselines for every past measurement.
+_NO_REGISTRY_SYSTEM_NOTE = (
+    "You are working on files in a workspace. Read a file with read_file "
+    "before editing it, make the change with edit_file (or create_file for a "
+    "new file), and when the change is done answer directly with a short "
+    "confirmation. Copy old_lines exactly as they appear in the file, "
+    "including indentation and spacing, without line numbers."
+)
+
+
 def _system_prompt(note: str = "", native: bool = False) -> str:
     """Match HPCA's own prompt style; fall back if the constant moved."""
     # Production picks this block by protocol (orchestrator_system_prompt):
@@ -140,8 +153,9 @@ def _system_prompt(note: str = "", native: bool = False) -> str:
         from hpca.agent.prompts import PATH_WORKFLOW_GUIDANCE as path_guidance
     except Exception:
         path_guidance = ""
+    default = _DEFAULT_SYSTEM_NOTE if HAS_REGISTRY else _NO_REGISTRY_SYSTEM_NOTE
     return f"{guidance}\n\n{path_guidance}\n\n{script_guidance}\n\n" + (
-        note or _DEFAULT_SYSTEM_NOTE
+        note or default
     )
 
 
@@ -1331,15 +1345,10 @@ def _near_preamble(workspace: Path) -> list[dict]:
     return _padding()
 
 
-def _recall_preamble(workspace: Path) -> list[dict]:
-    """Long context, and the path was established once, ~95k tokens ago.
-
-    This is the registry's remaining argument — durable naming — put where it
-    is supposed to pay: the path is far behind, and on the registry side it
-    also has a key, announced the way an auto-registration announces itself.
-    """
+def _recall_established(workspace: Path) -> list[dict]:
+    """The turn that puts the path into the session, once."""
     target = workspace / DEEP_DIR
-    established = [
+    return [
         {
             "role": "user",
             "content": "Where did the rpca/harmony run put its cluster annotation?",
@@ -1348,19 +1357,44 @@ def _recall_preamble(workspace: Path) -> list[dict]:
             "role": "assistant",
             "content": (
                 f"The run wrote its cluster-annotation results to {target}"
-                + (
-                    ", registered as 'annotation_dir'."
-                    if HAS_REGISTRY
-                    else "."
-                )
+                + (", registered as 'annotation_dir'." if HAS_REGISTRY else ".")
                 + " The annotation table itself is annotation.tsv in there, "
                 "with annotation_backup.tsv beside it from the previous round."
             ),
         },
     ]
+
+
+def _recall_preamble(workspace: Path) -> list[dict]:
+    """Long context, and the path was established once, ~95k tokens ago.
+
+    This is the registry's remaining argument — durable naming — put where it
+    is supposed to pay: the path is far behind, and on the registry side it
+    also has a key, announced the way an auto-registration announces itself.
+    """
+    established = _recall_established(workspace)
     # The establishing turn goes FIRST, then everything else on top of it, so
     # the path is at the far end of the window rather than next to the ask.
     return established + _padding()
+
+
+def _recall_mid_preamble(workspace: Path) -> list[dict]:
+    """The same, with the path buried in the MIDDLE of the context.
+
+    Position is not incidental to what this measures. A model holds the start
+    and the end of a long window far better than its middle, so establishing
+    the path in the very first turn tests the kindest position there is, and a
+    pass there does not carry to the case the registry is actually sold on: a
+    path mentioned somewhere in the middle of a long working session.
+
+    Kept alongside the first-position variant rather than replacing it, because
+    a difference between the two is itself the finding — it says the failure,
+    when it comes, is retrieval and not the interface.
+    """
+    established = _recall_established(workspace)
+    pad = _padding()
+    half = (len(pad) // 4) * 2  # split on a user/assistant boundary
+    return pad[:half] + established + pad[half:]
 
 
 def _annotation_edited(ws: Path) -> bool:
@@ -1409,6 +1443,19 @@ def _paths_files() -> dict:
     }
 
 
+def _paths_keys() -> dict:
+    """The directory's own key, on the side that has keys.
+
+    ``_recall_preamble`` tells the registry branch the results directory is
+    "registered as 'annotation_dir'", so it has to be — a preamble that
+    promises a key the registry does not hold would score that branch on an
+    UnknownKeyError the harness invented, not on its interface. Registered via
+    ``missing`` because the directory is made by the files above; on the
+    treatment side registration is a no-op and this dict does nothing.
+    """
+    return {"annotation_dir": DEEP_DIR}
+
+
 def _fake_create(target: str, lines: list[str]) -> dict:
     """A scripted create for --dry-run, in this branch's own argument shape."""
     arguments = (
@@ -1450,6 +1497,7 @@ def build_path_tasks() -> list[Task]:
             system_note=_PATHS_SYSTEM_NOTE,
             preamble=_near_preamble,
             files=_paths_files(),
+            missing=_paths_keys(),
             prompt=(
                 "Write a README.md into "
                 "{workspace}/" + DEEP_DIR + " with exactly these three lines:\n"
@@ -1464,6 +1512,7 @@ def build_path_tasks() -> list[Task]:
             system_note=_PATHS_SYSTEM_NOTE,
             preamble=_near_preamble,
             files=_paths_files(),
+            missing=_paths_keys(),
             prompt=(
                 "In {workspace}/" + DEEP_DIR + "/annotation.tsv, cluster 12 is "
                 "mislabelled: change its cell_type from Prolif to Prolif_S. "
@@ -1478,6 +1527,7 @@ def build_path_tasks() -> list[Task]:
             system_note=_PATHS_SYSTEM_NOTE,
             preamble=_near_preamble,
             files=_paths_files(),
+            missing=_paths_keys(),
             prompt=(
                 "Delete {workspace}/" + DEEP_DIR + "/annotation_backup.tsv — "
                 "we do not need the previous round any more. Do not touch "
@@ -1492,6 +1542,7 @@ def build_path_tasks() -> list[Task]:
             system_note=_PATHS_SYSTEM_NOTE,
             preamble=_recall_preamble,
             files=_paths_files(),
+            missing=_paths_keys(),
             prompt=(
                 "Write a README.md into the cluster-annotation results "
                 "directory you told me about earlier, with exactly these three "
@@ -1506,6 +1557,7 @@ def build_path_tasks() -> list[Task]:
             system_note=_PATHS_SYSTEM_NOTE,
             preamble=_recall_preamble,
             files=_paths_files(),
+            missing=_paths_keys(),
             prompt=(
                 "In the annotation table in that cluster-annotation results "
                 "directory, cluster 12 is mislabelled: change its cell_type "
@@ -1520,6 +1572,52 @@ def build_path_tasks() -> list[Task]:
             system_note=_PATHS_SYSTEM_NOTE,
             preamble=_recall_preamble,
             files=_paths_files(),
+            missing=_paths_keys(),
+            prompt=(
+                "Delete the previous round's backup table from that "
+                "cluster-annotation results directory — annotation_backup.tsv. "
+                "Do not touch annotation.tsv."
+            ),
+            check=_backup_deleted,
+            fake_calls=[_fake_target("delete_file", _BACKUP)],
+        ),
+        Task(
+            name="create_recall_mid",
+            templated=True,
+            system_note=_PATHS_SYSTEM_NOTE,
+            preamble=_recall_mid_preamble,
+            files=_paths_files(),
+            missing=_paths_keys(),
+            prompt=(
+                "Write a README.md into the cluster-annotation results "
+                "directory you told me about earlier, with exactly these three "
+                "lines:\n" + body
+            ),
+            check=_readme_written,
+            fake_calls=[_fake_create(_README, README_LINES)],
+        ),
+        Task(
+            name="edit_recall_mid",
+            templated=True,
+            system_note=_PATHS_SYSTEM_NOTE,
+            preamble=_recall_mid_preamble,
+            files=_paths_files(),
+            missing=_paths_keys(),
+            prompt=(
+                "In the annotation table in that cluster-annotation results "
+                "directory, cluster 12 is mislabelled: change its cell_type "
+                "from Prolif to Prolif_S. Leave every other row exactly as it is."
+            ),
+            check=_annotation_edited,
+            fake_calls=[_fake_target("edit_file", _ANNOTATION, **_EDIT)],
+        ),
+        Task(
+            name="delete_recall_mid",
+            templated=True,
+            system_note=_PATHS_SYSTEM_NOTE,
+            preamble=_recall_mid_preamble,
+            files=_paths_files(),
+            missing=_paths_keys(),
             prompt=(
                 "Delete the previous round's backup table from that "
                 "cluster-annotation results directory — annotation_backup.tsv. "
@@ -1538,8 +1636,50 @@ class FakeLLM:
     """Scripted model for --dry-run: emits each queued decision once, then
     responds DONE. Satisfies the two methods decide() uses."""
 
-    def __init__(self, calls: list[dict]):
+    def __init__(self, calls: list[dict], key_paths: dict | None = None):
         self._queue = list(calls)
+        # key -> path relative to the workspace, for the translation below.
+        self._key_paths = key_paths or {}
+
+    def _in_this_branchs_shape(self, call: dict, workspace: Path) -> dict:
+        """A scripted key-based call, rewritten for a branch that has no keys.
+
+        Same tool, same content, same effect on disk — only the argument names
+        and the way the target is spelled change. Untranslatable calls are
+        dropped rather than sent: register_path does not exist on this side,
+        and a scripted call to a missing tool would fail the dry run for the
+        one reason a dry run is not testing.
+        """
+        if HAS_REGISTRY or call.get("action") != "tool_call":
+            return call
+        if call.get("tool") == "register_path":
+            return {}
+        args = dict(call.get("arguments") or {})
+
+        def as_path(value):
+            # `is not None`, not truthiness: the workspace's own key maps to an
+            # empty relative part, which is a real answer and not a miss.
+            fname = self._key_paths.get(value)
+            return value if fname is None else str(workspace / fname)
+
+        if "dir_key" in args:
+            base = as_path(args.pop("dir_key"))
+            name = args.pop("name", "")
+            args["path"] = str(Path(base) / name) if name else base
+        for old, new in (
+            ("registry_key", "path"),
+            ("source_key", "source_path"),
+            ("dest_dir_key", "dest_path"),
+        ):
+            if old in args:
+                args[new] = as_path(args.pop(old))
+        subpath = args.pop("subpath", "")
+        if subpath and "path" in args:
+            args["path"] = str(Path(args["path"]) / subpath)
+        new_name = args.pop("new_name", "")
+        if new_name and "dest_path" in args:
+            args["dest_path"] = str(Path(args["dest_path"]) / new_name)
+        return {**call, "arguments": args}
 
     def bind_workspace(self, workspace: Path) -> None:
         """Substitute {workspace} inside the scripted arguments.
@@ -1557,7 +1697,12 @@ class FakeLLM:
                 return {k: _sub(v) for k, v in value.items()}
             return value
 
-        self._queue = [_sub(call) for call in self._queue]
+        self._queue = [
+            translated
+            for call in self._queue
+            for translated in [self._in_this_branchs_shape(_sub(call), workspace)]
+            if translated
+        ]
 
     async def supports_constrained_decoding(self) -> bool:
         return False
@@ -1585,18 +1730,61 @@ def _is_failed_edit(tool_name: str, result: str) -> bool:
     return result.startswith("NOT ") or "[tool error]" in result
 
 
+def _task_paths(task: Task) -> dict:
+    """key -> path relative to the workspace, for every key the task sets up.
+
+    "workspace" is in here because run_task registers it for every task, and a
+    prompt or a scripted call may name it — an empty relative part resolves
+    back to the workspace itself.
+    """
+    out = {"workspace": ""}
+    out.update({key: fname for key, (fname, _) in task.files.items()})
+    out.update(getattr(task, "missing", {}) or {})
+    return out
+
+
+def _in_this_branchs_words(prompt: str, task: Task, workspace: Path) -> str:
+    """The prompt, re-phrased for a checkout that has no registry.
+
+    The core and hard tiers say things like "the bash script is registered as
+    'runner'". On the treatment side that is not merely unhelpful, it is false —
+    there is no registry to be registered in — and a task cannot be scored on an
+    interface by lying to the model about which interface it has. So each key is
+    rewritten into the path it stood for, and nothing else about the task moves:
+    same files on disk, same check, same decision budget.
+
+    Deliberately narrow. It rewrites the two shapes the tiers actually use (the
+    "registered as 'k'" clause and a bare quoted key) and leaves anything else
+    alone, so a prompt it does not understand goes through unchanged rather than
+    silently half-translated.
+    """
+    if HAS_REGISTRY:
+        return prompt
+    for key, fname in sorted(_task_paths(task).items(), key=lambda kv: -len(kv[0])):
+        target = str(workspace / fname)
+        for pattern in (
+            f"is registered as '{key}'",
+            f"registered as '{key}'",
+        ):
+            prompt = prompt.replace(pattern, f"is at {target}")
+        prompt = prompt.replace(f"'{key}'", f"'{target}'")
+    return prompt
+
+
 def _render_prompt(task: Task, workspace: Path) -> str:
     """The prompt as the model sees it, with {workspace} filled in.
 
     Opt-in via Task.templated, and belt-and-braces even then: a stray brace in
     a future prompt must not crash the run and silently zero its success rate.
     """
-    if not getattr(task, "templated", False):
-        return task.prompt
-    try:
-        return task.prompt.format(workspace=str(workspace))
-    except (KeyError, IndexError, ValueError):
-        return task.prompt.replace("{workspace}", str(workspace))
+    if getattr(task, "templated", False):
+        try:
+            prompt = task.prompt.format(workspace=str(workspace))
+        except (KeyError, IndexError, ValueError):
+            prompt = task.prompt.replace("{workspace}", str(workspace))
+    else:
+        prompt = task.prompt
+    return _in_this_branchs_words(prompt, task, workspace)
 
 
 async def run_task(task: Task, llm, tools: ToolRegistry, keep: bool = False) -> dict:
@@ -1869,7 +2057,11 @@ async def main() -> int:
     try:
         for task in tasks:
             for rep in range(repeats):
-                llm = FakeLLM(task.fake_calls) if args.dry_run else live
+                llm = (
+                    FakeLLM(task.fake_calls, _task_paths(task))
+                    if args.dry_run
+                    else live
+                )
                 metrics = await run_task(task, llm, tools, keep=args.keep)
                 metrics["repeat"] = rep
                 runs.append(metrics)
