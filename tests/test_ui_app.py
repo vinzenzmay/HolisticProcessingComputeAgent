@@ -8,7 +8,7 @@ import pytest
 
 from hpca.ui.app import CHAT, INPUT, SESSIONS, WATCHERS, RowUI
 from hpca.ui.demo import build
-from hpca.ui.keys import decode
+from hpca.ui.keys import PASTE, decode
 from tests.ui_harness import clocked, frame, on_own_message, plain, widths
 
 SIZES = [(80, 24), (120, 40), (200, 60), (60, 14), (40, 10), (100, 8)]
@@ -197,7 +197,7 @@ def test_shift_arrow_does_not_throw_you_into_the_chat():
     # The old failure: an escape the table did not know arrived as "esc" plus
     # its letters, and the esc left the box.
     ui = in_the_box()
-    for key in decode(b"\x1b[1;2D\x1b[1;9Z"):
+    for key in decode(b"\x1b[1;2D\x1b[1;9Z", final=True)[0]:
         ui.handle(key, 120, 40)
     assert ui.focus == INPUT
 
@@ -518,7 +518,7 @@ def test_arrow_keys_do_not_arm_the_stop():
     # handle() ever sees an escape.
     ui = clocked(build())
     ui.focus = CHAT
-    for key in decode(b"\x1b[A\x1b[B"):
+    for key in decode(b"\x1b[A\x1b[B", final=True)[0]:
         ui.handle(key, 120, 40)
     assert ui._esc_armed_at is None
 
@@ -723,3 +723,186 @@ def test_the_frame_is_still_exact_after_a_rollback():
     drawn = ui.render(120, 40)
     assert len(drawn) == 40
     assert widths(drawn) == {120}
+
+
+# ------------------------------------- emoji, CJK and a paste in the frame
+
+MIXED = (
+    "🚀 deploy the 日本語 index — coverage was 31×, see résumé\n"
+    "second line with 中文 and an emoji family 👩‍💻 in it"
+)
+
+
+def with_a_wide_message() -> RowUI:
+    ui = in_the_box()
+    ui.input.insert_text(MIXED)
+    ui.handle("enter", 120, 40)
+    return ui
+
+
+@pytest.mark.parametrize("width,height", SIZES)
+def test_a_frame_carrying_emoji_and_cjk_is_still_exactly_the_width(width, height):
+    ui = with_a_wide_message()
+    ui.focus = CHAT
+    ui.handle("end", width, height)
+    drawn = ui.render(width, height)
+    assert len(drawn) == height
+    assert widths(drawn) == {width}
+
+
+@pytest.mark.parametrize("width,height", SIZES)
+def test_and_so_is_one_with_the_same_text_still_in_the_message_box(width, height):
+    ui = in_the_box()
+    ui.input.insert_text(MIXED)
+    drawn = ui.render(width, height)
+    assert widths(drawn) == {width}
+
+
+def test_an_open_entry_of_wide_text_still_draws_exact_rows():
+    ui = with_a_wide_message()
+    ui.focus = CHAT
+    ui.handle("end", 120, 40)
+    ui.handle("shift-right", 120, 40)
+    assert widths(ui.render(120, 40)) == {120}
+
+
+# ---------------------------------------------------------- bracketed paste
+
+
+def pasted(text: str, ui: RowUI | None = None) -> RowUI:
+    ui = ui if ui is not None else in_the_box()
+    ui.handle(PASTE + text, 120, 40)
+    return ui
+
+
+def test_a_paste_lands_in_the_draft_whole():
+    assert pasted("one\ntwo\nthree").input.text() == "one\ntwo\nthree"
+
+
+def test_a_pasted_newline_does_not_send():
+    ui = in_the_box()
+    before = len(ui.chat.items)
+    pasted("one\ntwo", ui)
+    assert len(ui.chat.items) == before
+
+
+def test_a_paste_joins_what_was_already_typed():
+    ui = typed(in_the_box(), "see: ")
+    pasted("a\nb", ui)
+    assert ui.input.text() == "see: a\nb"
+
+
+def test_a_paste_from_a_row_goes_to_the_message_box():
+    # A paste is an unambiguous "I am entering text"; dropping a multi-kilobyte
+    # one because the cursor happened to be in the chat is the worse answer.
+    ui = build()
+    ui.focus = CHAT
+    pasted("pasted text", ui)
+    assert ui.focus == INPUT
+    assert ui.input.text() == "pasted text"
+
+
+def test_a_paste_into_the_config_editor_lands_there_instead():
+    ui = build()
+    ui.focus = CHAT
+    ui.handle("c", 120, 40)
+    pasted('  "x": 1', ui)
+    assert '  "x": 1' in ui.overlay.editor.text()
+    assert ui.input.text() == ""
+
+
+def test_a_paste_a_screen_that_cannot_take_one_ignores_it():
+    ui = build()
+    ui.focus = CHAT
+    ui.handle("?", 120, 40)
+    pasted("nowhere to put this", ui)
+    assert ui.overlay is not None
+    assert ui.input.text() == ""
+
+
+def test_a_wide_paste_still_renders_exactly():
+    ui = pasted(MIXED)
+    assert widths(ui.render(100, 24)) == {100}
+
+
+# ------------------------------------------------------- the newline keys
+
+
+@pytest.mark.parametrize("key", ["alt-enter", "shift-enter", "ctrl-j"])
+def test_the_newline_key_adds_a_line_rather_than_sending(key):
+    ui = typed(in_the_box(), "half")
+    before = len(ui.chat.items)
+    ui.handle(key, 120, 40)
+    assert ui.input.text() == "half\n"
+    assert len(ui.chat.items) == before
+
+
+@pytest.mark.parametrize("key", ["alt-enter", "shift-enter", "ctrl-j"])
+def test_and_the_message_row_grows_by_one(key):
+    ui = typed(in_the_box(), "half")
+    before = ui._input_h(120)
+    ui.handle(key, 120, 40)
+    assert ui._input_h(120) == before + 1
+
+
+@pytest.mark.parametrize("key", ["alt-enter", "shift-enter", "ctrl-j"])
+def test_the_newline_keys_work_in_the_config_editor_too(key):
+    ui = build()
+    ui.handle("c", 120, 40)
+    ui.overlay.editor.set_text("{}")
+    ui.handle(key, 120, 40)
+    assert ui.overlay.editor.text() == "{}\n"
+
+
+def test_plain_enter_still_sends():
+    ui = typed(in_the_box(), "a message")
+    ui.handle("enter", 120, 40)
+    assert ui.input.text() == ""
+
+
+# ------------------------------- a key split across two reads and the stop
+
+
+def fed(ui: RowUI, *reads: bytes) -> RowUI:
+    """Drive the UI the way run.py does: each read carries the tail forward."""
+    pending = ""
+    for data in reads:
+        names, pending = decode(pending.encode() + data)
+        for key in names:
+            ui.handle(key, 120, 40)
+    return ui
+
+
+def test_an_arrow_split_across_two_reads_does_not_arm_the_stop():
+    # The defect: escape_len said the trailing ESC was a whole key, so half a
+    # cursor movement started killing the turn.
+    ui = clocked(build())
+    ui.focus = CHAT
+    fed(ui, b"\x1b", b"[A")
+    assert ui._esc_armed_at is None
+
+
+def test_and_it_still_moves_the_cursor_once():
+    ui = clocked(build())
+    ui.focus = CHAT
+    ui.chat.cursor = 5
+    fed(ui, b"\x1b", b"[A")
+    assert ui.chat.cursor == 4
+
+
+def test_two_split_arrows_never_stop_the_turn():
+    ui = clocked(build())
+    ui.focus = CHAT
+    fed(ui, b"\x1b", b"[A\x1b", b"[B")
+    assert ui.note == ""
+
+
+def test_a_real_escape_still_arms_it_when_nothing_follows():
+    ui = clocked(build())
+    ui.focus = CHAT
+    keys, pending = decode(b"\x1b")
+    assert keys == []  # held: this could still be an arrow
+    keys, pending = decode(pending, final=True)  # ...the read timed out
+    for key in keys:
+        ui.handle(key, 120, 40)
+    assert ui._esc_armed_at is not None

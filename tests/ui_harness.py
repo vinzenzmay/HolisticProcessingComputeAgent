@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 
+from hpca.ui.ansi import cell_width
 from hpca.ui.app import CHAT, RowUI
 
 # Every style is an SGR sequence, so one pattern strips a frame back to what a
@@ -28,8 +29,14 @@ def frame(ui: RowUI, width: int, height: int) -> list[str]:
 
 
 def widths(lines: list[str]) -> set[int]:
-    """The distinct visible widths in a frame — `{width}` if it is well formed."""
-    return {len(plain(x)) for x in lines}
+    """The distinct visible widths in a frame — `{width}` if it is well formed.
+
+    Counted in terminal *cells*, not characters: an emoji occupies two of them
+    and a combining mark none, so a frame full of ASCII and a frame full of CJK
+    are only comparable on this scale — and cells are what the differential
+    repaint is addressed in.
+    """
+    return {cell_width(plain(x)) for x in lines}
 
 
 def clocked(ui: RowUI) -> RowUI:

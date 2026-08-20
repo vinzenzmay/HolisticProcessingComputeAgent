@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from hpca.ui.ansi import BOLD, CYAN, RESET, rule
 from hpca.ui.editor import Editor
+from hpca.ui.keys import NEWLINE_KEYS
 from hpca.ui.overlays.base import Overlay
 from hpca.ui.pane import Item, Pane
 
@@ -33,6 +34,10 @@ class ProfilesOverlay(Overlay):
             ("esc", "back"),
         ]
 
+    def paste(self, text: str) -> None:
+        if self.editor is not None:
+            self.editor.insert_text(text)
+
     def render(self, width: int, height: int) -> list[str]:
         if self.editor is not None:
             head = rule(f"learnings · {self.editing}", width, self.note)
@@ -53,7 +58,7 @@ class ProfilesOverlay(Overlay):
                 self.learnings[self.editing] = self.editor.text()
                 self.editor = None
                 self.note = "kept"
-            elif key == "enter":
+            elif key == "enter" or key in NEWLINE_KEYS:
                 self.editor.newline()
             else:
                 self.editor.handle(key)

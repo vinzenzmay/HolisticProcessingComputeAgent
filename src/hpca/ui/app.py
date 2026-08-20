@@ -10,8 +10,9 @@ import time
 
 from hpca import __version__ as VERSION
 from hpca.ui.ansi import BLUE, BOLD, CYAN, DIM, GREEN, RED, RESET, REVERSE, YELLOW
-from hpca.ui.ansi import footer_line, pad, rule
+from hpca.ui.ansi import cell_width, footer_line, pad, rule
 from hpca.ui.editor import Editor
+from hpca.ui.keys import NEWLINE_KEYS, is_paste, paste_text
 from hpca.ui.overlays import (
     COPY,
     FORK,
@@ -306,7 +307,7 @@ class RowUI:
     def _header(self, width: int) -> str:
         left = f" HPCA {VERSION}  ·  {self.profile}  ·  {self.mode}"
         right = f"{self.frame_ms:5.2f}ms  ·  ? keys  "
-        gap = width - len(left) - len(right)
+        gap = width - cell_width(left) - cell_width(right)
         text = left + " " * gap + right if gap > 0 else left
         return REVERSE + pad(text, width) + RESET
 
@@ -331,7 +332,7 @@ class RowUI:
                 ("enter", "send"),
                 ("esc esc", "stop"),
                 ("^↑^↓", "row"),
-                ("alt-enter", "new line"),
+                ("⇧enter", "new line"),
                 ("^←→", "word"),
                 ("⇧←→", "select"),
                 ("^⌫ ^del", "cut word"),
@@ -351,6 +352,9 @@ class RowUI:
     # --------------------------------------------------------------- input
 
     def handle(self, key: str, width: int, height: int) -> bool:
+        if is_paste(key):
+            self._paste(paste_text(key))
+            return True
         if self.overlay is not None:
             overlay = self.overlay
             if not overlay.handle(key, width, height - 2):
@@ -360,6 +364,24 @@ class RowUI:
         if self.focus == INPUT:
             return self._handle_input(key)
         return self._handle_row(key, width, height)
+
+    def _paste(self, text: str) -> None:
+        """A block the terminal handed over whole, inserted literally.
+
+        Where it goes is decided by where the cursor is, with one deliberate
+        exception: from one of the list rows it goes to the message box and
+        takes the focus with it. A paste is an unambiguous "I am entering
+        text", the rows have nowhere to put one, and silently dropping a
+        multi-kilobyte payload because the cursor happened to be in the chat is
+        the worse of the two answers. A screen that has no editor open — the
+        key list, the session picker — does drop it, because there the paste
+        would have to close the screen to land anywhere.
+        """
+        if self.overlay is not None:
+            self.overlay.paste(text)
+            return
+        self.focus = INPUT
+        self.input.insert_text(text)
 
     def _closed(self, overlay: Overlay) -> None:
         """A screen that answered with something the rows have to act on."""
@@ -484,7 +506,7 @@ class RowUI:
             self._escape()
         elif key == "enter":
             self._send()
-        elif key == "alt-enter":
+        elif key in NEWLINE_KEYS:
             self.input.newline()
         elif key in ("ctrl-up", "shift-tab"):
             self.focus = CHAT

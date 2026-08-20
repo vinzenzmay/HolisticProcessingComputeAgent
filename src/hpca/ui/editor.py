@@ -2,33 +2,21 @@
 
 from __future__ import annotations
 
-from hpca.ui.ansi import DIM, RESET, pad, reverse
+from hpca.ui.ansi import (
+    DIM,
+    RESET,
+    cell_width,
+    char_width,
+    fit_index,
+    pad,
+    reverse,
+    wrap_spans,
+)
 
-
-def wrap_spans(text: str, width: int) -> list[tuple[int, int]]:
-    """Where one logical line breaks to fit ``width``, as ``(start, end)``.
-
-    Broken at a space where there is one and mid-run where there is not. The
-    spans partition the line exactly — nothing is dropped, not even the space
-    that caused the break — because the cursor is addressed by column, and a
-    swallowed character would leave a column with nowhere to stand.
-    """
-    if width < 1:
-        return [(0, len(text))]
-    spans: list[tuple[int, int]] = []
-    at, n = 0, len(text)
-    while at < n:
-        if n - at <= width:
-            spans.append((at, n))
-            break
-        cut = text.rfind(" ", at, at + width)
-        spans.append((at, cut + 1 if cut > at else at + width))
-        at = spans[-1][1]
-    if not spans:
-        return [(0, 0)]
-    if spans[-1][1] - spans[-1][0] == width:
-        spans.append((n, n))  # a full last line still needs a cursor slot
-    return spans
+# Re-exported: the folding lives in ``ansi`` with the rest of the cell-width
+# arithmetic, but it is the message box's geometry and this is where it is
+# looked for.
+__all__ = ["Editor", "wrap_spans"]
 
 
 class Editor:
@@ -83,6 +71,30 @@ class Editor:
         line = self.lines[self.row]
         self.lines[self.row] = line[: self.col] + ch + line[self.col :]
         self.col += 1
+        self._touch()
+
+    def insert_text(self, text: str) -> None:
+        """Insert a whole block at the cursor — what a paste is.
+
+        Newlines in it become newlines in the buffer, never a send: the caller
+        already knows this arrived as one bracketed unit rather than as typing,
+        which is the entire reason the terminal is asked to bracket pastes.
+        """
+        self.delete_selection()
+        parts = text.split("\n")
+        line = self.lines[self.row]
+        head, tail = line[: self.col], line[self.col :]
+        if len(parts) == 1:
+            self.lines[self.row] = head + parts[0] + tail
+            self.col += len(parts[0])
+        else:
+            self.lines[self.row : self.row + 1] = [
+                head + parts[0],
+                *parts[1:-1],
+                parts[-1] + tail,
+            ]
+            self.row += len(parts) - 1
+            self.col = len(parts[-1])
         self._touch()
 
     def newline(self) -> None:
@@ -197,9 +209,16 @@ class Editor:
         target = index + delta
         if not 0 <= target < len(rows):
             return
+        # The column is kept in *cells*, not characters: stepping off a row of
+        # ideographs onto one of latin text has to land under the cursor, and
+        # those two rows hold a different number of characters in the same
+        # number of columns.
+        here = rows[min(index, len(rows) - 1)]
+        column = cell_width(self.lines[here[0]][here[1] : here[1] + offset])
         row, start, end = rows[target]
         self.row = row
-        self.col = min(start + offset, end, len(self.lines[row]))
+        line = self.lines[row]
+        self.col = min(fit_index(line, start, column), end, len(line))
 
     def home(self) -> None:
         self.col = 0
@@ -268,6 +287,8 @@ class Editor:
     def cursor_visual(self, width: int) -> tuple[int, int]:
         """Which screen line the cursor sits on, and how far into it."""
         rows = self.visual(width)
+        if not rows:  # only reachable if wrap_spans ever stops answering
+            return 0, 0
         last = 0
         for index, (row, start, end) in enumerate(rows):
             if row != self.row:
@@ -332,8 +353,22 @@ class Editor:
             self.offset = cursor_row - height + 1
         self.offset = max(0, min(self.offset, max(0, len(rows) - height)))
         # A wrapped row already fits the box; only the sideways editors need an
-        # offset into the line.
-        hoff = 0 if self.wrap else max(0, cursor_col - body + 2)
+        # offset into the line. Measured in cells and answered in characters:
+        # the smallest number of characters to drop from the front that leaves
+        # the cursor inside the box.
+        hoff = 0
+        if not self.wrap and rows:
+            here = rows[min(cursor_row, len(rows) - 1)]
+            line, start = self.lines[here[0]], here[1]
+            # Walked backwards from the cursor rather than forwards from the
+            # start of the line: the answer is at most ``body`` cells away, and
+            # a JSON file edited at column 90 must not cost its whole line on
+            # every keystroke.
+            used, at = 0, start + cursor_col
+            while at > start and used + char_width(line[at - 1]) <= body - 2:
+                used += char_width(line[at - 1])
+                at -= 1
+            hoff = at - start
         span = self.sel_range() if focused else None
         out = []
         for index in range(self.offset, self.offset + height):
@@ -347,7 +382,8 @@ class Editor:
                 prefix = f"{DIM}{row + 1:>{gutter - 1}} {RESET}"
             else:
                 prefix = " " * gutter
-            text = pad(self.lines[row][start:end][hoff : hoff + body], body)
+            seg = self.lines[row][start:end]
+            text = pad(seg[hoff : fit_index(seg, min(hoff, len(seg)), body)], body)
             marks: list[tuple[int, int]] = []
             if span is not None:
                 (r1, c1), (r2, c2) = span

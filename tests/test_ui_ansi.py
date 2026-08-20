@@ -5,7 +5,18 @@ same one — a line is exactly `width` visible cells, whatever styling was
 wrapped around it afterwards.
 """
 
-from hpca.ui.ansi import CYAN, DIM, RESET, footer_line, pad, reverse, rule
+from hpca.ui.ansi import (
+    CYAN,
+    DIM,
+    RESET,
+    REVERSE,
+    cell_width,
+    fold,
+    footer_line,
+    pad,
+    reverse,
+    rule,
+)
 from hpca.ui.app import INPUT
 from hpca.ui.demo import build
 from tests.ui_harness import plain
@@ -75,3 +86,103 @@ class TestFooterLine:
         drawn = footer_line(PAIRS, 120, "sent", CYAN)
         assert f"{CYAN}sent{RESET}" in drawn
         assert len(plain(drawn)) == 120
+
+
+# ------------------------------------------------------------ cell widths
+
+WIDE = "中文"  # two CJK ideographs: two characters, four cells
+EMOJI = "🚀"  # one character, two cells
+COMBINED = "é"  # e + combining acute: two characters, one cell
+FAMILY = "👩‍💻"  # emoji ZWJ sequence: three characters
+
+
+class TestCellWidth:
+    def test_ascii_is_one_cell_each(self):
+        assert cell_width("abc") == 3
+
+    def test_a_cjk_ideograph_is_two(self):
+        assert cell_width(WIDE) == 4
+
+    def test_an_emoji_is_two(self):
+        assert cell_width(EMOJI) == 2
+
+    def test_a_combining_mark_is_none(self):
+        assert cell_width(COMBINED) == 1
+
+    def test_a_zero_width_joiner_is_none(self):
+        assert cell_width("‍") == 0
+
+    def test_the_box_drawing_the_ui_is_made_of_stays_one_cell(self):
+        # East-asian "ambiguous" must not be counted as two: every rule, marker
+        # and arrow in this UI is ambiguous-width, so widening them would
+        # break every frame the tests above assert.
+        assert cell_width("──▌▸▾●○…↑⇧") == 10
+
+
+class TestPadCountsCells:
+    def test_a_wide_string_is_padded_by_cells_not_characters(self):
+        assert cell_width(pad(WIDE, 10)) == 10
+
+    def test_a_wide_string_that_exactly_fills_is_not_truncated(self):
+        assert pad(WIDE, 4) == WIDE
+
+    def test_truncation_never_splits_a_wide_character(self):
+        # Four cells of "中文" plus the ellipsis does not fit in four, so the
+        # cut lands before 文 and the row is filled out with a space instead —
+        # a half-drawn glyph would shift every cell after it.
+        drawn = pad(WIDE + "x", 4)
+        assert drawn == "中… "
+        assert cell_width(drawn) == 4
+
+    def test_a_truncated_row_is_still_exactly_the_width(self):
+        for width in range(1, 12):
+            assert cell_width(pad("a中b文c🚀d", width)) == width
+
+    def test_a_single_cell_of_room_cannot_hold_a_wide_character(self):
+        assert pad(EMOJI, 1) == " "
+
+    def test_a_combining_mark_stays_with_the_character_it_marks(self):
+        assert pad(COMBINED, 1) == COMBINED
+
+    def test_a_zero_width_joiner_is_not_left_dangling(self):
+        # Cutting between 👩 and the joiner would leave the terminal waiting
+        # for a glyph that never comes.
+        assert not pad(FAMILY + "xx", 3).startswith("👩‍")
+
+
+class TestRuleCountsCells:
+    def test_a_rule_with_a_wide_label_is_exactly_the_width(self):
+        assert cell_width(rule("会話", 40)) == 40
+
+    def test_a_rule_with_a_wide_right_hand_note_is_too(self):
+        assert cell_width(rule("chat", 40, "行 3/9")) == 40
+
+
+class TestFooterCountsCells:
+    def test_a_wide_note_still_leaves_the_footer_exact(self):
+        assert cell_width(plain(footer_line(PAIRS, 120, "送信しました"))) == 120
+
+
+class TestFold:
+    def test_folding_loses_nothing(self):
+        assert "".join(fold("aaa bbb ccc ddd", 8)) == "aaa bbb ccc ddd"
+
+    def test_every_folded_line_fits_the_cell_budget(self):
+        for line in fold(WIDE * 10, 7):
+            assert cell_width(line) <= 7
+
+    def test_and_a_wide_character_is_never_split_across_two(self):
+        assert all(x in ("中", "文") for line in fold(WIDE * 5, 3) for x in line)
+
+
+class TestReverseKeepsGlyphsWhole:
+    def test_a_mark_that_starts_on_a_combining_mark_takes_its_base_too(self):
+        # Highlighting the accent alone would paint it over the character
+        # before it, which is not the one the cursor is on.
+        drawn = reverse(COMBINED + "x", [(1, 2)])
+        assert plain(drawn) == COMBINED + "x"
+        assert f"{REVERSE}{COMBINED}{RESET}" in drawn
+
+    def test_a_mark_that_ends_before_a_combining_mark_takes_it_along(self):
+        drawn = reverse(COMBINED, [(0, 1)])
+        assert f"{REVERSE}{COMBINED}{RESET}" in drawn

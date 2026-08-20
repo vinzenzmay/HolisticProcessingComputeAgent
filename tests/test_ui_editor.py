@@ -1,5 +1,6 @@
 """Tests for hpca.ui.editor: folding, word motion, selection, drawing."""
 
+from hpca.ui.ansi import cell_width
 from hpca.ui.editor import Editor, wrap_spans
 from tests.ui_harness import plain
 
@@ -168,3 +169,90 @@ class TestDrawing:
         drawn = [plain(x) for x in editor.render(40, 2, focused=False, numbers=True)]
         assert drawn[0].strip() == "1 one"
         assert drawn[1].strip() == "2 two"
+
+
+class TestWrappingCountsCells:
+    def test_a_wide_line_folds_at_the_cell_budget_not_the_character_count(self):
+        # Six ideographs are twelve cells, so a six-cell box takes three — and
+        # the second row is filled to its last cell, so it earns the empty
+        # cursor slot after it.
+        assert pieces("中" * 6, 6) == ["中中中", "中中中", ""]
+
+    def test_no_folded_row_ever_overflows_the_box(self):
+        text = "a中b🚀c 日本語 dd ee"
+        assert all(cell_width(x) <= 7 for x in pieces(text, 7))
+
+    def test_and_the_spans_still_partition_exactly(self):
+        # The load-bearing property: every column has somewhere for the cursor
+        # to stand, so nothing may be dropped at a break.
+        text = "a中b🚀c 日本語 dd ee"
+        spans = wrap_spans(text, 7)
+        assert "".join(text[a:b] for a, b in spans) == text
+        assert all(b == c for (_, b), (c, _) in zip(spans, spans[1:]))
+
+    def test_a_wide_character_that_does_not_fit_leaves_the_cell_empty(self):
+        # Seven cells cannot hold a fourth ideograph, so the row is six cells
+        # of text and one of padding — never half a glyph.
+        assert pieces("中" * 4, 7) == ["中中中", "中"]
+
+    def test_a_row_a_cell_short_of_full_still_has_room_for_the_cursor(self):
+        # ...which is why it does not get the extra empty span that a row
+        # filled to the last cell gets.
+        assert wrap_spans("中中", 5)[-1] == (0, 2)
+
+    def test_a_row_filled_to_the_last_cell_still_gets_one(self):
+        assert wrap_spans("中中", 4)[-1] == (2, 2)
+
+
+class TestCursorGeometry:
+    def test_up_and_down_keep_the_visual_column_across_wide_text(self):
+        editor = Editor("中中中中\nabcdefgh", wrap=True)
+        editor.row, editor.col = 0, 3  # three ideographs in: column six
+        editor.render(9, 2, focused=True)
+        editor.handle("down")
+        assert editor.col == 6
+
+    def test_an_editor_with_nothing_in_it_has_a_cursor_anyway(self):
+        # cursor_visual used to index rows[-1] unguarded (spec §8.1).
+        assert Editor("", wrap=True).cursor_visual(0) == (0, 0)
+
+    def test_a_wide_draft_renders_to_exactly_the_box_width(self):
+        editor = Editor("日本語のテキストが入っています", wrap=True)
+        drawn = editor.render(20, 3, focused=True)
+        assert {cell_width(plain(x)) for x in drawn} == {20}
+
+    def test_a_sideways_editor_scrolls_far_enough_to_show_a_wide_cursor(self):
+        editor = Editor("中" * 40)
+        editor.col = 40
+        drawn = plain(editor.render(20, 1, focused=True)[0])
+        assert cell_width(drawn) == 20
+
+
+class TestPasting:
+    def test_a_pasted_block_lands_as_several_lines(self):
+        editor = Editor("", wrap=True)
+        editor.insert_text("one\ntwo\nthree")
+        assert editor.text() == "one\ntwo\nthree"
+
+    def test_the_cursor_ends_after_what_was_pasted(self):
+        editor = Editor("", wrap=True)
+        editor.insert_text("one\ntwo")
+        assert (editor.row, editor.col) == (1, 3)
+
+    def test_a_paste_splits_the_line_it_landed_in(self):
+        editor = Editor("abcd", wrap=True)
+        editor.col = 2
+        editor.insert_text("X\nY")
+        assert editor.text() == "abX\nYcd"
+
+    def test_a_paste_replaces_the_marked_text(self):
+        editor = marked("alpha beta", 5)
+        editor.insert_text("omega")
+        assert editor.text() == "omega beta"
+
+    def test_a_single_line_paste_stays_on_the_line(self):
+        editor = Editor("ab", wrap=True)
+        editor.end()
+        editor.insert_text("cd")
+        assert editor.text() == "abcd"
+        assert editor.row == 0

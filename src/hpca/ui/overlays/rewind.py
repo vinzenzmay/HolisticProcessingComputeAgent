@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import textwrap
-
-from hpca.ui.ansi import BOLD, CYAN, DIM, RESET, pad, rule
+from hpca.ui.ansi import BOLD, CYAN, DIM, RESET, fold, pad, rule
 from hpca.ui.overlays.base import Overlay
 
 FORK, ROLLBACK, COPY = "fork", "rollback", "copy"
@@ -52,7 +50,7 @@ class RewindOverlay(Overlay):
             preview += " …"
         quoted: list[str] = []
         for paragraph in preview.split("\n"):
-            quoted += textwrap.wrap(paragraph, max(8, width - 6)) or [""]
+            quoted += fold(paragraph, max(8, width - 6))
         for line in quoted[:PREVIEW_LINES]:
             out.append(DIM + pad(f"    {line}", width) + RESET)
         if len(quoted) > PREVIEW_LINES:

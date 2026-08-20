@@ -58,7 +58,7 @@ class HelpOverlay(Overlay):
             "message box",
             [
                 ("enter", "send"),
-                ("alt-enter", "new line"),
+                ("⇧enter", "new line (alt-enter and ^j too)"),
                 ("↑ ↓", "move one screen line (long text wraps)"),
                 ("^← ^→", "jump a word (alt-← alt-→ also)"),
                 ("shift-← →", "mark text; shift-^← ^→ by the word"),

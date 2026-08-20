@@ -6,6 +6,7 @@ import json
 
 from hpca.ui.ansi import BOLD, CYAN, RESET, rule
 from hpca.ui.editor import Editor
+from hpca.ui.keys import NEWLINE_KEYS
 from hpca.ui.overlays.base import Overlay
 
 
@@ -28,6 +29,9 @@ class ConfigOverlay(Overlay):
             ("esc", "back"),
         ]
 
+    def paste(self, text: str) -> None:
+        self.editor.insert_text(text)
+
     def render(self, width: int, height: int) -> list[str]:
         out = [BOLD + CYAN + rule(self.title, width, self.note) + RESET]
         out += self.editor.render(width, height - 1, focused=True, numbers=True)
@@ -44,7 +48,7 @@ class ConfigOverlay(Overlay):
             else:
                 self.note = "saved"
             return True
-        if key == "enter":
+        if key == "enter" or key in NEWLINE_KEYS:
             self.editor.newline()
         else:
             self.editor.handle(key)

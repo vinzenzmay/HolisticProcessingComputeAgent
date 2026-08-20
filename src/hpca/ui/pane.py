@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import textwrap
 from dataclasses import dataclass, field
 
-from hpca.ui.ansi import BOLD, CYAN, DIM, RESET, REVERSE, pad, rule
+from hpca.ui.ansi import BOLD, CYAN, DIM, RESET, REVERSE, fold, pad, rule
 
 
 @dataclass
@@ -59,7 +58,11 @@ class Pane:
             lines.append((index, f"{marker} {item.head}", True))
             if index in self.expanded:
                 for raw in item.body:
-                    for piece in textwrap.wrap(raw, max(8, width - 4)) or [""]:
+                    # Folded by cells rather than by characters: a body line of
+                    # CJK holds half as many characters in the same row, and
+                    # counting them would leave the row over the width and the
+                    # padding to truncate what did not fit.
+                    for piece in fold(raw, max(8, width - 4)):
                         lines.append((index, f"    {piece}", False))
         self._flat = lines
         self._flat_width = width
