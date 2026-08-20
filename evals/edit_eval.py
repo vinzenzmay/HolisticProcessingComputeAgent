@@ -46,9 +46,18 @@ from hpca.agent.context import ToolContext
 from hpca.agent.middleware import DecisionError, DirectResponse, ToolCall, decide
 from hpca.agent.tools import ToolRegistry
 from hpca.config import Settings
-from hpca.registry import PathRegistry
 from hpca.runner import ProcessRunner
 from hpca.trash import TrashManager
+
+try:  # gone as of the path-registry removal; absent is the treatment side
+    from hpca.registry import PathRegistry
+except Exception:
+    PathRegistry = None
+
+# Which interface this checkout has. Every branch below that differs between the
+# two sides keys on this one flag, so the same harness file scores both — the
+# recipe in specs-edit-eval.md copies it into a baseline worktree unchanged.
+HAS_REGISTRY = PathRegistry is not None
 
 LIVE_URL = os.environ.get("HPCA_TEST_LLM_URL", "http://localhost:20001/v1")
 LIVE_KEY = os.environ.get("HPCA_TEST_LLM_KEY")
@@ -207,15 +216,21 @@ def _eval_tool_registry() -> ToolRegistry:
     from hpca.agent.file_tools import add_file_tools
 
     registry = add_file_tools(default_tool_registry())
-    wanted = ["read_file", "edit_file", "create_file", "register_path"]
-    try:
-        return registry.subset(wanted)
-    except Exception:
-        # subset() may differ across branches; rebuild by hand.
-        slim = ToolRegistry()
-        for name in wanted:
+    # delete_file joins the set for the `paths` tier; register_path/list_paths
+    # exist only on the registry side, and are that side's own affordance for
+    # naming a path it can no longer see. Anything missing is skipped rather
+    # than fatal, which is what lets one file score both branches.
+    wanted = [
+        "read_file", "edit_file", "create_file", "delete_file",
+        "register_path", "list_paths",
+    ]
+    slim = ToolRegistry()
+    for name in wanted:
+        try:
             slim.register(registry.get(name))
-        return slim
+        except Exception:
+            continue
+    return slim
 
 
 def _filtered_kwargs(cls, **kwargs):
@@ -229,12 +244,18 @@ def _make_context(workdir: Path) -> ToolContext:
 
     conn = connect(workdir / "hpca.db")
     init_db(conn)
+    registry = (
+        PathRegistry(
+            conn, **_filtered_kwargs(PathRegistry, profile="eval", session_id="eval")
+        )
+        if HAS_REGISTRY
+        else None
+    )
     ctx = ToolContext(
         **_filtered_kwargs(
             ToolContext,
-            registry=PathRegistry(
-                conn, **_filtered_kwargs(PathRegistry, profile="eval", session_id="eval")
-            ),
+            registry=registry,
+            workdir=workdir / "workspace",
             runner=ProcessRunner(
                 conn,
                 **_filtered_kwargs(
@@ -287,6 +308,12 @@ class Task:
     # per-task replacement for the task-facing half of the system prompt
     # (_DEFAULT_SYSTEM_NOTE). Empty = the text core and hard have always used.
     system_note: str = ""
+    # Conversation that already happened, inserted between the system prompt and
+    # the task prompt as (role, content) pairs. This is how the `paths` tier
+    # puts ~95k of context in front of the ask: the thing under test there is
+    # not the call itself but whether a path survives the distance to it.
+    # Built per run (it may need the workspace path), so it is a callable.
+    preamble: Callable[[Path], list[dict]] | None = None
 
 
 def _edit(key: str, old: list[str], new: list[str]) -> dict:
@@ -1197,6 +1224,313 @@ def build_shift_tasks() -> list[Task]:
     return tasks
 
 
+# ------------------------------------------------------- the `paths` tier
+
+# A path with everything that makes one hard: a cephfs mount prefix, a group
+# and project segment, two dates, an analysis name carrying its own parameters,
+# and a run id. Copied in shape from the cluster paths HPCA actually meets.
+# ~155 characters before the workspace prefix is prepended, ~200 after.
+DEEP_DIR = (
+    "data/cephfs-1/work/groups/cubi/projects/"
+    "2026-04-23_scrna_tcell_exhaustion/analysis/"
+    "umap_rpca_harmony_k30/run_20260423_1420/results/cluster_annotation"
+)
+
+ANNOTATION_TSV = "\n".join(
+    ["cluster_no\tcell_type\tlineage"]
+    + [f"{i}\tCd8_eff_like\tCd8" for i in range(12)]
+    + ["12\tProlif\tCd8", "13\tT_helper\tCd4", "14\tTreg\tCd4"]
+) + "\n"
+
+README_LINES = [
+    "# Cluster annotation",
+    "Rows are UMAP clusters from the rpca/harmony run.",
+    "Lineage is called from the Cd8/Cd4 marker panel.",
+]
+
+# How much prior conversation goes in front of the ask. Measured against the
+# backend's own prompt_tokens (recorded per run as `prompt_tokens`), not
+# guessed from a chars-per-token rule: these per-cluster tables tokenize at
+# ~2.2 chars a token where prose runs ~4, so 300k chars overran a
+# 112k-context server outright while 200k came in at 91,108. 207k lands near
+# 94k, which leaves room for the 4k output cap and for the tool exchanges the
+# task itself adds on top. Override to re-tune against a different window.
+#
+# Note what a 400 costs: an overrun is a failed *run*, not a failed task, and
+# it would score as a zero indistinguishable from the model getting the path
+# wrong. Hence the headroom, and hence prompt_tokens in the metrics.
+PAD_CHARS = int(os.environ.get("HPCA_EVAL_PAD_CHARS", "207000"))
+
+_TOPICS = [
+    "the doublet rate after scDblFinder",
+    "the harmony convergence trace",
+    "why cluster 7 splits at higher resolution",
+    "the mitochondrial fraction cutoff",
+    "whether to regress out cell cycle scores",
+    "the Cd8/Cd4 marker panel we settled on",
+    "the ambient RNA correction",
+    "the integration anchors across the four donors",
+]
+
+
+def _pad_pair(index: int) -> list[dict]:
+    """One prior exchange of a long session, deterministic in ``index``.
+
+    Prose with numbers in it, not a repeated block: a degenerate padding is
+    something a model can skip past, and skipping past it is exactly the
+    behaviour these tasks must not accidentally reward.
+    """
+    topic = _TOPICS[index % len(_TOPICS)]
+    cells = 4000 + (index * 137) % 9000
+    pct = 1.0 + (index % 70) / 10
+    rows = "\n".join(
+        f"cluster {c:>2}  n={200 + (index * 31 + c * 17) % 1800:<5} "
+        f"median_genes={900 + (index * 13 + c * 7) % 2100:<5} "
+        f"pct_mt={(index + c) % 12 + 0.5:.1f}"
+        for c in range(15)
+    )
+    return [
+        {
+            "role": "user",
+            "content": (
+                f"Round {index}: can you look at {topic} again? I want to be "
+                f"sure before we freeze the annotation."
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": (
+                f"Checked {topic} on the {cells} cells that survived QC. "
+                f"{pct:.1f}% of barcodes fall outside the threshold, which is "
+                f"in line with the previous rounds. Per-cluster summary:\n{rows}\n"
+                f"Nothing here changes the annotation as it stands."
+            ),
+        },
+    ]
+
+
+def _padding(skip_first: int = 0) -> list[dict]:
+    """Prior turns up to PAD_CHARS, as the model will be handed them."""
+    out: list[dict] = []
+    size = 0
+    index = skip_first
+    while size < PAD_CHARS:
+        pair = _pad_pair(index)
+        out += pair
+        size += sum(len(m["content"]) for m in pair)
+        index += 1
+    return out
+
+
+def _near_preamble(workspace: Path) -> list[dict]:
+    """Long context, and the path is in the ask itself.
+
+    This is the plain question: at ~95k of context, can the model copy a
+    200-character path out of the turn in front of it into a tool call?
+    """
+    return _padding()
+
+
+def _recall_preamble(workspace: Path) -> list[dict]:
+    """Long context, and the path was established once, ~95k tokens ago.
+
+    This is the registry's remaining argument — durable naming — put where it
+    is supposed to pay: the path is far behind, and on the registry side it
+    also has a key, announced the way an auto-registration announces itself.
+    """
+    target = workspace / DEEP_DIR
+    established = [
+        {
+            "role": "user",
+            "content": "Where did the rpca/harmony run put its cluster annotation?",
+        },
+        {
+            "role": "assistant",
+            "content": (
+                f"The run wrote its cluster-annotation results to {target}"
+                + (
+                    ", registered as 'annotation_dir'."
+                    if HAS_REGISTRY
+                    else "."
+                )
+                + " The annotation table itself is annotation.tsv in there, "
+                "with annotation_backup.tsv beside it from the previous round."
+            ),
+        },
+    ]
+    # The establishing turn goes FIRST, then everything else on top of it, so
+    # the path is at the far end of the window rather than next to the ask.
+    return established + _padding()
+
+
+def _annotation_edited(ws: Path) -> bool:
+    path = ws / DEEP_DIR / "annotation.tsv"
+    if not path.is_file():
+        return False
+    text = path.read_text()
+    return "12\tProlif_S\tCd8" in text and "12\tProlif\tCd8" not in text
+
+
+def _readme_written(ws: Path) -> bool:
+    path = ws / DEEP_DIR / "README.md"
+    if not path.is_file():
+        return False
+    lines = [line.strip() for line in path.read_text().splitlines() if line.strip()]
+    return lines[:3] == README_LINES
+
+
+def _backup_deleted(ws: Path) -> bool:
+    # Both halves matter: the right file gone AND the neighbour untouched. A
+    # near-miss path that deletes annotation.tsv is the failure this tier is
+    # looking for, and "the backup is gone" alone would score it as a pass.
+    return (
+        not (ws / DEEP_DIR / "annotation_backup.tsv").exists()
+        and (ws / DEEP_DIR / "annotation.tsv").is_file()
+    )
+
+
+# The tier's own standing text. The default note talks about a path registry,
+# which is false on one of the two branches and would hand the model a wrong
+# picture of its own tools; this says the same thing in terms both sides have.
+_PATHS_SYSTEM_NOTE = (
+    "You are working on files in a workspace. Read a file with read_file "
+    "before editing it, make the change with edit_file (or create_file for a "
+    "new file), delete with delete_file, and when the work is done answer "
+    "directly with a short confirmation. Copy old_lines exactly as they appear "
+    "in the file, including indentation and spacing, without line numbers."
+)
+
+
+def _paths_files() -> dict:
+    """The annotation and its backup, both deep under DEEP_DIR."""
+    return {
+        "annotation": (f"{DEEP_DIR}/annotation.tsv", ANNOTATION_TSV),
+        "annotation_backup": (f"{DEEP_DIR}/annotation_backup.tsv", ANNOTATION_TSV),
+    }
+
+
+def _fake_create(target: str, lines: list[str]) -> dict:
+    """A scripted create for --dry-run, in this branch's own argument shape."""
+    arguments = (
+        {"dir_key": str(Path(target).parent), "name": Path(target).name}
+        if HAS_REGISTRY
+        else {"path": target}
+    )
+    arguments["content_lines"] = lines
+    return {"action": "tool_call", "tool": "create_file", "arguments": arguments}
+
+
+def _fake_target(tool: str, target: str, **extra) -> dict:
+    arguments = {"registry_key" if HAS_REGISTRY else "path": target}
+    arguments.update(extra)
+    return {"action": "tool_call", "tool": tool, "arguments": arguments}
+
+
+_ANNOTATION = "{workspace}/" + DEEP_DIR + "/annotation.tsv"
+_BACKUP = "{workspace}/" + DEEP_DIR + "/annotation_backup.tsv"
+_README = "{workspace}/" + DEEP_DIR + "/README.md"
+_EDIT = {"old_lines": ["12\tProlif\tCd8"], "new_lines": ["12\tProlif_S\tCd8"]}
+
+
+def build_path_tasks() -> list[Task]:
+    """Can a long path survive a long context, across the three write verbs?
+
+    Six tasks, in two halves that ask different questions. The `_long_ctx` half
+    puts the path in the ask and ~95k of session behind it: a copying test. The
+    `_recall` half puts the path ~95k *back* and refers to it by description:
+    the durable-naming test, which is the only argument the path registry had
+    left. Both halves run identically on both branches; what differs is what
+    the branch's own tools let the model do about it.
+    """
+    body = "\n".join(README_LINES)
+    return [
+        Task(
+            name="create_long_ctx",
+            templated=True,
+            system_note=_PATHS_SYSTEM_NOTE,
+            preamble=_near_preamble,
+            files=_paths_files(),
+            prompt=(
+                "Write a README.md into "
+                "{workspace}/" + DEEP_DIR + " with exactly these three lines:\n"
+                + body
+            ),
+            check=_readme_written,
+            fake_calls=[_fake_create(_README, README_LINES)],
+        ),
+        Task(
+            name="edit_long_ctx",
+            templated=True,
+            system_note=_PATHS_SYSTEM_NOTE,
+            preamble=_near_preamble,
+            files=_paths_files(),
+            prompt=(
+                "In {workspace}/" + DEEP_DIR + "/annotation.tsv, cluster 12 is "
+                "mislabelled: change its cell_type from Prolif to Prolif_S. "
+                "Leave every other row exactly as it is."
+            ),
+            check=_annotation_edited,
+            fake_calls=[_fake_target("edit_file", _ANNOTATION, **_EDIT)],
+        ),
+        Task(
+            name="delete_long_ctx",
+            templated=True,
+            system_note=_PATHS_SYSTEM_NOTE,
+            preamble=_near_preamble,
+            files=_paths_files(),
+            prompt=(
+                "Delete {workspace}/" + DEEP_DIR + "/annotation_backup.tsv — "
+                "we do not need the previous round any more. Do not touch "
+                "annotation.tsv."
+            ),
+            check=_backup_deleted,
+            fake_calls=[_fake_target("delete_file", _BACKUP)],
+        ),
+        Task(
+            name="create_recall",
+            templated=True,
+            system_note=_PATHS_SYSTEM_NOTE,
+            preamble=_recall_preamble,
+            files=_paths_files(),
+            prompt=(
+                "Write a README.md into the cluster-annotation results "
+                "directory you told me about earlier, with exactly these three "
+                "lines:\n" + body
+            ),
+            check=_readme_written,
+            fake_calls=[_fake_create(_README, README_LINES)],
+        ),
+        Task(
+            name="edit_recall",
+            templated=True,
+            system_note=_PATHS_SYSTEM_NOTE,
+            preamble=_recall_preamble,
+            files=_paths_files(),
+            prompt=(
+                "In the annotation table in that cluster-annotation results "
+                "directory, cluster 12 is mislabelled: change its cell_type "
+                "from Prolif to Prolif_S. Leave every other row exactly as it is."
+            ),
+            check=_annotation_edited,
+            fake_calls=[_fake_target("edit_file", _ANNOTATION, **_EDIT)],
+        ),
+        Task(
+            name="delete_recall",
+            templated=True,
+            system_note=_PATHS_SYSTEM_NOTE,
+            preamble=_recall_preamble,
+            files=_paths_files(),
+            prompt=(
+                "Delete the previous round's backup table from that "
+                "cluster-annotation results directory — annotation_backup.tsv. "
+                "Do not touch annotation.tsv."
+            ),
+            check=_backup_deleted,
+            fake_calls=[_fake_target("delete_file", _BACKUP)],
+        ),
+    ]
+
+
 # --------------------------------------------------------------- fake model
 
 
@@ -1281,22 +1615,33 @@ async def run_task(task: Task, llm, tools: ToolRegistry, keep: bool = False) -> 
         "tool_errors": 0,
         "decisions": 0,
         "completion_tokens": 0,
+        # the largest context the backend actually saw, which is the whole
+        # point of the `paths` tier: a number claimed in a comment is not one.
+        "prompt_tokens": 0,
         "wall_s": 0.0,
         "error": "",
     }
     started = time.monotonic()
     try:
         ctx = _make_context(workdir)
-        ctx.registry.register("workspace", workspace)
+        registry = getattr(ctx, "registry", None)
+
+        def register(key, path):
+            """Bind a key, where there is something to bind it in."""
+            if registry is not None:
+                registry.register(key, path)
+
+        register("workspace", workspace)
         for key, (fname, content) in task.files.items():
             path = workspace / fname
+            path.parent.mkdir(parents=True, exist_ok=True)
             if isinstance(content, bytes):
                 path.write_bytes(content)
             else:
                 path.write_text(content)
-            ctx.registry.register(key, path)
+            register(key, path)
         for key, fname in getattr(task, "missing", {}).items():
-            ctx.registry.register(key, workspace / fname)
+            register(key, workspace / fname)
         for name, content in getattr(task, "unregistered", {}).items():
             path = workspace / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -1316,8 +1661,10 @@ async def run_task(task: Task, llm, tools: ToolRegistry, keep: bool = False) -> 
                     native=bool(getattr(llm, "uses_native_tools", _not_native)()),
                 ),
             },
-            {"role": "user", "content": _render_prompt(task, workspace)},
         ]
+        if getattr(task, "preamble", None) is not None:
+            messages += task.preamble(workspace)
+        messages.append({"role": "user", "content": _render_prompt(task, workspace)})
         for _ in range(task.max_decisions or MAX_DECISIONS):
             try:
                 decision = await decide(llm, _model_view(messages), tools)
@@ -1327,6 +1674,9 @@ async def run_task(task: Task, llm, tools: ToolRegistry, keep: bool = False) -> 
             metrics["decisions"] += 1
             usage = getattr(decision, "usage", None) or {}
             metrics["completion_tokens"] += int(usage.get("completion_tokens") or 0)
+            metrics["prompt_tokens"] = max(
+                metrics["prompt_tokens"], int(usage.get("prompt_tokens") or 0)
+            )
             if isinstance(decision, DirectResponse):
                 break
             assert isinstance(decision, ToolCall)
@@ -1476,11 +1826,13 @@ async def main() -> int:
     )
     parser.add_argument(
         "--tier",
-        choices=["core", "hard", "shift", "all"],
+        choices=["core", "hard", "shift", "paths", "all"],
         default="core",
         help="core: the original 12 tasks; hard: shapes the old tooling "
         "structurally mishandled; shift: what the key-only interface costs a "
-        "model post-trained on paths; all: every tier",
+        "model post-trained on paths; paths: a long path under ~95k of "
+        "context, which is where a registry key is supposed to win; all: "
+        "every tier",
     )
     parser.add_argument(
         "--tool-protocol",
@@ -1496,6 +1848,7 @@ async def main() -> int:
         "core": build_tasks(),
         "hard": build_hard_tasks(),
         "shift": build_shift_tasks(),
+        "paths": build_path_tasks(),
         "all": build_tasks() + build_hard_tasks() + build_shift_tasks(),
     }[args.tier]
     if args.tasks:
@@ -1549,6 +1902,8 @@ async def main() -> int:
         "mean_tool_calls": round(sum(r["tool_calls"] for r in runs) / n, 3) if n else 0.0,
         "mean_decisions": round(sum(r["decisions"] for r in runs) / n, 3) if n else 0.0,
         "total_completion_tokens": sum(r["completion_tokens"] for r in runs),
+        "max_prompt_tokens": max((r.get("prompt_tokens", 0) for r in runs), default=0),
+        "has_registry": HAS_REGISTRY,
         "total_wall_s": round(sum(r["wall_s"] for r in runs), 1),
     }
     out = {"summary": summary, "runs": runs}
