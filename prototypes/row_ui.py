@@ -537,7 +537,7 @@ class HelpOverlay(Overlay):
         (
             "sessions row",
             [
-                ("enter", "switch to that session"),
+                ("enter", "open that session (its chat, watches and draft)"),
                 ("r", "rename"),
                 ("t", "ask the llm for a title"),
                 ("d", "delete"),
@@ -588,13 +588,19 @@ class HelpOverlay(Overlay):
 
 
 class LlmOverlay(Overlay):
-    """Manage LLMs (m): discovered endpoints left, configured catalog right.
+    """Manage LLMs (m): discovered endpoints above, configured catalog below.
 
-    The two-column shape is the one screen in HPCA that genuinely wants
-    columns, and it keeps them — the row design is about the main view, not a
-    rule to apply everywhere. ←/→ switch side, and the footer offers "add"
-    only on the left and "remove"/"make default" only on the right, which is
-    what the Textual version does by hanging bindings off each panel.
+    Stacked rather than side by side, like the main view. Columns cost this
+    screen more than they cost anywhere else: an endpoint line is a URL and a
+    model name and a context size, which is most of eighty characters before
+    the catalog gets any, and halving the width truncated all of it. Rows give
+    each list the whole width and cost only vertical space, which is the one
+    thing a list can scroll.
+
+    ^↑/^↓ move between the two — the same keys as the main view, so the habit
+    transfers — and the footer offers "add" only on discovered and
+    "remove"/"make default" only on configured, which is what the Textual
+    version does by hanging bindings off each panel.
     """
 
     title = "manage llms"
@@ -605,7 +611,7 @@ class LlmOverlay(Overlay):
         self.note = ""
 
     def footer(self) -> list[tuple[str, str]]:
-        keys = [("←→", "side"), ("↑↓", "move"), ("e", "open")]
+        keys = [("^↑^↓", "row"), ("↑↓", "move"), ("e", "open")]
         if self.side == 0:
             keys.append(("enter", "add to catalog"))
             keys.append(("s", "rescan"))
@@ -614,35 +620,49 @@ class LlmOverlay(Overlay):
             keys.append(("d", "remove"))
         return keys + [("esc", "back")]
 
+    def _heights(self, height: int, width: int) -> list[int]:
+        """Half each, but a short list only takes what it has.
+
+        Same rule as the main view: whatever the top does not need goes to the
+        bottom, so three discovered endpoints do not hold half the screen open
+        above a catalog that has to scroll.
+        """
+        avail = max(4, height - 1)
+        inner = max(8, width - 2)
+        top = max(2, min(1 + len(self.panes[0].flat(inner)), avail // 2))
+        bottom = avail - top
+        if bottom < 2:
+            top, bottom = avail - 2, 2
+        return [top, bottom]
+
     def render(self, width: int, height: int) -> list[str]:
-        half = width // 2
-        body = height - 1
-        left = self.panes[0].render(half - 1, body, focused=self.side == 0)
-        right = self.panes[1].render(width - half, body, focused=self.side == 1)
         out = [BOLD + CYAN + _rule(self.title, width, self.note) + RESET]
-        # One column of rule between them: without it a truncated endpoint on
-        # the left runs straight into the right pane's cursor gutter.
-        out += [a + DIM + "│" + RESET + b for a, b in zip(left, right)]
+        for index, pane_h in enumerate(self._heights(height, width)):
+            out += self.panes[index].render(width, pane_h, focused=self.side == index)
         while len(out) < height:
             out.append(" " * width)
         return out[:height]
 
     def handle(self, key: str, width: int, height: int) -> bool:
         pane = self.panes[self.side]
-        half = max(8, (width // 2) - 2)
-        view = max(1, height - 2)
+        inner = max(8, width - 2)
+        view = max(1, self._heights(height, width)[self.side] - 1)
         if key == "esc":
             return False
-        if key in ("left", "right", "tab"):
+        if key in ("ctrl-up", "ctrl-down", "tab", "shift-tab", "left", "right"):
             self.side = 1 - self.side
         elif key == "up":
-            pane.move(-1, view, half)
+            pane.move(-1, view, inner)
         elif key == "down":
-            pane.move(1, view, half)
+            pane.move(1, view, inner)
+        elif key == "pgup":
+            pane.move(-view, view, inner)
+        elif key == "pgdn":
+            pane.move(view, view, inner)
         elif key == "e":
-            pane.toggle(half)
+            pane.toggle(inner)
         elif key == "E":
-            pane.toggle_all(half)
+            pane.toggle_all(inner)
         elif key == "enter":
             self.note = (
                 "added to the catalog" if self.side == 0 else "made the default"
@@ -775,31 +795,171 @@ class ConfigOverlay(Overlay):
 SESSIONS, CHAT, INPUT, WATCHERS = range(4)
 
 
+class SessionState:
+    """Everything that belongs to one conversation rather than to the app.
+
+    Switching sessions swaps this and nothing else, which is why the chat's
+    cursor line, its open entries and a half-typed message all survive going
+    away and coming back — the same property each row has, one level up. The
+    Textual app parks drafts per session for the same reason; here it falls out
+    of where the Editor lives instead of needing a store.
+
+    Watchers belong to the session that registered them (WatchStore.list takes
+    a session_id), so they swap too. A session with none simply shows an empty
+    row, which the layout already charges nothing for.
+
+    The chat and the watchers are built on first visit. The real app reads a
+    thread from the checkpointer on switch, and this mirrors that: fourteen
+    sessions of four hundred steps should not all exist because one is open.
+    """
+
+    def __init__(
+        self,
+        *,
+        title: str,
+        profile: str,
+        model: str,
+        started: str,
+        size: int,
+        watch_count: int,
+        index: int,
+    ) -> None:
+        self.title = title
+        self.profile = profile
+        self.model = model
+        self.started = started
+        self.size = size
+        self.watch_count = watch_count
+        self.index = index
+        self.draft = Editor()
+        self._chat: Pane | None = None
+        self._watchers: Pane | None = None
+
+    @property
+    def loaded(self) -> bool:
+        return self._chat is not None
+
+    @property
+    def chat(self) -> Pane:
+        if self._chat is None:
+            self._chat = Pane("chat", sample_chat(self.size, self.index, self.title))
+            self._chat.cursor = 10**9  # open at the newest, as the app does
+        return self._chat
+
+    @property
+    def watchers(self) -> Pane:
+        if self._watchers is None:
+            self._watchers = Pane(
+                "watchers", sample_watchers(self.watch_count, self.index)
+            )
+        return self._watchers
+
+    def invalidate(self) -> None:
+        for pane in (self._chat, self._watchers):
+            if pane is not None:
+                pane.invalidate()
+
+
 class RowUI:
     MIN_CHAT = 4
     MAX_INPUT = 6
 
     def __init__(
         self,
-        panes: list[Pane],
+        sessions: list[SessionState],
         *,
-        profile: str,
         learnings: dict[str, str],
         settings_json: str,
         llms: tuple[list[Item], list[Item]],
     ) -> None:
-        self.panes = panes  # sessions, chat, watchers
-        self.input = Editor()
+        self.sessions = sessions
+        self.active = 0
+        self.session_pane = Pane("sessions", [])
+        self._refresh_sessions()
         self.focus = CHAT
-        self.profile = profile
         self.mode = "agent"
-        self.model = "qwen3-27b-fp8"
         self.frame_ms = 0.0
         self.note = ""
         self.overlay: Overlay | None = None
         self._learnings = learnings
         self._settings_json = settings_json
         self._llms = llms
+
+    # ------------------------------------------------------ the open session
+
+    @property
+    def session(self) -> SessionState:
+        return self.sessions[self.active]
+
+    @property
+    def chat(self) -> Pane:
+        return self.session.chat
+
+    @property
+    def watchers(self) -> Pane:
+        return self.session.watchers
+
+    @property
+    def input(self) -> Editor:
+        return self.session.draft
+
+    @property
+    def profile(self) -> str:
+        return self.session.profile
+
+    @property
+    def model(self) -> str:
+        return self.session.model
+
+    @property
+    def panes(self) -> list[Pane]:
+        """The three list rows, top to bottom, for the session on screen."""
+        return [self.session_pane, self.chat, self.watchers]
+
+    def _refresh_sessions(self) -> None:
+        """Redraw the session list so the open one is marked.
+
+        Rebuilt rather than patched because it is fourteen rows, not fourteen
+        hundred — the cost that matters is the chat's, and that one is never
+        rebuilt at all. The cursor is kept: which session you are *looking at*
+        is not the same as which one is open, and moving the highlight must not
+        follow the switch.
+        """
+        cursor = self.session_pane.cursor
+        self.session_pane.items = [
+            Item(
+                head=(
+                    f"{'●' if i == self.active else '○'} "
+                    f"{state.title[:40]:<42}{state.started:>9}   {state.model}"
+                ),
+                body=[
+                    f"session 9f3c{i:04x} · profile {state.profile} · mode agent",
+                    f"{state.size} entries · {(i * 13) % 90}% of context used",
+                    f"{state.watch_count} watches"
+                    + (" · open" if i == self.active else ""),
+                ],
+                accent=GREEN if i == self.active else "",
+            )
+            for i, state in enumerate(self.sessions)
+        ]
+        self.session_pane.invalidate()
+        self.session_pane.cursor = cursor
+
+    def _switch(self, index: int) -> None:
+        if index < 0 or index >= len(self.sessions):
+            return
+        if index == self.active:
+            self.note = "already open"
+            return
+        self.active = index
+        self._refresh_sessions()
+        self.note = f"opened “{self.session.title}”"
+
+    def invalidate(self) -> None:
+        """Every pane that has been built — a session never visited has none."""
+        self.session_pane.invalidate()
+        for state in self.sessions:
+            state.invalidate()
 
     # ------------------------------------------------------------- geometry
 
@@ -938,7 +1098,7 @@ class RowUI:
         text = self.input.text().strip()
         if not text:
             return
-        chat = self.panes[1]
+        chat = self.chat
         chat.items.append(Item(head=f"you   {text}", accent=BLUE))
         chat.items.append(
             Item(
@@ -958,7 +1118,11 @@ class RowUI:
         inner = max(8, width - 2)
         slots = [SESSIONS, CHAT, INPUT, WATCHERS]
         view = max(1, self._heights(height, width)[slots.index(self.focus)] - 1)
-        pane = self.panes[{SESSIONS: 0, CHAT: 1, WATCHERS: 2}[self.focus]]
+        pane = {
+            SESSIONS: self.session_pane,
+            CHAT: self.chat,
+            WATCHERS: self.watchers,
+        }[self.focus]
         self.note = ""
         if key == "?":
             self.overlay = HelpOverlay()
@@ -991,11 +1155,10 @@ class RowUI:
         elif key == "E":
             pane.toggle_all(inner)
         elif key == "enter":
-            self.note = {
-                SESSIONS: "switched to that session",
-                CHAT: "…",
-                WATCHERS: "peeking at the log",
-            }[self.focus]
+            if self.focus == SESSIONS:
+                self._switch(self.session_pane.current(inner))
+            elif self.focus == WATCHERS:
+                self.note = "peeking at the log"
         elif key == "r" and self.focus == SESSIONS:
             self.note = "rename: a modal in the real app"
         elif key == "t" and self.focus == SESSIONS:
@@ -1070,28 +1233,19 @@ LEARNINGS = {
 }
 
 
-def sample_sessions(count: int) -> list[Item]:
-    return [
-        Item(
-            head=f"{TASKS[i % len(TASKS)][:42]:<44}{2 + i * 7:>4}m ago   qwen3-27b",
-            body=[
-                f"session 9f3c{i:04x} · profile hpc · mode agent",
-                f"{4 + (i * 7) % 60} messages · {(i * 13) % 90}% of context used",
-                f"last: {REPLIES[i % len(REPLIES)]}",
-            ],
-            accent=GREEN if i == 0 else "",
-        )
-        for i in range(count)
-    ]
-
-
-def sample_chat(count: int) -> list[Item]:
+def sample_chat(count: int, seed: int = 0, task: str = "") -> list[Item]:
+    """One session's conversation. ``seed`` shifts the content so that two
+    sessions never look alike, and ``task`` is what the user keeps asking
+    about — a session is about one thing, and that is what makes a switch
+    visible at a glance."""
     tools = ["read_file", "edit_file", "create_file", "run_bash", "list_dir"]
+    task = task or TASKS[seed % len(TASKS)]
     items: list[Item] = []
-    for i in range(count):
-        slot = i % 3
+    for n in range(count):
+        i = n + seed * 7
+        slot = n % 3
         if slot == 0:
-            items.append(Item(head=f"you   {TASKS[i % len(TASKS)]}", accent=BLUE))
+            items.append(Item(head=f"you   {task}", accent=BLUE))
         elif slot == 1:
             steps = 3 + (i * 5) % 18
             names = [tools[(i + k) % len(tools)] for k in range(steps)]
@@ -1121,10 +1275,11 @@ def sample_chat(count: int) -> list[Item]:
     return items
 
 
-def sample_watchers(count: int) -> list[Item]:
+def sample_watchers(count: int, seed: int = 0) -> list[Item]:
     states = [("RUNNING", GREEN), ("PENDING", ""), ("COMPLETED", ""), ("FAILED", RED)]
     out = []
-    for i in range(count):
+    for n in range(count):
+        i = n + seed * 3
         state, accent = states[i % len(states)]
         out.append(
             Item(
@@ -1133,7 +1288,7 @@ def sample_watchers(count: int) -> list[Item]:
                     f"last write {3 + i * 11}s ago"
                 ),
                 body=[
-                    f"/scratch/proj/cohort/run3/logs/step{i}.log",
+                    f"/scratch/proj/cohort/run{seed}/logs/step{n}.log",
                     "[12:41:07] merging shard 3 of 8",
                     "[12:41:44] merging shard 4 of 8",
                 ],
@@ -1179,20 +1334,22 @@ def sample_llms() -> tuple[list[Item], list[Item]]:
             body=["in the manifest, did not answer the probe"],
         ),
     ]
+    # The whole width, which is the point of stacking these rather than
+    # putting them in a column: url, model and context all fit on one line.
     configured = [
         Item(
-            head="★ ● cluster-qwen    http://10.12.4.31:20001/v1",
-            body=["qwen3-27b-fp8 · 112k ctx · the active default"],
+            head="★ ● cluster-qwen   http://10.12.4.31:20001/v1   qwen3-27b-fp8   112k",
+            body=["the active default", "answered the last probe 42s ago"],
             accent=GREEN,
         ),
         Item(
-            head="  ● tunnel-qwen     http://localhost:20001/v1",
-            body=["qwen3-27b-fp8 · 112k ctx"],
+            head="  ● tunnel-qwen    http://localhost:20001/v1     qwen3-27b-fp8   112k",
+            body=["the same server through an ssh tunnel"],
             accent=GREEN,
         ),
         Item(
-            head="  ○ big-llama       http://10.12.4.55:20001/v1",
-            body=["llama-3.3-70b · 128k ctx · not answering"],
+            head="  ○ big-llama      http://10.12.4.55:20001/v1    llama-3.3-70b   128k",
+            body=["not answering; last seen 3d ago"],
         ),
     ]
     return discovered, configured
@@ -1202,19 +1359,28 @@ def sample_llms() -> tuple[list[Item], list[Item]]:
 
 
 def build(chat: int = 400, sessions: int = 14, watchers: int = 5) -> RowUI:
-    ui = RowUI(
-        [
-            Pane("sessions", sample_sessions(sessions)),
-            Pane("chat", sample_chat(chat)),
-            Pane("watchers", sample_watchers(watchers)),
-        ],
-        profile="hpc",
+    states = [
+        SessionState(
+            title=TASKS[i % len(TASKS)],
+            profile=("hpc", "writing", "default")[i % 3],
+            model="qwen3-27b-fp8" if i % 2 == 0 else "llama-3.3-70b",
+            started=f"{2 + i * 7}m ago",
+            # Varied on purpose: a session with a handful of entries next to
+            # one with hundreds is what shows the chat row taking up the slack.
+            size=max(6, chat // (1 + i % 4)),
+            # And some with no watches at all, which is the case the layout
+            # charges nothing for.
+            watch_count=watchers if i == 0 else (i * 3) % 4,
+            index=i,
+        )
+        for i in range(sessions)
+    ]
+    return RowUI(
+        states,
         learnings=dict(LEARNINGS),
         settings_json=SETTINGS_JSON,
         llms=sample_llms(),
     )
-    ui.panes[1].cursor = 10**9
-    return ui
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1238,8 +1404,7 @@ def main(argv: list[str] | None = None) -> int:
             resized = (width, height) != size
             if resized:
                 size = (width, height)
-                for pane in ui.panes:
-                    pane.invalidate()
+                ui.invalidate()
             started = time.perf_counter()
             screen.paint(ui.render(width, height), full=resized)
             # Shown on the next frame rather than this one: measuring the frame
