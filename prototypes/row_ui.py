@@ -27,8 +27,8 @@ is TypeScript, so what is ported here is the architecture, not the library:
 Keys follow the ones already bound in the Textual app (app.py BINDINGS) so
 that muscle memory survives the move: m manage llms, a profiles & learnings,
 c config editor, r/t/d on a session, d unwatch, q quit. The one addition is
-``e``/``E`` to open an entry, which the row design needs and the column design
-had no equivalent of.
+→/← to open and close an entry, which the row design needs and the column
+design had no equivalent of.
 
 The message box edits the way an editor does: it wraps rather than overflowing,
 ctrl+arrow moves by word, ctrl+backspace and ctrl+delete cut one, and shift with
@@ -705,25 +705,65 @@ class Pane:
         self.cursor = max(0, min(total - 1, self.cursor + delta))
         self._scroll_into_view(view_h, total)
 
-    def toggle(self, width: int) -> None:
+    def expand(self, width: int) -> bool:
+        """Open the entry under the cursor. False if there was nothing to open."""
         item = self.current(width)
-        if item < 0 or not self.items[item].body:
-            return
-        self.expanded.symmetric_difference_update({item})
+        if item < 0 or not self.items[item].body or item in self.expanded:
+            return False
+        self.expanded.add(item)
         self.invalidate()
         # Land back on the entry's own first line: opening one twelve lines
         # long and being left in the middle of it reads as a jump.
         self._go_to(item, width)
+        return True
 
-    def toggle_all(self, width: int) -> None:
+    def collapse(self, width: int) -> bool:
+        """Close the entry the cursor is anywhere inside. False if it was shut."""
         item = self.current(width)
-        if self.expanded:
-            self.expanded.clear()
-        else:
-            self.expanded = {i for i, e in enumerate(self.items) if e.body}
+        if item < 0 or item not in self.expanded:
+            return False
+        self.expanded.discard(item)
+        self.invalidate()
+        self._go_to(item, width)
+        return True
+
+    def expand_all(self, width: int) -> None:
+        item = self.current(width)
+        self.expanded = {i for i, entry in enumerate(self.items) if entry.body}
         self.invalidate()
         if item >= 0:
             self._go_to(item, width)
+
+    def collapse_all(self, width: int) -> None:
+        item = self.current(width)
+        self.expanded.clear()
+        self.invalidate()
+        if item >= 0:
+            self._go_to(item, width)
+
+    def reorder(self, delta: int, view_h: int, width: int) -> bool:
+        """Move the entry under the cursor up or down past its neighbour.
+
+        The cursor travels with the entry rather than staying on the line,
+        which is what makes holding alt+↓ walk one watcher down the list
+        instead of shuffling a different one each press. ``expanded`` is keyed
+        by position, so the two entries trade that flag along with their slot.
+        """
+        item = self.current(width)
+        target = item + delta
+        if item < 0 or not 0 <= target < len(self.items):
+            return False
+        self.items[item], self.items[target] = self.items[target], self.items[item]
+        was = (item in self.expanded, target in self.expanded)
+        self.expanded.difference_update({item, target})
+        if was[1]:
+            self.expanded.add(item)
+        if was[0]:
+            self.expanded.add(target)
+        self.invalidate()
+        self._go_to(target, width)
+        self._scroll_into_view(view_h, len(self.flat(width)))
+        return True
 
     # -------------------------------------------------------------- drawing
 
@@ -825,14 +865,15 @@ class HelpOverlay(Overlay):
                 ("↑ ↓", "move one line"),
                 ("pgup pgdn", "move one screen"),
                 ("home end", "first / last line"),
-                ("e", "open or close the entry under the cursor"),
-                ("E", "open or close every entry in the row"),
+                ("→", "open the entry under the cursor, or step into it"),
+                ("←", "close it again"),
+                ("shift-→ ←", "open or close every entry in the row"),
             ],
         ),
         (
             "sessions row",
             [
-                ("enter", "open that session (its chat, watches and draft)"),
+                ("enter", "open it and go straight to the message box"),
                 ("r", "rename"),
                 ("t", "ask the llm for a title"),
                 ("d", "delete"),
@@ -937,7 +978,7 @@ class LlmOverlay(Overlay):
         self.note = ""
 
     def footer(self) -> list[tuple[str, str]]:
-        keys = [("^↑^↓", "row"), ("↑↓", "move"), ("e", "open")]
+        keys = [("^↑^↓", "row"), ("↑↓", "move"), ("→←", "open")]
         if self.side == 0:
             keys.append(("enter", "add to catalog"))
             keys.append(("s", "rescan"))
@@ -985,10 +1026,15 @@ class LlmOverlay(Overlay):
             pane.move(-view, view, inner)
         elif key == "pgdn":
             pane.move(view, view, inner)
-        elif key == "e":
-            pane.toggle(inner)
-        elif key == "E":
-            pane.toggle_all(inner)
+        elif key == "right":
+            if not pane.expand(inner) and pane.current(inner) in pane.expanded:
+                pane.move(1, view, inner)
+        elif key == "left":
+            pane.collapse(inner)
+        elif key == "shift-right":
+            pane.expand_all(inner)
+        elif key == "shift-left":
+            pane.collapse_all(inner)
         elif key == "enter":
             self.note = (
                 "added to the catalog" if self.side == 0 else "made the default"
@@ -1018,7 +1064,7 @@ class ProfilesOverlay(Overlay):
             return [("^s", "keep"), ("esc", "discard"), ("↑↓←→", "move")]
         return [
             ("↑↓", "move"),
-            ("e", "open"),
+            ("→←", "open"),
             ("enter", "edit learnings"),
             ("c", "copy"),
             ("d", "delete"),
@@ -1057,10 +1103,18 @@ class ProfilesOverlay(Overlay):
             self.pane.move(-1, view, inner)
         elif key == "down":
             self.pane.move(1, view, inner)
-        elif key == "e":
-            self.pane.toggle(inner)
-        elif key == "E":
-            self.pane.toggle_all(inner)
+        elif key == "right":
+            if (
+                not self.pane.expand(inner)
+                and self.pane.current(inner) in self.pane.expanded
+            ):
+                self.pane.move(1, view, inner)
+        elif key == "left":
+            self.pane.collapse(inner)
+        elif key == "shift-right":
+            self.pane.expand_all(inner)
+        elif key == "shift-left":
+            self.pane.collapse_all(inner)
         elif key == "enter":
             item = self.pane.current(inner)
             name = self.pane.items[item].head.split("  ")[0].strip("▸▾ ")
@@ -1401,7 +1455,7 @@ class RowUI:
                 ("^⌫ ^del", "cut word"),
                 ("^u", "clear"),
             ] + common
-        rows = [("↑↓", "line"), ("e", "open"), ("E", "open all")]
+        rows = [("↑↓", "line"), ("→←", "open"), ("⇧→←", "open all")]
         if self.focus == SESSIONS:
             rows += [("enter", "switch"), ("r", "rename"), ("t", "retitle"), ("d", "delete")]
         elif self.focus == CHAT:
@@ -1494,13 +1548,26 @@ class RowUI:
             pane.move(-(10**9), view, inner)
         elif key == "end":
             pane.move(10**9, view, inner)
-        elif key == "e":
-            pane.toggle(inner)
-        elif key == "E":
-            pane.toggle_all(inner)
+        elif key == "right":
+            # Open it; on one already open, step into what it opened, the way
+            # a file tree does. On an entry with no body, nothing.
+            if not pane.expand(inner) and pane.current(inner) in pane.expanded:
+                pane.move(1, view, inner)
+        elif key == "left":
+            pane.collapse(inner)
+        elif key == "shift-right":
+            pane.expand_all(inner)
+        elif key == "shift-left":
+            pane.collapse_all(inner)
+        elif key in ("alt-up", "alt-down") and self.focus == WATCHERS:
+            moved = pane.reorder(-1 if key == "alt-up" else 1, view, inner)
+            self.note = "moved" if moved else ""
         elif key == "enter":
             if self.focus == SESSIONS:
                 self._switch(self.session_pane.current(inner))
+                # Straight to the box: opening a session is something you do
+                # in order to say something in it.
+                self.focus = INPUT
             elif self.focus == WATCHERS:
                 self.note = "peeking at the log"
         elif key == "r" and self.focus == SESSIONS:
