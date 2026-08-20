@@ -40,7 +40,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import select
 import sys
 import termios
@@ -94,66 +93,17 @@ def _rule(label: str, width: int, right: str = "") -> str:
     return _pad(f"{left}{'─' * gap}{tail}", width)
 
 
-# Click and wheel reporting (?1000) in SGR coordinates (?1006). Deliberately
-# NOT ?1002 or ?1003: those add motion events, and on a cluster over ssh every
-# twitch of the mouse would then be bytes on the wire for no gain — nothing
-# here needs hover or drag.
-#
-# ?1006 is not optional. The original encoding puts the column in one byte with
-# an offset of 32, so it silently stops working past column 223 — which a wide
-# terminal on a big monitor really is.
-MOUSE_ON = f"{ESC}[?1000h{ESC}[?1006h"
-MOUSE_OFF = f"{ESC}[?1006l{ESC}[?1000l"
-
-
-@dataclass
-class Mouse:
-    """One click or wheel notch, in 1-based screen coordinates."""
-
-    button: int
-    x: int
-    y: int
-    press: bool
-
-    WHEEL_UP = 64
-    WHEEL_DOWN = 65
-
-    @property
-    def wheel(self) -> int:
-        """-1 up, +1 down, 0 if this is not a wheel event."""
-        if self.button == self.WHEEL_UP:
-            return -1
-        if self.button == self.WHEEL_DOWN:
-            return 1
-        return 0
-
-
 class Screen:
     """Raw terminal, alternate screen, differential repaint."""
 
-    def __init__(self, mouse: bool = True) -> None:
+    def __init__(self) -> None:
         self.fd = sys.stdin.fileno()
         self._saved: list | None = None
         self._prev: list[str] = []
-        self.mouse = mouse
-
-    def set_mouse(self, on: bool) -> None:
-        """Grab or release the mouse.
-
-        Worth being able to release: while the app holds the mouse, the
-        terminal's own drag-to-select is suppressed, and copying a path out of
-        the log is something this app's users do constantly. Most terminals
-        let shift-drag through regardless, but not all, so the escape hatch is
-        a key rather than a footnote.
-        """
-        self.mouse = on
-        _write(MOUSE_ON if on else MOUSE_OFF)
 
     def __enter__(self) -> "Screen":
         self._saved = termios.tcgetattr(self.fd)
         tty.setraw(self.fd)
-        if self.mouse:
-            _write(MOUSE_ON)
         # ?1049h alternate screen, ?25l hide the cursor, ?7l autowrap off.
         # Autowrap matters: every line is padded to the full width and painted
         # by absolute cursor address, and a character landing in the last cell
@@ -163,7 +113,7 @@ class Screen:
         return self
 
     def __exit__(self, *exc) -> None:
-        _write(f"{MOUSE_OFF}{ESC}[?7h{ESC}[?25h{ESC}[?1049l")
+        _write(f"{ESC}[?7h{ESC}[?25h{ESC}[?1049l")
         if self._saved is not None:
             termios.tcsetattr(self.fd, termios.TCSADRAIN, self._saved)
 
@@ -218,29 +168,12 @@ KEYS = {
 }
 
 
-# SGR mouse: ESC [ < button ; col ; row  then M for press, m for release.
-MOUSE_RE = re.compile(r"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
-
-
-def decode(data: bytes) -> list[str | Mouse]:
-    """One read into a list of key names and mouse events.
-
-    Mouse reports are matched first and by pattern, not by the fixed table:
-    their length depends on the coordinates, so a terminal 9 columns wide and
-    one 900 wide send sequences of different sizes for the same click.
-    """
+def decode(data: bytes) -> list[str]:
+    """One read into a list of key names, longest escape sequence first."""
     text = data.decode("utf-8", "replace")
-    keys: list[str | Mouse] = []
+    keys: list[str] = []
     at = 0
     while at < len(text):
-        hit = MOUSE_RE.match(text, at)
-        if hit:
-            button, col, row, kind = hit.groups()
-            keys.append(
-                Mouse(int(button), int(col), int(row), press=kind == "M")
-            )
-            at = hit.end()
-            continue
         for size in (6, 5, 4, 3, 2):
             chunk = text[at : at + size]
             if chunk in KEYS:
@@ -477,21 +410,6 @@ class Pane:
         self.cursor = max(0, min(total - 1, self.cursor + delta))
         self._scroll_into_view(view_h, total)
 
-    def click(self, body_row: int, width: int) -> bool:
-        """Put the cursor on the line ``body_row`` rows below the title.
-
-        Hit-testing is this cheap because the pane already knows which flat
-        line sits at the top of its view: screen row minus title minus offset
-        is the answer, with no widget tree to walk and nothing to ask about
-        its own size.
-        """
-        lines = self.flat(width)
-        row = self.offset + body_row
-        if not (0 <= row < len(lines)):
-            return False
-        self.cursor = row
-        return True
-
     def toggle(self, width: int) -> None:
         item = self.current(width)
         if item < 0 or not self.items[item].body:
@@ -586,9 +504,6 @@ class Overlay:
     def footer(self) -> list[tuple[str, str]]:
         return [("esc", "back")]
 
-    def click(self, event: "Mouse", width: int, height: int) -> None:
-        """Overlays that want the mouse override this; the rest ignore it."""
-
 
 class HelpOverlay(Overlay):
     """Every key, since the footer can only ever show the ones that fit."""
@@ -639,17 +554,6 @@ class HelpOverlay(Overlay):
                 ("alt-enter", "new line"),
                 ("^u", "clear"),
                 ("esc", "back to the chat"),
-            ],
-        ),
-        (
-            "mouse",
-            [
-                ("click", "focus that row and put the cursor on that line"),
-                ("click title", "focus the row, leaving its cursor alone"),
-                ("double click", "open or close the entry"),
-                ("wheel", "move the cursor in the row under the pointer"),
-                ("M", "release the mouse so the terminal can select text"),
-                ("shift-drag", "select text without releasing it (most terminals)"),
             ],
         ),
         (
@@ -769,23 +673,6 @@ class LlmOverlay(Overlay):
             self.note = "rescanned: 3 endpoints"
         return True
 
-    def click(self, event: Mouse, width: int, height: int) -> None:
-        # Screen row 0 is the app header and row 1 is this overlay's title, so
-        # the first pane line is screen row 2.
-        y = event.y - 2
-        inner = max(8, width - 2)
-        at = 0
-        for index, pane_h in enumerate(self._heights(height, width)):
-            if at <= y < at + pane_h:
-                if event.wheel:
-                    self.panes[index].move(event.wheel * 3, max(1, pane_h - 1), inner)
-                elif event.press:
-                    self.side = index
-                    if y > at:
-                        self.panes[index].click(y - at - 1, inner)
-                return
-            at += pane_h
-
 
 class ProfilesOverlay(Overlay):
     """Profiles & learnings (a): the list, and one profile's memories open in
@@ -860,25 +747,6 @@ class ProfilesOverlay(Overlay):
             self.note = "deleted (never the default, never one in use)"
         return True
 
-    def click(self, event: Mouse, width: int, height: int) -> None:
-        y = event.y - 2  # app header, then this overlay's title
-        if self.editor is not None:
-            if event.wheel:
-                self.editor.move(event.wheel * 3, 0)
-            elif event.press and y >= 0:
-                self.editor.row = min(
-                    self.editor.offset + y, len(self.editor.lines) - 1
-                )
-                self.editor.col = min(
-                    len(self.editor.lines[self.editor.row]), max(0, event.x - 1)
-                )
-            return
-        inner = max(8, width - 2)
-        if event.wheel:
-            self.pane.move(event.wheel * 3, max(1, height - 2), inner)
-        elif event.press and y > 0:
-            self.pane.click(y - 1, inner)
-
 
 class ConfigOverlay(Overlay):
     """Config editor (c): raw JSON over the whole settings file, validated on
@@ -920,18 +788,6 @@ class ConfigOverlay(Overlay):
         else:
             self.editor.handle(key)
         return True
-
-    def click(self, event: Mouse, width: int, height: int) -> None:
-        y = event.y - 2
-        if event.wheel:
-            self.editor.move(event.wheel * 3, 0)
-        elif event.press and y >= 0:
-            self.editor.row = min(self.editor.offset + y, len(self.editor.lines) - 1)
-            gutter = len(str(len(self.editor.lines))) + 2
-            self.editor.col = min(
-                len(self.editor.lines[self.editor.row]),
-                max(0, event.x - 1 - gutter),
-            )
 
 
 # ----------------------------------------------------------------------- app
@@ -1025,8 +881,6 @@ class RowUI:
         self.frame_ms = 0.0
         self.note = ""
         self.overlay: Overlay | None = None
-        self.mouse = True
-        self._last_click: tuple[tuple[int, int], float] | None = None
         self._learnings = learnings
         self._settings_json = settings_json
         self._llms = llms
@@ -1142,30 +996,6 @@ class RowUI:
             middle = max(1, avail - 6)
         return [top, middle, inp, bottom]
 
-    def _pane(self, slot: int) -> Pane:
-        return {
-            SESSIONS: self.session_pane,
-            CHAT: self.chat,
-            WATCHERS: self.watchers,
-        }[slot]
-
-    def _layout(self, width: int, height: int) -> list[tuple[int, int, int]]:
-        """``(slot, first screen row, height)`` for each row.
-
-        One source of truth for drawing and for hit-testing, so a click can
-        never land on a row the frame did not draw there — which is the whole
-        reason mouse support is cheap here: the geometry is already a list of
-        numbers this code owns, not something to ask a widget tree about.
-        """
-        rows: list[tuple[int, int, int]] = []
-        at = 1  # screen row 0 is the header
-        for slot, pane_h in zip(
-            (SESSIONS, CHAT, INPUT, WATCHERS), self._heights(height, width)
-        ):
-            rows.append((slot, at, pane_h))
-            at += pane_h
-        return rows
-
     # -------------------------------------------------------------- drawing
 
     def render(self, width: int, height: int) -> list[str]:
@@ -1176,13 +1006,18 @@ class RowUI:
             while len(out) < height:
                 out.insert(len(out) - 1, " " * width)
             return out[:height]
-        for slot, _, pane_h in self._layout(width, height):
+        heights = self._heights(height, width)
+        order = [
+            (SESSIONS, self.panes[0], heights[0]),
+            (CHAT, self.panes[1], heights[1]),
+            (INPUT, None, heights[2]),
+            (WATCHERS, self.panes[2], heights[3]),
+        ]
+        for slot, pane, pane_h in order:
             if slot == INPUT:
                 out += self._render_input(width, pane_h)
             else:
-                out += self._pane(slot).render(
-                    width, pane_h, focused=self.focus == slot
-                )
+                out += pane.render(width, pane_h, focused=self.focus == slot)
         out.append(footer_line(self._keys(), width, self.note))
         while len(out) < height:
             out.insert(len(out) - 1, " " * width)
@@ -1214,12 +1049,7 @@ class RowUI:
         one function, which is easier to read and impossible to get out of step
         with what the keys actually do.
         """
-        common = [
-            ("^↑^↓", "row"),
-            ("M", "mouse off" if self.mouse else "mouse on"),
-            ("?", "keys"),
-            ("q", "quit"),
-        ]
+        common = [("^↑^↓", "row"), ("?", "keys"), ("q", "quit")]
         if self.focus == INPUT:
             return [
                 ("enter", "send"),
@@ -1237,65 +1067,6 @@ class RowUI:
         return rows + [("m", "llms"), ("a", "profiles"), ("c", "config")] + common
 
     # --------------------------------------------------------------- input
-
-    def click(self, event: Mouse, width: int, height: int) -> None:
-        """A click or wheel notch anywhere on the screen.
-
-        Clicking a row focuses it *and* puts the cursor on the line clicked,
-        because those are one intention, not two. Clicking a title focuses the
-        row without moving its cursor — which is how you take a row's focus
-        without losing the line you had.
-
-        The wheel moves the cursor rather than the view. In a UI where the
-        cursor decides what ``e`` opens and what enter acts on, scrolling the
-        highlight off screen would leave every key aimed at something the user
-        cannot see.
-        """
-        if self.overlay is not None:
-            self.overlay.click(event, width, height - 2)
-            return
-        y = event.y - 1
-        if y <= 0 or y >= height - 1:
-            return  # the header and the footer are not targets
-        for slot, top, pane_h in self._layout(width, height):
-            if not (top <= y < top + pane_h):
-                continue
-            if event.wheel:
-                if slot != INPUT:
-                    self._pane(slot).move(
-                        event.wheel * 3, max(1, pane_h - 1), max(8, width - 2)
-                    )
-                return
-            if not event.press:
-                return
-            self.focus = slot
-            if slot == INPUT:
-                self._click_input(event, top)
-            elif y > top:
-                pane = self._pane(slot)
-                inner = max(8, width - 2)
-                if pane.click(y - top - 1, inner):
-                    self._double(slot, pane, inner)
-            return
-
-    def _click_input(self, event: Mouse, top: int) -> None:
-        row = max(0, event.y - 1 - top - 1)
-        self.input.row = min(self.input.offset + row, len(self.input.lines) - 1)
-        # "› " sits in front of the text.
-        self.input.col = min(
-            len(self.input.lines[self.input.row]), max(0, event.x - 3)
-        )
-
-    def _double(self, slot: int, pane: Pane, inner: int) -> None:
-        """Two clicks on the same line open it — the mouse's ``e``."""
-        now = time.monotonic()
-        where = (slot, pane.cursor)
-        if self._last_click and self._last_click[0] == where:
-            if now - self._last_click[1] < 0.4:
-                pane.toggle(inner)
-                self._last_click = None
-                return
-        self._last_click = (where, now)
 
     def handle(self, key: str, width: int, height: int) -> bool:
         if self.overlay is not None:
@@ -1353,13 +1124,7 @@ class RowUI:
             WATCHERS: self.watchers,
         }[self.focus]
         self.note = ""
-        if key == "M":
-            # Releasing the mouse gives the terminal its drag-to-select back.
-            # Most terminals let shift-drag through anyway, but not all, and
-            # copying a path out of the log is not a thing to leave to luck.
-            self.mouse = not self.mouse
-            self.note = "mouse on" if self.mouse else "mouse off — drag to select"
-        elif key == "?":
+        if key == "?":
             self.overlay = HelpOverlay()
         elif key == "m":
             self.overlay = LlmOverlay(*self._llms)
@@ -1653,13 +1418,9 @@ def main(argv: list[str] | None = None) -> int:
             data = os.read(screen.fd, 4096)
             if not data:
                 return 0
-            for event in decode(data):
-                if isinstance(event, Mouse):
-                    ui.click(event, width, height)
-                elif not ui.handle(event, width, height):
+            for key in decode(data):
+                if not ui.handle(key, width, height):
                     return 0
-            if ui.mouse != screen.mouse:
-                screen.set_mouse(ui.mouse)
 
 
 if __name__ == "__main__":
