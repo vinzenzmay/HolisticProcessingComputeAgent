@@ -1,25 +1,29 @@
 """Core tool suite (§5.1): script creation with mandatory syntax gate, script
-execution through the tracked runner, bounded file reading, path listing.
+execution through the tracked runner, bounded file reading, script listing.
 
 Scripts run two ways, both through the tracked runner (§5.1 — there is no
 free-form shell tool; a script is the unit of execution), split on the one
 axis the model cannot get back by itself: *when the result arrives*.
 ``run_bash`` writes a throwaway script inline and waits — the look-around
 workhorse (find a file, check a program exists, list conda environments) and,
-via ``{key}`` expansion, the way a *registered* script is run synchronously
-too. ``start_background_script`` runs a registered script in the background,
+via ``{name}`` expansion, the way a *kept* script is run synchronously
+too. ``start_background_script`` runs a kept script in the background,
 for work that outlives the turn; it alone reports back as a completion event
 (§5.4), because ``run_bash`` already handed its output over.
 
-The retired third tool was ``run_script`` (registered script, waits). Splitting
-on where the script came from bought nothing — its description advertised the
-same look-around job as ``run_bash``, so the model had two plausible tools for
-one move — while ``{key}`` expansion keeps the §4.3 "tools take keys, never
-literal paths" rule intact instead of carving an exception into it.
+The retired third tool was ``run_script`` (kept script, waits). Splitting on
+where the script came from bought nothing — its description advertised the same
+look-around job as ``run_bash``, so the model had two plausible tools for one
+move — while ``{name}`` expansion keeps a kept script reachable without making
+the model retype the scripts dir.
 
-Handlers return strings for the model; exceptions (unknown registry keys,
-key conflicts) propagate and are surfaced as ``[tool error]`` messages by the
-graph — the message text is written for the model to act on.
+A script's *name* is the one handle here that is not a path, and it is not an
+indirection either: it is the file's own name in ``ctx.scripts_dir``, so
+``script_path`` answers with a directory lookup and nothing is stored anywhere.
+
+Handlers return strings for the model; exceptions propagate and are surfaced as
+``[tool error]`` messages by the graph — the message text is written for the
+model to act on.
 """
 
 from __future__ import annotations
@@ -37,7 +41,7 @@ from hpca.agent.context import ToolContext
 from hpca.agent.history import carries_elision_marker
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.checks import syntax_check
-from hpca.registry import RegistryError, registered_note
+from hpca.paths import PathError, resolve_path
 from hpca.verify_code import format_gate_failure, format_gate_warnings, verify_script
 
 SCRIPT_SUFFIX = {"bash": ".sh", "python": ".py", "R": ".R", "snakemake": ".smk"}
@@ -67,13 +71,13 @@ INTERPRETER = {
 KEY_CHARS = r"[a-z0-9_.-]+"
 KEY_PATTERN = rf"^{KEY_CHARS}$"
 
-# A `{key}` in a run_bash line is a registry reference, expanded to the
-# registered absolute path before anything else looks at the script. The
-# lookbehind keeps `${VAR}` out; the character class keeps `{a,b}` brace
-# expansion and `awk '{print $1}'` out (comma, space and `$` are all excluded).
-# `{print}` still matches by shape, which is why expansion substitutes only
-# keys that are actually registered and leaves everything else untouched —
-# there is no way to tell a bare awk body from a typo'd key by shape alone.
+# A `{name}` in a run_bash line is a kept script, expanded to its absolute
+# path before anything else looks at the script. The lookbehind keeps `${VAR}`
+# out; the character class keeps `{a,b}` brace expansion and `awk '{print $1}'`
+# out (comma, space and `$` are all excluded). `{print}` still matches by
+# shape, which is why expansion substitutes only names that really are scripts
+# and leaves everything else untouched — there is no way to tell a bare awk
+# body from a typo'd name by shape alone.
 _KEY_REF = re.compile(rf"(?<![$\\]){{({KEY_CHARS})}}")
 MAX_KEYS_IN_NOTE = 30
 
@@ -82,8 +86,8 @@ class CreateScriptParams(BaseModel):
     kind: Literal["bash", "python", "R", "snakemake"] = Field(
         description="Script language"
     )
-    registry_key: str = Field(
-        pattern=KEY_PATTERN, description="New registry key for the script"
+    name: str = Field(
+        pattern=KEY_PATTERN, description="Name for the script, without a suffix"
     )
     # An array of lines, not one string: the live model reliably fills string
     # arrays but mangles \n escapes in long strings under guided decoding.
@@ -93,26 +97,57 @@ class CreateScriptParams(BaseModel):
     )
 
 
+def script_path(name: str, ctx: object) -> Path | None:
+    """The kept script called ``name``, or None.
+
+    A script's name IS its file name in the scripts dir, so there is nothing to
+    look up: the four suffixes are tried in turn. That is the whole of what the
+    registry did for scripts, minus the table.
+    """
+    scripts_dir = getattr(ctx, "scripts_dir", None)
+    if scripts_dir is None:
+        return None
+    for suffix in SCRIPT_SUFFIX.values():
+        candidate = Path(scripts_dir) / f"{name}{suffix}"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def script_names(ctx: object) -> list[str]:
+    """The kept scripts, by name, for the notes that list what does exist."""
+    scripts_dir = getattr(ctx, "scripts_dir", None)
+    if scripts_dir is None or not Path(scripts_dir).is_dir():
+        return []
+    suffixes = set(SCRIPT_SUFFIX.values())
+    return sorted(
+        {
+            entry.stem
+            for entry in Path(scripts_dir).iterdir()
+            if entry.suffix in suffixes and not entry.stem.startswith("bash_")
+        }
+    )
+
+
 def expand_keys(lines: list[str], ctx: object) -> tuple[list[str], list[str]]:
-    """Expand ``{key}`` references to registered paths.
+    """Expand ``{name}`` references to the paths of kept scripts.
 
     Returns the expanded lines and the brace references that matched nothing,
     which the caller reports only if the run then fails — an unmatched
-    ``{print}`` in an awk body is not an error, a typo'd key is, and the exit
-    code is what tells them apart.
+    ``{print}`` in an awk body is not an error, a typo'd script name is, and the
+    exit code is what tells them apart.
 
     The path is substituted raw, not shell-quoted: the model writes ``{ref}``
     where it would otherwise write the literal path, and quoting would break
-    the equally common ``"{ref}"``. Pure apart from registry reads, as the
+    the equally common ``"{ref}"``. Pure apart from a directory listing, as the
     gating predicates that call it require.
     """
-    registry = getattr(ctx, "registry", None)
     unresolved: list[str] = []
 
     def substitute(match: re.Match) -> str:
-        key = match.group(1)
-        if registry is not None and key in registry:
-            return str(registry.resolve(key))
+        path = script_path(match.group(1), ctx)
+        if path is not None:
+            return str(path)
         unresolved.append(match.group(0))
         return match.group(0)
 
@@ -124,11 +159,11 @@ def _unresolved_note(unresolved: list[str], ctx: ToolContext) -> str:
     if not unresolved:
         return ""
     refs = ", ".join(sorted(set(unresolved)))
-    known = ", ".join(sorted(ctx.registry.list())[:MAX_KEYS_IN_NOTE]) or "(none)"
+    known = ", ".join(script_names(ctx)[:MAX_KEYS_IN_NOTE]) or "(none)"
     return (
-        f"\n\nNote: {refs} did not match any registry key and was passed "
-        f"through unchanged. If you meant a registered path, the keys are: "
-        f"{known}"
+        f"\n\nNote: {refs} did not match any script and was passed through "
+        f"unchanged. If you meant a kept script, they are: {known}. For a file "
+        f"path, write the path itself."
     )
 
 
@@ -198,21 +233,15 @@ async def check_script_content(
 
 async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
     ctx.scripts_dir.mkdir(parents=True, exist_ok=True)
-    path = ctx.scripts_dir / f"{args.registry_key}{SCRIPT_SUFFIX[args.kind]}"
-    # Fail before writing anything: the script lands on disk before the key is
-    # registered, so a late refusal would leave the file behind. The test is
-    # the one Registry.register applies — a key whose path is gone names
-    # nothing, and refusing it would burn the key for the rest of the session.
-    taken = ctx.registry.get(args.registry_key)
-    if taken is not None and taken.exists():
-        if taken == path:
-            raise RegistryError(
-                f"Script {args.registry_key!r} already exists; "
-                f"{hints.SCRIPT_KEY_EXISTS}"
-            )
-        raise RegistryError(
-            f"Key {args.registry_key!r} already names {taken}; "
-            f"{hints.SCRIPT_KEY_TAKEN}"
+    path = ctx.scripts_dir / f"{args.name}{SCRIPT_SUFFIX[args.kind]}"
+    # Fail before writing anything, so a late refusal cannot leave a half-made
+    # script behind. A name is free exactly when no kept script answers to it —
+    # which now needs no table to decide, only the directory.
+    taken = script_path(args.name, ctx)
+    if taken is not None:
+        raise PathError(
+            f"Script {args.name!r} already exists ({taken}); "
+            f"{hints.SCRIPT_NAME_EXISTS}"
         )
     for number, line in enumerate(args.content_lines, 1):
         # The third way content reaches disk, and open to the same failure as
@@ -254,28 +283,18 @@ async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
     if refused:
         path.unlink(missing_ok=True)  # never keep a script that failed the gate
         return refused
-    replaced = ctx.registry.register(args.registry_key, path)
-    stale = f" Replaced a stale registration of {replaced}." if replaced else ""
     note = f" ({'; '.join(warnings)})" if warnings else ""
     strict = f" {hints.BASH_STRICT_MODE}" if args.kind == "bash" else ""
     return (
-        f"Created script {args.registry_key!r} ({args.kind}); "
+        f"Created script {args.name!r} at {path} ({args.kind}); "
         f"syntax check ok{note}. Start it with start_background_script, or run "
-        f"it now with run_bash: {{{args.registry_key}}} expands to its "
-        f"path.{strict}{stale}"
+        f"it now with run_bash: {{{args.name}}} expands to its path.{strict}"
     )
 
 
 class ReadFileParams(BaseModel):
-    registry_key: str = Field(
-        description="Registry key or absolute path of the file to read"
-    )
-    subpath: str = Field(
-        default="",
-        description=(
-            "Path relative to registry_key when it names a directory, e.g. "
-            "'src/main.py'. Leave empty to read the key itself."
-        ),
+    path: str = Field(
+        description="Path of the file to read; a directory is listed instead"
     )
     start_line: int = Field(
         default=1,
@@ -295,10 +314,10 @@ class ReadFileParams(BaseModel):
     )
 
 
-def _list_dir(path: Path, key: str, max_lines: int) -> str:
-    # A directory key is a dead end for read_text; instead of a raw
-    # IsADirectoryError, list it and point at the subpath route so the model
-    # can descend without registering every file first (live-session thrash).
+def _list_dir(path: Path, max_lines: int) -> str:
+    # A directory is a dead end for read_text; instead of a raw
+    # IsADirectoryError, list it, which is the answer the model wanted often
+    # enough that it is worth not costing a second call.
     entries = sorted(
         p.name + ("/" if p.is_dir() else "") for p in path.iterdir()
     )
@@ -307,53 +326,28 @@ def _list_dir(path: Path, key: str, max_lines: int) -> str:
     tail = f"\n... [{omitted} more] ..." if omitted > 0 else ""
     body = "\n".join(shown) or "(empty)"
     return (
-        f"{key!r} is a directory, not a file. Contents:\n{body}{tail}\n"
-        f"Read one with read_file(registry_key={key!r}, subpath='<name>')."
+        f"{path} is a directory, not a file. Contents:\n{body}{tail}\n"
+        f"Read one with read_file on its full path."
     )
 
 
 async def read_file(args: ReadFileParams, ctx: ToolContext) -> str:
-    path, key = ctx.registry.resolve_or_register(args.registry_key)
-    # Taken before the subpath descent below rebinds `key` to the inner file's
-    # own key: the note is about the argument the model passed, and a plain
-    # key + subpath call must read exactly as it always did.
-    note = registered_note(args.registry_key, key)
-    # A file's content is what the model copies edit_file's old_lines out of,
-    # so the note goes on its own line after it, never appended to a line.
-    tail = f"\n{note.strip()}" if note else ""
+    try:
+        path = resolve_path(args.path, ctx.workdir)
+    except PathError as exc:
+        return str(exc)
     if not path.exists():
-        # A key may be registered ahead of the thing it names (register_path
-        # accepts a path that is not there yet), and a file registered earlier
-        # can be moved or deleted from under it. Say so plainly: without this
-        # the read raises a bare FileNotFoundError at the model.
-        return (
-            f"Nothing at {path} (registered as {key!r}). It was registered "
-            "before anything was created there, or it has since moved or been "
-            "deleted — create it, or register the path that is really there."
-        )
-    if args.subpath:
-        # Descend into a registered directory. Reject escapes and keep the
-        # resolved file addressable next turn via its own auto-registered key.
-        candidate = (path / args.subpath).resolve()
-        if not candidate.is_relative_to(path.resolve()):
-            return (
-                f"subpath {args.subpath!r} escapes {args.registry_key!r}; "
-                f"{hints.SUBPATH_ESCAPES}"
-            )
-        if not candidate.exists():
-            return (
-                f"No such file: {args.subpath!r} under {args.registry_key!r}. "
-                f"Call read_file(registry_key={args.registry_key!r}) to list it."
-            )
-        path = candidate
-        key = ctx.registry.register_auto(path, hint=path.name)
+        # Say so plainly: without this the read raises a bare
+        # FileNotFoundError at the model, which reads as a crash rather than
+        # as an answer it can act on.
+        return f"Nothing at {path}. {hints.PATH_NOT_FOUND}"
     if path.is_dir():
-        return _list_dir(path, key, args.max_lines) + tail
+        return _list_dir(path, args.max_lines)
     lines = path.read_text(errors="replace").splitlines()
     total = len(lines)
     if args.start_line > total:
         return (
-            f"start_line={args.start_line} is past the end of {key!r}: it has "
+            f"start_line={args.start_line} is past the end of {path}: it has "
             f"{total} lines. Call read_file again with start_line <= {total}."
         )
     # §4.3 output size control: a contiguous window, never the full dump.
@@ -364,50 +358,51 @@ async def read_file(args: ReadFileParams, ctx: ToolContext) -> str:
     end = start + args.max_lines
     body = "\n".join(lines[start:end])
     if end >= total:
-        return body + tail
+        return body
     return (
         f"{body}\n... [file continues: lines {end + 1}-{total}; call "
         f"read_file again with start_line={end + 1}, and max_lines up to 500 "
-        f"to see more per call]{tail}"
+        f"to see more per call]"
     )
 
 
 class StartBackgroundScriptParams(BaseModel):
-    registry_key: str = Field(description="Registry key of the script to run")
+    name: str = Field(description="Name of the script to run, as create_script took it")
     args: str = Field(default="", description="Command-line arguments, space-separated")
 
 
 async def start_background_script(
     args: StartBackgroundScriptParams, ctx: ToolContext
 ) -> str:
-    path = ctx.registry.resolve(args.registry_key)
+    path = script_path(args.name, ctx)
+    if path is None:
+        known = ", ".join(script_names(ctx)[:MAX_KEYS_IN_NOTE]) or "(none)"
+        return (
+            f"NOT started: there is no script called {args.name!r}. "
+            f"The scripts you have kept are: {known}"
+        )
     interpreter = INTERPRETER.get(path.suffix)
     if interpreter is None:
         raise ValueError(
-            f"Cannot start {args.registry_key!r}: unknown script type {path.suffix!r}"
+            f"Cannot start {args.name!r}: unknown script type {path.suffix!r}"
         )
     # A model that does not get an immediate result readily starts the script
     # twice; both copies then write the same outputs, and the corrupted result
     # is far worse than the wasted CPU (seen in a live session: two sniffles
     # runs onto one VCF). The wait is now honest — §5.4 reports the exit.
-    running = ctx.runner.running_named(args.registry_key)
+    running = ctx.runner.running_named(args.name)
     if running is not None:
         return (
-            f"NOT started: {args.registry_key!r} is already running (pid "
+            f"NOT started: {args.name!r} is already running (pid "
             f"{running}), and a second copy would write the same output files. "
             f"{hints.SCRIPT_ALREADY_RUNNING}"
         )
     argv = interpreter + [str(path)] + (args.args.split() if args.args else [])
-    record = await ctx.runner.start(argv, name=args.registry_key, background=True)
-    stdout_key = ctx.registry.register_auto(
-        record.stdout_path, hint=f"{args.registry_key}_stdout"
-    )
-    stderr_key = ctx.registry.register_auto(
-        record.stderr_path, hint=f"{args.registry_key}_stderr"
-    )
+    record = await ctx.runner.start(argv, name=args.name, background=True)
     return (
-        f"Started {args.registry_key!r} (pid {record.pid}). It runs in the "
-        f"background; logs: {stdout_key}, {stderr_key} (use read_file to check)."
+        f"Started {args.name!r} (pid {record.pid}). It runs in the "
+        f"background; logs: {record.stdout_path}, {record.stderr_path} "
+        "(use read_file to check)."
     )
 
 
@@ -530,12 +525,12 @@ def _describe_bash(args: RunBashParams, ctx: object = None) -> str:
     return "Flagged command(s): " + ", ".join(flagged)
 
 
-def _tail(text: str, stream: str, register: Callable[[], str]) -> str:
+def _tail(text: str, stream: str, log_path: Path) -> str:
     """Bound one stream for the prompt, pointing at the log for the rest.
 
-    ``register`` is called only when something was actually cut. A look-around
-    command whose output fits needs no registry key, and minting one per run
-    would fill the registry the model reasons over with logs it never reads.
+    The log path is named only when something was actually cut: a look-around
+    command whose output fits needs no pointer, and printing one per run fills
+    the context with paths the model never reads.
     """
     lines = text.splitlines()
     kept = lines[-RUN_OUTPUT_LINES:]
@@ -551,7 +546,7 @@ def _tail(text: str, stream: str, register: Callable[[], str]) -> str:
             if omitted > 0
             else f"the start of {stream}"
         )
-        note = f"\n[... {what} omitted; read_file {register()!r} for all of it]"
+        note = f"\n[... {what} omitted; read_file {str(log_path)!r} for all of it]"
     else:
         note = ""
     return f"{stream}:\n{body}{note}"
@@ -613,15 +608,9 @@ def _cited_lines(script_lines: list[str], stderr: str, path: Path) -> str:
 
 
 def _run_output(record, ctx: ToolContext, hint: str) -> str:
-    """Both streams, bounded, each registering its log only if it was cut."""
+    """Both streams, bounded, each naming its log file only if it was cut."""
     parts = [
-        _tail(
-            path.read_text(errors="replace"),
-            stream,
-            lambda p=path, s=stream: ctx.registry.register_auto(
-                p, hint=f"{hint}_{s}"
-            ),
-        )
+        _tail(path.read_text(errors="replace"), stream, path)
         for stream, path in (
             ("stdout", record.stdout_path),
             ("stderr", record.stderr_path),
@@ -635,8 +624,8 @@ async def run_bash(args: RunBashParams, ctx: ToolContext) -> str:
     its output — all in one call.
 
     This is the look-around workhorse: find a file, check a program, read a BAM
-    header, list conda envs. It is also how a *registered* script is run
-    synchronously — write ``{key}`` and it expands to the path — so there is
+    header, list conda envs. It is also how a *kept* script is run
+    synchronously — write ``{name}`` and it expands to its path — so there is
     one tool for "run this and tell me what it said", whatever the script is.
     Work that outlives the turn goes to start_background_script instead.
     """
@@ -682,15 +671,21 @@ async def run_bash(args: RunBashParams, ctx: ToolContext) -> str:
     )
 
 
-class ListPathsParams(BaseModel):
+class ListScriptsParams(BaseModel):
     pass
 
 
-async def list_paths(args: ListPathsParams, ctx: ToolContext) -> str:
-    paths = ctx.registry.list()
-    if not paths:
-        return "No paths registered yet."
-    return "\n".join(f"{key}: {path}" for key, path in sorted(paths.items()))
+async def list_scripts(args: ListScriptsParams, ctx: ToolContext) -> str:
+    """The scripts this session has kept, by name.
+
+    What is left of ``list_paths`` once paths are just paths: a script's name is
+    the one handle in the system that is not a path, so it is the one thing
+    still worth being able to list.
+    """
+    names = script_names(ctx)
+    if not names:
+        return "No scripts kept yet."
+    return "\n".join(f"{name}: {script_path(name, ctx)}" for name in names)
 
 
 def default_tool_registry() -> ToolRegistry:
@@ -707,10 +702,9 @@ def default_tool_registry() -> ToolRegistry:
         Tool(
             name="read_file",
             description=(
-                "Read a registered file, paged: returns up to max_lines from "
+                "Read a file by path, paged: returns up to max_lines from "
                 "start_line and tells you where to continue if the file goes "
-                "on. If the key is a directory, lists it; pass subpath to "
-                "read a file inside it."
+                "on. A directory is listed instead."
             ),
             params=ReadFileParams,
             handler=read_file,
@@ -722,8 +716,8 @@ def default_tool_registry() -> ToolRegistry:
             description=(
                 "Run bash and wait for its output: look around (find files, "
                 "check a program, read a BAM header, list conda envs) or run a "
-                "registered script by writing {registry_key}, which expands to "
-                "its path. Use for anything you want the result of now"
+                "kept script by writing {name}, which expands to its path. "
+                "Use for anything you want the result of now"
             ),
             params=RunBashParams,
             handler=run_bash,
@@ -735,7 +729,7 @@ def default_tool_registry() -> ToolRegistry:
         Tool(
             name="start_background_script",
             description=(
-                "Run a registered script as a tracked background process for "
+                "Run a kept script (by name) as a tracked background process for "
                 "work that outlives this turn (a pipeline, a long tool run). "
                 "Returns a pid immediately, NOT the output; you are told when "
                 "it finishes. For output now, use run_bash"
@@ -746,10 +740,10 @@ def default_tool_registry() -> ToolRegistry:
     )
     registry.register(
         Tool(
-            name="list_paths",
-            description="List all registered path keys",
-            params=ListPathsParams,
-            handler=list_paths,
+            name="list_scripts",
+            description="List the scripts kept in this session, by name",
+            params=ListScriptsParams,
+            handler=list_scripts,
         )
     )
     return registry

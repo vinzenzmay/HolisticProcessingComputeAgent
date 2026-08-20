@@ -3,7 +3,7 @@
 from hpca.db import connect, init_db
 from hpca.watches import KIND_LOG, WatchStore
 
-EXPECTED_TABLES = {"jobs", "job_logs", "sessions", "path_registry", "processes"}
+EXPECTED_TABLES = {"jobs", "job_logs", "sessions", "processes"}
 
 
 def table_names(conn):

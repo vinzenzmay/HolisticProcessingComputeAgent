@@ -513,15 +513,14 @@ def _effort_for(sessions, settings, session_id: str) -> str:
 def _make_tool_ctx(deps, session, log, *, skills, backends, tools) -> ToolContext:
     """A tool context bound to one session and its transcript.
 
-    Built per turn, as before, so a turn keeps its own registry, runner and
-    log however the rest of the runtime moves on.
+    Built per turn, as before, so a turn keeps its own runner and log however
+    the rest of the runtime moves on.
     """
     from hpca.config import app_dir as _app_dir
     from hpca.episodic import EpisodicStore
     from hpca.jobs import JobStore
     from hpca.logs import LoggedLLM
     from hpca.rag import RagStore
-    from hpca.registry import PathRegistry
     from hpca.runner import ProcessRunner
     from hpca.symbols import SymbolIndex
     from hpca.trash import TrashManager
@@ -529,9 +528,6 @@ def _make_tool_ctx(deps, session, log, *, skills, backends, tools) -> ToolContex
 
     root = deps.app_dir or _app_dir()
     ctx = ToolContext(
-        registry=PathRegistry(
-            deps.conn, profile=session.profile, session_id=session.session_id
-        ),
         runner=ProcessRunner(
             deps.conn,
             session_id=session.session_id,

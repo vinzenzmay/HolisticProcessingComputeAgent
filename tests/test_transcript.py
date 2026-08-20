@@ -12,7 +12,7 @@ from hpca.transcript import (
 
 USER_MSG = {"role": "user", "content": "which BAMs are in the cohort?"}
 # The model's own copy of the call that produced STEP (hpca.agent.history).
-CALL_MSG = tool_call_message("list_dir", {"registry_key": "cohort"})
+CALL_MSG = tool_call_message("list_dir", {"path": "/data/cohort"})
 STEP = {"role": "user", "content": "[tool result] list_dir: 12 entries"}
 STEP2 = {"role": "user", "content": "[tool error] read_file: not found"}
 ANSWER = {"role": "assistant", "content": "Four BAMs match."}
@@ -125,7 +125,7 @@ class TestToolCalls:
             {
                 "after": 1,
                 "tool": "list_dir",
-                "arguments": {"registry_key": "cohort"},
+                "arguments": {"path": "/data/cohort"},
             }
         ]
         box = build_entries([USER_MSG, STEP, ANSWER], [], calls)[1]
@@ -167,7 +167,7 @@ class TestToolCalls:
                 "after": 1,
                 "tool": "edit_file",
                 "arguments": {
-                    "registry_key": "run_sh",
+                    "path": "/work/run.sh",
                     "old_lines": ["echo one"],
                     "new_lines": ["echo two"],
                 },
@@ -177,22 +177,22 @@ class TestToolCalls:
         call = build_entries([USER_MSG, STEP, ANSWER], [], calls)[1].parts[0]
         assert "- echo one\n+ echo two" in call.text
         assert "old_lines" not in call.text and "new_lines" not in call.text
-        assert "run_sh" in call.text  # which file is still an argument
+        assert "run.sh" in call.text  # which file is still an argument
 
     def test_details_are_shown_when_the_tool_resolved_the_call(self):
         calls = [
             {
                 "after": 1,
                 "tool": "delete_file",
-                "arguments": {"registry_key": "scratch"},
+                "arguments": {"path": "/work/scratch"},
                 "details": "rm /scratch/old.bam\n(12 bytes; will be recoverable)",
             }
         ]
         box = build_entries([USER_MSG, STEP, ANSWER], [], calls)[1]
         assert "rm /scratch/old.bam" in box.parts[0].text
         # the tool already resolved the key into that path; saying
-        # "registry_key: scratch" underneath would be the same fact, worse
-        assert "registry_key" not in box.parts[0].text
+        # "path: /work/scratch" underneath would be the same fact, worse
+        assert "path:" not in box.parts[0].text
 
     def test_calls_do_not_inflate_the_step_count(self):
         calls = [{"after": 1, "tool": "list_dir", "arguments": {}}]
@@ -238,7 +238,7 @@ class TestCallMessages:
     def test_the_call_record_still_lands_before_its_result(self):
         # Anchored to the index of the model's copy, which is the message
         # right before the result it produced.
-        calls = [{"after": 1, "tool": "list_dir", "arguments": {"key": "cohort"}}]
+        calls = [{"after": 1, "tool": "list_dir", "arguments": {"path": "/data/cohort"}}]
         thinking = [{"after": 1, "reasoning": "List it first."}]
         box = build_entries([USER_MSG, CALL_MSG, STEP, ANSWER], thinking, calls)[1]
         assert [p.kind for p in box.parts] == ["reasoning", "call"]
@@ -386,7 +386,7 @@ class TestOneExchangeIsOnePart:
     """
 
     def test_the_result_lands_on_the_call_that_produced_it(self):
-        calls = [{"after": 1, "tool": "list_dir", "arguments": {"key": "cohort"}}]
+        calls = [{"after": 1, "tool": "list_dir", "arguments": {"path": "/data/cohort"}}]
         box = build_entries([USER_MSG, STEP, ANSWER], [], calls)[1]
         assert len(box.parts) == 1
         part = box.parts[0]
@@ -455,7 +455,7 @@ class TestOneExchangeIsOnePart:
 
     def test_the_folded_block_writes_one_heading_per_exchange(self):
         # The session log is this text; it must not say "call" then "step".
-        calls = [{"after": 1, "tool": "list_dir", "arguments": {"key": "cohort"}}]
+        calls = [{"after": 1, "tool": "list_dir", "arguments": {"path": "/data/cohort"}}]
         text = build_entries([USER_MSG, STEP, ANSWER], [], calls)[1].text
         assert text.count("— list_dir · cohort —") == 1
         assert "— call —" not in text and "— step —" not in text

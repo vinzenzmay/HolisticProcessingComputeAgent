@@ -249,10 +249,10 @@ class TestVerifyOtherKinds:
 # ------------------------------------------------- create_script integration
 
 from hpca.agent.builtin_tools import default_tool_registry  # noqa: E402
+from hpca.agent.builtin_tools import script_names, script_path  # noqa: E402
 from hpca.agent.context import ToolContext  # noqa: E402
 from hpca.agent.doc_tools import safe_to_execute  # noqa: E402
 from hpca.config import Settings  # noqa: E402
-from hpca.registry import PathRegistry  # noqa: E402
 from hpca.runner import ProcessRunner  # noqa: E402
 
 
@@ -261,7 +261,7 @@ def ctx(tmp_path, index):
     conn = connect(tmp_path / "ctx.db")
     init_db(conn)
     yield ToolContext(
-        registry=PathRegistry(conn, profile="default", session_id="s1"),
+        workdir=tmp_path,
         runner=ProcessRunner(conn, session_id="s1", log_dir=tmp_path / "logs"),
         settings=Settings(),
         scripts_dir=tmp_path / "scripts",
@@ -274,7 +274,7 @@ async def create(ctx, key, lines):
     tools = default_tool_registry()
     tool = tools.get("create_script")
     args = tool.params.model_validate(
-        {"kind": "bash", "registry_key": key, "content_lines": lines}
+        {"kind": "bash", "name": key, "content_lines": lines}
     )
     return await tool.handler(args, ctx)
 
@@ -284,22 +284,22 @@ class TestCreateScriptGate:
         result = await create(ctx, "bad", ["samtools view -e in.bam"])
         assert "NOT created" in result
         assert "-e" in result
-        assert "bad" not in ctx.registry.list()
+        assert "bad" not in script_names(ctx)
 
     async def test_valid_flags_pass(self, ctx):
         result = await create(ctx, "good", ["samtools view -b -q 20 in.bam"])
         assert "ok" in result.lower()
-        assert "good" in ctx.registry.list()
+        assert "good" in script_names(ctx)
 
     async def test_unindexed_command_warns_but_creates(self, ctx):
         result = await create(ctx, "warned", ["bwa mem -t 4 ref.fa reads.fq"])
-        assert "warned" in ctx.registry.list()
+        assert "warned" in script_names(ctx)
         assert "not indexed" in result.lower()
 
     async def test_no_index_no_gate(self, ctx):
         ctx.symbols = None
         result = await create(ctx, "ungated", ["samtools view -e in.bam"])
-        assert "ungated" in ctx.registry.list()
+        assert "ungated" in script_names(ctx)
 
 
 @pytest.fixture
@@ -338,7 +338,7 @@ class TestAutoIndexing:
     async def test_correct_usage_of_a_learned_command_passes(self, ctx, faketool):
         result = await create(ctx, "ok", [f"{faketool} -a --verbose in.txt"])
         assert "NOT created" not in result
-        assert "ok" in ctx.registry.list()
+        assert "ok" in script_names(ctx)
 
     async def test_invented_flag_blocks_once_the_command_is_learned(
         self, ctx, faketool
@@ -346,11 +346,11 @@ class TestAutoIndexing:
         result = await create(ctx, "bad", [f"{faketool} -z in.txt"])
         assert "NOT created" in result
         assert "-z" in result
-        assert "bad" not in ctx.registry.list()
+        assert "bad" not in script_names(ctx)
 
     async def test_unprobeable_command_warns_and_is_not_retried(self, ctx):
         result = await create(ctx, "warned", ["no-such-program-xyz -q in.txt"])
-        assert "warned" in ctx.registry.list()  # unverifiable is not a failure
+        assert "warned" in script_names(ctx)  # unverifiable is not a failure
         assert "not indexed" in result.lower()
         assert "no-such-program-xyz" in ctx.doc_probe_failed
 
@@ -362,7 +362,7 @@ class TestAutoIndexing:
     async def test_bad_flag_in_a_downstream_stage_blocks(self, ctx, faketool):
         result = await create(ctx, "bad", [f"cat in.txt | {faketool} -z"])
         assert "NOT created" in result
-        assert "bad" not in ctx.registry.list()
+        assert "bad" not in script_names(ctx)
 
     async def test_flagless_commands_are_not_probed(self, ctx):
         await create(ctx, "plain", ["no-such-program-xyz in.txt"])
@@ -415,7 +415,7 @@ class TestProbeSafety:
         result = await create(ctx, "wrapper", [f"{helper} in.bam -x 5"])
 
         assert not marker.exists(), "the gate executed a script the agent wrote"
-        assert "wrapper" in ctx.registry.list()  # unverifiable is not a failure
+        assert "wrapper" in script_names(ctx)  # unverifiable is not a failure
         assert "not indexed" in result.lower()
 
 

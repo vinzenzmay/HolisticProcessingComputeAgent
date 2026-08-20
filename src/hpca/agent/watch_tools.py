@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 from hpca.agent import hints
 from hpca.agent.context import ToolContext
 from hpca.agent.tools import Tool, ToolRegistry
-from hpca.registry import RegistryError
+from hpca.paths import PathError, resolve_path
 from hpca.watches import (
     KIND_JOB,
     KIND_LOG,
@@ -44,17 +44,8 @@ def _require_watches(ctx: ToolContext) -> WatchStore:
 
 
 def _resolve_path(target: str, ctx: ToolContext) -> Path:
-    """A registry key or a literal path, whichever the model sent.
-
-    Both are accepted on purpose. The registry is the house style, but a log
-    the agent just discovered with `find` is a raw path it has in hand, and
-    forcing a register-then-watch round trip only buys a chance to get the key
-    wrong.
-    """
-    registry = getattr(ctx, "registry", None)
-    if registry is not None and target in registry:
-        return registry.resolve(target)
-    return Path(target).expanduser()
+    """The log file the model named, anchored like every other path argument."""
+    return resolve_path(target, ctx.workdir)
 
 
 def _render_list(watches: list[Watch]) -> str:
@@ -72,7 +63,7 @@ def _render_list(watches: list[Watch]) -> str:
 
 class WatchLogParams(BaseModel):
     path: str = Field(
-        description="Absolute path (or registry key) of the log file to watch"
+        description="Path of the log file to watch"
     )
     label: str = Field(
         default="",
@@ -83,12 +74,10 @@ class WatchLogParams(BaseModel):
 
 async def watch_log(args: WatchLogParams, ctx: ToolContext) -> str:
     store = _require_watches(ctx)
-    path = _resolve_path(args.path, ctx)
-    if not path.is_absolute():
-        return (
-            f"Not watched: {args.path!r} is neither a registry key nor an "
-            f"absolute path. {hints.WATCH_NEEDS_A_PATH}"
-        )
+    try:
+        path = _resolve_path(args.path, ctx)
+    except PathError:
+        return f"Not watched: no path given. {hints.WATCH_NEEDS_A_PATH}"
     watch = store.add(
         kind=KIND_LOG,
         target=str(path),
@@ -98,12 +87,6 @@ async def watch_log(args: WatchLogParams, ctx: ToolContext) -> str:
     )
     state, head, changed_at = log_fields(path)
     store.update(watch.id, state=state, head=head, changed_at=changed_at or None)
-    # Register the path too, so later turns can name it without re-discovering
-    # it — the same discipline every other tool follows.
-    try:
-        ctx.registry.register_auto(path, hint=args.label or path.stem)
-    except RegistryError:
-        pass
     if state == LOG_GONE:
         return (
             f"Watching {path} — it does not exist yet, so the panel box will "

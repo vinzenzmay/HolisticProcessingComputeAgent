@@ -1430,7 +1430,6 @@ from hpca.agent.context import ToolContext  # noqa: E402
 from hpca.agent.file_tools import add_file_tools  # noqa: E402
 from hpca.db import connect, init_db  # noqa: E402
 from hpca.runner import ProcessRunner  # noqa: E402
-from hpca.registry import PathRegistry  # noqa: E402
 from hpca.config import Settings  # noqa: E402
 from hpca.trash import TrashManager  # noqa: E402
 
@@ -1447,7 +1446,7 @@ class TestPerFileEditApproval:
         conn = connect(tmp_path / "hpca.db")
         init_db(conn)
         context = ToolContext(
-            registry=PathRegistry(conn, profile="default", session_id="s1"),
+            workdir=tmp_path,
             runner=ProcessRunner(conn, session_id="s1", log_dir=tmp_path / "logs"),
             settings=Settings(),
             scripts_dir=tmp_path / "scripts",
@@ -1457,22 +1456,20 @@ class TestPerFileEditApproval:
         notes.write_text("alpha\nbeta\ngamma\n")
         other = tmp_path / "other.md"
         other.write_text("delta\n")
-        context.registry.register("notes", notes)
-        context.registry.register("other", other)
         return context, notes, other, conn
 
     def edit(self, key, old, new):
         return tool_json(
-            "edit_file", registry_key=key, old_lines=[old], new_lines=[new]
+            "edit_file", path=key, old_lines=[old], new_lines=[new]
         )
 
     async def test_second_edit_to_approved_file_skips_the_gate(self, tmp_path):
         context, notes, _, conn = self.make(tmp_path)
         llm = FakeLLM(
             [
-                self.edit("notes", "alpha", "ALPHA"),
+                self.edit(str(notes), "alpha", "ALPHA"),
                 respond_json("first done"),
-                self.edit("notes", "beta", "BETA"),
+                self.edit(str(notes), "beta", "BETA"),
                 respond_json("second done"),
             ]
         )
@@ -1498,12 +1495,12 @@ class TestPerFileEditApproval:
         conn.close()
 
     async def test_a_different_file_still_gates(self, tmp_path):
-        context, _, other, conn = self.make(tmp_path)
+        context, notes, other, conn = self.make(tmp_path)
         llm = FakeLLM(
             [
-                self.edit("notes", "alpha", "ALPHA"),
+                self.edit(str(notes), "alpha", "ALPHA"),
                 respond_json("done"),
-                self.edit("other", "delta", "DELTA"),
+                self.edit(str(other), "delta", "DELTA"),
             ]
         )
         graph = build_graph(
@@ -1526,9 +1523,9 @@ class TestPerFileEditApproval:
         context, notes, _, conn = self.make(tmp_path)
         llm = FakeLLM(
             [
-                self.edit("notes", "alpha", "ALPHA"),
+                self.edit(str(notes), "alpha", "ALPHA"),
                 respond_json("ok, leaving it"),
-                self.edit("notes", "beta", "BETA"),
+                self.edit(str(notes), "beta", "BETA"),
             ]
         )
         graph = build_graph(
@@ -1551,9 +1548,9 @@ class TestPerFileEditApproval:
         context, notes, _, conn = self.make(tmp_path)
         llm = FakeLLM(
             [
-                self.edit("notes", "alpha", "ALPHA"),
+                self.edit(str(notes), "alpha", "ALPHA"),
                 respond_json("first done"),
-                self.edit("notes", "beta", "BETA"),
+                self.edit(str(notes), "beta", "BETA"),
             ]
         )
         graph = build_graph(

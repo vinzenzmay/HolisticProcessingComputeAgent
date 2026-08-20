@@ -147,7 +147,7 @@ class SessionStore:
         return cursor.rowcount
 
     def delete(self, session_id: str) -> None:
-        """Forget a chat thread and the path aliases it named.
+        """Forget a chat thread.
 
         Job and process rows stay: they record work that outlives the
         conversation about it — a cluster job runs on whether or not the chat
@@ -155,9 +155,6 @@ class SessionStore:
         is the durable record (see hpca.logs). LangGraph's checkpoints are the
         caller's to drop, since only it holds the checkpointer.
         """
-        self._conn.execute(
-            "DELETE FROM path_registry WHERE session_id = ?", (session_id,)
-        )
         self._conn.execute(
             "DELETE FROM sessions WHERE session_id = ?", (session_id,)
         )

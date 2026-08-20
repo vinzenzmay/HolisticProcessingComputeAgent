@@ -213,14 +213,11 @@ class TestScriptPreview:
     def ctx(self, tmp_path):
         import types
 
-        script = tmp_path / "align.sh"
+        scripts_dir = tmp_path / "scripts"
+        scripts_dir.mkdir()
+        script = scripts_dir / "align.sh"
         script.write_text("#!/usr/bin/env bash\nbwa mem ref.fa in.fq\n")
-
-        class Registry:
-            def resolve(self, key):
-                return script
-
-        return types.SimpleNamespace(registry=Registry())
+        return types.SimpleNamespace(scripts_dir=scripts_dir, workdir=tmp_path)
 
     def test_written_lines_are_the_script(self, ctx):
         preview = script_preview(
@@ -228,9 +225,9 @@ class TestScriptPreview:
         )
         assert preview == "ls /data\nwc -l"
 
-    def test_a_registered_script_being_run_is_shown(self, ctx):
+    def test_a_kept_script_being_run_is_shown(self, ctx):
         preview = script_preview(
-            "start_background_script", {"registry_key": "align", "args": "-t 4"}, ctx
+            "start_background_script", {"name": "align", "args": "-t 4"}, ctx
         )
         assert "bwa mem ref.fa in.fq" in preview
         assert "align.sh (args: -t 4)" in preview
@@ -240,7 +237,7 @@ class TestScriptPreview:
         # file is neither the call nor something the user can judge it by.
         preview = script_preview(
             "edit_file",
-            {"registry_key": "align", "old_lines": ["bwa mem"], "new_lines": ["bwa-mem2 mem"]},
+            {"path": "align.sh", "old_lines": ["bwa mem"], "new_lines": ["bwa-mem2 mem"]},
             ctx,
         )
         assert preview.splitlines() == ["- bwa mem", "+ bwa-mem2 mem"]

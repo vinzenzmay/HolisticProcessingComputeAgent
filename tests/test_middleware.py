@@ -737,7 +737,7 @@ class TestTruncationSalvage:
         lines = ",".join(f'"line {i}"' for i in range(n_lines))
         return (
             '{"action":"tool_call","tool":"create_file","arguments":'
-            '{"dir_key":"workspace","name":"specs.md","content_lines":['
+            '{"path":"/work/specs.md","content_lines":['
             + lines + "," + tail
         )
 
@@ -755,7 +755,7 @@ class TestTruncationSalvage:
         new = ",".join(f'"new {i}"' for i in range(20))
         partial = (
             '{"action":"tool_call","tool":"edit_file","arguments":'
-            '{"registry_key":"specs","subpath":"","old_lines":["TBD: Build"],'
+            '{"path":"specs.md","old_lines":["TBD: Build"],'
             '"new_lines":[' + new + ',"cut'
         )
         llm = FakeLLM([TruncatedOutput("t", partial=partial)])
@@ -770,7 +770,7 @@ class TestTruncationSalvage:
     async def test_cut_inside_old_lines_is_not_salvaged(self, file_tools):
         partial = (
             '{"action":"tool_call","tool":"edit_file","arguments":'
-            '{"registry_key":"specs","subpath":"","old_lines":["TBD: Bu'
+            '{"path":"specs.md","old_lines":["TBD: Bu'
         )
         llm = FakeLLM([TruncatedOutput("t", partial=partial), respond_json("ok")])
         # cut inside old_lines: no way to know the target lines, so no
@@ -895,9 +895,7 @@ class TestNativeSilentTruncation:
         # complete call that ends at the cap is real work.
         llm = NativeLLM(
             [
-                native_call(
-                    "create_file", dir_key="work", name="n.md", content_lines=["x"]
-                )
+                native_call("create_file", path="n.md", content_lines=["x"])
             ]
         )
         llm.usage = {"completion_tokens": 4096}

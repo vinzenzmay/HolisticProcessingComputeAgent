@@ -180,7 +180,6 @@ from hpca.agent.skill_tools import add_skill_tools  # noqa: E402
 from hpca.agent.tools import ToolRegistry  # noqa: E402
 from hpca.config import Settings  # noqa: E402
 from hpca.db import connect, init_db  # noqa: E402
-from hpca.registry import PathRegistry  # noqa: E402
 from hpca.runner import ProcessRunner  # noqa: E402
 
 
@@ -189,7 +188,7 @@ def ctx(tmp_path):
     conn = connect(tmp_path / "hpca.db")
     init_db(conn)
     yield ToolContext(
-        registry=PathRegistry(conn, profile="default", session_id="s1"),
+        workdir=tmp_path,
         runner=ProcessRunner(conn, session_id="s1", log_dir=tmp_path / "logs"),
         settings=Settings(),
         scripts_dir=tmp_path / "scripts",

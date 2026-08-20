@@ -55,14 +55,11 @@ PLUMBING_ARG_KEYS = ("timeout_s",)
 # short target next to the tool name on the collapsed row, so a column of
 # fifteen edit_file rows says which file each one touched.
 TARGET_ARG_KEYS = (
-    "name",
-    "subpath",
     "path",
-    "source_key",
-    "target_name",
-    "registry_key",
-    "dir_key",
-    "key",
+    "source_path",
+    "dest_path",
+    "name",
+    "target",
 )
 # Arguments are a display aid, not a record: a pathological call must not push
 # a wall of JSON into the chat (the script block has its own cap upstream).

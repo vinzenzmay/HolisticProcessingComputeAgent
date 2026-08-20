@@ -257,26 +257,3 @@ class TestFork:
             await open_rewind_on(app, pilot, 2)
             await choose(app, pilot, "f")
             assert len(app.session_store.list_all()) == 2
-
-    async def test_fork_copies_the_path_aliases(self, hpca_home):
-        """Aliases named in the copied history must resolve in the fork."""
-        app = HpcaApp(llm=FakeLLM([respond_json("a1"), respond_json("a2")]))
-        async with app.run_test(size=(120, 40)) as pilot:
-            await two_exchanges(app, pilot)
-            source = app.active_session
-            app._conn.execute(
-                "INSERT INTO path_registry (profile, session_id, key, path) "
-                "VALUES (?, ?, ?, ?)",
-                (source.profile, source.session_id, "cohort", "/data/cohort"),
-            )
-            app._conn.commit()
-            await open_rewind_on(app, pilot, 2)
-            await choose(app, pilot, "f")
-            fork = app.active_session
-            rows = app._conn.execute(
-                "SELECT key, path FROM path_registry WHERE session_id = ?",
-                (fork.session_id,),
-            ).fetchall()
-            assert [(row["key"], row["path"]) for row in rows] == [
-                ("cohort", "/data/cohort")
-            ]

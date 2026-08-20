@@ -13,7 +13,6 @@ from hpca.agent.tools import ToolRegistry
 from hpca.config import Settings
 from hpca.db import connect, init_db
 from hpca.llm import ChatResponse
-from hpca.registry import PathRegistry
 from hpca.runner import ProcessRunner
 from hpca.symbols import Symbol, SymbolIndex
 
@@ -33,7 +32,7 @@ def ctx(tmp_path):
     conn = connect(tmp_path / "hpca.db")
     init_db(conn)
     context = ToolContext(
-        registry=PathRegistry(conn, profile="default", session_id="s1"),
+        workdir=tmp_path,
         runner=ProcessRunner(conn, session_id="s1", log_dir=tmp_path / "logs"),
         settings=Settings(),
         scripts_dir=tmp_path / "scripts",
@@ -100,9 +99,8 @@ class TestReadSource:
     async def test_numbered_range(self, tools, ctx, tmp_path):
         f = tmp_path / "code.py"
         f.write_text("\n".join(f"code line {i}" for i in range(1, 51)))
-        ctx.registry.register("code", f)
         result = await call(
-            tools, "read_source", ctx, registry_key="code", start_line=10, end_line=12
+            tools, "read_source", ctx, path=str(f), start_line=10, end_line=12
         )
         assert result.splitlines() == [
             "10: code line 10",
@@ -116,7 +114,6 @@ class TestIndexDocs:
         pkg = tmp_path / "pkg"
         pkg.mkdir()
         (pkg / "mod.py").write_text("def fn(a, b=2):\n    pass\n")
-        ctx.registry.register("pkg", pkg)
         result = await call(
             tools, "index_docs", ctx, what="python_source", target="pkg"
         )
@@ -292,9 +289,8 @@ class TestIndexDocsDir:
         (docs / "a.md").write_text("Slurm job submission guide.")
         (docs / "sub" / "b.txt").write_text("Memory limits on the cluster.")
         (docs / "ignore.png").write_bytes(b"\x89PNG")
-        rag_ctx.registry.register("docs", docs)
         result = await call(
-            tools, "index_docs", rag_ctx, what="docs_dir", target="docs"
+            tools, "index_docs", rag_ctx, what="docs_dir", target=str(docs)
         )
         assert "Indexed 2 documents" in result
         assert rag_ctx.rag.count() == 2
@@ -303,17 +299,15 @@ class TestIndexDocsDir:
         docs = tmp_path / "docs"
         docs.mkdir()
         (docs / "a.md").write_text("Slurm guide.")
-        rag_ctx.registry.register("docs", docs)
-        await call(tools, "index_docs", rag_ctx, what="docs_dir", target="docs")
-        await call(tools, "index_docs", rag_ctx, what="docs_dir", target="docs")
+        await call(tools, "index_docs", rag_ctx, what="docs_dir", target=str(docs))
+        await call(tools, "index_docs", rag_ctx, what="docs_dir", target=str(docs))
         assert rag_ctx.rag.count() == 1
 
     async def test_without_embedder_refuses_clearly(self, tools, ctx, tmp_path):
         docs = tmp_path / "docs"
         docs.mkdir()
         (docs / "a.md").write_text("x")
-        ctx.registry.register("docs", docs)
-        result = await call(tools, "index_docs", ctx, what="docs_dir", target="docs")
+        result = await call(tools, "index_docs", ctx, what="docs_dir", target=str(docs))
         assert "not configured" in result
 
     async def test_manpage_indexing_also_feeds_rag(self, tools, rag_ctx, monkeypatch):

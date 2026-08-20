@@ -262,7 +262,7 @@ def first_command(path: Path, limit: int = 40) -> str:
 def describe(record: ProcessRecord) -> str:
     """What to call this process in a list.
 
-    Named scripts keep their registry key — the user chose it. Throwaway
+    Named scripts keep the name the model chose. Throwaway
     run_bash scripts get their first command instead, since a column of
     `bash_1784458703578782438` identifies nothing.
     """
