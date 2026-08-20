@@ -37,7 +37,7 @@ changed**.
 
 | file | what it is |
 |---|---|
-| `src/protocol.rs` | the wire, mirroring `hpca/protocol.py`: 19 commands, 17 events, `Entry`/`Part`/`SessionRow`/`PanelRow` |
+| `src/protocol.rs` | the wire, mirroring `hpca/protocol.py`: the 28 commands and 16 events, `Entry`/`Part`/`SessionRow`/`PanelRow` |
 | `src/transport.rs` | AF_UNIX + NDJSON client, framing and sequence numbers as `transport.py` defines them |
 | `src/app.rs` | front-end state, and the flattened chat line model that §4 is about |
 | `src/ui.rs` | the draw: top bar, three columns 1:2:1, chat boxes, context meter, mode line, approval bar, footer |
@@ -187,18 +187,19 @@ never did.** `tui/app.py` is still the monolith that builds the runtime, and
 `python -m hpca` has no `--serve`. The consequence is that `CoreService` has
 never had a client, and it shows:
 
-**`CoreService._dispatch` handles 6 of 19 commands** — `session.focus`,
-`turn.submit`, `turn.interrupt`, `decision.resolve`, `confirm.resolve`,
-`shutdown`. Everything else answers *"Unhandled command"*: the whole session
-lifecycle (`list`/`new`/`open`/`close`/`rename`/`retitle`/`delete`),
-`command.run`, `mode.set`, `thinking.set`, `backend.set`, the profile and skill
-commands, `process.kill`, `job.cancel`, `watch.drop`.
+**`CoreService._dispatch` handles 6 of the protocol's 28 commands** —
+`session.focus`, `turn.submit`, `turn.interrupt`, `decision.resolve`,
+`confirm.resolve`, `shutdown`. The other 22 answer *"Unhandled command"*; §10
+lists them.
 
-**The core never emits `chat.reset` or `chat.append` at all.** Grep `src/hpca/core`
-for either: nothing. The transcript events — the ones §4.2 calls the reason the
-protocol is not slower than what it replaces — are unimplemented. A reply
+**The core emits 11 of 16 events.** The five it never constructs are
+`chat.reset`, `chat.append`, `session.rows`, `turn.usage` and `hello`. The first
+two matter most: the transcript events — the ones §4.2 calls the reason the
+protocol is not slower than what it replaces — are unimplemented, so a reply
 reaches a client only as `TurnFinished.reply`. (The Rust client renders that,
 with a guard so it will not double-draw once real `chat.append` lands.)
+`session.rows` is why no client can populate a sidebar; `turn.usage` is why the
+context meter falls back to the estimate and shows "window unknown".
 
 So: **the front-end language is not the blocker; the unfinished core is.** That
 work is identical whether the next front-end is Rust, a rewritten Textual, or
@@ -244,3 +245,104 @@ work in `specs-core-process.md` — and the reason it is not yet *usable* is tha
 the same work is two-thirds finished. Throwing out Textual is a smaller decision
 than it looks; finishing the core split is the larger one, and it is owed
 regardless of which front-end wins.
+
+## 10. What is still unfinished, to actually *use* HPCA on ratatui
+
+Ordered by what blocks what. Everything in A is Python and front-end-agnostic —
+it is owed whether the next front-end is Rust, Textual, or the row-oriented
+prototype on the other branch.
+
+### A. Core side — blocking, and the real work (`src/hpca/core`, `src/hpca`)
+
+**A1. `hpca --serve` does not exist.** `coreproc.default_core_argv` already
+names `python -m hpca --serve --socket <path>`, but `__main__.py` only calls
+`HpcaApp().run()` and parses no flags. `ui-rs/serve.py` is a working ~90-line
+sketch of what it needs to be; it should move into the package and grow the
+handshake line `coreproc._handshake` expects on stdout.
+
+**A2. 22 of the 28 commands answer "Unhandled command".** `CoreService._dispatch`
+implements six. The rest, grouped by what they cost you:
+
+| group | commands | without them |
+|---|---|---|
+| session lifecycle | `session.list`, `.new`, `.open`, `.close`, `.rename`, `.retitle`, `.delete` | no sidebar, no way to create or open a conversation — **the hard blocker** |
+| per-session dials | `mode.set`, `thinking.set`, `backend.set` | mode/thinking/model cannot be changed |
+| slash commands | `command.run` | no `/compact`, `/memorize`, `/conclude`, `/skill-*` |
+| memory | `memory.resolve` | proposals can be shown but never accepted |
+| right column | `watch.drop`, `process.kill`, `job.cancel` | watches cannot be dismissed, jobs not cancellable |
+| profiles & skills | `profile.set/save/create/delete/duplicate`, `skill.save/delete` | the management screens have no back end |
+
+**A3. Five events are never emitted.** `chat.reset`, `chat.append`,
+`session.rows`, `turn.usage`, `hello`.
+
+- `chat.reset` / `chat.append` — no transcript ever reaches a client. A reply
+  arrives only as `TurnFinished.reply`, so tool calls, reasoning and thinking
+  boxes are invisible, and reopening a session shows an empty log. This is the
+  second hard blocker, and §4.2 of the core-process spec calls these events the
+  reason the protocol is not slower than what it replaces.
+- `session.rows` — the sidebar cannot be populated even once `session.list`
+  is handled, because the answer to it is this event.
+- `turn.usage` — the context meter falls back to the character estimate and
+  reads "window unknown"; the measured `prompt_tokens` never crosses.
+- `hello` — arguably the serve layer's job rather than `CoreService`'s, and
+  `ui-rs/serve.py` sends it. Needs a decision, not necessarily code.
+
+**A4. Nothing spawns the core.** `coreproc.CoreProcess` exists and is tested but
+has no caller. Today you run two processes by hand.
+
+### B. Front-end side — blocking for daily use (`ui-rs/`)
+
+**B1. The chat entry is append-only.** `chat_input_key` handles character,
+backspace and enter — there is no left/right cursor, Home/End, Delete, word
+delete, or line kill, and no bracketed paste. Pasting a path or editing the
+middle of a drafted message is not possible. This is the first thing to fix.
+
+**B2. Session delete has no confirmation.** `d` in the sidebar sends
+`session.delete` immediately; the Textual original routes through
+`confirm_delete_session`. A destructive key with no guard — do not ship it.
+
+**B3. No modal screens** (~2,200 lines of Textual to replace): `manage_llms`
+(585), `profiles_screen` (462), `backend_form` (226), `skill_screens` (206),
+`memory_screens` (177), `rewind_screen` (150), `settings_screen` (97),
+`switch_llm` (82), `thinking_screen` (78), `inspect_screen` (55),
+`rename_screen` (53), `confirm_screen` (49). Volume, not difficulty — but the
+memory and confirm ones are needed for correctness, not just convenience
+(today `confirm.requested` is shown as a toast and can never be answered).
+
+**B4. No slash-command autocomplete** — the `#command-menu` widget and its
+`↑/↓` selection.
+
+**B5. Scrolling is cursor-driven only.** No PageUp/PageDown, no mouse wheel, no
+"jump to end".
+
+**B6. No `$EDITOR` integration** (`ctrl+e` edit profile), no clipboard manager.
+Mouse is not captured at all, which means the terminal's own selection and copy
+still work — arguably better than Textual's, but it is a difference, not a port.
+
+**B7. No reconnect.** If the core goes away the UI toasts and sits there;
+`coreproc`'s stale-socket and re-attach logic has no client-side counterpart.
+
+**B8. Terminal-key edge cases.** `termkeys.py` / `patch_alt_enter` exist because
+shift+enter is not portable; the Rust side accepts shift/alt+enter but this has
+only been exercised through synthetic key events, never a real terminal — no
+TTY was available in this environment. **Untested on real hardware.**
+
+### C. Packaging and operations — decide before B3
+
+**C1. Distribution is unresolved.** HPCA installs as a Python package; a Rust
+binary is a different artefact. Options unexplored: a `pixi` build step,
+prebuilt per-target binaries, or `maturin`.
+
+**C2. Build needs a C linker.** This box had no `gcc`; `pixi global install gcc`
+fixed it. A cluster login node may be the same, which makes "build on the
+target" a poor default and pushes toward shipping binaries.
+
+### D. Suggested order
+
+1. A1 + A2 (session lifecycle only) + A3 (`session.rows`, `chat.reset`,
+   `chat.append`) — this is the minimum that makes *any* front-end usable, and
+   is the bulk of the remaining work.
+2. B1, B2 — the two that make the Rust client safe and pleasant to type in.
+3. Measure `looplag.py` under both front-ends (§8) and decide with a number.
+4. C1, then the rest of A2 and B3 — or decide the Rust client stays a fast chat
+   client and Textual keeps the management screens.
