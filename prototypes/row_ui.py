@@ -5,11 +5,10 @@
     pixi run -e dev python prototypes/row_ui.py --chat 2000 --sessions 40
 
 Nothing here imports hpca and nothing here opens a database: the point is to
-try the *shape* — a header and three stacked rows, ctrl-arrow to move between
-them, arrows line by line inside one, ``e`` to open an entry — before any of it
-is wired to real data. The content is synthetic and deliberately over-long,
-because the question this exists to answer is what the UI feels like once a
-turn has produced hundreds of steps.
+try the *shape* — a header, four stacked rows, a footer, and the three screens
+that open over them — before any of it is wired to real data. The content is
+synthetic and deliberately over-long, because the question this exists to
+answer is what the UI feels like once a turn has produced hundreds of steps.
 
 The rendering model is pi-tui's, which is the reason for the exercise. pi-tui
 is TypeScript, so what is ported here is the architecture, not the library:
@@ -25,15 +24,21 @@ is TypeScript, so what is ported here is the architecture, not the library:
   written — inside a synchronised-output pair so the terminal shows each frame
   atomically instead of tearing.
 
-What is deliberately missing: real data, mouse support, text selection, an
-input box, modal screens, colour theming. Those are the arguments *against*
-leaving Textual, and this prototype is not the place to pretend they are
-solved.
+Keys follow the ones already bound in the Textual app (app.py BINDINGS) so
+that muscle memory survives the move: m manage llms, a profiles & learnings,
+c config editor, r/t/d on a session, d unwatch, q quit. The one addition is
+``e``/``E`` to open an entry, which the row design needs and the column design
+had no equivalent of.
+
+What is deliberately still missing: real data, mouse support, text selection,
+and approval prompts. Those are arguments *against* leaving Textual and this
+prototype is not the place to pretend they are solved.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import select
 import sys
@@ -81,6 +86,13 @@ def _pad(text: str, width: int) -> str:
     return text + " " * (width - len(text))
 
 
+def _rule(label: str, width: int, right: str = "") -> str:
+    left = f"── {label} "
+    tail = f"{right} ──" if right else "──"
+    gap = max(1, width - len(left) - len(tail))
+    return _pad(f"{left}{'─' * gap}{tail}", width)
+
+
 class Screen:
     """Raw terminal, alternate screen, differential repaint."""
 
@@ -126,18 +138,31 @@ KEYS = {
     f"{ESC}OA": "up",
     f"{ESC}[B": "down",
     f"{ESC}OB": "down",
+    f"{ESC}[C": "right",
+    f"{ESC}OC": "right",
+    f"{ESC}[D": "left",
+    f"{ESC}OD": "left",
     f"{ESC}[1;5A": "ctrl-up",
     f"{ESC}[1;5B": "ctrl-down",
+    f"{ESC}[1;3A": "alt-up",
+    f"{ESC}[1;3B": "alt-down",
     f"{ESC}[5~": "pgup",
     f"{ESC}[6~": "pgdn",
     f"{ESC}[H": "home",
     f"{ESC}[F": "end",
     f"{ESC}[1~": "home",
     f"{ESC}[4~": "end",
+    f"{ESC}[3~": "delete",
     f"{ESC}[Z": "shift-tab",
+    f"{ESC}\r": "alt-enter",
+    ESC: "esc",
     "\t": "tab",
     "\r": "enter",
     "\n": "enter",
+    "\x7f": "backspace",
+    "\x08": "backspace",
+    "\x13": "ctrl-s",
+    "\x15": "ctrl-u",
     "\x03": "quit",
     "\x04": "quit",
 }
@@ -161,6 +186,145 @@ def decode(data: bytes) -> list[str]:
     return keys
 
 
+# -------------------------------------------------------------------- editor
+
+
+class Editor:
+    """A minimal multi-line text buffer with a cursor.
+
+    Shared by the three places that need real typing — the message row, the
+    config editor and a profile's learnings — because they differ only in what
+    Enter means, which is the caller's business, not the buffer's.
+    """
+
+    def __init__(self, text: str = "") -> None:
+        self.lines = text.split("\n") or [""]
+        self.row = 0
+        self.col = 0
+        self.offset = 0
+
+    # ------------------------------------------------------------- content
+
+    def text(self) -> str:
+        return "\n".join(self.lines)
+
+    def clear(self) -> None:
+        self.lines = [""]
+        self.row = self.col = self.offset = 0
+
+    def insert(self, ch: str) -> None:
+        line = self.lines[self.row]
+        self.lines[self.row] = line[: self.col] + ch + line[self.col :]
+        self.col += 1
+
+    def newline(self) -> None:
+        line = self.lines[self.row]
+        self.lines[self.row : self.row + 1] = [line[: self.col], line[self.col :]]
+        self.row += 1
+        self.col = 0
+
+    def backspace(self) -> None:
+        if self.col:
+            line = self.lines[self.row]
+            self.lines[self.row] = line[: self.col - 1] + line[self.col :]
+            self.col -= 1
+        elif self.row:
+            above = self.lines[self.row - 1]
+            self.col = len(above)
+            self.lines[self.row - 1] = above + self.lines[self.row]
+            del self.lines[self.row]
+            self.row -= 1
+
+    def delete(self) -> None:
+        line = self.lines[self.row]
+        if self.col < len(line):
+            self.lines[self.row] = line[: self.col] + line[self.col + 1 :]
+        elif self.row < len(self.lines) - 1:
+            self.lines[self.row] += self.lines[self.row + 1]
+            del self.lines[self.row + 1]
+
+    # ---------------------------------------------------------- navigation
+
+    def move(self, drow: int, dcol: int) -> None:
+        if drow:
+            self.row = max(0, min(len(self.lines) - 1, self.row + drow))
+            self.col = min(self.col, len(self.lines[self.row]))
+        if dcol:
+            self.col += dcol
+            if self.col < 0:
+                if self.row:
+                    self.row -= 1
+                    self.col = len(self.lines[self.row])
+                else:
+                    self.col = 0
+            elif self.col > len(self.lines[self.row]):
+                if self.row < len(self.lines) - 1:
+                    self.row += 1
+                    self.col = 0
+                else:
+                    self.col = len(self.lines[self.row])
+
+    def home(self) -> None:
+        self.col = 0
+
+    def end(self) -> None:
+        self.col = len(self.lines[self.row])
+
+    def handle(self, key: str) -> bool:
+        """The keys every editor shares. False means "not mine"."""
+        if key == "backspace":
+            self.backspace()
+        elif key == "delete":
+            self.delete()
+        elif key == "left":
+            self.move(0, -1)
+        elif key == "right":
+            self.move(0, 1)
+        elif key == "up":
+            self.move(-1, 0)
+        elif key == "down":
+            self.move(1, 0)
+        elif key == "home":
+            self.home()
+        elif key == "end":
+            self.end()
+        elif key == "ctrl-u":
+            self.clear()
+        elif len(key) == 1 and key.isprintable():
+            self.insert(key)
+        else:
+            return False
+        return True
+
+    # ------------------------------------------------------------- drawing
+
+    def render(
+        self, width: int, height: int, *, focused: bool, numbers: bool = False
+    ) -> list[str]:
+        gutter = len(str(len(self.lines))) + 2 if numbers else 0
+        body = max(4, width - gutter)
+        if self.row < self.offset:
+            self.offset = self.row
+        elif self.row >= self.offset + height:
+            self.offset = self.row - height + 1
+        self.offset = max(0, min(self.offset, max(0, len(self.lines) - height)))
+        # Horizontal scroll rather than wrapping: a JSON file edited at column
+        # 90 must not reflow the twenty lines under it every keystroke.
+        hoff = max(0, self.col - body + 2)
+        out = []
+        for row in range(self.offset, self.offset + height):
+            if row >= len(self.lines):
+                out.append(" " * width)
+                continue
+            prefix = f"{DIM}{row + 1:>{gutter - 1}} {RESET}" if numbers else ""
+            text = _pad(self.lines[row][hoff : hoff + body], body)
+            if focused and row == self.row:
+                at = self.col - hoff
+                text = text[:at] + REVERSE + text[at : at + 1] + RESET + text[at + 1 :]
+            out.append(prefix + text)
+        return out
+
+
 # --------------------------------------------------------------------- panes
 
 
@@ -174,7 +338,7 @@ class Item:
 
 
 class Pane:
-    """One of the three navigable rows.
+    """One navigable list of entries.
 
     Holds its own cursor line, scroll offset and set of open entries, which is
     what makes "each row remembers where you were" fall out rather than need
@@ -216,13 +380,13 @@ class Pane:
     def invalidate(self) -> None:
         self._flat = None
 
-    # ----------------------------------------------------------- navigation
-
-    def _current(self, width: int) -> int:
+    def current(self, width: int) -> int:
         lines = self.flat(width)
         if not lines:
             return -1
         return lines[min(self.cursor, len(lines) - 1)][0]
+
+    # ----------------------------------------------------------- navigation
 
     def _go_to(self, item: int, width: int) -> None:
         for row, (owner, _, _) in enumerate(self.flat(width)):
@@ -247,7 +411,7 @@ class Pane:
         self._scroll_into_view(view_h, total)
 
     def toggle(self, width: int) -> None:
-        item = self._current(width)
+        item = self.current(width)
         if item < 0 or not self.items[item].body:
             return
         self.expanded.symmetric_difference_update({item})
@@ -257,7 +421,7 @@ class Pane:
         self._go_to(item, width)
 
     def toggle_all(self, width: int) -> None:
-        item = self._current(width)
+        item = self.current(width)
         if self.expanded:
             self.expanded.clear()
         else:
@@ -275,7 +439,11 @@ class Pane:
         body_h = max(1, height - 1)
         self._scroll_into_view(body_h, len(lines))
         current = lines[self.cursor][0] if lines else -1
-        out = [self._title(width, len(lines), focused)]
+        right = f"line {min(self.cursor + 1, len(lines))}/{len(lines)}"
+        if self.expanded:
+            right += f" · {len(self.expanded)} open"
+        title = _rule(self.name, width, right)
+        out = [(BOLD + CYAN if focused else DIM) + title + RESET]
         for row in range(self.offset, self.offset + body_h):
             if row >= len(lines):
                 out.append(" " * width)
@@ -294,103 +462,550 @@ class Pane:
             out.append(painted)
         return out
 
-    def _title(self, width: int, total: int, focused: bool) -> str:
-        right = f"line {min(self.cursor + 1, total)}/{total}"
-        if self.expanded:
-            right += f" · {len(self.expanded)} open"
-        left = f"── {self.name} "
-        gap = max(1, width - len(left) - len(right) - 3)
-        text = _pad(f"{left}{'─' * gap}{right} ──", width)
-        return (BOLD + CYAN + text + RESET) if focused else (DIM + text + RESET)
+
+# ------------------------------------------------------------------- footers
+
+
+def footer_line(pairs: list[tuple[str, str]], width: int, note: str = "") -> str:
+    """As many ``key label`` pairs as fit, keys bright and labels dim.
+
+    Truncation is by whole pairs rather than by characters: half a hint is
+    worse than one hint fewer, and ``?`` opens the full list anyway — which is
+    the honest answer to "show *all* the hotkeys" on an 80-column terminal.
+    """
+    plain: list[str] = []
+    styled: list[str] = []
+    used = 1
+    if note:
+        used += len(note) + 2
+    for key, label in pairs:
+        piece = f"{key} {label}"
+        extra = len(piece) + (2 if plain else 0)
+        if used + extra > width - 1:
+            break
+        plain.append(piece)
+        styled.append(f"{CYAN}{key}{RESET} {DIM}{label}{RESET}")
+        used += extra
+    head = f"{YELLOW}{note}{RESET}  " if note else ""
+    return " " + head + "  ".join(styled) + " " * max(0, width - used)
+
+
+# ------------------------------------------------------------------ overlays
+
+
+class Overlay:
+    """A screen drawn over the rows. ``handle`` returning False closes it."""
+
+    title = ""
+
+    def render(self, width: int, height: int) -> list[str]:  # pragma: no cover
+        raise NotImplementedError
+
+    def footer(self) -> list[tuple[str, str]]:
+        return [("esc", "back")]
+
+
+class HelpOverlay(Overlay):
+    """Every key, since the footer can only ever show the ones that fit."""
+
+    title = "keys"
+
+    SECTIONS = [
+        (
+            "anywhere",
+            [
+                ("^↑ ^↓", "move between rows (tab / shift-tab also)"),
+                ("m", "manage llms"),
+                ("a", "profiles & learnings"),
+                ("c", "config editor"),
+                ("^l", "switch llm for this session"),
+                ("shift-tab", "cycle agent mode"),
+                ("?", "this list"),
+                ("q", "quit"),
+            ],
+        ),
+        (
+            "in any row",
+            [
+                ("↑ ↓", "move one line"),
+                ("pgup pgdn", "move one screen"),
+                ("home end", "first / last line"),
+                ("e", "open or close the entry under the cursor"),
+                ("E", "open or close every entry in the row"),
+            ],
+        ),
+        (
+            "sessions row",
+            [
+                ("enter", "switch to that session"),
+                ("r", "rename"),
+                ("t", "ask the llm for a title"),
+                ("d", "delete"),
+            ],
+        ),
+        (
+            "chat row",
+            [("i", "go to the message box"), ("esc esc", "stop the agent")],
+        ),
+        (
+            "message box",
+            [
+                ("enter", "send"),
+                ("alt-enter", "new line"),
+                ("^u", "clear"),
+                ("esc", "back to the chat"),
+            ],
+        ),
+        (
+            "watchers row",
+            [
+                ("enter", "peek at the log"),
+                ("d", "unwatch"),
+                ("alt-↑ alt-↓", "reorder"),
+            ],
+        ),
+    ]
+
+    def render(self, width: int, height: int) -> list[str]:
+        out = [BOLD + CYAN + _rule("keys", width) + RESET]
+        for name, keys in self.SECTIONS:
+            out.append(DIM + _pad(f"  {name}", width) + RESET)
+            for key, label in keys:
+                # Padded plain and coloured afterwards by column, never by
+                # adding the escape lengths to the width — that arithmetic is
+                # exactly the kind that leaves a row one cell short.
+                row = _pad(f"      {key:<12}{label}", width)
+                out.append(row[:6] + CYAN + row[6:18] + RESET + row[18:])
+            out.append(" " * width)
+        while len(out) < height:
+            out.append(" " * width)
+        return out[:height]
+
+    def handle(self, key: str, width: int, height: int) -> bool:
+        # Any key closes it. A list you opened by accident should not need the
+        # one key you were looking it up to find.
+        return False
+
+
+class LlmOverlay(Overlay):
+    """Manage LLMs (m): discovered endpoints left, configured catalog right.
+
+    The two-column shape is the one screen in HPCA that genuinely wants
+    columns, and it keeps them — the row design is about the main view, not a
+    rule to apply everywhere. ←/→ switch side, and the footer offers "add"
+    only on the left and "remove"/"make default" only on the right, which is
+    what the Textual version does by hanging bindings off each panel.
+    """
+
+    title = "manage llms"
+
+    def __init__(self, discovered: list[Item], configured: list[Item]) -> None:
+        self.panes = [Pane("discovered", discovered), Pane("configured", configured)]
+        self.side = 0
+        self.note = ""
+
+    def footer(self) -> list[tuple[str, str]]:
+        keys = [("←→", "side"), ("↑↓", "move"), ("e", "open")]
+        if self.side == 0:
+            keys.append(("enter", "add to catalog"))
+            keys.append(("s", "rescan"))
+        else:
+            keys.append(("enter", "make default"))
+            keys.append(("d", "remove"))
+        return keys + [("esc", "back")]
+
+    def render(self, width: int, height: int) -> list[str]:
+        half = width // 2
+        body = height - 1
+        left = self.panes[0].render(half - 1, body, focused=self.side == 0)
+        right = self.panes[1].render(width - half, body, focused=self.side == 1)
+        out = [BOLD + CYAN + _rule(self.title, width, self.note) + RESET]
+        # One column of rule between them: without it a truncated endpoint on
+        # the left runs straight into the right pane's cursor gutter.
+        out += [a + DIM + "│" + RESET + b for a, b in zip(left, right)]
+        while len(out) < height:
+            out.append(" " * width)
+        return out[:height]
+
+    def handle(self, key: str, width: int, height: int) -> bool:
+        pane = self.panes[self.side]
+        half = max(8, (width // 2) - 2)
+        view = max(1, height - 2)
+        if key == "esc":
+            return False
+        if key in ("left", "right", "tab"):
+            self.side = 1 - self.side
+        elif key == "up":
+            pane.move(-1, view, half)
+        elif key == "down":
+            pane.move(1, view, half)
+        elif key == "e":
+            pane.toggle(half)
+        elif key == "E":
+            pane.toggle_all(half)
+        elif key == "enter":
+            self.note = (
+                "added to the catalog" if self.side == 0 else "made the default"
+            )
+        elif key == "d" and self.side == 1:
+            self.note = "removed (confirm in the real screen)"
+        elif key == "s" and self.side == 0:
+            self.note = "rescanned: 3 endpoints"
+        return True
+
+
+class ProfilesOverlay(Overlay):
+    """Profiles & learnings (a): the list, and one profile's memories open in
+    a plain editor — the two states the Textual screen has."""
+
+    title = "profiles & learnings"
+
+    def __init__(self, profiles: list[Item], learnings: dict[str, str]) -> None:
+        self.pane = Pane("profiles", profiles)
+        self.learnings = learnings
+        self.editor: Editor | None = None
+        self.editing = ""
+        self.note = ""
+
+    def footer(self) -> list[tuple[str, str]]:
+        if self.editor is not None:
+            return [("^s", "keep"), ("esc", "discard"), ("↑↓←→", "move")]
+        return [
+            ("↑↓", "move"),
+            ("e", "open"),
+            ("enter", "edit learnings"),
+            ("c", "copy"),
+            ("d", "delete"),
+            ("esc", "back"),
+        ]
+
+    def render(self, width: int, height: int) -> list[str]:
+        if self.editor is not None:
+            head = _rule(f"learnings · {self.editing}", width, self.note)
+            out = [BOLD + CYAN + head + RESET]
+            out += self.editor.render(width, height - 1, focused=True, numbers=True)
+            return out[:height]
+        out = [BOLD + CYAN + _rule(self.title, width, self.note) + RESET]
+        out += self.pane.render(width, height - 1, focused=True)
+        return out[:height]
+
+    def handle(self, key: str, width: int, height: int) -> bool:
+        inner = max(8, width - 2)
+        if self.editor is not None:
+            if key == "esc":
+                self.editor = None
+                self.note = "discarded"
+            elif key == "ctrl-s":
+                self.learnings[self.editing] = self.editor.text()
+                self.editor = None
+                self.note = "kept"
+            elif key == "enter":
+                self.editor.newline()
+            else:
+                self.editor.handle(key)
+            return True
+        if key == "esc":
+            return False
+        view = max(1, height - 2)
+        if key == "up":
+            self.pane.move(-1, view, inner)
+        elif key == "down":
+            self.pane.move(1, view, inner)
+        elif key == "e":
+            self.pane.toggle(inner)
+        elif key == "E":
+            self.pane.toggle_all(inner)
+        elif key == "enter":
+            item = self.pane.current(inner)
+            name = self.pane.items[item].head.split("  ")[0].strip("▸▾ ")
+            self.editing = name
+            self.editor = Editor(self.learnings.get(name, "(nothing learned yet)\n"))
+            self.note = ""
+        elif key == "c":
+            self.note = "copied under a new name"
+        elif key == "d":
+            self.note = "deleted (never the default, never one in use)"
+        return True
+
+
+class ConfigOverlay(Overlay):
+    """Config editor (c): raw JSON over the whole settings file, validated on
+    save — deliberately not a friendly settings menu, which is what the real
+    screen's docstring insists on."""
+
+    title = "config editor"
+
+    def __init__(self, text: str) -> None:
+        self.editor = Editor(text)
+        self.note = ""
+
+    def footer(self) -> list[tuple[str, str]]:
+        return [
+            ("^s", "validate & save"),
+            ("↑↓←→", "move"),
+            ("^u", "clear"),
+            ("esc", "back"),
+        ]
+
+    def render(self, width: int, height: int) -> list[str]:
+        out = [BOLD + CYAN + _rule(self.title, width, self.note) + RESET]
+        out += self.editor.render(width, height - 1, focused=True, numbers=True)
+        return out[:height]
+
+    def handle(self, key: str, width: int, height: int) -> bool:
+        if key == "esc":
+            return False
+        if key == "ctrl-s":
+            try:
+                json.loads(self.editor.text())
+            except json.JSONDecodeError as e:
+                self.note = f"invalid: line {e.lineno} — {e.msg}"
+            else:
+                self.note = "saved"
+            return True
+        if key == "enter":
+            self.editor.newline()
+        else:
+            self.editor.handle(key)
+        return True
 
 
 # ----------------------------------------------------------------------- app
 
+SESSIONS, CHAT, INPUT, WATCHERS = range(4)
+
 
 class RowUI:
-    HEADER = 1
     MIN_CHAT = 4
+    MAX_INPUT = 6
 
-    def __init__(self, panes: list[Pane], *, profile: str) -> None:
-        self.panes = panes  # top to bottom: sessions, chat, watchers
-        self.focus = 1  # the chat, which is where a session starts
+    def __init__(
+        self,
+        panes: list[Pane],
+        *,
+        profile: str,
+        learnings: dict[str, str],
+        settings_json: str,
+        llms: tuple[list[Item], list[Item]],
+    ) -> None:
+        self.panes = panes  # sessions, chat, watchers
+        self.input = Editor()
+        self.focus = CHAT
         self.profile = profile
+        self.mode = "agent"
+        self.model = "qwen3-27b-fp8"
         self.frame_ms = 0.0
+        self.note = ""
+        self.overlay: Overlay | None = None
+        self._learnings = learnings
+        self._settings_json = settings_json
+        self._llms = llms
+
+    # ------------------------------------------------------------- geometry
+
+    def _input_h(self) -> int:
+        return 1 + max(1, min(self.MAX_INPUT, len(self.input.lines)))
 
     def _heights(self, height: int, width: int) -> list[int]:
-        """How the three rows split the screen.
+        """How the rows split the screen.
 
         A quarter each for sessions and watchers and the rest to the chat — but
         only as much of a quarter as the pane actually has to show, so a short
-        session list or an empty watcher row costs nothing instead of holding
-        a quarter of the screen open. What is left over always goes to the
-        chat, which is the row that can use it.
+        session list or an empty watcher row costs nothing instead of holding a
+        quarter of the screen open. The message box takes what it needs up to
+        six lines. Everything left over goes to the chat, which is the row that
+        can use it.
         """
-        avail = max(6, height - self.HEADER)
+        avail = max(8, height - 2)  # header and footer
+        inp = self._input_h()
         quarter = max(2, avail // 4)
         inner = max(8, width - 2)
         top = max(2, min(1 + len(self.panes[0].flat(inner)), quarter))
         bottom = max(2, min(1 + len(self.panes[2].flat(inner)), quarter))
-        while avail - top - bottom < self.MIN_CHAT and (top > 2 or bottom > 2):
+        while avail - top - bottom - inp < self.MIN_CHAT and (top > 2 or bottom > 2):
             if top >= bottom and top > 2:
                 top -= 1
             elif bottom > 2:
                 bottom -= 1
             else:
                 break
-        middle = avail - top - bottom
+        middle = avail - top - bottom - inp
         if middle < 1:  # a terminal too short for the design at all
-            top = bottom = max(1, (avail - 1) // 3)
-            middle = avail - top - bottom
-        return [top, middle, bottom]
+            top = bottom = 2
+            inp = 2
+            middle = max(1, avail - 6)
+        return [top, middle, inp, bottom]
+
+    # -------------------------------------------------------------- drawing
 
     def render(self, width: int, height: int) -> list[str]:
         out = [self._header(width)]
-        for index, (pane, pane_h) in enumerate(
-            zip(self.panes, self._heights(height, width))
-        ):
-            out.extend(pane.render(width, pane_h, focused=index == self.focus))
+        if self.overlay is not None:
+            out += self.overlay.render(width, height - 2)
+            out.append(footer_line(self.overlay.footer(), width))
+            while len(out) < height:
+                out.insert(len(out) - 1, " " * width)
+            return out[:height]
+        heights = self._heights(height, width)
+        order = [
+            (SESSIONS, self.panes[0], heights[0]),
+            (CHAT, self.panes[1], heights[1]),
+            (INPUT, None, heights[2]),
+            (WATCHERS, self.panes[2], heights[3]),
+        ]
+        for slot, pane, pane_h in order:
+            if slot == INPUT:
+                out += self._render_input(width, pane_h)
+            else:
+                out += pane.render(width, pane_h, focused=self.focus == slot)
+        out.append(footer_line(self._keys(), width, self.note))
         while len(out) < height:
-            out.append(" " * width)
+            out.insert(len(out) - 1, " " * width)
+        return out[:height]
+
+    def _render_input(self, width: int, height: int) -> list[str]:
+        focused = self.focus == INPUT
+        right = f"{self.mode} · {self.model} · 31% ctx"
+        title = _rule("message", width, right)
+        out = [(BOLD + CYAN if focused else DIM) + title + RESET]
+        rows = max(1, height - 1)
+        body = self.input.render(width - 2, rows, focused=focused)
+        for index, line in enumerate(body):
+            marker = "› " if index == 0 else "  "
+            out.append((CYAN if focused else DIM) + marker + RESET + line)
         return out[:height]
 
     def _header(self, width: int) -> str:
-        left = f" HPCA {VERSION}  ·  {self.profile}"
-        right = (
-            f"{self.frame_ms:5.2f}ms  ·  ↑↓ scroll   ^↑ ^↓ row   "
-            "e open   a open all   q quit "
-        )
+        left = f" HPCA {VERSION}  ·  {self.profile}  ·  {self.mode}"
+        right = f"{self.frame_ms:5.2f}ms  ·  ? keys  "
         gap = width - len(left) - len(right)
         text = left + " " * gap + right if gap > 0 else left
         return REVERSE + _pad(text, width) + RESET
 
+    def _keys(self) -> list[tuple[str, str]]:
+        """Only what applies where the cursor is — the footer's whole job.
+
+        The Textual app gets this from ``check_action`` per binding; here it is
+        one function, which is easier to read and impossible to get out of step
+        with what the keys actually do.
+        """
+        common = [("^↑^↓", "row"), ("?", "keys"), ("q", "quit")]
+        if self.focus == INPUT:
+            return [
+                ("enter", "send"),
+                ("alt-enter", "new line"),
+                ("^u", "clear"),
+                ("esc", "chat"),
+            ] + common
+        rows = [("↑↓", "line"), ("e", "open"), ("E", "open all")]
+        if self.focus == SESSIONS:
+            rows += [("enter", "switch"), ("r", "rename"), ("t", "retitle"), ("d", "delete")]
+        elif self.focus == CHAT:
+            rows += [("i", "write"), ("esc esc", "stop")]
+        else:
+            rows += [("enter", "peek"), ("d", "unwatch"), ("alt-↑↓", "move")]
+        return rows + [("m", "llms"), ("a", "profiles"), ("c", "config")] + common
+
+    # --------------------------------------------------------------- input
+
     def handle(self, key: str, width: int, height: int) -> bool:
-        """Act on one key; False means quit."""
+        if self.overlay is not None:
+            if not self.overlay.handle(key, width, height - 2):
+                self.overlay = None
+            return True
+        if self.focus == INPUT:
+            return self._handle_input(key)
+        return self._handle_row(key, width, height)
+
+    def _handle_input(self, key: str) -> bool:
+        if key == "esc":
+            self.focus = CHAT
+        elif key == "enter":
+            self._send()
+        elif key == "alt-enter":
+            self.input.newline()
+        elif key in ("ctrl-up", "shift-tab"):
+            self.focus = CHAT
+        elif key == "ctrl-down":
+            self.focus = WATCHERS
+        elif key == "quit":
+            return False
+        else:
+            self.input.handle(key)
+        return True
+
+    def _send(self) -> None:
+        text = self.input.text().strip()
+        if not text:
+            return
+        chat = self.panes[1]
+        chat.items.append(Item(head=f"you   {text}", accent=BLUE))
+        chat.items.append(
+            Item(
+                head="hpca  looking at that now…",
+                body=["(the prototype has no backend; this is where a turn would start)"],
+                accent=YELLOW,
+            )
+        )
+        chat.invalidate()
+        chat.cursor = 10**9
+        self.input.clear()
+        self.note = "sent"
+
+    def _handle_row(self, key: str, width: int, height: int) -> bool:
         if key in ("q", "quit"):
             return False
         inner = max(8, width - 2)
-        view_h = max(1, self._heights(height, width)[self.focus] - 1)
-        pane = self.panes[self.focus]
-        if key in ("ctrl-down", "tab"):
-            self.focus = (self.focus + 1) % len(self.panes)
+        slots = [SESSIONS, CHAT, INPUT, WATCHERS]
+        view = max(1, self._heights(height, width)[slots.index(self.focus)] - 1)
+        pane = self.panes[{SESSIONS: 0, CHAT: 1, WATCHERS: 2}[self.focus]]
+        self.note = ""
+        if key == "?":
+            self.overlay = HelpOverlay()
+        elif key == "m":
+            self.overlay = LlmOverlay(*self._llms)
+        elif key == "a":
+            self.overlay = ProfilesOverlay(sample_profiles(), self._learnings)
+        elif key == "c":
+            self.overlay = ConfigOverlay(self._settings_json)
+        elif key in ("ctrl-down", "tab"):
+            self.focus = slots[(slots.index(self.focus) + 1) % len(slots)]
         elif key in ("ctrl-up", "shift-tab"):
-            self.focus = (self.focus - 1) % len(self.panes)
+            self.focus = slots[(slots.index(self.focus) - 1) % len(slots)]
+        elif key == "i" and self.focus == CHAT:
+            self.focus = INPUT
         elif key == "up":
-            pane.move(-1, view_h, inner)
+            pane.move(-1, view, inner)
         elif key == "down":
-            pane.move(1, view_h, inner)
+            pane.move(1, view, inner)
         elif key == "pgup":
-            pane.move(-view_h, view_h, inner)
+            pane.move(-view, view, inner)
         elif key == "pgdn":
-            pane.move(view_h, view_h, inner)
+            pane.move(view, view, inner)
         elif key == "home":
-            pane.move(-(10**9), view_h, inner)
+            pane.move(-(10**9), view, inner)
         elif key == "end":
-            pane.move(10**9, view_h, inner)
-        elif key in ("e", "E", "enter"):
+            pane.move(10**9, view, inner)
+        elif key == "e":
             pane.toggle(inner)
-        elif key in ("a", "A"):
+        elif key == "E":
             pane.toggle_all(inner)
+        elif key == "enter":
+            self.note = {
+                SESSIONS: "switched to that session",
+                CHAT: "…",
+                WATCHERS: "peeking at the log",
+            }[self.focus]
+        elif key == "r" and self.focus == SESSIONS:
+            self.note = "rename: a modal in the real app"
+        elif key == "t" and self.focus == SESSIONS:
+            self.note = "asking the llm for a title"
+        elif key == "d":
+            self.note = (
+                "delete session (confirm)"
+                if self.focus == SESSIONS
+                else "unwatched"
+            )
         return True
 
 
@@ -398,7 +1013,7 @@ class RowUI:
 
 TASKS = [
     "annotate the cohort BAMs with sniffles",
-    "why did the snakemake run stall at rule merge_vcf",
+    "why did the snakemake run stall at merge_vcf",
     "write the methods section for the SV paper",
     "check GPU utilisation on the last training job",
     "rebuild the reference index on scratch",
@@ -420,6 +1035,39 @@ REPLIES = [
     "I have written the methods section — it is 42 lines, have a look.",
     "The job is still queued behind a reservation; nothing is wrong with it.",
 ]
+
+SETTINGS_JSON = """{
+  "llm": {
+    "base_url": "http://localhost:20001/v1",
+    "model": "qwen3-27b-fp8",
+    "context_window": 112000,
+    "temperature": 0.2
+  },
+  "database": {
+    "local_cache": true,
+    "sync_interval_s": 60
+  },
+  "logging": {
+    "enabled": true,
+    "dir": ""
+  },
+  "agent": {
+    "mode": "agent",
+    "max_steps": 40
+  }
+}
+"""
+
+LEARNINGS = {
+    "hpc": (
+        "The cluster's scratch is /scratch/proj, and $HOME is NFS — never write\n"
+        "large intermediates to $HOME.\n"
+        "Slurm partitions: gpu (a100), cpu-long, cpu-short.\n"
+        "Prefers sniffles over cuteSV for long-read SV calling.\n"
+    ),
+    "default": "(nothing learned yet)\n",
+    "writing": "Writes in British spelling. Dislikes bullet lists in prose.\n",
+}
 
 
 def sample_sessions(count: int) -> list[Item]:
@@ -443,17 +1091,13 @@ def sample_chat(count: int) -> list[Item]:
     for i in range(count):
         slot = i % 3
         if slot == 0:
-            items.append(
-                Item(head=f"you   {TASKS[i % len(TASKS)]}", accent=BLUE)
-            )
+            items.append(Item(head=f"you   {TASKS[i % len(TASKS)]}", accent=BLUE))
         elif slot == 1:
             steps = 3 + (i * 5) % 18
             names = [tools[(i + k) % len(tools)] for k in range(steps)]
             items.append(
                 Item(
-                    head=(
-                        f"      {steps} steps · " + " → ".join(names[:3]) + " …"
-                    ),
+                    head=f"      {steps} steps · " + " → ".join(names[:3]) + " …",
                     body=[
                         f"{name:<14}{SNIPPETS[(i + k) % len(SNIPPETS)]}"
                         for k, name in enumerate(names)
@@ -469,9 +1113,7 @@ def sample_chat(count: int) -> list[Item]:
                         reply,
                         "The detail is in the log at "
                         "/scratch/proj/cohort/run3/logs/merge_vcf.log, and the "
-                        "two shards are listed at the bottom of it. I have not "
-                        "changed anything yet — say the word and I will patch "
-                        "the rule to use a per-shard temp path.",
+                        "two shards are listed at the bottom of it.",
                     ],
                     accent=YELLOW,
                 )
@@ -480,12 +1122,7 @@ def sample_chat(count: int) -> list[Item]:
 
 
 def sample_watchers(count: int) -> list[Item]:
-    states = [
-        ("RUNNING", GREEN),
-        ("PENDING", ""),
-        ("COMPLETED", ""),
-        ("FAILED", RED),
-    ]
+    states = [("RUNNING", GREEN), ("PENDING", ""), ("COMPLETED", ""), ("FAILED", RED)]
     out = []
     for i in range(count):
         state, accent = states[i % len(states)]
@@ -506,7 +1143,78 @@ def sample_watchers(count: int) -> list[Item]:
     return out
 
 
+def sample_profiles() -> list[Item]:
+    return [
+        Item(
+            head=f"{'hpc':<18}12 memories · 4 skills · 3 sessions",
+            body=["created 2026-04-02", "used by the open session"],
+            accent=GREEN,
+        ),
+        Item(
+            head=f"{'default':<18}0 memories · 0 skills · 1 session",
+            body=["created 2026-01-11", "the fallback; cannot be deleted"],
+        ),
+        Item(
+            head=f"{'writing':<18}5 memories · 1 skill · 0 sessions",
+            body=["created 2026-06-20", "copied from hpc"],
+        ),
+        Item(head="(new profile)"),
+    ]
+
+
+def sample_llms() -> tuple[list[Item], list[Item]]:
+    discovered = [
+        Item(
+            head="● 10.12.4.31:20001    qwen3-27b-fp8      112k ctx",
+            body=["found in the shared endpoints manifest", "node gpu014, 42s ago"],
+            accent=GREEN,
+        ),
+        Item(
+            head="● localhost:20001     qwen3-27b-fp8      112k ctx",
+            body=["found by localhost scan (ssh tunnel)"],
+            accent=GREEN,
+        ),
+        Item(
+            head="○ 10.12.4.55:20001    llama-3.3-70b       128k ctx",
+            body=["in the manifest, did not answer the probe"],
+        ),
+    ]
+    configured = [
+        Item(
+            head="★ ● cluster-qwen    http://10.12.4.31:20001/v1",
+            body=["qwen3-27b-fp8 · 112k ctx · the active default"],
+            accent=GREEN,
+        ),
+        Item(
+            head="  ● tunnel-qwen     http://localhost:20001/v1",
+            body=["qwen3-27b-fp8 · 112k ctx"],
+            accent=GREEN,
+        ),
+        Item(
+            head="  ○ big-llama       http://10.12.4.55:20001/v1",
+            body=["llama-3.3-70b · 128k ctx · not answering"],
+        ),
+    ]
+    return discovered, configured
+
+
 # ---------------------------------------------------------------------- main
+
+
+def build(chat: int = 400, sessions: int = 14, watchers: int = 5) -> RowUI:
+    ui = RowUI(
+        [
+            Pane("sessions", sample_sessions(sessions)),
+            Pane("chat", sample_chat(chat)),
+            Pane("watchers", sample_watchers(watchers)),
+        ],
+        profile="hpc",
+        learnings=dict(LEARNINGS),
+        settings_json=SETTINGS_JSON,
+        llms=sample_llms(),
+    )
+    ui.panes[1].cursor = 10**9
+    return ui
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -522,17 +1230,7 @@ def main(argv: list[str] | None = None) -> int:
         print("row_ui needs a terminal.", file=sys.stderr)
         return 2
 
-    ui = RowUI(
-        [
-            Pane("sessions", sample_sessions(args.sessions)),
-            Pane("chat", sample_chat(args.chat)),
-            Pane("watchers", sample_watchers(args.watchers)),
-        ],
-        profile="hpc",
-    )
-    # Open on the newest chat entry, as the real app does.
-    ui.panes[1].cursor = 10**9
-
+    ui = build(args.chat, args.sessions, args.watchers)
     with Screen() as screen:
         size = (0, 0)
         while True:
