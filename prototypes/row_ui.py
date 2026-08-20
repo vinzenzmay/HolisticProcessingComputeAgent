@@ -59,6 +59,13 @@ from dataclasses import dataclass, field
 # of the repo to try in another terminal.
 VERSION = "0.25.0-proto"
 
+# How long a first escape stays armed for a second one to complete the stop
+# gesture. The same 1.0s the Textual app uses, and for the same reason a single
+# escape must keep meaning nothing: ESC is the byte a terminal also sends as the
+# prefix of every arrow key and of bracketed paste, so one arriving on its own
+# is not evidence that the user wants the turn dead. Two in a second are.
+ESC_STOP_WINDOW = 1.0
+
 # --------------------------------------------------------------------- ansi
 
 ESC = "\x1b"
@@ -850,6 +857,7 @@ class HelpOverlay(Overlay):
             "anywhere",
             [
                 ("^↑ ^↓", "move between rows (tab / shift-tab also)"),
+                ("esc esc", "stop the agent, from any row — one esc does nothing"),
                 ("m", "manage llms"),
                 ("a", "profiles & learnings"),
                 ("c", "config editor"),
@@ -881,7 +889,7 @@ class HelpOverlay(Overlay):
         ),
         (
             "chat row",
-            [("i", "go to the message box"), ("esc esc", "stop the agent")],
+            [("i", "go to the message box")],
         ),
         (
             "message box",
@@ -896,7 +904,7 @@ class HelpOverlay(Overlay):
                 ("^del", "delete the word after it"),
                 ("⌫ del", "delete the marked text, if any"),
                 ("^u", "clear"),
-                ("esc", "back to the chat"),
+                ("^↑", "back to the chat — escape is the stop gesture, not an exit"),
             ],
         ),
         (
@@ -1261,6 +1269,11 @@ class RowUI:
         self.frame_ms = 0.0
         self.note = ""
         self.overlay: Overlay | None = None
+        # When the last escape landed, so the next one can tell whether it is
+        # the second half of a stop. Injectable so the headless check can drive
+        # the clock instead of sleeping through the window.
+        self.clock = time.monotonic
+        self._esc_armed_at: float | None = None
         self._learnings = learnings
         self._settings_json = settings_json
         self._llms = llms
@@ -1441,25 +1454,33 @@ class RowUI:
         one function, which is easier to read and impossible to get out of step
         with what the keys actually do.
         """
-        common = [("^↑^↓", "row"), ("?", "keys"), ("q", "quit")]
+        # esc esc works from every row, so it belongs in the part every row
+        # shows — and ahead of "? keys" and "q quit", because a footer drops
+        # whole pairs off its end and this is the one that must not be the pair
+        # that goes. Leaving the message box is ^↑, not escape: escape has a
+        # job now.
+        common = [("^↑^↓", "row"), ("esc esc", "stop"), ("?", "keys"), ("q", "quit")]
         if self.focus == INPUT:
-            # Ordered by what you would miss most: the footer drops whole
-            # pairs off the end, and "how do I get out of here" has to survive
-            # a narrow terminal.
+            # Spelled out rather than built from ``common`` so that send and
+            # stop come first — the message box is where you sit while a turn
+            # runs, and those are the two keys that matter there.
             return [
                 ("enter", "send"),
-                ("esc", "chat"),
+                ("esc esc", "stop"),
+                ("^↑^↓", "row"),
                 ("alt-enter", "new line"),
                 ("^←→", "word"),
                 ("⇧←→", "select"),
                 ("^⌫ ^del", "cut word"),
                 ("^u", "clear"),
-            ] + common
+                ("?", "keys"),
+                ("q", "quit"),
+            ]
         rows = [("↑↓", "line"), ("→←", "open"), ("⇧→←", "open all")]
         if self.focus == SESSIONS:
             rows += [("enter", "switch"), ("r", "rename"), ("t", "retitle"), ("d", "delete")]
         elif self.focus == CHAT:
-            rows += [("i", "write"), ("esc esc", "stop")]
+            rows += [("i", "write")]
         else:
             rows += [("enter", "peek"), ("d", "unwatch"), ("alt-↑↓", "move")]
         return rows + [("m", "llms"), ("a", "profiles"), ("c", "config")] + common
@@ -1475,9 +1496,31 @@ class RowUI:
             return self._handle_input(key)
         return self._handle_row(key, width, height)
 
+    def _escape(self) -> bool:
+        """Two escapes in quick succession stop the turn. One does nothing.
+
+        Deliberately nothing, which is what app.py's ``action_stop_turn``
+        settled on: the doubling *is* the confirmation, and a lone escape is
+        too easy to arrive by accident — it is also the first byte of every
+        arrow key — to end a turn on. Saying "press escape again" would put a
+        message on screen every time a stray sequence reached us.
+
+        It works from wherever the cursor is, the message box included, and
+        that is the whole point of the gesture: a turn calling tool after tool
+        is writing rows into the very list you would otherwise have to aim at.
+        Escape needs no target.
+        """
+        now = self.clock()
+        first, self._esc_armed_at = self._esc_armed_at, now
+        if first is None or now - first > ESC_STOP_WINDOW:
+            return False
+        self._esc_armed_at = None  # spent: a third press opens a fresh pair
+        self.note = "stopped the turn"
+        return True
+
     def _handle_input(self, key: str) -> bool:
         if key == "esc":
-            self.focus = CHAT
+            self._escape()
         elif key == "enter":
             self._send()
         elif key == "alt-enter":
@@ -1522,7 +1565,9 @@ class RowUI:
             WATCHERS: self.watchers,
         }[self.focus]
         self.note = ""
-        if key == "?":
+        if key == "esc":
+            self._escape()
+        elif key == "?":
             self.overlay = HelpOverlay()
         elif key == "m":
             self.overlay = LlmOverlay(*self._llms)
