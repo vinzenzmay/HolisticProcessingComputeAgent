@@ -32,6 +32,7 @@ from typing import Callable, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from hpca.agent import hints
 from hpca.agent.context import ToolContext
 from hpca.agent.history import carries_elision_marker
 from hpca.agent.tools import Tool, ToolRegistry
@@ -206,12 +207,12 @@ async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
     if taken is not None and taken.exists():
         if taken == path:
             raise RegistryError(
-                f"Script {args.registry_key!r} already exists; change it with "
-                "edit_file rather than creating it again"
+                f"Script {args.registry_key!r} already exists; "
+                f"{hints.SCRIPT_KEY_EXISTS}"
             )
         raise RegistryError(
-            f"Key {args.registry_key!r} already names {taken}; pick a "
-            "different key"
+            f"Key {args.registry_key!r} already names {taken}; "
+            f"{hints.SCRIPT_KEY_TAKEN}"
         )
     for number, line in enumerate(args.content_lines, 1):
         # The third way content reaches disk, and open to the same failure as
@@ -231,10 +232,7 @@ async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
                 "script content, it is a placeholder the session history left "
                 "in place of a payload it did not keep, so what you sent is "
                 "your own record of an earlier call rather than the script. "
-                "Nothing was written. Do not send that line again. Re-derive "
-                "the script from what you built it from, or read the file it "
-                "came from back with read_file, and call create_script again "
-                "with the real lines."
+                f"Nothing was written. {hints.ELISION_REWRITE_SCRIPT}"
             )
     lines = args.content_lines
     nonempty = [line for line in lines if line.strip()]
@@ -243,8 +241,7 @@ async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
         # out entirely; syntax checks would pass vacuously.
         return (
             "Script NOT created: the whole script is a single shebang line, so "
-            "it would do nothing. Put each script line into its own "
-            "content_lines array element and call create_script again."
+            f"it would do nothing. {hints.SCRIPT_SHEBANG_ONLY}"
         )
     if args.kind == "bash":
         # execution scripts fail loudly; run_bash (exploration) stays lenient
@@ -260,11 +257,7 @@ async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
     replaced = ctx.registry.register(args.registry_key, path)
     stale = f" Replaced a stale registration of {replaced}." if replaced else ""
     note = f" ({'; '.join(warnings)})" if warnings else ""
-    strict = (
-        " Runs fail-fast (set -euo pipefail): a failed command stops the "
-        "script, so do not print success unconditionally." if args.kind == "bash"
-        else ""
-    )
+    strict = f" {hints.BASH_STRICT_MODE}" if args.kind == "bash" else ""
     return (
         f"Created script {args.registry_key!r} ({args.kind}); "
         f"syntax check ok{note}. Start it with start_background_script, or run "
@@ -345,7 +338,7 @@ async def read_file(args: ReadFileParams, ctx: ToolContext) -> str:
         if not candidate.is_relative_to(path.resolve()):
             return (
                 f"subpath {args.subpath!r} escapes {args.registry_key!r}; "
-                "use a path inside the directory."
+                f"{hints.SUBPATH_ESCAPES}"
             )
         if not candidate.exists():
             return (
@@ -402,7 +395,7 @@ async def start_background_script(
         return (
             f"NOT started: {args.registry_key!r} is already running (pid "
             f"{running}), and a second copy would write the same output files. "
-            "Wait for it — you will be told when it finishes — or kill it first."
+            f"{hints.SCRIPT_ALREADY_RUNNING}"
         )
     argv = interpreter + [str(path)] + (args.args.split() if args.args else [])
     record = await ctx.runner.start(argv, name=args.registry_key, background=True)
@@ -457,15 +450,7 @@ class RunBashParams(BaseModel):
         raise ValueError(
             f"this script is {size} characters and run_bash takes at most "
             f"{RUN_SCRIPT_MAX_CHARS}: it is for looking around, not for "
-            "writing files. To WRITE a file — notes, a specs document, a "
-            "config — call create_file with the content as content_lines. To "
-            "RUN real work, call create_script (it is syntax- and "
-            "docs-checked), then start_background_script, or run_bash with "
-            "{its_key}. If the content is too long for one call, write the "
-            "first part with create_file, then add each further part with "
-            "edit_file: put the file's current last line in old_lines, and "
-            "that same line followed by the new lines in new_lines. Or, if "
-            "this really is a look-around, make it shorter."
+            f"writing files. {hints.RUN_BASH_IS_NOT_A_WRITER}"
         )
 
 
@@ -663,7 +648,7 @@ async def run_bash(args: RunBashParams, ctx: ToolContext) -> str:
     if len(nonempty) == 1 and nonempty[0].lstrip().startswith("#!"):
         return (
             "NOT run: the whole script is a single shebang line, so it would do "
-            "nothing. Put each command on its own content_lines element."
+            f"nothing. {hints.RUN_BASH_SHEBANG_ONLY}"
         )
     path.write_text("\n".join(lines) + "\n")
     check = await syntax_check("bash", path)
@@ -685,15 +670,14 @@ async def run_bash(args: RunBashParams, ctx: ToolContext) -> str:
     )
     if record.state == "killed":
         return (
-            f"TIMED OUT after {args.timeout_s}s and was killed. Narrow it "
-            f"(fewer directories, -maxdepth, pipe through head) or raise "
-            f"timeout_s, then run it again.\n\n{output}"
+            f"TIMED OUT after {args.timeout_s}s and was killed. "
+            f"{hints.RUN_BASH_TIMED_OUT}\n\n{output}"
         )
     if record.exit_code == 0:
         return f"ran (exit 0).\n\n{output}"
     return (
-        f"ran (FAILED, exit {record.exit_code}). Read the error, fix the "
-        f"script, and call run_bash again.\n\n{output}"
+        f"ran (FAILED, exit {record.exit_code}). {hints.RUN_BASH_FAILED}"
+        f"\n\n{output}"
         f"{_unresolved_note(unresolved, ctx)}"
     )
 

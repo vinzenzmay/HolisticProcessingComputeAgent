@@ -38,6 +38,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from hpca.agent import hints
 from hpca.agent.tools import Tool, ToolRegistry
 
 MODES = ("manual", "auto", "full-auto")
@@ -270,17 +271,13 @@ def skipped_message(tool_name: str, reason: str = "") -> str:
     if not reason:
         return (
             f"[tool result] {tool_name}: SKIPPED — the user chose not to run "
-            "this. It was NOT executed. Do not retry it, do not rephrase it, "
-            "and do not attempt the same outcome via a different tool. Ask the "
-            "user how to proceed."
+            f"this. It was NOT executed. {hints.SKIPPED_WITHOUT_REASON}"
         )
     return (
         f"[tool result] {tool_name}: SKIPPED — the user chose not to run this. "
         "It was NOT executed. They said why:\n"
         f"{reason}\n"
-        "Treat that as the correction to make. Work it into a fixed version and "
-        "put that up for approval — do not send back what was just refused. If "
-        "the reason does not tell you enough to fix it, ask the user."
+        f"{hints.SKIPPED_WITH_REASON}"
     )
 
 
@@ -300,9 +297,7 @@ def denied_message(tool_name: str, reason: str = "") -> str:
         f"[tool result] {tool_name}: DENIED by the user — the operation was "
         "not executed. They said why:\n"
         f"{reason}\n"
-        "Treat that as the correction to make. Propose an amended operation "
-        "that answers it, or ask the user if the reason leaves you unsure — "
-        "do not re-send what was just denied."
+        f"{hints.DENIED_WITH_REASON}"
     )
 
 

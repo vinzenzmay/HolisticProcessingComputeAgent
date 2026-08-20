@@ -16,7 +16,7 @@ text.
 
 from __future__ import annotations
 
-import json
+from hpca.transcript import call_arguments
 
 
 def approval_kind(payload: dict) -> str:
@@ -24,9 +24,18 @@ def approval_kind(payload: dict) -> str:
 
 
 def approval_title(payload: dict) -> str:
+    """The question, naming the tool it is about.
+
+    The destructive heading names it too, which it did not have to while the
+    details below opened with a ``Tool: <name>`` line. That line is gone — it
+    said nothing the heading could not — so the heading is now the only place
+    the name appears, and a destructive tool that cannot describe its own call
+    would otherwise put bare arguments on screen with nothing saying what they
+    were arguments to.
+    """
     if approval_kind(payload) == "execution":
         return f"Run this — {payload.get('tool')}?"
-    return "Destructive operation — approve?"
+    return f"Destructive operation — {payload.get('tool')}?"
 
 
 def approval_hint(payload: dict) -> str:
@@ -54,18 +63,39 @@ def approval_reason_hint() -> str:
 
 
 def approval_details(payload: dict) -> str:
-    text = f"Tool: {payload.get('tool')}"
-    # With a script shown below, the raw arguments would repeat it as a
-    # JSON blob; without one they are all there is to judge the call by.
-    if not payload.get("script"):
-        text += f"\nArguments: {json.dumps(payload.get('arguments'), indent=2)}"
-    description = payload.get("description", "")
-    if description:
-        text += f"\n{description}"
+    """What this particular call does — and nothing that only the agent cares
+    about.
+
+    Pointedly *not* shown is ``payload["description"]``: that is the tool's
+    schema blurb, written for the model to pick the tool by ("Run a registered
+    script as a tracked background process for work that outlives this
+    turn..."). It describes the tool in general and never this call, so on a
+    prompt asking about one concrete action it is prompt content leaking onto
+    the screen. The tool's name is left out for the same reason it is not
+    repeated twice — ``approval_title`` already says it in the heading.
+
+    When the tool gave ``details`` that is the whole answer: it is the tool's
+    own account of *this* call with the real paths already resolved ("edit
+    /home/me/run.sh"), and the arguments it was built from would only say the
+    same thing again, less clearly. Without ``details`` the arguments are all
+    there is to judge by, so they are rendered instead.
+
+    Returning "" is a real outcome, not a failure: for ``run_bash`` the command
+    in the block below is the entire call, and there is nothing left to say
+    above it.
+
+    The arguments are rendered by :func:`hpca.transcript.call_arguments`, the
+    same function the chat's own call row uses. The prompt and the record of
+    what ran have to describe the same call in the same words — the prompt is
+    gone the moment it is answered, and the row is where the user goes back to
+    read it.
+    """
     details = payload.get("details")
     if details:  # resolved real paths (§5.3)
-        text += f"\n\n{details}"
-    return text
+        return str(details).strip()
+    return call_arguments(
+        payload.get("arguments") or {}, has_script=bool(payload.get("script"))
+    )
 
 
 def approval_script(payload: dict) -> str | None:

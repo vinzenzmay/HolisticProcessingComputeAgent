@@ -17,6 +17,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from hpca.agent import hints
 from hpca.agent.context import ToolContext
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.embeddings import EmbeddingError
@@ -200,7 +201,7 @@ class LookupSymbolParams(BaseModel):
 
 async def lookup_symbol(args: LookupSymbolParams, ctx: ToolContext) -> str:
     if ctx.symbols is None:
-        return "No symbol index available; run index_docs first."
+        return f"No symbol index available; {hints.NO_SYMBOL_INDEX}"
     matches = ctx.symbols.lookup(args.name, kind=args.kind or None)
     if not matches:
         return (
@@ -261,12 +262,9 @@ class SearchDocsParams(BaseModel):
 async def search_docs(args: SearchDocsParams, ctx: ToolContext) -> str:
     """Semantic retrieval over indexed docs (§5.6.2)."""
     if ctx.rag is None or ctx.embedder is None:
-        return (
-            "Semantic search is not configured; use lookup_symbol or "
-            "read_manpage instead."
-        )
+        return f"Semantic search is not configured; {hints.NO_SEMANTIC_SEARCH}"
     if ctx.rag.count() == 0:
-        return "The document index is empty — index something with index_docs first."
+        return f"The document index is empty — {hints.EMPTY_DOC_INDEX}"
     try:
         vectors = await ctx.embedder.embed([args.query])
     except EmbeddingError as e:
