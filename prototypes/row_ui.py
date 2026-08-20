@@ -338,6 +338,14 @@ class Editor:
         self.anchor = None
         self._touch()
 
+    def set_text(self, text: str) -> None:
+        """Replace the buffer, cursor left at the end of it."""
+        self.lines = text.split("\n") or [""]
+        self.row = len(self.lines) - 1
+        self.col = len(self.lines[self.row])
+        self.anchor = None
+        self._touch()
+
     def insert(self, ch: str) -> None:
         self.delete_selection()
         line = self.lines[self.row]
@@ -632,11 +640,19 @@ class Editor:
 
 @dataclass
 class Item:
-    """One entry: a single line, plus the body it opens into."""
+    """One entry: a single line, plus the body it opens into.
+
+    ``kind`` and ``text`` are what Enter needs: the log has to be able to say
+    which rows are the user's own words, and to hand back the words themselves
+    rather than the decorated line they are drawn as (app.py keeps the same two
+    on Entry, see OWN_MESSAGE_KINDS).
+    """
 
     head: str
     body: list[str] = field(default_factory=list)
     accent: str = ""
+    kind: str = ""
+    text: str = ""
 
 
 class Pane:
@@ -808,7 +824,9 @@ class Pane:
 # ------------------------------------------------------------------- footers
 
 
-def footer_line(pairs: list[tuple[str, str]], width: int, note: str = "") -> str:
+def footer_line(
+    pairs: list[tuple[str, str]], width: int, note: str = "", style: str = YELLOW
+) -> str:
     """As many ``key label`` pairs as fit, keys bright and labels dim.
 
     Truncation is by whole pairs rather than by characters: half a hint is
@@ -828,7 +846,7 @@ def footer_line(pairs: list[tuple[str, str]], width: int, note: str = "") -> str
         plain.append(piece)
         styled.append(f"{CYAN}{key}{RESET} {DIM}{label}{RESET}")
         used += extra
-    head = f"{YELLOW}{note}{RESET}  " if note else ""
+    head = f"{style}{note}{RESET}  " if note else ""
     return " " + head + "  ".join(styled) + " " * max(0, width - used)
 
 
@@ -845,6 +863,82 @@ class Overlay:
 
     def footer(self) -> list[tuple[str, str]]:
         return [("esc", "back")]
+
+
+FORK, ROLLBACK, COPY = "fork", "rollback", "copy"
+
+# The dialog quotes the message being rewound from so you can check you grabbed
+# the right one — a preview, not the transcript; the log has the rest. Same
+# figure as hpca.tui.rewind_screen.
+PREVIEW_CHARS = 300
+PREVIEW_LINES = 6  # what the Textual dialog's max-height comes to
+
+
+class RewindOverlay(Overlay):
+    """Enter on one of your own messages in the log (§ chat rewind).
+
+    Three ways to pick the conversation up from it, the same three
+    RewindScreen offers and on the same keys: fork the session from just
+    before it (the original stays whole), roll this conversation back to just
+    before it (everything after is dropped), or copy the text into the message
+    box — the old behaviour, still on Enter, so the reflex of activating a
+    message twice keeps doing what it always did.
+
+    The choice is read back by the caller rather than acted on here, for the
+    reason app.py captures the session before pushing the screen: what happens
+    belongs to the conversation the choice was made in.
+    """
+
+    title = "this message again"
+
+    OPTIONS = [
+        ("f", "fork the session from here — the original stays whole"),
+        ("r", "roll this conversation back to here"),
+        ("c / enter", "copy it into the message box"),
+        ("esc", "cancel"),
+    ]
+
+    def __init__(self, message: str, index: int) -> None:
+        self.message = message
+        self.index = index
+        self.choice = ""
+
+    def render(self, width: int, height: int) -> list[str]:
+        out = [BOLD + CYAN + _rule(self.title, width) + RESET]
+        preview = self.message[:PREVIEW_CHARS]
+        if preview != self.message:
+            preview += " …"
+        quoted: list[str] = []
+        for paragraph in preview.split("\n"):
+            quoted += textwrap.wrap(paragraph, max(8, width - 6)) or [""]
+        for line in quoted[:PREVIEW_LINES]:
+            out.append(DIM + _pad(f"    {line}", width) + RESET)
+        if len(quoted) > PREVIEW_LINES:
+            out.append(DIM + _pad("    …", width) + RESET)
+        out.append(" " * width)
+        for key, label in self.OPTIONS:
+            row = _pad(f"      {key:<12}{label}", width)
+            out.append(row[:6] + CYAN + row[6:18] + RESET + row[18:])
+        while len(out) < height:
+            out.append(" " * width)
+        return out[:height]
+
+    def handle(self, key: str, width: int, height: int) -> bool:
+        picked = {"f": FORK, "r": ROLLBACK, "c": COPY, "enter": COPY}
+        if key in picked:
+            self.choice = picked[key]
+            return False
+        if key in ("esc", "quit"):
+            return False
+        return True  # a modal ignores what it has no answer for
+
+    def footer(self) -> list[tuple[str, str]]:
+        return [
+            ("f", "fork"),
+            ("r", "roll back"),
+            ("c / enter", "copy"),
+            ("esc", "cancel"),
+        ]
 
 
 class HelpOverlay(Overlay):
@@ -889,7 +983,11 @@ class HelpOverlay(Overlay):
         ),
         (
             "chat row",
-            [("i", "go to the message box")],
+            [
+                ("i", "go to the message box"),
+                ("enter", "on one of your own messages: fork, roll back, copy"),
+                ("enter", "on anything else: go to the message box"),
+            ],
         ),
         (
             "message box",
@@ -1423,7 +1521,10 @@ class RowUI:
                 out += self._render_input(width, pane_h)
             else:
                 out += pane.render(width, pane_h, focused=self.focus == slot)
-        out.append(footer_line(self._keys(), width, self.note))
+        note, style = self.note, YELLOW
+        if self._esc_armed():
+            note, style = "esc again to stop", RED
+        out.append(footer_line(self._keys(), width, note, style))
         while len(out) < height:
             out.insert(len(out) - 1, " " * width)
         return out[:height]
@@ -1480,7 +1581,7 @@ class RowUI:
         if self.focus == SESSIONS:
             rows += [("enter", "switch"), ("r", "rename"), ("t", "retitle"), ("d", "delete")]
         elif self.focus == CHAT:
-            rows += [("i", "write")]
+            rows += [("i", "write"), ("enter", "reuse")]
         else:
             rows += [("enter", "peek"), ("d", "unwatch"), ("alt-↑↓", "move")]
         return rows + [("m", "llms"), ("a", "profiles"), ("c", "config")] + common
@@ -1489,12 +1590,111 @@ class RowUI:
 
     def handle(self, key: str, width: int, height: int) -> bool:
         if self.overlay is not None:
-            if not self.overlay.handle(key, width, height - 2):
+            overlay = self.overlay
+            if not overlay.handle(key, width, height - 2):
                 self.overlay = None
+                self._closed(overlay)
             return True
         if self.focus == INPUT:
             return self._handle_input(key)
         return self._handle_row(key, width, height)
+
+    def _closed(self, overlay: Overlay) -> None:
+        """A screen that answered with something the rows have to act on."""
+        if isinstance(overlay, RewindOverlay) and overlay.choice:
+            self._rewind(overlay.choice, overlay.index, overlay.message)
+
+    # -------------------------------------------------------- the chat rewind
+
+    def _activate_chat(self, width: int) -> None:
+        """Enter in the chat log.
+
+        On one of your own messages it opens the rewind. On anything else it
+        moves to the message box, which is what app.py answers an Enter it has
+        nothing better to do with.
+        """
+        index = self.chat.current(width)
+        item = self.chat.items[index] if index >= 0 else None
+        if item is not None and item.kind == "user":
+            self.overlay = RewindOverlay(item.text, index)
+        else:
+            self.focus = INPUT
+
+    def _rewind(self, choice: str, index: int, message: str) -> None:
+        if choice == COPY:
+            self.reuse_message(message)
+        elif choice == FORK:
+            self._fork_at(index)
+        elif choice == ROLLBACK:
+            self._rollback_to(index)
+
+    def reuse_message(self, text: str) -> None:
+        """Put one of your own past messages back in the box, to send again or
+        edit into the next one — usually a command that needs a word changed,
+        which is otherwise retyped off the screen.
+
+        Added to whatever is already being written rather than replacing it, so
+        activating a message can never lose a draft. It starts its own line,
+        except after a draft left ending in whitespace — that space is how you
+        say "continue here" (``rerun this: `` + the old command).
+        """
+        draft = self.input.text()
+        if draft and not draft[-1].isspace():
+            draft += "\n"
+        self.input.set_text(draft + text)
+        self.focus = INPUT  # cursor behind the reused text, ready to send
+        self.note = "copied into the message box"
+
+    def _fork_at(self, index: int) -> None:
+        """A copy of this conversation that stops just before that message.
+
+        The original stays whole — that is the difference from a rollback, and
+        the reason both are offered instead of one being the safe version of
+        the other.
+        """
+        source = self.session
+        fork = SessionState(
+            title=f"{source.title} (fork)",
+            profile=source.profile,
+            model=source.model,
+            started="just now",
+            size=0,
+            watch_count=0,
+            index=source.index,
+        )
+        fork._chat = Pane("chat", list(self.chat.items[:index]))
+        fork._chat.cursor = 10**9
+        self.sessions.insert(0, fork)
+        self.active = 0
+        self._refresh_sessions()
+        self.focus = INPUT
+        self.note = f"forked “{source.title}” — this copy stops before that message"
+
+    def _rollback_to(self, index: int) -> None:
+        """Drop this conversation back to just before that message."""
+        chat = self.chat
+        dropped = len(chat.items) - index
+        del chat.items[index:]
+        chat.expanded = {i for i in chat.expanded if i < index}
+        chat.invalidate()
+        chat.cursor = 10**9
+        self.focus = INPUT
+        self.note = f"rolled back to just before that message ({dropped} entries gone)"
+
+    def _esc_armed(self) -> bool:
+        """Whether a first escape is still waiting for its second.
+
+        Read by the footer, which says so in red. app.py deliberately stays
+        silent here, but its objection is to a *toast*: a notification for
+        every stray escape sequence would be noise on top of the screen. A
+        word in the footer costs nothing, cannot cover anything, and goes away
+        on its own — the poll timeout repaints twice a second, so the hint
+        expires with the window rather than sitting there until the next key.
+        """
+        return (
+            self._esc_armed_at is not None
+            and self.clock() - self._esc_armed_at <= ESC_STOP_WINDOW
+        )
 
     def _escape(self) -> bool:
         """Two escapes in quick succession stop the turn. One does nothing.
@@ -1502,8 +1702,7 @@ class RowUI:
         Deliberately nothing, which is what app.py's ``action_stop_turn``
         settled on: the doubling *is* the confirmation, and a lone escape is
         too easy to arrive by accident — it is also the first byte of every
-        arrow key — to end a turn on. Saying "press escape again" would put a
-        message on screen every time a stray sequence reached us.
+        arrow key — to end a turn on.
 
         It works from wherever the cursor is, the message box included, and
         that is the whole point of the gesture: a turn calling tool after tool
@@ -1540,7 +1739,9 @@ class RowUI:
         if not text:
             return
         chat = self.chat
-        chat.items.append(Item(head=f"you   {text}", accent=BLUE))
+        chat.items.append(
+            Item(head=f"you   {text}", accent=BLUE, kind="user", text=text)
+        )
         chat.items.append(
             Item(
                 head="hpca  looking at that now…",
@@ -1613,6 +1814,8 @@ class RowUI:
                 # Straight to the box: opening a session is something you do
                 # in order to say something in it.
                 self.focus = INPUT
+            elif self.focus == CHAT:
+                self._activate_chat(inner)
             elif self.focus == WATCHERS:
                 self.note = "peeking at the log"
         elif key == "r" and self.focus == SESSIONS:
@@ -1638,6 +1841,14 @@ TASKS = [
     "rebuild the reference index on scratch",
     "compare coverage between the two batches",
 ]
+
+LONG_ASK = (
+    "Use the reference on scratch rather than the one in my home directory, "
+    "keep the intermediate BAMs so I can check them afterwards, and if the "
+    "merge step stalls again do not retry it silently — stop and tell me which "
+    "shards were still open, because last time two of them wrote to the same "
+    "temp path and I only found out from the log three hours later."
+)
 
 SNIPPETS = [
     "/scratch/proj/cohort/run3/annotation.tsv (412 lines)",
@@ -1701,7 +1912,13 @@ def sample_chat(count: int, seed: int = 0, task: str = "") -> list[Item]:
         i = n + seed * 7
         slot = n % 3
         if slot == 0:
-            items.append(Item(head=f"you   {task}", accent=BLUE))
+            # Every fourth one is long, so that the rewind's preview has
+            # something to truncate and the wrapping is exercised by running
+            # the thing rather than only by the headless check.
+            said = task if n % 12 else f"{task}. {LONG_ASK}"
+            items.append(
+                Item(head=f"you   {said}", accent=BLUE, kind="user", text=said)
+            )
         elif slot == 1:
             steps = 3 + (i * 5) % 18
             names = [tools[(i + k) % len(tools)] for k in range(steps)]
