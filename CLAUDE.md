@@ -30,6 +30,13 @@ loop, or editing guidance gets measured, not eyeballed: run the live eval in
 v0.17.0→v0.18.0 reference numbers in specs-edit-eval.md. Like test-live it
 costs real generations; run it deliberately, never as part of a default suite.
 
+Tiers: `core` and `hard` are the standing regression set. `paths` is the
+long-context one (~95k of session in front of a ~200-character path, over
+create/edit/delete) — it costs ~15 min a side because each run re-prefills, so
+reach for it when a change touches how a file is *named*, and see
+specs-path-registry.md for what it settled. `shift` measured the key-vs-path
+friction of an interface that no longer exists; it is history, not a check.
+
 ## Where the databases are
 
 `hpca.db`, `checkpoints.db` and `rag.db` are *kept* in the app dir, but while

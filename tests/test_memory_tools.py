@@ -12,7 +12,6 @@ from hpca.agent.tools import ToolRegistry
 from hpca.config import Settings
 from hpca.db import connect, init_db
 from hpca.episodic import EpisodicStore
-from hpca.registry import PathRegistry
 from hpca.runner import ProcessRunner
 from hpca.sessions import SessionStore
 
@@ -33,7 +32,7 @@ def env(conn, tmp_path):
 
     def context(profile="default", session_id="current", episodic=store):
         return ToolContext(
-            registry=PathRegistry(conn, profile=profile, session_id=session_id),
+            workdir=tmp_path,
             runner=ProcessRunner(conn, session_id=session_id, log_dir=tmp_path),
             settings=settings,
             scripts_dir=tmp_path,

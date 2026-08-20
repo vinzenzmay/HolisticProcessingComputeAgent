@@ -15,7 +15,7 @@ sessions, and supervise running sub-processes and cluster jobs.
    logs, validating paths, dry-running scripts — all done in Python code, never by the
    model. The model explains, decides, and suggests; code observes and verifies.
 2. **The model never reproduces literal paths.** All paths/URIs live in a path
-   registry; tools accept registry keys.
+   working directory; tools accept paths.
 3. **Retry loops with validation feedback.** Malformed or semantically invalid tool
    calls are caught by pydantic validation; the error message is fed back to the model
    for a bounded number of retries.
@@ -127,7 +127,7 @@ Terminals in 2026 are assumed wider than 80 columns
     `key: value` line each rather than indented JSON, minus the payload the
     script block below already is, and minus the call altogether when the tool
     resolved it into real paths itself (`edit /work/x.tsv (replace 3 lines with
-    5)` says everything `registry_key`/`subpath` would, better).
+    5)` says everything the raw arguments would, better).
     Enter on anything else (the agent's replies, background events, recalled
     memory) simply hands focus to the entry. `(c)` copy content to clipboard.
   * *Working line (center, while a turn runs):* names the step in flight and
@@ -339,7 +339,7 @@ round, so switching applies immediately — even to a turn already in flight.
   and the prompt tells the model to verify paths itself and to list every
   destructive action in its final report.
 A fourth mode, **plan**, was removed. It withdrew `create_script`,
-`start_background_script` and `submit_job` from the registry offered to
+`start_background_script` and `submit_job` from the tools offered to
 `decide()`, made the model hand its checklist over through a `present_plan`
 tool, and let the inline decision bar start execution on auto (`ctrl+r`) or
 step-by-step (`ctrl+e`). The shipped `/plan` skill (§5.1) does the job better:
@@ -500,7 +500,7 @@ context-firewall contract below still holds for the two real sub-loops: raw
 retrieval and raw logs never enter the orchestrator's context.
 
 The orchestrator itself holds the full tool registry — file/script/job/doc/memory
-tools plus `list_paths` (registry) — and answers directly only for trivial
+tools plus `list_scripts` — and answers directly only for trivial
 conversational queries (see the grounded answering policy below).
 
 **Grounded answering policy.** Small models hallucinate API details, so the agent
@@ -529,7 +529,7 @@ model's compliance. Accepted cost: a technical question still takes ≥2 model c
 
 **Context firewall (subagent I/O contract).** Every subagent call follows a fixed
 contract: the caller passes a focused question plus optional context references
-(code excerpt, target library/tool, registry keys); the subagent may read as many
+(code excerpt, target library/tool, paths); the subagent may read as many
 raw chunks, man pages, or source excerpts as it needs *inside its own context*, and
 returns only a bounded, structured, cited answer. Raw retrieval results never enter
 the orchestrator's or another subagent's context.
@@ -562,43 +562,37 @@ the orchestrator's or another subagent's context.
   base rather than a constant because thinking is spent from the same budget —
   `decision_cap(effort)` applies ×1.5 at `medium` and ×2.0 at `xhigh` so the
   payload keeps its own room whatever the level (§3.6).
-* **Path registry:** a named map `{key → absolute path/URI}` per profile+session,
-  stored in sqlite. Tools accept **keys**, middleware resolves to real paths and
-  errors out on unknown keys (error fed back for retry). New paths discovered by
-  tools (e.g. output of a job) are auto-registered and announced to the model as
-  their key.
-  *What the registry is for* was originally "the model mis-copies long paths".
-  That premise did not survive measurement: asked to read a 161-character
-  cluster path (repeated segments, a date, sample ids with suffixes), the 27B
-  reproduced it byte-for-byte 20 times out of 20 — and constrained decoding
-  cannot help there, since inside a JSON string every character is legal. The
-  registry earns its place for a different reason: **durable naming**. A key
-  resolves from sqlite whatever is in the context window; a long path that has
-  scrolled out of a compacted conversation is simply gone, and the agent has to
-  ask or re-discover it. Sessions now turn context over faster (a tool round is
-  two messages, not one), so that argument got stronger, not weaker. Keys also
-  give a stable handle to something the user never spelled out — a job's output
-  directory, a file a script produced.
-  A key may point at something that does not exist **yet**: `register_path`
-  takes a path either way and says which case it is, because the path the agent
-  is about to create needs a key before the call that creates it. The tools
-  that resolve keys report the absence in those terms (`read_file` says nothing
-  is there; `create_file` makes the directory, as it already did for
-  intermediate ones) rather than raising a bare `FileNotFoundError`.
-  `create_file` is the one file tool that will build a mistyped path instead of
-  failing on it — every other one needs its target to exist — so when it has to
-  create the directory it says so as a **caution** naming the path, inviting a
-  spelling check before ten more calls are built on the wrong tree. That is the
-  warning `register_path` used to give by refusing a path that was not there.
-  A key is no longer *required*, either: wherever a file tool takes a key it
-  also takes a literal absolute path, which it auto-registers on the way
-  through (`PathRegistry.resolve_or_register`; the HITL predicates resolve the
-  same way, so a delete by literal path still gates). Keys stay for brevity
-  and for naming things the user never spelled out — what went is the mandatory
-  register-then-call round-trip, which cost a tool call every time the agent
-  was handed a path and bought nothing. Measured: the 27B registered first in
-  19 of 20 generations under the old guidance, and none of that work was
-  needed. A registry key is an affordance, not a toll.
+* **Paths are paths** (`hpca.paths`). A tool argument that names a file is the
+  path: `~` expands, a relative one is anchored at the session's working
+  directory, and `..` is folded lexically so a file that does not exist yet
+  still resolves. Nothing is stored and nothing is looked up.
+  This replaced a **path registry** — a `{key → absolute path}` map per
+  profile+session in sqlite, with `register_path` to mint a key and
+  `dir_key`/`subpath`/`source_key` arguments to spend one. Its original premise
+  ("the model mis-copies long paths") had already failed measurement: asked to
+  read a 161-character cluster path, the 27B reproduced it byte-for-byte 20
+  times out of 20. What kept it alive after that was **durable naming** — a key
+  resolves from sqlite whatever is in the context window, while a long path
+  that has scrolled out of a compacted conversation is gone.
+  That argument is the one the removal had to answer, and it was answered by
+  measuring it rather than by reasoning about it: see specs-path-registry.md
+  for the head-to-head at ~95k of context, which is where a key is supposed to
+  win. What the registry cost in the meantime was constant and visible in the
+  field — an `UnknownKeyError` listing keys the model never chose, in a session
+  whose registry was empty, for a `create_file` whose `dir_key` was `"."`.
+  A second vocabulary that no agent corpus the model was trained on contains is
+  paid for on every call; durable naming is collected on the few where the path
+  has scrolled away.
+  What survives of naming is the one handle that was never a path: a **script's
+  name**. `create_script(name=...)` writes `<name>.<suffix>` into the scripts
+  dir, `{name}` in a run_bash line expands to it, and `start_background_script`
+  / `submit_job` take it — resolved by looking in the directory, so there is
+  still no table.
+  `create_file` remains the one file tool that will build a mistyped path
+  instead of failing on it — every other one needs its target to exist — so
+  when it has to create the directory it says so as a **caution** naming the
+  path, inviting a spelling check before ten more calls are built on the wrong
+  tree.
 * **The model sees its own actions.** A tool round appends the model's own call
   as an assistant turn and then the result, rather than the result alone — the
   shape agent-trained models are post-trained on. Without it the model
@@ -662,7 +656,7 @@ the orchestrator's or another subagent's context.
   write. A tool parser instead reconstructs a call from whatever it managed to
   parse: measured on vLLM's `qwen3_coder` (2026-08-17), a `create_file` cut
   off inside its 200 `content_lines` comes back as a well-formed call of
-  `{dir_key, name}` — the array simply gone, `content` null, and
+  `{path}` alone — the array simply gone, `content` null, and
   `finish_reason` reading `"tool_calls"`. Nothing says truncation except
   `completion_tokens == max_tokens`. Read as a shape error it invites the same
   too-long write again, and the turn dies on the retry budget (reproduced
@@ -749,12 +743,12 @@ skill without the user reading it — the same rule as memory (§6).
 
 Core tools:
 
-* `create_script(kind: bash|python|R|snakemake, registry_key, content)` — writes the
+* `create_script(kind: bash|python|R|snakemake, name, content)` — writes the
   script, immediately syntax-checks it (§5.2), registers the path.
 * `run_bash(timeout_s, content_lines)` — runs *and blocks*, returning captured
   output as the tool result. Writes a throwaway script, `bash -n`-checks it, and
   runs it through the same tracked runner (it is not a free-form shell — see
-  below). A `{registry_key}` in a line expands to the registered path, which is
+  below). A `{name}` in a line expands to that script's path, which is
   how a *kept* script is run synchronously: `{my_script} --flag`. Only keys that
   exist are substituted, so `awk '{print $1}'` and `${VAR}` survive untouched;
   an unmatched `{…}` is named in the result if the run then fails. Its script is
@@ -766,18 +760,18 @@ Core tools:
   it is measurably bad at: asked for a design document with only run_bash available,
   the live model put all 5–8k characters into a single array element and skipped the
   §5.2 gate that `create_script` faces.
-  *(The design had a second blocking tool, `run_script(registry_key, args)`, for
+  *(The design had a second blocking tool, `run_script(name, args)`, for
   registered scripts. It was removed: splitting the two by where the script came
   from gave the model two tools advertising one job, while `{key}` expansion
   covers the case without carving an exception into the "keys, never paths"
   rule.)*
-* `start_background_script(registry_key, args)` — runs locally as a tracked **background**
+* `start_background_script(name, args)` — runs locally as a tracked **background**
   subprocess, stdout/stderr captured to files and
   registered; its completion is delivered back into the conversation (§5.4).
   The split from `run_bash` is *when the result arrives*, not what is run — the
   one choice the model cannot recover from on its own, which is why it is a
   separate tool rather than a flag.
-* `submit_job(registry_key, args)` — submits an sbatch script to the cluster,
+* `submit_job(name, args)` — submits an sbatch script to the cluster,
   records the job ID and log paths in the job DB (§5.4), starts periodic tracking.
   *(The design imagined a `kind: sbatch|snakemake` switch; only the sbatch path is
   implemented — a snakemake-cluster submission tool does not exist yet.)*
@@ -785,18 +779,18 @@ Core tools:
   failure report (§5.5).
 * `cancel_job(job_id)` — HITL-gated.
 * `search_docs(query)`, `lookup_symbol(name, kind)`, `read_manpage(name)`,
-  `read_source(registry_key, range)`, `index_docs(...)`, `ask_docs(question)` —
+  `read_source(path, range)`, `index_docs(...)`, `ask_docs(question)` —
   retrieval over man pages, tool documentation, and source code (§5.6):
   `lookup_symbol` is the exact-match path used by the verification gate (§5.2),
   `search_docs` the embedding path for prose questions, `ask_docs` the firewalled
   doc-researcher sub-loop (§4.2).
 * File operations (`move_file`, `copy_file`, `delete_file`, `restore_file`,
   `read_file`, `create_file`, `edit_file`) — destructive ones gated per §5.3. There is **no**
-  `list_dir` tool: registry keys are listed by `list_paths`, and directory contents
-  are read via `run_bash`. `restore_file` is the one file tool taking a path instead
-  of a key: the key died with the file.
-* `create_file(dir_key, name, content_lines)` — writes a **new** text file into a
-  registered directory, one array element per line. It exists because prose had no
+  `list_dir` tool: kept scripts are listed by `list_scripts`, and directory contents
+  are read via `run_bash`. `read_file` lists a directory rather than refusing it,
+  which is the answer often enough to be worth not costing a second call.
+* `create_file(path, content_lines)` — writes a **new** text file at that
+  path, one array element per line. It exists because prose had no
   tool: `create_script` writes only into the scripts dir under a language suffix and
   `edit_file` needs a file to already exist, so authoring a `specs.md` meant a
   `cat << 'EOF'` heredoc through `run_bash` — a hundred lines of documentation
@@ -806,7 +800,7 @@ Core tools:
   approval. A file whose suffix names a script language faces §5.2's gate on a
   scratch copy exactly as `edit_file` does — a second way to put content into a
   script file must not be a second way around the gate.
-* `edit_file(registry_key, subpath, old_lines, new_lines)` — replaces one run of
+* `edit_file(path, old_lines, new_lines)` — replaces one run of
   whole lines in place, so changing a 400-line script costs the two lines rather
   than the file twice (once read, once rewritten). Matching is whole-line and must
   be unique: no match and an ambiguous match are both refused with the line numbers
@@ -929,8 +923,8 @@ gate (§5.3) or actual submission proceed.
   * Trash entries carry a TTL (`trash_ttl_days`, default 7) and are cleaned up on
     app start. Recovery is reached by *asking the agent*: the `restore_file` tool
     wraps `TrashManager.list()`/`.restore()`, taking the file's original path (or
-    its name, or empty to list the trash) because the deletion dropped its registry
-    key. It never gates — restoring only creates a file, and refuses outright when
+    its name, or empty to list the trash) — the file it names is gone, so
+    there is nothing else left to identify it by. It never gates — restoring only creates a file, and refuses outright when
     the original path is occupied. *(Still no TUI affordance: the "restore from the
     inspect view" action is not wired up, so there is no trash browser to click.)*
 * Files ≥ 1 GB: no automatic backup (quota!), but the confirmation modal states this
@@ -953,7 +947,6 @@ jobs(job_id PK, kind, session_id, profile, submit_time, state,
      snakemake_log_path, last_checked, exit_info)
 job_logs(job_id FK, rule_or_step, log_path, tool_name)
 sessions(session_id PK, profile, title, created_at, checkpoint_ref)
-path_registry(profile, session_id, key, path, created_at)
 processes(pid, session_id, cmd, state, stdout_path, stderr_path, started_at,
           notified, background)
 ```
@@ -1188,7 +1181,7 @@ Constraints: no root, no daemons, installable into a venv/conda env on the clust
 * `httpx` + OpenAI-compatible client (or `langchain-openai`) — any backend behind an
   SSH tunnel
 * `pydantic` — tool schemas & validation-driven retries
-* `sqlite3` (stdlib) — job DB, sessions, path registry; LangGraph sqlite checkpointer
+* `sqlite3` (stdlib) — job DB, sessions; LangGraph sqlite checkpointer
   (`langgraph-checkpoint-sqlite`)
 * `sqlite-vec` — RAG vector store (the only store shipped; `chromadb` was dropped)
 * `pyyaml` — signature library, skills, front-matter
@@ -1208,7 +1201,7 @@ hard dependency, LangChain `AgentExecutor`.
 3. **LLM client** against the OpenAI-compatible API, incl. streaming into the chat
    window and constrained-decoding probe.
 4. **LangGraph core:** orchestrator, checkpointed sessions (left column live),
-   pydantic validation + retry middleware, path registry.
+   pydantic validation + retry middleware.
 5. **Runner + tools:** internal subprocess runner, `create_script`/`start_background_script`
    with dry-run gate. *(This milestone also built a right-column process list —
    Enter inspects, `k` kills — since removed; see §3.3.)*

@@ -35,12 +35,12 @@ CREATE_FILE_EXISTS = (
     "(the old version stays recoverable from the trash)."
 )
 
-CREATE_FILE_DIR_KEY_IS_FILE = "Give the key of the directory the file belongs in."
-
-CREATE_FILE_NAME_ESCAPES = (
-    "Give a name relative to it, and register another directory if the file "
-    "belongs somewhere else."
+CREATE_FILE_PARENT_IS_FILE = (
+    "Check the path against what the user wrote, or write into a different "
+    "directory."
 )
+
+CREATE_FILE_PATH_IS_DIR = "Give the path of the file itself, not of its directory."
 
 CREATE_FILE_MADE_DIRS = (
     "If you meant a directory that is already there, the path is misspelled — "
@@ -64,11 +64,9 @@ EDIT_FILE_NO_OP = (
 
 # ------------------------------------------------------------ paths and the trash
 
-SUBPATH_ESCAPES = "use a path inside the directory."
-
-REGISTERED_PATH_MISSING = (
-    "If the user meant a path that is already there, check the spelling "
-    "against their message; otherwise create it before reading it."
+PATH_NOT_FOUND = (
+    "Check the spelling against the path as the user wrote it, or list the "
+    "directory with read_file to see what is really there."
 )
 
 TRASH_NOT_RECOVERABLE = "Tell the user it is not recoverable from HPCA's trash."
@@ -98,9 +96,7 @@ ELISION_REWRITE_SCRIPT = (
 
 # ------------------------------------------------------------------------ scripts
 
-SCRIPT_KEY_EXISTS = "change it with edit_file rather than creating it again"
-
-SCRIPT_KEY_TAKEN = "pick a different key"
+SCRIPT_NAME_EXISTS = "change it with edit_file rather than creating it again"
 
 SCRIPT_SHEBANG_ONLY = (
     "Put each script line into its own content_lines array element and call "
@@ -196,12 +192,12 @@ MODEL_HINTS: tuple[str, ...] = (
     ELISION_REWRITE_SCRIPT,
     DENIED_WITH_REASON,
     CREATE_FILE_MADE_DIRS,
-    REGISTERED_PATH_MISSING,
+    PATH_NOT_FOUND,
     SKIPPED_WITHOUT_REASON,
     CREATE_FILE_EXISTS,
     BASH_STRICT_MODE,
     RUN_BASH_TIMED_OUT,
-    CREATE_FILE_NAME_ESCAPES,
+    CREATE_FILE_PARENT_IS_FILE,
     SCRIPT_SHEBANG_ONLY,
     EDIT_FILE_AMBIGUOUS,
     EDIT_FILE_NO_OP,
@@ -210,9 +206,9 @@ MODEL_HINTS: tuple[str, ...] = (
     SESSION_TAIL,
     WATCH_NEEDS_A_PATH,
     RUN_BASH_FAILED,
-    SCRIPT_KEY_EXISTS,
+    SCRIPT_NAME_EXISTS,
     TRASH_NOT_RECOVERABLE,
-    CREATE_FILE_DIR_KEY_IS_FILE,
+    CREATE_FILE_PATH_IS_DIR,
     RUN_BASH_SHEBANG_ONLY,
     EDIT_NOT_REWRITE,
     WATCH_TARGET_MISSING,
@@ -221,11 +217,9 @@ MODEL_HINTS: tuple[str, ...] = (
     EMPTY_DOC_INDEX,
     EDIT_FILE_ON_DIRECTORY,
     WATCH_JOB_UNKNOWN,
-    SUBPATH_ESCAPES,
     NO_READ_BACK,
     CHECK_JOB_STATUS,
     NO_SYMBOL_INDEX,
-    SCRIPT_KEY_TAKEN,
 )
 
 # Named here, and deliberately NOT stripped. Matching is by substring against

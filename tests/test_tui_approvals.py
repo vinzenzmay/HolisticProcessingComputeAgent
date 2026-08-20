@@ -21,7 +21,6 @@ from hpca.agent.tools import Tool, ToolRegistry
 from hpca.config import Settings
 from hpca.db import connect, init_db
 from hpca.llm import ChatResponse
-from hpca.registry import PathRegistry
 from hpca.runner import ProcessRunner
 from hpca.trash import TrashManager
 from hpca.tui.app import ChatInput, DecisionBar, HpcaApp
@@ -260,7 +259,7 @@ def edit_call_payload(tmp_path):
     conn = connect(tmp_path / "hpca.db")
     init_db(conn)
     ctx = ToolContext(
-        registry=PathRegistry(conn, profile="default", session_id="s1"),
+        workdir=tmp_path,
         runner=ProcessRunner(conn, session_id="s1", log_dir=tmp_path / "logs"),
         settings=Settings(),
         scripts_dir=tmp_path / "scripts",
@@ -268,10 +267,9 @@ def edit_call_payload(tmp_path):
     )
     path = tmp_path / "run.sh"
     path.write_text("#!/bin/bash\necho one\n")
-    ctx.registry.register("run_sh", path)
     tool = add_file_tools(ToolRegistry()).get("edit_file")
     arguments = {
-        "registry_key": "run_sh",
+        "path": str(path),
         "old_lines": ["echo one"],
         "new_lines": ["echo ONE"],
     }

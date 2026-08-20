@@ -46,26 +46,21 @@ GROUNDED_ANSWERING_GUIDANCE = (
     "information already present in this conversation."
 )
 
-# The key-first drilling that used to open this block is gone: every file tool
-# now takes a literal absolute path wherever it takes a key
-# (PathRegistry.resolve_or_register), so "register first, then call" is no
-# longer true, and the register_path round-trip it mandated was pure tax.
-# Measured (edit_eval, 2026-08-13): with the old text the 27B registered first
-# in 19 of 20 generations even though the path would have worked; with this
-# one it goes straight to the tool 20 of 20, one call instead of two.
-# This block ALONE was rewritten. A wider prompt cut measured worse — see
-# specs-edit-eval.md.
+# What is left of the path block once the registry is gone (specs-path-registry.md).
+# It says the one thing a path-taking interface still needs said — where a
+# relative path is anchored — and the one handle that is still not a path: a
+# kept script's name.
 PATH_WORKFLOW_GUIDANCE = (
-    "File tools take a registry key or a literal absolute path, so use a path "
-    "you already have as it stands; register_path gives one a short key up "
-    "front. In a run_bash line a key is written in braces — `head -2 "
-    "{ref_fasta}` — and expands to the real path; that is also how you run a "
-    "script you created: `{my_script} --flag`."
+    "File tools take a path. Use the path the user gave you, or the one you "
+    "just saw in output, exactly as it stands — copy it, do not retype it "
+    "from memory. A relative path is taken from the working directory this "
+    "session was started in, so '.' is that directory. A script you created "
+    "with create_script is named, not pathed: in a run_bash line write its "
+    "name in braces — `{my_script} --flag` — and it expands to its path."
 )
 
-# Without this the model has no idea it may look around: every file tool takes
-# a key, and keys came from the user's message, so "find X somewhere on this
-# system" looked impossible and it narrated instead of acting.
+# Without this the model has no idea it may look around: it narrated instead
+# of acting when a path was not already in the conversation.
 DISCOVERY_GUIDANCE = (
     "You can look around this system, and you should rather than guess or ask. "
     "Use run_bash for a one-shot check — it writes, runs and returns the "
@@ -77,8 +72,8 @@ DISCOVERY_GUIDANCE = (
     "only the ones that answered, or search the likely install roots directly "
     "with find. Keep searches "
     "bounded so they finish in seconds: start from likely roots rather than /, "
-    "cap the depth, pipe through head. Then register_path the paths it printed "
-    "and use them by key."
+    "cap the depth, pipe through head. Then use the paths it printed as they "
+    "were printed."
 )
 
 # The single most common way the agent burns its tool budget: it cannot run an
@@ -93,16 +88,15 @@ SCRIPT_GUIDANCE = (
     "run tools by when you need the answer, not by what the script is: "
     "start_background_script for work that outlives this turn (it returns a pid "
     "and tells you later how it ended), run_bash when you want the output now — "
-    "a look-around check, or a kept script run with `{its_key}`. "
+    "a look-around check, or a kept script run with `{its_name}`. "
     "Build each command plainly on one line — real flags and paths separated "
     "by single spaces, nothing else. Do NOT insert quotes, commas or `\\` "
     "line-continuations between arguments; a stray `\",` turns your command "
-    "into garbage the tool rejects. Reference paths by their registered value "
-    "or write the literal path; do not leave a shell variable unset. "
+    "into garbage the tool rejects. Write paths out literally; do not leave a "
+    "shell variable unset. "
     "To WRITE a file that is not a script — a specs or design document, "
     "notes, a README, a config, a sample sheet — call create_file with the "
-    "directory (its key or its path), a name, and the content one line per "
-    "array element. "
+    "path of the new file and the content one line per array element. "
     "Never build a file out of `echo` lines or a `cat << EOF` heredoc in "
     "run_bash: the content then has to survive bash quoting, a single stray "
     "line costs the whole file, and run_bash refuses a script that long "
@@ -114,7 +108,7 @@ SCRIPT_GUIDANCE = (
     "To CHANGE a file that already exists — a script of yours, a config, a "
     "sample sheet — call edit_file with just the lines to replace. Do not "
     "re-send the whole file through create_script or create_file: create_file "
-    "refuses an existing path, and create_script's key must be new, so it "
+    "refuses an existing path, and create_script's name must be new, so it "
     "would leave the old file sitting there beside a second copy. Read the "
     "file first and copy the lines into old_lines exactly as they appear, "
     "spacing and all. On a long file read_file shows one window at a time: "

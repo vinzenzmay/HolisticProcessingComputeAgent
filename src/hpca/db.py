@@ -1,4 +1,4 @@
-"""The application sqlite database (§5.4): jobs, sessions, path registry, processes.
+"""The application sqlite database (§5.4): jobs, sessions, processes.
 
 One database at ``<app_dir>/hpca.db`` in WAL mode. LangGraph checkpoints live
 in the same file (their tables are managed by the langgraph sqlite saver);
@@ -54,14 +54,6 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- Thinking effort (hpca.thinking): off | low | medium | xhigh. Empty means
     -- "use agent.default_thinking", same convention as mode above.
     thinking TEXT NOT NULL DEFAULT ''
-);
-CREATE TABLE IF NOT EXISTS path_registry (
-    profile TEXT NOT NULL,
-    session_id TEXT NOT NULL,
-    key TEXT NOT NULL,
-    path TEXT NOT NULL,
-    created_at TEXT DEFAULT (datetime('now')),
-    PRIMARY KEY (profile, session_id, key)
 );
 CREATE TABLE IF NOT EXISTS symbols (
     name TEXT NOT NULL,

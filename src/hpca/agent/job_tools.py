@@ -2,7 +2,7 @@
 
 Submission always passes the ``sbatch --test-only`` gate first (§5.2), pins
 stdout/stderr to generated ``%j`` log paths so every log location is known to
-the job DB (§5.4), and registers the resolved paths in the path registry.
+the job DB (§5.4), and reports the log paths it resolved.
 ``cancel_job`` is destructive and therefore HITL-gated by the graph (§5.3).
 """
 
@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from hpca.agent import hints
 from hpca.agent.context import ToolContext
+from hpca.agent.builtin_tools import script_names, script_path
 from hpca.agent.explainer import explain_failure
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.slurm import JobStatus
@@ -27,7 +28,9 @@ def _require_cluster(ctx: ToolContext):
 
 
 class SubmitJobParams(BaseModel):
-    registry_key: str = Field(description="Registry key of the sbatch script")
+    name: str = Field(
+        description="Name of the sbatch script, as create_script took it"
+    )
     args: str = Field(
         default="", description="Extra sbatch options, e.g. '--mem=8G --time=01:00:00'"
     )
@@ -35,10 +38,16 @@ class SubmitJobParams(BaseModel):
 
 async def submit_job(args: SubmitJobParams, ctx: ToolContext) -> str:
     slurm, jobs, job_log_dir = _require_cluster(ctx)
-    script = ctx.registry.resolve(args.registry_key)
+    script = script_path(args.name, ctx)
+    if script is None:
+        known = ", ".join(script_names(ctx)) or "(none)"
+        return (
+            f"Job NOT submitted: there is no script called {args.name!r}. "
+            f"The scripts you have kept are: {known}"
+        )
     job_log_dir.mkdir(parents=True, exist_ok=True)
-    stdout_tpl = str(job_log_dir / f"{args.registry_key}-%j.out")
-    stderr_tpl = str(job_log_dir / f"{args.registry_key}-%j.err")
+    stdout_tpl = str(job_log_dir / f"{args.name}-%j.out")
+    stderr_tpl = str(job_log_dir / f"{args.name}-%j.err")
     sbatch_args = ["-o", stdout_tpl, "-e", stderr_tpl]
     if args.args:
         sbatch_args += args.args.split()
@@ -58,19 +67,14 @@ async def submit_job(args: SubmitJobParams, ctx: ToolContext) -> str:
         kind="sbatch",
         session_id=ctx.session_id,
         profile=ctx.profile,
-        script_key=args.registry_key,
+        script_key=args.name,
         stdout_path=stdout_path,
         stderr_path=stderr_path,
     )
-    out_key = ctx.registry.register_auto(
-        stdout_path, hint=f"{args.registry_key}_job_stdout"
-    )
-    err_key = ctx.registry.register_auto(
-        stderr_path, hint=f"{args.registry_key}_job_stderr"
-    )
     return (
-        f"Submitted job {job_id} ({args.registry_key!r}). It is tracked in the "
-        f"background; logs: {out_key}, {err_key}. {hints.CHECK_JOB_STATUS}"
+        f"Submitted job {job_id} ({args.name!r}). It is tracked in the "
+        f"background; logs: {stdout_path}, {stderr_path}. "
+        f"{hints.CHECK_JOB_STATUS}"
     )
 
 

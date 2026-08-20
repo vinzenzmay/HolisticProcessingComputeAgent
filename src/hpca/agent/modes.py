@@ -60,10 +60,10 @@ EXECUTION_TOOLS = frozenset(
 # unbounded, and what remains is cut out of the MIDDLE (see ``_clip``).
 SCRIPT_PREVIEW_CHARS = 40_000
 
-# Tools whose call *is* a registered script: the file behind the key is the
-# thing that would run, so it is what the user judges the call by. Every other
-# tool taking a registry key points at data — a file to read, delete, move —
-# and its contents are neither the call nor a script.
+# Tools whose call *is* a kept script: the file behind the name is the thing
+# that would run, so it is what the user judges the call by. Every other tool
+# taking a path points at data — a file to read, delete, move — and its
+# contents are neither the call nor a script.
 SCRIPT_FILE_TOOLS = frozenset({"start_background_script", "submit_job"})
 
 
@@ -331,9 +331,10 @@ def script_preview(tool_name: str, arguments: dict, ctx: Any) -> str | None:
             return _clip(edit_preview(arguments, ctx)) or None
         if tool_name not in SCRIPT_FILE_TOOLS:
             return None
-        key = arguments.get("registry_key")
-        if key and ctx is not None and getattr(ctx, "registry", None) is not None:
-            path = ctx.registry.resolve(key)
+        from hpca.agent.builtin_tools import script_path
+
+        path = script_path(arguments.get("name") or "", ctx)
+        if path is not None:
             text = path.read_text(errors="replace")
             args = arguments.get("args")
             header = f"# {path.name}" + (f" (args: {args})" if args else "")

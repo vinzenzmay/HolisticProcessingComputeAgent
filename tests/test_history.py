@@ -71,15 +71,15 @@ def _history(payloads: list[list[str]], *, call_id: str = "") -> list[dict]:
 
 class TestExchangeShape:
     def test_two_messages_call_then_result(self):
-        messages = tool_exchange("read_file", {"registry_key": "cohort"}, "12 lines")
+        messages = tool_exchange("read_file", {"path": "/data/cohort"}, "12 lines")
         assert [m["role"] for m in messages] == ["assistant", "user"]
 
     def test_the_assistant_message_is_the_decision_envelope(self):
-        messages = tool_exchange("read_file", {"registry_key": "cohort"}, "ok")
+        messages = tool_exchange("read_file", {"path": "/data/cohort"}, "ok")
         assert json.loads(messages[0]["content"]) == {
             "action": "tool_call",
             "tool": "read_file",
-            "arguments": {"registry_key": "cohort"},
+            "arguments": {"path": "/data/cohort"},
         }
 
     def test_the_envelope_matches_what_the_schema_constrains(self):
@@ -478,12 +478,12 @@ class TestNativeProtocol:
 
     def test_the_call_rides_tool_calls_and_the_result_the_tool_role(self):
         call, result = tool_exchange(
-            "read_file", {"registry_key": "cohort"}, "12 lines", call_id="call_1"
+            "read_file", {"path": "/data/cohort"}, "12 lines", call_id="call_1"
         )
         assert call["role"] == "assistant"
         assert call["tool_calls"][0]["function"]["name"] == "read_file"
         assert json.loads(call["tool_calls"][0]["function"]["arguments"]) == {
-            "registry_key": "cohort"
+            "path": "/data/cohort"
         }
         assert result["role"] == "tool"
         assert result["content"] == "[tool result] read_file: 12 lines"

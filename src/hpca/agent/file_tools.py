@@ -1,17 +1,15 @@
 """File operation tools (§5.1, §5.3): all destructive paths trash-backed.
 
-``register_path`` names a path up front, and a key stays the cheap way to
-refer to one; but every key-taking argument here also takes a literal absolute
-path (``PathRegistry.resolve_or_register``, which registers it in passing), so
-a path the model just saw in `ls` output does not need a round-trip before it
-can be used. Deletions and overwrites are HITL-gated; a plain move/copy to a
-fresh target is not (conditional ``is_destructive_call``).
+Every tool here names its target with a plain path (``hpca.paths``), absolute
+or relative to the session's working directory — the shape every file tool in
+every agent corpus the model was trained on has. Deletions and overwrites are
+HITL-gated; a plain move/copy to a fresh target is not (conditional
+``is_destructive_call``).
 
 ``restore_file`` is the other half of the trash (§5.3): without it the backup
 a deletion writes is only reachable by the user digging through the app dir by
 hand, which is exactly what happened the first time someone asked for a file
-back. It takes the original path rather than a registry key — the key is gone,
-dropped by the deletion that created the backup.
+back.
 
 ``create_file`` and ``edit_file`` are the two tools here that write content,
 and they split "new file" from "change a file" rather than overlapping.
@@ -44,7 +42,7 @@ from hpca.agent import hints
 from hpca.agent.context import ToolContext
 from hpca.agent.history import carries_elision_marker
 from hpca.agent.tools import Tool, ToolRegistry
-from hpca.registry import registered_note
+from hpca.paths import PathError, resolve_path
 from hpca.trash import TrashEntry
 
 # Enough for the model to recognise the file the user means without pasting a
@@ -58,121 +56,47 @@ def _require_trash(ctx: ToolContext):
     return ctx.trash
 
 
-def _descend(base: Path, key: str, subpath: str) -> Path:
-    """Resolve a path inside a registered directory by relative subpath.
+def _target(value: str, ctx: ToolContext) -> Path:
+    """The path a tool argument names, anchored at the session workdir.
 
-    Mirrors read_file: a directory key is a legitimate handle, and subpath
-    reaches a file inside it without registering every entry first. Raises
-    ValueError (model-facing) on an escaping or missing subpath so the handler
-    returns the message into the retry loop.
+    One line, kept as a function because every handler, every gating predicate
+    and every describe helper in this module has to agree on it — and because
+    ``register=False`` used to be the thing they disagreed about.
     """
-    if not subpath:
-        return base
-    candidate = (base / subpath).resolve()
-    if not candidate.is_relative_to(base.resolve()):
-        raise ValueError(
-            f"subpath {subpath!r} escapes {key!r}; {hints.SUBPATH_ESCAPES}"
-        )
-    if not candidate.exists():
-        raise ValueError(
-            f"No such path: {subpath!r} under {key!r}. "
-            f"Read {key!r} to list what is there."
-        )
-    return candidate
+    return resolve_path(value, ctx.workdir)
 
 
-def _resolved(
-    ctx: ToolContext, value: str, subpath: str, *, register: bool = True
-) -> tuple[Path, str]:
-    """``(path, key)`` for a key-or-literal-path argument, descended by subpath.
+def _existing(value: str, ctx: ToolContext) -> Path:
+    """``_target`` plus the check the destructive tools need before they act.
 
-    Every key-taking argument in this module goes through
-    ``PathRegistry.resolve_or_register``; ``register=False`` is what the gating
-    predicates and describe helpers pass, so they resolve a literal path
-    without writing to the registry (see the method's docstring).
+    Raises PathError (model-facing) rather than returning a sentinel: the
+    handlers catch it and hand the sentence straight back to the model, which
+    is the same shape as every other refusal here.
     """
-    base, key = ctx.registry.resolve_or_register(value, register=register)
-    return _descend(base, key, subpath), key
-
-
-def _source(ctx: ToolContext, key: str, subpath: str, *, register: bool = True) -> Path:
-    """Resolve a registry key or literal path, then descend into it by subpath."""
-    return _resolved(ctx, key, subpath, register=register)[0]
-
-
-class RegisterPathParams(BaseModel):
-    key: str = Field(
-        description=(
-            "Registry key for this path; reusing a key is allowed only when "
-            "nothing exists at the path it points at (fixing a typo)"
-        )
-    )
-    path: str = Field(
-        description="Absolute path exactly as the user wrote it — copy verbatim"
-    )
-
-
-async def register_path(args: RegisterPathParams, ctx: ToolContext) -> str:
-    """Give a path a key, whether or not anything is there yet.
-
-    A missing path used to be refused outright, on the reasoning that it is
-    almost always a typo. It is also, just as often, a path that does not
-    exist *yet* — the output directory a run will write, the specs.md the user
-    just asked for — and refusing left the model with no key for it, hence no
-    way to name it in the call that would have created it. So it registers
-    either way, and the result says which case this is: a key pointing at
-    nothing is a real state (read_file and create_file report it in the same
-    terms), not a silent one that turns into a confusing failure later.
-
-    The cost of taking the typo is that the key is spent, and there is no
-    unregister tool — so the registry lets a second call repoint a key whose
-    path does not exist (nothing is behind it to protect). The result says so
-    explicitly, naming the path that was dropped, because "Registered ..."
-    alone reads the same whether the correction landed or was ignored.
-    """
-    path = Path(args.path)
-    replaced = ctx.registry.register(args.key, path)
-    note = (
-        f" It previously pointed at {replaced}, where nothing exists, so that "
-        "registration is gone."
-        if replaced is not None
-        else ""
-    )
+    path = _target(value, ctx)
     if not path.exists():
-        return (
-            f"Registered {args.key!r}, but nothing exists at {path} yet.{note} "
-            f"{hints.REGISTERED_PATH_MISSING}"
+        raise PathError(
+            f"No such path: {path}. {hints.PATH_NOT_FOUND}"
         )
-    kind = "directory" if path.is_dir() else "file"
-    return f"Registered {kind} as {args.key!r}.{note}"
+    return path
 
 
 class DeleteFileParams(BaseModel):
-    registry_key: str = Field(
-        description="Registry key or absolute path of the file to delete"
-    )
-    subpath: str = Field(
-        default="",
-        description=(
-            "Path relative to registry_key when it names a directory, e.g. "
-            "'logs/run.err'. Leave empty to delete the key itself."
-        ),
-    )
+    path: str = Field(description="Path of the file to delete")
 
 
 def _delete_resolvable(args: DeleteFileParams, ctx: ToolContext) -> bool:
-    # Gate only calls that can actually run; unresolvable keys (and bad
-    # subpaths) go straight to the error-feedback loop instead of asking the
-    # user to approve a dud.
+    # Gate only calls that can actually run; a path that is not there goes
+    # straight to the error-feedback loop instead of asking the user to
+    # approve a dud.
     try:
-        _source(ctx, args.registry_key, args.subpath, register=False)
-        return True
+        return _target(args.path, ctx).exists()
     except Exception:
         return False
 
 
 def _describe_delete(args: DeleteFileParams, ctx: ToolContext) -> str:
-    path = _source(ctx, args.registry_key, args.subpath, register=False)
+    path = _target(args.path, ctx)
     size = path.stat().st_size if path.exists() else 0
     backed_up = ctx.trash is not None and size < ctx.trash.backup_limit_bytes
     backup_note = (
@@ -184,14 +108,14 @@ def _describe_delete(args: DeleteFileParams, ctx: ToolContext) -> str:
 
 
 def _describe_move(args: MoveFileParams, ctx: ToolContext) -> str:
-    source, _ = ctx.registry.resolve_or_register(args.source_key, register=False)
+    source = _target(args.source_path, ctx)
     target = _move_target(args, ctx)
     note = " (OVERWRITES existing file — old file goes to trash)" if target.exists() else ""
     return f"mv {source} → {target}{note}"
 
 
 def _describe_copy(args: CopyFileParams, ctx: ToolContext) -> str:
-    source, _ = ctx.registry.resolve_or_register(args.source_key, register=False)
+    source = _target(args.source_path, ctx)
     target = _copy_target(args, ctx)
     note = " (OVERWRITES existing file — old file goes to trash)" if target.exists() else ""
     return f"cp {source} → {target}{note}"
@@ -200,18 +124,12 @@ def _describe_copy(args: CopyFileParams, ctx: ToolContext) -> str:
 async def delete_file(args: DeleteFileParams, ctx: ToolContext) -> str:
     trash = _require_trash(ctx)
     try:
-        path = _source(ctx, args.registry_key, args.subpath)
+        path = _existing(args.path, ctx)
     except ValueError as exc:
-        return str(exc)
+        # Prefixed like every other refusal here: "NOT <verb>" is the shape the
+        # model reads first, and a bare sentence reads like a result.
+        return f"NOT deleted: {exc}"
     entry = trash.trash(path)
-    # No registered_note here, unlike the other tools: a literal path handed to
-    # delete_file does get a key on the way in, and the sweep below drops it
-    # again in the same call, so reporting it would name a key that is gone.
-    # Drop every key pointing at the deleted path (the directory key survives
-    # when only a subpath was removed); keys are few, so a scan is fine.
-    for key, registered in ctx.registry.list().items():
-        if registered == path:
-            ctx.registry.remove(key)
     if entry.method == "none":
         return (
             f"Deleted {path} WITHOUT backup (file was above the backup size "
@@ -321,21 +239,11 @@ async def restore_file(args: RestoreFileParams, ctx: ToolContext) -> str:
         )
     except OSError as exc:
         return f"Could not restore {entry.original_path}: {exc}"
-    key = ctx.registry.register_auto(restored, hint=restored.name)
-    return f"Restored {restored}, registered as {key!r}."
+    return f"Restored {restored}."
 
 
 class EditFileParams(BaseModel):
-    registry_key: str = Field(
-        description="Registry key or absolute path of the file to edit"
-    )
-    subpath: str = Field(
-        default="",
-        description=(
-            "Path relative to registry_key when it names a directory, e.g. "
-            "'config/run.yaml'. Leave empty to edit the key itself."
-        ),
-    )
+    path: str = Field(description="Path of the file to edit")
     # Line arrays for the same reason create_script takes them: the live model
     # fills string arrays reliably and mangles \n escapes in long strings.
     old_lines: list[str] = Field(
@@ -536,17 +444,15 @@ def _near_miss(file_lines: list[str], old_lines: list[str]) -> str:
 
 
 def _edit_target(args: EditFileParams, ctx: ToolContext) -> Path:
-    # Read-only: the handler resolves for itself (it needs the key back), so
-    # every caller left here is a predicate or a preview.
-    return _source(ctx, args.registry_key, args.subpath, register=False)
+    return _target(args.path, ctx)
 
 
 def edit_target_path(args: EditFileParams, ctx: ToolContext) -> Path | None:
     """The file an edit_file call would touch, or None when it cannot resolve.
 
     The graph's per-file approval memory (§3.5 auto mode) keys on this: two
-    calls that resolve to the same path are edits of the same file, whatever
-    mix of key and subpath the model used to name it. Swallows resolution
+    calls that resolve to the same path are edits of the same file, whether the
+    model wrote it absolute or relative to the workdir. Swallows resolution
     errors — an unresolvable call never skips a gate, it just fails normally.
     """
     try:
@@ -557,7 +463,7 @@ def edit_target_path(args: EditFileParams, ctx: ToolContext) -> Path | None:
 
 def _edit_resolvable(args: EditFileParams, ctx: ToolContext) -> bool:
     # Overwriting a file's content is destructive (§5.3), so every edit that
-    # can actually run gates; a dud key goes to the error-feedback loop instead
+    # can actually run gates; a dud path goes to the error-feedback loop instead
     # of asking the user to approve something that will not happen.
     try:
         return _edit_target(args, ctx).is_file()
@@ -645,7 +551,7 @@ def edit_preview(arguments: dict, ctx: object = None) -> str:
 
 
 async def edit_file(args: EditFileParams, ctx: ToolContext) -> str:
-    """Replace an exact run of lines in a registered file.
+    """Replace an exact run of lines in a text file.
 
     The point is the file that stays: a one-line fix to a 400-line script costs
     the two lines, not the script twice over (once read, once rewritten). What
@@ -658,12 +564,12 @@ async def edit_file(args: EditFileParams, ctx: ToolContext) -> str:
     from hpca.agent.builtin_tools import KIND_BY_SUFFIX, check_script_content
 
     try:
-        path, key = _resolved(ctx, args.registry_key, args.subpath)
+        path = _existing(args.path, ctx)
     except ValueError as exc:
-        return str(exc)
+        return f"NOT edited: {exc}"
     if path.is_dir():
         return (
-            f"NOT edited: {args.registry_key!r} is a directory. "
+            f"NOT edited: {path} is a directory. "
             f"{hints.EDIT_FILE_ON_DIRECTORY}"
         )
     try:
@@ -756,23 +662,16 @@ async def edit_file(args: EditFileParams, ctx: ToolContext) -> str:
         "so this cannot be undone."
     )
     return (
-        f"Edited {path} at line {start + 1}: {_change(args)}{extra}"
-        f"{registered_note(args.registry_key, key)}."
+        f"Edited {path} at line {start + 1}: {_change(args)}{extra}."
         f" {hints.NO_READ_BACK}{no_backup}{_tbd_note(edited)}"
     )
 
 
 class CreateFileParams(BaseModel):
-    dir_key: str = Field(
+    path: str = Field(
         description=(
-            "Registry key or absolute path of the directory to create the "
-            "file in"
-        )
-    )
-    name: str = Field(
-        description=(
-            "Name for the new file, e.g. 'specs.md'. May name a subdirectory "
-            "of it too, e.g. 'docs/specs.md'"
+            "Path for the new file, e.g. '/data/project/specs.md'. Missing "
+            "parent directories are created"
         )
     )
     # Last, and an array of lines, for the two reasons the module and
@@ -790,18 +689,14 @@ def _describe_create(args: CreateFileParams, ctx: ToolContext) -> str:
     create_file is not gated — it refuses rather than overwrites, so there is
     nothing for §5.3 to ask about — but every call is described, gated or not,
     because the chat row shows the description too. Without one the row falls
-    back to the arguments, and ``dir_key: res`` / ``name: notes.md`` is the
-    tool's internal vocabulary for something the user would rather read as a
-    path. Side-effect-free like the other describers: ``register=False``, and
-    never raising is the caller's guarantee, not a reason to be careless here.
+    back to the arguments, which say the same thing with less of it resolved. Side-effect-free like the other describers, and never raising is the
+    caller's guarantee, not a reason to be careless here.
     """
-    base, _ = ctx.registry.resolve_or_register(args.dir_key, register=False)
-    path = (base / args.name.strip()).resolve()
-    return f"create {path}\n({len(args.content_lines)} lines)"
+    return f"create {_target(args.path, ctx)}\n({len(args.content_lines)} lines)"
 
 
 async def create_file(args: CreateFileParams, ctx: ToolContext) -> str:
-    """Write a new text file into a registered directory.
+    """Write a new text file.
 
     The gap this fills is prose. ``create_script`` writes only into the scripts
     dir under a language suffix, and ``edit_file`` needs a file to already
@@ -817,23 +712,25 @@ async def create_file(args: CreateFileParams, ctx: ToolContext) -> str:
     """
     from hpca.agent.builtin_tools import KIND_BY_SUFFIX, check_script_content
 
-    base, dir_key = ctx.registry.resolve_or_register(args.dir_key)
-    # Only a path that IS something else disqualifies the key. One that is not
-    # there yet does not: register_path takes a directory before it exists, and
-    # the write below already makes missing parents, so refusing here would
-    # bounce a call the tool can simply carry out — the retry loop is where the
-    # backend gets confused, which is the one place not to send it.
-    if base.exists() and not base.is_dir():
+    try:
+        path = _target(args.path, ctx)
+    except ValueError as exc:
+        return f"NOT created: {exc}"
+    # A parent that is a *file* is the one shape mkdir cannot make. Say which
+    # component it is rather than letting a NotADirectoryError out: from
+    # inside the turn the two look nothing alike.
+    for parent in path.parents:
+        if parent.exists():
+            if not parent.is_dir():
+                return (
+                    f"NOT created: {parent} is a file, not a directory, so "
+                    f"{path} cannot be made. {hints.CREATE_FILE_PARENT_IS_FILE}"
+                )
+            break
+    if path.is_dir():
         return (
-            f"NOT created: {args.dir_key!r} is a file, not a directory. "
-            f"{hints.CREATE_FILE_DIR_KEY_IS_FILE}"
-        )
-    name = args.name.strip()
-    path = (base / name).resolve()
-    if Path(name).is_absolute() or not path.is_relative_to(base.resolve()):
-        return (
-            f"NOT created: {name!r} points outside {args.dir_key!r}. "
-            f"{hints.CREATE_FILE_NAME_ESCAPES}"
+            f"NOT created: {path} is a directory. "
+            f"{hints.CREATE_FILE_PATH_IS_DIR}"
         )
     if path.exists():
         return f"NOT created: {path} already exists. {hints.CREATE_FILE_EXISTS}"
@@ -875,16 +772,13 @@ async def create_file(args: CreateFileParams, ctx: ToolContext) -> str:
     made_dirs = not path.parent.exists()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content)
-    key = ctx.registry.register_auto(path, hint=path.stem)
     extra = f" ({'; '.join(warnings)})" if warnings else ""
     # A made directory is a caution, not a footnote. Every other file tool
     # fails loudly on a mistyped path because the target has to exist already;
     # this one silently makes whatever it is given, so a typo lands the file in
     # a plausible-looking wrong place and reports success. Naming it is what
     # gives the model — and the user reading the transcript — a chance to catch
-    # a misspelling before the next ten calls build on it. This replaces the
-    # warning register_path used to give when a directory was registered before
-    # it existed, which a literal dir path now skips (see specs-edit-eval.md §6).
+    # a misspelling before the next ten calls build on it.
     made = (
         f" NOTE: {path.parent} did not exist and was created. "
         f"{hints.CREATE_FILE_MADE_DIRS}"
@@ -897,37 +791,37 @@ async def create_file(args: CreateFileParams, ctx: ToolContext) -> str:
     # for nothing, and it pays for itself twice over in context — the file's
     # content, which the model supplied a moment ago, comes straight back in.
     return (
-        f"Created {path} ({_lines(len(content_lines))}), registered as "
-        f"{key!r}{extra}. {hints.EDIT_NOT_REWRITE} "
+        f"Created {path} ({_lines(len(content_lines))}){extra}. "
+        f"{hints.EDIT_NOT_REWRITE} "
         f"{hints.NO_READ_BACK}{made}{_tbd_note(content)}"
-        f"{registered_note(args.dir_key, dir_key)}"
     )
 
 
 class MoveFileParams(BaseModel):
-    source_key: str = Field(
-        description="Registry key or absolute path of the file to move"
-    )
-    subpath: str = Field(
-        default="",
+    source_path: str = Field(description="Path of the file to move")
+    dest_path: str = Field(
         description=(
-            "Path relative to source_key when it names a directory. Leave "
-            "empty to move the key itself."
-        ),
+            "Where to move it: a full target path, or an existing directory "
+            "to move it into under its own name"
+        )
     )
-    dest_dir_key: str = Field(
-        description="Registry key or absolute path of the target directory"
-    )
-    new_name: str = Field(
-        default="", description="Optional new file name; default keeps the name"
-    )
+
+
+def _destination(source: Path, dest: str, ctx: ToolContext) -> Path:
+    """`mv` semantics, because that is the shape the model already knows.
+
+    An existing directory takes the file under its own name; anything else is
+    the target path itself. The old interface asked for the directory and an
+    optional new name as separate arguments, which is a distinction the shell
+    does not make and the model kept getting on the wrong side of.
+    """
+    target = _target(dest, ctx)
+    return target / source.name if target.is_dir() else target
 
 
 def _move_target(args: MoveFileParams, ctx: ToolContext) -> Path:
     # Predicate/describe path only — read-only, as their purity rule requires.
-    source = _source(ctx, args.source_key, args.subpath, register=False)
-    dest_dir, _ = ctx.registry.resolve_or_register(args.dest_dir_key, register=False)
-    return dest_dir / (args.new_name or source.name)
+    return _destination(_target(args.source_path, ctx), args.dest_path, ctx)
 
 
 def _move_overwrites(args: MoveFileParams, ctx: ToolContext) -> bool:
@@ -941,54 +835,32 @@ async def move_file(args: MoveFileParams, ctx: ToolContext) -> str:
     import shutil
 
     try:
-        source, source_key = _resolved(ctx, args.source_key, args.subpath)
-        dest_dir, dest_key = ctx.registry.resolve_or_register(args.dest_dir_key)
+        source = _existing(args.source_path, ctx)
     except ValueError as exc:
-        return str(exc)
-    target = dest_dir / (args.new_name or source.name)
+        return f"NOT moved: {exc}"
+    target = _destination(source, args.dest_path, ctx)
     note = ""
     if target.exists():
         entry = _require_trash(ctx).trash(target)
         note = f" (previous {target.name} moved to trash via {entry.method})"
+    target.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(source), target)
-    # source_key/dest_key, not the raw arguments: a literal path was given a key
-    # on the way in, and it is that key reassign and the result talk about.
-    keys = registered_note(args.dest_dir_key, dest_key)
-    if args.subpath:
-        # source_key still names the directory; register the moved file freshly.
-        key = ctx.registry.register_auto(target, hint=target.name)
-        return (
-            f"Moved {source_key!r}/{args.subpath} to {target}, registered as "
-            f"{key!r}{note}.{registered_note(args.source_key, source_key)}{keys}"
-        )
-    ctx.registry.reassign(source_key, target)
-    return f"Moved {source_key!r} to {target}{note}.{keys}"
+    return f"Moved {source} to {target}{note}."
 
 
 class CopyFileParams(BaseModel):
-    source_key: str = Field(
-        description="Registry key or absolute path of the file to copy"
-    )
-    subpath: str = Field(
-        default="",
+    source_path: str = Field(description="Path of the file to copy")
+    dest_path: str = Field(
         description=(
-            "Path relative to source_key when it names a directory. Leave "
-            "empty to copy the key itself."
-        ),
-    )
-    dest_dir_key: str = Field(
-        description="Registry key or absolute path of the target directory"
-    )
-    new_name: str = Field(
-        default="", description="Optional new file name; default keeps the name"
+            "Where to copy it: a full target path, or an existing directory "
+            "to copy it into under its own name"
+        )
     )
 
 
 def _copy_target(args: CopyFileParams, ctx: ToolContext) -> Path:
     # Predicate/describe path only — read-only, as their purity rule requires.
-    source = _source(ctx, args.source_key, args.subpath, register=False)
-    dest_dir, _ = ctx.registry.resolve_or_register(args.dest_dir_key, register=False)
-    return dest_dir / (args.new_name or source.name)
+    return _destination(_target(args.source_path, ctx), args.dest_path, ctx)
 
 
 def _copy_overwrites(args: CopyFileParams, ctx: ToolContext) -> bool:
@@ -1002,47 +874,24 @@ async def copy_file(args: CopyFileParams, ctx: ToolContext) -> str:
     import shutil
 
     try:
-        source, source_key = _resolved(ctx, args.source_key, args.subpath)
-        dest_dir, dest_key = ctx.registry.resolve_or_register(args.dest_dir_key)
+        source = _existing(args.source_path, ctx)
     except ValueError as exc:
-        return str(exc)
-    target = dest_dir / (args.new_name or source.name)
+        return f"NOT copied: {exc}"
+    target = _destination(source, args.dest_path, ctx)
     note = ""
     if target.exists():
         entry = _require_trash(ctx).trash(target)
         note = f" (previous {target.name} moved to trash via {entry.method})"
+    target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, target)
-    # source_key, not the raw argument: a literal path hints off its own key,
-    # not off the 90 characters the model typed.
-    hint = f"{source.name}_copy" if args.subpath else f"{source_key}_copy"
-    key = ctx.registry.register_auto(target, hint=hint)
-    keys = registered_note(args.source_key, source_key) + registered_note(
-        args.dest_dir_key, dest_key
-    )
-    return (
-        f"Copied {source_key!r} to {target}, registered as {key!r}{note}.{keys}"
-    )
+    return f"Copied {source} to {target}{note}."
 
 
 def add_file_tools(registry: ToolRegistry) -> ToolRegistry:
     registry.register(
         Tool(
-            name="register_path",
-            description=(
-                "Register a path (the user's, or one you found) under a key; "
-                "call it again with the same key to correct a mistyped path"
-            ),
-            params=RegisterPathParams,
-            handler=register_path,
-        )
-    )
-    registry.register(
-        Tool(
             name="delete_file",
-            description=(
-                "Delete a registered file (trash-backed); pass subpath to "
-                "delete a file inside a registered directory"
-            ),
+            description="Delete a file by path (trash-backed)",
             params=DeleteFileParams,
             handler=delete_file,
             is_destructive_call=_delete_resolvable,
@@ -1066,12 +915,11 @@ def add_file_tools(registry: ToolRegistry) -> ToolRegistry:
             name="create_file",
             description=(
                 "Write a NEW text file — specs, notes, a README, a config — "
-                "into a registered directory, one array element per line. Use "
-                "this instead of echoing or heredoc'ing a file through "
-                "run_bash. Past ~150 lines send a skeleton (headings + one "
-                "`TBD: ...` line each) and fill per section with edit_file. "
-                "It will not overwrite: to change a file that exists, call "
-                "edit_file"
+                "at a path, one array element per line. Use this instead of "
+                "echoing or heredoc'ing a file through run_bash. Past ~150 "
+                "lines send a skeleton (headings + one `TBD: ...` line each) "
+                "and fill per section with edit_file. It will not overwrite: "
+                "to change a file that exists, call edit_file"
             ),
             params=CreateFileParams,
             handler=create_file,
@@ -1082,11 +930,9 @@ def add_file_tools(registry: ToolRegistry) -> ToolRegistry:
         Tool(
             name="edit_file",
             description=(
-                "Change part of a registered text file in place: give the "
-                "exact lines to replace and what to put there, instead of "
-                "rewriting the whole file. Pass subpath to edit a file inside "
-                "a registered directory. Read the file first and copy the "
-                "lines from it exactly"
+                "Change part of a text file in place: give the exact lines to "
+                "replace and what to put there, instead of rewriting the whole "
+                "file. Read the file first and copy the lines from it exactly"
             ),
             params=EditFileParams,
             handler=edit_file,
@@ -1097,10 +943,7 @@ def add_file_tools(registry: ToolRegistry) -> ToolRegistry:
     registry.register(
         Tool(
             name="move_file",
-            description=(
-                "Move a registered file into a registered directory; pass "
-                "subpath to move a file inside a registered directory"
-            ),
+            description="Move or rename a file, like `mv`",
             params=MoveFileParams,
             handler=move_file,
             is_destructive_call=_move_overwrites,
@@ -1110,10 +953,7 @@ def add_file_tools(registry: ToolRegistry) -> ToolRegistry:
     registry.register(
         Tool(
             name="copy_file",
-            description=(
-                "Copy a registered file into a registered directory; pass "
-                "subpath to copy a file inside a registered directory"
-            ),
+            description="Copy a file, like `cp`",
             params=CopyFileParams,
             handler=copy_file,
             is_destructive_call=_copy_overwrites,

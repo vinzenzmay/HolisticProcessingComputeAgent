@@ -100,10 +100,9 @@ class TestOnlyBackgroundWork:
         from hpca.agent.builtin_tools import default_tool_registry
         from hpca.agent.context import ToolContext
         from hpca.config import Settings
-        from hpca.registry import PathRegistry
 
         ctx = ToolContext(
-            registry=PathRegistry(conn, profile="default", session_id="s1"),
+            workdir=tmp_path,
             runner=ProcessRunner(conn, session_id="s1", log_dir=tmp_path / "logs"),
             settings=Settings(),
             scripts_dir=tmp_path / "scripts",
@@ -112,13 +111,13 @@ class TestOnlyBackgroundWork:
         create = tools.get("create_script")
         await create.handler(
             create.params.model_validate(
-                {"kind": "bash", "registry_key": "job", "content_lines": ["exit 4"]}
+                {"kind": "bash", "name": "job", "content_lines": ["exit 4"]}
             ),
             ctx,
         )
         start = tools.get("start_background_script")
         await start.handler(
-            start.params.model_validate({"registry_key": "job"}), ctx
+            start.params.model_validate({"name": "job"}), ctx
         )
         await asyncio.sleep(0.5)
         changes = poll_processes(conn)
@@ -134,10 +133,9 @@ class TestNoDuplicateStart:
     def ctx(self, conn, tmp_path):
         from hpca.agent.context import ToolContext
         from hpca.config import Settings
-        from hpca.registry import PathRegistry
 
         return ToolContext(
-            registry=PathRegistry(conn, profile="default", session_id="s1"),
+            workdir=tmp_path,
             runner=ProcessRunner(conn, session_id="s1", log_dir=tmp_path / "logs"),
             settings=Settings(),
             scripts_dir=tmp_path / "scripts",
@@ -150,7 +148,7 @@ class TestNoDuplicateStart:
         create = tools.get("create_script")
         await create.handler(
             create.params.model_validate(
-                {"kind": "bash", "registry_key": key, "content_lines": lines}
+                {"kind": "bash", "name": key, "content_lines": lines}
             ),
             ctx,
         )
@@ -159,10 +157,10 @@ class TestNoDuplicateStart:
     async def test_second_start_is_refused(self, ctx):
         start = await self._make(ctx, "slow_job", ["sleep 5"])
         first = await start.handler(
-            start.params.model_validate({"registry_key": "slow_job"}), ctx
+            start.params.model_validate({"name": "slow_job"}), ctx
         )
         second = await start.handler(
-            start.params.model_validate({"registry_key": "slow_job"}), ctx
+            start.params.model_validate({"name": "slow_job"}), ctx
         )
         assert "Started" in first
         assert "NOT started" in second
@@ -172,12 +170,12 @@ class TestNoDuplicateStart:
     async def test_restart_allowed_once_it_has_finished(self, ctx):
         start = await self._make(ctx, "quick_job", ["true"])
         first = await start.handler(
-            start.params.model_validate({"registry_key": "quick_job"}), ctx
+            start.params.model_validate({"name": "quick_job"}), ctx
         )
         pid = int(first.split("pid ")[1].split(")")[0])
         await ctx.runner.wait(pid)
         again = await start.handler(
-            start.params.model_validate({"registry_key": "quick_job"}), ctx
+            start.params.model_validate({"name": "quick_job"}), ctx
         )
         assert "Started" in again
 
@@ -185,7 +183,7 @@ class TestNoDuplicateStart:
         """A row left at 'running' by a crashed app must not wedge the name."""
         start = await self._make(ctx, "ghost", ["true"])
         await start.handler(
-            start.params.model_validate({"registry_key": "ghost"}), ctx
+            start.params.model_validate({"name": "ghost"}), ctx
         )
         conn.execute(
             "UPDATE processes SET state = 'running', pid = 999999 WHERE name = 'ghost'"

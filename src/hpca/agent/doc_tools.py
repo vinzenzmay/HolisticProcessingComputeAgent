@@ -21,6 +21,7 @@ from hpca.agent import hints
 from hpca.agent.context import ToolContext
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.embeddings import EmbeddingError
+from hpca.paths import resolve_path
 from hpca.rag import chunk_text, embed_fitting
 from hpca.symbols import index_python_source, parse_help_flags, parse_manpage_flags
 from hpca.verify_code import basename, commands_needing_docs
@@ -238,13 +239,15 @@ async def read_manpage(args: ReadManpageParams, ctx: ToolContext) -> str:
 
 
 class ReadSourceParams(BaseModel):
-    registry_key: str = Field(description="Registry key of the source file")
+    path: str = Field(description="Path of the source file")
     start_line: int = Field(default=1, ge=1)
     end_line: int = Field(default=SOURCE_MAX_LINES, ge=1)
 
 
 async def read_source(args: ReadSourceParams, ctx: ToolContext) -> str:
-    path = ctx.registry.resolve(args.registry_key)
+    path = resolve_path(args.path, ctx.workdir)
+    if not path.is_file():
+        return f"Nothing to read at {path}. {hints.PATH_NOT_FOUND}"
     lines = path.read_text(errors="replace").splitlines()
     end = min(args.end_line, args.start_line + SOURCE_MAX_LINES - 1, len(lines))
     excerpt = lines[args.start_line - 1 : end]
@@ -301,7 +304,7 @@ class IndexDocsParams(BaseModel):
         description="What to index"
     )
     target: str = Field(
-        description="python_source/docs_dir: registry key of a directory; "
+        description="python_source/docs_dir: path of a directory; "
         "manpages: space-separated command names, e.g. 'grep samtools-view'"
     )
 
@@ -312,9 +315,9 @@ async def index_docs(args: IndexDocsParams, ctx: ToolContext) -> str:
     rag_ready = ctx.rag is not None and ctx.embedder is not None
 
     if args.what == "python_source":
-        root = ctx.registry.resolve(args.target)
+        root = resolve_path(args.target, ctx.workdir)
         files = index_python_source(ctx.symbols, root)
-        return f"Indexed {files} Python files from {args.target!r}."
+        return f"Indexed {files} Python files from {root}."
 
     if args.what == "docs_dir":
         if not rag_ready:
@@ -322,7 +325,7 @@ async def index_docs(args: IndexDocsParams, ctx: ToolContext) -> str:
                 "Cannot index docs_dir: semantic search is not configured "
                 "(no embedding backend)."
             )
-        root = ctx.registry.resolve(args.target)
+        root = resolve_path(args.target, ctx.workdir)
         indexed, problems = 0, []
         for path in sorted(root.rglob("*")):
             if path.suffix.lower() not in DOC_SUFFIXES or not path.is_file():

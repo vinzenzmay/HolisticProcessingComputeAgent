@@ -41,7 +41,6 @@ from hpca.agent.history import (
 from hpca.agent.tools import ToolRegistry
 from hpca.config import Settings
 from hpca.db import connect, init_db
-from hpca.registry import PathRegistry
 from hpca.runner import ProcessRunner
 from hpca.trash import TrashManager
 
@@ -71,7 +70,7 @@ def ctx(tmp_path):
     conn = connect(tmp_path / "hpca.db")
     init_db(conn)
     yield ToolContext(
-        registry=PathRegistry(conn, profile="default", session_id="s1"),
+        workdir=tmp_path,
         runner=ProcessRunner(conn, session_id="s1", log_dir=tmp_path / "logs"),
         settings=Settings(),
         scripts_dir=tmp_path / "scripts",
@@ -126,8 +125,7 @@ class TestAFreshRecordSurvives:
         file while it is still working on it, so the record it reads back is
         minutes old at most — and that record now holds the lines."""
         write = {
-            "dir_key": str(tmp_path),
-            "name": "annotation.tsv",
+            "path": str(tmp_path / "annotation.tsv"),
             "content_lines": ANNOTATION,
         }
         await call(tools, "create_file", ctx, **write)
@@ -140,8 +138,7 @@ class TestAFreshRecordSurvives:
         reads its own record and writes the rows it finds there — which is now
         the right thing to do, so the file comes out whole."""
         write = {
-            "dir_key": str(tmp_path),
-            "name": "annotation.tsv",
+            "path": str(tmp_path / "annotation.tsv"),
             "content_lines": ANNOTATION,
         }
         await call(tools, "create_file", ctx, **write)
@@ -152,8 +149,7 @@ class TestAFreshRecordSurvives:
             tools,
             "create_file",
             ctx,
-            dir_key=str(tmp_path),
-            name="annotation2.tsv",
+            path=str(tmp_path / "annotation2.tsv"),
             content_lines=ANNOTATION,
         )
         assert result.startswith("Created")
@@ -165,7 +161,7 @@ class TestAnOldRecordCannotReachDisk:
     have been folded, and sessions checkpointed before the fold moved."""
 
     def test_a_buried_call_is_folded_and_keeps_no_line(self):
-        write = {"dir_key": "d", "name": "annotation.tsv", "content_lines": ANNOTATION}
+        write = {"path": "annotation.tsv", "content_lines": ANNOTATION}
         view = history_with(write, followed_by=KEEP_RECENT_CALLS)
         folded = payload_of(view[0])
         assert isinstance(folded, str)  # a description, not a shortened list
@@ -175,14 +171,13 @@ class TestAnOldRecordCannotReachDisk:
     async def test_writing_a_folded_record_back_is_refused(
         self, tools, ctx, tmp_path
     ):
-        write = {"dir_key": "d", "name": "annotation.tsv", "content_lines": ANNOTATION}
+        write = {"path": "annotation.tsv", "content_lines": ANNOTATION}
         folded = payload_of(history_with(write, followed_by=KEEP_RECENT_CALLS)[0])
         result = await call(
             tools,
             "create_file",
             ctx,
-            dir_key=str(tmp_path),
-            name="annotation2.tsv",
+            path=str(tmp_path / "annotation2.tsv"),
             content_lines=[folded],
         )
         assert result.startswith("NOT created")
@@ -197,8 +192,7 @@ class TestAnOldRecordCannotReachDisk:
             tools,
             "create_file",
             ctx,
-            dir_key=str(tmp_path),
-            name="annotation3.tsv",
+            path=str(tmp_path / "annotation3.tsv"),
             content_lines=LEGACY_ELIDED,
         )
         assert result.startswith("NOT created")
@@ -212,8 +206,7 @@ class TestAnOldRecordCannotReachDisk:
             tools,
             "create_file",
             ctx,
-            dir_key=str(tmp_path),
-            name="annotation4.tsv",
+            path=str(tmp_path / "annotation4.tsv"),
             content_lines=LEGACY_ELIDED,
         )
         assert "read_file" in result
@@ -227,8 +220,7 @@ class TestAnOldRecordCannotReachDisk:
             tools,
             "create_file",
             ctx,
-            dir_key=str(tmp_path),
-            name="ordinary.tsv",
+            path=str(tmp_path / "ordinary.tsv"),
             content_lines=content,
         )
         assert (tmp_path / "ordinary.tsv").read_text() == "\n".join(content) + "\n"
@@ -246,7 +238,7 @@ class TestRepairingAFileThatAlreadyCarriesOne:
             tools,
             "edit_file",
             ctx,
-            registry_key=str(broken),
+            path=str(broken),
             old_lines=[LEGACY_ELIDED[-1]],
             new_lines=ANNOTATION[3:],
         )
@@ -262,7 +254,7 @@ class TestRepairingAFileThatAlreadyCarriesOne:
             tools,
             "edit_file",
             ctx,
-            registry_key=str(intact),
+            path=str(intact),
             old_lines=ANNOTATION[3:],
             new_lines=[LEGACY_ELIDED[-1]],
         )

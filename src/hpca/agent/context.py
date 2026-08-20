@@ -11,7 +11,6 @@ from hpca.embeddings import EmbeddingClient
 from hpca.episodic import EpisodicStore
 from hpca.jobs import JobStore
 from hpca.rag import RagStore
-from hpca.registry import PathRegistry
 from hpca.runner import ProcessRunner
 from hpca.skills import Skill
 from hpca.slurm import SlurmClient
@@ -22,10 +21,14 @@ from hpca.watches import WatchStore
 
 @dataclass
 class ToolContext:
-    registry: PathRegistry
     runner: ProcessRunner
     settings: Settings
     scripts_dir: Path
+    # Where a relative path argument is anchored (hpca.paths). One value
+    # for the whole session, because nothing here chdirs: run_bash starts
+    # its scripts without a cwd of their own, so "." has to mean the same
+    # directory in every tool or it means nothing.
+    workdir: Path = field(default_factory=Path.cwd)
     session_id: str = ""
     profile: str = "default"
     slurm: SlurmClient | None = None

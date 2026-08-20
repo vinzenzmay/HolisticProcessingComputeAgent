@@ -3,11 +3,12 @@
 import pytest
 
 from hpca.agent.builtin_tools import default_tool_registry
+from hpca.agent.builtin_tools import script_names, script_path
 from hpca.agent.context import ToolContext
 from hpca.agent.history import ELISION_SENTINEL, omitted_list
 from hpca.config import Settings
 from hpca.db import connect, init_db
-from hpca.registry import PathRegistry, RegistryError, UnknownKeyError
+from hpca.paths import PathError
 from hpca.runner import ProcessRunner
 
 
@@ -16,7 +17,7 @@ def ctx(tmp_path):
     conn = connect(tmp_path / "hpca.db")
     init_db(conn)
     yield ToolContext(
-        registry=PathRegistry(conn, profile="default", session_id="s1"),
+        workdir=tmp_path,
         runner=ProcessRunner(conn, session_id="s1", log_dir=tmp_path / "logs"),
         settings=Settings(),
         scripts_dir=tmp_path / "scripts",
@@ -29,8 +30,8 @@ def tools():
     return default_tool_registry()
 
 
-async def call(tools, name, ctx, **kwargs):
-    tool = tools.get(name)
+async def call(tools, tool_name, ctx, **kwargs):
+    tool = tools.get(tool_name)
     args = tool.params.model_validate(kwargs)
     return await tool.handler(args, ctx)
 
@@ -42,27 +43,26 @@ class TestCreateScript:
             "create_script",
             ctx,
             kind="bash",
-            registry_key="hello_sh",
+            name="hello_sh",
             content_lines=["echo hello"],
         )
-        path = ctx.registry.resolve("hello_sh")
+        path = script_path("hello_sh", ctx)
         # strict mode is injected, then the model's lines
         assert path.read_text() == "set -euo pipefail\necho hello\n"
         assert "hello_sh" in result
         assert "ok" in result.lower()
 
-    async def test_invalid_bash_script_not_registered(self, tools, ctx):
+    async def test_invalid_bash_script_is_not_kept(self, tools, ctx):
         result = await call(
             tools,
             "create_script",
             ctx,
             kind="bash",
-            registry_key="bad_sh",
+            name="bad_sh",
             content_lines=["if [ 1 -eq 1 ]; then", "echo unclosed"],
         )
         assert "syntax" in result.lower()
-        with pytest.raises(UnknownKeyError):
-            ctx.registry.resolve("bad_sh")
+        assert script_path("bad_sh", ctx) is None
 
     async def test_invalid_python_reports_error_text(self, tools, ctx):
         result = await call(
@@ -70,56 +70,36 @@ class TestCreateScript:
             "create_script",
             ctx,
             kind="python",
-            registry_key="bad_py",
+            name="bad_py",
             content_lines=["def broken(:", "    pass"],
         )
         assert "SyntaxError" in result
 
-    async def test_duplicate_key_raises(self, tools, ctx):
+    async def test_a_name_already_taken_raises(self, tools, ctx):
         await call(
             tools, "create_script", ctx,
-            kind="bash", registry_key="x", content_lines=["echo 1"],
+            kind="bash", name="x", content_lines=["echo 1"],
         )
-        with pytest.raises(RegistryError, match="already exists"):
+        with pytest.raises(PathError, match="already exists"):
             await call(
                 tools, "create_script", ctx,
-                kind="bash", registry_key="x", content_lines=["echo 2"],
+                kind="bash", name="x", content_lines=["echo 2"],
             )
 
-    async def test_key_naming_another_live_file_raises(self, tools, ctx, tmp_path):
-        other = tmp_path / "data.txt"
-        other.write_text("payload\n")
-        ctx.registry.register("x", other)
-        with pytest.raises(RegistryError, match="already names"):
-            await call(
-                tools, "create_script", ctx,
-                kind="bash", registry_key="x", content_lines=["echo 1"],
-            )
-        assert ctx.registry.resolve("x") == other
-
-    async def test_key_whose_script_is_gone_can_be_recreated(self, tools, ctx):
-        # A key naming a file that no longer exists names nothing. Refusing it
-        # would burn the key for the session, the trap Registry.register fixed.
+    async def test_a_name_whose_script_is_gone_can_be_reused(self, tools, ctx):
+        # A name is free exactly when no file answers to it, so deleting the
+        # script frees the name — there is no separate registration to go stale.
         await call(
             tools, "create_script", ctx,
-            kind="bash", registry_key="x", content_lines=["echo 1"],
+            kind="bash", name="x", content_lines=["echo 1"],
         )
-        ctx.registry.resolve("x").unlink()
+        script_path("x", ctx).unlink()
         result = await call(
             tools, "create_script", ctx,
-            kind="bash", registry_key="x", content_lines=["echo 2"],
+            kind="bash", name="x", content_lines=["echo 2"],
         )
-        assert "echo 2" in ctx.registry.resolve("x").read_text()
-        assert "stale" not in result  # same path back, so nothing was repointed
-
-    async def test_repointing_a_dead_key_is_reported(self, tools, ctx, tmp_path):
-        ctx.registry.register("x", tmp_path / "never_written.sh")
-        result = await call(
-            tools, "create_script", ctx,
-            kind="bash", registry_key="x", content_lines=["echo 1"],
-        )
-        assert "never_written.sh" in result
-        assert ctx.registry.resolve("x") == ctx.scripts_dir / "x.sh"
+        assert "echo 2" in script_path("x", ctx).read_text()
+        assert "syntax check ok" in result
 
     async def test_content_carrying_the_elision_marker_is_refused(self, tools, ctx):
         """The model handing its own elided record back as script content is
@@ -128,7 +108,7 @@ class TestCreateScript:
         of the script, and every rewrite after that shrinks the file further."""
         result = await call(
             tools, "create_script", ctx,
-            kind="bash", registry_key="x",
+            kind="bash", name="x",
             content_lines=["echo start", omitted_list(["echo body"] * 40)],
         )
         assert "NOT created" in result
@@ -138,17 +118,16 @@ class TestCreateScript:
         # composed its next call out of the refusal it had just read, and the
         # same call was refused seventeen times until the decision budget died.
         assert ELISION_SENTINEL not in result
-        # Nothing may reach disk, and the key must stay free for the retry.
+        # Nothing may reach disk, and the name must stay free for the retry.
         assert not (ctx.scripts_dir / "x.sh").exists()
-        with pytest.raises(UnknownKeyError):
-            ctx.registry.resolve("x")
+        assert script_path("x", ctx) is None
 
     async def test_the_legacy_elision_wording_is_refused_too(self, tools, ctx):
         """Pre-0.23.3 sessions and the files already written from one carry the
         old marker, so the guard has to know that wording as well."""
         result = await call(
             tools, "create_script", ctx,
-            kind="bash", registry_key="x",
+            kind="bash", name="x",
             content_lines=["echo start", "... 22 more lines elided ..."],
         )
         assert "NOT created" in result
@@ -157,7 +136,7 @@ class TestCreateScript:
     async def test_the_refusal_names_the_offending_line(self, tools, ctx):
         result = await call(
             tools, "create_script", ctx,
-            kind="bash", registry_key="x",
+            kind="bash", name="x",
             content_lines=["echo one", "echo two", "... 7 more lines elided ..."],
         )
         assert "line 3 of content_lines" in result
@@ -169,19 +148,18 @@ class TestCreateScript:
         an ordinary script saying 'lines' and a number is not a placeholder."""
         result = await call(
             tools, "create_script", ctx,
-            kind="bash", registry_key="x",
+            kind="bash", name="x",
             content_lines=["echo 'skipping 22 more lines'", "echo done"],
         )
         assert "ok" in result.lower()
-        assert "skipping 22 more lines" in ctx.registry.resolve("x").read_text()
+        assert "skipping 22 more lines" in script_path("x", ctx).read_text()
 
 
 class TestReadFile:
     async def test_reads_registered_file(self, tools, ctx, tmp_path):
         f = tmp_path / "data.txt"
         f.write_text("line1\nline2\n")
-        ctx.registry.register("data", f)
-        result = await call(tools, "read_file", ctx, registry_key="data")
+        result = await call(tools, "read_file", ctx, path=str(f))
         assert "line1" in result and "line2" in result
 
     async def test_long_file_returns_contiguous_window_with_hint(
@@ -189,8 +167,7 @@ class TestReadFile:
     ):
         f = tmp_path / "big.txt"
         f.write_text("\n".join(f"line{i}" for i in range(1000)))
-        ctx.registry.register("big", f)
-        result = await call(tools, "read_file", ctx, registry_key="big", max_lines=20)
+        result = await call(tools, "read_file", ctx, path=str(f), max_lines=20)
         # Contiguous head window, no middle omission — the model pages instead.
         assert "line0" in result and "line19" in result
         assert "line20" not in result
@@ -201,9 +178,8 @@ class TestReadFile:
     async def test_paging_window_with_start_line(self, tools, ctx, tmp_path):
         f = tmp_path / "big.txt"
         f.write_text("\n".join(f"line{i}" for i in range(1000)))
-        ctx.registry.register("big", f)
         result = await call(
-            tools, "read_file", ctx, registry_key="big",
+            tools, "read_file", ctx, path=str(f),
             start_line=501, max_lines=10,
         )
         assert result.splitlines()[0] == "line500"
@@ -214,9 +190,8 @@ class TestReadFile:
     async def test_start_line_beyond_eof_is_instructive(self, tools, ctx, tmp_path):
         f = tmp_path / "big.txt"
         f.write_text("\n".join(f"line{i}" for i in range(50)))
-        ctx.registry.register("big", f)
         result = await call(
-            tools, "read_file", ctx, registry_key="big", start_line=100
+            tools, "read_file", ctx, path=str(f), start_line=100
         )
         assert "50" in result and "start_line" in result
 
@@ -225,49 +200,39 @@ class TestReadFile:
     ):
         f = tmp_path / "big.txt"
         f.write_text("\n".join(f"line{i}" for i in range(100)))
-        ctx.registry.register("big", f)
         result = await call(
-            tools, "read_file", ctx, registry_key="big",
+            tools, "read_file", ctx, path=str(f),
             start_line=91, max_lines=20,
         )
         assert result.splitlines()[0] == "line90"
         assert "line99" in result
         assert "file continues" not in result
 
-    async def test_unknown_key_raises_with_available(self, tools, ctx, tmp_path):
-        ctx.registry.register("known", tmp_path / "k.txt")
-        with pytest.raises(UnknownKeyError, match="known"):
-            await call(tools, "read_file", ctx, registry_key="nope")
+    async def test_a_path_that_is_not_there_says_so(self, tools, ctx, tmp_path):
+        result = await call(tools, "read_file", ctx, path="nope")
+        assert "Nothing at" in result
+        assert str(tmp_path / "nope") in result  # resolved, not echoed back
 
-    async def test_reads_a_literal_path_and_reports_its_new_key(
-        self, tools, ctx, tmp_path
-    ):
-        """A path the model just saw in `ls` output is usable as it stands —
-        no register_path round-trip first (§4.3, path-or-key)."""
+    async def test_the_body_is_the_whole_result(self, tools, ctx, tmp_path):
+        """Nothing is appended to a read. The body is what the model copies
+        edit_file's old_lines out of, so a trailing note would be a line of the
+        file as far as the next call can tell."""
         f = tmp_path / "data.txt"
         f.write_text("line1\nline2\n")
-        result = await call(tools, "read_file", ctx, registry_key=str(f))
-        assert "line1" in result and "line2" in result
-        assert ctx.registry.resolve("data.txt") == f
-        # The note is its own last line: the body above it is what the model
-        # copies edit_file's old_lines out of, and must stay untouched.
-        assert result.splitlines()[-1] == f"({f} is registered as 'data.txt')"
+        result = await call(tools, "read_file", ctx, path=str(f))
+        assert result == "line1\nline2"
 
-    async def test_a_plain_key_read_carries_no_note(self, tools, ctx, tmp_path):
+    async def test_a_read_carries_no_note(self, tools, ctx, tmp_path):
         f = tmp_path / "data.txt"
         f.write_text("line1\n")
-        ctx.registry.register("data", f)
-        assert await call(tools, "read_file", ctx, registry_key="data") == "line1"
+        assert await call(tools, "read_file", ctx, path=str(f)) == "line1"
 
-    async def test_key_and_subpath_read_carries_no_note(self, tools, ctx, tmp_path):
-        """The auto-registration a subpath already did is not a path argument,
-        so it must not start announcing itself."""
+    async def test_a_nested_path_reads_the_same(self, tools, ctx, tmp_path):
         d = tmp_path / "run"
         d.mkdir()
         (d / "a.txt").write_text("inner\n")
-        ctx.registry.register("run_dir", d)
         result = await call(
-            tools, "read_file", ctx, registry_key="run_dir", subpath="a.txt"
+            tools, "read_file", ctx, path=str(d / "a.txt")
         )
         assert result == "inner"
 
@@ -275,146 +240,109 @@ class TestReadFile:
         d = tmp_path / "tools"
         d.mkdir()
         (d / "run.sh").write_text("echo hi\n")
-        result = await call(tools, "read_file", ctx, registry_key=str(d))
+        result = await call(tools, "read_file", ctx, path=str(d))
         assert "is a directory" in result
         assert "run.sh" in result
-        assert "is registered as 'tools'" in result
 
-    async def test_a_relative_path_is_still_an_unknown_key(
+    async def test_a_relative_path_reads_from_the_workdir(
         self, tools, ctx, tmp_path
     ):
-        ctx.registry.register("known", tmp_path / "k.txt")
-        with pytest.raises(UnknownKeyError, match="known"):
-            await call(tools, "read_file", ctx, registry_key="results/out.txt")
+        """What the registry answered with UnknownKeyError. The model wrote a
+        path it could see; there is no reason for that to be an error."""
+        (tmp_path / "results").mkdir()
+        (tmp_path / "results" / "out.txt").write_text("done\n")
+        assert await call(tools, "read_file", ctx, path="results/out.txt") == "done"
 
-    async def test_a_key_pointing_at_nothing_says_so(self, tools, ctx, tmp_path):
-        """register_path takes a path before it exists, and a registered file
-        can be deleted from under its key. Either way the read must come back
-        as a sentence the model can act on, not a bare FileNotFoundError."""
-        ctx.registry.register("planned", tmp_path / "results" / "run.log")
-        result = await call(tools, "read_file", ctx, registry_key="planned")
+    async def test_a_missing_file_comes_back_as_a_sentence(
+        self, tools, ctx, tmp_path
+    ):
+        """Not a bare FileNotFoundError: the read has to come back as something
+        the model can act on."""
+        result = await call(
+            tools, "read_file", ctx, path=str(tmp_path / "results" / "run.log")
+        )
         assert "Nothing at" in result
-        assert "planned" in result
+        assert "Check the spelling" in result
 
-    async def test_directory_key_is_listed_not_an_error(self, tools, ctx, tmp_path):
+    async def test_a_directory_is_listed_not_an_error(self, tools, ctx, tmp_path):
         d = tmp_path / "tools"
         d.mkdir()
         (d / "run.sh").write_text("echo hi\n")
         (d / "sub").mkdir()
-        ctx.registry.register("tools_dir", d)
-        result = await call(tools, "read_file", ctx, registry_key="tools_dir")
+        result = await call(tools, "read_file", ctx, path=str(d))
         assert "is a directory" in result
         assert "run.sh" in result
         assert "sub/" in result  # trailing slash marks nested directories
-        assert "subpath" in result
+        assert "full path" in result
 
-    async def test_subpath_reads_file_inside_registered_directory(
-        self, tools, ctx, tmp_path
-    ):
+    async def test_a_deep_path_is_read_for_real(self, tools, ctx, tmp_path):
         d = tmp_path / "pkg"
         (d / "src").mkdir(parents=True)
         (d / "src" / "main.py").write_text("print('hello')\n")
-        ctx.registry.register("pkg", d)
         result = await call(
-            tools, "read_file", ctx, registry_key="pkg", subpath="src/main.py"
+            tools, "read_file", ctx, path=str(d / "src/main.py")
         )
         assert "hello" in result
 
-    async def test_subpath_autoregisters_the_file_for_reuse(
+    async def test_a_missing_file_inside_a_directory_is_a_useful_error(
         self, tools, ctx, tmp_path
     ):
         d = tmp_path / "pkg"
         d.mkdir()
-        (d / "notes.txt").write_text("body\n")
-        ctx.registry.register("pkg", d)
-        await call(tools, "read_file", ctx, registry_key="pkg", subpath="notes.txt")
-        assert ctx.registry.resolve("notes.txt") == d / "notes.txt"
-
-    async def test_missing_subpath_is_a_useful_error(self, tools, ctx, tmp_path):
-        d = tmp_path / "pkg"
-        d.mkdir()
-        ctx.registry.register("pkg", d)
-        result = await call(
-            tools, "read_file", ctx, registry_key="pkg", subpath="nope.txt"
-        )
-        assert "No such file" in result
-
-    async def test_subpath_cannot_escape_the_directory(self, tools, ctx, tmp_path):
-        secret = tmp_path / "secret.txt"
-        secret.write_text("top secret\n")
-        d = tmp_path / "pkg"
-        d.mkdir()
-        ctx.registry.register("pkg", d)
-        result = await call(
-            tools, "read_file", ctx, registry_key="pkg", subpath="../secret.txt"
-        )
-        assert "escapes" in result
-        assert "top secret" not in result
-
+        result = await call(tools, "read_file", ctx, path=str(d / "nope.txt"))
+        assert "Nothing at" in result
 
 class TestStartScript:
-    async def test_runs_and_registers_logs(self, tools, ctx):
+    async def test_runs_and_names_its_logs(self, tools, ctx):
         await call(
             tools, "create_script", ctx,
-            kind="bash", registry_key="greeter",
+            kind="bash", name="greeter",
             content_lines=['echo "hi from script"'],
         )
         result = await call(
-            tools, "start_background_script", ctx, registry_key="greeter"
+            tools, "start_background_script", ctx, name="greeter"
         )
         assert "pid" in result.lower()
-        assert "greeter_stdout" in result
         record = ctx.runner.list()[0]
         await ctx.runner.wait(record.pid)
-        stdout = ctx.registry.resolve("greeter_stdout")
-        assert "hi from script" in stdout.read_text()
+        # the log paths are in the result outright, ready for read_file
+        assert str(record.stdout_path) in result
+        assert "hi from script" in record.stdout_path.read_text()
 
     async def test_passes_args(self, tools, ctx):
         await call(
             tools, "create_script", ctx,
-            kind="bash", registry_key="argsy", content_lines=['echo "arg1=$1"'],
+            kind="bash", name="argsy", content_lines=['echo "arg1=$1"'],
         )
         await call(
             tools, "start_background_script", ctx,
-            registry_key="argsy", args="banana",
+            name="argsy", args="banana",
         )
         record = ctx.runner.list()[0]
         await ctx.runner.wait(record.pid)
-        assert "arg1=banana" in ctx.registry.resolve("argsy_stdout").read_text()
+        assert "arg1=banana" in record.stdout_path.read_text()
 
     async def test_python_script_started_with_python(self, tools, ctx):
         await call(
             tools, "create_script", ctx,
-            kind="python", registry_key="pyhello",
+            kind="python", name="pyhello",
             content_lines=['print("python says hi")'],
         )
-        await call(tools, "start_background_script", ctx, registry_key="pyhello")
+        await call(tools, "start_background_script", ctx, name="pyhello")
         record = ctx.runner.list()[0]
         await ctx.runner.wait(record.pid)
         assert record.state == "finished"
-        assert "python says hi" in ctx.registry.resolve("pyhello_stdout").read_text()
+        assert "python says hi" in record.stdout_path.read_text()
 
 
-class TestListPaths:
-    async def test_lists_registered_keys(self, tools, ctx, tmp_path):
-        ctx.registry.register("alpha", tmp_path / "a.txt")
-        ctx.registry.register("beta", tmp_path / "b.txt")
-        result = await call(tools, "list_paths", ctx)
-        assert "alpha" in result and "beta" in result
-
-    async def test_empty_registry(self, tools, ctx):
-        result = await call(tools, "list_paths", ctx)
-        assert "no paths" in result.lower()
-
-
-class TestRegistryShape:
+class TestToolSuiteShape:
     def test_default_registry_has_expected_tools(self, tools):
         assert set(tools.names()) == {
             "create_script",
             "read_file",
             "run_bash",
             "start_background_script",
-            "list_paths",
+            "list_scripts",
         }
 
     def test_no_tool_is_unconditionally_destructive(self, tools):
@@ -431,23 +359,23 @@ class TestSingleLineScriptGate:
     async def test_shebang_only_script_rejected(self, tools, ctx):
         result = await call(
             tools, "create_script", ctx,
-            kind="bash", registry_key="oneliner",
+            kind="bash", name="oneliner",
             content_lines=["#!/bin/bash for i in 1 2 3; do echo $i; done"],
         )
         assert "NOT created" in result
-        assert "oneliner" not in ctx.registry.list()
+        assert "oneliner" not in script_names(ctx)
 
     async def test_single_command_line_without_shebang_ok(self, tools, ctx):
         result = await call(
             tools, "create_script", ctx,
-            kind="bash", registry_key="shortie", content_lines=["echo hi"],
+            kind="bash", name="shortie", content_lines=["echo hi"],
         )
         assert "ok" in result.lower()
 
     async def test_multiline_with_shebang_ok(self, tools, ctx):
         result = await call(
             tools, "create_script", ctx,
-            kind="bash", registry_key="proper",
+            kind="bash", name="proper",
             content_lines=["#!/bin/bash", "for i in 1 2 3; do echo $i; done"],
         )
         assert "ok" in result.lower()
@@ -524,17 +452,17 @@ class TestRunBash:
         await call(tools, "run_bash", ctx, content_lines=["echo y"])
         # nothing clutters the registry the model reasons over: the script is
         # throwaway, and output that fit needs no log key
-        assert ctx.registry.list() == {}
+        assert script_names(ctx) == []
         assert ctx.runner.list()[0].state == "finished"
 
-    async def test_clipped_output_registers_a_log_that_can_be_read(self, tools, ctx):
+    async def test_clipped_output_names_a_log_that_can_be_read(self, tools, ctx):
         result = await call(tools, "run_bash", ctx, content_lines=["seq 1 500"])
         assert "omitted" in result and "read_file" in result
-        # the key it points at must actually exist — the whole point of
-        # registering lazily is that the follow-up read works
-        key = next(k for k in ctx.registry.list() if k.startswith("bash_stdout"))
-        assert key in result
-        assert "1\n" in ctx.registry.resolve(key).read_text()
+        # the path it points at must actually hold the rest — the whole point
+        # of naming it is that the follow-up read works
+        record = ctx.runner.list()[0]
+        assert str(record.stdout_path) in result
+        assert "1\n" in record.stdout_path.read_text()
 
 
 class TestRunBashFailingLines:
@@ -592,31 +520,38 @@ class TestRunBashFailingLines:
         assert "|" not in result
 
     async def test_the_quoted_line_is_the_expanded_one(self, tools, ctx, tmp_path):
-        # What ran is what is quoted: `{key}` resolved, as the script has it.
-        ctx.registry.register("data", tmp_path / "data")
+        # What ran is what is quoted: `{name}` resolved, as the script has it.
+        await call(
+            tools, "create_script", ctx,
+            kind="bash", name="data", content_lines=["echo hi"],
+        )
+        script = ctx.scripts_dir / "data.sh"
         result = await call(
             tools, "run_bash", ctx,
             content_lines=["not_a_command_xyz {data}"],
         )
-        assert f"not_a_command_xyz {tmp_path / 'data'}" in result
+        assert f"not_a_command_xyz {script}" in result
 
 
-class TestRunBashKeyInterpolation:
-    """`{key}` in a run_bash line expands to the registered path, which is how
-    a kept script is run now that run_script is gone — and it keeps the
-    "tools take keys, never literal paths" rule instead of carving it open."""
+class TestRunBashScriptInterpolation:
+    """`{name}` in a run_bash line expands to a kept script's path, which is how
+    a kept script is run now that run_script is gone. A name is the only thing
+    that expands: a data file is written as the path it is."""
 
-    async def test_key_expands_to_its_path(self, tools, ctx, tmp_path):
+    async def test_a_data_path_is_written_out_not_braced(
+        self, tools, ctx, tmp_path
+    ):
         target = tmp_path / "reads.bam"
         target.write_text("BAMDATA\n")
-        ctx.registry.register("reads", target)
-        result = await call(tools, "run_bash", ctx, content_lines=["cat {reads}"])
+        result = await call(
+            tools, "run_bash", ctx, content_lines=[f"cat {target}"]
+        )
         assert "BAMDATA" in result
 
-    async def test_a_registered_script_is_run_by_key(self, tools, ctx):
+    async def test_a_kept_script_is_run_by_name(self, tools, ctx):
         await call(
             tools, "create_script", ctx,
-            kind="python", registry_key="qc",
+            kind="python", name="qc",
             content_lines=["import sys", "print('qc ran', sys.argv[1])"],
         )
         result = await call(
@@ -645,10 +580,13 @@ class TestRunBashKeyInterpolation:
     async def test_unresolved_reference_is_named_when_the_run_fails(
         self, tools, ctx, tmp_path
     ):
-        ctx.registry.register("reads", tmp_path / "reads.bam")
+        await call(
+            tools, "create_script", ctx,
+            kind="bash", name="reads", content_lines=["echo hi"],
+        )
         result = await call(tools, "run_bash", ctx, content_lines=["cat {readz}"])
         assert "{readz}" in result
-        assert "reads" in result  # the keys that do exist, for the retry
+        assert "reads" in result  # the scripts that do exist, for the retry
 
     async def test_a_successful_run_is_not_nagged_about_braces(self, tools, ctx):
         result = await call(
@@ -714,14 +652,14 @@ class TestBashFailFast:
     async def test_failure_before_a_success_echo_is_not_masked(self, tools, ctx):
         await call(
             tools, "create_script", ctx,
-            kind="bash", registry_key="run_thing",
+            kind="bash", name="run_thing",
             content_lines=[
                 "false",                       # the "tool" fails
                 'echo "Done. Output: out.vcf"',  # would otherwise mask it
             ],
         )
         record = await ctx.runner.start(
-            ["bash", str(ctx.registry.resolve("run_thing"))], name="run_thing"
+            ["bash", str(script_path("run_thing", ctx))], name="run_thing"
         )
         record = await ctx.runner.wait(record.pid)
         assert record.state == "failed"
@@ -732,10 +670,10 @@ class TestBashFailFast:
     async def test_strict_mode_is_injected_after_the_shebang(self, tools, ctx):
         await call(
             tools, "create_script", ctx,
-            kind="bash", registry_key="shebanged",
+            kind="bash", name="shebanged",
             content_lines=["#!/bin/bash", "echo hi"],
         )
-        text = ctx.registry.resolve("shebanged").read_text()
+        text = script_path("shebanged", ctx).read_text()
         lines = text.splitlines()
         assert lines[0] == "#!/bin/bash"
         assert lines[1] == "set -euo pipefail"
@@ -743,19 +681,19 @@ class TestBashFailFast:
     async def test_strict_mode_prepended_when_no_shebang(self, tools, ctx):
         await call(
             tools, "create_script", ctx,
-            kind="bash", registry_key="bare", content_lines=["echo hi"],
+            kind="bash", name="bare", content_lines=["echo hi"],
         )
-        assert ctx.registry.resolve("bare").read_text().startswith(
+        assert script_path("bare", ctx).read_text().startswith(
             "set -euo pipefail\n"
         )
 
     async def test_the_models_own_set_e_is_respected(self, tools, ctx):
         await call(
             tools, "create_script", ctx,
-            kind="bash", registry_key="own",
+            kind="bash", name="own",
             content_lines=["set -e", "echo hi"],
         )
-        text = ctx.registry.resolve("own").read_text()
+        text = script_path("own", ctx).read_text()
         assert text.count("set -e") == 1  # not doubled
 
     async def test_the_success_note_warns_against_unconditional_done(
@@ -763,16 +701,16 @@ class TestBashFailFast:
     ):
         result = await call(
             tools, "create_script", ctx,
-            kind="bash", registry_key="noted", content_lines=["echo hi"],
+            kind="bash", name="noted", content_lines=["echo hi"],
         )
         assert "fail-fast" in result
 
     async def test_non_bash_scripts_are_not_touched(self, tools, ctx):
         await call(
             tools, "create_script", ctx,
-            kind="python", registry_key="py", content_lines=["print('hi')"],
+            kind="python", name="py", content_lines=["print('hi')"],
         )
-        text = ctx.registry.resolve("py").read_text()
+        text = script_path("py", ctx).read_text()
         assert "set -euo pipefail" not in text  # python fails on exception anyway
 
     async def test_run_bash_stays_lenient_for_exploration(self, tools, ctx):

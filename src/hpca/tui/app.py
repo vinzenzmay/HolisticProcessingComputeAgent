@@ -97,7 +97,6 @@ from hpca.transcript import ASSISTANT as ASSISTANT_ENTRY
 from hpca.transcript import THINKING, Entry, Step, build_entries, live_step
 from hpca.transcript import USER as USER_ENTRY
 from hpca.profiles import DEFAULT_PROFILE, MemoryScope, Profile
-from hpca.registry import PathRegistry
 from hpca.runner import (
     ProcessRunner,
     analyse_process_failure,
@@ -3484,9 +3483,6 @@ class HpcaApp(App):
         both of them fail to connect in a session whose chat was working."""
         client = self._client_for(session)
         ctx = ToolContext(
-            registry=PathRegistry(
-                self._conn, profile=session.profile, session_id=session.session_id
-            ),
             runner=ProcessRunner(
                 self._conn,
                 session_id=session.session_id,
@@ -4998,21 +4994,11 @@ class HpcaApp(App):
             self.notify(f"Fork failed: {e}", severity="error")
             return
 
-        # Path aliases the copied history mentions must resolve in the fork
-        # too, or the agent re-reads a conversation full of names it cannot
-        # use. Jobs and processes are NOT copied: they record real work, which
-        # belongs to the session that started it (see SessionStore.delete).
-        def copy_aliases(conn):
-            conn.execute(
-                "INSERT OR IGNORE INTO path_registry "
-                "(profile, session_id, key, path) "
-                "SELECT profile, ?, key, path FROM path_registry "
-                "WHERE profile = ? AND session_id = ?",
-                (fork.session_id, session.profile, session.session_id),
-            )
-            conn.commit()
-
-        await self._db(copy_aliases)
+        # Nothing session-scoped needs copying alongside the history: the
+        # paths it mentions are paths, and mean the same thing in the fork.
+        # Jobs and processes are deliberately NOT copied — they record real
+        # work, which belongs to the session that started it (see
+        # SessionStore.delete).
         await self._reload_sessions()
         await self.open_session(fork)
         self._focus_column("chat")

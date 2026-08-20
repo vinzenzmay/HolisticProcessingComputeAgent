@@ -63,26 +63,6 @@ class TestDelete:
         assert store.get(drop.session_id) is None
         assert store.get(keep.session_id) is not None
 
-    def test_delete_takes_the_sessions_path_aliases_with_it(self, store, tmp_path):
-        from hpca.registry import PathRegistry
-
-        session = store.create(profile="default")
-        other = store.create(profile="default")
-        registry = PathRegistry(
-            store._conn, profile="default", session_id=session.session_id
-        )
-        registry.register("cohort", str(tmp_path))
-        PathRegistry(
-            store._conn, profile="default", session_id=other.session_id
-        ).register("cohort", str(tmp_path))
-
-        store.delete(session.session_id)
-        assert registry.list() == {}  # its aliases meant nothing without it
-        kept = PathRegistry(
-            store._conn, profile="default", session_id=other.session_id
-        )
-        assert "cohort" in kept.list()
-
     def test_deleting_an_unknown_session_is_quiet(self, store):
         store.delete("no-such-session")  # must not raise
 

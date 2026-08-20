@@ -577,10 +577,9 @@ def _salvage_truncated_call(partial: str, tools: ToolRegistry) -> ToolCall | Non
         return None
 
     if tool_name == "create_file":
-        dir_key = _scalar_arg(partial, "dir_key")
-        name = _scalar_arg(partial, "name")
+        path = _scalar_arg(partial, "path")
         start = _array_start(partial, "content_lines")
-        if not dir_key or not name or start is None:
+        if not path or start is None:
             return None
         lines, closed = _scan_strings(partial, start)
         # closed means the array was fine and the cut hit something else —
@@ -591,8 +590,7 @@ def _salvage_truncated_call(partial: str, tools: ToolRegistry) -> ToolCall | Non
         if len(lines) < MIN_SALVAGE_LINES:
             return None
         args: dict = {
-            "dir_key": dir_key,
-            "name": name,
+            "path": path,
             "content_lines": lines + [SALVAGE_MARKER],
         }
         note = (
@@ -604,9 +602,9 @@ def _salvage_truncated_call(partial: str, tools: ToolRegistry) -> ToolCall | Non
             "call, at most ~80 new lines each."
         )
     else:
-        registry_key = _scalar_arg(partial, "registry_key")
+        path = _scalar_arg(partial, "path")
         old_start = _array_start(partial, "old_lines")
-        if not registry_key or old_start is None:
+        if not path or old_start is None:
             return None
         old_lines, old_closed = _scan_strings(partial, old_start)
         if not old_closed or not old_lines:
@@ -621,8 +619,7 @@ def _salvage_truncated_call(partial: str, tools: ToolRegistry) -> ToolCall | Non
         if len(new_lines) < MIN_SALVAGE_LINES:
             return None
         args = {
-            "registry_key": registry_key,
-            "subpath": _scalar_arg(partial, "subpath") or "",
+            "path": path,
             "old_lines": old_lines,
             "new_lines": new_lines + [SALVAGE_MARKER],
         }
@@ -821,7 +818,7 @@ async def decide(
                 # parsers (measured: vLLM's qwen3_coder, 2026-08-17) drop the
                 # argument they were part-way through and hand back the rest
                 # as a well-formed call — `create_file` arrives as
-                # {dir_key, name} with the 200 content_lines simply gone, and
+                # {path} alone with the 200 content_lines simply gone, and
                 # `finish_reason` says "tool_calls", not "length". Nothing in
                 # the response says truncation; only the token count does.
                 #

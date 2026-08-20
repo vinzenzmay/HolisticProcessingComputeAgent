@@ -7,7 +7,6 @@ from hpca.agent.context import ToolContext
 from hpca.agent.watch_tools import add_watch_tools
 from hpca.config import Settings
 from hpca.db import connect, init_db
-from hpca.registry import PathRegistry
 from hpca.runner import ProcessRunner
 from hpca.slurm import SlurmClient
 from hpca.watches import KIND_JOB, KIND_LOG, LOG_PRESENT, WatchStore
@@ -42,7 +41,7 @@ def make_ctx(tmp_path, *, run=None):
     conn = connect(tmp_path / "hpca.db")
     init_db(conn)
     return ToolContext(
-        registry=PathRegistry(conn, profile="default", session_id="s1"),
+        workdir=tmp_path,
         runner=ProcessRunner(conn, session_id="s1", log_dir=tmp_path / "logs"),
         settings=Settings(),
         scripts_dir=tmp_path / "scripts",
@@ -71,22 +70,14 @@ class TestWatchLog:
         # anything is still writing cannot be read off the file's mtime.
         assert watch.state == LOG_PRESENT
 
-    async def test_a_registry_key_works_as_well_as_a_path(self, tools, tmp_path):
-        ctx = make_ctx(tmp_path)
-        log = tmp_path / "run.log"
-        log.write_text("x")
-        ctx.registry.register("run_log", log)
-        await call(tools, "watch_log", ctx, path="run_log")
-        assert ctx.watches.list(profile="default")[0].target == str(log)
-
-    async def test_the_path_is_registered_so_later_turns_can_name_it(
+    async def test_a_relative_path_is_anchored_at_the_workdir(
         self, tools, tmp_path
     ):
         ctx = make_ctx(tmp_path)
         log = tmp_path / "run.log"
         log.write_text("x")
-        await call(tools, "watch_log", ctx, path=str(log))
-        assert log in ctx.registry.list().values()
+        await call(tools, "watch_log", ctx, path="run.log")
+        assert ctx.watches.list(profile="default")[0].target == str(log)
 
     async def test_a_log_that_does_not_exist_yet_is_watched_but_flagged(
         self, tools, tmp_path
@@ -98,11 +89,11 @@ class TestWatchLog:
         assert "does not exist yet" in result
         assert len(ctx.watches.list(profile="default")) == 1
 
-    async def test_a_relative_path_is_refused_with_what_to_do_instead(
+    async def test_an_empty_path_is_refused_with_what_to_do_instead(
         self, tools, tmp_path
     ):
         ctx = make_ctx(tmp_path)
-        result = await call(tools, "watch_log", ctx, path="sniffles.log")
+        result = await call(tools, "watch_log", ctx, path="   ")
         assert "Not watched" in result
         assert ctx.watches.list(profile="default") == []
 
