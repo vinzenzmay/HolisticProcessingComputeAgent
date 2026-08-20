@@ -187,9 +187,35 @@ added to `protocol.py` with tests, in the same style as what is there:
    and the "cancel it" gesture need a wire representation — most likely
    `chat.append` with `kind="queued"` plus a `turn.unqueue` command.
 10. **`--serve` argv.** `coreproc.default_core_argv` already builds
-    `python -m hpca --serve --socket …` and `__main__.py` parses nothing. Only
-    needed for the last milestone, but it is the reason `__main__` gets touched
-    at all.
+    `python -m hpca --serve --socket …` and `__main__.py` parses nothing.
+    Deliberately deferred to M11: the argv has no production caller today
+    (`CoreSupervisor` is only ever constructed in tests, always with a stub),
+    so parsing the flag early can only make it lie — a core that prints a
+    handshake and exits leaves the supervisor dialling a socket nobody bound,
+    which is a worse failure than the current honest absence. `__main__.py` is
+    edited once, at the milestone that also swaps the front-end, and `main()`
+    must argparse *before* importing either side so a core process never
+    imports the UI.
+11. **Entry addressing.** `chat.append` can only append, but a tool call must
+    appear as a row and have its result land *in that row* (`Part.done`
+    already documents that shape), and a `queued` entry must become an ordinary
+    `user` entry in place. Textual dodged both by rebuilding the whole chat
+    every turn — exactly the cost this protocol exists to delete, and
+    incompatible with §3.2's append-only invariant. Needs a core-assigned entry
+    identity and an update event.
+
+Three smaller gaps, recorded here for the milestone that hits each:
+
+- **`chat.reset` must re-emit queued rows.** A session re-opened while a turn
+  is running silently loses its type-ahead entries otherwise; `tui/app.py:4585`
+  is where the old UI appended them. (M5.)
+- **`notify` has no `title`.** Several Textual call sites used one. Memory and
+  curation warnings will want it. (M8.)
+- **`decision.requested.payload` is an opaque dict**, so the UI must understand
+  the agent's interrupt shape after all. Accepted by `specs-core-process.md`
+  §4.4, but it means `tui/approval_screen.py`'s seven helpers are load-bearing
+  on the UI side rather than a convenience — they must be moved, not
+  reimplemented. (M5.)
 
 ### 4.3 Screens and features with no prototype equivalent
 
