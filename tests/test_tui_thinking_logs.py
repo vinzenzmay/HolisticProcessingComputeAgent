@@ -10,6 +10,7 @@ from textual.widgets import ListView, Static
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.config import Settings
 from hpca.llm import ChatResponse
+from hpca.transcript import RESULT_RULE
 from hpca.tui.app import (
     ChatInput,
     DecisionBar,
@@ -178,8 +179,8 @@ class TestThinkingBox:
     async def test_parts_are_individually_navigable_and_hold_the_highlight(
         self, hpca_home
     ):
-        # A turn with reasoning, a tool call and its result, then more
-        # reasoning: four parts.
+        # A turn with reasoning, one tool exchange and more reasoning: three
+        # parts, because the call and the result it returned are one row.
         app = HpcaApp(
             llm=FakeLLM(
                 [
@@ -201,22 +202,24 @@ class TestThinkingBox:
 
             steps = list(app.query(StepBox))
             assert [s._step.label() for s in steps] == [
-                "reasoning", "ask_docs (call)", "ask_docs", "reasoning"
+                "reasoning", "ask_docs", "reasoning"
             ]
             assert all(not s.expanded for s in steps)  # each revealed collapsed
             assert chat_list.index == 1  # highlight kept on the box
 
-            # Open the tool's result individually; the others stay shut.
+            # Open the tool exchange individually; the others stay shut.
             await pilot.press("down")  # first reasoning
-            await pilot.press("down")  # the ask_docs call
-            await pilot.press("down")  # the ask_docs result
-            assert chat_list.index == 4
+            await pilot.press("down")  # the ask_docs exchange
+            assert chat_list.index == 3
             await pilot.press("enter")
             await pilot.pause()
-            assert steps[2].expanded
-            assert not any(s.expanded for s in (steps[0], steps[1], steps[3]))
-            assert "binary alignment map" in str(steps[2].content)
-            assert chat_list.index == 4  # still on the same step
+            assert steps[1].expanded
+            assert not any(s.expanded for s in (steps[0], steps[2]))
+            # both halves in the one row, the question above the answer
+            body = str(steps[1].content)
+            assert body.index("what is a BAM?") < body.index("binary alignment map")
+            assert RESULT_RULE in body
+            assert chat_list.index == 3  # still on the same step
 
             # Collapse the box: every step row goes away, highlight back on it.
             chat_list.index = 1
@@ -284,16 +287,19 @@ class TestToolCallBoxes:
             await pilot.pause()
             assert not app.query_one("#decision-bar", DecisionBar).display
             steps = await expand_box(app, pilot)
-            assert [s._step.label() for s in steps] == ["run_bash (call)", "run_bash"]
+            # one row for the exchange, not one for the script and one for
+            # what it printed
+            assert [s._step.label() for s in steps] == ["run_bash"]
             # revealed collapsed: the script is a box you open, not a wall
             assert all(not s.expanded for s in steps)
             assert "echo cohort-listing" not in str(steps[0].content)
 
-            await pilot.press("down")  # onto the call row
+            await pilot.press("down")  # onto the exchange row
             await pilot.press("enter")  # open it
             await pilot.pause()
             assert steps[0].expanded
             assert "echo cohort-listing" in str(steps[0].content)
+            assert RESULT_RULE in str(steps[0].content)  # and what it printed
 
     async def test_a_skipped_script_is_still_there_to_read(self, hpca_home):
         app = HpcaApp(
@@ -312,9 +318,12 @@ class TestToolCallBoxes:
             await app.workers.wait_for_complete()
             await pilot.pause()
             steps = await expand_box(app, pilot)
-            assert steps[0]._step.label() == "run_bash (call)"
+            assert len(steps) == 1  # the refusal is this row's result half
+            # and it reads as a failure on the collapsed row, though the tool
+            # never ran to raise anything
+            assert steps[0]._step.label() == "run_bash (error)"
             assert "echo scratch-cleanup" in steps[0]._step.text
-            assert "SKIPPED" in steps[1]._step.text
+            assert "SKIPPED" in steps[0]._step.result
 
     async def test_auto_mode_shows_what_ran_unasked(self, hpca_home):
         # Nothing gates here, so this box is the only account of what ran.
@@ -369,8 +378,12 @@ class TestToolCallBoxes:
         async with app.run_test(size=(120, 40)) as pilot:
             await submit_chat(app, pilot, "why did job 42 fail?")
             text = log_text(logs_dir)
-            assert "[tool call] run_bash" in text
+            # One heading for the exchange, with the script and what it
+            # printed under it — the log writes the same reading of the turn
+            # the chat shows, and the tool is named once in both.
+            assert text.count("— run_bash —") == 1
             assert "echo job-42" in text
+            assert RESULT_RULE in text
 
 
 class TestLiveSteps:
@@ -413,10 +426,12 @@ class TestLiveSteps:
             await asyncio.wait_for(entered.wait(), timeout=5)
             await pilot.pause()
 
-            # Mid-run: the call is already a row, and it says what is running.
+            # Mid-run: the call is already a row, and it says what is running
+            # and that the answer is still out.
             steps = list(app.query(StepBox))
-            assert [s._step.label() for s in steps] == ["scan_cohort (call)"]
+            assert [s._step.label() for s in steps] == ["scan_cohort …"]
             assert "how many BAMs?" in steps[0]._step.text
+            assert not steps[0]._step.done
             # and the spinner is still below it, where the turn continues
             assert app.query(WorkingIndicator)
 
@@ -469,6 +484,98 @@ class TestLiveSteps:
             release.set()
             await app.workers.wait_for_complete()
             await pilot.pause()
+
+
+# The two halves as the graph announces them (its ``on_step``), so the tests
+# below can drive the chat's half of the merge without a tool that blocks.
+LIVE_CALL = {
+    "kind": "call",
+    "tool": "run_bash",
+    "arguments": {"content_lines": ["echo forty-two"]},
+    "script": "echo forty-two",
+}
+LIVE_RESULT = {"kind": "step", "text": "[tool result] run_bash: ran (exit 0).\n42"}
+
+
+class TestAResultFillsInTheRowItsCallOpened:
+    """The call and the result are announced separately and can be minutes
+    apart, and still have to end up as one row: the call goes up the moment it
+    is made, and the result is written into that same row when it lands. A
+    second row would put the tool's name on screen twice and move everything
+    under it just as the user started reading."""
+
+    async def test_a_call_alone_is_one_row_with_no_result_on_it(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM([respond_json("done")]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            await pilot.pause()
+            app.report_step(app.active_session.session_id, LIVE_CALL)
+            await pilot.pause()
+            rows = list(app.query(StepBox))
+            assert len(rows) == 1
+            assert rows[0].awaiting_result
+            assert rows[0]._step.label() == "run_bash …"  # the answer is still out
+            rows[0].toggle()
+            # only the call: an empty "result" heading would read as a tool
+            # that answered with nothing
+            assert "echo forty-two" in str(rows[0].content)
+            assert RESULT_RULE not in str(rows[0].content)
+
+    async def test_the_result_fills_that_row_rather_than_adding_one(self, hpca_home):
+        app = HpcaApp(llm=FakeLLM([respond_json("done")]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            await pilot.pause()
+            session_id = app.active_session.session_id
+            app.report_step(session_id, LIVE_CALL)
+            await pilot.pause()
+            app.report_step(session_id, LIVE_RESULT)
+            await pilot.pause()
+            rows = list(app.query(StepBox))
+            assert len(rows) == 1, "still the one row, now with both halves"
+            assert not rows[0].awaiting_result
+            assert rows[0]._step.label() == "run_bash"  # no longer running
+            rows[0].toggle()
+            body = str(rows[0].content)
+            assert body.index("echo forty-two") < body.index("ran (exit 0).")
+            assert RESULT_RULE in body
+
+    async def test_a_result_with_no_call_of_its_own_still_gets_a_row(self, hpca_home):
+        # Nothing to land on — the announcement is news either way, and a
+        # dropped result would leave the turn looking like it did nothing.
+        app = HpcaApp(llm=FakeLLM([respond_json("done")]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            await pilot.pause()
+            app.report_step(app.active_session.session_id, LIVE_RESULT)
+            await pilot.pause()
+            rows = list(app.query(StepBox))
+            assert len(rows) == 1
+            assert rows[0]._step.label() == "run_bash"
+            assert "ran (exit 0)." in rows[0]._step.text
+
+    async def test_a_rebuild_between_the_halves_leaves_the_result_standing(
+        self, hpca_home
+    ):
+        # Switching session mid-turn redraws the chat and takes the live rows
+        # with it. The result then belongs to no row on screen, and must not be
+        # written into the widget that is no longer there.
+        app = HpcaApp(llm=FakeLLM([respond_json("done")]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            await pilot.pause()
+            session_id = app.active_session.session_id
+            app.report_step(session_id, LIVE_CALL)
+            await pilot.pause()
+            await app._set_chat_messages([])
+            await pilot.pause()
+            assert app._live_call is None
+            app.report_step(session_id, LIVE_RESULT)
+            await pilot.pause()
+            rows = list(app.query(StepBox))
+            assert len(rows) == 1  # the result on its own, the call gone
+            assert not rows[0].awaiting_result
+            assert "ran (exit 0)." in rows[0]._step.text
 
 
 class TestEntryStyling:

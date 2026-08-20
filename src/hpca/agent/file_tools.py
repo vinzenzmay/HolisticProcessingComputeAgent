@@ -40,6 +40,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from hpca.agent import hints
 from hpca.agent.context import ToolContext
 from hpca.agent.history import carries_elision_marker
 from hpca.agent.tools import Tool, ToolRegistry
@@ -70,7 +71,7 @@ def _descend(base: Path, key: str, subpath: str) -> Path:
     candidate = (base / subpath).resolve()
     if not candidate.is_relative_to(base.resolve()):
         raise ValueError(
-            f"subpath {subpath!r} escapes {key!r}; use a path inside the directory."
+            f"subpath {subpath!r} escapes {key!r}; {hints.SUBPATH_ESCAPES}"
         )
     if not candidate.exists():
         raise ValueError(
@@ -140,8 +141,7 @@ async def register_path(args: RegisterPathParams, ctx: ToolContext) -> str:
     if not path.exists():
         return (
             f"Registered {args.key!r}, but nothing exists at {path} yet.{note} "
-            "If the user meant a path that is already there, check the spelling "
-            "against their message; otherwise create it before reading it."
+            f"{hints.REGISTERED_PATH_MISSING}"
         )
     kind = "directory" if path.is_dir() else "file"
     return f"Registered {kind} as {args.key!r}.{note}"
@@ -310,19 +310,14 @@ async def restore_file(args: RestoreFileParams, ctx: ToolContext) -> str:
         return (
             f"Cannot restore {entry.original_path}: it was deleted without a "
             "backup (it was above the backup size limit), so no copy was kept. "
-            "Tell the user it is not recoverable from HPCA's trash."
+            f"{hints.TRASH_NOT_RECOVERABLE}"
         )
     try:
         restored = trash.restore(entry)
     except FileExistsError:
         return (
             f"Cannot restore {entry.original_path}: a file already exists "
-            "there. Move or rename that file first with move_file, then "
-            "restore again — the backup is still in the trash. Undoing an edit "
-            "always lands here, because the backup and the edited file share a "
-            "path. Do not delete the file to clear the path: that trashes it "
-            "under the same path too, and the restore would then bring back "
-            "what you were undoing."
+            f"there. {hints.RESTORE_PATH_OCCUPIED}"
         )
     except OSError as exc:
         return f"Could not restore {entry.original_path}: {exc}"
@@ -438,11 +433,7 @@ def _elision_refusal(
             f"{refusal}: {field} line {index + 1} is not file content — it is a "
             "placeholder the session history left in place of a payload it did "
             "not keep, so what you sent is your own record of an earlier call "
-            f"rather than the file. {outcome} Do not send that line again. Call "
-            "read_file on the file and send the lines it gives back, or "
-            "re-derive the content from whatever you built it from. If you did "
-            "mean this literal text — documentation about the placeholder "
-            "itself — write it with run_bash and a heredoc."
+            f"rather than the file. {outcome} {hints.ELISION_REWRITE_FILE}"
         )
     return ""
 
@@ -672,8 +663,8 @@ async def edit_file(args: EditFileParams, ctx: ToolContext) -> str:
         return str(exc)
     if path.is_dir():
         return (
-            f"NOT edited: {args.registry_key!r} is a directory. Pass subpath to "
-            "edit a file inside it."
+            f"NOT edited: {args.registry_key!r} is a directory. "
+            f"{hints.EDIT_FILE_ON_DIRECTORY}"
         )
     try:
         text, bom, ending = _read_for_edit(path)
@@ -715,8 +706,7 @@ async def edit_file(args: EditFileParams, ctx: ToolContext) -> str:
         where = ", ".join(f"line {index + 1}" for index in hits[:5])
         return (
             f"NOT edited: those lines occur {len(hits)} times in {path} ({where}), "
-            "so which one you mean is ambiguous. Call edit_file again with "
-            "enough surrounding lines to pick out the one you want."
+            f"so which one you mean is ambiguous. {hints.EDIT_FILE_AMBIGUOUS}"
         )
     # A unique fallback-level match applies: the file's own lines outside the
     # run are untouched (whole-line replacement, so nothing gets normalized
@@ -727,8 +717,7 @@ async def edit_file(args: EditFileParams, ctx: ToolContext) -> str:
     if edited == text:
         return (
             f"NOT edited: the replacement produces identical content — "
-            "old_lines and new_lines are the same. If you meant to change "
-            "something else, re-read the file and edit that."
+            f"old_lines and new_lines are the same. {hints.EDIT_FILE_NO_OP}"
         )
 
     warnings: list[str] = []
@@ -769,7 +758,7 @@ async def edit_file(args: EditFileParams, ctx: ToolContext) -> str:
     return (
         f"Edited {path} at line {start + 1}: {_change(args)}{extra}"
         f"{registered_note(args.registry_key, key)}."
-        f" Do not read it back to check.{no_backup}{_tbd_note(edited)}"
+        f" {hints.NO_READ_BACK}{no_backup}{_tbd_note(edited)}"
     )
 
 
@@ -793,6 +782,22 @@ class CreateFileParams(BaseModel):
         min_length=1,
         description="File content as an array of lines, one string per line",
     )
+
+
+def _describe_create(args: CreateFileParams, ctx: ToolContext) -> str:
+    """Where this call would put the file, and how much of it there is.
+
+    create_file is not gated — it refuses rather than overwrites, so there is
+    nothing for §5.3 to ask about — but every call is described, gated or not,
+    because the chat row shows the description too. Without one the row falls
+    back to the arguments, and ``dir_key: res`` / ``name: notes.md`` is the
+    tool's internal vocabulary for something the user would rather read as a
+    path. Side-effect-free like the other describers: ``register=False``, and
+    never raising is the caller's guarantee, not a reason to be careless here.
+    """
+    base, _ = ctx.registry.resolve_or_register(args.dir_key, register=False)
+    path = (base / args.name.strip()).resolve()
+    return f"create {path}\n({len(args.content_lines)} lines)"
 
 
 async def create_file(args: CreateFileParams, ctx: ToolContext) -> str:
@@ -820,23 +825,18 @@ async def create_file(args: CreateFileParams, ctx: ToolContext) -> str:
     # backend gets confused, which is the one place not to send it.
     if base.exists() and not base.is_dir():
         return (
-            f"NOT created: {args.dir_key!r} is a file, not a directory. Give "
-            "the key of the directory the file belongs in."
+            f"NOT created: {args.dir_key!r} is a file, not a directory. "
+            f"{hints.CREATE_FILE_DIR_KEY_IS_FILE}"
         )
     name = args.name.strip()
     path = (base / name).resolve()
     if Path(name).is_absolute() or not path.is_relative_to(base.resolve()):
         return (
-            f"NOT created: {name!r} points outside {args.dir_key!r}. Give a "
-            "name relative to it, and register another directory if the file "
-            "belongs somewhere else."
+            f"NOT created: {name!r} points outside {args.dir_key!r}. "
+            f"{hints.CREATE_FILE_NAME_ESCAPES}"
         )
     if path.exists():
-        return (
-            f"NOT created: {path} already exists. Change it with edit_file; "
-            "to replace it wholesale, delete_file first (the old version stays "
-            "recoverable from the trash)."
-        )
+        return f"NOT created: {path} already exists. {hints.CREATE_FILE_EXISTS}"
     # Same embedded-\n repair as edit_file: the array is lines, but a model
     # that packs a block into one element still means the lines it contains.
     content_lines = _split_embedded_newlines(list(args.content_lines))
@@ -886,9 +886,8 @@ async def create_file(args: CreateFileParams, ctx: ToolContext) -> str:
     # warning register_path used to give when a directory was registered before
     # it existed, which a literal dir path now skips (see specs-edit-eval.md §6).
     made = (
-        f" NOTE: {path.parent} did not exist and was created. If you meant a "
-        "directory that is already there, the path is misspelled — check it "
-        "against what the user wrote before building on this file."
+        f" NOTE: {path.parent} did not exist and was created. "
+        f"{hints.CREATE_FILE_MADE_DIRS}"
         if made_dirs
         else ""
     )
@@ -899,8 +898,8 @@ async def create_file(args: CreateFileParams, ctx: ToolContext) -> str:
     # content, which the model supplied a moment ago, comes straight back in.
     return (
         f"Created {path} ({_lines(len(content_lines))}), registered as "
-        f"{key!r}{extra}. Change it with edit_file, not by writing it again. "
-        f"Do not read it back to check.{made}{_tbd_note(content)}"
+        f"{key!r}{extra}. {hints.EDIT_NOT_REWRITE} "
+        f"{hints.NO_READ_BACK}{made}{_tbd_note(content)}"
         f"{registered_note(args.dir_key, dir_key)}"
     )
 
@@ -1076,6 +1075,7 @@ def add_file_tools(registry: ToolRegistry) -> ToolRegistry:
             ),
             params=CreateFileParams,
             handler=create_file,
+            describe_call=_describe_create,
         )
     )
     registry.register(

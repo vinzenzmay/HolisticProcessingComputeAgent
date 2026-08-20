@@ -589,15 +589,22 @@ class ThinkingBox(Static):
 
 
 class StepBox(Static):
-    """One part of an expanded thinking box — a reasoning block or a tool step —
-    collapsible on its own. Collapsed shows just its label; expanded appends the
-    part's full text. Each is a ListView row, so up/down/enter navigate them
-    with no special-casing."""
+    """One part of an expanded thinking box — a reasoning block, or one whole
+    tool exchange — collapsible on its own. Collapsed shows just its label;
+    expanded appends the part's body, which for an exchange is the call with
+    the result under it. Each is a ListView row, so up/down/enter navigate them
+    with no special-casing.
+
+    A row mounted while its call is still running holds only the call, and
+    :meth:`attach_result` fills the other half in where it stands — the user
+    keeps reading the row they were already looking at instead of watching a
+    second one appear underneath it.
+    """
 
     def __init__(self, step: Step, *, expanded: bool = False) -> None:
-        # A call is marked apart from the reasoning and results around it: it
-        # is the row that holds the script, and the one the user comes back to
-        # the log to read.
+        # A call is marked apart from the reasoning around it: it is the row
+        # that holds the script, and the one the user comes back to the log to
+        # read.
         classes = "chat-step chat-step-call" if step.kind == "call" else "chat-step"
         super().__init__(classes=classes)
         self._step = step
@@ -608,14 +615,27 @@ class StepBox(Static):
     def expanded(self) -> bool:
         return not self._collapsed
 
+    @property
+    def awaiting_result(self) -> bool:
+        """Whether the tool this row announced has yet to answer — which is
+        what makes this the row the next result belongs on."""
+        return self._step.kind == "call" and not self._step.done
+
     def toggle(self) -> None:
         self._collapsed = not self._collapsed
+        self._render_step()
+
+    def attach_result(self, content: str) -> None:
+        """Take the result its call was waiting for and redraw in place. The
+        header changes too: the trailing "…" is what said the tool was still
+        running, and a failure has to say so on the collapsed row."""
+        self._step.attach(content)
         self._render_step()
 
     def _render_step(self) -> None:
         marker = "▶" if self._collapsed else "▼"
         header = f"{marker} {self._step.label()}"
-        body = "" if self._collapsed else "\n\n" + self._step.text.strip()
+        body = "" if self._collapsed else "\n\n" + self._step.body()
         self.update(Content(header + body))
 
 
@@ -913,10 +933,15 @@ class DecisionBar(Vertical):
             if stage == "reason"
             else approval_title(payload)
         )
-        widgets: list[Widget] = [
-            Static(title, classes="decision-title"),
-            Static(Content(approval_details(payload)), classes="decision-details"),
-        ]
+        widgets: list[Widget] = [Static(title, classes="decision-title")]
+        details = approval_details(payload)
+        if details:
+            # Empty when the block below is the whole call — run_bash, where
+            # the command is the only thing there is to judge. An empty Static
+            # would still cost a blank line above it.
+            widgets.append(
+                Static(Content(details), classes="decision-details")
+            )
         script = approval_script(payload)
         if script:
             scroller = VerticalScroll(
@@ -1333,6 +1358,15 @@ class HpcaApp(App):
         # re-render but resets when a session is reloaded and fresh entries are
         # built. See _ThinkingExpansion / _entry_items.
         self._thinking_expanded: dict[int, _ThinkingExpansion] = {}
+        # The live call row still waiting for its result, so the result fills
+        # it in instead of landing below it (see report_step). One app-level
+        # reference, not one per session: report_step ignores every session but
+        # the one on screen, so a live row only ever belongs to the visible
+        # chat, and switching session clears that chat — a per-session mapping
+        # would be claiming rows that no longer exist anywhere. Dropped
+        # wherever the chat list is emptied, so a removed widget is never
+        # written into.
+        self._live_call: StepBox | None = None
         # Slash-command autocomplete: the currently-shown (name, usage) matches
         # and which one the ↑/↓ selection is on.
         self._command_matches: list[tuple[str, str]] = []
@@ -2430,13 +2464,16 @@ class HpcaApp(App):
                 indicator.set_interruptible(self._can_interrupt())
 
     def report_step(self, session_id: str, step: dict) -> None:
-        """One tool call, or the result it returned, the moment it happens.
+        """One tool exchange as it happens: the call the moment it is made, and
+        the result filled into that same row when it lands.
 
         The row goes in above the spinner, so a turn that spends minutes in
         tools shows *what* it is doing while it does it rather than only once
-        it is over. These rows are running commentary, not the record: the
-        turn's own state is, and the rebuild at the end of the turn replaces
-        them with the folded thinking box they belong to.
+        it is over. The result does not get a row of its own — it grows the one
+        already on screen, so the user's eye stays where the question was
+        asked and nothing below it moves. These rows are running commentary,
+        not the record: the turn's own state is, and the rebuild at the end of
+        the turn replaces them with the folded thinking box they belong to.
 
         Only for the session on screen — a background turn never writes into a
         chat the user is not looking at (decision 7); its work is in the box
@@ -2450,7 +2487,22 @@ class HpcaApp(App):
         chat_list = self._chat_list()
         if chat_list is None:
             return
-        self._add_rows(chat_list, [ChatItem(StepBox(live_step(step)))])
+        if step.get("kind") == "call":
+            box = StepBox(live_step(step))
+            self._live_call = box
+            self._add_rows(chat_list, [ChatItem(box)])
+        elif (
+            self._live_call is not None
+            and self._live_call.parent is not None  # not wiped by a rebuild
+            and self._live_call.awaiting_result
+        ):
+            self._live_call.attach_result(str(step.get("text", "")))
+            self._live_call = None
+        else:
+            # No call row to land on: the user switched sessions mid-turn and
+            # the rebuild took the live rows with it. A result is news either
+            # way, so it stands as its own row rather than being dropped.
+            self._add_rows(chat_list, [ChatItem(StepBox(live_step(step)))])
         chat_list.scroll_end(animate=False)
 
     async def _agent_turn(
@@ -4511,6 +4563,7 @@ class HpcaApp(App):
         if chat_list is not None:
             await chat_list.clear()
         self._chat_entries = []
+        self._live_call = None  # its row went with the rows just cleared
         # Fresh entries mean the old id()-keyed expansion state is stale (and
         # a recycled id could wrongly re-open a new box); start clean.
         self._thinking_expanded.clear()
@@ -4551,6 +4604,10 @@ class HpcaApp(App):
         working = next(iter(chat_list.query(WorkingIndicator)), None)
         spinner = working.clone() if working is not None else None
         await chat_list.clear()
+        # The live rows are not among the entries redrawn below — they are
+        # commentary the turn's own rebuild replaces — so this redraw is the
+        # end of the call row as well.
+        self._live_call = None
         for entry in self._chat_entries:
             for item in self._entry_items(entry):
                 chat_list.append(item)

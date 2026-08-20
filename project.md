@@ -103,15 +103,31 @@ Terminals in 2026 are assumed wider than 80 columns
     log and handing the text back to the entry exactly as an interrupt does,
     and **(c / Enter)** copies it and leaves it queued.
     Enter on a thinking box expands
-    it into its parts — each block of reasoning, each tool call with the script
-    or command it would run, and each result — every one its own collapsible
-    row, so the script the agent wrote and the call it made stay readable long
-    after the approval prompt that showed them is answered (and are there at all
-    in auto mode, where no prompt showed them). Those rows do not wait for the
-    turn to end: each call appears the moment it is made and its result the
-    moment it lands, above the working line, so a turn that spends minutes in
-    tools shows *what* it is doing while it does it — and can be opened and
-    read while it runs. The turn's last act is to fold them into its box.
+    it into its parts — each block of reasoning, and each tool *exchange* — every
+    one its own collapsible row, so the script the agent wrote and the call it
+    made stay readable long after the approval prompt that showed them is
+    answered (and are there at all in auto mode, where no prompt showed them).
+    One exchange is one row: the call on top, with the script or command or diff
+    it would actually run, and the result underneath it. They used to be two
+    rows, which put the tool's name on the screen twice and left the reader
+    scrolling between a question and its answer. Those rows do not wait for the
+    turn to end: the call appears the moment it is made, above the working line,
+    and the row *fills in* when the result lands rather than a second one
+    arriving below it — so a turn that spends minutes in tools shows *what* it is
+    doing while it does it, can be opened and read while it runs, and does not
+    move under the cursor when it finishes. The turn's last act is to fold them
+    into its box.
+    What a row shows is what happened, not what the agent was told about it. A
+    tool result carries both: "Created x.tsv (8 lines)" is news, and "Change it
+    with edit_file, not by writing it again" is an instruction for the model's
+    next call. The second kind is stripped for display — the sentences live in
+    `hpca.agent.hints`, which is where the tools themselves get them, so the two
+    cannot drift apart — along with the `[tool result] <tool>:` framing, which
+    the row's own header already says. Arguments are shown the same way: one
+    `key: value` line each rather than indented JSON, minus the payload the
+    script block below already is, and minus the call altogether when the tool
+    resolved it into real paths itself (`edit /work/x.tsv (replace 3 lines with
+    5)` says everything `registry_key`/`subpath` would, better).
     Enter on anything else (the agent's replies, background events, recalled
     memory) simply hands focus to the entry. `(c)` copy content to clipboard.
   * *Working line (center, while a turn runs):* names the step in flight and
@@ -882,7 +898,14 @@ gate (§5.3) or actual submission proceed.
 * **Every** destructive operation (delete, overwrite, move-over-existing, kill,
   cancel) requires an explicit interactive confirmation in the TUI
   (LangGraph `interrupt()` → modal with the exact operation and resolved real paths
-  shown to the user).
+  shown to the user). The prompt shows *that* operation and nothing else: the
+  command bash would run, the diff a file would be replaced with, the lines a
+  file would be created from. What it deliberately does not show is the tool's
+  schema description — that is the blurb written for the model to pick the tool
+  by, it describes the tool in general and never this call, and on a prompt
+  asking a yes/no about one concrete action it is prompt content leaking onto the
+  screen. Nor the raw arguments when the tool already resolved them into a
+  sentence about real paths.
 * **Refusing asks why.** Saying no has a second step: the prompt keeps the call
   on screen and opens a box for what should be different, sent with enter
   (empty is allowed, and esc refuses without explaining). The graph resumes

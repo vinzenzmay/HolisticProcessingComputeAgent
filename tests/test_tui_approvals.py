@@ -12,11 +12,20 @@ import json
 
 import pytest
 from pydantic import BaseModel, Field
-from textual.widgets import Label, ListView
+from textual.widgets import Label, ListView, Static
 
+from hpca.agent.context import ToolContext
+from hpca.agent.file_tools import add_file_tools
+from hpca.agent.modes import script_preview
 from hpca.agent.tools import Tool, ToolRegistry
+from hpca.config import Settings
+from hpca.db import connect, init_db
 from hpca.llm import ChatResponse
+from hpca.registry import PathRegistry
+from hpca.runner import ProcessRunner
+from hpca.trash import TrashManager
 from hpca.tui.app import ChatInput, DecisionBar, HpcaApp
+from hpca.tui.approval_screen import approval_details
 
 
 def is_title_request(json_schema):
@@ -97,6 +106,13 @@ def hpca_home(monkeypatch, tmp_path):
 
 def decision_bar(app):
     return app.query_one("#decision-bar", DecisionBar)
+
+
+def bar_texts(app):
+    """Everything the inline prompt is showing, as one blob to search."""
+    return "\n".join(
+        str(child.render()) for child in decision_bar(app).query(Static)
+    )
 
 
 def session_row(app, session_id):
@@ -233,3 +249,124 @@ class TestBackgroundIndicator:
             assert bar.display and bar.kind == "approval"
             # still pending until answered — opening does not resolve it
             assert parked.session_id in app._pending_decision
+
+
+def edit_call_payload(tmp_path):
+    """The payload the graph puts up for a gated ``edit_file``, built the way
+    the graph builds it — the real tool's schema description, its own
+    ``describe_call`` and the real diff preview — so that what the bar is
+    asserted to show is what it shows in the app.
+    """
+    conn = connect(tmp_path / "hpca.db")
+    init_db(conn)
+    ctx = ToolContext(
+        registry=PathRegistry(conn, profile="default", session_id="s1"),
+        runner=ProcessRunner(conn, session_id="s1", log_dir=tmp_path / "logs"),
+        settings=Settings(),
+        scripts_dir=tmp_path / "scripts",
+        trash=TrashManager(tmp_path / "trash", backup_limit_bytes=1024 * 1024),
+    )
+    path = tmp_path / "run.sh"
+    path.write_text("#!/bin/bash\necho one\n")
+    ctx.registry.register("run_sh", path)
+    tool = add_file_tools(ToolRegistry()).get("edit_file")
+    arguments = {
+        "registry_key": "run_sh",
+        "old_lines": ["echo one"],
+        "new_lines": ["echo ONE"],
+    }
+    payload = {
+        "tool": "edit_file",
+        "arguments": arguments,
+        "description": tool.description,
+        "kind": "destructive",
+        "script": script_preview("edit_file", arguments, ctx),
+        "details": tool.describe_call(tool.params.model_validate(arguments), ctx),
+    }
+    conn.close()
+    return path, tool.description, payload
+
+
+class TestThePromptShowsTheCallAndNothingElse:
+    """What is on screen is what this call does — not what the tool is.
+
+    The question being answered is about one action, so the bar carries the
+    real path, the real diff, the real command. The tool's schema blurb and a
+    JSON dump of its arguments are things the model needs and the person
+    deciding does not.
+    """
+
+    async def test_a_gated_edit_shows_the_path_and_the_diff(self, hpca_home, tmp_path):
+        path, _, payload = edit_call_payload(tmp_path)
+        app = HpcaApp(llm=FakeLLM([respond_json("hi")]), tools=destructive_tools())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            await decision_bar(app).show_approval(payload)
+            await pilot.pause()
+            shown = bar_texts(app)
+
+            # what the call does, with the path resolved and the change spelled
+            # out — enough to answer the question with
+            assert str(path) in shown
+            assert "copied to trash" in shown
+            assert "- echo one" in shown and "+ echo ONE" in shown
+
+    async def test_the_tool_blurb_and_a_json_blob_stay_off_the_screen(
+        self, hpca_home, tmp_path
+    ):
+        _, description, payload = edit_call_payload(tmp_path)
+        app = HpcaApp(llm=FakeLLM([respond_json("hi")]), tools=destructive_tools())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.start_new_session()
+            await decision_bar(app).show_approval(payload)
+            await pilot.pause()
+            shown = bar_texts(app)
+
+            # the blurb describes the tool in general, never this call
+            assert description[:40] not in shown
+            # and the arguments the details were built from are not repeated,
+            # least of all as JSON
+            assert "registry_key" not in shown
+            assert '"old_lines"' not in shown
+
+
+class TestArgumentsWhenTheToolCannotDescribeItself:
+    """The fallback: no ``details``, so the arguments are all there is."""
+
+    def test_they_are_lines_not_json(self):
+        text = approval_details(
+            {"tool": "delete", "arguments": {"target": "results/", "force": True}}
+        )
+        assert text == "target: results/\nforce: True"
+
+    def test_plumbing_arguments_are_left_out(self):
+        text = approval_details(
+            {"tool": "run_thing", "arguments": {"key": "run_sh", "timeout_s": 600}}
+        )
+        assert text == "key: run_sh"
+
+    def test_the_lines_of_the_script_below_are_not_repeated_above_it(self):
+        text = approval_details(
+            {
+                "tool": "run_bash",
+                "arguments": {"content_lines": ["squeue -u me"]},
+                "script": "squeue -u me",
+            }
+        )
+        # nothing left but the script block, which is the whole call
+        assert text == ""
+
+    def test_a_pathological_argument_is_clipped(self):
+        text = approval_details({"tool": "x", "arguments": {"blob": "y" * 5000}})
+        assert len(text) < 2100 and text.endswith("[clipped]")
+
+    def test_details_replace_the_arguments_entirely(self):
+        text = approval_details(
+            {
+                "tool": "delete_file",
+                "arguments": {"registry_key": "notes"},
+                "description": "Delete a registered file",
+                "details": "rm /home/me/notes.txt\n(12 bytes; recoverable from trash)",
+            }
+        )
+        assert text == "rm /home/me/notes.txt\n(12 bytes; recoverable from trash)"

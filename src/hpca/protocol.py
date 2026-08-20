@@ -201,16 +201,25 @@ def parse(env: Envelope) -> Message:
 
 
 class Part(_Model):
-    """One ordered piece of a turn's working: reasoning, a tool call, or the
-    result it returned.
+    """One ordered piece of a turn's working: a block of reasoning, or one tool
+    exchange — the call and the result it returned, held together.
 
     The wire twin of `hpca.transcript.Step`. Not that class: this module stays
     importable without the agent side, and `transcript` pulls in the LLM types.
+
+    Both halves travel in one part because a client renders them as one row,
+    and `done` is what tells it whether the second half has arrived: a call sent
+    while the tool is still running has an empty `result`, and the same part
+    comes again filled in rather than a second part arriving after it.
     """
 
     kind: str  # reasoning | call | step
     text: str
     tool: str = ""  # call: the tool named
+    target: str = ""  # the file or key the call is about, if it has one
+    result: str = ""  # what came back, framing for the model taken off
+    done: bool = False  # whether the result has landed
+    failed: bool = False  # the tool raised, or the user refused the call
 
 
 class Entry(_Model):

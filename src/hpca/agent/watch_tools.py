@@ -21,6 +21,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from hpca.agent import hints
 from hpca.agent.context import ToolContext
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.registry import RegistryError
@@ -86,8 +87,7 @@ async def watch_log(args: WatchLogParams, ctx: ToolContext) -> str:
     if not path.is_absolute():
         return (
             f"Not watched: {args.path!r} is neither a registry key nor an "
-            "absolute path. Find the log's full path first (ls / find), then "
-            "pass that."
+            f"absolute path. {hints.WATCH_NEEDS_A_PATH}"
         )
     watch = store.add(
         kind=KIND_LOG,
@@ -107,8 +107,7 @@ async def watch_log(args: WatchLogParams, ctx: ToolContext) -> str:
     if state == LOG_GONE:
         return (
             f"Watching {path} — it does not exist yet, so the panel box will "
-            "say so until something creates it. If that is not what you "
-            "expected, check the path."
+            f"say so until something creates it. {hints.WATCH_TARGET_MISSING}"
         )
     return (
         f"Watching {path} in the Processes panel ({head}, {state}). The box "
@@ -144,7 +143,7 @@ async def watch_job(args: WatchJobParams, ctx: ToolContext) -> str:
         if job_id not in statuses:
             return (
                 f"Not watched: Slurm does not know job {job_id} (neither "
-                "squeue nor sacct). Check the id with squeue -u $USER."
+                f"squeue nor sacct). {hints.WATCH_JOB_UNKNOWN}"
             )
     elif not label:
         label = detail.name
@@ -224,7 +223,10 @@ async def unwatch(args: UnwatchParams, ctx: ToolContext) -> str:
         return f"No watch matches {args.target!r}.\n{_render_list(watches)}"
     if len(matches) > 1:
         names = ", ".join(f"{w.title} ({w.target})" for w in matches)
-        return f"{args.target!r} matches several watches: {names}. Be specific."
+        return (
+            f"{args.target!r} matches several watches: {names}. "
+            f"{hints.WATCH_AMBIGUOUS}"
+        )
     watch = matches[0]
     store.remove(watch.id)
     return f"Stopped watching {watch.title} ({watch.target})."

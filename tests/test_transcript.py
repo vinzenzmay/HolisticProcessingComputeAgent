@@ -1,7 +1,14 @@
 """Tests for hpca.transcript: folding state into chat entries."""
 
+from hpca.agent.hints import MODEL_HINTS
 from hpca.agent.history import tool_call_message
-from hpca.transcript import Entry, build_entries
+from hpca.transcript import (
+    RESULT_RULE,
+    Entry,
+    build_entries,
+    call_step,
+    result_text,
+)
 
 USER_MSG = {"role": "user", "content": "which BAMs are in the cohort?"}
 # The model's own copy of the call that produced STEP (hpca.agent.history).
@@ -27,8 +34,10 @@ class TestGrouping:
         assert kinds(entries) == ["user", "thinking", "assistant"]
         box = entries[1]
         assert box.steps == 2
-        assert "list_dir: 12 entries" in box.text
-        assert "read_file: not found" in box.text
+        # each result under a heading naming its tool, the "[tool result]"
+        # framing dropped — the heading is what it said
+        assert "— list_dir —\n12 entries" in box.text
+        assert "— read_file (error) —\nnot found" in box.text
 
     def test_reasoning_and_steps_interleave_in_the_order_they_happened(self):
         thinking = [
@@ -85,7 +94,8 @@ class TestParts:
         box = build_entries([USER_MSG, STEP, ANSWER], thinking)[1]
         assert [p.kind for p in box.parts] == ["reasoning", "step", "reasoning"]
         assert box.parts[0].text == "I should list the directory first."
-        assert box.parts[1].text == STEP["content"]
+        # the "[tool result] list_dir:" framing is the row's header now
+        assert box.parts[1].text == "12 entries"
         assert box.parts[2].text == "Now I can answer."
 
     def test_step_label_is_the_tool_name(self):
@@ -119,15 +129,18 @@ class TestToolCalls:
             }
         ]
         box = build_entries([USER_MSG, STEP, ANSWER], [], calls)[1]
-        assert [p.kind for p in box.parts] == ["call", "step"]
-        assert box.parts[0].label() == "list_dir (call)"
+        # one exchange, one part: the call on top and its result below it
+        assert [p.kind for p in box.parts] == ["call"]
+        assert box.parts[0].label() == "list_dir · cohort"
         assert "cohort" in box.parts[0].text
+        assert box.parts[0].result == "12 entries"
+        assert box.parts[0].done
 
     def test_call_comes_after_the_reasoning_that_produced_it(self):
         thinking = [{"after": 1, "reasoning": "List it first."}]
         calls = [{"after": 1, "tool": "list_dir", "arguments": {}}]
         box = build_entries([USER_MSG, STEP, ANSWER], thinking, calls)[1]
-        assert [p.kind for p in box.parts] == ["reasoning", "call", "step"]
+        assert [p.kind for p in box.parts] == ["reasoning", "call"]
 
     def test_script_is_carried_in_the_call_part(self):
         calls = [
@@ -143,7 +156,10 @@ class TestToolCalls:
         assert "ls /data" in call.text
         # the script is the block below, not repeated as a JSON argument
         assert "content_lines" not in call.text
-        assert "timeout_s" in call.text  # the other arguments still say how
+        # nor is the timeout: it is how the harness ran the command, not what
+        # the agent is doing, and the command is the whole of the latter
+        assert "timeout_s" not in call.text
+        assert call.text.strip() == "ls /data"
 
     def test_edited_lines_are_shown_as_the_diff_not_as_json(self):
         calls = [
@@ -174,6 +190,9 @@ class TestToolCalls:
         ]
         box = build_entries([USER_MSG, STEP, ANSWER], [], calls)[1]
         assert "rm /scratch/old.bam" in box.parts[0].text
+        # the tool already resolved the key into that path; saying
+        # "registry_key: scratch" underneath would be the same fact, worse
+        assert "registry_key" not in box.parts[0].text
 
     def test_calls_do_not_inflate_the_step_count(self):
         calls = [{"after": 1, "tool": "list_dir", "arguments": {}}]
@@ -222,7 +241,8 @@ class TestCallMessages:
         calls = [{"after": 1, "tool": "list_dir", "arguments": {"key": "cohort"}}]
         thinking = [{"after": 1, "reasoning": "List it first."}]
         box = build_entries([USER_MSG, CALL_MSG, STEP, ANSWER], thinking, calls)[1]
-        assert [p.kind for p in box.parts] == ["reasoning", "call", "step"]
+        assert [p.kind for p in box.parts] == ["reasoning", "call"]
+        assert box.parts[1].result == "12 entries"
 
     def test_a_call_message_is_never_a_rewind_cut_point(self):
         # Only real user messages name one; indices stay absolute either way.
@@ -355,3 +375,150 @@ class TestRecalledMemory:
             [{"role": "user", "content": "hi", "api_content": "hi"}]
         )
         assert [e.kind for e in entries] == ["user"]
+
+
+class TestOneExchangeIsOnePart:
+    """A call and the result it returned are one row, not two.
+
+    They were two for as long as the record was written that way, which put the
+    tool's name on the screen twice and left the user scrolling between a
+    question and its answer.
+    """
+
+    def test_the_result_lands_on_the_call_that_produced_it(self):
+        calls = [{"after": 1, "tool": "list_dir", "arguments": {"key": "cohort"}}]
+        box = build_entries([USER_MSG, STEP, ANSWER], [], calls)[1]
+        assert len(box.parts) == 1
+        part = box.parts[0]
+        assert part.kind == "call" and part.done
+        assert "cohort" in part.text  # the call, on top
+        assert part.result == "12 entries"  # the result, below it
+
+    def test_the_body_puts_the_call_above_the_result(self):
+        calls = [
+            {
+                "after": 1,
+                "tool": "run_bash",
+                "arguments": {"content_lines": ["ls /data"]},
+                "script": "ls /data",
+            }
+        ]
+        body = build_entries([USER_MSG, STEP, ANSWER], [], calls)[1].parts[0].body()
+        assert body.index("ls /data") < body.index("12 entries")
+        assert RESULT_RULE in body
+
+    def test_a_call_with_no_result_yet_shows_only_the_call(self):
+        # What the chat renders the moment the announcement arrives: the turn
+        # is parked on an approval, or the tool is simply still running.
+        step = call_step({"tool": "run_bash", "script": "sleep 30"})
+        assert not step.done
+        assert step.body() == "sleep 30"
+        assert RESULT_RULE not in step.body()
+        assert step.label().endswith("…")
+
+    def test_the_result_fills_the_same_part_in_place(self):
+        step = call_step({"tool": "run_bash", "script": "sleep 30"})
+        step.attach("[tool result] run_bash: ran (exit 0).")
+        assert step.done and not step.failed
+        assert step.label() == "run_bash"
+        assert step.body() == f"sleep 30\n\n{RESULT_RULE}\nran (exit 0)."
+
+    def test_a_failed_result_marks_the_row_it_lands_on(self):
+        step = call_step({"tool": "read_file", "arguments": {"path": "/no/such"}})
+        step.attach("[tool error] read_file: FileNotFoundError: /no/such")
+        assert step.failed
+        assert step.label() == "read_file · such (error)"
+        assert "FileNotFoundError: /no/such" in step.body()
+
+    def test_a_refusal_reads_as_a_failure_even_though_nothing_raised(self):
+        step = call_step({"tool": "delete_file", "arguments": {}})
+        step.attach("[tool result] delete_file: DENIED by the user — not executed.")
+        assert step.failed
+        assert step.label() == "delete_file (error)"
+
+    def test_two_calls_before_either_answers_pair_up_in_order(self):
+        calls = [
+            {"after": 1, "tool": "list_dir", "arguments": {}},
+            {"after": 1, "tool": "read_file", "arguments": {}},
+        ]
+        box = build_entries([USER_MSG, STEP, STEP2, ANSWER], [], calls)[1]
+        assert [p.tool for p in box.parts] == ["list_dir", "read_file"]
+        assert box.parts[0].result == "12 entries"
+        assert box.parts[1].result == "not found"
+
+    def test_a_result_whose_call_is_out_of_view_stands_on_its_own(self):
+        # A log tail that begins between the two halves has no call to land on.
+        box = build_entries([USER_MSG, STEP, ANSWER], [])[1]
+        assert [p.kind for p in box.parts] == ["step"]
+        assert box.parts[0].label() == "list_dir"
+        assert box.parts[0].text == "12 entries"
+
+    def test_the_folded_block_writes_one_heading_per_exchange(self):
+        # The session log is this text; it must not say "call" then "step".
+        calls = [{"after": 1, "tool": "list_dir", "arguments": {"key": "cohort"}}]
+        text = build_entries([USER_MSG, STEP, ANSWER], [], calls)[1].text
+        assert text.count("— list_dir · cohort —") == 1
+        assert "— call —" not in text and "— step —" not in text
+        assert text.index("cohort") < text.index("12 entries")
+
+
+class TestModelFacingFramingIsNotShown:
+    """A tool result says both what happened and what the model should do about
+    it. Only the first is news for the user; the second is prompt."""
+
+    def test_the_result_prefix_comes_off(self):
+        text, failed = result_text("[tool result] list_dir: 12 entries")
+        assert (text, failed) == ("12 entries", False)
+
+    def test_an_error_is_flagged_and_unwrapped(self):
+        text, failed = result_text("[tool error] read_file: OSError: nope")
+        assert (text, failed) == ("OSError: nope", True)
+
+    def test_every_hint_the_tools_carry_is_stripped(self):
+        for hint in MODEL_HINTS:
+            text, _ = result_text(f"[tool result] create_file: Created x.tsv. {hint}")
+            assert hint not in text
+            assert text == "Created x.tsv."
+
+    def test_a_hint_taken_out_of_a_line_leaves_no_gap(self):
+        hint = MODEL_HINTS[0]
+        text, _ = result_text(f"[tool result] t: before {hint} after")
+        assert "  " not in text
+        assert text == "before after"
+
+    def test_a_hint_that_finishes_a_sentence_takes_its_connective_with_it(self):
+        # Half the hints are the back half of a sentence. Lifting one out on
+        # its own would leave the line ending in a dash or a semicolon.
+        for joiner in ("; ", " — ", ", ", ": "):
+            text, _ = result_text(
+                f"[tool result] t: The document index is empty{joiner}{MODEL_HINTS[0]}"
+            )
+            assert text == "The document index is empty"
+
+    def test_a_full_stop_before_a_hint_is_not_eaten_with_it(self):
+        # There the hint was its own sentence, and the stop closes the one
+        # before it — which is news, and keeps its punctuation.
+        text, _ = result_text(f"[tool result] t: Created x.tsv. {MODEL_HINTS[0]}")
+        assert text == "Created x.tsv."
+
+    def test_a_result_that_is_nothing_but_guidance_is_still_shown(self):
+        # Some tools answer a malformed call with advice and no news at all. A
+        # row showing a call and then a blank where the result goes reads as a
+        # tool that hung, so the advice stands rather than emptying the row.
+        text, _ = result_text(f"[tool result] session_search: {MODEL_HINTS[0]}")
+        assert text == MODEL_HINTS[0]
+
+    def test_output_that_merely_looks_like_framing_is_left_alone(self):
+        # run_bash printing a bracketed line of its own is still output.
+        text, failed = result_text(
+            "[tool result] run_bash: ran (exit 0).\n\nstdout:\n[tool result] echoed"
+        )
+        assert text.endswith("[tool result] echoed")
+        assert not failed
+
+    def test_columns_in_command_output_keep_their_alignment(self):
+        # Whitespace is only touched around a hint that was removed; a table
+        # the user is reading must not be reflowed.
+        table = "a     1\nbb    2"
+        text, _ = result_text(f"[tool result] run_bash: ran (exit 0).\n\n{table}")
+        assert table in text

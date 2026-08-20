@@ -152,10 +152,10 @@ class TestOpeningTheBox:
             await pilot.press("n")
             await pilot.pause()
             # What is being declined has to stay readable — the reason is
-            # written *about* it.
+            # written *about* it. What that is, is the call: this tool has no
+            # description of its own to give, so the arguments are it.
             joined = "\n".join(bar_texts(app))
-            assert "delete" in joined
-            assert "results/" in joined
+            assert "target: results/" in joined
 
     async def test_the_box_takes_the_keys_the_prompt_used(self, hpca_home):
         app = HpcaApp(

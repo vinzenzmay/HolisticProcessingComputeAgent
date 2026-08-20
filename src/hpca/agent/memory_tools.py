@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from hpca.agent import hints
 from hpca.agent.context import ToolContext
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.episodic import MESSAGE_CHARS, EpisodicStore
@@ -76,12 +77,10 @@ async def session_search(args: SessionSearchParams, ctx: ToolContext) -> str:
                 content = content[: MESSAGE_CHARS - 1] + "…"
             lines.append(f"[{row['turn_no']}] {row['role']}: {content}")
         if args.around is None:
-            lines.append(
-                "(session tail; pass around=<turn number> to read elsewhere)"
-            )
+            lines.append(hints.SESSION_TAIL)
         return _clip_to_budget(lines)
     if not args.query.strip():
-        return "Give a query to search, or a session_id to read."
+        return hints.SESSION_SEARCH_ARGUMENTS
     hits = store.search(
         args.query, profile=profile, exclude_session_id=ctx.session_id
     )
@@ -97,9 +96,7 @@ async def session_search(args: SessionSearchParams, ctx: ToolContext) -> str:
             f"  match: {hit.snippet}",
             f"  resolution: {hit.resolution or '—'}",
         ]
-    lines.append(
-        "(use session_search with session_id= and around=<turn> for context)"
-    )
+    lines.append(hints.SESSION_CONTEXT)
     return _clip_to_budget(lines)
 
 

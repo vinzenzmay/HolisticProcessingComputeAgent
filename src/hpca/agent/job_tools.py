@@ -12,6 +12,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from hpca.agent import hints
 from hpca.agent.context import ToolContext
 from hpca.agent.explainer import explain_failure
 from hpca.agent.tools import Tool, ToolRegistry
@@ -69,7 +70,7 @@ async def submit_job(args: SubmitJobParams, ctx: ToolContext) -> str:
     )
     return (
         f"Submitted job {job_id} ({args.registry_key!r}). It is tracked in the "
-        f"background; logs: {out_key}, {err_key}. Check with job_status."
+        f"background; logs: {out_key}, {err_key}. {hints.CHECK_JOB_STATUS}"
     )
 
 

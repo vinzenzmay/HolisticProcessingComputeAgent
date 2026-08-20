@@ -8,30 +8,68 @@ writes as one block.
 
 Reasoning and tool calls are anchored by the message index they produced
 (``after``) and live outside ``messages``. The reasoning is never fed back to
-the model at all; a call is, but only as the elided envelope
+the model at all; a call is, but only as the folded envelope
 :mod:`hpca.agent.history` builds — a script fed back verbatim would cost the
-window twice. The record here is the unelided one, which is what the user
+window twice. The record here is the unfolded one, which is what the user
 reads, so the message carrying the model's own copy is skipped when rendering.
+
+What this module decides is *how much of that record is worth a human's
+attention*. Two things are cut here and nowhere else:
+
+* A call and the result it returned are ONE part, not two. They were two for as
+  long as the record was written that way, which put the tool's name on the
+  screen twice and left the user scrolling between a question and its answer.
+  ``Step`` now holds both halves and knows whether the second one has landed.
+* The framing a tool result carries for the model's benefit is taken off. A
+  result says both what happened ("Created /path/x.tsv (8 lines)") and what the
+  model should do next ("Change it with edit_file, not by writing it again") —
+  the first is news, the second is prompt, and only the first is shown. The
+  sentences are matched against :mod:`hpca.agent.hints`, which is where the
+  tools get them from, so the two cannot drift apart.
+
+Nothing here changes what the model sees. The stored messages are untouched;
+this is a reading of them.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 
+from hpca.agent.hints import MODEL_HINTS
 from hpca.agent.history import is_tool_call_message
 from hpca.llm import Message
 
 TOOL_PREFIXES = ("[tool result]", "[tool error]")
-CALL_PREFIX = "[tool call]"
 # The lines themselves — a script's, or the two sides of an edit — rendered as
 # their own block below the other arguments rather than as a JSON list of lines
 # nobody can read. Which file was edited stays an argument; what changed does
 # not, because the block already says it.
 SCRIPT_ARG_KEYS = ("content_lines", "old_lines", "new_lines")
+# Arguments that say how the call was made rather than what it does. A timeout
+# is the harness's business; showing it puts a line of JSON on screen that
+# tells the user nothing about what the agent is up to.
+PLUMBING_ARG_KEYS = ("timeout_s",)
+# The argument most likely to answer "on what?", best first. Only used to put a
+# short target next to the tool name on the collapsed row, so a column of
+# fifteen edit_file rows says which file each one touched.
+TARGET_ARG_KEYS = (
+    "name",
+    "subpath",
+    "path",
+    "source_key",
+    "target_name",
+    "registry_key",
+    "dir_key",
+    "key",
+)
 # Arguments are a display aid, not a record: a pathological call must not push
 # a wall of JSON into the chat (the script block has its own cap upstream).
 ARGUMENTS_CHARS = 2000
+# Separates the two halves of one exchange. Written rather than drawn, because
+# the same string goes into the session log, which is a text file.
+RESULT_RULE = "── result ──"
 # Background work reporting in on its own (§5.4). Rides the user role like
 # tool results do, and is marked so the transcript does not attribute a
 # process crash to the human sitting there.
@@ -50,33 +88,79 @@ RECALL = "recall"
 FENCE_OPEN = "<memory-context>"
 FENCE_CLOSE = "</memory-context>"
 
+# "[tool result] edit_file: " and its error twin. A tool name has no colon in
+# it, so the first one ends the name.
+_RESULT_PREFIX = re.compile(r"^\[tool (?:result|error)\] ([^:\n]*): ?")
+# A refusal is a result too, and reads as a failure on the row even though the
+# tool never raised.
+_REFUSED_PREFIXES = ("DENIED by the user", "SKIPPED")
+# What joins a hint to the news in front of it, taken out along with it. Half
+# the hints are the back half of a sentence — "The document index is empty —
+# index something with index_docs first." — and lifting one out on its own
+# leaves the line ending in a dangling dash or semicolon. A full stop is
+# deliberately NOT eaten: there the hint was a sentence of its own, and the stop
+# closes the sentence before it, which stays.
+_HINT_JOIN = r"[ \t]*[;,:—–-]?[ \t]*"
+
 
 @dataclass
 class Step:
-    """One ordered part of a turn's working: a block of reasoning, one tool
-    call, or the result it returned. The chat window reveals these as
-    individually-collapsible lines when a thinking box is expanded;
-    ``Entry.text`` still holds the whole box as one string, which is what the
-    session log writes."""
+    """One ordered part of a turn's working: a block of reasoning, or one tool
+    exchange — the call and the result it returned, held together.
+
+    ``text`` is the call as the user reads it and ``result`` is what came back,
+    with ``done`` saying whether it has yet. A step announced while the turn is
+    still running is built without a result and gains one in place
+    (:meth:`attach`), so the row the user is already looking at is the row that
+    fills in — nothing new appears below it and nothing jumps.
+
+    ``kind`` is ``reasoning``, ``call``, or ``step``. The last is a result whose
+    call is out of view, which happens when a log tail starts between the two;
+    it keeps its own tool name, parsed back out of the text.
+    """
 
     kind: str  # reasoning | call | step
     text: str
     tool: str = ""  # call: named here, so the label needs no parsing
+    target: str = ""  # the file or key the call is about, if it has one
+    result: str = ""  # what came back, framing for the model taken off
+    done: bool = False  # whether the result has landed
+    failed: bool = False  # the tool raised, or the user refused the call
+
+    def attach(self, content: str) -> None:
+        """Fill in the result half of an exchange announced while it ran."""
+        self.result, self.failed = result_text(content)
+        self.done = True
 
     def label(self) -> str:
-        """Short header for the collapsed line — the tool name for a call or a
-        step (a step's is parsed from its ``[tool result] <tool>: …`` prefix),
-        else "reasoning"."""
-        if self.kind == "call":
-            return f"{self.tool or 'tool'} (call)"
-        if self.kind != "step":
+        """Short header for the collapsed row: the tool, what it acted on, and
+        how it went. "reasoning" for a block of thinking."""
+        if self.kind == "reasoning":
             return self.kind
-        for prefix in TOOL_PREFIXES:
-            if self.text.startswith(prefix):
-                name = self.text[len(prefix) :].strip().split(":", 1)[0].strip()
-                suffix = " (error)" if prefix == "[tool error]" else ""
-                return (name or "tool") + suffix
-        return "step"
+        name = self.tool or "tool"
+        if self.target:
+            name += f" · {self.target}"
+        if self.failed:
+            return name + " (error)"
+        if self.kind == "call" and not self.done:
+            return name + " …"
+        return name
+
+    def body(self) -> str:
+        """Everything under the header: the call, then the result below it once
+        there is one. A call still in flight shows only itself — an empty
+        "result" heading would read as a tool that answered with nothing."""
+        call = self.text.strip()
+        result = self.result.strip()
+        if self.kind != "call":
+            return call
+        if not self.done:
+            return call
+        if not call:
+            return result
+        if not result:
+            return call
+        return f"{call}\n\n{RESULT_RULE}\n{result}"
 
 
 @dataclass
@@ -137,31 +221,119 @@ def recalled_text(message: Message) -> str:
     return "\n".join(lines)
 
 
-def call_text(call: dict) -> str:
-    """One tool call as the user reads it: the tool, the arguments that say
-    what it was asked to do, and the script or command it would actually run.
+def result_text(content: str) -> tuple[str, bool]:
+    """One raw result message as the user reads it, and whether it went wrong.
 
-    The same three things the approval prompt shows for a gated call — which is
-    the point: after the prompt is answered it is gone, and what ran has to
-    stay somewhere the user can still open.
+    Three things come off. The ``[tool result] <tool>:`` prefix, because the
+    row it lands on is already headed by that tool's name. The sentences the
+    tools address to the model (:data:`hpca.agent.hints.MODEL_HINTS`), because
+    they are instructions for the next call, not a report of what happened —
+    the user reading "Created x.tsv (8 lines)" does not also need to be told
+    that the agent should use edit_file next time. And the whitespace either of
+    those leaves behind.
+
+    What survives is the news: paths, counts, exit codes, output, error text,
+    and a refusal saying it was refused.
     """
-    tool = call.get("tool") or "tool"
+    failed = content.startswith("[tool error]")
+    body = _RESULT_PREFIX.sub("", content, count=1)
+    if body.startswith(_REFUSED_PREFIXES):
+        failed = True
+    for hint in MODEL_HINTS:
+        without = re.sub(_HINT_JOIN + re.escape(hint), "", body)
+        # A result that is *nothing but* guidance keeps it. Some tools answer a
+        # malformed call with advice and no news at all, and a row that shows a
+        # call and then a blank where the result goes reads as a tool that hung.
+        if without.strip():
+            body = without
+    return "\n".join(line.rstrip() for line in body.splitlines()).strip(), failed
+
+
+def result_tool(content: str) -> str:
+    """The tool named by a raw result message, for a result whose call is out
+    of view. "" when the message carries no such prefix."""
+    match = _RESULT_PREFIX.match(content)
+    return (match.group(1).strip() if match else "") or ""
+
+
+def call_target(arguments: dict) -> str:
+    """The one thing a call is about, short enough to sit next to the tool name.
+
+    A path is shown by its last segment: the collapsed row has a line, and
+    thirty characters of shared parent directory would spend all of it saying
+    nothing that distinguishes this call from the one above.
+    """
+    for key in TARGET_ARG_KEYS:
+        value = (arguments or {}).get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().rstrip("/").rsplit("/", 1)[-1]
+    return ""
+
+
+def call_arguments(arguments: dict, *, has_script: bool) -> str:
+    """The arguments worth reading, one ``key: value`` line each.
+
+    Not ``json.dumps(indent=2)``: braces, quotes and trailing commas are three
+    lines of punctuation around two facts, and the user is looking for the two
+    facts. Plumbing and the payload the script block already shows are left
+    out — see :data:`PLUMBING_ARG_KEYS` and :data:`SCRIPT_ARG_KEYS`.
+    """
+    lines = []
+    for key, value in (arguments or {}).items():
+        if key in PLUMBING_ARG_KEYS:
+            continue
+        if has_script and key in SCRIPT_ARG_KEYS:
+            continue
+        if value is None or isinstance(value, (str, int, float, bool)):
+            lines.append(f"{key}: {value}")
+        else:  # a list or a dict that is not the payload: one line, compact
+            lines.append(f"{key}: {json.dumps(value, default=str)}")
+    return clip("\n".join(lines))
+
+
+def call_text(call: dict) -> str:
+    """One tool call as the user reads it: what it does to what, and the script
+    or the diff it would actually run.
+
+    The same thing the approval prompt shows for a gated call — which is the
+    point: after the prompt is answered it is gone, and what ran has to stay
+    somewhere the user can still open.
+
+    ``details`` is the tool's own account of this call, with the keys already
+    resolved to real paths ("edit /work/x.tsv (replace 3 lines with 5)"). When
+    there is one it stands alone: repeating the arguments underneath would say
+    the same thing again in the tool's internal vocabulary.
+    """
     script = (call.get("script") or "").strip()
-    arguments = {
-        key: value
-        for key, value in (call.get("arguments") or {}).items()
-        if not (script and key in SCRIPT_ARG_KEYS)
-    }
-    blocks: list[str] = []
-    if arguments:
-        blocks.append(_clip(json.dumps(arguments, indent=2, default=str)))
     details = (call.get("details") or "").strip()
+    blocks: list[str] = []
     if details:  # resolved real paths, flagged commands (§5.3)
         blocks.append(details)
+    else:
+        arguments = call_arguments(call.get("arguments") or {}, has_script=bool(script))
+        if arguments:
+            blocks.append(arguments)
     if script:
         blocks.append(script)
-    head = f"{CALL_PREFIX} {tool}:"
-    return "\n".join([head, *blocks]) if blocks else head
+    return "\n\n".join(blocks)
+
+
+def call_step(call: dict) -> Step:
+    """The part one recorded call renders as, with no result on it yet."""
+    return Step(
+        kind="call",
+        text=call_text(call),
+        tool=str(call.get("tool") or ""),
+        target=call_target(call.get("arguments") or {}),
+    )
+
+
+def result_step(content: str) -> Step:
+    """The part a result renders as when its call is not in view."""
+    text, failed = result_text(content)
+    return Step(
+        kind="step", text=text, tool=result_tool(content), done=True, failed=failed
+    )
 
 
 def live_step(payload: dict) -> Step:
@@ -170,22 +342,35 @@ def live_step(payload: dict) -> Step:
 
     The same rendering the finished turn gets, so a step the user opened while
     it was running reads identically once it is folded into its thinking box.
+    A result is only built into a part of its own here as a fallback — the chat
+    attaches it to the call already on screen (:meth:`Step.attach`), which is
+    what makes one exchange one row.
     """
     if payload.get("kind") == "call":
-        return Step(
-            kind="call", text=call_text(payload), tool=str(payload.get("tool") or "")
-        )
-    return Step(kind="step", text=str(payload.get("text", "")))
+        return call_step(payload)
+    return result_step(str(payload.get("text", "")))
 
 
-def _clip(text: str) -> str:
+def clip(text: str) -> str:
     if len(text) <= ARGUMENTS_CHARS:
         return text
     return text[:ARGUMENTS_CHARS] + "\n... [clipped]"
 
 
 def _block(parts: list[Step]) -> str:
-    return "\n\n".join(f"— {part.kind} —\n{part.text.strip()}" for part in parts)
+    return "\n\n".join(f"— {part.label()} —\n{part.body().strip()}" for part in parts)
+
+
+def _open_call(pending: list[Step]) -> Step | None:
+    """The earliest call in the open box still waiting for its result.
+
+    Earliest, not latest: a model that made two calls before either answered
+    gets its results back in the order it asked for them.
+    """
+    for part in pending:
+        if part.kind == "call" and not part.done:
+            return part
+    return None
 
 
 def build_entries(
@@ -239,13 +424,7 @@ def build_entries(
         as an orphaned reasoning anchor is.
         """
         for call in calls_at.get(index, []):
-            pending.append(
-                Step(
-                    kind="call",
-                    text=call_text(call),
-                    tool=str(call.get("tool") or ""),
-                )
-            )
+            pending.append(call_step(call))
 
     for index in range(start, len(messages)):
         message = messages[index]
@@ -261,14 +440,21 @@ def build_entries(
             # The model's own copy of a call it made (hpca.agent.history): it
             # exists so the history has the shape the model was trained on, and
             # is not an answer. The user reads the call from its anchored
-            # record instead — same call, arguments unelided — which
+            # record instead — same call, arguments unfolded — which
             # ``open_calls`` has already put in the open thinking box.
             continue
         if role == ASSISTANT:
             flush()  # the answer closes the box that produced it
             entries.append(Entry(kind=ASSISTANT, text=content, index=index))
         elif is_tool_message(message):
-            pending.append(Step(kind="step", text=content))
+            # Onto the call it answers, so the exchange is one part. A tail
+            # that begins between a call and its result has no call to land
+            # on, and the result stands as its own part instead.
+            call = _open_call(pending)
+            if call is not None:
+                call.attach(content)
+            else:
+                pending.append(result_step(content))
             steps += 1
         elif is_event_message(message):
             flush()
