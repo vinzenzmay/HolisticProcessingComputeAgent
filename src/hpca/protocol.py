@@ -255,6 +255,11 @@ class Entry(_Model):
     # renumbers from 1 and the UI drops what it had, which is what keeps a
     # rollback or a fold from leaving the two sides numbering different rows.
     seq: int = 0
+    # When this happened, ISO-8601 UTC — see the transcript original. UTC on
+    # the wire and not the core's local rendering of it, because a core and a
+    # front-end need not be on the same machine (specs-core-process.md) and
+    # only the front-end knows which clock a person is reading.
+    at: str = ""
 
 
 class SessionRow(_Model):
@@ -264,6 +269,15 @@ class SessionRow(_Model):
     title: str
     profile: str = ""
     mode: str = ""
+    # When something last happened in this conversation, ISO-8601 UTC: a turn
+    # submitted, or one recorded. Stored on the session rather than derived
+    # from the thread, because the sidebar draws every row and reading each
+    # one's last message would mean opening every thread to paint a list.
+    #
+    # Named for what it is rather than `updated_at`, which would sit one
+    # character away from the front-end's own `updated` — the unread marker —
+    # in code that draws both on the same row.
+    last_active: str = ""
     # The model this conversation is pinned to; empty when it talks to the
     # bootstrap client. On the wire because two things drew it — the sidebar
     # and the message row (§4.3 item 20) — and a front-end cannot work it out:

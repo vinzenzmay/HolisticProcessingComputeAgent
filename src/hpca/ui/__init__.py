@@ -48,7 +48,9 @@ line above them — because the terminal's own drag-to-select takes whole
 columns, and every one the UI spent in front of a line of the conversation
 came along with it. Anything at column 0 is verbatim; anything indented is the
 UI talking. A closed row shows one line of what it holds, clipped with a
-``[...]``; → opens it into the wrapped text. What is deliberately still
+``[...]``; → opens it into the wrapped text. Each label says when it happened
+and each sidebar row when its conversation was last worked in — UTC on the
+wire, the reader's own clock on screen (``state.when``). What is deliberately still
 missing: mouse support, which is what keeps that selection working at all, so
 the mouse stays released. specs-ui-replacement.md §4 is the full list of what is absent, and
 specs-ui-coverage.md §3 is an audit of it, most of which is now wired: what

@@ -213,6 +213,20 @@ list, and it is the bulk of the work.
    Opening is what a selection wants anyway: the clipped line carries a
    `[...]` that is not part of what anyone said.
 
+   **And when it happened.** The label line is what made room for it: a row
+   reads `▸ you 21-08-2026 19:04:11`, because a chat log people scroll back
+   through is one they ask "when was that" of. `protocol.Entry.at` carries the
+   instant as UTC and `ui.state.when` writes it in the reader's own clock —
+   the core need not be on the same machine (specs-core-process.md), and only
+   the front-end knows which clock a person reads. The stamp is put on the
+   *message* by the reducer that appends it, `agent.graph._append_messages`,
+   which is the one door every path into a thread goes through; the transcript
+   reads it back rather than reading a clock of its own, so a transcript built
+   twice comes out the same. A turn's working carries none — it folds several
+   messages and cannot honestly name an instant — and neither do the steps and
+   tool calls under it. The sidebar says the same thing about a whole
+   conversation, from `SessionRow.last_active`.
+
    The line list still grew — 8,300 lines at 5000 entries against 5000 —
    which is why `Pane.extend` exists: a row arriving is added to the cached
    list instead of dropping it. See §4.2 property 1 and

@@ -415,6 +415,10 @@ class AgentService:
             session = self._known(command.session_id)
             if session is None:
                 return
+            # Before anything else can fail: the conversation has just been
+            # worked in, and the sidebar says so for the whole length of the
+            # turn rather than only once it lands (`SessionStore.touch`).
+            self._sessions.touch(session.session_id)
             # A conversation nobody has named takes the opening message as a
             # provisional name, and is queued for the model to name properly
             # once this exchange is over (`_name_provisionally`). Here rather
@@ -630,6 +634,7 @@ class AgentService:
             # `mode`: empty means "follows the setting", and a row that
             # answered with the default could not say which of the two it was.
             thinking=session.thinking,
+            last_active=session.last_active,
             flags=self._flags(session.session_id),
         )
 
@@ -962,6 +967,9 @@ class AgentService:
         must not cost the session its recall, and an index that cannot be
         written must not cost it the transcript.
         """
+        # A turn that produced anything is activity, however it ended — a
+        # failure is still the last thing that happened here.
+        self._sessions.touch(session.session_id)
         if log is not None and entries:
             try:
                 # On a thread: this is an append to a file that is very likely

@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 
 from hpca.agent.hints import MODEL_HINTS
 from hpca.agent.history import is_tool_call_message
-from hpca.llm import Message
+from hpca.llm import STAMP_KEY, Message
 
 TOOL_PREFIXES = ("[tool result]", "[tool error]")
 # The lines themselves — a script's, or the two sides of an edit — rendered as
@@ -174,6 +174,13 @@ class Entry:
     # rides its user message, live rows predate the graph copy). What the chat
     # rewind (fork / roll back) uses to name its cut point.
     index: int = -1
+    # When the message this entry reads was added, ISO-8601 UTC, straight off
+    # `llm.STAMP_KEY`. Empty for the entries that are not one message: a
+    # thinking box folds several and a live row predates the graph copy, and
+    # neither can honestly name an instant. Empty too for a thread written
+    # before there were stamps, which is what makes "" mean "not known"
+    # rather than "the epoch".
+    at: str = ""
 
     def summary(self) -> str:
         """One-line gist, for the collapsed box: only what is actually there."""
@@ -458,9 +465,10 @@ def build_entries(
             # record instead — same call, arguments unfolded — which
             # ``open_calls`` has already put in the open thinking box.
             continue
+        at = str(message.get(STAMP_KEY) or "")
         if role == ASSISTANT:
             flush()  # the answer closes the box that produced it
-            entries.append(Entry(kind=ASSISTANT, text=content, index=index))
+            entries.append(Entry(kind=ASSISTANT, text=content, index=index, at=at))
         elif is_tool_message(message):
             # Onto the call it answers, so the exchange is one part. A tail
             # that begins between a call and its result has no call to land
@@ -473,12 +481,15 @@ def build_entries(
             steps += 1
         elif is_event_message(message):
             flush()
-            entries.append(Entry(kind=EVENT, text=content, index=index))
+            entries.append(Entry(kind=EVENT, text=content, index=index, at=at))
         else:
             flush()
-            entries.append(Entry(kind=USER, text=content, index=index))
+            entries.append(Entry(kind=USER, text=content, index=index, at=at))
             recalled = recalled_text(message)
             if recalled:
-                entries.append(Entry(kind=RECALL, text=recalled))
+                # The recall rides its user message, so it happened when that
+                # message did — the one entry with no index of its own that
+                # can still name an instant.
+                entries.append(Entry(kind=RECALL, text=recalled, at=at))
     flush()  # a turn interrupted for approval leaves its box open
     return entries

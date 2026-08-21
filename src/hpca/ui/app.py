@@ -72,6 +72,7 @@ from hpca.ui.state import (
     Toast,
     Unqueue,
     mode_line,
+    when,
 )
 
 # How long a first escape stays armed for a second one to complete the stop
@@ -522,6 +523,7 @@ class RowUI:
             session.mode = row.mode
             session.model = row.model
             session.thinking = row.thinking
+            session.last_active = row.last_active
             # The meter's `. think medium` (§4.3 item 18) reads this: a session
             # left on xhigh looks identical to one on off until the first wait.
             session.context.effort = row.thinking
@@ -609,8 +611,18 @@ class RowUI:
                         head=(
                             f"{'●' if i == self.active else '○'} "
                             f"{self._marks(session)} {session.title[:40]:<42}"
+                            # Mode before the clock, because the two are cut
+                            # in that order on a narrow terminal and which of
+                            # them is lost matters: "full-auto" is a safety
+                            # fact and "last worked in on Tuesday" is not.
                             + " · ".join(
-                                x for x in (self._tag(session), session.mode) if x
+                                x
+                                for x in (
+                                    self._tag(session),
+                                    session.mode,
+                                    when(session.last_active),
+                                )
+                                if x
                             )
                         ),
                         body=[

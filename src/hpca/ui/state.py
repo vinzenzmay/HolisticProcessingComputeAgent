@@ -37,6 +37,39 @@ OWN_MESSAGE_KINDS = ("user", "queued")
 # What a step's label is padded to in an opened entry, so tool names line up.
 TOOL_COLUMN = 14
 
+# How the UI writes an instant, wherever it writes one: a chat row's label and
+# a sidebar row's activity. Day first and seconds included — the seconds are
+# not decoration here, because a turn's question and its answer routinely land
+# in the same minute and the log is read to tell them apart.
+STAMP_FORMAT = "%d-%m-%Y %H:%M:%S"
+
+
+def when(stamp: str) -> str:
+    """A core ISO stamp as local wall-clock, or "" if there is not one.
+
+    Local, and that is the whole reason the conversion lives on this side of
+    the wire: the core stamps in UTC because it need not be on the same
+    machine as the front-end (specs-core-process.md), and only the front-end
+    knows which clock a person is reading.
+
+    Empty rather than a placeholder when the core sent nothing — a row from a
+    thread written before there were stamps, or one the UI wrote itself. A
+    label with no time on it says "not known", where a zero would say
+    something false.
+    """
+    if not stamp:
+        return ""
+    try:
+        return datetime.fromisoformat(stamp).astimezone().strftime(STAMP_FORMAT)
+    except ValueError:
+        return ""
+
+
+def _label(who: str, at: str) -> str:
+    """`you 21-08-2026 19:04:11` — who said it, and when."""
+    stamp = when(at)
+    return f"{who} {stamp}" if stamp else who
+
 # The mode line's copy, lifted from `tui/mode_bar.py` — the hint is the whole
 # value of the row: "auto" and "full-auto" differ by whether a destructive
 # operation stops to ask, which is not something a user should have to
@@ -113,6 +146,9 @@ class ChatEntry:
     steps: int = 0
     reasoning_chars: int = 0
     parts: list[ChatPart] = field(default_factory=list)
+    # When it happened, as the core stamped it (ISO-8601 UTC). Rendered by
+    # `when`, which is the only thing that knows about local clocks.
+    at: str = ""
 
 
 def _one_line(text: str) -> str:
@@ -182,13 +218,23 @@ def entry_item(entry: ChatEntry) -> Item:
     # addresses and what `Pane.expanded` remembers.
     row = dict(kind=entry.kind, text=entry.text, key=str(entry.seq))
     if entry.kind == "user":
-        return Item(head="you", body=body, preview=said, accent=WHITE, **row)
+        return Item(
+            head=_label("you", entry.at), body=body, preview=said, accent=WHITE, **row
+        )
     if entry.kind == "queued":
         # Still the user's own words, and still copyable as such — the label
         # is what says they have not been sent yet.
-        return Item(head="you · queued", body=body, preview=said, accent=DIM, **row)
+        return Item(
+            head=f"{_label('you', entry.at)} · queued",
+            body=body,
+            preview=said,
+            accent=DIM,
+            **row,
+        )
     if entry.kind == "error":
-        return Item(head="error", body=body, preview=said, accent=RED, **row)
+        return Item(
+            head=_label("error", entry.at), body=body, preview=said, accent=RED, **row
+        )
     if entry.kind == "thinking":
         steps = entry.steps or len(entry.parts)
         names = [x.tool or x.kind for x in entry.parts if x.tool or x.kind]
@@ -208,7 +254,7 @@ def entry_item(entry: ChatEntry) -> Item:
     # renderer has never heard of: the text is what matters and dropping the
     # row would lose it.
     return Item(
-        head="hpca",
+        head=_label("hpca", entry.at),
         body=body,
         preview=said,
         accent=AMBER,
@@ -720,6 +766,12 @@ class SessionState:
         # the same core has a different answer to it. Cleared by opening the
         # session, which is the only thing that can be read as having read it.
         self.updated = False
+        # When something last happened here, as the core stamped it. Not to be
+        # read as a companion to `updated` above, which is a different fact
+        # entirely: that one is "there is something here you have not seen",
+        # this one is "this is when it was last worked in", and a session can
+        # be either without the other.
+        self.last_active = ""
         self.entries: list[ChatEntry] = []
         # seq -> position in `entries` / `chat.items`, which are parallel.
         # The map, not a scan: a `chat.update` during a long turn arrives once
@@ -943,6 +995,7 @@ class SidebarRow:
     mode: str = ""
     model: str = ""
     thinking: str = ""
+    last_active: str = ""
     flags: tuple[str, ...] = ()
 
 

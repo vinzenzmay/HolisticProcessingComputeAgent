@@ -33,6 +33,8 @@ class Session:
     # so it invalidates the session's prefix KV cache and is not something to
     # churn.
     thinking: str = ""
+    # When something last happened here, ISO-8601 UTC — see `touch`.
+    last_active: str = ""
 
 
 class SessionStore:
@@ -48,21 +50,26 @@ class SessionStore:
         backend: str = "",
         thinking: str = "",
     ) -> Session:
+        now = datetime.now(timezone.utc).isoformat()
         session = Session(
             session_id=str(uuid.uuid4()),
             profile=profile,
             title=title,
-            created_at=datetime.now(timezone.utc).isoformat(),
+            created_at=now,
             checkpoint_ref="",
             mode=mode,
             backend=backend,
             thinking=thinking,
+            # Being made is the first thing that happens in a conversation, so
+            # a session with no turns in it yet reads as new rather than as
+            # never having happened.
+            last_active=now,
         )
         session.checkpoint_ref = session.session_id
         self._conn.execute(
             "INSERT INTO sessions (session_id, profile, title, created_at, "
-            "checkpoint_ref, mode, backend, thinking) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "checkpoint_ref, mode, backend, thinking, last_active) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 session.session_id,
                 session.profile,
@@ -72,10 +79,28 @@ class SessionStore:
                 session.mode,
                 session.backend,
                 session.thinking,
+                session.last_active,
             ),
         )
         self._conn.commit()
         return session
+
+    def touch(self, session_id: str, when: str = "") -> None:
+        """Something happened in this conversation, just now.
+
+        Called where a turn is submitted and again where one is recorded, so
+        the sidebar says "a minute ago" for a turn still running rather than
+        only once it lands. Both, not one: a submit alone would leave a
+        five-minute turn looking untouched for its whole length, and a record
+        alone would leave it looking untouched until it finished.
+
+        ``when`` is for a caller that already has the instant; otherwise now.
+        """
+        self._conn.execute(
+            "UPDATE sessions SET last_active = ? WHERE session_id = ?",
+            (when or datetime.now(timezone.utc).isoformat(), session_id),
+        )
+        self._conn.commit()
 
     def set_mode(self, session_id: str, mode: str) -> None:
         self._conn.execute(
@@ -171,4 +196,7 @@ class SessionStore:
             mode=row["mode"] if "mode" in row.keys() else "",
             backend=row["backend"] if "backend" in row.keys() else "",
             thinking=row["thinking"] if "thinking" in row.keys() else "",
+            last_active=(
+                row["last_active"] if "last_active" in row.keys() else ""
+            ),
         )

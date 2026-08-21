@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Annotated, Any, Callable, TypedDict
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -43,7 +44,7 @@ from hpca.agent.modes import (
 from hpca.agent.file_tools import edit_target_path
 from hpca.agent.prompts import orchestrator_system_prompt
 from hpca.agent.tools import ToolRegistry
-from hpca.llm import Message
+from hpca.llm import STAMP_KEY, Message
 
 # Fallback per-turn tool budget for callers that do not pass one. The app
 # passes llm.max_tool_rounds, whose default is -1 (no cap); a non-positive
@@ -66,6 +67,28 @@ def _append(left: list, right) -> list:
     if isinstance(right, dict) and TRUNCATE_TO in right:
         return left[: right[TRUNCATE_TO]]
     return left + right
+
+
+def _append_messages(left: list, right) -> list:
+    """`_append`, and every message that arrives without one gets a stamp.
+
+    In the reducer because that is the one door. Messages reach a thread from
+    a node returning ``{"messages": [...]}``, from `run_turn`'s opening
+    payload, and from `push_event`'s `aupdate_state` — three places to forget,
+    and forgetting means a chat row that cannot say when it happened.
+
+    Already-stamped messages are left exactly as they are, which is what makes
+    a fork honest: `fork_thread` re-appends the source's messages into a new
+    thread, and re-dating them would make a copy of a week-old conversation
+    look like it was all said just now.
+    """
+    if isinstance(right, dict) and TRUNCATE_TO in right:
+        return left[: right[TRUNCATE_TO]]
+    now = datetime.now(timezone.utc).isoformat()
+    return left + [
+        message if message.get(STAMP_KEY) else {**message, STAMP_KEY: now}
+        for message in right
+    ]
 
 
 def _resolve(provider, thread_id):
@@ -109,7 +132,7 @@ def _thread_id(config) -> str | None:
 
 
 class AgentState(TypedDict, total=False):
-    messages: Annotated[list[Message], _append]
+    messages: Annotated[list[Message], _append_messages]
     # The model's reasoning, anchored to the message index it produced. Kept
     # out of `messages` so it is never fed back to the model, only shown and
     # logged (§4.2 context firewall).

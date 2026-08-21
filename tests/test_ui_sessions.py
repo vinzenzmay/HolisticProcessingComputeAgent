@@ -689,6 +689,51 @@ class TestTheSidebarMarkers:
         return rows[0]
 
 
+class TestTheSidebarSaysWhenEachSessionWasLastWorkedIn:
+    """The overview's answer to "which of these thirty is still alive".
+
+    The core owns the fact (`SessionStore.last_active`) and the front-end owns
+    the clock it is written in: the stamp crosses the wire as UTC, because a
+    core need not be on the same machine as the UI, and `state.when` is the
+    only thing that turns it into the time on a person's own wall.
+    """
+
+    AT = "2026-08-21T12:34:56+00:00"
+
+    async def listed(self, w: Wire, at: str = AT) -> Wire:
+        await started(w)
+        await w.tell(
+            protocol.SessionRows(
+                rows=[ROWS[0].model_copy(update={"last_active": at}), ROWS[1]]
+            )
+        )
+        return w
+
+    async def test_the_row_carries_the_time(self, wire):
+        await self.listed(wire)
+        assert "21-08-2026 " in self.row_for(wire, "the first thing")
+
+    async def test_a_session_the_core_said_nothing_about_shows_none(self, wire):
+        # Not a placeholder date: a row with no stamp says nothing about when
+        # rather than something false.
+        await self.listed(wire)
+        assert "-2026 " not in self.row_for(wire, "the second thing")
+
+    async def test_the_mode_comes_first(self, wire):
+        # They are cut in that order on a narrow terminal, and which one is
+        # lost matters: "full-auto" is a safety fact and "worked in on
+        # Tuesday" is not.
+        await self.listed(wire)
+        row = self.row_for(wire, "the first thing")
+        assert row.index("auto") < row.index("21-08-2026")
+
+    @staticmethod
+    def row_for(w: Wire, title: str) -> str:
+        rows = [x for x in w.frame() if title in x]
+        assert rows, f"no sidebar row for {title!r}"
+        return rows[0]
+
+
 # --------------------------------------------------------------- the rewind
 
 

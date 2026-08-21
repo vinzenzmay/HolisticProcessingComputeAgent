@@ -853,6 +853,26 @@ class TestSessionList:
         # pinned to, and it is pinned to nothing.
         assert rows[0].model == ""
 
+    async def test_a_row_says_when_its_session_was_last_worked_in(
+        self, service, session, conn
+    ):
+        queue = subscribe(service)
+        await service.handle(SessionList())
+        rows = only(await drain(queue), "SessionRows").rows
+        assert rows[0].last_active == SessionStore(conn).get(
+            session.session_id
+        ).last_active
+        assert rows[0].last_active, "a session that exists has been active once"
+
+    async def test_and_a_turn_moves_it(self, service, session, conn, llm):
+        # Submitting is the point it moves, not the point the answer lands: a
+        # five-minute turn must not leave its row looking untouched for its
+        # whole length.
+        store = SessionStore(conn)
+        store.touch(session.session_id, "2000-01-01T00:00:00+00:00")
+        await service.handle(TurnSubmit(session_id=session.session_id, text="hi"))
+        assert store.get(session.session_id).last_active > "2001"
+
     async def test_a_running_turn_marks_its_row(self, service, session, llm):
         release = await park_turn(service, llm, session.session_id)
         queue = subscribe(service)
@@ -1042,6 +1062,21 @@ class TestSessionOpen:
         assert [e.seq for e in reset.entries] == list(
             range(1, len(reset.entries) + 1)
         )
+
+    async def test_and_each_one_says_when_it_happened(self, service, session):
+        # The end-to-end of it: `graph._append_messages` stamps the message,
+        # `build_entries` reads the stamp onto the entry, and `wire_entry`
+        # carries it across by field name. Four layers, and the only place
+        # they can be checked against each other is here.
+        await run_turn(service, session.session_id, "which BAMs?")
+        queue = subscribe(service)
+        await service.handle(SessionOpen(session_id=session.session_id))
+        reset = only(await drain(queue), "ChatReset")
+        spoken = [e for e in reset.entries if e.kind in ("user", "assistant")]
+        assert spoken, "the turn produced nothing to check"
+        assert all(e.at for e in spoken), [(e.kind, e.at) for e in reset.entries]
+        # And a turn's working names no instant: it folds several messages.
+        assert all(e.at == "" for e in reset.entries if e.kind == "thinking")
 
     async def test_an_empty_session_opens_empty(self, service, session):
         queue = subscribe(service)

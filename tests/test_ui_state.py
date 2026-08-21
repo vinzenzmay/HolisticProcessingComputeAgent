@@ -8,6 +8,8 @@ import the protocol.
 
 from __future__ import annotations
 
+import re
+
 from hpca.ui.ansi import AMBER, RED, WHITE
 from hpca.ui.state import (
     ChatEntry,
@@ -16,6 +18,7 @@ from hpca.ui.state import (
     SessionState,
     Turn,
     entry_item,
+    when,
 )
 
 
@@ -281,3 +284,63 @@ class TestTheContextMeter:
 
     def test_and_never_divides_by_a_window_it_does_not_have(self):
         assert Context(used=900).percent == 0
+
+
+class TestWhen:
+    """`when`: a core ISO stamp as the local wall clock a person reads.
+
+    On this side of the wire because only this side knows which clock that is
+    — the core stamps UTC precisely so it need not be on the same machine
+    (specs-core-process.md).
+    """
+
+    def test_a_stamp_is_written_day_first_with_seconds(self):
+        # Seconds are not decoration: a question and its answer routinely land
+        # in the same minute and the log is read to tell them apart.
+        got = when("2026-08-21T12:34:56+00:00")
+        assert re.fullmatch(r"21-08-2026 \d\d:\d\d:56", got), got
+
+    def test_and_it_is_shown_in_local_time(self):
+        # Same instant, two offsets, one answer.
+        assert when("2026-08-21T12:34:56+00:00") == when("2026-08-21T14:34:56+02:00")
+
+    def test_no_stamp_is_no_text(self):
+        assert when("") == ""
+
+    def test_and_nor_is_something_that_is_not_one(self):
+        # A row the UI wrote itself, or a field a future core fills in
+        # differently: neither is a reason to raise in the middle of a frame.
+        assert when("whenever") == ""
+
+
+class TestRowsSayWhenTheyHappened:
+    AT = "2026-08-21T12:34:56+00:00"
+
+    def test_your_own_message_is_labelled_with_its_time(self):
+        item = entry_item(entry(1, text="run it", at=self.AT))
+        assert item.head.startswith("you 21-08-2026 ")
+
+    def test_and_so_is_the_agents(self):
+        item = entry_item(entry(1, "assistant", "done", at=self.AT))
+        assert item.head.startswith("hpca 21-08-2026 ")
+
+    def test_a_queued_one_says_both(self):
+        item = entry_item(entry(2, "queued", "next", at=self.AT))
+        assert item.head.startswith("you 21-08-2026 ")
+        assert item.head.endswith(" · queued")
+
+    def test_an_error_too(self):
+        assert entry_item(entry(1, "error", "it fell over", at=self.AT)).head.startswith(
+            "error 21-08-2026 "
+        )
+
+    def test_a_row_with_no_stamp_is_just_the_label(self):
+        # Not "you --" or "you 01-01-1970": a row the core did not stamp says
+        # nothing about when rather than saying something false.
+        assert entry_item(entry(1, text="run it")).head == "you"
+
+    def test_a_turn_is_not_labelled_with_one(self):
+        # Its head is a summary of several messages, and it has no instant to
+        # name (`transcript.Entry.at`).
+        item = entry_item(ChatEntry(kind="thinking", seq=3, steps=4))
+        assert item.head == "4 steps"

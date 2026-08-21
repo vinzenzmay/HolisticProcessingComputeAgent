@@ -198,9 +198,9 @@ One envelope in both directions:
 | type | payload |
 |---|---|
 | `hello` | `version`, `profile`, `settings_digest` — first frame on connect |
-| `session.rows` | `rows: [{session_id, title, profile, mode, flags}]` — deliberately **not** `session.list`: `parse()` sees a frame without knowing which direction it travelled, so one type string cannot carry two payload shapes |
+| `session.rows` | `rows: [{session_id, title, profile, mode, last_active, flags}]` — `last_active` is when something last happened in that conversation, ISO-8601 **UTC**: the core and the front-end need not share a machine, so the wire carries the instant and the UI decides whose clock to write it in (`ui.state.when`). Stored on the session rather than read off the thread, because the sidebar draws every row at once and answering it from the transcript would mean opening every conversation to paint a list — deliberately **not** `session.list`: `parse()` sees a frame without knowing which direction it travelled, so one type string cannot carry two payload shapes |
 | `session.created` | `row: SessionRow` — a session the core just made and the UI is expected to open: the reply to `session.fork`, and what `session.new` needs too. The whole row, so one frame both opens it and fills the sidebar; `session.rows` re-states the sidebar but cannot say which line is new |
-| `chat.reset` | `session_id`, `entries: [Entry]` — on open only; also re-bases the row numbering (see `chat.update`) |
+| `chat.reset` | `session_id`, `entries: [Entry]` — on open only; also re-bases the row numbering (see `chat.update`). Each `Entry` carries `at`: when the message it reads was added, ISO-8601 UTC, stamped once by the reducer that appends it (`agent.graph._append_messages`) and read back by `transcript.build_entries`. Empty for the entries that are not one message — a `thinking` box folds several and cannot honestly name an instant |
 | `chat.append` | `session_id`, `entry: Entry` |
 | `chat.update` | `session_id`, `entry: Entry` — a row already on screen, revised in place; `Entry.seq` says which. Without it the chat is not append-only: a tool call that gains its result, and a `queued` entry becoming a `user` one, could only be expressed by resending the transcript — the per-turn rebuild this protocol exists to delete |
 | `turn.started` | `session_id` |

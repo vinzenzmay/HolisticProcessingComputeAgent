@@ -182,6 +182,7 @@ def sample_entries(count: int, seed: int = 0, task: str = "") -> list[protocol.E
     """
     task = task or TASKS[seed % len(TASKS)]
     entries: list[protocol.Entry] = []
+    at = stamps(count)
     for n in range(count):
         i = n + seed * 7
         slot = n % 3
@@ -191,7 +192,9 @@ def sample_entries(count: int, seed: int = 0, task: str = "") -> list[protocol.E
             # the thing rather than only by the headless tests.
             said = task if n % 12 else f"{task}. {LONG_ASK}"
             entries.append(
-                protocol.Entry(kind="user", text=said, seq=n + 1, index=n)
+                protocol.Entry(
+                    kind="user", text=said, seq=n + 1, index=n, at=at[n]
+                )
             )
         elif slot == 1:
             steps = 3 + (i * 5) % 18
@@ -220,6 +223,7 @@ def sample_entries(count: int, seed: int = 0, task: str = "") -> list[protocol.E
                 protocol.Entry(
                     kind="assistant",
                     seq=n + 1,
+                    at=at[n],
                     text=(
                         f"{reply}\nThe detail is in the log at "
                         "/scratch/proj/cohort/run3/logs/merge_vcf.log, and the "
@@ -228,6 +232,25 @@ def sample_entries(count: int, seed: int = 0, task: str = "") -> list[protocol.E
                 )
             )
     return entries
+
+
+# One instant for the whole process, read once at import.
+#
+# Off the wall clock rather than a fixed date, because the demo is what the
+# design is looked at in and a conversation stamped in perpetuity reads as a
+# screenshot rather than as a chat. Read *once*, because two demos built in one
+# process have to agree: a clock read per call puts them on either side of a
+# second boundary now and then, which is a test that fails one run in sixty and
+# a bug nobody can reproduce.
+DEMO_NOW = datetime.now(timezone.utc)
+
+
+def stamps(count: int, *, every: int = 90) -> list[str]:
+    """``count`` instants ending at `DEMO_NOW`, oldest first."""
+    return [
+        (DEMO_NOW - timedelta(seconds=every * (count - 1 - n))).isoformat()
+        for n in range(count)
+    ]
 
 
 def sample_watches(count: int, seed: int = 0) -> list[protocol.PanelRow]:
@@ -347,6 +370,8 @@ class DemoCore:
 
     def __init__(self, *, chat: int = 400, sessions: int = 14, watchers: int = 5):
         self.emit: Callable[[protocol.Event], None] = lambda event: None
+        # Newest first, which is the order the sidebar lists them in.
+        active = stamps(sessions, every=4200)[::-1]
         self.rows: list[protocol.SessionRow] = [
             protocol.SessionRow(
                 session_id=f"9f3c{i:04x}",
@@ -354,6 +379,7 @@ class DemoCore:
                 profile=PROFILES[i % len(PROFILES)],
                 mode=MODES[i % len(MODES)],
                 model=MODELS[i % len(MODELS)],
+                last_active=active[i],
             )
             for i in range(sessions)
         ]

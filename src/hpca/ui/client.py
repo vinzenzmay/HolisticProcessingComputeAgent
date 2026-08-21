@@ -55,6 +55,7 @@ def _entry(wire: protocol.Entry) -> state.ChatEntry:
         text=wire.text,
         seq=wire.seq,
         index=wire.index,
+        at=wire.at,
         steps=wire.steps,
         reasoning_chars=wire.reasoning_chars,
         parts=[
@@ -612,6 +613,7 @@ class UIClient:
                     mode=row.mode,
                     model=row.model,
                     thinking=row.thinking,
+                    last_active=row.last_active,
                     flags=tuple(row.flags),
                 )
                 for row in msg.rows
@@ -634,6 +636,7 @@ class UIClient:
         session.profile = msg.row.profile
         session.mode = msg.row.mode
         session.model = msg.row.model
+        session.last_active = msg.row.last_active
         session.thinking = msg.row.thinking
         session.context.effort = msg.row.thinking
         session.flags = list(msg.row.flags)
