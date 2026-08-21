@@ -572,7 +572,7 @@ class RowUI:
         # `working` the mark above was drawn from, or the "*" would overwrite
         # a "⟳" the core's flag put there and nothing local knew about — a
         # reconnect, or a second front-end (specs-ui-coverage.md §9.14).
-        if session.updated and not (parked or session.turn.busy):
+        if session.updated and not (parked or working):
             marks = marks[0] + UPDATED_MARK
         return marks
 
