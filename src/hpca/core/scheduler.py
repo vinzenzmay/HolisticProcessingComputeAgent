@@ -357,6 +357,32 @@ class TurnScheduler:
     def busy_sessions(self) -> set[str]:
         return set(self._turns)
 
+    def busy_profiles(self) -> set[str]:
+        """Which profiles have a turn in flight.
+
+        The memory service's half of "may this profile be deleted": deleting
+        one out from under a running turn would strand it under a profile
+        whose memories and skills no longer exist. Answered from the live
+        turns' own session copies rather than from the store, because that is
+        the profile the turn is actually running as.
+        """
+        return {
+            ts.session.profile
+            for ts in self._turns.values()
+            if getattr(ts.session, "profile", "")
+        }
+
+    def tool_context(self, session_id: str) -> Any:
+        """The tool context of the turn running on this session, or None.
+
+        Exposed because two things outside the scheduler legitimately want the
+        *live* one rather than a rebuilt copy: the graph's per-turn resolver,
+        and killing a subprocess by pid — the runner that started it is the one
+        with a monitor that will record how it ended.
+        """
+        ts = self._turns.get(session_id)
+        return ts.plan.ctx if ts is not None else None
+
     # --------------------------------------------------------------- intake
 
     def submit_user(

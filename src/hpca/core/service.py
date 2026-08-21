@@ -34,6 +34,7 @@ import asyncio
 import hashlib
 import logging
 from contextlib import suppress
+from datetime import datetime, timezone
 from typing import Any
 
 from hpca.agent.builtin_tools import default_tool_registry
@@ -42,6 +43,7 @@ from hpca.agent.doc_tools import add_ask_docs, add_doc_tools
 from hpca.agent.file_tools import add_file_tools
 from hpca.agent.graph import (
     build_graph,
+    compact_now,
     fork_thread,
     rollback_thread,
     thread_message_count,
@@ -50,7 +52,7 @@ from hpca.agent.job_tools import add_job_tools
 from hpca.agent.memory_context import build_memory_context, compose_api_content
 from hpca.agent.memory_tools import add_memory_tools
 from hpca.agent.middleware import uses_native_tools
-from hpca.agent.modes import add_plan_tool
+from hpca.agent.modes import MODES, add_plan_tool
 from hpca.agent.prompts import (
     build_skill_directive,
     environment_facts,
@@ -59,22 +61,38 @@ from hpca.agent.prompts import (
 from hpca.agent.skill_tools import add_skill_tools
 from hpca.agent.titler import propose_title
 from hpca.agent.watch_tools import add_watch_tools
+from hpca.config import LLMBackend
 from hpca.core.backends import BackendRegistry
 from hpca.core.deps import CoreDeps
-from hpca.core.memory_service import MemoryService
+from hpca.core.memory_service import KIND_REFLECTION, MemoryService
 from hpca.core.pollers import Pollers
 from hpca.core.scheduler import TurnPlan, TurnScheduler, wire_entry
+from hpca.db import record_command_use
 from hpca.episodic import EpisodicStore
+from hpca.jobs import JobStore
+from hpca.logs import open_log
+from hpca.profiles import DEFAULT_PROFILE, Profile
 from hpca.protocol import (
     PROTOCOL_VERSION,
+    BackendSet,
     ChatReset,
+    CommandRun,
     ConfirmRequested,
     ConfirmResolve,
     DecisionRequested,
     DecisionResolve,
     Hello,
+    JobCancel,
+    MemoryResolve,
     Message,
+    ModeSet,
     Notify,
+    ProcessKill,
+    ProfileCreate,
+    ProfileDelete,
+    ProfileDuplicate,
+    ProfileSave,
+    ProfileSet,
     SessionClose,
     SessionCreated,
     SessionDelete,
@@ -89,16 +107,53 @@ from hpca.protocol import (
     SessionRow,
     SessionRows,
     Shutdown,
+    SkillDelete,
+    SkillSave,
+    ThinkingSet,
+    TurnActivity,
     TurnInterrupt,
     TurnInterrupted,
     TurnSubmit,
     TurnUnqueue,
     TurnUnqueued,
+    WatchDrop,
+    WatchPeek,
+    WatchPeeked,
 )
+from hpca.runner import kill_unowned
+from hpca.skills import load_own_skills, load_project_skills, load_skills
+from hpca.thinking import EFFORT_HINTS, EFFORTS, XHIGH_WARNING
 from hpca.transcript import build_entries
-from hpca.watches import WatchStore
+from hpca.watches import KIND_LOG, WatchStore, peek, watch_lines
 
 logger = logging.getLogger("hpca.core.service")
+
+# The slash commands this core answers — the seven built-ins of §4.1. Kept as
+# a set rather than inferred from the handler chain because it is also what
+# decides whether a command is worth counting for the front-end's frequency
+# sort: an unknown one must not teach the menu a name nothing can run.
+SLASH_COMMANDS = frozenset(
+    {
+        "compact",
+        "memorize",
+        "conclude",
+        "thinking",
+        "skills-list",
+        "skill-remove",
+        "skill-creator",
+    }
+)
+
+# How `/skills-list` marks where a skill resolved from. The profile's own carry
+# no tag — they are the removable, unsurprising case; everything else says
+# where it came from, because that is what decides whether removing it would
+# change another profile.
+SKILL_LEVEL_TAGS = {
+    "project": "  (project)",
+    "profile": "",
+    "global": "  (global)",
+    "builtin": "  (built-in)",
+}
 
 
 class AgentService:
@@ -304,6 +359,54 @@ class AgentService:
         if isinstance(command, ConfirmResolve):
             await self._resolve_confirmation(command.id, command.confirmed)
             return
+        if isinstance(command, MemoryResolve):
+            self._resolve_memory(command)
+            return
+        if isinstance(command, ModeSet):
+            self._set_mode(command.session_id, command.mode)
+            return
+        if isinstance(command, ThinkingSet):
+            self._set_thinking(command.session_id, command.effort)
+            return
+        if isinstance(command, BackendSet):
+            await self._set_backend(command)
+            return
+        if isinstance(command, ProfileSet):
+            await self._set_profile(command.name)
+            return
+        if isinstance(command, ProfileSave):
+            self._save_profile(command)
+            return
+        if isinstance(command, ProfileCreate):
+            self._create_profile(command.name)
+            return
+        if isinstance(command, ProfileDuplicate):
+            self._duplicate_profile(command)
+            return
+        if isinstance(command, ProfileDelete):
+            await self._delete_profile(command.name)
+            return
+        if isinstance(command, SkillSave):
+            self._save_skill(command)
+            return
+        if isinstance(command, SkillDelete):
+            self._memory.delete_profile_skill(command.profile, command.name)
+            return
+        if isinstance(command, WatchPeek):
+            await self._peek_watch(command.watch_id)
+            return
+        if isinstance(command, WatchDrop):
+            await self._drop_watch(command.watch_id)
+            return
+        if isinstance(command, ProcessKill):
+            await self._kill_process(command.pid)
+            return
+        if isinstance(command, JobCancel):
+            await self._cancel_job(command.job_id)
+            return
+        if isinstance(command, CommandRun):
+            await self._run_slash(command)
+            return
         if isinstance(command, Shutdown):
             await self.stop()
             return
@@ -345,6 +448,10 @@ class AgentService:
             # Empty for the bootstrap client: the row says what this
             # conversation is *pinned* to, and pinned to nothing is news.
             model=backend.model if backend is not None else "",
+            # The stored level, not the resolved one, for the same reason as
+            # `mode`: empty means "follows the setting", and a row that
+            # answered with the default could not say which of the two it was.
+            thinking=session.thinking,
             flags=self._flags(session.session_id),
         )
 
@@ -644,6 +751,373 @@ class AgentService:
         )
         return None
 
+    # ------------------------------------------------------------ the dials
+
+    def _set_mode(self, session_id: str, mode: str) -> None:
+        """`mode.set`: how much this conversation asks before it acts (§3.5).
+
+        Stored and then restated, rather than acknowledged: the mode is a
+        column of the sidebar row, so the frame that says it worked is the
+        same frame that redraws it — and it redraws it for every client, which
+        a reply addressed to the sender could not.
+
+        An unknown mode is refused here because the set of them is the agent's
+        business, which is exactly why the wire carries a plain string
+        (`protocol.ModeSet`): validating it at the edge would put a second
+        copy of that list in a module that must not have an opinion about it.
+        """
+        if self._known(session_id) is None:
+            return
+        if mode not in MODES:
+            self._deps.emit(
+                Notify(severity="warning", text=f"There is no “{mode}” mode.")
+            )
+            return
+        self._sessions.set_mode(session_id, mode)
+        self._emit_rows()
+
+    def _set_thinking(self, session_id: str, effort: str) -> None:
+        """`thinking.set`: how hard this conversation reasons (hpca.thinking).
+
+        The same shape as the mode above, including the sidebar restatement —
+        the level rides on `SessionRow`, so this is also the event the context
+        meter's `· think medium` reads (see `protocol.SessionRow.thinking`).
+
+        xhigh gets a warning rather than a confirmation because it does not
+        work: the level is offered since the model advertises it, and a user
+        who picks it needs to be told before the first lost turn rather than
+        after it. The headline is in the title for the reason `tui/app.py`
+        gave — a toast is read in the order it is laid out, and this one has to
+        land even if the paragraph under it is skimmed.
+        """
+        if self._known(session_id) is None:
+            return
+        if effort not in EFFORTS:
+            self._deps.emit(
+                Notify(
+                    severity="warning",
+                    text=f"There is no “{effort}” thinking level.",
+                )
+            )
+            return
+        self._sessions.set_thinking(session_id, effort)
+        self._emit_rows()
+        if effort == "xhigh":
+            self._deps.emit(
+                Notify(
+                    severity="warning",
+                    title="Thinking: xhigh — NOT USABLE",
+                    text=XHIGH_WARNING,
+                    timeout=25,
+                )
+            )
+            return
+        self._deps.emit(
+            Notify(text=f"Thinking effort for this session: {effort}")
+        )
+
+    async def _set_backend(self, command: BackendSet) -> None:
+        """`backend.set`: which model answers — one session's, or everyone's.
+
+        Two operations behind one command, told apart by whether a session is
+        named (`protocol.BackendSet`), and they are genuinely different: the
+        per-session half rewrites one row and is refused only while THAT
+        session is mid-reply, while the global half writes the settings, so it
+        outlives the run, decides what the next session is created against, and
+        is refused while any turn anywhere is in flight (`BackendRegistry`).
+
+        The blob is validated against the real settings model rather than
+        modelled a second time in the protocol — which is why it crosses as an
+        opaque dict, and why an unusable one is refused here.
+        """
+        try:
+            backend = LLMBackend.model_validate(command.backend)
+        except Exception as e:
+            # A front-end sending a shape the settings model does not accept is
+            # a bug on its side; pinning a session to it would strand the
+            # conversation on a backend nothing can build a client from.
+            self._deps.emit(
+                Notify(severity="error", text=f"Not a usable backend: {e}")
+            )
+            return
+        if command.session_id is None:
+            await self._backends.set_default(
+                backend, busy=bool(self._scheduler.busy_sessions())
+            )
+            # Every session that pinned nothing now names a different model.
+            self._emit_rows()
+            return
+        if self._known(command.session_id) is None:
+            return
+        switched = self._backends.switch_backend(
+            command.session_id,
+            backend,
+            busy=self._scheduler.is_busy(command.session_id),
+        )
+        if switched:
+            self._emit_rows()  # the row carries the model name
+
+    # --------------------------------------------------------------- profiles
+
+    async def _set_profile(self, name: str) -> None:
+        """`profile.set`: the profile the core works under when nothing else
+        narrows it — a new session's default, and whose watches an unfocused
+        panel shows (`CoreDeps.profile`).
+
+        Deliberately not "the open session's profile": a session's profile is
+        the session's, and changing what the core is working under must not
+        silently move a conversation to another set of memories.
+
+        The panel is repainted because `panel.update` is the one event that
+        carries the working profile's name — `hello` also does, but only to a
+        client that is connecting, and this can happen at any time.
+        """
+        if name not in Profile.list_profiles():
+            self._deps.emit(
+                Notify(
+                    severity="warning",
+                    text=f"There is no profile called “{name}”.",
+                )
+            )
+            return
+        self._memory.set_working_profile(name)
+        self._deps.emit(Notify(text=f"Working profile: {name}"))
+        await self._pollers.refresh_panel(force=True)
+
+    def _save_profile(self, command: ProfileSave) -> None:
+        """`profile.save`: write back what the user edited in $EDITOR (§4.4).
+
+        The editor is the front-end's (it needs a terminal to suspend), the
+        file is the core's, so the flow ends here with the finished text. Both
+        halves report their own outcome, including a memory file that no longer
+        parses — the edits are the user's and are never refused, only flagged.
+        """
+        if command.kind == "memories":
+            self._memory.save_profile_memories(command.name, command.text)
+            return
+        self._memory.save_profile_archive(command.name, command.text)
+
+    def _create_profile(self, name: str) -> None:
+        error = self._memory.create_profile(name)
+        if error is not None:
+            # The name is a filename: what it may contain, and that it may not
+            # collide, is the profile store's rule and its wording.
+            self._deps.emit(Notify(severity="warning", text=error))
+            return
+        self._deps.emit(Notify(text=f"Created profile “{name.strip()}”."))
+
+    def _duplicate_profile(self, command: ProfileDuplicate) -> None:
+        """`profile.duplicate`: same learnings, its own future.
+
+        ``source`` defaults to the working profile, which is what "duplicate
+        this one" means from a screen that is already showing it.
+        """
+        error = self._memory.duplicate_profile(
+            command.source or self._deps.profile, command.name
+        )
+        if error is not None:
+            self._deps.emit(Notify(severity="warning", text=error))
+            return
+        # The copy announces itself (it counts what came along); nothing in the
+        # sidebar changed, since sessions belong to conversations rather than
+        # to the knowledge that came out of them.
+
+    async def _delete_profile(self, name: str) -> None:
+        """`profile.delete`: drop a profile and everything it learned.
+
+        Three refusals, in the order that costs least to find out: the default
+        cannot go at all (it is where deleted profiles' sessions land, so
+        removing it would leave them pointing at nothing), a name that does not
+        exist is a stale screen, and a profile in use — a reply in flight, or a
+        live subprocess under one of its sessions — would strand running work.
+
+        Its sessions are reassigned to the default rather than deleted, which
+        is why the sidebar is restated afterwards: every row that named this
+        profile now names another.
+        """
+        if name == DEFAULT_PROFILE:
+            self._deps.emit(
+                Notify(
+                    severity="warning",
+                    text="The default profile cannot be deleted — it is where "
+                    "other profiles' sessions go.",
+                )
+            )
+            return
+        if name not in Profile.list_profiles():
+            self._deps.emit(
+                Notify(
+                    severity="warning",
+                    text=f"There is no profile called “{name}”.",
+                )
+            )
+            return
+        blocker = await self._memory.profile_delete_blocker(name)
+        if blocker is not None:
+            self._deps.emit(Notify(severity="warning", text=blocker))
+            return
+        await self._memory.delete_profile(name)
+        self._emit_rows()
+
+    def _save_skill(self, command: SkillSave) -> None:
+        """`skill.save`: persist a skill file verbatim, front matter and all.
+
+        Written into the profile's own directory and nowhere else. The global
+        (`_shared/`) level is deliberately unreachable from here: one profile
+        editing a procedure every other profile can see is a change nobody
+        asked for, and the same rule already governs deletion.
+        """
+        if command.text is None:
+            # The shape is shared with `skill.delete`, where the body is
+            # meaningless; saving without one would truncate the file.
+            self._deps.emit(
+                Notify(severity="warning", text="A skill needs a body to save.")
+            )
+            return
+        self._memory.save_skill_file(command.profile, command.name, command.text)
+
+    # ---------------------------------------------------------------- watches
+
+    async def _peek_watch(self, watch_id: int) -> None:
+        """`watch.peek`: what is this box saying right now?
+
+        The one read-only command in §4.1, and still a command: the tail lives
+        in a file on a node the front-end may not share, and rule 2 of §4.2
+        puts the database out of its reach either way.
+
+        A job answers with its state line plus its output, but only when hpca
+        submitted it — a job the user sbatch'ed by hand has no known stdout
+        path, and the state is then the whole answer. A read that failed comes
+        back as the text (`watches.peek` says so in words), because what
+        happened to the log is exactly what was asked.
+        """
+        watch = await self._deps.db(lambda conn: WatchStore(conn).get(watch_id))
+        if watch is None:
+            self._deps.emit(
+                Notify(severity="warning", text="That box is gone.")
+            )
+            return
+        if watch.kind == KIND_LOG:
+            text = await self._tail(watch.target)
+        else:
+            text = " · ".join(part for part in watch_lines(watch) if part)
+            row = await self._deps.db(
+                lambda conn: JobStore(conn).get(watch.target)
+            )
+            if row is not None and row.sbatch_stdout_path:
+                text += "\n" + await self._tail(row.sbatch_stdout_path)
+        self._deps.emit(
+            WatchPeeked(watch_id=watch_id, title=watch.title, text=text)
+        )
+
+    @staticmethod
+    async def _tail(path: str) -> str:
+        """`watches.peek`, off the dispatch loop.
+
+        The read is small by construction but the file is a job log on a
+        cluster filesystem, where a stat can cost a network round trip — and
+        this loop has one socket and every other session's commands behind it.
+        The same reason `deps.db` exists, for a file rather than a database.
+        """
+        return await asyncio.to_thread(peek, path)
+
+    async def _drop_watch(self, watch_id: int) -> None:
+        """`watch.drop`: stop watching, and repaint the column.
+
+        Nothing is deleted but the box — the log and the job are untouched —
+        which is why there is no confirmation step: the usual reason for
+        pressing it is that the run is over and the box has stopped saying
+        anything.
+        """
+        watch = await self._deps.db(lambda conn: WatchStore(conn).get(watch_id))
+        removed = await self._deps.db(
+            lambda conn: WatchStore(conn).remove(watch_id)
+        )
+        if not removed:
+            self._deps.emit(
+                Notify(severity="warning", text="That box is gone.")
+            )
+            return
+        self._deps.emit(Notify(text=f"Stopped watching {watch.title}"))
+        await self._pollers.refresh_panel(force=True)
+
+    # ------------------------------------------------------- running work
+
+    async def _kill_process(self, pid: int) -> None:
+        """`process.kill`: stop a background subprocess by pid.
+
+        Preferring the runner that started it, when there still is one: its
+        monitor is what records how the process ended, so a kill it can see
+        settles the row properly. A process from an earlier turn has no live
+        monitor — the runner is built per turn — and `kill_unowned` both
+        signals it and settles the row itself, which is what stops the history
+        claiming it is still running forever.
+
+        The row is looked up by pid alone because that is all the command
+        carries, and no store call takes a bare one: the panel that used to
+        offer this listed processes per session, and it does not any more.
+        """
+        row = await self._deps.db(
+            lambda conn: conn.execute(
+                "SELECT session_id, name, state FROM processes WHERE pid = ?",
+                (pid,),
+            ).fetchone()
+        )
+        if row is None:
+            self._deps.emit(
+                Notify(severity="warning", text=f"No process with pid {pid}.")
+            )
+            return
+        if row["state"] != "running":
+            self._deps.emit(
+                Notify(
+                    severity="warning",
+                    text=f"{row['name']} is not running ({row['state']}).",
+                )
+            )
+            return
+        session_id = row["session_id"]
+        ctx = self._scheduler.tool_context(session_id)
+        runner = getattr(ctx, "runner", None)
+        if runner is not None and runner.owns(pid):
+            await runner.kill(pid)
+            await runner.wait(pid)
+        else:
+            await self._deps.db(
+                lambda conn: kill_unowned(conn, pid=pid, session_id=session_id)
+            )
+        self._deps.emit(Notify(text=f"Killed {row['name']} (pid {pid})."))
+
+    async def _cancel_job(self, job_id: str) -> None:
+        """`job.cancel`: scancel a job hpca submitted.
+
+        The provisional state is written straight away rather than waited for:
+        scancel returns before the scheduler has acted, and sacct is what
+        confirms it on the next poll (`JobStore.mark`). Until then a box that
+        says CANCELLING is the honest answer.
+        """
+        slurm = self._deps.slurm
+        if slurm is None:
+            self._deps.emit(
+                Notify(
+                    severity="warning",
+                    text="No cluster is configured — there is nothing to cancel.",
+                )
+            )
+            return
+        try:
+            await slurm.cancel(job_id)
+        except Exception as e:
+            self._deps.emit(
+                Notify(severity="error", text=f"Cancel failed: {e}")
+            )
+            return
+        await self._deps.db(
+            lambda conn: JobStore(conn).mark(job_id, "CANCELLING")
+        )
+        self._deps.emit(Notify(text=f"Cancelling job {job_id}"))
+        await self._pollers.refresh_panel(force=True)
+
     # ---------------------------------------------------------- confirmations
 
     def ask(self, question: str, on_yes) -> None:
@@ -668,7 +1142,406 @@ class AgentService:
             logger.exception("confirmed action failed")
             self._deps.emit(Notify(severity="error", text=str(e)))
 
+    # ------------------------------------------------------ memory proposals
+
+    def _resolve_memory(self, command: MemoryResolve) -> None:
+        """`memory.resolve`: write exactly the proposals that were approved.
+
+        Positional against the set the core still holds, and that asymmetry is
+        the design point (`protocol.MemoryResolve`): the authoritative objects
+        never leave this process, so an approval cannot carry an edited memory
+        back in. A short list rejects the rest — an answer that never arrived
+        is not an approval.
+
+        An answer to nothing is a stale screen, not an error: a review that has
+        already been applied, or one that belonged to a session since deleted.
+
+        The `/conclude` chain continues from here. The self-review and the
+        facts the agent flagged mid-session are two rounds of one pass, and
+        they cannot be offered together — one session holds one unanswered set,
+        so a second offer would overwrite the first. So the flagged batch is
+        put up once the reflections have been answered, which is also the order
+        the user reads them in.
+        """
+        pending = self._memory.pending_proposals(command.session_id)
+        if pending is None:
+            self._deps.emit(
+                Notify(
+                    severity="warning",
+                    text="There is nothing waiting to be reviewed.",
+                )
+            )
+            return
+        kind = pending.kind
+        kept = self._memory.apply_answered(command.session_id, command.approved)
+        followed = False
+        if kind == KIND_REFLECTION:
+            session = self._session(command.session_id)
+            if session is not None:
+                followed = self._memory.propose_flagged_edits(session) is not None
+        if kept:
+            self._deps.emit(
+                Notify(
+                    text=f"Kept {kept} memor{'y' if kept == 1 else 'ies'}."
+                )
+            )
+        elif not followed:
+            # Silent only while a second round is on its way: "nothing kept"
+            # ahead of the batch still to be reviewed would read as the end.
+            self._deps.emit(Notify(text="Nothing kept."))
+
+    # ----------------------------------------------------------- slash commands
+
+    async def _run_slash(self, command: CommandRun) -> None:
+        """`command.run`: the seven built-in slash commands.
+
+        The front-end parses `/name rest` and sends both halves; what ``rest``
+        means is each handler's business (a note, a level, a skill name,
+        nothing). Which conversation a session-scoped one acts on is named
+        explicitly rather than taken from the last `session.focus`, so a
+        destructive fold cannot be aimed at whatever the user switched to
+        between the keystroke and the frame arriving.
+
+        Three of them are slow — they call a model — and none may hold up the
+        dispatch loop, which has one socket behind it. So the gates that can be
+        checked cheaply are checked here, synchronously, and only the work goes
+        on a task (`_spawn`).
+        """
+        name = command.name.lstrip("/").strip()
+        args = command.args.strip()
+        if name in SLASH_COMMANDS:
+            # The frequency sort behind the front-end's "/" menu. Counted here
+            # because the table is the core's; nothing serves the counts back
+            # yet, and recording them anyway is what keeps that possible.
+            await self._deps.db(lambda conn: record_command_use(conn, name))
+        if name == "compact":
+            session = self._session_for_command(command)
+            if session is not None:
+                self._spawn(self._compact(session, args))
+            return
+        if name == "memorize":
+            if not args:
+                self._deps.emit(
+                    Notify(severity="warning", text="Usage: /memorize <note>")
+                )
+                return
+            session = self._session_for_command(command)
+            if session is not None:
+                self._spawn(self._memorize(session, args))
+            return
+        if name == "conclude":
+            session = self._session_for_command(command)
+            if session is not None:
+                self._spawn(self._conclude(session))
+            return
+        if name == "thinking":
+            self._thinking_command(command, args)
+            return
+        if name == "skills-list":
+            self._list_skills(command.session_id)
+            return
+        if name == "skill-remove":
+            self._remove_skill(command.session_id, args)
+            return
+        if name == "skill-creator":
+            # The one built-in with no core-side shape. It is a form — name,
+            # description, body, and which level to write at — and the model's
+            # draft is a head start inside that form, not an answer. There is
+            # no event that could carry a draft to a front-end and no way for
+            # the core to know what came back out of the editing, so the whole
+            # command belongs on the other side of the socket, ending in the
+            # `skill.save` this core already answers.
+            self._deps.emit(
+                Notify(
+                    severity="warning",
+                    text="/skill-creator is a form the front-end owns; the "
+                    "finished skill arrives as skill.save.",
+                )
+            )
+            return
+        self._deps.emit(
+            Notify(severity="warning", text=f"Unknown command: /{name}")
+        )
+
+    def _session_for_command(self, command: CommandRun):
+        """The conversation a session-scoped slash command acts on, or None.
+
+        None is already reported: either the command arrived without a session
+        (a front-end sending `/compact` with nothing open) or it names one that
+        has since been deleted, and both are refused the way every
+        un-carry-out-able command is — one warning, no state change.
+        """
+        if command.session_id is None:
+            self._deps.emit(
+                Notify(
+                    severity="warning",
+                    text=f"Open a session first — /{command.name} works on "
+                    "one conversation.",
+                )
+            )
+            return None
+        return self._known(command.session_id)
+
+    def _thinking_command(self, command: CommandRun, args: str) -> None:
+        """`/thinking [level]`: set the session's level, or say what there is.
+
+        With a level it is `thinking.set` typed instead of picked, and goes
+        through the same handler so the two cannot drift. Without one the
+        front-end is expected to put its own chooser up; the list is answered
+        anyway, because the levels and what they cost are the core's to know
+        and a client that has no chooser must still be able to find out.
+        """
+        if args:
+            session_id = command.session_id
+            if session_id is None:
+                self._deps.emit(
+                    Notify(
+                        severity="warning",
+                        text="Open a session first — thinking is per session.",
+                    )
+                )
+                return
+            self._set_thinking(session_id, args)
+            return
+        self._deps.emit(
+            Notify(
+                title="Thinking effort",
+                text="\n".join(
+                    f"• {level} — {EFFORT_HINTS.get(level, '')}"
+                    for level in EFFORTS
+                ),
+            )
+        )
+
+    def _list_skills(self, session_id: str | None) -> None:
+        """`/skills-list`: every skill the profile can see, and from where.
+
+        Profile-scoped, so it answers for the *session's* profile when one is
+        named and for the working profile otherwise — a user reading a session
+        that belongs to another profile is asking about that one's skills.
+
+        A `notify` with a heading rather than an event of its own: this is a
+        block of text with a title, which is exactly what `Notify.title`
+        exists for, and inventing an `inspect` event for one read-only listing
+        would put a screen shape in the protocol.
+        """
+        profile = self._profile_for(session_id)
+        visible = load_skills(profile, project_root=self._project_root)
+        if not visible:
+            self._deps.emit(
+                Notify(text=f"No skills for profile “{profile}”.")
+            )
+            return
+        lines = []
+        for skill in visible:
+            lines.append(f"• {skill.name}{SKILL_LEVEL_TAGS.get(skill.level, '')}")
+            if skill.description:
+                lines.append(f"    {skill.description}")
+        self._deps.emit(
+            Notify(title=f"Skills · profile “{profile}”", text="\n".join(lines))
+        )
+
+    def _remove_skill(self, session_id: str | None, args: str) -> None:
+        """`/skill-remove [name]`: delete one of this profile's own skills.
+
+        Named rather than picked, because a picker is a screen: with a name
+        this is `skill.delete` typed instead of chosen, and without one it
+        answers with what may be removed so that a front-end can offer the
+        choice — or a user can simply retype the command with a name.
+
+        Global (`_shared/`) and shipped skills are not offered and are refused
+        underneath as well: removing one would change every other profile that
+        sees it.
+        """
+        profile = self._profile_for(session_id)
+        if args:
+            self._memory.delete_profile_skill(profile, args)
+            return
+        removable = sorted(
+            {s.name for s in load_own_skills(profile)}
+            | {s.name for s in load_project_skills(project_root=self._project_root)}
+        )
+        if not removable:
+            self._deps.emit(
+                Notify(
+                    text=f"Profile “{profile}” has no skills of its own to "
+                    "remove.",
+                )
+            )
+            return
+        self._deps.emit(
+            Notify(
+                title="Removable skills",
+                text="\n".join(f"• {name}" for name in removable)
+                + "\n\nRemove one with /skill-remove <name>.",
+            )
+        )
+
+    async def _compact(self, session, guidance: str) -> None:
+        """`/compact [instruction]`: fold this conversation's history now.
+
+        The automatic fold waits for the window to fill and keeps the recent
+        turns verbatim, because it fires unasked. This one is asked for, so it
+        folds everything and takes the rest of the typed line as its brief —
+        material to preserve, or the step the user is about to take, which is
+        the same instruction from the summarizer's point of view.
+
+        **No `chat.reset`, and this is the one to be careful about.** A fold
+        looks like the rollback next to it and is not: `rollback_thread`
+        removes messages, so the rows drawn for them describe messages that no
+        longer exist and only a reset can un-draw them, whereas `compact_now`
+        writes a *view* — the stored history is untouched and every row on
+        screen still names a message the thread still has. Re-stating the chat
+        here would be the per-turn rebuild §4.2 exists to delete, in exchange
+        for nothing.
+
+        So what crosses is what changed: the summary the model will work from
+        (worth reading once — the user may have named what it had to keep, and
+        a small model does not always keep it), and the fill, because the last
+        measured count described the unfolded prompt.
+        """
+        session_id = session.session_id
+        if session_id in self._scheduler.pending_decisions():
+            # The thread is parked on an interrupt; rewriting the state under
+            # an unanswered decision is not something to do quietly.
+            self._deps.emit(
+                Notify(
+                    severity="warning",
+                    text=f"“{session.title}” is waiting on an approval — "
+                    "answer that first.",
+                )
+            )
+            return
+        self._working(session_id, "compacting context")
+        try:
+            folded = await compact_now(
+                self._graph,
+                session_id=session_id,
+                llm=self._backends.labelled_client(
+                    "compact", session_id=session_id
+                ),
+                guidance=guidance,
+            )
+        except Exception as e:
+            # Nothing was written: the thread is exactly as it was.
+            self._deps.emit(
+                Notify(severity="error", text=f"/compact failed: {e}")
+            )
+            return
+        finally:
+            self._working(session_id, "")
+        if folded is None:
+            self._deps.emit(
+                Notify(text="Nothing new to compact in this conversation.")
+            )
+            return
+        note = (
+            f"Context compacted: {folded['folded']} messages folded into a "
+            "summary."
+        )
+        if guidance:
+            note = f"{note} Asked to keep: {guidance}"
+        log = open_log(self._deps.settings, session)
+        if log is not None:
+            log.write("context compacted", f"{note}\n{folded['summary']['content']}")
+        # The measured count described the unfolded prompt, so it no longer
+        # describes what the next turn will send: drop it and re-derive the
+        # fill from the folded view, which `estimate_context` already accounts
+        # for.
+        self._backends.forget_session(session_id)
+        self._backends.estimate_context(
+            session_id, await self._thread_values(session_id)
+        )
+        self._deps.emit(
+            Notify(
+                title="Context compacted",
+                text=f"{note}\n\n{folded['summary']['content']}",
+                timeout=20,
+            )
+        )
+
+    async def _memorize(self, session, note: str) -> None:
+        """`/memorize <note>`: turn the note plus the conversation into
+        proposals, each of which still needs the user's approval (§5.3).
+
+        Session-scoped even though the note is the substance of it, because
+        the answer has to come back addressed: the proposals are held per
+        session and `memory.resolve` names one. A memory formed against no
+        conversation would have no id to be approved under.
+        """
+        messages = list((await self._thread_values(session.session_id)).get(
+            "messages", []
+        ))
+        await self._memory.propose_from_note(session, messages, note)
+
+    async def _conclude(self, session) -> None:
+        """`/conclude`: what is worth keeping from this conversation.
+
+        Two rounds, offered one after the other because a session holds one
+        unanswered set at a time: the model's self-review first, then the facts
+        the agent flagged mid-session with the `memory` tool (see
+        `_resolve_memory`, which starts the second). With nothing said and
+        nothing flagged there is nothing to review, and saying so is cheaper
+        than a generation that will propose nothing.
+        """
+        messages = list((await self._thread_values(session.session_id)).get(
+            "messages", []
+        ))
+        pending = self._memory.pending_edits(session.session_id)
+        if not messages and not pending:
+            self._deps.emit(
+                Notify(severity="warning", text="Nothing to conclude yet.")
+            )
+            return
+        proposed = None
+        if messages:
+            proposed = await self._memory.review_conversation(
+                session, messages, span="whole"
+            )
+        if proposed is None:
+            # No self-review to answer, so nothing will arrive later to start
+            # the flagged round: start it here instead.
+            proposed = self._memory.propose_flagged_edits(session)
+        if proposed is None:
+            self._deps.emit(
+                Notify(text="Nothing durable to keep from this conversation.")
+            )
+
+    def _profile_for(self, session_id: str | None) -> str:
+        """The profile a profile-scoped command means: the named session's,
+        else the one the core is working under.
+
+        A user reading a session that belongs to another profile is asking
+        about that profile's skills, not about the core's — the same reason
+        `_skill_named` resolves a forced skill against the session.
+        """
+        session = self._session(session_id)
+        return getattr(session, "profile", None) or self._deps.profile
+
+    def _working(self, session_id: str, activity: str) -> None:
+        """Say that a *command* is holding this session up, and since when.
+
+        The same event a turn reports with, deliberately: what the user has to
+        know is that the session is busy and for how long, not which part of
+        the core is busy on their behalf — `MemoryService._activity` says the
+        same for its own sub-agent calls. An empty label ends it.
+        """
+        self._deps.emit(
+            TurnActivity(
+                session_id=session_id,
+                activity=activity,
+                started_at=datetime.now(timezone.utc).isoformat(),
+            )
+        )
+
     # ---------------------------------------------------------------- helpers
+
+    @property
+    def _project_root(self) -> Any:
+        """Where project-level skills are read from. The memory service was
+        handed one so tests can pin it; the same one is used here rather than
+        asking the working directory a second time."""
+        return self._memory.project_root
 
     def _session(self, session_id: str | None):
         if session_id is None:
@@ -713,8 +1586,6 @@ class AgentService:
         """
         if not name:
             return None
-        from hpca.skills import load_skills
-
         profile = getattr(session, "profile", self._deps.profile)
         return next((s for s in load_skills(profile) if s.name == name), None)
 
@@ -779,7 +1650,6 @@ def build_service(
     with three real components and one fake.
     """
     from hpca.sessions import SessionStore
-    from hpca.skills import load_skills
 
     events: list = []
     service_ref: dict[str, AgentService] = {}
@@ -814,6 +1684,18 @@ def build_service(
         add_plan_tool(tools)
 
     backends = BackendRegistry(deps, sessions=sessions, llm=llm)
+    # Declared before the memory service, which needs to ask it a question
+    # (below) long before it exists.
+    scheduler_ref: dict[str, TurnScheduler] = {}
+
+    def busy_profiles() -> set[str]:
+        """Which profiles have a turn in flight — the memory service's half of
+        "may this profile be deleted". Read through a callable rather than
+        copied, because a stale copy would refuse a deletion that is now fine,
+        or allow one that is not."""
+        sched = scheduler_ref.get("scheduler")
+        return sched.busy_profiles() if sched is not None else set()
+
     memory = MemoryService(
         deps,
         # The two services disagree about whether a session is an object or an
@@ -826,10 +1708,9 @@ def build_service(
         backend_name=lambda s: backends.model_for(
             s.session_id if s is not None else None
         ),
+        busy_profiles=busy_profiles,
         tools=tools,
     )
-
-    scheduler_ref: dict[str, TurnScheduler] = {}
 
     def turn_session(session_id: str):
         """The session a turn belongs to, resolvable after the user has moved
@@ -843,10 +1724,7 @@ def build_service(
 
     def ctx_for_turn(session_id: str) -> ToolContext | None:
         sched = scheduler_ref.get("scheduler")
-        if sched is None:
-            return None
-        ts = sched._turns.get(session_id)
-        return ts.plan.ctx if ts is not None else None
+        return sched.tool_context(session_id) if sched is not None else None
 
     def skills_for(profile: str):
         """This profile's skills. Loaded per turn rather than read off the

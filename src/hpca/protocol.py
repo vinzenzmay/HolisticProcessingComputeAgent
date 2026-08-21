@@ -273,6 +273,22 @@ class SessionRow(_Model):
     # backend entry, because a label is all that is being drawn and shipping
     # the entry would put an api_key on the wire to render one.
     model: str = ""
+    # The session's thinking level (hpca.thinking), empty when it never chose
+    # one and follows the configured default.
+    #
+    # Here rather than in an event of its own, which was the other candidate
+    # for closing the "`ThinkingSet` is a command with no answer" gap. Three
+    # reasons, and the third is the deciding one. It is the same class of thing
+    # as `mode` — a per-session dial the core stores and the front-end changes
+    # — and `mode` is already here. Every path that can change it already
+    # restates the sidebar (`thinking.set`, `command.run` of `/thinking`, a new
+    # session, a fork), so an event would be a second announcement of a change
+    # that has just been announced. And a `thinking.changed` event could only
+    # ever describe the session that just changed, whereas the meter has to
+    # draw the level of whichever session is opened next: a session left on
+    # xhigh looks identical to one on off until the first wait, which is
+    # exactly the case the meter's `· think medium` exists to prevent.
+    thinking: str = ""
     # Render markers the core owns because it owns the state behind them —
     # "working", "decision pending". Open-ended: the UI ignores what it does
     # not know how to draw.
@@ -779,10 +795,35 @@ class TurnActivity(Event):
 
 
 class TurnUsage(Event):
+    """What the backend said the last decision cost, and how long it took.
+
+    ``prompt_tokens`` is what occupies the window; the completion is spent the
+    moment it is generated, which is why the two are different claims and only
+    the first moves the meter's fill.
+
+    The other two are the speed. They are carried as the pair rather than as a
+    ready-made rate because they are two different measurements: the token
+    count is the backend's, and the wall clock is ours — an OpenAI-style body
+    carries no timing at all, so `llm.LLMClient` times the request itself and
+    puts ``request_seconds`` in the same usage dict (see `llm.py`). Dividing
+    them is a rendering decision (the meter shows one decimal only where it
+    carries information), and a client that wants to show "3.4s for 210
+    tokens" instead cannot get that back out of a rate.
+
+    Both default to nothing, and a client must treat them that way: a session
+    restated after a backend switch has a prompt size and no fresh generation
+    behind it, and a backend that reports no completion count leaves the
+    speed unknown rather than zero.
+    """
+
     TYPE: ClassVar[str] = "turn.usage"
     session_id: str
     prompt_tokens: int
     max_model_len: int | None = None
+    completion_tokens: int = 0
+    # Seconds of wall clock around the request that produced them. None when
+    # nothing has been generated for this session yet.
+    request_seconds: float | None = None
 
 
 class TurnFinished(Event):
@@ -935,6 +976,17 @@ class Notify(Event):
     TYPE: ClassVar[str] = "notify"
     severity: Literal["information", "warning", "error"] = "information"
     text: str
+    # A headline for the body, or empty. Carried because a few of the core's
+    # answers are a heading plus a block — the skills a profile can see, a
+    # summary a `/compact` just wrote, the xhigh warning whose first clause has
+    # to land even if the paragraph under it is skimmed. Those are the toasts
+    # `tui/app.py` passed `title=` for, and without the field the heading would
+    # have to be glued onto the front of `text`, where a renderer can no longer
+    # tell it apart from the body it is meant to introduce.
+    #
+    # A hint like `timeout`: a front-end with nowhere to put a heading is free
+    # to ignore it, and none of these notifies is unreadable without one.
+    title: str = ""
     # Seconds to keep it up, or None for the renderer's default. Carried
     # because a few warnings — a matched past struggle, the memory budget, a
     # curation run — are ones the user is meant to actually read, and the core

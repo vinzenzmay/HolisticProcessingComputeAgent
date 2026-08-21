@@ -203,6 +203,14 @@ class MemoryService:
     def _cap(self) -> int:
         return self._settings().system_prompt_token_cap
 
+    @property
+    def project_root(self) -> Path | None:
+        """Where project-level skills are read from, or None for the working
+        directory. Public because the slash commands that list and remove
+        skills have to look in the same place this service writes them, and
+        two answers to "which project" would silently disagree in a test."""
+        return self._project_root
+
     # ------------------------------------------------------------ snapshots
 
     def snapshot(self, profile: str) -> Profile:

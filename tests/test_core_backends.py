@@ -552,6 +552,60 @@ class TestContextAccounting:
         folded = len("summary") + len("kept")
         assert h.estimates[-1].used == folded // CHARS_PER_TOKEN
 
+    def test_the_speed_rides_with_the_count_it_was_measured_beside(self, home):
+        # The meter's `· 14.2 tok/s`. Two numbers rather than a rate: the
+        # completion count is the backend's and the wall clock is ours (an
+        # OpenAI-style body has no timing), and dividing them is a rendering
+        # decision.
+        h = Harness(home)
+        session_id = h.session()
+        h.registry.note_usage(
+            session_id,
+            {"prompt_tokens": 700, "completion_tokens": 142, "request_seconds": 10.0},
+        )
+        assert (h.usages[-1].completion_tokens, h.usages[-1].request_seconds) == (
+            142,
+            10.0,
+        )
+
+    def test_a_backend_that_times_nothing_leaves_the_speed_unknown(self, home):
+        # Unknown, not zero: a client draws no rate rather than "0 tok/s".
+        h = Harness(home)
+        session_id = h.session()
+        h.registry.note_usage(session_id, {"prompt_tokens": 700})
+        assert (h.usages[-1].completion_tokens, h.usages[-1].request_seconds) == (
+            0,
+            None,
+        )
+
+    def test_the_last_speed_is_restated_with_the_fill(self, home):
+        # A re-open restates the measured count; the speed goes with it, so a
+        # client never has to remember which earlier frame it arrived in.
+        h = Harness(home)
+        session_id = h.session()
+        h.registry.note_usage(
+            session_id,
+            {"prompt_tokens": 700, "completion_tokens": 60, "request_seconds": 2.0},
+        )
+        h.registry.estimate_context(session_id, {"messages": [_msg("x" * 40)]})
+        assert h.usages[-1].completion_tokens == 60
+
+    def test_switching_backend_drops_the_old_models_speed(self, home):
+        # A rate measured on one model says nothing about another, and it
+        # would otherwise sit beside a fill restated for the new window.
+        h = Harness(home)
+        session_id = h.session(backend_a())
+        h.registry.note_usage(
+            session_id,
+            {"prompt_tokens": 700, "completion_tokens": 60, "request_seconds": 2.0},
+        )
+        h.registry.switch_backend(session_id, backend_b())
+        assert h.usages[-1].max_model_len == 2000  # the new window
+        assert (h.usages[-1].completion_tokens, h.usages[-1].request_seconds) == (
+            0,
+            None,
+        )
+
     def test_forgetting_a_session_drops_only_its_own_number(self, home):
         h = Harness(home)
         a, b = h.session(), h.session()

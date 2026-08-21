@@ -19,10 +19,26 @@ from hpca.config import Settings
 from hpca.core.service import build_service
 from hpca.db import connect, init_db
 from hpca.llm import ChatResponse
+from hpca.jobs import JobStore
+from hpca.memory_ops import MemoryOp
+from hpca.profiles import MemoryScope, Profile
 from hpca.protocol import (
     PROTOCOL_VERSION,
+    BackendSet,
+    Command,
+    CommandRun,
     ConfirmResolve,
     DecisionResolve,
+    JobCancel,
+    MemoryResolve,
+    ModeSet,
+    Notify,
+    ProcessKill,
+    ProfileCreate,
+    ProfileDelete,
+    ProfileDuplicate,
+    ProfileSave,
+    ProfileSet,
     SessionClose,
     SessionDelete,
     SessionFocus,
@@ -34,11 +50,18 @@ from hpca.protocol import (
     SessionRetitle,
     SessionRollback,
     Shutdown,
+    SkillDelete,
+    SkillSave,
+    ThinkingSet,
     TurnInterrupt,
     TurnSubmit,
     TurnUnqueue,
+    WatchDrop,
+    WatchPeek,
 )
 from hpca.sessions import SessionStore
+from hpca.skills import Skill, load_own_skills, write_skill
+from hpca.watches import KIND_JOB, KIND_LOG, WatchStore
 
 
 def respond(text="done"):
@@ -101,6 +124,42 @@ def service(home, conn, llm):
         llm=llm,
     )
     return built
+
+
+class FakeSlurm:
+    """Enough of a cluster to answer a cancel. Records what was asked."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.cancelled: list[str] = []
+        self._error = error
+
+    async def cancel(self, job_id: str) -> None:
+        if self._error is not None:
+            raise self._error
+        self.cancelled.append(job_id)
+
+
+@pytest.fixture
+def slurm():
+    return FakeSlurm()
+
+
+@pytest.fixture
+def cluster_service(home, conn, llm, slurm):
+    """The same runtime, with a cluster behind it — `job.cancel` needs one."""
+
+    async def db(fn):
+        return fn(conn)
+
+    return build_service(
+        settings=Settings.load(),
+        app_dir=home,
+        db=db,
+        conn=conn,
+        checkpointer=InMemorySaver(),
+        llm=llm,
+        slurm=slurm,
+    )
 
 
 @pytest.fixture
@@ -1776,6 +1835,868 @@ class TestConfirmations:
         )
 
 
+class TestTheTwoDials:
+    """`mode.set` and `thinking.set`: the per-session dials of §4.1.
+
+    Both are stored and then *restated as a sidebar row* rather than
+    acknowledged, which is what lets a second client see the change too.
+    """
+
+    async def test_a_mode_lands_on_the_row_and_in_the_store(
+        self, service, session, conn
+    ):
+        queue = subscribe(service)
+        await service.handle(
+            ModeSet(session_id=session.session_id, mode="full-auto")
+        )
+        assert only(await drain(queue), "SessionRows").rows[0].mode == "full-auto"
+        assert SessionStore(conn).get(session.session_id).mode == "full-auto"
+
+    async def test_a_mode_the_agent_does_not_have_is_refused(
+        self, service, session, conn
+    ):
+        # The wire carries a plain string because the set of modes is the
+        # agent's business; that is exactly why it has to be checked here.
+        queue = subscribe(service)
+        await service.handle(ModeSet(session_id=session.session_id, mode="yolo"))
+        events = await drain(queue)
+        assert kinds(events) == ["Notify"] and events[0].severity == "warning"
+        assert SessionStore(conn).get(session.session_id).mode == ""
+
+    async def test_setting_the_mode_of_a_session_that_is_gone_says_so(
+        self, service
+    ):
+        queue = subscribe(service)
+        await service.handle(ModeSet(session_id="gone", mode="auto"))
+        assert only(await drain(queue), "Notify").severity == "warning"
+
+    async def test_the_thinking_level_rides_the_sidebar_row(
+        self, service, session, conn
+    ):
+        # The meter's `· think medium` reads it from here: an event of its own
+        # could only describe the session that just changed, and the level of
+        # whichever session is opened next is what has to be drawn.
+        queue = subscribe(service)
+        await service.handle(
+            ThinkingSet(session_id=session.session_id, effort="medium")
+        )
+        events = await drain(queue)
+        assert only(events, "SessionRows").rows[0].thinking == "medium"
+        assert SessionStore(conn).get(session.session_id).thinking == "medium"
+        assert only(events, "Notify").severity == "information"
+
+    async def test_xhigh_says_that_it_does_not_work(self, service, session):
+        # Offered because the model advertises it, not because it is usable —
+        # and the headline is in the title so it lands even if the paragraph
+        # under it is skimmed.
+        queue = subscribe(service)
+        await service.handle(
+            ThinkingSet(session_id=session.session_id, effort="xhigh")
+        )
+        toast = only(await drain(queue), "Notify")
+        assert toast.severity == "warning"
+        assert "NOT USABLE" in toast.title
+        assert toast.timeout and toast.timeout > 10
+
+    async def test_a_level_the_served_model_has_never_heard_of_is_refused(
+        self, service, session, conn
+    ):
+        # There is no "high", however much the name suggests one (hpca.thinking).
+        queue = subscribe(service)
+        await service.handle(
+            ThinkingSet(session_id=session.session_id, effort="high")
+        )
+        assert only(await drain(queue), "Notify").severity == "warning"
+        assert SessionStore(conn).get(session.session_id).thinking == ""
+
+
+def entry(model="qwen3-32b", url="http://localhost:20001/v1"):
+    return {"model": model, "base_url": url}
+
+
+class TestBackendSet:
+    """One command, two operations, told apart by whether a session is named."""
+
+    async def test_one_session_is_pointed_at_another_model(
+        self, service, session, conn
+    ):
+        queue = subscribe(service)
+        await service.handle(
+            BackendSet(session_id=session.session_id, backend=entry())
+        )
+        events = await drain(queue)
+        assert only(events, "SessionRows").rows[0].model == "qwen3-32b"
+        # Stored as the blob, so the choice survives the catalog entry going.
+        assert "qwen3-32b" in SessionStore(conn).get(session.session_id).backend
+
+    async def test_it_is_refused_while_that_session_is_mid_reply(
+        self, service, session, conn, llm
+    ):
+        release = await park_turn(service, llm, session.session_id)
+        queue = subscribe(service)
+        await service.handle(
+            BackendSet(session_id=session.session_id, backend=entry())
+        )
+        assert only(await drain(queue), "Notify").severity == "warning"
+        assert SessionStore(conn).get(session.session_id).backend == ""
+        release.set()
+        await service.stop()
+
+    async def test_another_sessions_turn_does_not_block_it(
+        self, service, session, conn, llm
+    ):
+        # Clients are keyed per backend and checkpoints per thread, so nothing
+        # the other turn is holding is disturbed by this.
+        other = SessionStore(conn).create(profile="default", title="elsewhere")
+        release = await park_turn(service, llm, other.session_id)
+        queue = subscribe(service)
+        await service.handle(
+            BackendSet(session_id=session.session_id, backend=entry())
+        )
+        assert "SessionRows" in kinds(await drain(queue))
+        release.set()
+        await service.stop()
+
+    async def test_no_session_sets_the_default_and_catalogues_it(self, service):
+        # The global half writes the *settings*, so it outlives the run and
+        # decides what the next session is created against.
+        await service.handle(BackendSet(backend=entry()))
+        settings = service._deps.settings
+        assert settings.llm.model == "qwen3-32b"
+        assert any(b.model == "qwen3-32b" for b in settings.backends)
+
+    async def test_a_blob_the_settings_model_refuses_is_not_stored(
+        self, service, session, conn
+    ):
+        queue = subscribe(service)
+        await service.handle(
+            BackendSet(session_id=session.session_id, backend={"nonsense": 1})
+        )
+        assert only(await drain(queue), "Notify").severity == "error"
+        assert SessionStore(conn).get(session.session_id).backend == ""
+
+
+class TestProfiles:
+    async def test_the_working_profile_can_be_switched(self, service):
+        Profile.create("bioinformatics")
+        queue = subscribe(service)
+        await service.handle(ProfileSet(name="bioinformatics"))
+        events = await drain(queue)
+        assert service._deps.profile == "bioinformatics"
+        # `panel.update` is the one event that restates the working profile to
+        # a client that connected before the switch; `hello` only greets.
+        assert only(events, "PanelUpdate").profile == "bioinformatics"
+
+    async def test_a_profile_that_does_not_exist_is_refused(self, service):
+        queue = subscribe(service)
+        await service.handle(ProfileSet(name="ghost"))
+        assert only(await drain(queue), "Notify").severity == "warning"
+        assert service._deps.profile == "default"
+
+    async def test_one_is_created_and_then_copied(self, service):
+        await service.handle(ProfileCreate(name="bioinformatics"))
+        assert "bioinformatics" in Profile.list_profiles()
+        await service.handle(
+            ProfileDuplicate(name="rnaseq", source="bioinformatics")
+        )
+        assert "rnaseq" in Profile.list_profiles()
+
+    async def test_a_name_that_collides_is_refused_in_the_stores_words(
+        self, service
+    ):
+        queue = subscribe(service)
+        await service.handle(ProfileCreate(name="default"))
+        toast = only(await drain(queue), "Notify")
+        assert toast.severity == "warning" and "already exists" in toast.text
+
+    async def test_a_memory_file_edited_in_the_editor_is_written_back(
+        self, service
+    ):
+        await service.handle(
+            ProfileSave(
+                name="default",
+                kind="memories",
+                text="## [rag]\n- the cohort lives in /data/cohort\n",
+            )
+        )
+        assert any(
+            "/data/cohort" in m.text for m in Profile.load("default").memories
+        )
+
+    async def test_deleting_moves_its_sessions_to_the_default(
+        self, service, conn
+    ):
+        Profile.create("bioinformatics")
+        moved = SessionStore(conn).create(
+            profile="bioinformatics", title="theirs"
+        )
+        queue = subscribe(service)
+        await service.handle(ProfileDelete(name="bioinformatics"))
+        rows = {
+            r.session_id: r
+            for r in only(await drain(queue), "SessionRows").rows
+        }
+        assert rows[moved.session_id].profile == "default"
+        assert "bioinformatics" not in Profile.list_profiles()
+
+    async def test_the_default_profile_cannot_be_deleted(self, service):
+        # It is where a deleted profile's sessions land, so removing it would
+        # leave them pointing at nothing.
+        queue = subscribe(service)
+        await service.handle(ProfileDelete(name="default"))
+        assert only(await drain(queue), "Notify").severity == "warning"
+        assert "default" in Profile.list_profiles()
+
+    async def test_a_profile_with_a_reply_in_progress_is_kept(
+        self, service, conn, llm
+    ):
+        Profile.create("bioinformatics")
+        busy = SessionStore(conn).create(
+            profile="bioinformatics", title="working"
+        )
+        release = await park_turn(service, llm, busy.session_id)
+        queue = subscribe(service)
+        await service.handle(ProfileDelete(name="bioinformatics"))
+        toast = only(await drain(queue), "Notify")
+        assert toast.severity == "warning" and "reply in progress" in toast.text
+        assert "bioinformatics" in Profile.list_profiles()
+        release.set()
+        await service.stop()
+
+    async def test_a_profile_with_a_live_subprocess_is_kept(
+        self, service, conn
+    ):
+        import os
+
+        Profile.create("bioinformatics")
+        owner = SessionStore(conn).create(
+            profile="bioinformatics", title="scripted"
+        )
+        # This process: `running_session_ids` verifies the pid against the OS,
+        # so a made-up one would be treated as the stale row it looks like.
+        conn.execute(
+            "INSERT INTO processes (pid, session_id, name, state) "
+            "VALUES (?, ?, ?, 'running')",
+            (os.getpid(), owner.session_id, "align.sh"),
+        )
+        conn.commit()
+        queue = subscribe(service)
+        await service.handle(ProfileDelete(name="bioinformatics"))
+        assert "sub-process" in only(await drain(queue), "Notify").text
+        assert "bioinformatics" in Profile.list_profiles()
+
+
+class TestSkillFiles:
+    async def test_a_skill_is_written_into_the_profiles_own_directory(
+        self, service
+    ):
+        await service.handle(
+            SkillSave(
+                profile="default",
+                name="qc-report",
+                text="---\nname: qc-report\ndescription: run QC\n---\n\nsteps\n",
+            )
+        )
+        assert [s.name for s in load_own_skills("default")] == ["qc-report"]
+
+    async def test_saving_without_a_body_is_refused(self, service):
+        # The shape is shared with `skill.delete`, where a body is meaningless.
+        queue = subscribe(service)
+        await service.handle(SkillSave(profile="default", name="qc-report"))
+        assert only(await drain(queue), "Notify").severity == "warning"
+        assert load_own_skills("default") == []
+
+    async def test_one_of_the_profiles_own_is_deleted(self, service):
+        write_skill(
+            Skill(name="qc-report", description="run QC", triggers=[], body="s"),
+            "default",
+        )
+        await service.handle(SkillDelete(profile="default", name="qc-report"))
+        assert load_own_skills("default") == []
+
+    async def test_deleting_one_that_is_not_there_says_so(self, service):
+        queue = subscribe(service)
+        await service.handle(SkillDelete(profile="default", name="ghost"))
+        assert only(await drain(queue), "Notify").severity == "warning"
+
+
+class TestWatchBoxes:
+    async def test_peeking_a_log_answers_with_its_tail(
+        self, service, session, conn, home
+    ):
+        log = home / "train.log"
+        log.write_text("epoch 4/10\nloss 0.31\n")
+        watch = WatchStore(conn).add(
+            kind=KIND_LOG, target=str(log), label="train.log",
+            session_id=session.session_id,
+        )
+        queue = subscribe(service)
+        await service.handle(WatchPeek(watch_id=watch.id))
+        peeked = only(await drain(queue), "WatchPeeked")
+        # Named, because two peeks can cross and a bare string of text could
+        # then be attributed to the wrong box.
+        assert peeked.watch_id == watch.id and peeked.title == "train.log"
+        assert "loss 0.31" in peeked.text
+
+    async def test_a_log_that_cannot_be_read_answers_in_the_text(
+        self, service, session, conn, home
+    ):
+        # What happened to the log is exactly what the user asked; it belongs
+        # where the tail would have been, not in an error.
+        watch = WatchStore(conn).add(
+            kind=KIND_LOG, target=str(home / "never-written.log"),
+            session_id=session.session_id,
+        )
+        queue = subscribe(service)
+        await service.handle(WatchPeek(watch_id=watch.id))
+        assert "could not read" in only(await drain(queue), "WatchPeeked").text
+
+    async def test_peeking_a_job_answers_with_its_state_and_output(
+        self, service, session, conn, home
+    ):
+        out = home / "slurm-42.out"
+        out.write_text("srun: step 1 done\n")
+        JobStore(conn).add(
+            job_id="42", kind="sbatch", session_id=session.session_id,
+            profile="default", script_key="align", stdout_path=str(out),
+            stderr_path="",
+        )
+        watch = WatchStore(conn).add(
+            kind=KIND_JOB, target="42", label="job 42",
+            session_id=session.session_id,
+        )
+        WatchStore(conn).update(watch.id, state="RUNNING")
+        queue = subscribe(service)
+        await service.handle(WatchPeek(watch_id=watch.id))
+        text = only(await drain(queue), "WatchPeeked").text
+        assert "RUNNING" in text and "step 1 done" in text
+
+    async def test_peeking_a_box_that_is_gone_says_so(self, service):
+        queue = subscribe(service)
+        await service.handle(WatchPeek(watch_id=404))
+        assert only(await drain(queue), "Notify").severity == "warning"
+
+    async def test_dropping_removes_the_box_and_repaints_the_column(
+        self, service, session, conn, home
+    ):
+        service._deps.focused_session_id = session.session_id
+        watch = WatchStore(conn).add(
+            kind=KIND_LOG, target=str(home / "train.log"), label="train.log",
+            session_id=session.session_id,
+        )
+        queue = subscribe(service)
+        await service.handle(WatchDrop(watch_id=watch.id))
+        events = await drain(queue)
+        assert WatchStore(conn).get(watch.id) is None
+        assert only(events, "PanelUpdate").rows == []
+
+    async def test_dropping_a_box_that_is_gone_says_so(self, service):
+        queue = subscribe(service)
+        await service.handle(WatchDrop(watch_id=404))
+        assert only(await drain(queue), "Notify").severity == "warning"
+
+
+class TestRunningWork:
+    """`process.kill` and `job.cancel` — stopping what the agent started."""
+
+    def _row(self, conn, session_id, pid, state="running"):
+        conn.execute(
+            "INSERT INTO processes (pid, session_id, name, state) "
+            "VALUES (?, ?, 'align.sh', ?)",
+            (pid, session_id, state),
+        )
+        conn.commit()
+
+    async def test_a_process_no_runner_owns_is_killed_and_its_row_settled(
+        self, service, session, conn
+    ):
+        # A background script from an earlier turn outlives the runner that
+        # started it, so there is no monitor left to notice the signal — and
+        # without settling the row the history would claim it runs forever.
+        self._row(conn, session.session_id, 999_999)
+        queue = subscribe(service)
+        await service.handle(ProcessKill(pid=999_999))
+        assert only(await drain(queue), "Notify").severity == "information"
+        state = conn.execute(
+            "SELECT state FROM processes WHERE pid = 999999"
+        ).fetchone()["state"]
+        assert state == "killed"
+
+    async def test_the_runner_that_started_it_is_preferred(
+        self, service, session, conn
+    ):
+        # Its monitor is what records how the process ended, so a kill it can
+        # see settles the row properly instead of racing an UPDATE with it.
+        class FakeRunner:
+            def __init__(self):
+                self.killed = []
+
+            def owns(self, pid):
+                return True
+
+            async def kill(self, pid):
+                self.killed.append(pid)
+
+            async def wait(self, pid):
+                return None
+
+        class FakeCtx:
+            pass
+
+        ctx, runner = FakeCtx(), FakeRunner()
+        ctx.runner = runner
+        service._scheduler.tool_context = lambda session_id: ctx
+        self._row(conn, session.session_id, 999_998)
+        await service.handle(ProcessKill(pid=999_998))
+        assert runner.killed == [999_998]
+
+    async def test_a_pid_with_no_row_says_so(self, service):
+        queue = subscribe(service)
+        await service.handle(ProcessKill(pid=999_997))
+        assert only(await drain(queue), "Notify").severity == "warning"
+
+    async def test_a_process_that_already_ended_is_left_alone(
+        self, service, session, conn
+    ):
+        self._row(conn, session.session_id, 999_996, state="exited")
+        queue = subscribe(service)
+        await service.handle(ProcessKill(pid=999_996))
+        toast = only(await drain(queue), "Notify")
+        assert toast.severity == "warning" and "exited" in toast.text
+
+    async def test_a_job_is_cancelled_and_marked_provisionally(
+        self, cluster_service, conn, slurm, session
+    ):
+        # scancel returns before the scheduler has acted; sacct confirms it on
+        # the next poll, and until then CANCELLING is the honest answer.
+        JobStore(conn).add(
+            job_id="42", kind="sbatch", session_id=session.session_id,
+            profile="default", script_key="align", stdout_path="",
+            stderr_path="",
+        )
+        queue = subscribe(cluster_service)
+        await cluster_service.handle(JobCancel(job_id="42"))
+        assert slurm.cancelled == ["42"]
+        assert JobStore(conn).get("42").state == "CANCELLING"
+        assert "Notify" in kinds(await drain(queue))
+
+    async def test_a_failed_cancel_leaves_the_state_alone(
+        self, home, conn, llm, session
+    ):
+        async def db(fn):
+            return fn(conn)
+
+        service = build_service(
+            settings=Settings.load(), app_dir=home, db=db, conn=conn,
+            checkpointer=InMemorySaver(), llm=llm,
+            slurm=FakeSlurm(error=RuntimeError("scancel failed: no such job")),
+        )
+        JobStore(conn).add(
+            job_id="42", kind="sbatch", session_id=session.session_id,
+            profile="default", script_key="align", stdout_path="",
+            stderr_path="",
+        )
+        queue = subscribe(service)
+        await service.handle(JobCancel(job_id="42"))
+        assert only(await drain(queue), "Notify").severity == "error"
+        assert JobStore(conn).get("42").state == "SUBMITTED"
+
+    async def test_cancelling_without_a_cluster_says_so(self, service):
+        queue = subscribe(service)
+        await service.handle(JobCancel(job_id="42"))
+        assert only(await drain(queue), "Notify").severity == "warning"
+
+
+def proposals(*texts, scope="rag"):
+    return json.dumps(
+        {
+            "proposals": [
+                {"scope": scope, "kind": "fact", "text": text} for text in texts
+            ]
+        }
+    )
+
+
+class TestMemoryReview:
+    """`/memorize`, `/conclude` and the `memory.resolve` that answers them."""
+
+    async def test_a_note_becomes_proposals_and_only_the_approved_are_written(
+        self, service, session, llm
+    ):
+        await run_turn(service, session.session_id, "how many reads?")
+        llm._outputs = [proposals("the cohort is in /data/cohort", "not this")]
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(
+                name="memorize",
+                args="where the cohort lives",
+                session_id=session.session_id,
+            )
+        )
+        offer = only(await wait_for(queue, "MemoryProposals"), "MemoryProposals")
+        assert [p.text for p in offer.proposals] == [
+            "the cohort is in /data/cohort",
+            "not this",
+        ]
+        # Positional, and a short answer rejects the rest: an answer that never
+        # arrived is not an approval.
+        await service.handle(
+            MemoryResolve(session_id=session.session_id, approved=[True])
+        )
+        kept = [m.text for m in Profile.load("default").memories]
+        assert "the cohort is in /data/cohort" in kept
+        assert "not this" not in kept
+
+    async def test_the_answer_cannot_carry_a_memory_of_its_own(self):
+        # The authoritative objects never leave the core, so there is nowhere
+        # in the answer for an edited memory to ride back in.
+        assert set(MemoryResolve.model_fields) == {"session_id", "approved"}
+
+    async def test_memorize_without_a_note_says_what_it_wants(
+        self, service, session
+    ):
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(name="memorize", session_id=session.session_id)
+        )
+        toast = only(await drain(queue), "Notify")
+        assert toast.severity == "warning" and "Usage" in toast.text
+
+    async def test_an_answer_to_nothing_is_a_stale_screen_not_an_error(
+        self, service, session
+    ):
+        queue = subscribe(service)
+        await service.handle(
+            MemoryResolve(session_id=session.session_id, approved=[True])
+        )
+        assert only(await drain(queue), "Notify").severity == "warning"
+
+    async def test_conclude_reviews_the_conversation(
+        self, service, session, llm
+    ):
+        await run_turn(service, session.session_id, "how many reads?")
+        llm._outputs = [
+            json.dumps(
+                {
+                    "proposals": [
+                        {"kind": "memory", "text": "samtools is at /opt/bin",
+                         "scope": "rag"}
+                    ]
+                }
+            )
+        ]
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(name="conclude", session_id=session.session_id)
+        )
+        offer = only(await wait_for(queue, "MemoryProposals"), "MemoryProposals")
+        assert offer.proposals[0].text == "samtools is at /opt/bin"
+
+    async def test_the_flagged_batch_is_offered_once_the_review_is_answered(
+        self, service, session, llm
+    ):
+        # Two rounds of one pass: a session holds one unanswered set at a time,
+        # so a second offer alongside the first would overwrite it.
+        await run_turn(service, session.session_id, "how many reads?")
+        service._memory.queue_edits(
+            session.session_id,
+            [MemoryOp(op="add", scope=MemoryScope.RAG, text="flagged fact")],
+        )
+        llm._outputs = [
+            json.dumps(
+                {
+                    "proposals": [
+                        {"kind": "memory", "text": "reviewed fact", "scope": "rag"}
+                    ]
+                }
+            )
+        ]
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(name="conclude", session_id=session.session_id)
+        )
+        await wait_for(queue, "MemoryProposals")
+        await service.handle(
+            MemoryResolve(session_id=session.session_id, approved=[True])
+        )
+        second = only(await drain(queue), "MemoryProposals")
+        assert "flagged fact" in second.proposals[0].text
+        await service.handle(
+            MemoryResolve(session_id=session.session_id, approved=[True])
+        )
+        kept = [m.text for m in Profile.load("default").memories]
+        assert {"reviewed fact", "flagged fact"} <= set(kept)
+
+    async def test_a_conversation_with_nothing_in_it_is_not_reviewed(
+        self, service, session, llm
+    ):
+        # Cheaper than a generation that will propose nothing.
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(name="conclude", session_id=session.session_id)
+        )
+        toast = only(await wait_for(queue, "Notify"), "Notify")
+        assert toast.severity == "warning" and "Nothing to conclude" in toast.text
+
+
+class TestCompact:
+    """`/compact`: fold the history, and — deliberately — do not reset the chat."""
+
+    async def test_the_thread_is_folded_and_the_summary_reported(
+        self, service, session, llm
+    ):
+        await run_turn(service, session.session_id, "how many reads?")
+        llm._outputs = ["we counted the reads in the cohort"]
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(name="compact", session_id=session.session_id)
+        )
+        events = await wait_for(queue, "Notify")
+        toast = [e for e in events if type(e).__name__ == "Notify"][-1]
+        assert toast.title == "Context compacted"
+        assert "we counted the reads in the cohort" in toast.text
+        values = await service._thread_values(session.session_id)
+        assert values["compacted"]["upto"] > 0
+
+    async def test_the_chat_is_not_re_stated(self, service, session, llm):
+        # The rollback next to it removes messages, so only a reset can
+        # un-draw their rows. A fold writes a *view*: the stored history is
+        # untouched and every row on screen still names a message the thread
+        # has, so a reset here would be the per-turn rebuild §4.2 deletes.
+        await run_turn(service, session.session_id, "how many reads?")
+        llm._outputs = ["a summary"]
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(name="compact", session_id=session.session_id)
+        )
+        events = await wait_for(queue, "Notify")
+        assert "ChatReset" not in kinds(events)
+        # The fill is restated, though: the measured count described the
+        # unfolded prompt.
+        assert "ContextEstimate" in kinds(events)
+
+    async def test_the_instruction_after_the_command_steers_the_summary(
+        self, service, session, llm
+    ):
+        await run_turn(service, session.session_id, "how many reads?")
+        llm._outputs = ["a summary"]
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(
+                name="compact",
+                args="keep the QC findings",
+                session_id=session.session_id,
+            )
+        )
+        events = await wait_for(queue, "Notify")
+        toast = [e for e in events if type(e).__name__ == "Notify"][-1]
+        assert "keep the QC findings" in toast.text
+        assert "keep the QC findings" in llm.prompts[-1][0]["content"]
+
+    async def test_a_session_parked_on_an_approval_is_not_folded(
+        self, service, session, llm
+    ):
+        # Rewriting the thread's state under an unanswered decision is not
+        # something to do quietly. (The gate M5a left in place.)
+        await run_turn(service, session.session_id, "how many reads?")
+        service._scheduler._decisions[session.session_id] = {"tool": "run_bash"}
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(name="compact", session_id=session.session_id)
+        )
+        toast = only(await wait_for(queue, "Notify"), "Notify")
+        assert toast.severity == "warning" and "approval" in toast.text
+        values = await service._thread_values(session.session_id)
+        assert not values.get("compacted")
+
+    async def test_an_empty_conversation_has_nothing_to_fold(
+        self, service, session
+    ):
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(name="compact", session_id=session.session_id)
+        )
+        assert "Nothing new to compact" in only(
+            await wait_for(queue, "Notify"), "Notify"
+        ).text
+
+    async def test_a_fold_that_fails_leaves_the_thread_as_it_was(
+        self, service, session, llm
+    ):
+        await run_turn(service, session.session_id, "how many reads?")
+
+        async def broken(messages, **kwargs):
+            raise RuntimeError("the backend went away")
+
+        llm.chat = broken
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(name="compact", session_id=session.session_id)
+        )
+        assert only(await wait_for(queue, "Notify"), "Notify").severity == "error"
+        values = await service._thread_values(session.session_id)
+        assert not values.get("compacted")
+
+    async def test_it_does_not_hold_up_the_next_command(
+        self, service, session, llm
+    ):
+        # A summary is a generation; a dispatch that awaited it would stall
+        # every command queued behind it on the same socket.
+        await run_turn(service, session.session_id, "hello")
+        import asyncio
+
+        release = asyncio.Event()
+        answer = llm.chat
+
+        async def gated(messages, **kwargs):
+            await release.wait()
+            return await answer(messages, **kwargs)
+
+        llm.chat = gated
+        await service.handle(
+            CommandRun(name="compact", session_id=session.session_id)
+        )
+        queue = subscribe(service)
+        await service.handle(SessionList())
+        assert "SessionRows" in kinds(await drain(queue))
+        release.set()
+        await service.stop()
+
+
+class TestTheOtherSlashCommands:
+    async def test_thinking_with_a_level_sets_it(self, service, session, conn):
+        # `/thinking low` is `thinking.set` typed instead of picked, and goes
+        # through the same handler so the two cannot drift.
+        await service.handle(
+            CommandRun(name="thinking", args="low", session_id=session.session_id)
+        )
+        assert SessionStore(conn).get(session.session_id).thinking == "low"
+
+    async def test_thinking_without_one_says_what_there_is(
+        self, service, session
+    ):
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(name="thinking", session_id=session.session_id)
+        )
+        toast = only(await drain(queue), "Notify")
+        assert toast.title == "Thinking effort"
+        for level in ("off", "low", "medium", "xhigh"):
+            assert level in toast.text
+
+    async def test_skills_list_names_every_level_it_can_see(
+        self, service, session
+    ):
+        write_skill(
+            Skill(name="qc-report", description="run QC", triggers=[], body="s"),
+            "default",
+        )
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(name="skills-list", session_id=session.session_id)
+        )
+        toast = only(await drain(queue), "Notify")
+        assert "Skills · profile “default”" == toast.title
+        assert "qc-report" in toast.text and "run QC" in toast.text
+        # The built-ins ship with hpca and are marked as not the profile's own.
+        assert "(built-in)" in toast.text
+
+    async def test_skills_list_answers_for_the_sessions_own_profile(
+        self, service, conn
+    ):
+        Profile.create("bioinformatics")
+        theirs = SessionStore(conn).create(
+            profile="bioinformatics", title="theirs"
+        )
+        write_skill(
+            Skill(name="cohort-qc", description="qc", triggers=[], body="s"),
+            "bioinformatics",
+        )
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(name="skills-list", session_id=theirs.session_id)
+        )
+        toast = only(await drain(queue), "Notify")
+        assert "bioinformatics" in toast.title and "cohort-qc" in toast.text
+
+    async def test_skill_remove_with_a_name_deletes_it(self, service, session):
+        write_skill(
+            Skill(name="qc-report", description="run QC", triggers=[], body="s"),
+            "default",
+        )
+        await service.handle(
+            CommandRun(
+                name="skill-remove", args="qc-report", session_id=session.session_id
+            )
+        )
+        assert load_own_skills("default") == []
+
+    async def test_skill_remove_without_one_offers_what_may_go(
+        self, service, session
+    ):
+        # Global and shipped skills are not offered: removing one would change
+        # every other profile that sees it.
+        write_skill(
+            Skill(name="qc-report", description="run QC", triggers=[], body="s"),
+            "default",
+        )
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(name="skill-remove", session_id=session.session_id)
+        )
+        toast = only(await drain(queue), "Notify")
+        assert "qc-report" in toast.text
+        assert "read_skill" not in toast.text
+
+    async def test_skill_creator_belongs_to_the_front_end(self, service, session):
+        # It is a form, and no event can carry a draft into one; what comes
+        # back out of the editing arrives as `skill.save`.
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(name="skill-creator", args="watch a jupyter run")
+        )
+        toast = only(await drain(queue), "Notify")
+        assert toast.severity == "warning" and "skill.save" in toast.text
+
+    async def test_a_session_scoped_command_with_no_session_says_so(
+        self, service
+    ):
+        queue = subscribe(service)
+        await service.handle(CommandRun(name="compact"))
+        assert only(await drain(queue), "Notify").severity == "warning"
+
+    async def test_a_session_scoped_command_naming_a_gone_session_says_so(
+        self, service
+    ):
+        queue = subscribe(service)
+        await service.handle(CommandRun(name="conclude", session_id="gone"))
+        assert "That session is gone." == only(await drain(queue), "Notify").text
+
+    async def test_an_unknown_slash_command_is_reported(self, service, session):
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(name="frobnicate", session_id=session.session_id)
+        )
+        toast = only(await drain(queue), "Notify")
+        assert toast.severity == "warning" and "frobnicate" in toast.text
+
+    async def test_a_recognised_command_is_counted_for_the_menus_sort(
+        self, service, session, conn
+    ):
+        from hpca.db import command_use_counts
+
+        await service.handle(
+            CommandRun(name="skills-list", session_id=session.session_id)
+        )
+        await service.handle(
+            CommandRun(name="frobnicate", session_id=session.session_id)
+        )
+        counts = command_use_counts(conn)
+        assert counts.get("skills-list") == 1
+        # An unknown one must not teach the menu a name nothing can run.
+        assert "frobnicate" not in counts
+
+
 class TestRobustness:
     async def test_a_command_that_fails_is_a_notify_not_an_exception(
         self, service, session, monkeypatch
@@ -1794,13 +2715,17 @@ class TestRobustness:
             type(e).__name__ == "Notify" and "on fire" in e.text for e in events
         )
 
-    async def test_a_command_with_no_handler_yet_is_reported(self, service):
-        # Most of §4.1 is not dispatched yet. Silence would let a front-end
-        # wait forever for something that was never going to happen, so an
-        # unhandled command must say so.
+    async def test_a_command_with_no_handler_is_reported(self, service):
+        # §4.1 is dispatched in full now, so the fallback needs a command from
+        # outside it to be reached at all. It still has to exist: silence would
+        # let a front-end wait forever for something that was never going to
+        # happen.
+        class Unheard(Command):
+            pass  # no TYPE, so it claims no place in the registry
+
         queue = subscribe(service)
-        await service.handle(Shutdown.model_construct(TYPE="shutdown"))
-        await service.stop()
+        await service.handle(Unheard())
+        assert only(await drain(queue), "Notify").severity == "warning"
 
     async def test_answering_a_decision_nobody_is_parked_on_is_harmless(
         self, service

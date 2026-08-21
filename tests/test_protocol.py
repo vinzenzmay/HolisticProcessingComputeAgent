@@ -44,6 +44,7 @@ from hpca.protocol import (
     TurnSubmit,
     TurnUnqueue,
     TurnUnqueued,
+    TurnUsage,
     WatchPeek,
     WatchPeeked,
     decode,
@@ -373,6 +374,25 @@ class TestPayloadShapes:
         # exactly what the absence means.
         assert SessionRow(session_id="s1", title="a session").model == ""
 
+    def test_a_session_row_carries_the_thinking_level_too(self):
+        # The other per-session dial, on the same row as `mode` rather than in
+        # an event of its own: the meter has to draw the level of whatever
+        # session is opened next, and an event could only ever describe the one
+        # that just changed (see `protocol.SessionRow.thinking`).
+        row = SessionRow(session_id="s1", title="a session", thinking="medium")
+        assert parse(decode(encode(SessionRows(rows=[row]).to_envelope()))).rows == [
+            row
+        ]
+
+    def test_a_session_that_never_chose_a_level_says_nothing(self):
+        # Empty, not the configured default: the row reports what the session
+        # chose, and "it follows the setting" is what the absence means.
+        assert SessionRow(session_id="s1", title="a session").thinking == ""
+
+    def test_no_event_competes_with_the_row_for_the_thinking_level(self):
+        # One source, or two clients disagree about which is authoritative.
+        assert not [name for name in EVENTS if name.startswith("thinking.")]
+
     def test_an_entry_needs_only_a_kind_and_text(self):
         entry = Entry(kind="user", text="hi")
         assert (entry.steps, entry.reasoning_chars, entry.parts) == (0, 0, [])
@@ -620,6 +640,52 @@ class TestChatAddressing:
         # message at all.
         folded = Entry(kind="thinking", text="…", seq=3)
         assert (folded.seq, folded.index) == (3, -1)
+
+
+class TestTheMeter:
+    """What `turn.usage` has to carry for the context meter to be drawable."""
+
+    def test_it_carries_the_speed_as_two_measurements_not_a_rate(self):
+        # Two different claims: the token count is the backend's, the wall
+        # clock is ours (an OpenAI-style body carries no timing, so the client
+        # times the request). Dividing them is the renderer's decision, and a
+        # rate cannot be turned back into "3.4s for 210 tokens".
+        usage = TurnUsage(
+            session_id="s1",
+            prompt_tokens=12_000,
+            max_model_len=32_768,
+            completion_tokens=210,
+            request_seconds=3.4,
+        )
+        back = parse(decode(encode(usage.to_envelope())))
+        assert back == usage
+        assert back.completion_tokens / back.request_seconds == pytest.approx(61.76, abs=0.1)
+
+    def test_a_prompt_size_with_no_generation_behind_it_still_parses(self):
+        # A session restated after a backend switch has a window and a prompt
+        # size and nothing generated since; the speed is unknown, not zero.
+        usage = TurnUsage(session_id="s1", prompt_tokens=12_000)
+        assert (usage.completion_tokens, usage.request_seconds) == (0, None)
+        assert parse(decode(encode(usage.to_envelope()))) == usage
+
+
+class TestNotifyTitle:
+    def test_a_toast_can_carry_a_headline_over_its_body(self):
+        # The core's longer answers are a heading plus a block — a profile's
+        # skills, a summary /compact just wrote — and glueing the heading onto
+        # the front of `text` loses the renderer's ability to tell them apart.
+        toast = Notify(
+            severity="warning",
+            title="Thinking: xhigh — NOT USABLE",
+            text="any turn that writes a file is likely to be lost…",
+            timeout=25,
+        )
+        assert parse(decode(encode(toast.to_envelope()))) == toast
+
+    def test_most_toasts_have_no_title(self):
+        # A hint, like `timeout`: one line of news needs no heading, and a
+        # front-end with nowhere to put one may ignore it.
+        assert Notify(text="Deleted “notes”").title == ""
 
 
 class TestWireFormat:

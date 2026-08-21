@@ -148,6 +148,11 @@ class BackendRegistry:
         # context, so this can never be one number.
         self._discovered_window: int | None = None
         self._context_used: dict[str, int] = {}
+        # The last generation each session paid for: (completion tokens, wall
+        # clock). Kept beside the prompt size rather than divided into a rate
+        # here, because the protocol carries both (`protocol.TurnUsage`) and
+        # this is the only place that has them.
+        self._last_generation: dict[str, tuple[int, float]] = {}
         self._closed = False
 
     # ------------------------------------------------------------- clients
@@ -320,9 +325,52 @@ class BackendRegistry:
         if self.sessions is not None:
             self.sessions.set_backend(session_id, blob)
         self._deps.emit(Notify(text=f"This session now uses {backend.model}"))
+        # A rate measured on the old model says nothing about the new one, and
+        # leaving it beside a restated fill would attribute one backend's speed
+        # to another. The prompt size survives: it counts the same thread.
+        self._last_generation.pop(session_id, None)
         # A different backend is a different window, so the fill this session
         # was showing describes the wrong denominator until it is restated.
         self._emit_estimate(session_id)
+        return True
+
+    async def set_default(
+        self, backend: LLMBackend, *, busy: bool = False
+    ) -> bool:
+        """Make one backend the default — what every un-pinned session uses.
+
+        The other half of `backend.set` (`switch_backend` is the per-session
+        one), and a different operation rather than the same one with a wider
+        blast radius: this writes the *settings*, so it outlives the run and
+        decides what the next session is created against, while a session
+        switch only rewrites one row.
+
+        Added to the catalog if it is not in it, for the same reason
+        `ensure_catalog` does it on the auto-connect path: a backend that is
+        active but unlisted is one the picker cannot show the user as chosen.
+        Its port and key are remembered too, so a later scan finds it first.
+
+        ``busy`` is whether ANY turn is in flight, because the client this
+        replaces is the one every un-pinned session is talking through.
+        Announced regardless of whether the rebuild happened: what was said is
+        that this endpoint is now the default, and a rebuild deferred by a
+        running turn (or skipped for an injected client) leaves that true — it
+        only delays which client speaks it, exactly as `auto_activate` argues.
+        """
+        settings = self._deps.settings
+        if not any(
+            entry.base_url == backend.base_url and entry.model == backend.model
+            for entry in settings.backends
+        ):
+            settings.backends.append(backend)
+        settings.activate_backend(backend)
+        settings.remember_llm_ports([backend.base_url])
+        settings.remember_llm_key(backend.api_key)
+        settings.save()
+        await self.reload(busy=busy)
+        self._deps.emit(
+            Notify(text=f"Sessions without a backend of their own now use {backend.model}")
+        )
         return True
 
     def model_for(self, session_id: str | None) -> str:
@@ -383,6 +431,7 @@ class BackendRegistry:
         # session's measurement so each re-measures on its next turn.
         self._discovered_window = None
         self._context_used.clear()
+        self._last_generation.clear()
         if self._on_reload is not None:
             self._on_reload()
         if old is not None:
@@ -417,7 +466,18 @@ class BackendRegistry:
         its own number, so switching to it later shows its current fill instead
         of a stale zero or another session's count. Whether the update reaches
         a screen is the renderer's call now: the event names its session.
+
+        The same report carries the turn's speed — the completion count over
+        the wall clock our own client measured around the request (`llm.py`
+        puts ``request_seconds`` in this dict, since an OpenAI-style body has
+        no timing in it). Recorded before the early return, because a decision
+        that generated tokens took time whether or not the backend bothered to
+        say what the prompt cost.
         """
+        completion = usage.get("completion_tokens")
+        seconds = usage.get("request_seconds")
+        if completion and seconds:
+            self._last_generation[session_id] = (int(completion), float(seconds))
         prompt_tokens = usage.get("prompt_tokens")
         if not prompt_tokens:
             return
@@ -440,11 +500,20 @@ class BackendRegistry:
         session (it is a guess about a number it knows), so restating a new
         window as an estimate would silently fail to move the meter.
         """
+        completion, seconds = self._last_generation.get(session_id, (0, None))
         self._deps.emit(
             TurnUsage(
                 session_id=session_id,
                 prompt_tokens=self._context_used.get(session_id, 0),
                 max_model_len=self.max_model_len_for(session_id),
+                # Restated on every measurement rather than sent once, so the
+                # pair always travels with the fill it was measured beside and
+                # a client never has to remember which earlier frame the speed
+                # arrived in. Zero and None where there is nothing to report:
+                # see `switch_backend`, which drops a rate the new model did
+                # not earn.
+                completion_tokens=completion,
+                request_seconds=seconds,
             )
         )
 
@@ -473,8 +542,13 @@ class BackendRegistry:
         Reopening then re-derives the fill from the stored history, which
         reflects compaction and any growth since; a running turn re-stores its
         count the next time it reports.
+
+        The speed goes with it, and for a sharper reason: it describes one
+        request made by one backend, so carrying it across a close would put a
+        rate from the old model beside a fill measured against the new one.
         """
         self._context_used.pop(session_id, None)
+        self._last_generation.pop(session_id, None)
 
     def _emit_estimate(self, session_id: str, *, used: int | None = None) -> None:
         """Say how full one session's window is, as far as anyone can tell.
