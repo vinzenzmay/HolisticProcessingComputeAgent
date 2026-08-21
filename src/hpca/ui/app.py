@@ -19,17 +19,22 @@ from hpca.ui.keys import NEWLINE_KEYS, is_paste, paste_text
 from hpca.ui.overlays import (
     COPY,
     FORK,
+    NO_SESSION,
     ROLLBACK,
     UNQUEUE,
     ConfigOverlay,
     HelpOverlay,
+    InspectOverlay,
     LlmOverlay,
+    MemoryReviewOverlay,
     NewSessionOverlay,
     Overlay,
     ProfilesOverlay,
     QueuedOverlay,
     RenameOverlay,
     RewindOverlay,
+    SwitchLlmOverlay,
+    ThinkingOverlay,
     choice,
 )
 from hpca.ui.pane import Item, Pane
@@ -37,6 +42,7 @@ from hpca.ui.state import (
     MODE_COLOURS,
     OWN_MESSAGE_KINDS,
     Answer,
+    BackendInfo,
     Confirm,
     CycleMode,
     Decide,
@@ -48,9 +54,11 @@ from hpca.ui.state import (
     NewSession,
     OpenSession,
     Peek,
+    ProfileInfo,
     Rename,
     Retitle,
     Rollback,
+    SaveSettings,
     SessionState,
     SidebarRow,
     Submit,
@@ -136,23 +144,6 @@ STATUS_TIERS = (
 METER_STYLES = {"warn": YELLOW, "danger": BOLD + RED}
 
 
-def _profile_name(item: Item) -> str:
-    """The profile a row of the profiles screen is about.
-
-    That screen's rows are drawn as `name` padded out to a column of counts,
-    and its own Enter reads the name back the same way. Parsed rather than
-    carried because those rows are handed in as `Item`s by whoever built the
-    screen, and until a `profile.list` event exists (M7) there is nothing
-    better to read them off.
-
-    A parenthesised row is not a profile — `(new profile)` is that screen's
-    own "make one" line — and a picker offering it would start a conversation
-    under a profile of that name.
-    """
-    name = item.head.split("  ")[0].strip("▸▾ ")
-    return "" if name.startswith("(") else name
-
-
 class RowUI:
     MIN_CHAT = 4
     MAX_INPUT = 6
@@ -161,11 +152,9 @@ class RowUI:
         self,
         sessions: list[SessionState] | None = None,
         *,
-        learnings: dict[str, str] | None = None,
         settings_json: str = "",
-        llms: tuple[list[Item], list[Item]] | None = None,
-        profiles: list[Item] | None = None,
-        backends: list[Item] | None = None,
+        profiles: list[ProfileInfo] | None = None,
+        catalog: list[BackendInfo] | None = None,
         send: Callable[[Intent], None] | None = None,
     ) -> None:
         # The sidebar's order, and the store behind it. Two things, because an
@@ -195,7 +184,11 @@ class RowUI:
         self.core_profile = ""
         self.confirm: Confirm | None = None
         self.toasts: list[Toast] = []
-        self.overlay: Overlay | None = None
+        # The screens over the rows, innermost last. A stack rather than one
+        # slot because the profiles screen is genuinely three deep — the list,
+        # a profile's skills, one skill's file — and escaping the file has to
+        # land back on the skills. `overlay` is still the one the keys go to.
+        self.overlays: list[Overlay] = []
         # When the last escape landed, so the next one can tell whether it is
         # the second half of a stop. Injectable so the headless check can drive
         # the clock instead of sleeping through the window.
@@ -206,17 +199,78 @@ class RowUI:
         # two processes share a wall clock and not a monotonic one.
         self.wall = time.time
         self._esc_armed_at: float | None = None
-        self._learnings = learnings or {}
-        self._settings_json = settings_json
-        self._llms = llms or ([], [])
-        self._profiles = profiles or []
-        # The catalog a new session may be pinned to: `head` is drawn, `text`
-        # is what the core wants back. Empty until something fills it — which
-        # is the state a real run is in today, and exactly the case the
-        # Textual flow answered by skipping the picker (§4.3 item 28 is M7).
-        self._backends = backends or []
+        # Everything the overlays draw and nothing else reads. Handed in
+        # rather than fetched, for the reason every screen in `overlays/` is:
+        # the UI opens no files and no sockets (rule 2 of §4.2). There is no
+        # `profile.list` and no catalog event on the wire yet, so `client.py`
+        # fills these from what it can and the shapes are `state.ProfileInfo`
+        # and `state.BackendInfo` — whatever carries them later fills exactly
+        # those.
+        self.settings_json = settings_json
+        # How the editor's text and its validator arrive. Both are injected,
+        # because what a settings *file* is belongs to `hpca.config` and this
+        # module has never heard of it (§3.1) — and the loader is called on
+        # the first `c` rather than at startup, so a UI that is never asked for
+        # the editor never reads the file at all.
+        self.settings_loader: Callable[[], None] | None = None
+        # A validator for the config editor, injected because what a settings
+        # *file* means belongs to `hpca.config` and this module has never heard
+        # of it (§3.1). None means "JSON syntax is the whole check".
+        self.validate_settings: Callable[[str], str] | None = None
+        self.profiles = list(profiles or [])
+        # Every LLM the core knows about (`protocol.LLMCatalog`), configured
+        # and discovered in one list with a flag — which is how the wire
+        # carries it, and splitting it into two here would be a second copy to
+        # keep in step. Empty until the first catalog arrives, which is the
+        # case the new-session flow answers by skipping the LLM picker.
+        self.catalog = list(catalog or [])
 
     # ------------------------------------------------------ the open session
+
+    # ------------------------------------------------------------- the screens
+
+    @property
+    def overlay(self) -> Overlay | None:
+        """The screen the keys go to: the innermost one, or None."""
+        return self.overlays[-1] if self.overlays else None
+
+    @overlay.setter
+    def overlay(self, screen: Overlay | None) -> None:
+        """Open a screen over the rows, replacing whatever was there.
+
+        Assignment stays the way a screen is opened — `self.overlay = X` reads
+        as what it does — and it starts a fresh stack: every top-level screen
+        is opened from the rows, so there is never one to go back to.
+        """
+        self.overlays = []
+        if screen is not None:
+            self.push(screen)
+
+    def push(self, screen: Overlay) -> None:
+        """Put a screen on the stack and let it ask the core for things.
+
+        The one thing a screen is given beyond its content: where its intents
+        go. Without it a screen keeps them in `sent`, which is what makes one
+        testable on its own with no app around it.
+        """
+        screen.send = self.send
+        self.overlays.append(screen)
+
+    def _pop(self) -> None:
+        """The innermost screen has closed. Whoever opened it hears about it."""
+        done = self.overlays.pop()
+        if self.overlays:
+            parent = self.overlays[-1]
+            parent.child_closed(done)
+            self._adopt(parent)
+        else:
+            self._closed(done)
+
+    def _adopt(self, screen: Overlay) -> None:
+        """A screen asked for a screen of its own. Give it one."""
+        if screen.child is not None:
+            child, screen.child = screen.child, None
+            self.push(child)
 
     @property
     def session(self) -> SessionState:
@@ -334,6 +388,10 @@ class RowUI:
             session.profile = row.profile
             session.mode = row.mode
             session.model = row.model
+            session.thinking = row.thinking
+            # The meter's `. think medium` (§4.3 item 18) reads this: a session
+            # left on xhigh looks identical to one on off until the first wait.
+            session.context.effort = row.thinking
             session.flags = list(row.flags)
             self.sessions.append(session)
         keep = {x.session_id for x in self.sessions} | {was}
@@ -753,6 +811,7 @@ class RowUI:
                 ("^↑^↓", "row"),
                 ("⇧enter", "new line"),
                 ("^←→", "word"),
+                ("^l", "switch llm"),
                 ("⇧←→", "select"),
                 ("^⌫ ^del", "cut word"),
                 ("^u", "clear"),
@@ -771,7 +830,16 @@ class RowUI:
             rows += [("i", "write"), ("enter", "reuse"), ("⇧tab", "mode")]
         else:
             rows += [("enter", "peek"), ("d", "unwatch"), ("alt-↑↓", "move")]
-        return rows + [("m", "llms"), ("a", "profiles"), ("c", "config")] + common
+        # Only where they do something. `m` and `a` are the sessions row's, `c`
+        # is everywhere but the chat, and ctrl+l is the chat's — a key list
+        # that lies is worse than a short one.
+        if self.focus == SESSIONS:
+            rows += [("m", "llms"), ("a", "profiles"), ("c", "config")]
+        elif self.focus == CHAT:
+            rows += [("^l", "switch llm")]
+        else:
+            rows += [("c", "config")]
+        return rows + common
 
     # --------------------------------------------------------------- input
 
@@ -784,11 +852,16 @@ class RowUI:
             # whatever raised it, and it is answered before anything else can
             # be done (see `_over_confirm`).
             return self._handle_confirm(key)
-        if self.overlay is not None:
-            overlay = self.overlay
-            if not overlay.handle(key, width, height - 2):
-                self.overlay = None
-                self._closed(overlay)
+        if self.overlays:
+            overlay = self.overlays[-1]
+            alive = overlay.handle(key, width, height - 2)
+            # A screen that opened a screen has not closed, and one that closed
+            # cannot also have opened one — so the two are exclusive and the
+            # order only decides which is checked first.
+            if overlay.child is not None:
+                self._adopt(overlay)
+            elif not alive:
+                self._pop()
             return True
         if self.focus == DECISION:
             # After the overlay, because a decision can arrive while a screen
@@ -829,6 +902,27 @@ class RowUI:
             # conversation is sent once, and escaping either picker sends none.
             self.send(NewSession(overlay.profile, overlay.backend))
             self.note = f"new session under “{overlay.profile}”"
+        elif isinstance(overlay, ConfigOverlay) and overlay.saved:
+            self.send(SaveSettings(overlay.text))
+            self.settings_json = overlay.text
+            self.note = "settings saved"
+        elif isinstance(overlay, ProfilesOverlay):
+            # The screen sent its own commands; what comes back is the list it
+            # now believes in, so the next `a` opens what the last one left.
+            self.profiles = list(overlay.profiles)
+        elif isinstance(overlay, LlmOverlay):
+            self.catalog = overlay.discovered + overlay.configured
+        elif isinstance(overlay, SwitchLlmOverlay) and overlay.chosen is not None:
+            # Shown before the core answers, like the mode bar: the next
+            # `session.rows` is what makes it true, and what puts it back.
+            self.session_for(overlay.session_id).model = overlay.chosen.model
+            self.refresh_sidebar()
+            self.note = f"this session now talks to {overlay.chosen.label}"
+        elif isinstance(overlay, ThinkingOverlay) and overlay.effort:
+            session = self.session_for(overlay.session_id)
+            session.thinking = overlay.effort
+            session.context.effort = overlay.effort
+            self.note = f"thinking effort: {overlay.effort}"
         elif isinstance(overlay, RenameOverlay) and overlay.name:
             self.send(Rename(overlay.session_id, overlay.name))
             # Shown before the core answers, like the mode bar: the next
@@ -1189,6 +1283,11 @@ class RowUI:
             self.focus = CHAT
         elif key == "ctrl-down":
             self.focus = WATCHERS
+        elif key == "ctrl-l":
+            # From the box too: which model answers is a thought you have while
+            # writing the message, like the mode — and ctrl+l is not a
+            # printable character, so it cannot be something being typed.
+            self._switch_llm()
         elif key == "quit":
             return False
         else:
@@ -1210,6 +1309,9 @@ class RowUI:
         if not self.active_id:
             self.note = "no session open"
             return
+        if self._builtin(text):
+            self.input.clear()
+            return
         if text.startswith("/") and self.session.turn.busy:
             # A slash command acts on the UI and runs its own exclusive
             # worker, so there is nothing sensible to queue it behind — and a
@@ -1222,6 +1324,18 @@ class RowUI:
         self.send(Submit(self.active_id, text))
         self.input.clear()
         self.note = "sent"
+
+    # The slash commands are M8's, with one exception: `/thinking` opens a
+    # screen and sends nothing, so it belongs to the milestone that built the
+    # screen. Everything else falls through to the core (`command.run`).
+    BUILTIN_SCREENS = ("/thinking", chr(92) + "thinking")
+
+    def _builtin(self, text: str) -> bool:
+        """A typed command this side answers by drawing something."""
+        if text.split()[0] not in self.BUILTIN_SCREENS:
+            return False
+        self.thinking()
+        return True
 
     def _handle_row(self, key: str, width: int, height: int) -> bool:
         if key in ("q", "quit"):
@@ -1239,12 +1353,24 @@ class RowUI:
             self._escape()
         elif key == "?":
             self.overlay = HelpOverlay()
-        elif key == "m":
-            self.overlay = LlmOverlay(*self._llms)
-        elif key == "a":
-            self.overlay = ProfilesOverlay(list(self._profiles), self._learnings)
-        elif key == "c":
-            self.overlay = ConfigOverlay(self._settings_json)
+        elif key == "m" and self.focus == SESSIONS:
+            # Sessions row only, like `a` (§5). Both are global screens opened
+            # from the one row whose keys are about the app rather than about a
+            # conversation — and in the chat `m` and `a` are letters somebody
+            # may be about to type into the box they just left.
+            self.overlay = LlmOverlay(self.catalog)
+        elif key == "a" and self.focus == SESSIONS:
+            self.overlay = ProfilesOverlay(self.profiles)
+        elif key == "c" and self.focus != CHAT:
+            # Anywhere but the chat column (§5), which is the one row where the
+            # cursor is on a conversation and `c` reads as a letter.
+            if not self.settings_json and self.settings_loader is not None:
+                self.settings_loader()
+            self.overlay = ConfigOverlay(
+                self.settings_json, validate=self.validate_settings
+            )
+        elif key == "ctrl-l" and self.focus == CHAT:
+            self._switch_llm()
         elif key == "shift-tab" and self.focus == CHAT:
             # The mode is a per-session dial, so the key means something only
             # where a session's conversation is: here and in the message box
@@ -1324,7 +1450,71 @@ class RowUI:
     def _new_session(self) -> None:
         """The two-stage picker (§4.3 item 14). Nothing is asked for until it
         closes with a choice, so escaping it creates nothing."""
-        self.overlay = NewSessionOverlay(self._profile_rows(), list(self._backends))
+        self.overlay = NewSessionOverlay(self._profile_rows(), self._backend_rows())
+
+    def _backend_rows(self) -> list[Item]:
+        """The catalog a new conversation may be pinned to.
+
+        Empty means no second stage at all, which is the case a fresh install
+        is in: the core then talks to the bootstrap client, and a picker
+        holding one thing that cannot be declined asks for nothing.
+        """
+        return [
+            # `value` is the label and nothing else: `protocol.SessionNew`
+            # settled on `LLMEntry.label` as the one field a command may name
+            # an entry by, and a front-end that sent anything else pinned
+            # nothing at all — silently, until the core started warning.
+            choice(
+                x.label,
+                " · ".join(
+                    y
+                    for y in (x.model, x.base_url, "the default" if x.active else "")
+                    if y
+                ),
+                value=x.label,
+            )
+            for x in self.catalog
+            if not x.discovered
+        ]
+
+    def _switch_llm(self) -> None:
+        """`ctrl+l` (§4.3 item 29): this conversation's backend, not the app's."""
+        if not self.active_id:
+            self.note = "no session open"
+            return
+        configured = [x for x in self.catalog if not x.discovered]
+        if not configured:
+            self.note = "no backends configured — press m on the sessions row"
+            return
+        self.overlay = SwitchLlmOverlay(
+            configured, session_id=self.active_id, current=self.session.model
+        )
+
+    def thinking(self) -> None:
+        """`/thinking` (§4.3 item 30). A conversation's level, so it needs one."""
+        if not self.active_id:
+            self.note = NO_SESSION
+            return
+        self.overlay = ThinkingOverlay(
+            self.session.thinking, session_id=self.active_id
+        )
+
+    def review_memories(self, session_id: str = "") -> None:
+        """Put the proposals a session is holding up for review (§4.3 item 32).
+
+        By session and not "the open one": `memory.proposals` names the
+        conversation it came out of, and answering it against another one
+        would resolve the wrong offer.
+        """
+        session = self.session_for(session_id or self.active_id)
+        if not session.proposals:
+            self.note = "nothing to review"
+            return
+        self.overlay = MemoryReviewOverlay(session.proposals, session.session_id)
+
+    def inspect(self, title: str, body: str) -> None:
+        """A read-only window over text too long to be a toast (item 31)."""
+        self.overlay = InspectOverlay(body, title=title)
 
     def _profile_rows(self) -> list[Item]:
         """The profiles a new conversation can be started under.
@@ -1342,7 +1532,7 @@ class RowUI:
             DEFAULT_PROFILE,
             self.core_profile,
             *(x.profile for x in self.sessions),
-            *(_profile_name(x) for x in self._profiles),
+            *(x.name for x in self.profiles),
         ):
             if name and name not in names:
                 names.append(name)

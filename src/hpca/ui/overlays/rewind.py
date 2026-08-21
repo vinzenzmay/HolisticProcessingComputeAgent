@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from hpca.ui.ansi import BOLD, CYAN, DIM, RESET, fold, pad, rule
-from hpca.ui.overlays.base import Overlay
+from hpca.ui.ansi import DIM, RESET, fold, pad
+from hpca.ui.overlays.base import BACK_KEYS, Overlay, options
 
 FORK, ROLLBACK, COPY = "fork", "rollback", "copy"
 
@@ -14,7 +14,62 @@ PREVIEW_CHARS = 300
 PREVIEW_LINES = 6  # what the Textual dialog's max-height comes to
 
 
-class RewindOverlay(Overlay):
+def quoted(message: str, width: int) -> list[str]:
+    """A few lines of what is being decided about, cut and marked as cut.
+
+    Shared by the two screens that ask about one message the user wrote, and
+    by the memory dialogs, which ask about one paragraph the agent wrote.
+    """
+    preview = message[:PREVIEW_CHARS]
+    if preview != message:
+        preview += " …"
+    lines: list[str] = []
+    for paragraph in preview.split("\n"):
+        lines += fold(paragraph, max(8, width - 6))
+    out = [DIM + pad(f"    {line}", width) + RESET for line in lines[:PREVIEW_LINES]]
+    if len(lines) > PREVIEW_LINES:
+        out.append(DIM + pad("    …", width) + RESET)
+    return out
+
+
+class ChoiceDialog(Overlay):
+    """One subject, a handful of lettered ways out, and no list to scroll.
+
+    The shape `RewindOverlay` and `QueuedOverlay` already shared: quote the
+    thing, print the options, and answer exactly the keys that are printed. A
+    key it has no answer for leaves it open, because a modal that closed on
+    any keystroke would lose the decision to a stray arrow.
+    """
+
+    OPTIONS: list[tuple[str, str]] = []
+    # key -> what the caller reads off ``choice`` afterwards.
+    PICKS: dict[str, str] = {}
+
+    def __init__(self, message: str, seq: int = 0, session_id: str = "") -> None:
+        super().__init__()
+        self.message = message
+        # The row's core-assigned name (`protocol.Entry.seq`), not its position
+        # in the log: the cut is decided here and carried out later, and a turn
+        # appending in between moves every position after this one.
+        self.seq = seq
+        # And the conversation it was decided in, since a decision that closes
+        # after the user has switched sessions must not act on the new one.
+        self.session_id = session_id
+        self.choice = ""
+
+    def body(self, width: int, height: int) -> list[str]:
+        return quoted(self.message, width) + [" " * width] + options(
+            self.OPTIONS, width
+        )
+
+    def keys(self, key: str, width: int, height: int) -> bool:
+        if key in self.PICKS:
+            self.choice = self.PICKS[key]
+            return False
+        return key not in BACK_KEYS  # a modal ignores what it has no answer for
+
+
+class RewindOverlay(ChoiceDialog):
     """Enter on one of your own messages in the log (§ chat rewind).
 
     Three ways to pick the conversation up from it, the same three
@@ -37,48 +92,9 @@ class RewindOverlay(Overlay):
         ("c / enter", "copy it into the message box"),
         ("esc", "cancel"),
     ]
+    PICKS = {"f": FORK, "r": ROLLBACK, "c": COPY, "enter": COPY}
 
-    def __init__(self, message: str, seq: int = 0, session_id: str = "") -> None:
-        self.message = message
-        # The row's core-assigned name (`protocol.Entry.seq`), not its position
-        # in the log: the cut is decided here and carried out later, and a turn
-        # appending in between moves every position after this one.
-        self.seq = seq
-        # And the conversation it was decided in, since a rewind that closes
-        # after the user has switched sessions must not cut the new one.
-        self.session_id = session_id
-        self.choice = ""
-
-    def render(self, width: int, height: int) -> list[str]:
-        out = [BOLD + CYAN + rule(self.title, width) + RESET]
-        preview = self.message[:PREVIEW_CHARS]
-        if preview != self.message:
-            preview += " …"
-        quoted: list[str] = []
-        for paragraph in preview.split("\n"):
-            quoted += fold(paragraph, max(8, width - 6))
-        for line in quoted[:PREVIEW_LINES]:
-            out.append(DIM + pad(f"    {line}", width) + RESET)
-        if len(quoted) > PREVIEW_LINES:
-            out.append(DIM + pad("    …", width) + RESET)
-        out.append(" " * width)
-        for key, label in self.OPTIONS:
-            row = pad(f"      {key:<12}{label}", width)
-            out.append(row[:6] + CYAN + row[6:18] + RESET + row[18:])
-        while len(out) < height:
-            out.append(" " * width)
-        return out[:height]
-
-    def handle(self, key: str, width: int, height: int) -> bool:
-        picked = {"f": FORK, "r": ROLLBACK, "c": COPY, "enter": COPY}
-        if key in picked:
-            self.choice = picked[key]
-            return False
-        if key in ("esc", "quit"):
-            return False
-        return True  # a modal ignores what it has no answer for
-
-    def footer(self) -> list[tuple[str, str]]:
+    def keymap(self) -> list[tuple[str, str]]:
         return [
             ("f", "fork"),
             ("r", "roll back"),

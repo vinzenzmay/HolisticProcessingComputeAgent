@@ -72,6 +72,28 @@ def _entry(wire: protocol.Entry) -> state.ChatEntry:
     )
 
 
+def _settings_error(text: str) -> str:
+    """Why this text is not a settings file, in one line, or "".
+
+    The config editor refuses to close on a non-empty answer (§4.3 item 26),
+    so it has to fit on a rule: pydantic's own report is several lines and a
+    front-end that pasted all of it would push the editor off screen.
+    """
+    from pydantic import ValidationError
+
+    from hpca.config import Settings
+
+    try:
+        Settings.model_validate_json(text)
+    except ValidationError as e:
+        first = e.errors()[0]
+        where = ".".join(str(x) for x in first.get("loc", ())) or "settings"
+        return f"invalid: {where} — {first.get('msg', 'not accepted')}"
+    except ValueError as e:
+        return f"invalid: {e}"
+    return ""
+
+
 def _panel_item(row: protocol.PanelRow) -> Item:
     """One watch box, keyed by the name the core gave it.
 
@@ -92,6 +114,53 @@ def _panel_item(row: protocol.PanelRow) -> Item:
         text=row.ref,
         key=row.key,
     )
+
+
+def _profile(info: state.ProfileInfo) -> state.ProfileInfo:
+    """Fill in the three bodies the profiles screen's editors open.
+
+    **A stopgap, and it is worth being explicit about which half is which.**
+    Writing a profile is on the wire — `profile.save`, `skill.save`,
+    `skill.delete` — because the write is what has to invalidate the core's
+    loaded copy. *Reading* one is not: `profile.rows` carries a memory count
+    and nothing else, and there is no `profile.get` or `skill.list` to ask.
+
+    So these are read here, out of the app dir, through the same modules the
+    core uses — the same bargain already made for the settings file, and for
+    the same reason: it is a file both ends read, it costs no database, and
+    the alternative is a memory editor that opens over an empty box and whose
+    save would then truncate what it could not show.
+
+    Never raises, and says so through ``loaded``: a profile whose files could
+    not be read is one the screens must refuse to edit rather than edit blind.
+    """
+    from hpca.curator import archive_path
+    from hpca.profiles import Profile
+    from hpca.skills import load_own_skills, skill_path
+
+    try:
+        info.text = Profile.load(info.name).render()
+        archive = archive_path(info.name)
+        info.archive = archive.read_text() if archive.exists() else ""
+        info.skills = [
+            state.SkillInfo(
+                name=skill.name,
+                description=skill.description,
+                text=_read(skill_path(skill.name, info.name)),
+            )
+            for skill in load_own_skills(info.name)
+        ]
+        info.loaded = True
+    except Exception as e:  # pragma: no cover - an unreadable app dir
+        logger.warning("could not read profile %s: %s", info.name, e)
+    return info
+
+
+def _read(path) -> str:
+    try:
+        return path.read_text()
+    except OSError:  # pragma: no cover - a file that went away under us
+        return ""
 
 
 class UIClient:
@@ -122,6 +191,10 @@ class UIClient:
         # something has asked the core for it.
         self._opened = False
         ui.send = self.intent
+        # Filled on the first `c`, not now: the settings file is read by this
+        # side (there is no `settings.get` on the wire, see `load_settings`),
+        # and a UI that is never asked for the editor should never read it.
+        ui.settings_loader = self.load_settings
 
     # ------------------------------------------------------------- outbound
 
@@ -195,8 +268,132 @@ class UIClient:
             self._rewind(intent)
         elif isinstance(intent, state.Peek | state.Drop):
             self._watch(intent)
+        elif isinstance(intent, state.SetThinking):
+            self.command(
+                protocol.ThinkingSet(
+                    session_id=session, effort=intent.effort
+                )
+            )
+        elif isinstance(intent, state.SetBackend):
+            # None, not "": `protocol.BackendSet` spells "the default backend
+            # rather than one session's" as a missing session, and an empty
+            # string would name a conversation that does not exist.
+            self.command(
+                protocol.BackendSet(
+                    backend=intent.backend, session_id=intent.session_id or None
+                )
+            )
+        elif isinstance(intent, state.SetProfile):
+            self.command(protocol.ProfileSet(name=intent.name))
+        elif isinstance(intent, state.SaveProfile):
+            self.command(
+                protocol.ProfileSave(
+                    name=intent.name, kind=intent.kind, text=intent.text
+                )
+            )
+        elif isinstance(intent, state.CreateProfile):
+            self.command(protocol.ProfileCreate(name=intent.name))
+            self._reread_profiles()
+        elif isinstance(intent, state.CopyProfile):
+            self.command(
+                protocol.ProfileDuplicate(
+                    name=intent.name, source=intent.source or None
+                )
+            )
+            self._reread_profiles()
+        elif isinstance(intent, state.DeleteProfile):
+            self.command(protocol.ProfileDelete(name=intent.name))
+            self._reread_profiles()
+        elif isinstance(intent, state.SaveSkill):
+            self.command(
+                protocol.SkillSave(
+                    profile=intent.profile, name=intent.name, text=intent.text
+                )
+            )
+        elif isinstance(intent, state.DeleteSkill):
+            self.command(
+                protocol.SkillDelete(profile=intent.profile, name=intent.name)
+            )
+        elif isinstance(intent, state.ResolveMemory):
+            self.command(
+                protocol.MemoryResolve(
+                    session_id=session, approved=list(intent.approved)
+                )
+            )
+        elif isinstance(intent, state.RunCommand):
+            self.command(
+                protocol.CommandRun(
+                    name=intent.name,
+                    args=intent.args,
+                    session_id=intent.session_id or None,
+                )
+            )
+        elif isinstance(intent, state.SaveSettings):
+            self._save_settings(intent.text)
         else:  # pragma: no cover - every Intent member is handled above
             logger.warning("no command for %r", intent)
+
+    def _reread_profiles(self) -> None:
+        """Ask for the list again after something changed it.
+
+        Nothing announces a created, copied or deleted profile: the core says
+        so in a `notify` and restates the *sessions* (their profile moved), but
+        `profile.rows` is only ever sent when it is asked for. The screen shows
+        what it believes in the meantime; this is what makes it true, or takes
+        it back when the core refused the name.
+        """
+        self.command(protocol.ProfileList())
+
+    # --------------------------------------------------------- the settings
+
+    def load_settings(self) -> None:
+        """Fill the config editor's text and its validator from `hpca.config`.
+
+        Here rather than in `app.py` for the reason everything is: the app has
+        never heard of a settings model and must not learn about one to draw a
+        box of text (§3.1). Here rather than on the wire because there is no
+        `settings.get`/`settings.save` on it — the file is the interface, both
+        processes read it, and giving it a command belongs to the milestone
+        that actually separates them (M11).
+        """
+        from hpca.config import Settings, settings_path
+
+        self.ui.validate_settings = _settings_error
+        try:
+            self.ui.settings_json = settings_path().read_text()
+        except OSError:
+            # Never written, or unreadable. The model's own defaults are a
+            # truthful starting point and are what `Settings.load` would use.
+            try:
+                self.ui.settings_json = Settings().model_dump_json(indent=2)
+            except Exception:  # pragma: no cover - a broken settings model
+                self.ui.settings_json = "{}"
+
+    def _save_settings(self, text: str) -> None:
+        """Write the edited file, having already been told it is valid.
+
+        Validated again rather than trusted: the check the editor ran is the
+        one that let it close, and between the two the only thing that can
+        have changed is which process is asking.
+        """
+        from hpca.config import Settings
+
+        error = _settings_error(text)
+        if error:
+            self.ui.toast(error, "error")
+            return
+        try:
+            Settings.model_validate_json(text).save()
+        except Exception as e:  # pragma: no cover - a read-only app dir
+            self.ui.toast(f"could not write the settings: {e}", "error")
+            return
+        self.ui.settings_json = text
+        # Said out loud because it is not the whole truth: the core built its
+        # clients and its graph from the settings it loaded at startup, and
+        # nothing on the wire asks it to build them again.
+        self.ui.toast(
+            "settings saved — llm and database changes apply on the next start"
+        )
 
     def _cycle_mode(self, session_id: str) -> None:
         """The next mode, worked out here and shown before the core answers.
@@ -322,6 +519,17 @@ class UIClient:
             )
         self.ui.core_profile = msg.profile
         self.command(protocol.SessionList())
+        # The two lists the screens draw and the UI cannot work out for itself
+        # (rule 2 of §4.2). Asked for on connect rather than when a screen
+        # opens, because `m` and `a` and the new-session picker must not each
+        # begin with a round trip — and because the catalog is what decides
+        # whether the new-session flow has a second stage at all.
+        #
+        # With probes: this client draws ● / ○, and the first frame is
+        # identical either way (`protocol.LLMList`), so asking for them costs
+        # nothing before the catalog can be drawn.
+        self.command(protocol.LLMList(probe=True))
+        self.command(protocol.ProfileList())
 
     def _rows(self, msg: protocol.SessionRows) -> None:
         self.ui.sync_sessions(
@@ -332,6 +540,7 @@ class UIClient:
                     profile=row.profile,
                     mode=row.mode,
                     model=row.model,
+                    thinking=row.thinking,
                     flags=tuple(row.flags),
                 )
                 for row in msg.rows
@@ -354,12 +563,64 @@ class UIClient:
         session.profile = msg.row.profile
         session.mode = msg.row.mode
         session.model = msg.row.model
+        session.thinking = msg.row.thinking
+        session.context.effort = msg.row.thinking
         session.flags = list(msg.row.flags)
         self.ui.adopt(session)
         # Straight into the message box: a conversation that exists because
         # the user asked for one — `session.new` or a fork — exists in order
         # to be typed in, which is what `start_new_session` ended with too.
         self.ui.open_session(session.session_id, land_in_box=True)
+
+    def _catalog(self, msg: protocol.LLMCatalog) -> None:
+        """Every LLM the core knows about, whole (`protocol.LLMCatalog`).
+
+        Replaced rather than merged, because the event is a statement of what
+        the catalog *is* — and the second frame, the one with the probes in
+        it, is the same catalog with `reachable` filled in.
+
+        An open screen is restated too: `m` can be sitting on the panel while
+        the probes land, and a list that only refreshed on the next open would
+        show `·` for the whole time the answer was already in.
+        """
+        self.ui.catalog = [
+            state.BackendInfo(
+                label=entry.label,
+                model=entry.model,
+                base_url=entry.base_url,
+                context=entry.max_model_len or 0,
+                needs_key=entry.needs_key,
+                active=entry.active,
+                reachable=entry.reachable,
+                discovered=entry.discovered,
+            )
+            for entry in msg.entries
+        ]
+        for screen in self.ui.overlays:
+            catalog = getattr(screen, "catalog_changed", None)
+            if catalog is not None:
+                catalog(self.ui.catalog)
+
+    def _profiles(self, msg: protocol.ProfileRows) -> None:
+        """The profiles, whole — the answer to `profile.list`.
+
+        The two file bodies the editors open are deliberately absent: the row
+        carries a *count* (`protocol.ProfileRow`), and the text of a profile's
+        memories is a `profile.save` round trip away rather than something
+        shipped to every client on connect.
+        """
+        self.ui.profiles = [
+            _profile(
+                state.ProfileInfo(
+                    name=row.name,
+                    memories=row.memories,
+                    copied_from=row.copied_from,
+                    default=row.is_default,
+                    working=row.working,
+                )
+            )
+            for row in msg.rows
+        ]
 
     def _reset(self, msg: protocol.ChatReset) -> None:
         self._session(msg.session_id).reset([_entry(e) for e in msg.entries])
@@ -488,10 +749,29 @@ class UIClient:
         self._session(session_id).set_watchers([_panel_item(r) for r in msg.rows])
 
     def _proposals(self, msg: protocol.MemoryProposals) -> None:
-        self._session(msg.session_id).proposals = [
+        """Memories the agent wants to keep, and the screen that answers them.
+
+        Held on the session first, because the offer belongs to the
+        conversation it came out of and answering it against another one would
+        resolve the wrong batch. Put on screen straight away only when that
+        conversation is the one on screen — a review that covered somebody
+        else's chat would be the modal mistake §4.3 item 21 is careful about,
+        one screen over.
+        """
+        session = self._session(msg.session_id)
+        session.proposals = [
             state.Proposal(scope=p.scope, kind=p.kind, text=p.text)
             for p in msg.proposals
         ]
+        if not session.proposals:
+            return
+        if msg.session_id == self.ui.active_id and self.ui.overlay is None:
+            self.ui.review_memories(msg.session_id)
+        else:
+            self.ui.toast(
+                f"{len(session.proposals)} memories to review in "
+                f"“{session.title or msg.session_id}”"
+            )
 
     def _notify(self, msg: protocol.Notify) -> None:
         self.ui.toast(msg.text, msg.severity, msg.timeout)
@@ -512,6 +792,8 @@ UIClient._HANDLERS = {
     protocol.Hello.__name__: UIClient._hello,
     protocol.SessionRows.__name__: UIClient._rows,
     protocol.SessionCreated.__name__: UIClient._created,
+    protocol.LLMCatalog.__name__: UIClient._catalog,
+    protocol.ProfileRows.__name__: UIClient._profiles,
     protocol.ChatReset.__name__: UIClient._reset,
     protocol.ChatAppend.__name__: UIClient._append,
     protocol.ChatUpdate.__name__: UIClient._update,

@@ -51,6 +51,7 @@ from hpca.ui.overlays import (
     RewindOverlay,
     choice,
 )
+from hpca.ui.state import BackendInfo, ProfileInfo
 from tests.ui_harness import Wire, connected, frame, plain, widths
 
 # Two conversations under two profiles, one of them the default — which is the
@@ -69,10 +70,24 @@ FIRST, SECOND = 1, 2
 
 WIDTHS = [80, 100, 137]
 
-BACKENDS = [
-    choice("cluster-qwen", "qwen3-27b-fp8", value='{"model": "qwen3-27b-fp8"}'),
-    choice("big-llama", "llama-3.3-70b", value='{"model": "llama-3.3-70b"}'),
+# The catalog, as `llm.catalog` carries it. `SessionNew.backend` is an
+# `LLMEntry.label` and nothing else: it was once documented as a label and
+# implemented as serialised backend JSON, which pinned nothing at all, silently.
+CATALOG = [
+    BackendInfo(
+        label="qwen3-27b-fp8",
+        model="qwen3-27b-fp8",
+        base_url="http://10.12.4.31:20001/v1",
+        context=112000,
+        active=True,
+    ),
+    BackendInfo(
+        label="llama-3.3-70b",
+        model="llama-3.3-70b",
+        base_url="http://10.12.4.55:20001/v1",
+    ),
 ]
+BACKEND_ROWS = [choice(x.label, x.model, value=x.label) for x in CATALOG]
 
 
 def entry(seq: int, kind: str = "user", text: str = "", **kw) -> protocol.Entry:
@@ -97,7 +112,7 @@ async def wire():
 @pytest.fixture
 async def with_backends():
     """A UI that has been handed a catalog, which a real run has not yet."""
-    async with connected(RowUI(backends=list(BACKENDS))) as w:
+    async with connected(RowUI(catalog=list(CATALOG))) as w:
         yield w
 
 
@@ -196,18 +211,11 @@ class TestStartingOne:
         assert offered[0] == "default"
         assert "hpc" in offered
 
-    async def test_the_make_one_row_of_the_profiles_screen_is_not_a_profile(self):
-        # `(new profile)` is that screen's own "make one" line. Offering it
-        # here would start a conversation under a profile of that name;
-        # creating a profile from inside the picker is §4.3 item 27 (M7).
-        from hpca.ui.pane import Item
-
-        ui = RowUI(
-            profiles=[
-                Item(head=f"{'hpc':<18}12 memories"),
-                Item(head="(new profile)"),
-            ]
-        )
+    async def test_the_profiles_screen_s_rows_reach_the_picker(self):
+        # `(new profile)` is the profiles screen's own "make one" line and is
+        # added by that screen, so it can no longer leak into the picker and
+        # start a conversation under a profile of that name.
+        ui = RowUI(profiles=[ProfileInfo(name="hpc", memories=12)])
         assert [x.text for x in ui._profile_rows()] == ["default", "hpc"]
 
     async def test_choosing_one_asks_the_core_for_a_session(self, wire):
@@ -296,23 +304,24 @@ class TestTheLlmPicker:
         await on_row(with_backends, 0)
         await with_backends.press("enter", "enter", "down", "enter")
         sent = with_backends.peer.last(protocol.SessionNew)
-        assert sent.backend == BACKENDS[1].text
+        assert sent.backend == CATALOG[1].label
         assert sent.profile == "default"
 
-    async def test_the_ui_never_looks_inside_the_backend_string(self, with_backends):
-        # Whatever the catalog handed over comes back untouched: what
-        # identifies a backend is `core.backends`' business.
+    async def test_what_goes_back_is_the_label_the_catalog_gave(self, with_backends):
+        # The label and nothing else (`protocol.SessionNew`): what identifies a
+        # backend is the core's business, and it mints the name so that both
+        # sides cannot disagree about what a backend is called.
         await started(with_backends)
         await on_row(with_backends, 0)
         await with_backends.press("enter", "enter", "enter")
         assert with_backends.peer.last(protocol.SessionNew).backend == (
-            '{"model": "qwen3-27b-fp8"}'
+            "qwen3-27b-fp8"
         )
 
     @pytest.mark.parametrize("width", WIDTHS)
     def test_every_row_is_exactly_the_width(self, width: int):
         screen = NewSessionOverlay(
-            [choice("default", "the fallback")], list(BACKENDS)
+            [choice("default", "the fallback")], list(BACKEND_ROWS)
         )
         assert widths(screen.render(width, 20)) == {width}
         screen.handle("enter", width, 20)
@@ -864,7 +873,7 @@ class TestDrafts:
 @pytest.mark.parametrize("keys", [("enter",), ("enter", "enter"), ("r",)])
 async def test_a_session_screen_fills_the_frame_exactly(width: int, keys):
     """The picker (both stages) and the rename box, drawn as whole frames."""
-    async with connected(RowUI(backends=list(BACKENDS))) as w:
+    async with connected(RowUI(catalog=list(CATALOG))) as w:
         await started(w)
         await on_row(w, 0 if keys[0] == "enter" else FIRST)
         await w.press(*keys)

@@ -69,6 +69,24 @@ def at_wall(ui: RowUI, when: float) -> RowUI:
     return ui
 
 
+def recorded(ui: RowUI) -> RowUI:
+    """Keep a copy of every intent, whatever else is listening for them.
+
+    `RowUI` records intents in ``ui.intents`` only when nothing else is wired
+    to `send` — and a UI built by `demo.build` has a client on the other end.
+    This keeps both, so a test can drive the demo *and* say what a keypress
+    asked the core to do without going through the wire to find out.
+    """
+    original = ui.send
+
+    def record(intent) -> None:
+        ui.intents.append(intent)
+        original(intent)
+
+    ui.send = record
+    return ui
+
+
 def on_own_message(ui: RowUI, nth: int = 4) -> int:
     """Put the chat cursor on the nth message the user wrote — not the first,
     so that a fork or a rollback actually has a conversation to cut."""

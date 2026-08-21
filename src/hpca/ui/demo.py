@@ -27,11 +27,9 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
 from hpca import protocol
-from hpca.ui.ansi import GREEN
 from hpca.ui.app import RowUI
 from hpca.ui.client import UIClient
-from hpca.ui.overlays import choice
-from hpca.ui.pane import Item
+from hpca.ui.state import ProfileInfo, SkillInfo
 
 TASKS = [
     "annotate the cohort BAMs with sniffles",
@@ -99,6 +97,17 @@ SETTINGS_JSON = """{
   }
 }
 """
+
+ARCHIVE_TEXT = (
+    "## [rag] aged out 2026-03-01\n"
+    "The old queue names before the January reorganisation: gpu-a100, gpu-v100.\n"
+)
+
+SKILL_TEXT = (
+    "---\nname: merge-vcfs\ndescription: how this lab merges shard VCFs\n---\n\n"
+    "1. bcftools merge the shards in the order the manifest lists them.\n"
+    "2. Never write the intermediate to $HOME.\n"
+)
 
 LEARNINGS = {
     "hpc": (
@@ -232,73 +241,77 @@ def sample_watches(count: int, seed: int = 0) -> list[protocol.PanelRow]:
     return rows
 
 
-def sample_profiles() -> list[Item]:
-    return [
-        Item(
-            head=f"{'hpc':<18}12 memories · 4 skills · 3 sessions",
-            body=["created 2026-04-02", "used by the open session"],
-            accent=GREEN,
-        ),
-        Item(
-            head=f"{'default':<18}0 memories · 0 skills · 1 session",
-            body=["created 2026-01-11", "the fallback; cannot be deleted"],
-        ),
-        Item(
-            head=f"{'writing':<18}5 memories · 1 skill · 0 sessions",
-            body=["created 2026-06-20", "copied from hpc"],
-        ),
-        Item(head="(new profile)"),
-    ]
+def sample_profiles() -> list[ProfileInfo]:
+    """The profiles screen's rows, with the file bodies its editors open.
 
-
-def sample_llms() -> tuple[list[Item], list[Item]]:
-    discovered = [
-        Item(
-            head="● 10.12.4.31:20001    qwen3-27b-fp8      112k ctx",
-            body=["found in the shared endpoints manifest", "node gpu014, 42s ago"],
-            accent=GREEN,
-        ),
-        Item(
-            head="● localhost:20001     qwen3-27b-fp8      112k ctx",
-            body=["found by localhost scan (ssh tunnel)"],
-            accent=GREEN,
-        ),
-        Item(
-            head="○ 10.12.4.55:20001    llama-3.3-70b       128k ctx",
-            body=["in the manifest, did not answer the probe"],
-        ),
-    ]
-    # The whole width, which is the point of stacking these rather than
-    # putting them in a column: url, model and context all fit on one line.
-    configured = [
-        Item(
-            head="★ ● cluster-qwen   http://10.12.4.31:20001/v1   qwen3-27b-fp8   112k",
-            body=["the active default", "answered the last probe 42s ago"],
-            accent=GREEN,
-        ),
-        Item(
-            head="  ● tunnel-qwen    http://localhost:20001/v1     qwen3-27b-fp8   112k",
-            body=["the same server through an ssh tunnel"],
-            accent=GREEN,
-        ),
-        Item(
-            head="  ○ big-llama      http://10.12.4.55:20001/v1    llama-3.3-70b   128k",
-            body=["not answering; last seen 3d ago"],
-        ),
-    ]
-    return discovered, configured
-
-
-def sample_backends() -> list[Item]:
-    """The catalog a new session may be pinned to.
-
-    `head` is drawn and `text` is what goes back to the core, which is the
-    whole of what the UI knows about a backend — see `NewSessionOverlay`.
+    Handed to the UI whole rather than answered as `profile.rows`, because
+    that event carries a memory *count* and the bodies are read off disk
+    (`client._profile`) — which a demo must not do. Everything else about
+    these rows is what the real event would say.
     """
     return [
-        choice("cluster-qwen", "qwen3-27b-fp8 · 112k · the active default"),
-        choice("tunnel-qwen", "qwen3-27b-fp8 · 112k · through an ssh tunnel"),
-        choice("big-llama", "llama-3.3-70b · 128k · not answering"),
+        ProfileInfo(
+            name="hpc",
+            memories=12,
+            sessions=3,
+            working=True,
+            loaded=True,
+            text=LEARNINGS["hpc"],
+            archive=ARCHIVE_TEXT,
+            skills=[
+                SkillInfo("merge-vcfs", "how this lab merges shard VCFs", SKILL_TEXT),
+                SkillInfo("submit-gpu", "the partition and the flags that work", ""),
+            ],
+        ),
+        ProfileInfo(
+            name="default",
+            memories=0,
+            sessions=1,
+            default=True,
+            loaded=True,
+            text=LEARNINGS["default"],
+        ),
+        ProfileInfo(
+            name="writing",
+            memories=5,
+            copied_from="hpc",
+            loaded=True,
+            text=LEARNINGS["writing"],
+        ),
+    ]
+
+
+def sample_catalog() -> list[protocol.LLMEntry]:
+    """The catalog, as `llm.catalog` carries it — labels and marks, no keys.
+
+    One entry deliberately unprobed and one deliberately down, because the
+    three-state `reachable` is the thing the manage-LLMs panel has to draw
+    correctly and two of the three states are easy to conflate.
+    """
+    return [
+        protocol.LLMEntry(
+            label="qwen3-27b-fp8 @ 10.12.4.31:20001",
+            model="qwen3-27b-fp8",
+            base_url="http://10.12.4.31:20001/v1",
+            max_model_len=112000,
+            active=True,
+            reachable=True,
+        ),
+        protocol.LLMEntry(
+            label="qwen3-27b-fp8 @ localhost:20001",
+            model="qwen3-27b-fp8",
+            base_url="http://localhost:20001/v1",
+            max_model_len=112000,
+            reachable=None,
+        ),
+        protocol.LLMEntry(
+            label="llama-3.3-70b",
+            model="llama-3.3-70b",
+            base_url="http://10.12.4.55:20001/v1",
+            max_model_len=128000,
+            needs_key=True,
+            reachable=False,
+        ),
     ]
 
 
@@ -621,6 +634,79 @@ class DemoCore:
         self.emit(protocol.SessionCreated(row=row))
         self.emit(protocol.SessionRows(rows=list(self.rows)))
 
+    def _do_LLMList(self, cmd: protocol.LLMList) -> None:
+        """The catalog, and — when probes were asked for — the catalog again.
+
+        Twice on purpose: that is the shape a real core answers in
+        (`protocol.LLMCatalog.probed`), and a demo that only ever sent the
+        settled frame would never show the mark a client has to draw for "not
+        asked yet".
+        """
+        entries = sample_catalog()
+        self.emit(
+            protocol.LLMCatalog(
+                entries=[e.model_copy(update={"reachable": None}) for e in entries]
+            )
+        )
+        if cmd.probe:
+            self.emit(protocol.LLMCatalog(entries=entries, probed=True))
+
+    def _do_ProfileList(self, cmd: protocol.ProfileList) -> None:
+        """Deliberately silent.
+
+        `profile.rows` carries a memory count and no file bodies, and the
+        bodies are read off disk by the client — which a demo must not do. So
+        the demo's profiles are handed to `RowUI` whole (`build`), and
+        answering here would replace them with rows whose editors have nothing
+        to open.
+        """
+
+    def _do_ThinkingSet(self, cmd: protocol.ThinkingSet) -> None:
+        self.rows[self._index(cmd.session_id)].thinking = cmd.effort
+        self.emit(protocol.SessionRows(rows=list(self.rows)))
+        self.emit(protocol.Notify(text=f"Thinking effort: {cmd.effort}"))
+
+    def _do_BackendSet(self, cmd: protocol.BackendSet) -> None:
+        model = str(cmd.backend.get("model", "")) or "the new backend"
+        if cmd.session_id is None:
+            self.emit(protocol.Notify(text=f"Default backend: {model}"))
+            return
+        self.rows[self._index(cmd.session_id)].model = model
+        self.emit(protocol.SessionRows(rows=list(self.rows)))
+        self.emit(protocol.Notify(text=f"This session now uses {model}"))
+
+    def _do_ProfileSet(self, cmd: protocol.ProfileSet) -> None:
+        self.emit(protocol.Notify(text=f"Working profile: {cmd.name}"))
+
+    def _do_ProfileSave(self, cmd: protocol.ProfileSave) -> None:
+        self.emit(protocol.Notify(text=f"Saved {cmd.kind} for {cmd.name}."))
+
+    def _do_ProfileCreate(self, cmd: protocol.ProfileCreate) -> None:
+        self.emit(protocol.Notify(text=f"Created profile {cmd.name}."))
+
+    def _do_ProfileDuplicate(self, cmd: protocol.ProfileDuplicate) -> None:
+        self.emit(
+            protocol.Notify(text=f"Copied {cmd.source or 'hpc'} to {cmd.name}.")
+        )
+
+    def _do_ProfileDelete(self, cmd: protocol.ProfileDelete) -> None:
+        self.emit(protocol.Notify(text=f"Deleted profile {cmd.name}."))
+
+    def _do_SkillSave(self, cmd: protocol.SkillSave) -> None:
+        self.emit(protocol.Notify(text=f"Saved skill {cmd.name}."))
+
+    def _do_SkillDelete(self, cmd: protocol.SkillDelete) -> None:
+        self.emit(protocol.Notify(text=f"Removed skill {cmd.name}."))
+
+    def _do_MemoryResolve(self, cmd: protocol.MemoryResolve) -> None:
+        kept = sum(1 for x in cmd.approved if x)
+        self.emit(
+            protocol.Notify(text=f"{kept} of {len(cmd.approved)} memories kept.")
+        )
+
+    def _do_CommandRun(self, cmd: protocol.CommandRun) -> None:
+        self.emit(protocol.Notify(text=f"the demo core does not run /{cmd.name}"))
+
     def _do_SessionRename(self, cmd: protocol.SessionRename) -> None:
         if not cmd.title.strip():
             self.emit(
@@ -747,11 +833,8 @@ def build(chat: int = 400, sessions: int = 14, watchers: int = 5) -> RowUI:
     ownership this needs while the loopback is synchronous.
     """
     ui = RowUI(
-        learnings=dict(LEARNINGS),
         settings_json=SETTINGS_JSON,
-        llms=sample_llms(),
         profiles=sample_profiles(),
-        backends=sample_backends(),
     )
     core = DemoCore(chat=chat, sessions=sessions, watchers=watchers)
     client = UIClient(ui, send=core.handle)

@@ -454,6 +454,84 @@ class Proposal:
     text: str
 
 
+@dataclass
+class BackendInfo:
+    """One LLM the UI can draw and name — the plain twin of `protocol.LLMEntry`.
+
+    ``label`` is the identity and the only field a command may name an entry
+    by (`protocol.SessionNew.backend`); it is minted by the core so both sides
+    cannot disagree about what a backend is called.
+
+    ``reachable`` is deliberately three-state. A probe costs a round trip to a
+    cluster node, so the catalog arrives first with nothing known and is
+    restated once the probes land — and a client that drew ○ for "not asked"
+    would libel every backend for as long as the scan takes.
+
+    There is no api key here and there will not be one: the key never crosses
+    the socket, and ``needs_key`` is all the manage-LLMs line ever drew.
+    """
+
+    label: str = ""
+    model: str = ""
+    base_url: str = ""
+    context: int = 0
+    needs_key: bool = False
+    active: bool = False
+    reachable: bool | None = None
+    # Found by a scan rather than configured. One list with a flag rather than
+    # two, because everything else about the two rows is identical.
+    discovered: bool = False
+
+
+@dataclass
+class SkillInfo:
+    """One of a profile's own procedure files, as the screens draw it.
+
+    The body travels with the name because the skill editor is a raw text box
+    over that file (`tui/profiles_screen.py`'s `ProfileSkillsScreen` read it
+    off disk; rule 2 of §4.2 puts disk out of the UI's reach, so it is handed
+    in instead).
+    """
+
+    name: str
+    description: str = ""
+    text: str = ""
+
+
+@dataclass
+class ProfileInfo:
+    """One profile, as the profiles screen and the pickers need it.
+
+    Everything the Textual screen read off disk in `refresh_profiles` —
+    the memory count, the star, the provenance — plus the two file bodies its
+    editors opened. One record rather than four parallel dicts keyed by name,
+    because the screens ask about *a profile*, and a name that is in three of
+    the four dicts is a bug that only shows up on the fourth screen.
+
+    There is no `profile.list` event yet, so these are handed to `RowUI` the
+    way the sidebar's first rows were before `session.rows` existed. Whatever
+    fills them later fills exactly this shape.
+    """
+
+    name: str
+    memories: int = 0
+    sessions: int = 0
+    copied_from: str = ""
+    # The ★: where a deleted profile's sessions land, and so the one profile
+    # that cannot be deleted. A different question from ``working``, which is
+    # the one the core is currently running under — usually another profile.
+    default: bool = False
+    working: bool = False
+    # The memories file, the RAG archive, and the profile's own skills, as the
+    # editors open them. ``loaded`` is whether they are real: an editor opened
+    # over text nobody fetched would save an empty file over a full one, and
+    # `profile.save` writes what it is given verbatim.
+    loaded: bool = False
+    text: str = ""
+    archive: str = ""
+    skills: list[SkillInfo] = field(default_factory=list)
+
+
 # ---------------------------------------------------------------- the session
 
 
@@ -479,12 +557,18 @@ class SessionState:
         mode: str = "",
         flags: tuple[str, ...] = (),
         model: str = "",
+        thinking: str = "",
     ) -> None:
         self.session_id = session_id
         self.title = title
         self.profile = profile
         self.mode = mode
         self.flags = list(flags)
+        # `protocol.SessionRow.thinking`: how hard this conversation reasons,
+        # empty when it never chose and follows the configured default. Held
+        # here and not only on the meter because `/thinking` opens with the
+        # current level preselected, and "" is a different answer from "off".
+        self.thinking = thinking
         # `protocol.SessionRow.model`: the backend this conversation is pinned
         # to, as a bare name. Drawn on the message row (§4.3 item 20) and
         # empty for a session that talks to the bootstrap client.
@@ -714,6 +798,7 @@ class SidebarRow:
     profile: str = ""
     mode: str = ""
     model: str = ""
+    thinking: str = ""
     flags: tuple[str, ...] = ()
 
 
@@ -871,6 +956,142 @@ class Drop:
     ref: str
 
 
+@dataclass(frozen=True)
+class SaveSettings:
+    """The whole settings file, as the config editor left it (§4.3 item 26).
+
+    The text and not a parsed object: the UI validated it to know whether it
+    could close, but what a settings *file* means belongs to `hpca.config`,
+    and a UI that shipped a half-understood dict would be the second place the
+    model is defined.
+    """
+
+    text: str
+
+
+@dataclass(frozen=True)
+class SetThinking:
+    """How hard this conversation reasons (`hpca.thinking`).
+
+    Per session and not per app, like the mode and the backend: two
+    conversations keep their own levels, and the level is a stable property of
+    one thread because changing it throws away that thread's prefix cache.
+    """
+
+    session_id: str
+    effort: str
+
+
+@dataclass(frozen=True)
+class SetBackend:
+    """Which model answers — this session's, or, with no session, everyone's.
+
+    ``backend`` is an opaque blob the way `NewSession.backend` is a string:
+    what identifies a backend is the core's business, and the UI hands back
+    what the catalog it was given handed it. `protocol.BackendSet` validates
+    it against the real settings model at the far end.
+    """
+
+    backend: dict
+    session_id: str = ""
+
+
+@dataclass(frozen=True)
+class SetProfile:
+    """The profile the core works under when nothing else narrows it."""
+
+    name: str
+
+
+@dataclass(frozen=True)
+class SaveProfile:
+    """Write back what the user edited: a profile's memories, or its archive.
+
+    Two kinds down one intent because they are one screen — the memory editor
+    is content-agnostic and the caller decides where the text lands, which is
+    exactly what `tui/profiles_screen.py` said about it.
+    """
+
+    name: str
+    kind: str  # "memories" or "archive"
+    text: str
+
+
+@dataclass(frozen=True)
+class CreateProfile:
+    """Make a profile under this name. The name is a filename, and whether it
+    is a usable one is the profile store's rule and its wording — so a bad
+    name comes back as a `notify`, not as a refusal drawn here."""
+
+    name: str
+
+
+@dataclass(frozen=True)
+class CopyProfile:
+    """Fork a profile under a new name: same learnings, its own future."""
+
+    source: str
+    name: str
+
+
+@dataclass(frozen=True)
+class DeleteProfile:
+    """Drop a profile and everything it learned.
+
+    The three refusals — the default cannot go, a gone profile, a profile with
+    work in flight — are the core's (`_delete_profile`), because two of them
+    are about state the UI cannot see. Only the first is also checked here,
+    so the key is inert rather than a round trip that comes back "no".
+    """
+
+    name: str
+
+
+@dataclass(frozen=True)
+class SaveSkill:
+    """Persist a skill file verbatim, front matter and all."""
+
+    profile: str
+    name: str
+    text: str
+
+
+@dataclass(frozen=True)
+class DeleteSkill:
+    """Remove one of a profile's own skills. Asked first."""
+
+    profile: str
+    name: str
+
+
+@dataclass(frozen=True)
+class ResolveMemory:
+    """The verdicts on a `memory.proposals` offer, in the order offered.
+
+    Positional, because the core holds the authoritative proposals and a
+    front-end must not be able to smuggle an edited memory back in an
+    approval (`protocol.MemoryResolve`). A short list rejects the rest, which
+    is what escaping the review half-way through means.
+    """
+
+    session_id: str
+    approved: tuple[bool, ...] = ()
+
+
+@dataclass(frozen=True)
+class RunCommand:
+    """A slash command: `/compact`, `/thinking`, `/skills-list`, `/<skill>`.
+
+    ``session_id`` is empty for the profile-scoped ones, which is the
+    difference `protocol.CommandRun` spells as None: `/skills-list` acts on the
+    profile and would be wrong to aim at whatever session happened to be open.
+    """
+
+    name: str
+    args: str = ""
+    session_id: str = ""
+
+
 Intent = (
     NewSession
     | Rename
@@ -887,4 +1108,16 @@ Intent = (
     | Answer
     | Peek
     | Drop
+    | SaveSettings
+    | SetThinking
+    | SetBackend
+    | SetProfile
+    | SaveProfile
+    | CreateProfile
+    | CopyProfile
+    | DeleteProfile
+    | SaveSkill
+    | DeleteSkill
+    | ResolveMemory
+    | RunCommand
 )

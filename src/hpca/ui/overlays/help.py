@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from hpca.ui.ansi import BOLD, CYAN, DIM, RESET, pad, rule
-from hpca.ui.overlays.base import Overlay
+from hpca.ui.overlays.base import Overlay, keyed
 
 
 class HelpOverlay(Overlay):
@@ -17,10 +17,11 @@ class HelpOverlay(Overlay):
             [
                 ("^↑ ^↓", "move between rows (tab / shift-tab outside the chat)"),
                 ("esc esc", "stop the agent, from any row — one esc does nothing"),
-                ("m", "manage llms"),
-                ("a", "profiles & learnings"),
-                ("c", "config editor"),
+                ("m", "manage llms — sessions row only"),
+                ("a", "profiles & learnings — sessions row only"),
+                ("c", "config editor — anywhere but the chat"),
                 ("^l", "switch llm for this session"),
+                ("/thinking", "how hard this session's model reasons"),
                 ("?", "this list"),
                 ("q", "quit"),
             ],
@@ -103,6 +104,7 @@ class HelpOverlay(Overlay):
     ]
 
     def __init__(self) -> None:
+        super().__init__()
         self.offset = 0
 
     def _body(self, width: int) -> list[str]:
@@ -110,11 +112,7 @@ class HelpOverlay(Overlay):
         for name, keys in self.SECTIONS:
             out.append(DIM + pad(f"  {name}", width) + RESET)
             for key, label in keys:
-                # Padded plain and coloured afterwards by column, never by
-                # adding the escape lengths to the width — that arithmetic is
-                # exactly the kind that leaves a row one cell short.
-                row = pad(f"      {key:<12}{label}", width)
-                out.append(row[:6] + CYAN + row[6:18] + RESET + row[18:])
+                out.append(keyed(f"      {key:<12}{label}", width))
             out.append(" " * width)
         return out
 

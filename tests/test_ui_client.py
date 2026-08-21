@@ -25,6 +25,7 @@ import pytest
 from hpca import protocol
 from hpca.transport import InProcessConnection
 from hpca.ui.app import CHAT, INPUT, SESSIONS, WATCHERS, RowUI
+from hpca.ui import state
 from hpca.ui.client import UIClient
 from tests.ui_harness import Peer, Wire, clocked, plain, settle, widths
 
@@ -816,3 +817,336 @@ class TestWithNothingOpenYet:
             protocol.ChatAppend(session_id="stranger", entry=entry(1, text="early"))
         )
         assert wire.ui.session_for("stranger").entries[0].text == "early"
+
+
+# --------------------------------------------------- the catalog and profiles
+
+# M7. Both lists are asked for on connect, because `m`, `a` and the new-session
+# picker must not each begin with a round trip.
+
+
+CATALOG = [
+    protocol.LLMEntry(
+        label="qwen3-27b-fp8",
+        model="qwen3-27b-fp8",
+        base_url="http://10.12.4.31:20001/v1",
+        max_model_len=112000,
+        active=True,
+    ),
+    protocol.LLMEntry(
+        label="llama-3.3-70b",
+        model="llama-3.3-70b",
+        base_url="http://10.12.4.55:20001/v1",
+        needs_key=True,
+    ),
+]
+
+
+class TestTheCatalog:
+    async def test_hello_asks_for_it(self, wire):
+        await wire.tell(protocol.Hello(profile="hpc"))
+        assert wire.peer.took(protocol.LLMList)
+
+    async def test_and_asks_for_the_probes_too(self, wire):
+        # This client draws ● / ○, and the first frame is identical either way
+        # (`protocol.LLMList`), so asking costs nothing before it can draw.
+        await wire.tell(protocol.Hello(profile="hpc"))
+        assert wire.peer.last(protocol.LLMList).probe is True
+
+    async def test_it_fills_the_ui_s_catalog(self, wire):
+        await wire.tell(protocol.LLMCatalog(entries=CATALOG))
+        assert [x.label for x in wire.ui.catalog] == [
+            "qwen3-27b-fp8",
+            "llama-3.3-70b",
+        ]
+
+    async def test_an_unprobed_entry_keeps_its_third_state(self, wire):
+        await wire.tell(protocol.LLMCatalog(entries=CATALOG))
+        assert wire.ui.catalog[0].reachable is None
+
+    async def test_a_second_catalog_replaces_the_first(self, wire):
+        await wire.tell(protocol.LLMCatalog(entries=CATALOG))
+        probed = [x.model_copy(update={"reachable": True}) for x in CATALOG]
+        await wire.tell(protocol.LLMCatalog(entries=probed, probed=True))
+        assert [x.reachable for x in wire.ui.catalog] == [True, True]
+
+    async def test_it_reaches_the_new_session_picker(self, wire):
+        await wire.tell(protocol.LLMCatalog(entries=CATALOG))
+        assert [x.text for x in wire.ui._backend_rows()] == [
+            "qwen3-27b-fp8",
+            "llama-3.3-70b",
+        ]
+
+    async def test_a_catalog_that_lands_while_manage_llms_is_open_restates_it(
+        self, wire
+    ):
+        wire.ui.focus = SESSIONS
+        await wire.press("m")
+        await wire.tell(protocol.LLMCatalog(entries=CATALOG))
+        assert "llama-3.3-70b" in wire.screen()
+
+    async def test_the_key_never_crosses(self, wire):
+        # `protocol.LLMEntry` has no api_key field at all; what the UI holds
+        # is whether there is one.
+        await wire.tell(protocol.LLMCatalog(entries=CATALOG))
+        assert wire.ui.catalog[1].needs_key is True
+        assert not hasattr(wire.ui.catalog[1], "api_key")
+
+
+class TestTheProfiles:
+    async def test_hello_asks_for_them(self, wire):
+        await wire.tell(protocol.Hello(profile="hpc"))
+        assert wire.peer.took(protocol.ProfileList)
+
+    async def test_the_rows_reach_the_screen(self, wire, monkeypatch, tmp_path):
+        monkeypatch.setenv("HPCA_HOME", str(tmp_path))
+        await wire.tell(
+            protocol.ProfileRows(
+                rows=[
+                    protocol.ProfileRow(name="default", memories=0, is_default=True),
+                    protocol.ProfileRow(
+                        name="hpc", memories=12, copied_from="default", working=True
+                    ),
+                ]
+            )
+        )
+        assert [x.name for x in wire.ui.profiles] == ["default", "hpc"]
+        assert wire.ui.profiles[1].copied_from == "default"
+        assert wire.ui.profiles[0].default is True
+        assert wire.ui.profiles[1].working is True
+
+
+# ------------------------------------------------------- the M7 intents
+
+# Each screen's decision, as the command that carries it. The screens
+# themselves are tested in `test_ui_overlays.py`; this is the translation.
+
+
+class TestTheScreenCommands:
+    async def test_thinking_set(self, wire):
+        wire.client.intent(state.SetThinking("s1", "medium"))
+        await wire.client.flush()
+        await settle()
+        sent = wire.peer.last(protocol.ThinkingSet)
+        assert (sent.session_id, sent.effort) == ("s1", "medium")
+
+    async def test_backend_set_for_one_session(self, wire):
+        wire.client.intent(state.SetBackend({"model": "m"}, "s1"))
+        await wire.client.flush()
+        await settle()
+        assert wire.peer.last(protocol.BackendSet).session_id == "s1"
+
+    async def test_and_none_for_the_default(self, wire):
+        # None rather than "": the two halves of `backend.set` are told apart
+        # by whether a session is named, and "" would name one that is not there.
+        wire.client.intent(state.SetBackend({"model": "m"}))
+        await wire.client.flush()
+        await settle()
+        assert wire.peer.last(protocol.BackendSet).session_id is None
+
+    async def test_profile_save(self, wire):
+        wire.client.intent(state.SaveProfile("hpc", "memories", "text\n"))
+        await wire.client.flush()
+        await settle()
+        sent = wire.peer.last(protocol.ProfileSave)
+        assert (sent.name, sent.kind, sent.text) == ("hpc", "memories", "text\n")
+
+    async def test_profile_create(self, wire):
+        wire.client.intent(state.CreateProfile("bench"))
+        await wire.client.flush()
+        await settle()
+        assert wire.peer.last(protocol.ProfileCreate).name == "bench"
+
+    async def test_a_created_profile_is_asked_about_again(self, wire):
+        # Nothing announces one: the core says so in a `notify` and restates
+        # the sessions, and `profile.rows` only ever comes when it is asked for.
+        wire.client.intent(state.CreateProfile("bench"))
+        await wire.client.flush()
+        await settle()
+        assert wire.peer.took(protocol.ProfileList)
+
+    async def test_and_so_is_a_deleted_one(self, wire):
+        wire.client.intent(state.DeleteProfile("bench"))
+        await wire.client.flush()
+        await settle()
+        assert wire.peer.took(protocol.ProfileList)
+
+    async def test_profile_duplicate(self, wire):
+        wire.client.intent(state.CopyProfile("hpc", "hpc-gpu"))
+        await wire.client.flush()
+        await settle()
+        sent = wire.peer.last(protocol.ProfileDuplicate)
+        assert (sent.source, sent.name) == ("hpc", "hpc-gpu")
+
+    async def test_profile_delete(self, wire):
+        wire.client.intent(state.DeleteProfile("writing"))
+        await wire.client.flush()
+        await settle()
+        assert wire.peer.last(protocol.ProfileDelete).name == "writing"
+
+    async def test_skill_save_and_delete(self, wire):
+        wire.client.intent(state.SaveSkill("hpc", "merge", "body"))
+        wire.client.intent(state.DeleteSkill("hpc", "merge"))
+        await wire.client.flush()
+        await settle()
+        assert wire.peer.last(protocol.SkillSave).text == "body"
+        assert wire.peer.last(protocol.SkillDelete).name == "merge"
+
+    async def test_memory_resolve_is_positional(self, wire):
+        wire.client.intent(state.ResolveMemory("s1", (True, False)))
+        await wire.client.flush()
+        await settle()
+        assert wire.peer.last(protocol.MemoryResolve).approved == [True, False]
+
+    async def test_a_profile_scoped_command_names_no_session(self, wire):
+        wire.client.intent(state.RunCommand("skills-list"))
+        await wire.client.flush()
+        await settle()
+        assert wire.peer.last(protocol.CommandRun).session_id is None
+
+    async def test_a_session_scoped_one_does(self, wire):
+        wire.client.intent(state.RunCommand("compact", session_id="s1"))
+        await wire.client.flush()
+        await settle()
+        assert wire.peer.last(protocol.CommandRun).session_id == "s1"
+
+
+class TestTheSettingsFile:
+    """There is no `settings.get`/`settings.save` on the wire: the file is the
+    interface and both ends read it (`UIClient.load_settings`)."""
+
+    async def test_loading_prefills_the_editor(self, wire, monkeypatch, tmp_path):
+        monkeypatch.setenv("HPCA_HOME", str(tmp_path))
+        tmp_path.mkdir(exist_ok=True)
+        (tmp_path / "settings.json").write_text('{"llm": {"model": "written"}}')
+        wire.client.load_settings()
+        assert "written" in wire.ui.settings_json
+
+    async def test_the_first_c_fills_the_editor(self, wire, monkeypatch, tmp_path):
+        # Lazily, so a UI that is never asked for the editor never reads it.
+        monkeypatch.setenv("HPCA_HOME", str(tmp_path))
+        (tmp_path / "settings.json").write_text('{"llm": {"model": "lazy"}}')
+        assert wire.ui.settings_json == ""
+        wire.ui.focus = SESSIONS
+        await wire.press("c")
+        assert "lazy" in wire.ui.overlay.editor.text()
+
+    async def test_a_missing_file_falls_back_to_the_model_s_defaults(
+        self, wire, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HPCA_HOME", str(tmp_path / "nothing-here"))
+        wire.client.load_settings()
+        assert wire.ui.settings_json.startswith("{")
+
+    async def test_saving_writes_it(self, wire, monkeypatch, tmp_path):
+        monkeypatch.setenv("HPCA_HOME", str(tmp_path))
+        wire.client.load_settings()
+        edited = wire.ui.settings_json.replace('"local_cache": true', '"local_cache": false')
+        wire.client.intent(state.SaveSettings(edited))
+        assert '"local_cache": false' in (tmp_path / "settings.json").read_text()
+
+    async def test_and_says_the_llm_changes_wait_for_a_restart(
+        self, wire, monkeypatch, tmp_path
+    ):
+        # The core built its clients from the settings it loaded at startup and
+        # nothing on the wire asks it to build them again.
+        monkeypatch.setenv("HPCA_HOME", str(tmp_path))
+        wire.client.load_settings()
+        wire.client.intent(state.SaveSettings(wire.ui.settings_json))
+        assert "next start" in wire.ui.note
+
+    async def test_a_file_the_model_refuses_is_not_written(
+        self, wire, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HPCA_HOME", str(tmp_path))
+        wire.client.intent(
+            state.SaveSettings('{"database": {"sync_interval_s": "soon"}}')
+        )
+        assert not (tmp_path / "settings.json").exists()
+        assert "invalid" in wire.ui.note
+
+    async def test_the_validator_reaches_the_editor(
+        self, wire, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HPCA_HOME", str(tmp_path))
+        wire.client.load_settings()
+        wire.ui.focus = SESSIONS
+        await wire.press("c")
+        wire.ui.overlay.editor.set_text('{"database": {"sync_interval_s": "soon"}}')
+        await wire.press("esc")
+        assert wire.ui.overlay is not None, "invalid values keep it open"
+        assert "invalid" in wire.screen()
+
+
+class TestThinkingOnTheSidebar:
+    async def test_the_level_reaches_the_meter(self, wire):
+        await wire.tell(
+            protocol.SessionRows(
+                rows=[
+                    protocol.SessionRow(
+                        session_id="s1", title="t", thinking="medium"
+                    )
+                ]
+            )
+        )
+        assert wire.ui.session_for("s1").thinking == "medium"
+        assert wire.ui.session_for("s1").context.effort == "medium"
+
+    async def test_two_sessions_keep_their_own(self, wire):
+        await wire.tell(
+            protocol.SessionRows(
+                rows=[
+                    protocol.SessionRow(session_id="s1", title="a", thinking="low"),
+                    protocol.SessionRow(session_id="s2", title="b", thinking="xhigh"),
+                ]
+            )
+        )
+        assert wire.ui.session_for("s1").thinking == "low"
+        assert wire.ui.session_for("s2").thinking == "xhigh"
+
+    async def test_a_session_that_chose_nothing_shows_no_level(self, wire):
+        await wire.tell(
+            protocol.SessionRows(
+                rows=[protocol.SessionRow(session_id="s1", title="a")]
+            )
+        )
+        assert "think" not in wire.screen()
+
+
+class TestMemoryProposals:
+    PROPOSALS = [
+        protocol.Proposal(scope="profile", kind="fact", text="scratch is /scratch"),
+    ]
+
+    async def test_they_open_the_review_for_the_session_on_screen(self, wire):
+        await started(wire)
+        await wire.tell(
+            protocol.MemoryProposals(session_id="s1", proposals=self.PROPOSALS)
+        )
+        assert "scratch is /scratch" in wire.screen()
+
+    async def test_another_session_s_offer_only_toasts(self, wire):
+        # A review that covered somebody else's chat would be the modal mistake
+        # the inline approval prompt is careful about, one screen over.
+        await started(wire)
+        await wire.tell(
+            protocol.MemoryProposals(session_id="s2", proposals=self.PROPOSALS)
+        )
+        assert wire.ui.overlay is None
+        assert "to review" in plain(wire.frame()[-1])
+
+    async def test_and_is_still_held_for_when_it_is_opened(self, wire):
+        await started(wire)
+        await wire.tell(
+            protocol.MemoryProposals(session_id="s2", proposals=self.PROPOSALS)
+        )
+        assert len(wire.ui.session_for("s2").proposals) == 1
+
+    async def test_the_verdicts_go_back_positionally(self, wire):
+        await started(wire)
+        await wire.tell(
+            protocol.MemoryProposals(session_id="s1", proposals=self.PROPOSALS)
+        )
+        await wire.press("y")
+        sent = wire.peer.last(protocol.MemoryResolve)
+        assert (sent.session_id, sent.approved) == ("s1", [True])

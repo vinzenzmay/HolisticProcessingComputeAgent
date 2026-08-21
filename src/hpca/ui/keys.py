@@ -117,6 +117,7 @@ KEYS = {
     "\x7f": "backspace",
     "\x08": "ctrl-backspace",  # what most terminals send for ctrl+backspace
     "\x17": "ctrl-backspace",  # and ctrl-w, for the terminals that do not
+    "\x0c": "ctrl-l",  # switch this session's LLM (§5)
     "\x13": "ctrl-s",
     "\x15": "ctrl-u",
     "\x03": "quit",

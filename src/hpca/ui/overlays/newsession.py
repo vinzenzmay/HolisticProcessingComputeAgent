@@ -14,8 +14,8 @@ carries whatever string the core wants back, and nothing here looks inside it.
 
 from __future__ import annotations
 
-from hpca.ui.ansi import BOLD, CYAN, DIM, RESET, pad, rule
-from hpca.ui.overlays.base import Overlay
+from hpca.ui.ansi import DIM, RESET, pad
+from hpca.ui.overlays.base import ListOverlay
 from hpca.ui.pane import Item, Pane
 
 PROFILE, BACKEND = "profile", "backend"
@@ -47,7 +47,7 @@ def choice(name: str, detail: str = "", *, value: str = "") -> Item:
     )
 
 
-class NewSessionOverlay(Overlay):
+class NewSessionOverlay(ListOverlay):
     """Enter on the `(new session)` row (§4.3 item 14).
 
     With no backends configured there is no second stage at all — the core
@@ -58,7 +58,7 @@ class NewSessionOverlay(Overlay):
     def __init__(
         self, profiles: list[Item], backends: list[Item] | None = None
     ) -> None:
-        self.pane = Pane(PROFILE, list(profiles))
+        super().__init__(profiles, name=PROFILE)
         self._backends = list(backends or [])
         self.stage = PROFILE
         self.profile = ""
@@ -68,62 +68,37 @@ class NewSessionOverlay(Overlay):
         # one place to get it wrong instead of two.
         self.chosen = False
 
-    @property
-    def title(self) -> str:
+    def heading(self) -> str:
         return STAGE_TITLES[self.stage]
 
-    def footer(self) -> list[tuple[str, str]]:
+    def keymap(self) -> list[tuple[str, str]]:
         return [
             ("↑↓", "move"),
             ("enter", "choose"),
             ("esc", "cancel — nothing is created"),
         ]
 
-    def render(self, width: int, height: int) -> list[str]:
-        out = [BOLD + CYAN + rule(self.title, width) + RESET]
-        out.append(DIM + pad(f"  {STAGE_HINTS[self.stage]}", width) + RESET)
-        out += self.pane.render(width, max(1, height - 2), focused=True)
-        while len(out) < height:
-            out.append(" " * width)
-        return out[:height]
+    def view(self, height: int) -> int:
+        return max(1, super().view(height) - 1)  # the hint line under the rule
 
-    def handle(self, key: str, width: int, height: int) -> bool:
-        inner = max(8, width - 2)
-        view = max(1, height - 3)
-        if key in ("esc", "quit"):
-            return False
-        if key == "up":
-            self.pane.move(-1, view, inner)
-        elif key == "down":
-            self.pane.move(1, view, inner)
-        elif key == "pgup":
-            self.pane.move(-view, view, inner)
-        elif key == "pgdn":
-            self.pane.move(view, view, inner)
-        elif key == "home":
-            self.pane.move(-(10**9), view, inner)
-        elif key == "end":
-            self.pane.move(10**9, view, inner)
-        elif key == "enter":
-            return self._pick(inner)
-        return True
+    def body(self, width: int, height: int) -> list[str]:
+        hint = DIM + pad(f"  {STAGE_HINTS[self.stage]}", width) + RESET
+        return [hint] + super().body(width, max(1, height - 1))
 
-    def _pick(self, inner: int) -> bool:
+    def chose(self, item: Item | None) -> bool:
         """Take the row under the cursor, and either move on or finish."""
-        index = self.pane.current(inner)
-        if index < 0:
+        if item is None:
             # A list with nothing in it. Closing with nothing chosen is the
             # honest answer: the alternative is a screen with no way out.
             return False
-        picked = self.pane.items[index].text
         if self.stage == PROFILE:
-            self.profile = picked
+            self.profile = item.text
             if not self._backends:
                 self.chosen = True
                 return False
             self.stage = BACKEND
             self.pane = Pane(BACKEND, self._backends)
             return True
-        self.backend = picked
+        self.backend = item.text
         self.chosen = True
         return False

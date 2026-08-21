@@ -839,7 +839,9 @@ def test_a_paste_from_a_row_goes_to_the_message_box():
 
 def test_a_paste_into_the_config_editor_lands_there_instead():
     ui = build()
-    ui.focus = CHAT
+    # Not from the chat column: `c` is a letter there and the editor is
+    # deliberately not offered (specs-ui-acceptance.md, "Navigating the entry").
+    ui.focus = SESSIONS
     ui.handle("c", 120, 40)
     pasted('  "x": 1', ui)
     assert '  "x": 1' in ui.overlay.editor.text()
@@ -883,6 +885,7 @@ def test_and_the_message_row_grows_by_one(key):
 @pytest.mark.parametrize("key", ["alt-enter", "shift-enter", "ctrl-j"])
 def test_the_newline_keys_work_in_the_config_editor_too(key):
     ui = build()
+    ui.focus = SESSIONS
     ui.handle("c", 120, 40)
     ui.overlay.editor.set_text("{}")
     ui.handle(key, 120, 40)
