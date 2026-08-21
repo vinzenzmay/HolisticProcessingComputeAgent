@@ -24,8 +24,10 @@ blob the choice is stored as, are here.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import TYPE_CHECKING, Any, Callable
 
 import httpx
@@ -35,11 +37,11 @@ from hpca.autoconnect import AutoConnectPlan, plan_auto_connect
 from hpca.cluster_endpoints import discover_cluster_endpoints
 from hpca.config import LLMBackend, LLMSettings, llm_settings_for
 from hpca.core.deps import CoreDeps
-from hpca.discover import DiscoveredBackend
+from hpca.discover import DiscoveredBackend, is_reachable
 from hpca.embeddings import EmbeddingClient
 from hpca.llm import LLMClient
 from hpca.logs import LoggedLLM
-from hpca.protocol import ContextEstimate, Notify, TurnUsage
+from hpca.protocol import ContextEstimate, LLMEntry, Notify, TurnUsage
 from hpca.sessions import SessionStore
 
 if TYPE_CHECKING:
@@ -250,34 +252,138 @@ class BackendRegistry:
     # ------------------------------------------------------------- catalog
 
     def choices(self) -> list[LLMBackend]:
-        """The configured catalog, for whoever puts the picker up.
+        """The configured catalog, entries and all, for callers inside the core.
 
         Choosing is a front-end job — it was a modal — but the list being
         chosen from belongs to the core, and so does what the choice is
         stored as (`backend_for_new_session`).
+
+        Not what crosses the socket: these hold api keys. `catalog` is the
+        drawable form, and it is the only one a front-end ever sees.
         """
         return list(self._deps.settings.backends)
 
+    def labels(self) -> dict[str, LLMBackend]:
+        """The catalog by the name a command may pin an entry with.
+
+        One place mints these, because two would eventually disagree and the
+        disagreement would look like "the backend I picked was ignored": the
+        same function fills `LLMEntry.label` for the front-end and resolves
+        what comes back in `session.new`.
+
+        The model name where it is unique, ``model @ host:port`` where it is
+        not — two vLLMs serving one model on two nodes are two entries a user
+        has to be able to tell apart, and a bare index would not survive the
+        catalog being reordered, which is the property the stored blob has and
+        a label must not lose. A catalog holding the very same model at the
+        very same endpoint twice is a duplicated settings entry rather than a
+        choice; the second copy is numbered so that every entry still has a
+        name, and neither name is silently unreachable.
+        """
+        counts: dict[str, int] = {}
+        for entry in self._deps.settings.backends:
+            counts[entry.model] = counts.get(entry.model, 0) + 1
+        out: dict[str, LLMBackend] = {}
+        for entry in self._deps.settings.backends:
+            label = entry.model
+            if counts.get(entry.model, 0) > 1:
+                label = f"{entry.model} @ {urlparse(entry.base_url).netloc}"
+            if label in out:
+                seq = 2
+                while f"{label} #{seq}" in out:
+                    seq += 1
+                label = f"{label} #{seq}"
+            out[label] = entry
+        return out
+
+    def catalog(self, *, reachable: dict[str, bool] | None = None) -> list[LLMEntry]:
+        """The catalog as a front-end draws it (`protocol.LLMCatalog`).
+
+        Never the `LLMBackend` objects themselves: they hold api keys, and a
+        picker only needs the name, the endpoint, the window and whether a key
+        is required — which is exactly what the manage-LLMs line has always
+        shown (`discover.DiscoveredBackend.details`).
+
+        ``reachable`` is the probe results by label when there are any. Absent
+        means "not asked", which is a third state and not a synonym for
+        disconnected: see `probe_catalog`.
+        """
+        settings = self._deps.settings
+        results = reachable or {}
+        return [
+            LLMEntry(
+                label=label,
+                model=entry.model,
+                base_url=entry.base_url,
+                max_model_len=entry.max_model_len,
+                # Whether there is a key, never the key. The line says "key:
+                # yes"; nothing on a screen ever needed more than that.
+                needs_key=entry.api_key is not None,
+                active=settings.is_active(entry),
+                reachable=results.get(label),
+            )
+            for label, entry in self.labels().items()
+        ]
+
+    async def probe_catalog(self) -> dict[str, bool]:
+        """Ask every configured endpoint whether it answers, all at once.
+
+        Concurrent because the endpoints are independent and a probe of a node
+        that has gone away costs the full timeout; serialised, a catalog of
+        five dead entries would take five timeouts before the first ● could be
+        drawn.
+
+        Authenticated where the entry has a key, because `is_reachable` counts
+        a 401 as reachable only when it was not given one — a stored key that
+        no longer works is a backend the user cannot use, and it should read
+        as disconnected rather than as connected.
+
+        Never raises: a probe is a nicety, and an endpoint that fails in a way
+        `is_reachable` does not catch must not cost the client its catalog.
+        """
+        entries = list(self.labels().items())
+        if not entries:
+            return {}
+
+        async def ask(entry: LLMBackend) -> bool:
+            try:
+                return await is_reachable(
+                    entry.base_url,
+                    api_key=entry.api_key,
+                    transport=self._probe_transport,
+                )
+            except Exception:
+                return False
+
+        answers = await asyncio.gather(*(ask(entry) for _, entry in entries))
+        return {label: bool(ok) for (label, _), ok in zip(entries, answers)}
+
     def backend_for_new_session(
         self, requested: LLMBackend | str | None = None
-    ) -> str:
-        """The backend blob to store on a session about to be created.
+    ) -> str | None:
+        """The backend blob to store on a session about to be created, or None
+        when the label names nothing.
 
-        JSON rather than a catalog index, so the choice survives that entry
-        being dropped from the catalog later (`sessions.Session.backend`). An
-        empty string means the bootstrap client — what a run with no configured
-        backends gets, since then there is nothing to pick from.
+        Stored as JSON rather than as the label itself, so the choice survives
+        that entry being dropped from the catalog later
+        (`sessions.Session.backend`) — the label is how a *command* names a
+        backend, not how a session remembers one.
+
+        What crosses the wire is a label (`protocol.SessionNew`). It used to be
+        the blob, while the protocol documented a label, and the mismatch was
+        silent in the worst way: an unrecognised value returned "" and the
+        session was created against the bootstrap client as though nothing had
+        been asked for. So an empty request still means the bootstrap — that is
+        a real answer, and what a run with no configured backends gets — but a
+        label nothing in the catalog answers to comes back as None, for the
+        caller to report rather than absorb.
         """
         if requested is None or requested == "":
             return ""
         if isinstance(requested, LLMBackend):
             return requested.model_dump_json()
-        try:
-            return LLMBackend.model_validate_json(requested).model_dump_json()
-        except Exception:
-            # An unparseable blob would pin the session to nothing at all;
-            # the bootstrap client is at least something that answers.
-            return ""
+        entry = self.labels().get(requested)
+        return entry.model_dump_json() if entry is not None else None
 
     def marks_session_backend(
         self, backend: LLMBackend, *, session_id: str | None

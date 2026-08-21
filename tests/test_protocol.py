@@ -37,6 +37,11 @@ from hpca.protocol import (
     SessionCreated,
     SessionFork,
     SessionRollback,
+    LLMCatalog,
+    LLMEntry,
+    ProfileRow,
+    ProfileRows,
+    SessionNew,
     SessionRow,
     SessionRows,
     TurnInterrupted,
@@ -75,6 +80,10 @@ SPEC_COMMANDS = {
     "mode.set",
     "thinking.set",
     "backend.set",
+    # Not in the §4.1 table: the catalog and the profile listing the table
+    # never had, added because a front-end cannot draw either by inference.
+    "llm.list",
+    "profile.list",
     "profile.set",
     "profile.save",
     "profile.create",
@@ -93,6 +102,8 @@ SPEC_EVENTS = {
     "hello",
     "session.rows",
     "session.created",
+    "llm.catalog",
+    "profile.rows",
     "chat.reset",
     "chat.append",
     "chat.update",
@@ -699,3 +710,100 @@ class TestWireFormat:
     def test_non_ascii_survives_the_utf8_round_trip(self):
         message = Notify(text="job ✗ failed · 3 nodes")
         assert parse(decode(encode(message.to_envelope()))).text == message.text
+
+
+class TestTheLLMCatalog:
+    """`llm.catalog`: the configured backends, drawable without the keys.
+
+    What this closes is not a rough edge but an absence — nothing carried the
+    catalog to a front-end, so the new-session picker and the manage-LLMs
+    screen could only be populated by a demo, and §4.2 rule 2 (the UI never
+    reads the core's state) leaves an event as the only way to fill them.
+    """
+
+    def test_an_entry_carries_what_a_row_draws_and_never_the_key(self):
+        assert set(LLMEntry.model_fields) == {
+            "label",
+            "model",
+            "base_url",
+            "max_model_len",
+            "needs_key",
+            "active",
+            "reachable",
+            "discovered",
+        }
+        # The precedent is `SessionRow.model`: a name rather than the entry,
+        # because shipping the entry would put an api_key on the wire to
+        # render one line.
+        assert "api_key" not in LLMEntry.model_fields
+
+    def test_a_key_cannot_be_smuggled_in_as_an_extra_field(self):
+        with pytest.raises(ProtocolError):
+            parse(
+                Envelope(
+                    type="llm.catalog",
+                    payload={
+                        "entries": [
+                            {
+                                "label": "qwen",
+                                "model": "qwen",
+                                "api_key": "sk-secret",
+                            }
+                        ]
+                    },
+                )
+            )
+
+    def test_a_catalog_round_trips(self):
+        entry = LLMEntry(
+            label="qwen3-32b",
+            model="qwen3-32b",
+            base_url="http://node07:20001/v1",
+            max_model_len=32768,
+            needs_key=True,
+            active=True,
+            reachable=True,
+        )
+        catalog = LLMCatalog(entries=[entry], probed=True)
+        assert parse(decode(encode(catalog.to_envelope()))).entries == [entry]
+
+    def test_reachability_is_three_states_not_two(self):
+        # None is "nobody has asked yet". A probe costs a round trip to a
+        # cluster node, so the first frame answers with nothing known — and a
+        # client that drew ○ for None would libel every backend until the
+        # scan lands.
+        assert LLMEntry(label="q", model="q").reachable is None
+        assert LLMCatalog().probed is False
+
+    def test_the_entry_identity_is_the_label_a_command_sends_back(self):
+        # `session.new` names a backend by this string and by nothing else.
+        entry = LLMEntry(label="qwen3-32b @ node07:20001", model="qwen3-32b")
+        assert SessionNew(profile="hpc", backend=entry.label).backend == entry.label
+
+
+class TestTheProfileListing:
+    """`profile.list` / `profile.rows`: an event where inference used to be."""
+
+    def test_a_row_carries_what_the_profiles_screen_draws(self):
+        assert set(ProfileRow.model_fields) == {
+            "name",
+            "memories",
+            "copied_from",
+            "is_default",
+            "working",
+        }
+
+    def test_the_rows_round_trip(self):
+        row = ProfileRow(
+            name="bioinformatics", memories=12, copied_from="default", working=True
+        )
+        assert parse(decode(encode(ProfileRows(rows=[row]).to_envelope()))).rows == [
+            row
+        ]
+
+    def test_the_default_and_the_working_profile_are_different_questions(self):
+        # The ★ marks the profile a deleted one's sessions fall back to; the
+        # other marks what the core is running under right now. Usually not
+        # the same profile, so one flag could not answer both.
+        row = ProfileRow(name="hpc", working=True)
+        assert (row.is_default, row.working) == (False, True)

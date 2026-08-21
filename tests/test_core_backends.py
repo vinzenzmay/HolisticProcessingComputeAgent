@@ -377,6 +377,16 @@ class TestSwitching:
 
 
 class TestNewSessionBackend:
+    """What `session.new` may name a backend by, and what gets stored.
+
+    The two are deliberately different. A command names a *label* out of the
+    catalog it was given (`protocol.SessionNew`); a session stores the entry
+    as JSON, so the conversation survives that entry being dropped from the
+    catalog later. The old code accepted the blob on the wire while the
+    protocol documented a label, and answered anything else with "" — so a
+    front-end sending what the docstring described pinned nothing, silently.
+    """
+
     def test_no_choice_means_the_bootstrap(self, home):
         h = Harness(home)
         assert h.registry.backend_for_new_session() == ""
@@ -387,19 +397,115 @@ class TestNewSessionBackend:
         blob = h.registry.backend_for_new_session(backend_b())
         assert json.loads(blob)["model"] == "qwen-b"
 
-    def test_a_blob_round_trips(self, home):
+    def test_a_label_from_the_catalog_is_stored_as_that_entrys_json(self, home):
         h = Harness(home)
-        blob = backend_b().model_dump_json()
-        assert h.registry.backend_for_new_session(blob) == blob
+        h.settings.backends = [backend_a(), backend_b()]
+        blob = h.registry.backend_for_new_session("qwen-b")
+        assert json.loads(blob)["base_url"] == "http://b/v1"
 
-    def test_an_unusable_blob_falls_back_to_the_bootstrap(self, home):
+    def test_a_label_nothing_answers_to_is_refused_rather_than_absorbed(self, home):
         h = Harness(home)
-        assert h.registry.backend_for_new_session("{not json") == ""
+        h.settings.backends = [backend_a()]
+        # None, not "": falling back to the bootstrap client here is exactly
+        # the silence that made the old mismatch invisible. The caller reports
+        # it (`AgentService._new_session`).
+        assert h.registry.backend_for_new_session("qwen-b") is None
+
+    def test_a_blob_is_no_longer_a_second_spelling_of_a_label(self, home):
+        # Two accepted forms would mean a stray string that happens to parse
+        # as JSON pinning a backend nobody chose. Naming one that is not in
+        # the catalog is `backend.set`, which still carries the whole entry.
+        h = Harness(home)
+        h.settings.backends = [backend_b()]
+        assert h.registry.backend_for_new_session(backend_b().model_dump_json()) is None
 
     def test_choices_are_the_configured_catalog(self, home):
         h = Harness(home)
         h.settings.backends = [backend_a(), backend_b()]
         assert [b.model for b in h.registry.choices()] == ["qwen-a", "qwen-b"]
+
+
+class TestLabels:
+    """The names both sides call a backend by — minted in one place so they
+    cannot disagree about what was picked."""
+
+    def test_a_unique_model_is_its_own_label(self, home):
+        h = Harness(home)
+        h.settings.backends = [backend_a(), backend_b()]
+        assert list(h.registry.labels()) == ["qwen-a", "qwen-b"]
+
+    def test_one_model_on_two_endpoints_is_told_apart_by_endpoint(self, home):
+        h = Harness(home)
+        h.settings.backends = [
+            backend_a(),
+            LLMBackend(model="qwen-a", base_url="http://node07:20001/v1"),
+        ]
+        assert list(h.registry.labels()) == ["qwen-a @ a", "qwen-a @ node07:20001"]
+
+    def test_a_duplicated_entry_still_gets_a_name_of_its_own(self, home):
+        # A settings file holding the same entry twice is a mistake, but every
+        # row a picker draws has to be pickable: a label neither row can be
+        # named by would be a choice that silently selects the other one.
+        h = Harness(home)
+        h.settings.backends = [backend_a(), backend_a()]
+        assert len(h.registry.labels()) == 2
+
+    def test_a_label_survives_the_catalog_being_reordered(self, home):
+        h = Harness(home)
+        h.settings.backends = [backend_a(), backend_b()]
+        first = h.registry.backend_for_new_session("qwen-b")
+        h.settings.backends = [backend_b(), backend_a()]
+        assert h.registry.backend_for_new_session("qwen-b") == first
+
+
+class TestTheCatalogOnTheWire:
+    """`BackendRegistry.catalog`: rows a front-end can draw, keys withheld."""
+
+    def test_an_entry_carries_what_a_row_draws(self, home):
+        h = Harness(home)
+        h.settings.backends = [backend_a()]
+        entry = h.registry.catalog()[0]
+        assert (entry.label, entry.model, entry.base_url) == (
+            "qwen-a",
+            "qwen-a",
+            "http://a/v1",
+        )
+        assert entry.max_model_len == 1000
+
+    def test_the_key_never_leaves_the_core(self, home):
+        h = Harness(home)
+        h.settings.backends = [backend_a(api_key="sk-secret")]
+        entry = h.registry.catalog()[0]
+        assert entry.needs_key is True
+        assert "sk-secret" not in entry.model_dump_json()
+
+    def test_the_active_default_is_marked(self, home):
+        h = Harness(home)
+        h.settings.backends = [backend_a(), backend_b()]
+        h.settings.activate_backend(backend_b())
+        assert [e.active for e in h.registry.catalog()] == [False, True]
+
+    def test_reachability_is_unknown_until_something_asks(self, home):
+        h = Harness(home)
+        h.settings.backends = [backend_a()]
+        assert h.registry.catalog()[0].reachable is None
+
+    async def test_a_probe_answers_per_entry(self, home):
+        h = Harness(
+            home,
+            probe_transport=make_transport({20001: serve("qwen-a")}),
+        )
+        h.settings.backends = [
+            LLMBackend(model="qwen-a", base_url="http://node07:20001/v1"),
+            LLMBackend(model="qwen-b", base_url="http://node07:20002/v1"),
+        ]
+        answers = await h.registry.probe_catalog()
+        assert answers == {"qwen-a": True, "qwen-b": False}
+        marked = h.registry.catalog(reachable=answers)
+        assert [e.reachable for e in marked] == [True, False]
+
+    async def test_probing_an_empty_catalog_asks_nothing(self, home):
+        assert await Harness(home).registry.probe_catalog() == {}
 
 
 # --- teardown ----------------------------------------------------------------

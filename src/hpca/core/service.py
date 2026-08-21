@@ -83,6 +83,8 @@ from hpca.protocol import (
     DecisionResolve,
     Hello,
     JobCancel,
+    LLMCatalog,
+    LLMList,
     MemoryResolve,
     Message,
     ModeSet,
@@ -91,6 +93,9 @@ from hpca.protocol import (
     ProfileCreate,
     ProfileDelete,
     ProfileDuplicate,
+    ProfileList,
+    ProfileRow,
+    ProfileRows,
     ProfileSave,
     ProfileSet,
     SessionClose,
@@ -155,6 +160,25 @@ SKILL_LEVEL_TAGS = {
     "builtin": "  (built-in)",
 }
 
+# The name a conversation has before anything has named it — the same string
+# `sessions.SessionStore.create` defaults to, passed explicitly below so that
+# the two places that care are visibly one decision.
+#
+# It carries a second meaning the core relies on twice, and it is the only
+# durable answer to "has anyone named this?": a title still equal to this was
+# written by nobody. That distinguishes a never-named session from one the
+# user renamed, which is what stops the model overwriting a hand-written name
+# (§ automatic titling) and what makes an untouched session safe to reuse
+# (`_reusable_session`). A flag on the row would say the same thing and would
+# need a migration to say it; the placeholder is already stored, already
+# survives a restart, and is already what the sidebar draws.
+UNTITLED_SESSION = "untitled"
+
+# How much of the first message becomes the provisional name. Long enough to
+# recognise the conversation in a narrow column, short enough that the row
+# does not become the message (`tui/app.py:SESSION_TITLE_MAX`).
+SESSION_TITLE_MAX = 40
+
 
 class AgentService:
     """The whole runtime behind one command/event surface."""
@@ -190,6 +214,16 @@ class AgentService:
         # one it was offered.
         self._confirmations: dict[str, Any] = {}
         self._confirm_seq = 0
+        # Sessions carrying a provisional name — the truncated first message —
+        # and waiting for the model to write a real one after the exchange.
+        #
+        # In memory on purpose, which is what makes "a reopened session is not
+        # retitled" fall out rather than need arranging: the set is emptied by
+        # a restart, so a conversation whose first exchange happened in an
+        # earlier run is never named again behind the user's back. Whether a
+        # session was ever named at all is the durable question, and
+        # UNTITLED_SESSION answers that one.
+        self._untitled: set[str] = set()
         self._timers: list[asyncio.Task] = []
         # Command work that outlives its dispatch — titling, today. See _spawn.
         self._tasks: set[asyncio.Task] = set()
@@ -262,7 +296,7 @@ class AgentService:
             self._emit_rows()
             return
         if isinstance(command, SessionNew):
-            self._new_session(command)
+            await self._new_session(command)
             return
         if isinstance(command, SessionOpen):
             if self._known(command.session_id) is not None:
@@ -299,6 +333,12 @@ class AgentService:
             session = self._known(command.session_id)
             if session is None:
                 return
+            # A conversation nobody has named takes the opening message as a
+            # provisional name, and is queued for the model to name properly
+            # once this exchange is over (`_name_provisionally`). Here rather
+            # than in the scheduler because it is a *typed* message that does
+            # it: an event delivered into a session names nothing.
+            self._name_provisionally(session, command.text)
             # Whether it runs now or waits is the scheduler's answer, and so
             # is saying so: a message that has to queue is drawn by the
             # scheduler as a `queued` chat row, because only the scheduler
@@ -370,6 +410,17 @@ class AgentService:
             return
         if isinstance(command, BackendSet):
             await self._set_backend(command)
+            return
+        if isinstance(command, LLMList):
+            self._emit_catalog()
+            if command.probe:
+                # The probes are round trips to cluster nodes, so they never
+                # hold up the frame that lets the screen draw: the catalog has
+                # gone out already and the marks arrive in a second one.
+                self._spawn(self._probe_catalog())
+            return
+        if isinstance(command, ProfileList):
+            self._emit_profiles()
             return
         if isinstance(command, ProfileSet):
             await self._set_profile(command.name)
@@ -485,24 +536,98 @@ class AgentService:
             )
         return session
 
-    def _new_session(self, command: SessionNew) -> None:
-        """Make one, and say which it is.
+    async def _new_session(self, command: SessionNew) -> None:
+        """Make one — or hand back the empty one already on screen — and say
+        which it is.
 
         `session.created` before `session.rows` on purpose: the UI has to open
         it, and a sidebar cannot say which of its lines is new (see
-        `protocol.SessionCreated`).
+        `protocol.SessionCreated`). Emitted for a reused session too: what the
+        front-end asked for is a conversation to type in, and it must be told
+        which one that is whether or not a row was added.
         """
         settings = self._deps.settings
-        session = self._sessions.create(
-            profile=command.profile or self._deps.profile,
-            mode=settings.agent.default_mode,
-            # A blob, not a catalog index, so the choice survives the entry
-            # being dropped from the catalog later.
-            backend=self._backends.backend_for_new_session(command.backend),
-            thinking=settings.agent.default_thinking,
-        )
+        profile = command.profile or self._deps.profile
+        # A blob, not a label, so the choice survives the entry being dropped
+        # from the catalog later; None means the label named nothing, which is
+        # said out loud rather than absorbed as "the default" — that silence is
+        # what made a front-end sending what `protocol.SessionNew` documented
+        # pin nothing at all.
+        backend = self._backends.backend_for_new_session(command.backend)
+        if backend is None:
+            self._deps.emit(
+                Notify(
+                    severity="warning",
+                    text=f"No LLM called “{command.backend}” — this "
+                    "conversation talks to the default one.",
+                )
+            )
+            backend = ""
+        session = await self._reusable_session()
+        if session is not None:
+            session = self._retag(session, profile=profile, backend=backend)
+        else:
+            session = self._sessions.create(
+                profile=profile,
+                title=UNTITLED_SESSION,
+                mode=settings.agent.default_mode,
+                backend=backend,
+                thinking=settings.agent.default_thinking,
+            )
         self._deps.emit(SessionCreated(row=self._row(session)))
         self._emit_rows()
+
+    async def _reusable_session(self):
+        """The conversation on screen, when starting a new one would only
+        duplicate it — else None.
+
+        "(new session)" pressed twice used to leave two empty rows, and the
+        Textual app avoided that by reusing an untouched session and retagging
+        it to whatever profile and backend had just been picked. That belongs
+        here and could not live anywhere else: the retag is a change to an
+        existing session's profile, which no command in §4.1 can express, and
+        "untouched" is a question about the checkpointed thread, which §4.2
+        rule 2 puts out of a front-end's reach.
+
+        Untouched means four things, and all four have to hold. Nobody has
+        named it (the title is still the placeholder — a renamed empty session
+        is one the user meant to keep, and retagging it under them would move
+        a conversation they had named to another profile). Its thread is
+        empty. No turn is running on it. And nothing is queued or parked
+        against it — both would land in a thread that is about to change
+        profile underneath them.
+        """
+        session = self._session(self._deps.focused_session_id)
+        if session is None or session.title != UNTITLED_SESSION:
+            return None
+        session_id = session.session_id
+        if (
+            self._scheduler.is_busy(session_id)
+            or self._scheduler.queued_texts_for(session_id)
+            or session_id in self._scheduler.pending_decisions()
+        ):
+            return None
+        values = await self._thread_values(session_id)
+        return None if values.get("messages") else session
+
+    def _retag(self, session, *, profile: str, backend: str):
+        """Point an empty conversation at the profile and LLM just chosen.
+
+        The backend is only rewritten when one was actually asked for: a
+        `session.new` that names no backend means "whatever the core would
+        pick", and reading that as "unpin this session" would silently undo a
+        choice the user made a moment ago in the same empty session.
+
+        The measured window goes with a backend change for the reason
+        `switch_backend` gives — a different backend is a different window, and
+        the fill this session was showing describes the wrong denominator.
+        """
+        if session.profile != profile:
+            self._sessions.set_profile(session.session_id, profile)
+        if backend and backend != session.backend:
+            self._sessions.set_backend(session.session_id, backend)
+            self._backends.forget_session(session.session_id)
+        return self._sessions.get(session.session_id) or session
 
     async def _reset_chat(self, session_id: str) -> None:
         """The whole transcript for one session, renumbered from 1.
@@ -562,7 +687,8 @@ class AgentService:
         self._emit_rows()
 
     def _rename_session(self, session_id: str, title: str) -> None:
-        if self._known(session_id) is None:
+        session = self._known(session_id)
+        if session is None:
             return
         if not title.strip():
             # A nameless row is a row the user cannot find again. Refused
@@ -571,7 +697,108 @@ class AgentService:
                 Notify(severity="warning", text="A session needs a name.")
             )
             return
-        self._sessions.rename(session_id, title)
+        self._store_title(session, title, by="user")
+        self._emit_rows()
+
+    def _store_title(self, session, title: str, *, by: str, log=None) -> None:
+        """Write a session's name, record who wrote it, and stop the model
+        from writing over it.
+
+        The one place a title is stored, because two things have to happen with
+        it and both were missed by having three. It goes in the transcript —
+        the log is the durable record of the conversation, and a session that
+        changes name halfway through it is otherwise two records that cannot be
+        told apart. And it takes the session out of the queue for automatic
+        titling: a name a person typed is never overwritten by the model, which
+        is the whole reason that queue is a set of ids rather than a rule about
+        the title's shape.
+
+        ``log`` is the turn's own log when a turn is what caused this, so the
+        line lands in the transcript of the session being renamed rather than
+        wherever the user has since navigated (`tui/app.py:_rename_session`
+        made the same distinction).
+        """
+        self._sessions.rename(session.session_id, title)
+        self._untitled.discard(session.session_id)
+        sink = log if log is not None else open_log(self._deps.settings, session)
+        if sink is not None:
+            sink.write("session renamed", f"{title} (by {by})")
+
+    def _name_provisionally(self, session, text: str) -> None:
+        """Name a never-named conversation after its opening message, and put
+        it in the queue for a real title.
+
+        The truncated message is a placeholder and is meant to be replaced:
+        it is cut mid-word, and it describes where the conversation started
+        rather than what it became. It exists because the alternative is a
+        sidebar row that says "untitled" for as long as the first exchange
+        takes, and because the model's title has to have something to replace
+        if that call fails.
+
+        Not stored through `_store_title`: this is not somebody naming the
+        session, and passing it through the one place that records an author
+        would also cancel the titling this exists to schedule.
+        """
+        if session.title != UNTITLED_SESSION:
+            return
+        provisional = text.strip()[:SESSION_TITLE_MAX] or UNTITLED_SESSION
+        self._sessions.rename(session.session_id, provisional)
+        self._untitled.add(session.session_id)
+        self._emit_rows()
+
+    async def after_turn(self, session, result, plan) -> None:
+        """What follows a turn that is not the turn's own business.
+
+        Wired to `TurnScheduler`'s `on_turn_result`, which existed for exactly
+        this and had nothing passed to it — so no session was ever titled after
+        its first exchange and `session.retitle` was the whole of naming.
+
+        Nothing here may fail a turn, and the scheduler already guarantees that
+        by catching; what it cannot do is decide *when*. A turn parked on an
+        approval has not finished — the exchange continues in the resume — so
+        naming it now would summarise half a conversation and, worse, spend the
+        one attempt doing it (`tui/app.py` returns at the same point).
+        """
+        if getattr(result, "interrupt", None) is not None:
+            return
+        await self._title_after_turn(
+            session, list(getattr(result, "messages", []) or []), plan
+        )
+
+    async def _title_after_turn(self, session, messages: list, plan) -> None:
+        """Give a freshly-started conversation the model's name for it, once.
+
+        Once, and quietly. The membership test is the whole of the policy:
+        a session is put in `_untitled` by its first typed message and taken
+        out by the first thing that names it, so a second exchange finds
+        nothing to do, a reopened session was never in the set, a slash command
+        never put one there, and a hand-written name has already removed it.
+
+        A failure is silent — no toast, no retry. The provisional name is still
+        a name, `t` is always there, and a turn's reply is what the user is
+        waiting to read; an error toast about the *title* on the back of it
+        would be the loudest thing on screen for the smallest reason. The
+        explicit `session.retitle` reports, because there somebody asked.
+        """
+        session_id = session.session_id
+        if session_id not in self._untitled:
+            return
+        self._untitled.discard(session_id)  # one attempt, whatever comes of it
+        if not messages:
+            return
+        try:
+            title = await propose_title(
+                self._backends.labelled_client(
+                    "title", session_id=session_id, log=getattr(plan, "log", None)
+                ),
+                messages,
+            )
+        except Exception:
+            logger.exception("automatic titling failed")
+            return
+        if self._session(session_id) is None:
+            return  # deleted while the title was being written
+        self._store_title(session, title, by="llm", log=getattr(plan, "log", None))
         self._emit_rows()
 
     async def _retitle(self, session_id: str) -> None:
@@ -580,6 +807,12 @@ class AgentService:
         Routed through the session's *own* client, not the bootstrap one: a
         session pinned to a backend must not have its title written by
         whichever model the core happens to be holding.
+
+        Reported as activity, because this is a silent backend call: from
+        outside, a title being written is indistinguishable from a core that
+        has stopped answering. The same event a turn uses, for the reason
+        `_working` gives — what the user needs to know is that the session is
+        busy and for how long, not which part of the core is busy.
         """
         session = self._session(session_id)
         if session is None:
@@ -590,6 +823,12 @@ class AgentService:
                 Notify(severity="warning", text="Nothing to summarize yet.")
             )
             return
+        # Only when nothing else is holding the session up: a turn running in
+        # it is already reporting its own activity, and the empty label below
+        # would end that report rather than this one.
+        quiet = not self._scheduler.is_busy(session_id)
+        if quiet:
+            self._working(session_id, "writing a title")
         try:
             title = await propose_title(
                 self._backends.labelled_client("title", session_id=session_id),
@@ -603,7 +842,10 @@ class AgentService:
                 Notify(severity="error", text="The model could not write a title.")
             )
             return
-        self._sessions.rename(session_id, title)
+        finally:
+            if quiet:
+                self._working(session_id, "")
+        self._store_title(session, title, by="llm")
         self._emit_rows()
         self._deps.emit(Notify(text=f"Renamed to “{title}”"))
 
@@ -626,6 +868,7 @@ class AgentService:
         # Its queue, its parked decision and its row names go first, so
         # nothing queued for it can start against a thread that is going away.
         self._scheduler.forget_session(session_id)
+        self._untitled.discard(session_id)
         self._backends.forget_session(session_id)
         self._sessions.delete(session_id)
         await self._deps.db(
@@ -846,6 +1089,10 @@ class AgentService:
             )
             # Every session that pinned nothing now names a different model.
             self._emit_rows()
+            # And the ★ has moved — `set_default` adds an unlisted backend to
+            # the catalog on its way past, so this can be a new row as well as
+            # a moved mark.
+            self._emit_catalog()
             return
         if self._known(command.session_id) is None:
             return
@@ -857,7 +1104,76 @@ class AgentService:
         if switched:
             self._emit_rows()  # the row carries the model name
 
+    def _emit_catalog(self, reachable: dict[str, bool] | None = None) -> None:
+        """The LLM catalog, whole (`protocol.LLMCatalog`).
+
+        The event that was missing: with the settings out of a front-end's
+        reach (§4.2 rule 2), nothing carried the configured backends across, so
+        the new-session picker and the manage-LLMs screen could only ever be
+        drawn from a list a demo filled in.
+
+        Whole rather than incremental for the same reason `session.rows` is,
+        and restated wherever it changes — a default switched, an entry added,
+        the probes landing.
+        """
+        self._deps.emit(
+            LLMCatalog(
+                entries=self._backends.catalog(reachable=reachable),
+                probed=reachable is not None,
+            )
+        )
+
+    async def _probe_catalog(self) -> None:
+        """Ask each configured endpoint whether it is up, then say so.
+
+        A second frame rather than a delayed first one. A probe is a round trip
+        to a node that may have gone away, so waiting for the slowest of them
+        before answering `llm.list` would leave a picker blank for the full
+        timeout; the screen draws immediately with nothing marked and the
+        ● / ○ arrive when they arrive (`tui/switch_llm.py` did the same with a
+        worker that filled in "…" per row).
+        """
+        self._emit_catalog(await self._backends.probe_catalog())
+
     # --------------------------------------------------------------- profiles
+
+    def _emit_profiles(self) -> None:
+        """The profiles, whole — the answer to `profile.list`.
+
+        Read here rather than derived by a front-end, which is what was
+        happening: a picker was assembled out of `hello`'s profile plus
+        whatever profiles the sidebar rows named, which misses every profile
+        that has no session, and can carry neither the memory count nor the
+        provenance because those live in files only the core reads.
+
+        A broken profile file counts nothing rather than taking the listing
+        down with it: the screen exists partly so that such a profile can be
+        opened and fixed, and it cannot be opened from a screen that failed to
+        draw.
+        """
+        rows = []
+        for name in Profile.list_profiles():
+            memories, copied_from = 0, ""
+            try:
+                profile = Profile.load(name)
+            except Exception:
+                logger.exception("could not read profile %s", name)
+            else:
+                memories = len(profile.memories)
+                copied_from = profile.copied_from
+            rows.append(
+                ProfileRow(
+                    name=name,
+                    memories=memories,
+                    copied_from=copied_from,
+                    # Two different questions: which profile a deleted one's
+                    # sessions fall back to, and which one the core is running
+                    # under right now (`protocol.ProfileRow`).
+                    is_default=name == DEFAULT_PROFILE,
+                    working=name == self._deps.profile,
+                )
+            )
+        self._deps.emit(ProfileRows(rows=rows))
 
     async def _set_profile(self, name: str) -> None:
         """`profile.set`: the profile the core works under when nothing else
@@ -882,6 +1198,9 @@ class AgentService:
             return
         self._memory.set_working_profile(name)
         self._deps.emit(Notify(text=f"Working profile: {name}"))
+        # The listing carries which profile is the working one, so it is now
+        # out of date on every client that is showing it.
+        self._emit_profiles()
         await self._pollers.refresh_panel(force=True)
 
     def _save_profile(self, command: ProfileSave) -> None:
@@ -905,6 +1224,7 @@ class AgentService:
             self._deps.emit(Notify(severity="warning", text=error))
             return
         self._deps.emit(Notify(text=f"Created profile “{name.strip()}”."))
+        self._emit_profiles()
 
     def _duplicate_profile(self, command: ProfileDuplicate) -> None:
         """`profile.duplicate`: same learnings, its own future.
@@ -920,7 +1240,9 @@ class AgentService:
             return
         # The copy announces itself (it counts what came along); nothing in the
         # sidebar changed, since sessions belong to conversations rather than
-        # to the knowledge that came out of them.
+        # to the knowledge that came out of them. The profile listing did: a
+        # copy is a new row, and it is the one row that carries a provenance.
+        self._emit_profiles()
 
     async def _delete_profile(self, name: str) -> None:
         """`profile.delete`: drop a profile and everything it learned.
@@ -958,6 +1280,7 @@ class AgentService:
             return
         await self._memory.delete_profile(name)
         self._emit_rows()
+        self._emit_profiles()
 
     def _save_skill(self, command: SkillSave) -> None:
         """`skill.save`: persist a skill file verbatim, front matter and all.
@@ -1835,11 +2158,26 @@ def build_service(
             log=log,
         )
 
+    async def after_turn(session, result, plan) -> None:
+        """Post-turn work, routed to the service the scheduler cannot see.
+
+        The scheduler is built before the service and must stay that way — it
+        is handed to the constructor — so the hook goes through the same
+        forward reference `emit` uses. Passing *something* here is the fix for
+        a real regression: `on_turn_result` exists for exactly this and had
+        nothing wired to it, so a conversation was never named after its first
+        exchange and `session.retitle` was the whole of titling.
+        """
+        holder = service_ref.get("service")
+        if holder is not None:
+            await holder.after_turn(session, result, plan)
+
     scheduler = TurnScheduler(
         deps,
         graph=graph,
         prepare=prepare,
         session_for=sessions.get,
+        on_turn_result=after_turn,
     )
     scheduler_ref["scheduler"] = scheduler
 

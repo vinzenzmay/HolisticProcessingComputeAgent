@@ -15,7 +15,7 @@ import json
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
-from hpca.config import Settings
+from hpca.config import LLMBackend, Settings
 from hpca.core.service import build_service
 from hpca.db import connect, init_db
 from hpca.llm import ChatResponse
@@ -30,6 +30,7 @@ from hpca.protocol import (
     ConfirmResolve,
     DecisionResolve,
     JobCancel,
+    LLMList,
     MemoryResolve,
     ModeSet,
     Notify,
@@ -37,6 +38,7 @@ from hpca.protocol import (
     ProfileCreate,
     ProfileDelete,
     ProfileDuplicate,
+    ProfileList,
     ProfileSave,
     ProfileSet,
     SessionClose,
@@ -111,7 +113,18 @@ def llm():
 
 
 @pytest.fixture
-def service(home, conn, llm):
+def saver():
+    """The checkpointer, out where a test can hand it to a second core.
+
+    Which is what "restarted" means here: the same stores and the same
+    threads, a new process. Only that can show what a core keeps in memory
+    versus what it reads back — the difference automatic titling turns on.
+    """
+    return InMemorySaver()
+
+
+@pytest.fixture
+def service(home, conn, llm, saver):
     async def db(fn):
         return fn(conn)
 
@@ -120,7 +133,7 @@ def service(home, conn, llm):
         app_dir=home,
         db=db,
         conn=conn,
-        checkpointer=InMemorySaver(),
+        checkpointer=saver,
         llm=llm,
     )
     return built
@@ -782,22 +795,137 @@ class TestSessionNew:
         assert stored is not None and stored.profile == "bioinformatics"
 
     async def test_the_backend_it_asks_for_is_pinned_to_it(self, service, conn):
-        blob = json.dumps(
-            {"model": "qwen3-32b", "base_url": "http://localhost:20001/v1"}
-        )
+        # A label out of the catalog the core answered `llm.list` with — the
+        # thing `protocol.SessionNew` always documented and never accepted.
+        service._deps.settings.backends = [
+            LLMBackend(model="qwen3-32b", base_url="http://localhost:20001/v1")
+        ]
         queue = subscribe(service)
-        await service.handle(SessionNew(profile="default", backend=blob))
+        await service.handle(SessionNew(profile="default", backend="qwen3-32b"))
         created = only(await drain(queue), "SessionCreated").row
         assert created.model == "qwen3-32b"
-        # Stored as the blob, so the choice survives the catalog entry going.
+        # Stored as the entry's JSON, so the choice survives the catalog entry
+        # being dropped later: the label names it, the blob remembers it.
         assert "qwen3-32b" in SessionStore(conn).get(created.session_id).backend
 
-    async def test_an_unusable_backend_falls_back_rather_than_stranding_it(
-        self, service
-    ):
+    async def test_a_label_nothing_answers_to_is_said_out_loud(self, service):
         queue = subscribe(service)
-        await service.handle(SessionNew(profile="default", backend="not json"))
-        assert only(await drain(queue), "SessionCreated").row.model == ""
+        await service.handle(SessionNew(profile="default", backend="gone-away"))
+        events = await drain(queue)
+        # Still a session — an Enter keypress that produces nothing at all is
+        # worse — but never a silent one: the old code answered an
+        # unrecognised value by quietly using the bootstrap client.
+        warning = only(events, "Notify")
+        assert warning.severity == "warning" and "gone-away" in warning.text
+        assert only(events, "SessionCreated").row.model == ""
+
+    async def test_naming_no_backend_is_not_an_error(self, service):
+        queue = subscribe(service)
+        await service.handle(SessionNew(profile="default"))
+        assert "Notify" not in kinds(await drain(queue))
+
+
+class TestReusingAnEmptySession:
+    """"(new session)" twice must not leave two empty rows.
+
+    Textual reused an untouched session and *retagged* it to the profile and
+    backend just chosen. Neither half can live in a front-end: no command in
+    §4.1 changes an existing session's profile, and "untouched" is a question
+    about the checkpointed thread, which §4.2 rule 2 puts out of its reach.
+
+    The distinction that makes it safe is the same one automatic titling
+    needs: a session still carrying the placeholder title was named by
+    nobody, and one the user renamed is a conversation they meant to keep.
+    """
+
+    async def test_an_untouched_focused_session_is_handed_back(
+        self, service, conn
+    ):
+        empty = SessionStore(conn).create(profile="default")
+        await service.handle(SessionFocus(session_id=empty.session_id))
+        queue = subscribe(service)
+        await service.handle(SessionNew(profile="default"))
+        created = only(await drain(queue), "SessionCreated").row
+        assert created.session_id == empty.session_id
+        # And no second empty row was added.
+        assert len(SessionStore(conn).list_all()) == 1
+
+    async def test_it_is_retagged_to_the_profile_just_chosen(
+        self, service, conn
+    ):
+        empty = SessionStore(conn).create(profile="default")
+        await service.handle(SessionFocus(session_id=empty.session_id))
+        queue = subscribe(service)
+        await service.handle(SessionNew(profile="bioinformatics"))
+        assert only(await drain(queue), "SessionCreated").row.profile == (
+            "bioinformatics"
+        )
+        assert SessionStore(conn).get(empty.session_id).profile == "bioinformatics"
+
+    async def test_it_is_retagged_to_the_backend_just_chosen(
+        self, service, conn
+    ):
+        service._deps.settings.backends = [
+            LLMBackend(model="qwen3-32b", base_url="http://localhost:20001/v1")
+        ]
+        empty = SessionStore(conn).create(profile="default")
+        await service.handle(SessionFocus(session_id=empty.session_id))
+        queue = subscribe(service)
+        await service.handle(SessionNew(profile="default", backend="qwen3-32b"))
+        assert only(await drain(queue), "SessionCreated").row.model == "qwen3-32b"
+
+    async def test_choosing_no_backend_leaves_a_pin_alone(self, service, conn):
+        # "The core decides" is not "unpin this session": the user may have
+        # picked that backend a moment ago, in this very session.
+        pinned = json.dumps({"model": "qwen3-32b", "base_url": "http://x/v1"})
+        empty = SessionStore(conn).create(profile="default", backend=pinned)
+        await service.handle(SessionFocus(session_id=empty.session_id))
+        await service.handle(SessionNew(profile="default"))
+        assert SessionStore(conn).get(empty.session_id).backend == pinned
+
+    async def test_a_session_someone_named_is_never_reused(self, service, conn):
+        # Empty, but named — so it is a conversation the user meant to keep,
+        # and retagging it would move it to a profile they did not choose.
+        named = SessionStore(conn).create(profile="default", title="BAM QC")
+        await service.handle(SessionFocus(session_id=named.session_id))
+        queue = subscribe(service)
+        await service.handle(SessionNew(profile="bioinformatics"))
+        created = only(await drain(queue), "SessionCreated").row
+        assert created.session_id != named.session_id
+        assert SessionStore(conn).get(named.session_id).profile == "default"
+
+    async def test_a_session_with_a_conversation_in_it_is_never_reused(
+        self, service, conn
+    ):
+        used = SessionStore(conn).create(profile="default")
+        await run_turn(service, used.session_id, "how many reads?")
+        await service.handle(SessionFocus(session_id=used.session_id))
+        queue = subscribe(service)
+        await service.handle(SessionNew(profile="default"))
+        assert only(await drain(queue), "SessionCreated").row.session_id != (
+            used.session_id
+        )
+
+    async def test_a_busy_session_is_never_reused(self, service, conn, llm):
+        empty = SessionStore(conn).create(profile="default")
+        release = await park_turn(service, llm, empty.session_id)
+        await service.handle(SessionFocus(session_id=empty.session_id))
+        queue = subscribe(service)
+        await service.handle(SessionNew(profile="bioinformatics"))
+        assert only(await drain(queue), "SessionCreated").row.session_id != (
+            empty.session_id
+        )
+        release.set()
+        await service.stop()
+
+    async def test_with_nothing_focused_a_session_is_simply_made(
+        self, service, conn
+    ):
+        SessionStore(conn).create(profile="default")  # empty, but not on screen
+        queue = subscribe(service)
+        await service.handle(SessionNew(profile="default"))
+        assert len(SessionStore(conn).list_all()) == 2
+        assert "SessionCreated" in kinds(await drain(queue))
 
 
 class TestSessionOpen:
@@ -1495,6 +1623,227 @@ class TestSessionRetitle:
         )
         assert "SessionRows" not in kinds(events)
 
+    async def test_it_says_the_session_is_busy_writing_a_title(
+        self, service, session, llm
+    ):
+        # A silent backend call is indistinguishable from a core that has
+        # stopped answering. The same event a turn reports with, because what
+        # the user needs to know is that the session is busy and since when.
+        await run_turn(service, session.session_id, "hello")
+        llm._outputs = [json.dumps({"title": "Read counting"})]
+        queue = subscribe(service)
+        await service.handle(SessionRetitle(session_id=session.session_id))
+        events = await wait_for(queue, "SessionRows")
+        activity = [e for e in events if type(e).__name__ == "TurnActivity"]
+        assert [a.activity for a in activity] == ["writing a title", ""]
+        assert activity[0].started_at
+
+    async def test_the_new_name_lands_in_the_session_log(
+        self, service, session, llm, home
+    ):
+        await run_turn(service, session.session_id, "hello")
+        llm._outputs = [json.dumps({"title": "Read counting"})]
+        queue = subscribe(service)
+        await service.handle(SessionRetitle(session_id=session.session_id))
+        await wait_for(queue, "SessionRows")
+        assert "Read counting (by llm)" in _transcript(home)
+
+
+def _transcript(home) -> str:
+    """Every session log this core wrote, concatenated.
+
+    The transcript is the durable record of a conversation, so a session that
+    changes name halfway through one has to say so in it — otherwise the file
+    and the sidebar disagree about what the conversation was called and only
+    one of them survives the run.
+    """
+    logs = sorted((home / "chatlogs").glob("*.log"))
+    return "\n".join(path.read_text() for path in logs)
+
+
+class TestAutomaticTitling:
+    """A conversation names itself after its first exchange.
+
+    A real regression when this was written: `TurnScheduler` takes an
+    `on_turn_result` hook for post-turn work and `build_service` passed none,
+    so no session was ever titled and `session.retitle` was the whole of
+    naming. Seven acceptance claims hang off it, and they are the tests below.
+
+    Two questions have to be told apart for any of it to work, and they are
+    answered by two different things. "Has anyone named this conversation?" is
+    durable and is answered by the stored title still being the placeholder.
+    "Is this one waiting for the model to name it?" belongs to this run only,
+    and is a set of ids — which is what makes a reopened session safe.
+    """
+
+    async def test_the_column_shows_the_models_summary_not_the_first_message(
+        self, service, conn, llm
+    ):
+        fresh = SessionStore(conn).create(profile="default")
+        llm._outputs = [respond(), json.dumps({"title": "Read counting"})]
+        await run_turn(service, fresh.session_id, "how many reads are in these BAMs?")
+        assert SessionStore(conn).get(fresh.session_id).title == "Read counting"
+
+    async def test_the_sidebar_is_restated_with_the_new_name(
+        self, service, conn, llm
+    ):
+        fresh = SessionStore(conn).create(profile="default")
+        llm._outputs = [respond(), json.dumps({"title": "Read counting"})]
+        queue = subscribe(service)
+        await run_turn(service, fresh.session_id, "how many reads?")
+        rows = [e for e in await drain(queue) if type(e).__name__ == "SessionRows"]
+        assert rows and rows[-1].rows[0].title == "Read counting"
+
+    async def test_the_opening_message_names_it_until_the_model_does(
+        self, service, conn, llm
+    ):
+        # The placeholder has to be replaced by *something* immediately: a row
+        # reading "untitled" for as long as the first exchange takes is a row
+        # the user cannot find again, and a failed title call needs a name to
+        # fall back to.
+        fresh = SessionStore(conn).create(profile="default")
+        release = await park_turn(service, llm, fresh.session_id)
+        assert SessionStore(conn).get(fresh.session_id).title == "running"
+        release.set()
+        await service.stop()
+
+    async def test_a_long_first_message_is_cut_to_a_column_width(
+        self, service, conn, llm
+    ):
+        fresh = SessionStore(conn).create(profile="default")
+        llm._outputs = [respond(), "not a title"]  # titling fails; the cut shows
+        await run_turn(service, fresh.session_id, "x" * 200)
+        assert SessionStore(conn).get(fresh.session_id).title == "x" * 40
+
+    async def test_each_new_conversation_is_titled(self, service, conn, llm):
+        first = SessionStore(conn).create(profile="default")
+        second = SessionStore(conn).create(profile="default")
+        llm._outputs = [respond(), json.dumps({"title": "One"})]
+        await run_turn(service, first.session_id, "one")
+        llm._outputs = [respond(), json.dumps({"title": "Two"})]
+        await run_turn(service, second.session_id, "two")
+        stored = SessionStore(conn)
+        assert stored.get(first.session_id).title == "One"
+        assert stored.get(second.session_id).title == "Two"
+
+    async def test_a_conversation_is_titled_once(self, service, conn, llm):
+        fresh = SessionStore(conn).create(profile="default")
+        llm._outputs = [respond(), json.dumps({"title": "Read counting"})]
+        await run_turn(service, fresh.session_id, "how many reads?")
+        # A second exchange with another title queued behind it: if titling
+        # fired again, the turn would consume the reply and the title the row.
+        llm._outputs = [respond(), json.dumps({"title": "Something else"})]
+        await run_turn(service, fresh.session_id, "and how many were mapped?")
+        assert SessionStore(conn).get(fresh.session_id).title == "Read counting"
+
+    async def test_a_reopened_conversation_is_not_retitled(
+        self, home, conn, llm, saver
+    ):
+        """A session whose first exchange happened in an earlier run.
+
+        The set of sessions awaiting a title is this run's; a restart empties
+        it. So a conversation carried over from a previous run is never
+        renamed behind the user's back, however it was named then.
+        """
+
+        async def db(fn):
+            return fn(conn)
+
+        def core():
+            return build_service(
+                settings=Settings.load(),
+                app_dir=home,
+                db=db,
+                conn=conn,
+                checkpointer=saver,
+                llm=llm,
+            )
+
+        fresh = SessionStore(conn).create(profile="default")
+        first = core()
+        llm._outputs = [respond(), json.dumps({"title": "Read counting"})]
+        await run_turn(first, fresh.session_id, "how many reads?")
+        await first.stop()
+
+        restarted = core()
+        llm._outputs = [respond(), json.dumps({"title": "Something else"})]
+        await run_turn(restarted, fresh.session_id, "and mapped?")
+        assert SessionStore(conn).get(fresh.session_id).title == "Read counting"
+        await restarted.stop()
+
+    async def test_a_slash_command_alone_does_not_trigger_a_title(
+        self, service, conn, llm
+    ):
+        fresh = SessionStore(conn).create(profile="default")
+        await service.handle(
+            CommandRun(name="skills-list", session_id=fresh.session_id)
+        )
+        await _settle()
+        # Never named, so never queued for a title: a command is not a turn,
+        # and the conversation still has nothing in it to summarise.
+        assert SessionStore(conn).get(fresh.session_id).title == "untitled"
+        assert not llm.prompts
+
+    async def test_a_hand_written_name_is_never_overwritten(
+        self, service, conn, llm
+    ):
+        # The race that makes this worth a test: the user renames while the
+        # first turn is still running, so the model's title arrives *after*
+        # the name it must not replace.
+        fresh = SessionStore(conn).create(profile="default")
+        release = await park_turn(service, llm, fresh.session_id)
+        await service.handle(
+            SessionRename(session_id=fresh.session_id, title="BAM QC")
+        )
+        llm._outputs = [respond(), json.dumps({"title": "Something else"})]
+        release.set()
+        await _settle()
+        assert SessionStore(conn).get(fresh.session_id).title == "BAM QC"
+        await service.stop()
+
+    async def test_a_failed_title_call_leaves_the_name_alone(
+        self, service, conn, llm
+    ):
+        fresh = SessionStore(conn).create(profile="default")
+        # Every attempt answers with something that is not a title.
+        llm._outputs = [respond()]
+        queue = subscribe(service)
+        await run_turn(service, fresh.session_id, "how many reads?")
+        assert SessionStore(conn).get(fresh.session_id).title == "how many reads?"
+        # And silently: the user is reading the reply, and a toast about the
+        # *title* on the back of it would be the loudest thing on screen for
+        # the smallest reason. `t` is always there.
+        assert not [
+            e
+            for e in await drain(queue)
+            if type(e).__name__ == "Notify" and e.severity == "error"
+        ]
+
+    async def test_a_turn_parked_on_an_approval_is_not_named_yet(
+        self, service, conn, llm
+    ):
+        # The exchange is not over — it continues in the resume — so naming it
+        # here would summarise half a conversation and spend the one attempt.
+        fresh = SessionStore(conn).create(profile="default")
+        service._untitled.add(fresh.session_id)
+        await service.after_turn(fresh, _Parked(), None)
+        assert fresh.session_id in service._untitled
+
+    async def test_the_model_written_name_lands_in_the_session_log(
+        self, service, conn, llm, home
+    ):
+        fresh = SessionStore(conn).create(profile="default")
+        llm._outputs = [respond(), json.dumps({"title": "Read counting"})]
+        await run_turn(service, fresh.session_id, "how many reads?")
+        assert "Read counting (by llm)" in _transcript(home)
+
+
+class _Parked:
+    """A turn result that stopped at an approval."""
+
+    interrupt = {"tool": "run_bash"}
+    messages: list = []
+
 
 class TestSessionDelete:
     async def test_the_row_and_its_history_go(self, service, session, conn):
@@ -1974,6 +2323,198 @@ class TestBackendSet:
         )
         assert only(await drain(queue), "Notify").severity == "error"
         assert SessionStore(conn).get(session.session_id).backend == ""
+
+
+class TestTheLLMCatalog:
+    """`llm.list` → `llm.catalog`: the backends, drawable, without the keys.
+
+    The event this protocol was missing. Nothing carried the configured
+    backends to a front-end, so the new-session picker and the manage-LLMs
+    screen could only be filled by a demo — and §4.2 rule 2 (the UI never
+    reads the core's state) leaves an event as the only way to fill them.
+    """
+
+    async def test_the_configured_backends_come_back_as_drawable_rows(
+        self, service
+    ):
+        service._deps.settings.backends = [
+            LLMBackend(
+                model="qwen3-32b",
+                base_url="http://node07:20001/v1",
+                max_model_len=32768,
+            )
+        ]
+        queue = subscribe(service)
+        await service.handle(LLMList())
+        entry_row = only(await drain(queue), "LLMCatalog").entries[0]
+        assert (entry_row.label, entry_row.model) == ("qwen3-32b", "qwen3-32b")
+        assert entry_row.base_url == "http://node07:20001/v1"
+        assert entry_row.max_model_len == 32768
+
+    async def test_no_api_key_crosses_the_wire(self, service):
+        service._deps.settings.backends = [
+            LLMBackend(
+                model="qwen3-32b",
+                base_url="http://node07:20001/v1",
+                api_key="sk-secret",
+            )
+        ]
+        queue = subscribe(service)
+        await service.handle(LLMList())
+        catalog = only(await drain(queue), "LLMCatalog")
+        assert "sk-secret" not in catalog.model_dump_json()
+        assert catalog.entries[0].needs_key is True
+
+    async def test_the_default_backend_is_marked(self, service):
+        settings = service._deps.settings
+        settings.backends = [
+            LLMBackend(model="a", base_url="http://a/v1"),
+            LLMBackend(model="b", base_url="http://b/v1"),
+        ]
+        settings.activate_backend(settings.backends[1])
+        queue = subscribe(service)
+        await service.handle(LLMList())
+        assert [e.active for e in only(await drain(queue), "LLMCatalog").entries] == [
+            False,
+            True,
+        ]
+
+    async def test_nothing_is_probed_unless_the_client_asks(self, service):
+        service._deps.settings.backends = [
+            LLMBackend(model="a", base_url="http://a/v1")
+        ]
+        queue = subscribe(service)
+        await service.handle(LLMList())
+        catalog = only(await drain(queue), "LLMCatalog")
+        assert catalog.probed is False
+        assert catalog.entries[0].reachable is None
+
+    async def test_the_probes_arrive_in_a_second_frame(self, service):
+        # The screen must draw before the round trips land: an endpoint on a
+        # node that has gone away costs the full timeout, and a picker blank
+        # for that long is a picker nobody waits for.
+        service._deps.settings.backends = [
+            LLMBackend(model="a", base_url="http://a/v1")
+        ]
+        service._backends.probe_catalog = _answers({"a": True})
+        queue = subscribe(service)
+        await service.handle(LLMList(probe=True))
+        events = await wait_for(queue, "LLMCatalog")
+        first = [e for e in events if type(e).__name__ == "LLMCatalog"][0]
+        assert first.probed is False
+        probed = await wait_for(queue, "LLMCatalog")
+        answer = [e for e in probed if type(e).__name__ == "LLMCatalog"][-1]
+        assert answer.probed is True and answer.entries[0].reachable is True
+
+    async def test_setting_the_default_restates_the_catalog(self, service):
+        # The ★ has moved, and `set_default` adds an unlisted backend on its
+        # way past — so this can be a new row as well as a moved mark.
+        queue = subscribe(service)
+        await service.handle(BackendSet(backend=entry()))
+        catalog = only(await drain(queue), "LLMCatalog")
+        assert [(e.model, e.active) for e in catalog.entries] == [
+            ("qwen3-32b", True)
+        ]
+
+    async def test_a_run_with_no_backends_answers_with_an_empty_catalog(
+        self, service
+    ):
+        # Not silence: "there is nothing to pick from" is the answer that lets
+        # a front-end skip the picker rather than wait for a frame.
+        queue = subscribe(service)
+        await service.handle(LLMList())
+        assert only(await drain(queue), "LLMCatalog").entries == []
+
+
+def _answers(result):
+    """A stand-in for a probe run: no socket, the answer already known."""
+
+    async def probe():
+        return dict(result)
+
+    return probe
+
+
+class TestTheProfileListing:
+    """`profile.list` → `profile.rows`: an event where inference used to be.
+
+    The profiles screen was assembled from `hello`'s profile plus whatever
+    profiles the sidebar rows happened to name. That misses every profile with
+    no session, and neither source can carry the memory count or the
+    provenance — those live in files only the core reads.
+    """
+
+    async def test_every_profile_comes_back_with_what_the_screen_draws(
+        self, service
+    ):
+        Profile.create("bioinformatics")
+        queue = subscribe(service)
+        await service.handle(ProfileList())
+        rows = {r.name: r for r in only(await drain(queue), "ProfileRows").rows}
+        assert set(rows) == {"default", "bioinformatics"}
+        assert rows["default"].is_default is True
+        assert rows["bioinformatics"].is_default is False
+
+    async def test_a_profile_with_no_session_is_still_listed(self, service):
+        # The whole reason inference was not good enough: nothing in the
+        # sidebar names a profile nobody has had a conversation under.
+        Profile.create("unused")
+        queue = subscribe(service)
+        await service.handle(ProfileList())
+        rows = only(await drain(queue), "ProfileRows").rows
+        assert "unused" in {r.name for r in rows}
+
+    async def test_the_memories_are_counted(self, service):
+        profile = Profile.create("bioinformatics")
+        profile.add_memory("BAMs live on /scratch", scope=MemoryScope.SYSTEM_PROMPT)
+        profile.save()
+        queue = subscribe(service)
+        await service.handle(ProfileList())
+        rows = {r.name: r for r in only(await drain(queue), "ProfileRows").rows}
+        assert rows["bioinformatics"].memories == 1
+
+    async def test_a_copy_says_what_it_was_copied_from(self, service):
+        Profile.create("base")
+        Profile.duplicate("base", "specialised")
+        queue = subscribe(service)
+        await service.handle(ProfileList())
+        rows = {r.name: r for r in only(await drain(queue), "ProfileRows").rows}
+        assert rows["specialised"].copied_from == "base"
+
+    async def test_the_working_profile_is_marked_and_is_not_the_default(
+        self, service
+    ):
+        Profile.create("bioinformatics")
+        await service.handle(ProfileSet(name="bioinformatics"))
+        queue = subscribe(service)
+        await service.handle(ProfileList())
+        rows = {r.name: r for r in only(await drain(queue), "ProfileRows").rows}
+        assert rows["bioinformatics"].working is True
+        assert rows["bioinformatics"].is_default is False
+        assert rows["default"].working is False
+
+    async def test_creating_one_restates_the_listing(self, service):
+        queue = subscribe(service)
+        await service.handle(ProfileCreate(name="bioinformatics"))
+        rows = only(await drain(queue), "ProfileRows").rows
+        assert "bioinformatics" in {r.name for r in rows}
+
+    async def test_deleting_one_restates_the_listing(self, service):
+        Profile.create("doomed")
+        queue = subscribe(service)
+        await service.handle(ProfileDelete(name="doomed"))
+        rows = only(await drain(queue), "ProfileRows").rows
+        assert "doomed" not in {r.name for r in rows}
+
+    async def test_a_profile_that_will_not_load_is_listed_anyway(self, service):
+        # The screen is partly *how* a broken profile gets opened and fixed,
+        # and it cannot be opened from a screen that failed to draw.
+        Profile.create("bioinformatics")
+        Profile.path_for("bioinformatics").write_text("\x00 not a profile")
+        queue = subscribe(service)
+        await service.handle(ProfileList())
+        rows = {r.name: r for r in only(await drain(queue), "ProfileRows").rows}
+        assert "bioinformatics" in rows
 
 
 class TestProfiles:

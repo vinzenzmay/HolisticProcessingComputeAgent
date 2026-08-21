@@ -331,6 +331,72 @@ class Proposal(_Model):
     text: str
 
 
+class LLMEntry(_Model):
+    """One line of the LLM catalog: what a front-end draws, and what it sends
+    back to act on it.
+
+    Not `config.LLMBackend`, and the difference is the point. That model holds
+    an ``api_key``, and a catalog crosses this socket precisely so that a
+    picker can be drawn — `SessionRow.model` set the precedent (a bare name
+    rather than the entry, "because shipping the entry would put an api_key on
+    the wire to render one"). So the key never travels; ``needs_key`` says
+    whether there is one, which is all the manage-LLMs line ever showed
+    (`discover.DiscoveredBackend.details`).
+
+    ``label`` is the identity, and the one field a command may name an entry
+    by (`SessionNew.backend`). Minted by the core (`BackendRegistry.catalog`)
+    so both sides cannot disagree about what a backend is called: the model
+    name where it is unique in the catalog, and ``model @ host:port`` where it
+    is not, because two vLLMs serving one model on two nodes are two entries a
+    user has to be able to tell apart.
+
+    The three render markers the manage-LLMs and switch-LLM screens draw:
+
+    * ``active`` — the ★: what a session that pinned nothing talks to.
+    * ``reachable`` — ● connected / ○ disconnected, and **None for neither**.
+      A probe costs a round trip to a cluster node, so the catalog is answered
+      first with nothing known and restated once the probes land; a client
+      that drew "disconnected" for unknown would libel every backend for as
+      long as the scan takes.
+    * ``discovered`` — this entry was found by a scan rather than configured.
+      One list with a flag rather than two lists, because everything else
+      about the two rows is identical and a second field would have to be kept
+      in step with the first.
+    """
+
+    label: str
+    model: str
+    base_url: str = ""
+    max_model_len: int | None = None
+    needs_key: bool = False
+    active: bool = False
+    reachable: bool | None = None
+    discovered: bool = False
+
+
+class ProfileRow(_Model):
+    """One line of the profiles screen (`tui/profiles_screen.py`).
+
+    Everything that screen puts on a row and nothing else: the name, how much
+    the profile has learned, and — for a copy — what it was copied from, which
+    is "the thing you need to know when they start disagreeing with each
+    other". The memories are counted rather than sent: the screen shows a
+    count, and the text of one is a `profile.save` round trip away.
+
+    Two flags rather than one, because they answer different questions. The
+    ★ marks the *default* profile, which is where a deleted profile's sessions
+    land and so the one that cannot be deleted; ``working`` marks the one the
+    core is currently running under, which is where the picker's cursor
+    starts. They are usually different profiles.
+    """
+
+    name: str
+    memories: int = 0
+    copied_from: str = ""
+    is_default: bool = False
+    working: bool = False
+
+
 # -------------------------------------------------------------------- commands
 
 
@@ -339,10 +405,30 @@ class SessionList(Command):
 
 
 class SessionNew(Command):
+    """Make a conversation under this profile, talking to this backend.
+
+    ``backend`` is an `LLMEntry.label` — a name out of the catalog the core
+    answered `llm.list` with — and null means "whatever the core would have
+    picked", which is what a run with no configured backends gets.
+
+    It was documented as a label and implemented as serialised `LLMBackend`
+    JSON, which is worse than either: a front-end sending what this docstring
+    described pinned nothing at all, silently, because an unparseable value
+    fell back to the bootstrap client. A label settles it in the direction the
+    documentation already pointed, and it is now answerable — `llm.catalog`
+    gives a front-end the names to use, and one it does not recognise comes
+    back as a warning `notify` rather than a session quietly created against
+    the wrong model.
+
+    The blob does not survive as an alternative spelling. Two accepted forms
+    would mean a typo'd label that happened to parse as JSON pinning something
+    nobody chose, and the one thing that genuinely needs to name a backend
+    that is not in the catalog — a hand-filled connection form — is
+    `backend.set`, which still carries the whole entry.
+    """
+
     TYPE: ClassVar[str] = "session.new"
     profile: str
-    # The backend *label* a session is pinned to, which survives that backend
-    # being dropped from the catalog (see `sessions.Session.backend`).
     backend: str | None = None
 
 
@@ -581,6 +667,41 @@ class BackendSet(Command):
     session_id: str | None = None
 
 
+class LLMList(Command):
+    """Ask for the LLM catalog — what a picker and the manage-LLMs screen draw.
+
+    A command rather than a handshake frame, and the same shape as
+    `session.list` for the same reason: the catalog is a screen's worth of
+    state a client may not need at all, and a front-end that wants it at
+    startup asks for it in the same breath as the sidebar.
+
+    Answered by `llm.catalog`, usually twice — once with what settings say and
+    once with the probes filled in (`LLMEntry.reachable`).
+    """
+
+    TYPE: ClassVar[str] = "llm.list"
+    # Whether to go and ask each endpoint whether it is up. Off is for a
+    # client that only needs names (the new-session picker), on for the
+    # screen that draws ● / ○; the first frame is identical either way, so a
+    # client that asks for probes has nothing extra to wait for before it can
+    # draw.
+    probe: bool = False
+
+
+class ProfileList(Command):
+    """Ask for the profiles — the answer is `profile.rows`.
+
+    The profiles screen used to be assembled by inference: `hello` named one
+    profile, the sidebar rows named the others, and a picker was handed
+    whatever the last screen happened to hold. That works and is inference
+    where an event belongs — none of those sources knows how much a profile
+    has learned or what it was copied from, and a profile with no session in
+    the sidebar appeared in none of them.
+    """
+
+    TYPE: ClassVar[str] = "profile.list"
+
+
 class ProfileSet(Command):
     TYPE: ClassVar[str] = "profile.set"
     name: str
@@ -706,6 +827,37 @@ class SessionCreated(Event):
 
     TYPE: ClassVar[str] = "session.created"
     row: SessionRow
+
+
+class LLMCatalog(Event):
+    """Every LLM the core knows about — the answer to `llm.list`.
+
+    The event this protocol was missing: nothing carried the configured
+    backends across, so the new-session picker and the manage-LLMs screen
+    could only be populated by a demo. Rule 2 of §4.2 puts the settings file
+    out of a front-end's reach the same way it puts the database there, so a
+    catalog has to be an event or it does not exist.
+
+    Whole, never incremental, for the reason `session.rows` and `panel.update`
+    are: a catalog is a handful of rows, and a diff would need the core to
+    model what the front-end drew. It is restated when it changes — a default
+    switched, an entry added — and again when the probes land.
+    """
+
+    TYPE: ClassVar[str] = "llm.catalog"
+    entries: list[LLMEntry] = Field(default_factory=list)
+    # Whether the ``reachable`` fields in this frame are answers or "not asked
+    # yet". Carried because both are legitimate states of the same field and a
+    # client redrawing ● / ○ has to know whether a None means "still
+    # scanning" (leave the last marks up) or "nobody asked" (draw neither).
+    probed: bool = False
+
+
+class ProfileRows(Event):
+    """The profiles, whole — the answer to `profile.list`."""
+
+    TYPE: ClassVar[str] = "profile.rows"
+    rows: list[ProfileRow] = Field(default_factory=list)
 
 
 class ChatReset(Event):
