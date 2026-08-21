@@ -109,6 +109,19 @@ SKILL_TEXT = (
     "2. Never write the intermediate to $HOME.\n"
 )
 
+# What HPCA ships, as the wide `skill.list` scope reports them: callable from
+# the "/" menu on a fresh install, and not any one profile's to edit or
+# remove. The names are the real package's (`hpca/data/skills`).
+SHIPPED_SKILLS = (
+    ("plan", "break a piece of work into steps before starting it"),
+    ("grillme", "interrogate a plan for what it has not thought about"),
+)
+
+# How often each command has been run, as `command.counts` reports it. Held by
+# the core rather than by the UI, which is the whole point of that event: the
+# table is the core's and rule 2 of §4.2 keeps a front-end out of it.
+COMMAND_COUNTS: dict[str, int] = {"compact": 5, "memorize": 2, "conclude": 1}
+
 LEARNINGS = {
     "hpc": (
         "The cluster's scratch is /scratch/proj, and $HOME is NFS — never write\n"
@@ -723,16 +736,47 @@ class DemoCore:
         )
 
     def _do_SkillList(self, cmd: protocol.SkillList) -> None:
+        """Both scopes, because the real core answers both: a menu asks what
+        is callable and an editor asks what it may overwrite. The shipped
+        skills are in the wide answer only — which is what makes `/plan` work
+        here the way it works on a fresh install."""
         info = next((x for x in self.profiles if x.name == cmd.profile), None)
+        own = [
+            protocol.SkillRow(
+                name=x.name, description=x.description, level="profile"
+            )
+            for x in (info.skills if info else [])
+        ]
+        shipped = [
+            protocol.SkillRow(
+                name=name, description=description, level="builtin"
+            )
+            for name, description in SHIPPED_SKILLS
+        ]
         self.emit(
             protocol.SkillRows(
                 profile=cmd.profile,
-                skills=[
-                    protocol.SkillRow(name=x.name, description=x.description)
-                    for x in (info.skills if info else [])
-                ],
+                scope=cmd.scope,
+                skills=(own + shipped) if cmd.scope == "visible" else own,
             )
         )
+
+    def _do_SkillDraft(self, cmd: protocol.SkillDraft) -> None:
+        """There is no model behind the demo, so the "draft" is the request
+        itself, shaped like one — enough for the form to open pre-filled."""
+        words = [w for w in cmd.request.split() if w.isalnum()][:3]
+        self.emit(
+            protocol.SkillDrafted(
+                profile=cmd.profile,
+                request=cmd.request,
+                name="-".join(words).lower() or "new-skill",
+                description=f"when the task is: {cmd.request}",
+                body=f"1. {cmd.request}\n2. check it worked\n",
+            )
+        )
+
+    def _do_CommandList(self, cmd: protocol.CommandList) -> None:
+        self.emit(protocol.CommandCounts(counts=dict(COMMAND_COUNTS)))
 
     def _do_SkillGet(self, cmd: protocol.SkillGet) -> None:
         self.emit(
@@ -758,6 +802,10 @@ class DemoCore:
         )
 
     def _do_CommandRun(self, cmd: protocol.CommandRun) -> None:
+        # Counted the way the real core counts, so the menu's frequency sort
+        # is visible in the demo rather than only in the tests.
+        COMMAND_COUNTS[cmd.name] = COMMAND_COUNTS.get(cmd.name, 0) + 1
+        self.emit(protocol.CommandCounts(counts=dict(COMMAND_COUNTS)))
         self.emit(protocol.Notify(text=f"the demo core does not run /{cmd.name}"))
 
     def _do_SessionRename(self, cmd: protocol.SessionRename) -> None:

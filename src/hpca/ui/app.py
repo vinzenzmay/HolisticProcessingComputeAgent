@@ -50,6 +50,7 @@ from hpca.ui.state import (
     CycleMode,
     Decide,
     DeleteSession,
+    DraftSkill,
     Drop,
     Fork,
     Intent,
@@ -259,7 +260,12 @@ class RowUI:
         # rather than at startup, so a UI nobody types a slash into makes no
         # round trip; the answer comes back through `skills_listed`.
         self.skills_loader: Callable[[str], None] | None = None
-        self._skills: dict[str, list[tuple[str, str]]] = {}
+        self._skills: dict[str, list[SkillInfo]] = {}
+        # How often each slash command has been run, as `command.counts` last
+        # said. Empty until something answers, which sorts the menu in
+        # definition order — the same order an install nobody has typed into
+        # yet would produce anyway.
+        self.command_counts: dict[str, int] = {}
         # `y` on a chat row: text in, a sentence about where it went out
         # (`hpca.clipboard.ClipboardManager.copy(...).message`). A callable and
         # not the manager itself, because the manager writes OSC 52 straight to
@@ -617,8 +623,8 @@ class RowUI:
 
     # ------------------------------------------------- the slash commands
 
-    def skills(self) -> list[tuple[str, str]]:
-        """The skills the open profile can call, name and description.
+    def visible_skills(self) -> list[SkillInfo]:
+        """Every skill the open profile can call, each with its level.
 
         Whatever the last `skill.rows` for this profile said, and *asked for*
         the first time the menu wants it — the answer arrives a frame later and
@@ -626,10 +632,10 @@ class RowUI:
         does. Asked once per profile rather than per keystroke, because the
         question is asked on every character of a command being typed.
 
-        **Own skills only**, which is what `skill.list` answers. A shipped,
-        shared or project skill is callable and is not listed here, so `/plan`
-        on a fresh install is reported unknown. That is a gap in the wire —
-        see `UIClient.ask_skills`.
+        The *visible* scope, not the profile's own: HPCA ships skills, and a
+        shared or project one is callable too, so a menu built from the own
+        list reports `/plan` unknown on a fresh install. What each row may
+        have done to it is `SkillInfo.level`'s business, not this list's.
         """
         profile = self.profile
         if profile not in self._skills:
@@ -638,9 +644,25 @@ class RowUI:
                 self.skills_loader(profile)
         return self._skills[profile]
 
+    def skills(self) -> list[tuple[str, str]]:
+        """The same list as the menu takes it: name and description."""
+        return [(x.name, x.description) for x in self.visible_skills()]
+
     def skills_listed(self, profile: str, skills: list[SkillInfo]) -> None:
-        """`skill.rows` arrived: what this profile can call, and what it owns."""
-        self._skills[profile] = [(x.name, x.description) for x in skills]
+        """A `visible`-scoped `skill.rows`: what this profile can call.
+
+        The own-scoped answer goes elsewhere (`own_skills_listed`): the two
+        scopes fill two lists, and letting either one land in the other is how
+        a screen ends up offering to delete a skill that ships with HPCA.
+        """
+        self._skills[profile] = list(skills)
+
+    def own_skills_listed(self, profile: str, skills: list[SkillInfo]) -> None:
+        """An `own`-scoped `skill.rows`: what that profile may edit and delete.
+
+        Kept on the `ProfileInfo` because that is what the skills screen is
+        opened *about*, and it may well be a profile other than the open one.
+        """
         info = next((x for x in self.profiles if x.name == profile), None)
         if info is not None:
             info.skills = list(skills)
@@ -656,21 +678,32 @@ class RowUI:
         info = next((x for x in self.profiles if x.name == self.profile), None)
         if name:
             self._skills[self.profile] = [
-                x for x in self._skills.get(self.profile, []) if x[0] != name
+                x for x in self._skills.get(self.profile, []) if x.name != name
             ]
             if info is not None:
                 info.skills = [x for x in info.skills if x.name != name]
         if self.skills_loader is not None:
             self.skills_loader(self.profile)
 
-    def _remember_skill(self, name: str, description: str) -> None:
-        """A skill the user just wrote, in the two lists that offer skills."""
+    def _remember_skill(self, name: str, description: str, level: str) -> None:
+        """A skill the user just wrote, in the lists that already offer skills.
+
+        The menu takes it whatever level it was written at — every level is
+        callable. The profile's own list takes it only if it is the profile's
+        to remove: a global skill is visible and is not "own", and putting one
+        there would offer it to a picker whose Enter cannot delete it.
+        """
+        fresh = SkillInfo(name=name, description=description, level=level)
         known = self._skills.setdefault(self.profile, [])
-        if not any(x[0] == name for x in known):
-            known.append((name, description))
+        if not any(x.name == name for x in known):
+            known.append(fresh)
         info = next((x for x in self.profiles if x.name == self.profile), None)
-        if info is not None and not any(x.name == name for x in info.skills):
-            info.skills.append(SkillInfo(name=name, description=description))
+        if (
+            fresh.removable
+            and info is not None
+            and not any(x.name == name for x in info.skills)
+        ):
+            info.skills.append(fresh)
 
     def menu(self) -> list[commands.Command]:
         """The commands the draft is currently naming, best first, or none.
@@ -681,16 +714,19 @@ class RowUI:
         the menu follows because it was never state of its own. Only the
         highlighted row is remembered, on the session (`SessionState.menu_at`).
 
-        The order is definition order. The core counts every `command.run` in
-        `command_usage` and nothing serves the counts back, and rule 2 of §4.2
-        says this side does not read the table — so `commands.matching` takes
-        the counts as a parameter and is handed none. Most-used-first is not
-        implemented; see `ui/commands.py`.
+        Most-used first, then definition order. The counts are the core's —
+        rule 2 of §4.2 keeps this side out of the database — and they arrive
+        as `command.counts`, asked for on connect and restated whenever one
+        changes. Until one arrives the mapping is empty and the sort collapses
+        to definition order, which is what a menu nobody has typed into yet
+        would show anyway.
         """
         typed = commands.typed_name(self.input.text())
         if typed is None:
             return []
-        return commands.matching(typed, commands.all_commands(self.skills()))
+        return commands.matching(
+            typed, commands.all_commands(self.skills()), self.command_counts
+        )
 
     def _menu_at(self, matches: list[commands.Command]) -> int:
         """Which row is highlighted, clamped to a list that has since narrowed."""
@@ -1179,12 +1215,18 @@ class RowUI:
             session.context.effort = overlay.effort
             self.note = f"thinking effort: {overlay.effort}"
         elif isinstance(overlay, SkillCreatorOverlay) and overlay.saved:
-            self.send(SaveSkill(self.profile, overlay.name, overlay.text))
+            self.send(
+                SaveSkill(
+                    self.profile, overlay.name, overlay.text, overlay.level
+                )
+            )
             # Shown before the core answers, and remembered locally, because
             # the menu is what a new skill has to appear in and there is no
             # event that says a skill file was written.
-            self._remember_skill(overlay.name, overlay.description)
-            self.note = f"saved skill “{overlay.name}”"
+            self._remember_skill(
+                overlay.name, overlay.description, overlay.level
+            )
+            self.note = f"saved skill “{overlay.name}” · {overlay.where}"
         elif isinstance(overlay, SkillRemoveOverlay) and overlay.removed:
             self.forget_skills(overlay.removed)
             self.note = f"removed skill “{overlay.removed}”"
@@ -1688,11 +1730,17 @@ class RowUI:
             self.thinking()
             return True
         if name == "skill-creator":
-            self.overlay = SkillCreatorOverlay(
-                self.profile,
-                taken=tuple(x for x, _ in self.skills()),
-                request=args,
-            )
+            if args:
+                # A draft is a model call, so it happens on the core's side
+                # (`protocol.SkillDraft`); the form opens when it answers, and
+                # opens empty if it could not. Nothing is drawn in between —
+                # the wait is a spinner in the conversation, which is where
+                # the core reports it.
+                self.send(DraftSkill(self.profile, args, self.active_id))
+                self.input.clear()
+                self.note = "drafting a skill…"
+                return True
+            self.overlay = self._skill_form()
             return True
         if name == "skill-remove" and not args:
             own = self._own_skills()
@@ -1706,6 +1754,37 @@ class RowUI:
             return True
         return False
 
+    def _skill_form(
+        self, drafted: SkillInfo | None = None, request: str = ""
+    ) -> Overlay:
+        """The creator's form, empty or filled with the model's draft.
+
+        One form either way, which is the claim: a draft is a head start
+        inside the screen the user was going to fill in anyway, edited and
+        confirmed exactly like a hand-typed skill.
+        """
+        return SkillCreatorOverlay(
+            self.profile,
+            taken=tuple((x.name, x.level) for x in self.visible_skills()),
+            request=request,
+            name=drafted.name if drafted else "",
+            description=drafted.description if drafted else "",
+            body=drafted.text if drafted else "",
+        )
+
+    def skill_drafted(
+        self, drafted: SkillInfo | None, request: str = "", error: str = ""
+    ) -> None:
+        """`skill.drafted` arrived: open the form over what came back.
+
+        A failed draft opens the *empty* form rather than losing the command —
+        the user asked for a skill about something, and the worst answer is
+        the one that takes the request away and says nothing.
+        """
+        if error:
+            self.toast(f"could not draft that skill ({error})", "warning")
+        self.overlay = self._skill_form(drafted, request)
+
     def _skill_named(self, name: str) -> tuple[str, str] | None:
         """The visible skill that `/name` names, or None. Built-ins win."""
         if not name or name in commands.BUILTIN_NAMES:
@@ -1713,10 +1792,16 @@ class RowUI:
         return next((x for x in self.skills() if x[0] == name), None)
 
     def _own_skills(self) -> list[SkillInfo]:
-        """The open profile's own skills — the only ones `skill.delete` can
-        take, and the only ones the picker may therefore offer."""
-        info = next((x for x in self.profiles if x.name == self.profile), None)
-        return list(info.skills) if info is not None else []
+        """The open profile's removable skills — its own and this project's.
+
+        Read off the menu's list rather than fetched again, and filtered by
+        level: `skill.list` answers one question per round trip, and asking
+        the same profile twice on the same keystroke to get a subset of what
+        already arrived would be a second answer to disagree with the first.
+        A shipped or global skill is callable and is not one profile's to
+        delete, which is exactly what `SkillInfo.removable` says.
+        """
+        return [x for x in self.visible_skills() if x.removable]
 
     def _handle_row(self, key: str, width: int, height: int) -> bool:
         if key == "quit":

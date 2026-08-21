@@ -17,6 +17,8 @@ from hpca import protocol, transcript
 from hpca.protocol import (
     COMMANDS,
     EVENTS,
+    CommandCounts,
+    CommandList,
     PROTOCOL_VERSION,
     ChatAppend,
     ChatReset,
@@ -47,7 +49,10 @@ from hpca.protocol import (
     SettingsBody,
     SettingsSave,
     SkillBody,
+    SkillDraft,
+    SkillDrafted,
     SkillGet,
+    SkillList,
     SkillRow,
     SkillRows,
     ProfileRow,
@@ -102,6 +107,11 @@ SPEC_COMMANDS = {
     "profile.get",
     "skill.list",
     "skill.get",
+    # And the two the "/" menu needs behind it: a draft is a model call, so it
+    # cannot happen on the front-end's side of the socket, and the usage
+    # counts are a table rule 2 puts out of a front-end's reach.
+    "skill.draft",
+    "command.list",
     "settings.get",
     "settings.save",
     # And the three the manage-LLMs screen needs behind it: an endpoint check,
@@ -133,6 +143,8 @@ SPEC_EVENTS = {
     "profile.body",
     "skill.rows",
     "skill.body",
+    "skill.drafted",
+    "command.counts",
     "settings.body",
     "backend.probed",
     "backend.scanned",
@@ -882,11 +894,71 @@ class TestTheReadPaths:
             )
 
     def test_a_skill_listing_draws_a_menu_and_carries_no_bodies(self):
-        assert set(SkillRow.model_fields) == {"name", "description"}
+        assert set(SkillRow.model_fields) == {"name", "description", "level"}
         rows = SkillRows(
             profile="hpc", skills=[SkillRow(name="qc", description="run QC")]
         )
         assert "text" not in rows.model_dump_json()
+
+    def test_listing_and_writing_have_different_scopes(self):
+        """A front-end may be told about a skill it may not write.
+
+        `skill.list` reports four levels — the shipped ones included, or a
+        fresh install's menu could not offer `/plan`. `skill.save` names three:
+        `builtin` is package data, and a write that could name it would edit
+        the install.
+        """
+        from hpca.protocol import SkillLevel, SkillOrigin
+        from typing import get_args
+
+        assert set(get_args(SkillOrigin)) == {
+            "builtin",
+            "global",
+            "profile",
+            "project",
+        }
+        assert set(get_args(SkillLevel)) == set(get_args(SkillOrigin)) - {
+            "builtin"
+        }
+        with pytest.raises(ProtocolError):
+            parse(
+                Envelope(
+                    type="skill.save",
+                    payload={"profile": "hpc", "name": "qc", "level": "builtin"},
+                )
+            )
+
+    def test_a_listing_says_which_scope_it_answers(self):
+        # Two screens ask the same command different questions; an answer that
+        # did not say which would fill an editor's list with a menu's.
+        assert SkillList(profile="hpc").scope == "own"
+        wide = SkillList(profile="hpc", scope="visible")
+        assert parse(decode(encode(wide.to_envelope()))).scope == "visible"
+        assert SkillRows(profile="hpc").scope == "own"
+
+    def test_a_draft_is_asked_for_and_comes_back_unwritten(self):
+        # A draft is a model call, so it happens on the core's side; nothing
+        # is written until the user confirms, which arrives as `skill.save`.
+        ask = SkillDraft(profile="hpc", request="watch a jupyter run")
+        assert parse(decode(encode(ask.to_envelope()))).request == ask.request
+        assert ask.session_id is None
+        drafted = SkillDrafted(
+            profile="hpc", request=ask.request, name="watch-run", body="1. go"
+        )
+        assert parse(decode(encode(drafted.to_envelope()))).name == "watch-run"
+        assert drafted.error == "", "empty error is what makes it a draft"
+
+    def test_a_failed_draft_is_still_an_answer(self):
+        # The empty form opens behind it, so silence is the one thing this
+        # event may not be.
+        failed = SkillDrafted(profile="hpc", request="x", error="no backend")
+        assert failed.name == "" and failed.error
+
+    def test_the_command_counts_are_a_mapping(self):
+        counts = CommandCounts(counts={"compact": 3, "memorize": 1})
+        assert parse(decode(encode(counts.to_envelope()))).counts["compact"] == 3
+        assert CommandCounts().counts == {}, "a core that has counted nothing"
+        assert "counts" not in set(CommandList.model_fields), "it asks, it tells"
 
     def test_a_skill_body_is_fetched_one_at_a_time(self):
         body = SkillBody(profile="hpc", name="qc", text="---\nname: qc\n---\n")

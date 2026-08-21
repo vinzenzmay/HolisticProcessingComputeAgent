@@ -499,17 +499,36 @@ class BackendInfo:
 
 @dataclass
 class SkillInfo:
-    """One of a profile's own procedure files, as the screens draw it.
+    """One procedure file, as the screens and the "/" menu draw it.
 
     The body travels with the name because the skill editor is a raw text box
     over that file (`tui/profiles_screen.py`'s `ProfileSkillsScreen` read it
     off disk; rule 2 of §4.2 puts disk out of the UI's reach, so it is handed
     in instead).
+
+    ``level`` is where the file lives — "builtin", "global", "profile" or
+    "project" (`protocol.SkillRow`). It is what tells the two lists apart: a
+    menu offers every level, and only the profile's own and the project's may
+    be offered for removal. It defaults to "profile" because that is what the
+    other three levels are the exception to, and what a skill invented on this
+    side (the creator's form) is until the user says otherwise.
     """
 
     name: str
     description: str = ""
     text: str = ""
+    level: str = "profile"
+
+    @property
+    def removable(self) -> bool:
+        """Whether `skill.delete` can take this one.
+
+        The profile's own and the project's. A shipped or global skill is
+        visible and callable and is nobody's single profile to delete —
+        removing one would change every other profile that sees it, which is
+        the same rule the core enforces on the way in.
+        """
+        return self.level in ("profile", "project")
 
 
 @dataclass
@@ -1081,11 +1100,18 @@ class DeleteProfile:
 
 @dataclass(frozen=True)
 class SaveSkill:
-    """Persist a skill file verbatim, front matter and all."""
+    """Persist a skill file verbatim, front matter and all.
+
+    ``level`` is where it lands: the profile's own directory, the global one
+    every profile sees, or this project's. The creator asks; every other path
+    that saves a skill is editing a file that already exists, and leaves the
+    default alone (`protocol.SkillSave`).
+    """
 
     profile: str
     name: str
     text: str
+    level: str = "profile"
 
 
 @dataclass(frozen=True)
@@ -1129,9 +1155,36 @@ class Fetch:
 
 @dataclass(frozen=True)
 class FetchSkills:
-    """`skill.list`: a profile's own skills, for the list and for the menu."""
+    """`skill.list`: a profile's skills, at one of the two scopes.
+
+    ``own`` is what a screen that edits and deletes them may show; ``visible``
+    is everything the profile can call — the shipped skills included — which
+    is what the "/" menu needs and what makes `/plan` work on a fresh install.
+    The answer says which scope it is, so the two lists cannot fill each
+    other (`protocol.SkillList`).
+    """
 
     profile: str
+    scope: str = "own"
+
+
+@dataclass(frozen=True)
+class DraftSkill:
+    """`skill.draft`: ask the core for a model-written first draft.
+
+    `/skill-creator <what it should do>`. The form is this side's and the
+    draft cannot be: a draft is a model call. Nothing is written by it — what
+    comes back fills the same form, which the user still edits and confirms,
+    and the confirmation leaves as an ordinary `SaveSkill`.
+
+    ``session_id`` is the conversation the request came out of, empty when
+    there is none: the transcript goes to the drafter with the request, and
+    the session is where the core reports the wait.
+    """
+
+    profile: str
+    request: str
+    session_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -1178,4 +1231,5 @@ Intent = (
     | RunCommand
     | Fetch
     | FetchSkills
+    | DraftSkill
 )

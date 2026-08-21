@@ -67,10 +67,12 @@ from hpca.runner import running_session_ids
 from hpca.sessions import Session, SessionStore
 from hpca.skills import (
     Skill,
+    SkillLevel,
     copy_profile_skills,
     delete_own_skill,
     delete_profile_skills,
     load_own_skills,
+    load_project_skills,
     load_skills,
     patched_body,
     skill_path,
@@ -820,10 +822,20 @@ class MemoryService:
             path.unlink()
             self._notify(f"Cleared archive for “{name}”.")
 
-    def save_skill_file(self, profile: str, name: str, text: str) -> None:
+    def save_skill_file(
+        self, profile: str, name: str, text: str, *, level: SkillLevel = "profile"
+    ) -> None:
         """Persist a hand-edited skill file verbatim (front matter and body).
-        The user owns the file; a parse problem is reported, never fatal."""
-        path = skill_path(name, profile)
+        The user owns the file; a parse problem is reported, never fatal.
+
+        ``level`` is where it lands — the profile's own directory, the shared
+        one every profile sees, or this project's. It defaults to the
+        profile's, which is where an edited file came from and where a
+        self-review patch goes, so the editor paths need no opinion about it.
+        """
+        path = skill_path(
+            name, profile, level=level, project_root=self._project_root
+        )
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text if text.endswith("\n") else text + "\n")
         if profile == self._deps.profile:
@@ -831,11 +843,27 @@ class MemoryService:
         self._notify(f"Saved skill “{name}”.")
 
     def delete_profile_skill(self, profile: str, name: str) -> None:
-        """Delete one of a profile's own skills (never shared/project)."""
-        skill = next(
-            (s for s in load_own_skills(profile) if s.name == name), None
+        """Delete one skill the user owns: this profile's, or this project's.
+
+        The two removable levels, and only those — `delete_own_skill` will not
+        touch `_shared/` or the shipped files, because removing one would
+        silently change every other profile that sees it. The project's are
+        here because a project skill is written from the creator like any
+        other and would otherwise be listed as removable and refuse to go.
+        """
+        by_name = {s.name: s for s in load_own_skills(profile)}
+        # Project shadows profile on a name clash, matching load precedence:
+        # the file the user can see is the one they mean to remove.
+        by_name.update(
+            {
+                s.name: s
+                for s in load_project_skills(project_root=self._project_root)
+            }
         )
-        if skill is None or not delete_own_skill(skill, profile):
+        skill = by_name.get(name)
+        if skill is None or not delete_own_skill(
+            skill, profile, project_root=self._project_root
+        ):
             self._notify(f"No skill “{name}” to delete.", "warning")
             return
         if profile == self._deps.profile:

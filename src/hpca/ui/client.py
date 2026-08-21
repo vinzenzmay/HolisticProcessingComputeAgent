@@ -277,7 +277,23 @@ class UIClient:
         elif isinstance(intent, state.SaveSkill):
             self.command(
                 protocol.SkillSave(
-                    profile=intent.profile, name=intent.name, text=intent.text
+                    profile=intent.profile,
+                    name=intent.name,
+                    text=intent.text,
+                    # Where it lands. The creator asks; every other path is
+                    # editing a file that already exists and leaves it alone.
+                    level=intent.level,
+                )
+            )
+        elif isinstance(intent, state.DraftSkill):
+            # The half of `/skill-creator` that is not this side's: a draft is
+            # a model call. None rather than "" for a request made with
+            # nothing open — the wire spells "no session" as null.
+            self.command(
+                protocol.SkillDraft(
+                    profile=intent.profile,
+                    request=intent.request,
+                    session_id=intent.session_id or None,
                 )
             )
         elif isinstance(intent, state.DeleteSkill):
@@ -314,7 +330,9 @@ class UIClient:
             else:  # pragma: no cover - a screen asking for something new
                 logger.warning("no read path for %r", intent.what)
         elif isinstance(intent, state.FetchSkills):
-            self.command(protocol.SkillList(profile=intent.profile))
+            self.command(
+                protocol.SkillList(profile=intent.profile, scope=intent.scope)
+            )
         elif isinstance(intent, state.SaveSettings):
             # Straight out, with only the JSON check already done on screen.
             # What is *in* the file is the core's model to judge, and it is the
@@ -341,16 +359,18 @@ class UIClient:
     def ask_skills(self, profile: str) -> None:
         """`skill.list`: what the "/" menu offers besides the seven built-ins.
 
-        **A profile's *own* skills, and only those** — that is what the command
-        answers (`core.service._emit_skills`), and it is a smaller set than the
-        menu wants. HPCA ships skills, and a shared or project one is callable
-        too; none of them appear here, so `/plan` on a fresh install reports
-        itself unknown. That is a gap in the wire and not a decision taken
-        here: closing it wants a scope on `skill.list`, which is a protocol
-        change, and reading the skills directory instead is the rule-2
-        stopgap this milestone exists to remove.
+        The **visible** scope, which is everything the profile can call: the
+        skills HPCA ships, the shared ones, its own and the project's, each
+        row saying which level it came from. The narrower `own` scope is what
+        an editor asks for, and a menu built from it reports `/plan` unknown
+        on a fresh install — the profile has no skills of its own yet and the
+        shipped ones are what a fresh install *does* have.
+
+        The rows are not a permission: `SkillInfo.removable` is what decides
+        which of them the remove picker may offer, because a shipped or shared
+        skill is not one profile's to delete.
         """
-        self.command(protocol.SkillList(profile=profile))
+        self.command(protocol.SkillList(profile=profile, scope="visible"))
 
     # --------------------------------------------------------------- $EDITOR
 
@@ -559,6 +579,11 @@ class UIClient:
         # nothing before the catalog can be drawn.
         self.command(protocol.LLMList(probe=True))
         self.command(protocol.ProfileList())
+        # And the third: how often each command has been run, which is what
+        # sorts the "/" menu. Asked for here rather than carried by `hello`
+        # because the numbers change as commands are run and the greeting is
+        # stated once — the core restates this one (`protocol.CommandCounts`).
+        self.command(protocol.CommandList())
 
     def _rows(self, msg: protocol.SessionRows) -> None:
         self.ui.sync_sessions(
@@ -833,13 +858,45 @@ class UIClient:
         )
 
     def _skill_rows(self, msg: protocol.SkillRows) -> None:
-        """`skill.rows`: the list a screen is drawing and the "/" menu offers."""
+        """`skill.rows`: the list a screen is drawing, or the "/" menu offers.
+
+        Routed by the scope it answers, and it has to be: the menu asked about
+        everything callable and an editor asked about what it may overwrite,
+        and filling either list with the other's answer is how a screen ends
+        up offering to delete a skill that ships with HPCA.
+        """
         skills = [
-            state.SkillInfo(name=row.name, description=row.description)
+            state.SkillInfo(
+                name=row.name, description=row.description, level=row.level
+            )
             for row in msg.skills
         ]
-        self.ui.skills_listed(msg.profile, skills)
+        if msg.scope == "visible":
+            self.ui.skills_listed(msg.profile, skills)
+            return
+        self.ui.own_skills_listed(msg.profile, skills)
         self.ui.list_arrived(("skills", msg.profile), skills)
+
+    def _skill_drafted(self, msg: protocol.SkillDrafted) -> None:
+        """`skill.drafted`: the form, opened over what the model wrote.
+
+        A failed draft opens the empty form rather than losing the command —
+        the core sends this event either way, which is what makes that
+        possible (`protocol.SkillDrafted`).
+        """
+        drafted = (
+            state.SkillInfo(
+                name=msg.name, description=msg.description, text=msg.body
+            )
+            if msg.name
+            else None
+        )
+        self.ui.skill_drafted(drafted, msg.request, msg.error)
+
+    def _command_counts(self, msg: protocol.CommandCounts) -> None:
+        """`command.counts`: how the "/" menu sorts. Replaced whole — it is a
+        statement of the table, not a delta (`protocol.CommandCounts`)."""
+        self.ui.command_counts = dict(msg.counts)
 
     def _skill_body(self, msg: protocol.SkillBody) -> None:
         self.ui.body_arrived(
@@ -909,6 +966,8 @@ UIClient._HANDLERS = {
     protocol.MemoryProposals.__name__: UIClient._proposals,
     protocol.ProfileBody.__name__: UIClient._profile_body,
     protocol.SkillRows.__name__: UIClient._skill_rows,
+    protocol.SkillDrafted.__name__: UIClient._skill_drafted,
+    protocol.CommandCounts.__name__: UIClient._command_counts,
     protocol.SkillBody.__name__: UIClient._skill_body,
     protocol.SettingsBody.__name__: UIClient._settings_body,
     protocol.Notify.__name__: UIClient._notify,

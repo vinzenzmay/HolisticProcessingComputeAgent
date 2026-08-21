@@ -4,11 +4,12 @@ The claims come from specs-ui-acceptance.md: "Slash-command menu" whole, the
 `/memorize` and `/conclude` claims under "Memory", "Compaction", and the
 `/skill-*` claims under "Skills and self-review".
 
-Two claims on that list are **not** satisfied here and say so in place:
-frequency ordering (nothing serves `command_usage` back and rule 2 forbids
-reading it) and `/plan` on a fresh install (`skill.list` answers a profile's
-own skills only). Both are tested for what *is* true instead of quietly
-passing.
+Three claims on that list were once "not satisfied here" and are now closed,
+tested for what they promise: frequency ordering (the counts arrive as
+`command.counts`), `/plan` on a fresh install (`skill.list` has a scope, and
+the menu asks for the wide one), and `/skill-creator <what it should do>` (the
+draft is a model call, so it crosses as `skill.draft` and comes back into the
+same form).
 """
 
 import subprocess
@@ -28,6 +29,7 @@ from hpca.ui.overlays import (
 )
 from hpca.ui.state import (
     DeleteSkill,
+    DraftSkill,
     ProfileInfo,
     RunCommand,
     SaveSkill,
@@ -47,6 +49,9 @@ SKILLS = {
     "hpc": [
         SkillInfo("merge-vcfs", "merge shard VCFs [see $MANIFEST] (bcftools)"),
         SkillInfo("submit-gpu", "the partition and the flags that work"),
+        # What HPCA ships. Callable by every profile with no setup, and not
+        # this profile's to edit or remove — which is what `level` is for.
+        SkillInfo("plan", "break work into steps first", level="builtin"),
     ]
 }
 
@@ -185,19 +190,32 @@ class TestTheMenu:
 
 
 class TestFrequencyOrdering:
-    """**Not satisfied**, and this is what stands in its place.
+    """"Frequency sorts the most-used first."
 
-    The core counts every `command.run` in `command_usage` and there is no
-    event, no command and no field that serves the counts back; rule 2 of §4.2
-    forbids this side reading the table. So the menu is in definition order,
-    `commands.matching` takes the counts it cannot be given, and the day a
-    channel exists the sort is one argument away.
+    The counts are the core's — rule 2 of §4.2 forbids this side reading the
+    table — and they arrive as `command.counts`, asked for on connect and
+    restated whenever one changes. Until one arrives the menu is in definition
+    order, which is what a table nobody has run anything from would give.
     """
 
-    def test_the_order_is_definition_order(self):
+    def test_the_order_is_definition_order_until_the_counts_arrive(self):
         assert names(press(app(), "/"))[: len(BUILTINS)] == [
             x.name for x in BUILTINS
         ]
+
+    def test_and_most_used_first_once_they_do(self):
+        ui = app()
+        ui.command_counts = {"thinking": 9, "conclude": 4}
+        offered = names(press(ui, "/"))
+        assert offered[:2] == ["thinking", "conclude"]
+        # Everything uncounted keeps definition order behind them.
+        rest = [x.name for x in BUILTINS if x.name not in ("thinking", "conclude")]
+        assert [x for x in offered if x in rest] == rest
+
+    def test_a_narrowed_menu_is_sorted_too(self):
+        ui = app()
+        ui.command_counts = {"skill-remove": 3}
+        assert names(press(ui, *"/skill"))[0] == "skill-remove"
 
     def test_the_ui_does_not_read_the_usage_table(self):
         # The rule that makes a socket-separated core possible, checked in a
@@ -211,7 +229,7 @@ class TestFrequencyOrdering:
         )
         assert done.returncode == 0, done.stderr
 
-    def test_the_sort_is_written_and_waiting_for_a_channel(self):
+    def test_the_sort_itself_is_a_pure_function_of_the_counts(self):
         table = [Command("a", "/a"), Command("b", "/b"), Command("c", "/c")]
         assert [x.name for x in commands.matching("", table)] == ["a", "b", "c"]
         ranked = commands.matching("", table, {"c": 9, "b": 3})
@@ -353,18 +371,33 @@ class TestASkillByName:
         press(ui, *"/merge-vcfs go", "enter")
         assert sent(ui, Submit)[-1].forced_skill == "merge-vcfs"
 
-    def test_a_shipped_skill_is_not_offered_and_says_it_is_unknown(self):
-        """**Not satisfied**: "`/plan …` works out of the box".
+    def test_a_shipped_skill_runs_out_of_the_box(self):
+        """"`/plan …` works out of the box on a fresh install".
 
-        `skill.list` answers a profile's *own* skills, which is what
-        `skill.save` writes and `skill.delete` removes. HPCA's shipped skills,
-        `_shared/` and the project's are callable and are not in that answer,
-        and the only other source was the app-dir read this milestone removed.
-        Closing it wants a scope on `skill.list` — a protocol change.
+        The menu asks `skill.list` for the *visible* scope — everything the
+        profile can call, shipped skills included — rather than the `own`
+        scope an editor asks for. A profile with no skills of its own still
+        has HPCA's, and that is what a fresh install is.
         """
         ui = press(app(), *"/plan the migration", "enter")
-        assert sent(ui, Submit) == []
-        assert "unknown command: /plan" in ui.note
+        turn = sent(ui, Submit)[-1]
+        assert turn.forced_skill == "plan"
+        assert turn.text == "/plan the migration"
+        assert "unknown command" not in ui.note
+
+    def test_and_a_profile_with_nothing_of_its_own_still_has_it(self):
+        # The fresh install exactly: no profile skills at all.
+        shipped = {"hpc": [SkillInfo("plan", "steps first", level="builtin")]}
+        assert "plan" in names(press(app(shipped), "/"))
+        ran = press(app(shipped), *"/plan it", "enter")
+        assert sent(ran, Submit)[-1].forced_skill == "plan"
+
+    def test_but_it_is_not_offered_for_removal(self):
+        # Visible is not the same as the profile's own: a shipped skill
+        # belongs to the package, and `skill.delete` will not take it.
+        ui = press(app(), *"/skill-remove", "enter")
+        assert "plan" not in screen(ui)
+        assert "merge-vcfs" in screen(ui)
 
 
 # ------------------------------------------------------------- the skill screens
@@ -429,21 +462,93 @@ class TestSkillCreator:
         front = text.split("---")[1]
         assert yaml.safe_load(front)["description"] == "note: this has a colon"
 
-    def test_an_argument_is_not_drafted_and_the_form_says_so(self):
-        """**Not satisfied**: "`/skill-creator <what it should do>` drafts via
-        the model into the same form".
+    def test_an_argument_asks_the_core_for_a_draft(self):
+        """"`/skill-creator <what it should do>` drafts via the model."
 
-        There is no command that asks the core for a draft and no event that
-        could carry one back — `core.service._run_slash` answers
-        `/skill-creator` with a warning saying the form belongs to the
-        front-end. So the argument opens the same empty form, and the screen
-        says why rather than swallowing it.
+        A draft is a model call, so it happens on the core's side and crosses
+        as `skill.draft` — with the open session on it, so the conversation
+        goes to the drafter and the wait is reported where the user is
+        looking. Nothing is drawn in the meantime.
         """
         ui = press(app(), *"/skill-creator something about queues", "enter")
-        assert isinstance(ui.overlay, SkillCreatorOverlay)
-        assert ui.overlay.request == "something about queues"
-        assert "drafting is not on the wire" in screen(ui)
+        asked = sent(ui, DraftSkill)[-1]
+        assert (asked.profile, asked.request) == ("hpc", "something about queues")
+        assert asked.session_id == "s1"
+        assert ui.overlay is None, "the form opens when the draft lands"
         assert sent(ui, RunCommand) == []
+        assert "drafting" in ui.note
+
+    def test_and_a_bare_command_asks_for_none(self):
+        ui = self._form()
+        assert sent(ui, DraftSkill) == []
+        assert sent(ui, RunCommand) == []
+
+    def test_the_draft_opens_the_same_form_pre_filled(self):
+        ui = press(app(), *"/skill-creator watch a run", "enter")
+        ui.skill_drafted(
+            SkillInfo("watch-run", "when a run needs watching", "1. squeue"),
+            "watch a run",
+        )
+        assert isinstance(ui.overlay, SkillCreatorOverlay)
+        assert "watch-run" in screen(ui)
+        assert "1. squeue" in screen(ui)
+
+    def test_and_it_saves_like_any_other_skill(self):
+        # Edited and confirmed exactly like a hand-typed one: the draft is a
+        # head start, not an author.
+        ui = press(app(), *"/skill-creator watch a run", "enter")
+        ui.skill_drafted(
+            SkillInfo("watch-run", "when a run needs watching", "1. squeue"),
+            "watch a run",
+        )
+        press(ui, "ctrl-s")
+        saved = sent(ui, SaveSkill)[-1]
+        assert (saved.profile, saved.name) == ("hpc", "watch-run")
+        assert "1. squeue" in saved.text and saved.text.startswith("---\n")
+
+    def test_a_failed_draft_still_opens_the_empty_form(self):
+        ui = press(app(), *"/skill-creator watch a run", "enter")
+        ui.skill_drafted(None, "watch a run", error="no backend answered")
+        assert isinstance(ui.overlay, SkillCreatorOverlay)
+        assert ui.overlay.value("name") == ""
+        assert "could not draft" in screen(ui)
+
+    def test_and_an_empty_pre_filled_form_is_still_abandoned_with_escape(self):
+        ui = press(app(), *"/skill-creator watch a run", "enter")
+        ui.skill_drafted(None, "watch a run", error="no backend answered")
+        press(ui, "esc")
+        assert ui.overlay is None
+        assert sent(ui, SaveSkill) == []
+
+    def test_the_level_is_the_profiles_by_default(self):
+        ui = self._form()
+        press(ui, *"queue-check", "ctrl-s")
+        assert sent(ui, SaveSkill)[-1].level == "profile"
+
+    def test_and_a_global_skill_is_visible_but_not_own(self):
+        ui = self._form()
+        press(ui, *"queue-check", "tab", "tab", "right")  # name, then the level
+        assert ui.overlay.level == "global"
+        press(ui, "ctrl-s")
+        assert sent(ui, SaveSkill)[-1].level == "global"
+        # Offered by the menu, and not by the picker that deletes.
+        assert "queue-check" in names(press(ui, "/"))
+        assert "queue-check" not in screen(press(ui, *"/skill-remove", "enter"))
+
+    def test_and_a_project_skill_is_removable(self):
+        ui = self._form()
+        press(ui, *"run-cohort", "tab", "tab", "right", "right")
+        assert ui.overlay.level == "project"
+        press(ui, "ctrl-s")
+        assert sent(ui, SaveSkill)[-1].level == "project"
+        assert "run-cohort" in screen(press(ui, *"/skill-remove", "enter"))
+
+    def test_a_name_taken_at_another_level_is_not_a_duplicate(self):
+        # The same name at two levels is how a project overrides a profile's
+        # procedure; only the same name at the *same* level is a collision.
+        ui = self._form()
+        press(ui, *"merge-vcfs", "tab", "tab", "right", "right", "ctrl-s")
+        assert sent(ui, SaveSkill)[-1].level == "project"
 
     @pytest.mark.parametrize("width", WIDTHS)
     def test_the_form_keeps_every_row_exact(self, width: int):

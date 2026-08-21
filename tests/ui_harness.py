@@ -107,7 +107,11 @@ def served(ui: RowUI, bodies=None, skills=None) -> RowUI:
     original = ui.send
     # What `UIClient` wires: the menu asks for a profile's skills the first
     # time it wants them, and the answer arrives as an intent this handles.
-    ui.skills_loader = lambda profile: ui.send(state.FetchSkills(profile))
+    # The *visible* scope, as the client asks for it — everything callable,
+    # the shipped skills included.
+    ui.skills_loader = lambda profile: ui.send(
+        state.FetchSkills(profile, scope="visible")
+    )
 
     def answer(intent) -> None:
         original(intent)
@@ -118,9 +122,16 @@ def served(ui: RowUI, bodies=None, skills=None) -> RowUI:
                 key, text or "", "" if text is not None else "could not be read"
             )
         elif isinstance(intent, state.FetchSkills):
+            # Answered by scope, as the core answers it: the menu's list and
+            # the editable one are two different questions, and a harness that
+            # answered both with one list would hide exactly that.
             rows = list(skills.get(intent.profile, []))
-            ui.skills_listed(intent.profile, rows)
-            ui.list_arrived(("skills", intent.profile), rows)
+            if intent.scope == "visible":
+                ui.skills_listed(intent.profile, rows)
+                return
+            own = [x for x in rows if x.removable]
+            ui.own_skills_listed(intent.profile, own)
+            ui.list_arrived(("skills", intent.profile), own)
 
     ui.send = answer
     return ui

@@ -374,16 +374,44 @@ class LLMEntry(_Model):
     discovered: bool = False
 
 
+# Where a skill lives, and so who sees it and who may change it. Spelled out
+# here rather than imported from `hpca.skills` because this module imports
+# nothing of hpca's own (see the module docstring); the two lists are the same
+# names that module uses, and `tests/test_protocol.py` holds them to it.
+#
+# Two literals rather than one, and the difference is the point: a listing may
+# report all four levels, and a *write* may only name the three a user owns.
+# The shipped level is read-only — it is package data, and a `skill.save` that
+# could name it would write into the install.
+SkillOrigin = Literal["builtin", "global", "profile", "project"]
+SkillLevel = Literal["global", "profile", "project"]
+
+# Which set `skill.list` answers with. ``own`` is the editable set — what
+# `skill.save` overwrites and `skill.delete` removes for that profile, and so
+# what a screen offering those two may draw. ``visible`` is the callable set —
+# everything `/<skill>` can name, the shipped and shared skills included, each
+# row saying which level it resolved from. A menu wants the second and an
+# editor wants the first, which is why one command answers both and the answer
+# says which it is.
+SkillScope = Literal["own", "visible"]
+
+
 class SkillRow(_Model):
     """One line of a profile's skill menu (`skill.rows`).
 
     What the menu draws and nothing else. The body is `skill.get`'s answer,
     fetched when an editor opens rather than carried here — a listing has no
     use for it, and one carried here would be stale by the time it is edited.
+
+    ``level`` is where the skill resolved from, and it is what tells a
+    front-end which rows it may offer to remove: a ``visible`` listing mixes
+    the shipped and shared skills — which are not one profile's to delete —
+    with the profile's and the project's, which are.
     """
 
     name: str
     description: str = ""
+    level: SkillOrigin = "profile"
 
 
 class ProfileRow(_Model):
@@ -848,23 +876,95 @@ class _SkillEdit(Command):
 
 
 class SkillSave(_SkillEdit):
+    """Write one skill file, verbatim, at one level.
+
+    ``level`` is where it lands — the profile's own directory, the shared
+    `_shared/` one every profile sees, or the project's `.hpca/skills` in the
+    working directory. It defaults to `profile`, which is where a hand-edited
+    file came from and where a self-review patch goes, so an editor saving
+    back what `skill.get` handed it needs no opinion about levels at all.
+
+    Deliberately narrower than what `skill.list` can *report*: the shipped
+    level is missing from `SkillLevel` because it is package data. Listing and
+    writing have different scopes on purpose — a front-end may see a skill it
+    may not overwrite.
+    """
+
     TYPE: ClassVar[str] = "skill.save"
+    level: SkillLevel = "profile"
 
 
 class SkillDelete(_SkillEdit):
+    """Remove one skill file — the profile's own, or this project's.
+
+    The two removable levels, and only those: deleting a shared or shipped
+    skill from one profile would silently change every other profile that
+    sees it. Named rather than levelled, because a name resolves to at most
+    one removable file (`skills.delete_own_skill`).
+    """
+
     TYPE: ClassVar[str] = "skill.delete"
 
 
 class SkillList(Command):
-    """What skills this profile has of its own — answered by `skill.rows`.
+    """What skills a profile has — answered by `skill.rows`.
 
-    Only the profile's own, which is what the screen may edit and delete: a
-    shipped or shared skill is not one profile's to change (`skill.save`
-    writes into the profile's directory and nowhere else).
+    ``scope`` decides which set, and the two exist because two screens ask
+    different questions of the same command:
+
+    * ``own`` — the profile's own directory, which is exactly what the editor
+      may open (`skill.get`), overwrite (`skill.save`) and delete
+      (`skill.delete`) for that profile. The default, because a screen that
+      offers those three must not list a file it cannot touch.
+    * ``visible`` — everything the profile can *call*: the shipped skills,
+      `_shared/`, its own, and the project's, each row tagged with its level.
+      This is what a "/" menu needs — HPCA ships skills, so a menu built from
+      `own` reports `/plan` unknown on a fresh install.
+
+    So listing is wider than writing, on purpose. A `visible` row is not a
+    permission: what may be written is `SkillLevel`, and what may be removed
+    is what `skill.delete` will find.
     """
 
     TYPE: ClassVar[str] = "skill.list"
     profile: str
+    scope: SkillScope = "own"
+
+
+class SkillDraft(Command):
+    """Ask the model for a first draft of a skill — answered by `skill.drafted`.
+
+    `/skill-creator <what it should do>`. The form belongs to the front-end
+    and the *draft* cannot: a draft is a model call, and only the core makes
+    those (§4.2 rule 1). So the request crosses, one generation happens here,
+    and three fields come back to be edited.
+
+    Nothing is written by this command, which is the whole reason it is not a
+    `skill.save`: the draft is a head start inside a form the user still edits
+    and confirms, and what they confirm arrives as an ordinary `skill.save`.
+
+    ``session_id`` names the conversation the request came out of. It is not
+    decoration: "write a skill for what we just did" is the common case, so
+    the transcript goes to the drafter with the request, and the session is
+    also where the core reports the wait (`turn.activity`) while the model is
+    writing. Null when the request came from no conversation.
+    """
+
+    TYPE: ClassVar[str] = "skill.draft"
+    profile: str
+    request: str
+    session_id: str | None = None
+
+
+class CommandList(Command):
+    """How often each slash command has been run — answered by `command.counts`.
+
+    The frequency sort behind a "/" menu. Asked for on connect because a menu
+    is sorted the first time it is drawn; restated by the core afterwards, so
+    a front-end asks once and never polls.
+    """
+
+    TYPE: ClassVar[str] = "command.list"
 
 
 class SkillGet(Command):
@@ -1098,16 +1198,69 @@ class ProfileBody(Event):
 
 
 class SkillRows(Event):
-    """A profile's own skills, as a menu draws them — answered to `skill.list`.
+    """A profile's skills, as a menu draws them — answered to `skill.list`.
 
-    Name and description only. The body is a separate fetch (`skill.get`) and
-    deliberately not here: see that command for why a body carried by a
+    Name, description and level. The body is a separate fetch (`skill.get`)
+    and deliberately not here: see that command for why a body carried by a
     listing is a body that goes stale before it is edited.
+
+    ``scope`` echoes the question, and it has to: the two scopes answer two
+    screens — a menu asked for `visible`, an editor asked for `own` — and a
+    front-end holding both would otherwise fill one list with the other's
+    answer, offering `delete` on a skill that belongs to the package.
     """
 
     TYPE: ClassVar[str] = "skill.rows"
     profile: str
+    scope: SkillScope = "own"
     skills: list[SkillRow] = Field(default_factory=list)
+
+
+class SkillDrafted(Event):
+    """The model's first draft of a skill — answered to `skill.draft`.
+
+    The three fields of the form, for the form to open pre-filled. Not a file
+    and not a `skill.save`: nothing has been written, and nothing will be
+    until the user confirms what they see.
+
+    ``error`` is why there is no draft — the model said nothing usable, or
+    the backend is down. The event is sent either way, with the fields empty,
+    because a failed draft must still open the empty form: the alternative is
+    a command that silently swallows what the user typed.
+
+    ``request`` is echoed so a front-end can tell which request this answers
+    and put it in front of the user again if the draft is not what they meant.
+    """
+
+    TYPE: ClassVar[str] = "skill.drafted"
+    profile: str
+    request: str = ""
+    name: str = ""
+    description: str = ""
+    body: str = ""
+    error: str = ""
+
+
+class CommandCounts(Event):
+    """How often each slash command has been run — answered to `command.list`.
+
+    Whole, never incremental, for the reason `llm.catalog` is: it is a handful
+    of numbers, and a delta would need the core to model what the front-end
+    holds.
+
+    **Why not a field on `hello`.** That was the obvious place — the counts
+    are read once when the menu is first drawn, and `hello` is what a client
+    is handed on connect. But `hello` is a handshake: it is stated once and
+    never restated, and these numbers change every time the user runs a
+    command. A count carried by the greeting would be right for one frame and
+    quietly wrong for the rest of the session, and the menu would keep its
+    order until the front-end was restarted. So the core restates this after
+    every command it counts, and a front-end that asked once stays current
+    without polling a table it is not allowed to read (§4.2 rule 2).
+    """
+
+    TYPE: ClassVar[str] = "command.counts"
+    counts: dict[str, int] = Field(default_factory=dict)
 
 
 class SkillBody(Event):

@@ -1,20 +1,21 @@
 """The two skill screens a slash command opens (§4.3 item 33).
 
-`/skill-creator` is the one built-in the core has no shape for, and says so:
-"a form the front-end owns; the finished skill arrives as skill.save". So the
-form is here — name, description, body — and what leaves it is one
-`state.SaveSkill` carrying the file as it will be written, front matter and all.
+`/skill-creator` is a form the core does not own and says so: "the finished
+skill arrives as skill.save". So the form is here — name, description, level,
+body — and what leaves it is one `state.SaveSkill` carrying the file as it
+will be written, front matter and all, plus the level it is written at.
 
-`/skill-remove` is a picker over the profile's own skills. The core also
-answers `/skill-remove <name>` directly, and that path is left alone; this is
-what a bare `/skill-remove` opens, so that "the chosen skill" is a row the user
-points at rather than a name they have to remember and retype.
+The *draft* is the half that is not this side's. `/skill-creator <what it
+should do>` is a model call, and only the core makes those: the request goes
+out as `skill.draft` and comes back as three fields this same form opens over
+(`RowUI.skill_drafted`). One form either way — a draft is a head start, not an
+author, and it is edited and confirmed exactly like a hand-typed skill.
 
-Neither screen can offer the *level* a skill is written at ("global", "project"
-or the profile's own). `protocol.SkillSave` carries a profile and nothing else,
-so every skill saved from here is a profile skill; the picker likewise only
-ever lists what `skill.list` calls the profile's own, which is also the only
-thing `skill.delete` can remove.
+`/skill-remove` is a picker over the skills the profile may remove — its own
+and this project's. The core also answers `/skill-remove <name>` directly, and
+that path is left alone; this is what a bare `/skill-remove` opens, so that
+"the chosen skill" is a row the user points at rather than a name they have to
+remember and retype.
 """
 
 from __future__ import annotations
@@ -30,21 +31,34 @@ from hpca.ui.pane import Item
 from hpca.ui.state import DeleteSkill, SkillInfo
 
 # The fields, in the order they are filled and in the order a skill file
-# carries them. ``body`` is last and takes the rest of the screen: it is the
-# procedure, and the other two are a line each.
-NAME, DESCRIPTION, BODY = "name", "description", "body"
+# carries them. ``level`` sits before the body because it is a choice and the
+# body is a paragraph; ``body`` is last and takes the rest of the screen: it is
+# the procedure, and the other two are a line each.
+NAME, DESCRIPTION, LEVEL, BODY = "name", "description", "level", "body"
 FIELDS = (
     (NAME, "one word — this is what /<skill> types"),
     (DESCRIPTION, "when the model should reach for it"),
+    (LEVEL, "← → where it lives"),
     (BODY, "the procedure itself"),
 )
 
+# The three levels a user may write at, in the order they are offered, with
+# what choosing one means. The shipped level is absent because it is package
+# data — `protocol.SkillLevel` does not admit it either.
+LEVELS = (
+    ("profile", "this profile only"),
+    ("global", "every profile"),
+    ("project", "this directory only"),
+)
+WHERE = dict(LEVELS)
+
 EMPTY_NAME = "a name is needed"
-TAKEN = "“{name}” already exists in this profile"
+TAKEN = "“{name}” already exists at the {level} level"
 SPACED = "a skill name cannot contain spaces — /<skill> splits on the first one"
 EMPTY_LIST = "(this profile has no skills of its own)"
 REMOVE_QUESTION = "Remove skill “{name}”?"
 KEEP_CHANGES = "Save this skill?"
+DRAFTED = "the model's draft — edit it, then ^s to save"
 
 
 def skill_file(name: str, description: str, body: str) -> str:
@@ -69,20 +83,17 @@ def skill_file(name: str, description: str, body: str) -> str:
 
 
 class SkillCreatorOverlay(Overlay):
-    """`/skill-creator`: a skill, written by hand, saved to this profile.
+    """`/skill-creator`: a skill, written or drafted, saved at a chosen level.
 
-    Three editors and a cursor between them, rather than three screens in a
-    row: a skill is one thing, and a name typed on a screen that has already
-    gone is a name that cannot be corrected once the description makes it
-    obvious it was wrong.
+    Three editors, a level, and a cursor between them, rather than four
+    screens in a row: a skill is one thing, and a name typed on a screen that
+    has already gone is a name that cannot be corrected once the description
+    makes it obvious it was wrong.
 
-    **What is missing, and it is a channel and not an omission.** The Textual
-    command took an argument — `/skill-creator <what it should do>` — and had
-    the model draft the three fields before the form opened. There is no
-    command that asks the core for a draft and no event that could carry one
-    back (`core.service._run_slash` answers `/skill-creator` with a warning),
-    so a bare form is what the argument gets too; the request is kept on the
-    rule so nothing is silently swallowed.
+    Opened empty by a bare command, or over the model's draft when the command
+    carried a request (`RowUI.skill_drafted`). The same screen either way, on
+    purpose: what the user does to a draft — read it, fix the name, cut two
+    steps, save — is what they were going to do to their own typing.
     """
 
     title = "new skill"
@@ -91,14 +102,18 @@ class SkillCreatorOverlay(Overlay):
         self,
         profile: str,
         *,
-        taken: tuple[str, ...] = (),
+        taken: tuple[tuple[str, str], ...] = (),
         request: str = "",
         name: str = "",
         description: str = "",
         body: str = "",
+        level: str = LEVELS[0][0],
     ) -> None:
         super().__init__()
         self.profile = profile
+        # (name, level) pairs: a name is only taken at the level it was
+        # written at. The same name at two levels is not a collision, it is
+        # how a project overrides a profile's procedure (`hpca.skills`).
         self.taken = tuple(taken)
         self.request = request
         self.editors = {
@@ -109,13 +124,15 @@ class SkillCreatorOverlay(Overlay):
         for field, value in ((NAME, name), (DESCRIPTION, description), (BODY, body)):
             if value:
                 self.editors[field].set_text(value)
+        self.level = level
         self.at = 0
         # What was decided, read by `RowUI` after the screen closes.
         self.name = ""
         self.text = ""
         self.saved = False
-        if request:
-            self.note = "drafting is not on the wire — write it here"
+        self.drafted = bool(name or description or body)
+        if self.drafted:
+            self.note = DRAFTED
 
     # ------------------------------------------------------------ the fields
 
@@ -125,10 +142,19 @@ class SkillCreatorOverlay(Overlay):
 
     @property
     def editor(self) -> Editor:
-        return self.editors[self.field]
+        """The editor the keys go to. The level is a choice, not a field
+        anyone types into, so it borrows the body's — a stray character while
+        the cursor is on it lands where the procedure is being written rather
+        than nowhere."""
+        return self.editors[BODY if self.field == LEVEL else self.field]
 
     def value(self, field: str) -> str:
         return self.editors[field].text().strip()
+
+    @property
+    def where(self) -> str:
+        """What choosing this level means, in the words the form offers."""
+        return WHERE.get(self.level, self.level)
 
     @property
     def description(self) -> str:
@@ -137,7 +163,12 @@ class SkillCreatorOverlay(Overlay):
 
     @property
     def dirty(self) -> bool:
-        return any(self.value(f) for f, _ in FIELDS)
+        """Whether anything would be lost by closing.
+
+        The level is not counted: it has a value from the moment the screen
+        opens, and a form nobody has typed into is one escape closes.
+        """
+        return any(self.value(f) for f in (NAME, DESCRIPTION, BODY))
 
     def heading(self) -> str:
         return f"{self.title} · {self.profile}"
@@ -146,11 +177,25 @@ class SkillCreatorOverlay(Overlay):
         return [
             ("⇥", "next field"),
             ("⇧⇥", "previous"),
+            ("←→", "level"),
             ("^s", "save"),
             ("esc", "cancel"),
         ]
 
     # ----------------------------------------------------------- the drawing
+
+    def level_row(self, width: int, focused: bool) -> str:
+        """The three levels on one row, the chosen one marked.
+
+        A row of choices rather than a list: there are three, they fit, and a
+        list would put the body another screenful down from the name.
+        """
+        parts = []
+        for name, what in LEVELS:
+            mark = "●" if name == self.level else "○"
+            parts.append(f"{mark} {name} ({what})")
+        row = pad("  " + "   ".join(parts), width)
+        return (BOLD + CYAN + row + RESET) if focused else (DIM + row + RESET)
 
     def body_rows(self, width: int, height: int) -> list[str]:
         out: list[str] = []
@@ -158,6 +203,9 @@ class SkillCreatorOverlay(Overlay):
             here = at == self.at
             label = f" {field}" + (f"  ({hint})" if here else "")
             out.append((BOLD + CYAN if here else DIM) + pad(label, width) + RESET)
+            if field == LEVEL:
+                out.append(self.level_row(width, here))
+                continue
             if field != BODY:
                 out += self.editors[field].render(width, 1, focused=here)
                 continue
@@ -193,6 +241,11 @@ class SkillCreatorOverlay(Overlay):
             self.at = (self.at - 1) % len(FIELDS)
         elif key == "ctrl-s":
             return self.save()
+        elif self.field == LEVEL and key in ("left", "right"):
+            step = 1 if key == "right" else -1
+            names = [x for x, _ in LEVELS]
+            self.level = names[(names.index(self.level) + step) % len(names)]
+            self.note = ""
         elif key == "enter" or key in NEWLINE_KEYS:
             # Enter moves on from the one-line fields and breaks the line in
             # the body, which is the only field a newline means anything in.
@@ -214,8 +267,12 @@ class SkillCreatorOverlay(Overlay):
         if any(ch.isspace() for ch in name):
             self.at, self.note = 0, SPACED
             return True
-        if name in self.taken:
-            self.at, self.note = 0, TAKEN.format(name=name)
+        if (name, self.level) in self.taken:
+            # Only at *this* level: the same name at another one is not a
+            # collision but an override, which is how a project skill replaces
+            # a profile's for as long as you work in that directory.
+            self.at = 0
+            self.note = TAKEN.format(name=name, level=self.level)
             return True
         self.name = name
         self.text = skill_file(name, self.value(DESCRIPTION), self.value(BODY))
@@ -229,7 +286,7 @@ class SkillCreatorOverlay(Overlay):
 
 
 class SkillRemoveOverlay(ListOverlay):
-    """`/skill-remove`: pick one of this profile's own skills, and confirm.
+    """`/skill-remove`: pick one of the removable skills, and confirm.
 
     Its own class rather than `SkillsOverlay` with a different Enter, because
     the two screens answer different questions: that one is "edit my skills",

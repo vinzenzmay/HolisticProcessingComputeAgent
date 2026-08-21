@@ -134,6 +134,12 @@ class TestHello:
         await wire.tell(protocol.Hello(profile="genomics"))
         assert "genomics" in wire.frame()[0]
 
+    async def test_it_asks_how_often_each_command_has_been_run(self, wire):
+        # The "/" menu is sorted the first time it is drawn, so the counts are
+        # asked for on connect rather than when a slash is typed.
+        await wire.tell(protocol.Hello(profile="hpc"))
+        assert wire.peer.took(protocol.CommandList)
+
     async def test_a_core_of_another_version_says_so(self, wire):
         await wire.tell(protocol.Hello(version=99))
         assert [t.severity for t in wire.ui.toasts] == ["error"]
@@ -990,7 +996,98 @@ class TestTheScreenCommands:
         await wire.client.flush()
         await settle()
         assert wire.peer.last(protocol.SkillSave).text == "body"
+        assert wire.peer.last(protocol.SkillSave).level == "profile"
         assert wire.peer.last(protocol.SkillDelete).name == "merge"
+
+    async def test_a_save_carries_the_level_the_creator_chose(self, wire):
+        wire.client.intent(state.SaveSkill("hpc", "etiquette", "body", "global"))
+        await wire.client.flush()
+        await settle()
+        assert wire.peer.last(protocol.SkillSave).level == "global"
+
+    async def test_the_menu_asks_for_every_skill_the_profile_can_call(
+        self, wire
+    ):
+        # The wide scope, which is what makes `/plan` work on a fresh install:
+        # the profile's own list has nothing in it and HPCA's shipped skills
+        # are still callable.
+        wire.client.ask_skills("hpc")
+        await wire.client.flush()
+        await settle()
+        assert wire.peer.last(protocol.SkillList).scope == "visible"
+
+    async def test_and_an_editor_asks_only_for_what_it_may_write(self, wire):
+        wire.client.intent(state.FetchSkills("hpc"))
+        await wire.client.flush()
+        await settle()
+        assert wire.peer.last(protocol.SkillList).scope == "own"
+
+    async def test_the_two_answers_fill_two_different_lists(self, wire):
+        # Letting either land in the other is how a screen ends up offering to
+        # delete a skill that ships with HPCA.
+        wire.ui.profiles = [state.ProfileInfo(name="hpc")]
+        await wire.tell(
+            protocol.SkillRows(
+                profile="hpc",
+                scope="visible",
+                skills=[
+                    protocol.SkillRow(name="plan", level="builtin"),
+                    protocol.SkillRow(name="merge", level="profile"),
+                ],
+            )
+        )
+        assert [x.name for x in wire.ui._skills["hpc"]] == ["plan", "merge"]
+        assert wire.ui.profiles[0].skills == [], "not the editable list"
+        await wire.tell(
+            protocol.SkillRows(
+                profile="hpc",
+                scope="own",
+                skills=[protocol.SkillRow(name="merge", level="profile")],
+            )
+        )
+        assert [x.name for x in wire.ui.profiles[0].skills] == ["merge"]
+
+    async def test_a_draft_is_asked_for_and_opens_the_form(self, wire):
+        wire.client.intent(state.DraftSkill("hpc", "watch a run", "s1"))
+        await wire.client.flush()
+        await settle()
+        asked = wire.peer.last(protocol.SkillDraft)
+        assert (asked.request, asked.session_id) == ("watch a run", "s1")
+        await wire.tell(
+            protocol.SkillDrafted(
+                profile="hpc",
+                request="watch a run",
+                name="watch-run",
+                description="when a run needs watching",
+                body="1. squeue",
+            )
+        )
+        assert wire.ui.overlay is not None
+        assert "watch-run" in wire.screen()
+
+    async def test_and_a_failed_one_opens_it_empty(self, wire):
+        await wire.tell(
+            protocol.SkillDrafted(
+                profile="hpc", request="watch a run", error="no backend"
+            )
+        )
+        assert wire.ui.overlay is not None
+        assert wire.ui.overlay.value("name") == ""
+        assert "no backend" in wire.screen()
+
+    async def test_a_request_with_nothing_open_names_no_session(self, wire):
+        # Null, not "": the wire spells "no conversation" as a missing id.
+        wire.client.intent(state.DraftSkill("hpc", "watch a run"))
+        await wire.client.flush()
+        await settle()
+        assert wire.peer.last(protocol.SkillDraft).session_id is None
+
+    async def test_the_counts_sort_the_menu(self, wire):
+        await wire.tell(protocol.CommandCounts(counts={"thinking": 7}))
+        assert wire.ui.command_counts == {"thinking": 7}
+        wire.ui.focus = INPUT
+        await wire.press("/")
+        assert [x.name for x in wire.ui.menu()][0] == "thinking"
 
     async def test_memory_resolve_is_positional(self, wire):
         wire.client.intent(state.ResolveMemory("s1", (True, False)))

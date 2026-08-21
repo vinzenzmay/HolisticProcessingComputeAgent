@@ -18,13 +18,12 @@ Three rules from `specs-ui-acceptance.md`, "Slash-command menu", live here:
   styled spans to stop a bracket being eaten, and this renderer has no parser
   to protect it from.
 
-**Frequency ordering, and why it is not here.** The core records
-`command_usage` on every `command.run` and nothing serves the counts back — and
-rule 2 of §4.2 says the UI never reads the database. So ``counts`` is a
-parameter with an empty default: hand it a mapping the day an event carries
-one, and the sort is already written. Until then the order is definition
-order, most-used-first is not implemented, and saying so is better than a
-front-end quietly opening a sqlite file behind the architecture's back.
+**Frequency ordering, and where the numbers come from.** The core records
+`command_usage` on every `command.run` and rule 2 of §4.2 says the UI never
+reads the database — so the counts arrive as an event (`command.counts`),
+asked for on connect and restated whenever one changes, and `RowUI.menu` hands
+the mapping to `matching`. With no counts yet the sort collapses to definition
+order, which is what a table nobody has run anything from would give anyway.
 """
 
 from __future__ import annotations
@@ -60,7 +59,7 @@ class Command:
 
 
 # The seven built-ins (§4.3 item 24), in definition order — which is also the
-# order the menu shows them in until something serves the usage counts back.
+# order the menu shows them in until the first `command.counts` arrives.
 # The strings are `tui/app.py`'s COMMANDS, kept word for word: they are the
 # only documentation most of these commands have.
 BUILTINS: tuple[Command, ...] = (
@@ -76,7 +75,8 @@ BUILTINS: tuple[Command, ...] = (
     ),
     Command(
         "skill-creator",
-        "/skill-creator — add a skill (name, description, body) to this profile",
+        "/skill-creator [what it should do] — add a skill; with a request the "
+        "model drafts it into the form first",
         session=False,
     ),
     Command(
@@ -111,7 +111,11 @@ def skill_command(name: str, description: str = "") -> Command:
 
 
 def all_commands(skills: Iterable[tuple[str, str]] = ()) -> list[Command]:
-    """The built-ins plus the visible skills, built-ins winning a name clash.
+    """The built-ins plus every visible skill, built-ins winning a name clash.
+
+    "Visible" is the wide `skill.list` scope — the shipped skills, the shared
+    ones, the profile's own and the project's — which is what makes `/plan`
+    offerable on an install whose profile has no skills of its own.
 
     A skill whose name carries whitespace is left out rather than listed and
     unreachable: `split` takes the name up to the first space, so `/<skill>`
@@ -166,10 +170,10 @@ def matching(
 ) -> list[Command]:
     """Every command whose name contains ``typed``, best first.
 
-    "Best" is most-used first and then definition order — but only when
-    ``counts`` is given, and nothing gives it one today (see the module
-    docstring). With no counts this is a stable filter and the order is the
-    order `all_commands` built.
+    "Best" is most-used first and then definition order. ``counts`` is what
+    `command.counts` last said (`RowUI.command_counts`); with none — a core
+    that has counted nothing, or an answer that has not arrived — this is a
+    stable filter and the order is the order `all_commands` built.
     """
     needle = typed.lower()
     found = [x for x in commands if needle in x.name.lower()]

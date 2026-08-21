@@ -30,6 +30,7 @@ from hpca.protocol import (
     BackendScan,
     BackendSet,
     Command,
+    CommandList,
     CommandRun,
     ConfirmResolve,
     DecisionResolve,
@@ -60,6 +61,7 @@ from hpca.protocol import (
     SettingsSave,
     Shutdown,
     SkillDelete,
+    SkillDraft,
     SkillGet,
     SkillList,
     SkillSave,
@@ -71,7 +73,13 @@ from hpca.protocol import (
     WatchPeek,
 )
 from hpca.sessions import SessionStore
-from hpca.skills import Skill, load_own_skills, write_skill
+from hpca.skills import (
+    Skill,
+    load_own_skills,
+    load_project_skills,
+    load_skills,
+    write_skill,
+)
 from hpca.transcript import RESULT_RULE
 from hpca.watches import KIND_JOB, KIND_LOG, WatchStore
 
@@ -111,6 +119,19 @@ def home(monkeypatch, tmp_path):
 
 
 @pytest.fixture
+def project(tmp_path):
+    """Where project-level skills live for these tests.
+
+    Pinned rather than left to default to the working directory, which under
+    pytest is the repository: a `/skill-creator` test writing a project skill
+    would otherwise create `.hpca/skills` in the checkout.
+    """
+    root = tmp_path / "project"
+    root.mkdir()
+    return root
+
+
+@pytest.fixture
 def conn(home):
     connection = connect(home / "hpca.db")
     init_db(connection)
@@ -134,7 +155,7 @@ def saver():
 
 
 @pytest.fixture
-def service(home, conn, llm, saver):
+def service(home, conn, llm, saver, project):
     async def db(fn):
         return fn(conn)
 
@@ -145,6 +166,7 @@ def service(home, conn, llm, saver):
         conn=conn,
         checkpointer=saver,
         llm=llm,
+        project_root=project,
     )
     return built
 
@@ -168,7 +190,7 @@ def slurm():
 
 
 @pytest.fixture
-def cluster_service(home, conn, llm, slurm):
+def cluster_service(home, conn, llm, slurm, project):
     """The same runtime, with a cluster behind it — `job.cancel` needs one."""
 
     async def db(fn):
@@ -182,6 +204,7 @@ def cluster_service(home, conn, llm, slurm):
         checkpointer=InMemorySaver(),
         llm=llm,
         slurm=slurm,
+        project_root=project,
     )
 
 
@@ -2981,6 +3004,64 @@ class TestSkillFiles:
         await service.handle(SkillDelete(profile="default", name="ghost"))
         assert only(await drain(queue), "Notify").severity == "warning"
 
+    async def test_a_global_skill_is_visible_everywhere_but_is_not_own(
+        self, service
+    ):
+        # The level `skill.save` carries decides where the file lands, and
+        # "global" is the one a second profile can also see.
+        await service.handle(
+            SkillSave(
+                profile="default",
+                name="cluster-etiquette",
+                text="---\nname: cluster-etiquette\n---\n\nbe kind\n",
+                level="global",
+            )
+        )
+        assert load_own_skills("default") == [], "not the profile's own"
+        assert "cluster-etiquette" in [s.name for s in load_skills("default")]
+        assert "cluster-etiquette" in [s.name for s in load_skills("other")]
+
+    async def test_a_project_skill_lands_in_the_working_directory(
+        self, service, project
+    ):
+        await service.handle(
+            SkillSave(
+                profile="default",
+                name="run-cohort",
+                text="---\nname: run-cohort\n---\n\n1. sbatch\n",
+                level="project",
+            )
+        )
+        assert (project / ".hpca" / "skills" / "run-cohort.md").exists()
+        assert load_own_skills("default") == []
+        assert [s.name for s in load_project_skills(project_root=project)] == [
+            "run-cohort"
+        ]
+
+    async def test_and_a_project_skill_is_removable(self, service, project):
+        # The other half of "a project skill lands in cwd and is removable":
+        # `skill.delete` looks in both directories a user owns.
+        write_skill(
+            Skill(name="run-cohort", description="", triggers=[], body="s"),
+            "default",
+            level="project",
+            project_root=project,
+        )
+        await service.handle(SkillDelete(profile="default", name="run-cohort"))
+        assert load_project_skills(project_root=project) == []
+
+    async def test_a_skill_defaults_to_the_profiles_own_directory(self, service):
+        # No level named: where a hand-edited file came from, and where a
+        # self-review patch goes.
+        await service.handle(
+            SkillSave(
+                profile="default",
+                name="qc",
+                text="---\nname: qc\n---\n\nsteps\n",
+            )
+        )
+        assert [s.name for s in load_own_skills("default")] == ["qc"]
+
 
 class TestEditableBodies:
     """The read half of every editor — `profile.get`, `skill.list`, `skill.get`.
@@ -3105,6 +3186,67 @@ class TestEditableBodies:
         assert [
             r.name for r in only(await drain(queue), "SkillRows").skills
         ] == ["mine"]
+
+    async def test_the_visible_scope_carries_the_shipped_skills_too(
+        self, service
+    ):
+        # The regression the scope exists for: HPCA ships skills, so a menu
+        # built from the profile's own reports `/plan` unknown on a fresh
+        # install — with no profile skill in sight to explain it.
+        queue = subscribe(service)
+        await service.handle(SkillList(profile="default", scope="visible"))
+        rows = only(await drain(queue), "SkillRows")
+        assert rows.scope == "visible", "an answer says which question it took"
+        assert "plan" in [r.name for r in rows.skills]
+        assert {r.level for r in rows.skills} == {"builtin"}
+
+    async def test_and_says_which_level_each_one_resolved_from(
+        self, service, project
+    ):
+        # The level is what tells a front-end which rows it may offer to
+        # remove: the shipped and shared ones are not one profile's to delete.
+        write_skill(
+            Skill(name="mine", description="", triggers=[], body="s"), "default"
+        )
+        write_skill(
+            Skill(name="ours", description="", triggers=[], body="s"),
+            "default",
+            level="global",
+        )
+        write_skill(
+            Skill(name="here", description="", triggers=[], body="s"),
+            "default",
+            level="project",
+            project_root=project,
+        )
+        queue = subscribe(service)
+        await service.handle(SkillList(profile="default", scope="visible"))
+        rows = only(await drain(queue), "SkillRows")
+        levels = {r.name: r.level for r in rows.skills}
+        assert levels["mine"] == "profile"
+        assert levels["ours"] == "global"
+        assert levels["here"] == "project"
+        assert levels["plan"] == "builtin"
+
+    async def test_the_own_scope_is_still_only_what_may_be_written(
+        self, service, project
+    ):
+        # Listing and writing have different scopes on purpose: an editor that
+        # opens `skill.get` and saves `skill.save` may only be shown files
+        # those two commands can reach.
+        write_skill(
+            Skill(name="mine", description="", triggers=[], body="s"), "default"
+        )
+        write_skill(
+            Skill(name="ours", description="", triggers=[], body="s"),
+            "default",
+            level="global",
+        )
+        queue = subscribe(service)
+        await service.handle(SkillList(profile="default"))
+        rows = only(await drain(queue), "SkillRows")
+        assert rows.scope == "own"
+        assert [r.name for r in rows.skills] == ["mine"]
 
     async def test_a_skill_file_arrives_verbatim(self, service):
         raw = "---\nname: qc-report\ndescription: run QC\n---\n\n1. sort\n"
@@ -3952,15 +4094,19 @@ class TestTheOtherSlashCommands:
         assert "qc-report" in toast.text
         assert "read_skill" not in toast.text
 
-    async def test_skill_creator_belongs_to_the_front_end(self, service, session):
-        # It is a form, and no event can carry a draft into one; what comes
-        # back out of the editing arrives as `skill.save`.
+    async def test_skill_creators_form_belongs_to_the_front_end(
+        self, service, session
+    ):
+        # The form is the front-end's; the *draft* is a model call and so is
+        # the core's, which is what `skill.draft` carries. What comes back out
+        # of the editing arrives as `skill.save`.
         queue = subscribe(service)
         await service.handle(
             CommandRun(name="skill-creator", args="watch a jupyter run")
         )
         toast = only(await drain(queue), "Notify")
-        assert toast.severity == "warning" and "skill.save" in toast.text
+        assert toast.severity == "warning"
+        assert "skill.draft" in toast.text and "skill.save" in toast.text
 
     async def test_a_session_scoped_command_with_no_session_says_so(
         self, service
@@ -3999,6 +4145,172 @@ class TestTheOtherSlashCommands:
         assert counts.get("skills-list") == 1
         # An unknown one must not teach the menu a name nothing can run.
         assert "frobnicate" not in counts
+
+
+class TestSkillDrafting:
+    """`/skill-creator <what it should do>` — specs-ui-acceptance.md, "Skills".
+
+    The form belongs to the front-end and the draft cannot: a draft is a
+    generation, and only the core makes those. So the request crosses as
+    `skill.draft`, one model call happens here, and three fields come back to
+    be edited and confirmed — nothing is written until they are.
+    """
+
+    DRAFT = json.dumps(
+        {
+            "name": "watch-run",
+            "description": "when a notebook run needs watching",
+            "body": "1. squeue -u $USER\n2. tail the log",
+        }
+    )
+
+    async def test_a_request_comes_back_as_three_fields_to_edit(
+        self, service, llm
+    ):
+        llm._outputs = [self.DRAFT]
+        queue = subscribe(service)
+        await service.handle(
+            SkillDraft(profile="default", request="watch a jupyter run")
+        )
+        drafted = only(await wait_for(queue, "SkillDrafted"), "SkillDrafted")
+        assert (drafted.name, drafted.error) == ("watch-run", "")
+        assert "squeue" in drafted.body
+        assert drafted.request == "watch a jupyter run", "echoed, to be re-tried"
+
+    async def test_and_nothing_is_written_by_it(self, service, llm):
+        # Which is why it is a draft and not a save: the user still confirms.
+        llm._outputs = [self.DRAFT]
+        queue = subscribe(service)
+        await service.handle(
+            SkillDraft(profile="default", request="watch a jupyter run")
+        )
+        await wait_for(queue, "SkillDrafted")
+        assert load_own_skills("default") == []
+
+    async def test_the_request_and_the_conversation_reach_the_drafter(
+        self, service, session, llm
+    ):
+        # "Write a skill for what we just did" is the common case, so the
+        # transcript goes with the request.
+        queue = subscribe(service)
+        await service.handle(
+            TurnSubmit(
+                session_id=session.session_id, text="the gpu partition is a100"
+            )
+        )
+        await wait_for(queue, "TurnFinished")
+        llm._outputs = [self.DRAFT]
+        await service.handle(
+            SkillDraft(
+                profile="default",
+                request="submitting to the gpu queue",
+                session_id=session.session_id,
+            )
+        )
+        await wait_for(queue, "SkillDrafted")
+        asked = json.dumps(llm.prompts[-1])
+        assert "submitting to the gpu queue" in asked
+        assert "a100" in asked, "the conversation went with it"
+
+    async def test_the_wait_is_named_on_the_session(self, service, session, llm):
+        # The spinner has to say what it is waiting for: a silent minute in a
+        # conversation the user did not start is what this event prevents.
+        llm._outputs = [self.DRAFT]
+        queue = subscribe(service)
+        await service.handle(
+            SkillDraft(
+                profile="default",
+                request="watch a run",
+                session_id=session.session_id,
+            )
+        )
+        events = await wait_for(queue, "SkillDrafted")
+        said = [e for e in events if type(e).__name__ == "TurnActivity"]
+        assert [e.activity for e in said][0] == "drafting a skill"
+        assert said[-1].activity == "", "and the wait is ended"
+
+    async def test_a_failed_draft_is_still_answered(self, service, llm):
+        # The empty form opens behind it, so silence is the one thing this
+        # command may not answer with.
+        llm._outputs = ["not json at all", "still not json"]
+        queue = subscribe(service)
+        await service.handle(
+            SkillDraft(profile="default", request="watch a jupyter run")
+        )
+        drafted = only(await wait_for(queue, "SkillDrafted"), "SkillDrafted")
+        assert drafted.error and drafted.name == ""
+        assert drafted.request == "watch a jupyter run"
+
+    async def test_an_empty_request_asks_the_model_for_nothing(
+        self, service, llm
+    ):
+        # A bare `/skill-creator` is an empty form, and an empty form costs no
+        # generation.
+        queue = subscribe(service)
+        await service.handle(SkillDraft(profile="default", request="  "))
+        await _settle()
+        assert llm.prompts == []
+        assert only(await drain(queue), "Notify").severity == "warning"
+
+    async def test_a_draft_counts_as_the_command_it_is(self, service, llm, conn):
+        # `/skill-creator` reaches the core as this and nothing else, so this
+        # is where the menu's frequency sort learns it was used.
+        from hpca.db import command_use_counts
+
+        llm._outputs = [self.DRAFT]
+        queue = subscribe(service)
+        await service.handle(SkillDraft(profile="default", request="watch a run"))
+        await wait_for(queue, "SkillDrafted")
+        assert command_use_counts(conn).get("skill-creator") == 1
+
+
+class TestTheCommandCounts:
+    """How often each slash command was run, served back (`command.counts`).
+
+    The core has counted `command_usage` since M2 and nothing carried the
+    numbers across, so a front-end's "/" menu could only be in definition
+    order — rule 2 of §4.2 puts the table itself out of its reach.
+    """
+
+    async def test_they_are_answered_when_asked_for(self, service, session):
+        await service.handle(
+            CommandRun(name="skills-list", session_id=session.session_id)
+        )
+        queue = subscribe(service)
+        await service.handle(CommandList())
+        assert only(await drain(queue), "CommandCounts").counts == {
+            "skills-list": 1
+        }
+
+    async def test_and_restated_as_soon_as_one_changes(self, service, session):
+        # Which is why they do not ride on `hello`: the greeting is stated
+        # once, and these numbers change every time the user runs a command.
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(name="skills-list", session_id=session.session_id)
+        )
+        assert only(await drain(queue), "CommandCounts").counts == {
+            "skills-list": 1
+        }
+        await service.handle(
+            CommandRun(name="skills-list", session_id=session.session_id)
+        )
+        assert only(await drain(queue), "CommandCounts").counts == {
+            "skills-list": 2
+        }
+
+    async def test_the_greeting_carries_none_of_this(self, service):
+        assert "counts" not in service.subscribe().get_nowait().model_dump()
+
+    async def test_an_unknown_command_restates_nothing(self, service, session):
+        # It is not counted, so there is nothing new to say — and a menu must
+        # not learn a name nothing can run.
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(name="frobnicate", session_id=session.session_id)
+        )
+        assert [e for e in await drain(queue) if type(e).__name__ ==
+                "CommandCounts"] == []
 
 
 class TestRobustness:

@@ -60,6 +60,7 @@ from hpca.agent.prompts import (
     environment_facts,
     orchestrator_system_prompt,
 )
+from hpca.agent.skill_drafter import propose_skill
 from hpca.agent.skill_tools import add_skill_tools
 from hpca.agent.titler import propose_title
 from hpca.agent.watch_tools import add_watch_tools
@@ -69,7 +70,7 @@ from hpca.core.deps import CoreDeps
 from hpca.core.memory_service import KIND_REFLECTION, MemoryService
 from hpca.core.pollers import Pollers
 from hpca.core.scheduler import TurnPlan, TurnScheduler, wire_entry
-from hpca.db import record_command_use
+from hpca.db import command_use_counts, record_command_use
 from hpca.episodic import EpisodicStore
 from hpca.jobs import JobStore
 from hpca.logs import open_log
@@ -83,6 +84,8 @@ from hpca.protocol import (
     BackendScanned,
     BackendSet,
     ChatReset,
+    CommandCounts,
+    CommandList,
     CommandRun,
     ConfirmRequested,
     ConfirmResolve,
@@ -126,6 +129,8 @@ from hpca.protocol import (
     Shutdown,
     SkillBody,
     SkillDelete,
+    SkillDraft,
+    SkillDrafted,
     SkillGet,
     SkillList,
     SkillRow,
@@ -143,7 +148,12 @@ from hpca.protocol import (
     WatchPeeked,
 )
 from hpca.runner import kill_unowned
-from hpca.skills import load_own_skills, load_project_skills, load_skills
+from hpca.skills import (
+    load_own_skills,
+    load_project_skills,
+    load_skills,
+    summarize_skills,
+)
 from hpca.thinking import EFFORT_HINTS, EFFORTS, XHIGH_WARNING
 from hpca.transcript import (
     ASSISTANT,
@@ -184,6 +194,17 @@ def _write_entries(log, entries: list[Entry]) -> None:
         if entry.kind == THINKING:
             kind = f"thinking ({entry.summary()})"
         log.write(kind, entry.text)
+
+
+def _count_use(conn, name: str) -> dict[str, int]:
+    """Bump one command's count and hand back the whole table.
+
+    One database call for both, because the second is the first one's answer:
+    `AgentService._count_command` restates the counts to every client, and a
+    separate read could only tell it something it already knew.
+    """
+    record_command_use(conn, name)
+    return command_use_counts(conn)
 
 
 # The slash commands this core answers — the seven built-ins of §4.1. Kept as
@@ -508,7 +529,13 @@ class AgentService:
             await self._delete_profile(command.name)
             return
         if isinstance(command, SkillList):
-            self._emit_skills(command.profile)
+            self._emit_skills(command.profile, command.scope)
+            return
+        if isinstance(command, SkillDraft):
+            await self._request_draft(command)
+            return
+        if isinstance(command, CommandList):
+            await self._emit_command_counts()
             return
         if isinstance(command, SkillGet):
             self._emit_skill_body(command)
@@ -1584,13 +1611,26 @@ class AgentService:
         self._emit_rows()
         self._emit_profiles()
 
-    def _emit_skills(self, profile: str) -> None:
-        """`skill.list`: the profile's own skills, as a menu draws them.
+    def _emit_skills(self, profile: str, scope: str = "own") -> None:
+        """`skill.list`: a profile's skills, as a menu draws them.
 
-        Own only, matching what `skill.save` writes and `skill.delete`
-        removes: a shipped or shared skill is not one profile's to change, and
-        offering it in a menu whose editor saves into this profile's directory
-        would silently fork it.
+        Two scopes, because two screens ask this one command two different
+        questions (`protocol.SkillList`), and **listing is deliberately wider
+        than writing**:
+
+        * ``own`` — the profile's own directory, which is exactly what
+          `skill.get` opens, `skill.save` overwrites and `skill.delete`
+          removes for that profile. The default, because a screen offering
+          those three must not list a file none of them can touch.
+        * ``visible`` — everything the profile can *call*: the shipped skills,
+          `_shared/`, its own, and the project's, each row carrying the level
+          it resolved from. This is what a "/" menu needs. HPCA ships skills,
+          so a menu built from ``own`` reports `/plan` unknown on a fresh
+          install, which is the regression this scope closes.
+
+        A row in the wide answer is not a permission: `SkillRow.level` is what
+        says whether it may be edited at all, and the write commands stay
+        restricted to the levels a user owns whatever a listing showed.
 
         A profile whose skill dir cannot be read lists nothing rather than
         taking the screen down — the same bargain `_emit_profiles` makes, and
@@ -1598,15 +1638,27 @@ class AgentService:
         fixed.
         """
         try:
-            skills = self._memory.own_skills(profile)
+            skills = (
+                load_skills(profile, project_root=self._project_root)
+                if scope == "visible"
+                else self._memory.own_skills(profile)
+            )
         except Exception:
             logger.exception("could not list skills for %s", profile)
             skills = []
         self._deps.emit(
             SkillRows(
                 profile=profile,
+                scope=scope,
                 skills=[
-                    SkillRow(name=skill.name, description=skill.description)
+                    SkillRow(
+                        name=skill.name,
+                        description=skill.description,
+                        # Empty only for a skill built in memory; a listing
+                        # always comes off disk, and "profile" is the level
+                        # every write path defaults to.
+                        level=skill.level or "profile",
+                    )
                     for skill in skills
                 ],
             )
@@ -1632,10 +1684,18 @@ class AgentService:
     def _save_skill(self, command: SkillSave) -> None:
         """`skill.save`: persist a skill file verbatim, front matter and all.
 
-        Written into the profile's own directory and nowhere else. The global
-        (`_shared/`) level is deliberately unreachable from here: one profile
-        editing a procedure every other profile can see is a change nobody
-        asked for, and the same rule already governs deletion.
+        At the level the command names, which is one of the three a user owns
+        — the profile's own directory (the default, and where a hand-edited
+        file came from), the shared `_shared/` one every profile sees, or the
+        project's `.hpca/skills` in the working directory. The shipped level
+        is not among them and cannot be: `protocol.SkillLevel` does not admit
+        it, so a frame naming it is refused at the boundary rather than
+        writing into the install.
+
+        The level is a *choice the user makes in the creator*, which is why it
+        travels rather than being inferred: a global procedure and a
+        project-local one are different intentions, and neither is guessable
+        from the file.
         """
         if command.text is None:
             # The shape is shared with `skill.delete`, where the body is
@@ -1644,7 +1704,9 @@ class AgentService:
                 Notify(severity="warning", text="A skill needs a body to save.")
             )
             return
-        self._memory.save_skill_file(command.profile, command.name, command.text)
+        self._memory.save_skill_file(
+            command.profile, command.name, command.text, level=command.level
+        )
 
     # --------------------------------------------------------------- settings
 
@@ -1994,10 +2056,7 @@ class AgentService:
         name = command.name.lstrip("/").strip()
         args = command.args.strip()
         if name in SLASH_COMMANDS:
-            # The frequency sort behind the front-end's "/" menu. Counted here
-            # because the table is the core's; nothing serves the counts back
-            # yet, and recording them anyway is what keeps that possible.
-            await self._deps.db(lambda conn: record_command_use(conn, name))
+            await self._count_command(name)
         if name == "compact":
             session = self._session_for_command(command)
             if session is not None:
@@ -2028,24 +2087,138 @@ class AgentService:
             self._remove_skill(command.session_id, args)
             return
         if name == "skill-creator":
-            # The one built-in with no core-side shape. It is a form — name,
-            # description, body, and which level to write at — and the model's
-            # draft is a head start inside that form, not an answer. There is
-            # no event that could carry a draft to a front-end and no way for
-            # the core to know what came back out of the editing, so the whole
-            # command belongs on the other side of the socket, ending in the
-            # `skill.save` this core already answers.
+            # The *form* is the front-end's — name, description, level, body —
+            # and the core has no way to know what came back out of the
+            # editing, so what the user confirmed arrives as `skill.save`.
+            # The *draft* is the other half and is not the front-end's to
+            # make: it is a generation. That crosses as `skill.draft`, which
+            # is where a request typed after the command belongs.
             self._deps.emit(
                 Notify(
                     severity="warning",
-                    text="/skill-creator is a form the front-end owns; the "
-                    "finished skill arrives as skill.save.",
+                    text="/skill-creator is a form the front-end owns: ask "
+                    "skill.draft for a first draft, and the finished skill "
+                    "arrives as skill.save.",
                 )
             )
             return
         self._deps.emit(
             Notify(severity="warning", text=f"Unknown command: /{name}")
         )
+
+    async def _count_command(self, name: str) -> None:
+        """Record one use of a slash command, and restate the counts.
+
+        The frequency sort behind a front-end's "/" menu (§4.3 item 25). The
+        table has always been the core's — rule 2 of §4.2 keeps a front-end
+        out of the database — and until `command.counts` existed nothing
+        carried the numbers across, so every menu was in definition order.
+
+        Both halves in one database call, because the read is the write's own
+        answer: a second round trip could only return something the first one
+        already knew, and could disagree with it under a concurrent client.
+
+        Restated rather than left to be re-asked: the sort is wanted the next
+        time the menu is drawn, which is one keystroke away, and a mapping of
+        seven small integers is cheaper than the round trip that would fetch
+        it. See `protocol.CommandCounts` for why this is not a `hello` field.
+        """
+        counts = await self._deps.db(lambda conn: _count_use(conn, name))
+        self._deps.emit(CommandCounts(counts=counts))
+
+    async def _emit_command_counts(self) -> None:
+        """`command.list`: the counts as they stand, for a client that just
+        connected and has a menu to sort."""
+        counts = await self._deps.db(command_use_counts)
+        self._deps.emit(CommandCounts(counts=counts))
+
+    # -------------------------------------------------------- skill drafting
+
+    async def _request_draft(self, command: SkillDraft) -> None:
+        """`skill.draft`: check what can be checked, then go and generate.
+
+        The cheap gate is here and synchronous, the generation is on a task —
+        the same split every slow command makes, because `handle` is driven by
+        a reader loop with one socket behind it.
+
+        A bare `/skill-creator` is an empty form and must cost no generation,
+        so an empty request is refused here rather than sent to a model that
+        would dutifully invent a skill about nothing.
+        """
+        if not command.request.strip():
+            self._deps.emit(
+                Notify(
+                    severity="warning",
+                    text="Say what the skill should do: "
+                    "/skill-creator <what it should do>.",
+                )
+            )
+            return
+        # `/skill-creator` reaches the core as this command and nothing else —
+        # the front-end owns the form, so no `command.run` is ever sent for it
+        # — which makes this the one place the menu's sort can learn it ran.
+        await self._count_command("skill-creator")
+        self._spawn(self._draft_skill(command))
+
+    async def _draft_skill(self, command: SkillDraft) -> None:
+        """One model-written first draft of a skill, sent back to be edited.
+
+        Nothing is written here, and that is the whole shape: a draft is a
+        head start inside a form the user still edits and confirms, and what
+        they confirm comes back as `skill.save`. A core that wrote the file
+        itself would be putting a procedure the model invented into every
+        later prompt without anyone having read it.
+
+        The conversation goes with the request because "write a skill for what
+        we just did" is the common case, and the profile's existing skills go
+        too so the draft neither takes a name that is taken nor rewrites a
+        procedure that already exists.
+
+        Failure is an answer, not silence: the front-end opens the empty form
+        behind it, so a request that produced nothing must still come back —
+        otherwise the command swallows what the user typed.
+        """
+        session = self._session(command.session_id)
+        profile = command.profile or self._profile_for(command.session_id)
+        if session is not None:
+            # The spinner has to say what the wait is for: a conversation that
+            # goes busy for a minute without a turn behind it is exactly what
+            # this event exists to explain.
+            self._working(session.session_id, "drafting a skill")
+        answer = SkillDrafted(profile=profile, request=command.request)
+        try:
+            # Inside the try with the generation, because reading a thread can
+            # fail too and the form still has to open: everything between the
+            # command and the answer is one attempt that either drafts or does
+            # not.
+            messages: list = []
+            if session is not None:
+                messages = list(
+                    (await self._thread_values(session.session_id)).get(
+                        "messages", []
+                    )
+                )
+            draft = await propose_skill(
+                self._backends.labelled_client(
+                    "skill-creator", session_id=command.session_id
+                ),
+                command.request,
+                messages=messages,
+                existing=summarize_skills(
+                    load_skills(profile, project_root=self._project_root)
+                ),
+            )
+        except Exception as e:
+            logger.warning("skill draft failed: %s", e)
+            answer.error = str(e)
+        else:
+            answer.name = draft.name
+            answer.description = draft.description
+            answer.body = draft.body
+        finally:
+            if session is not None:
+                self._working(session.session_id, "")
+        self._deps.emit(answer)
 
     def _session_for_command(self, command: CommandRun):
         """The conversation a session-scoped slash command acts on, or None.
@@ -2425,6 +2598,7 @@ def build_service(
     tools=None,
     llm=None,
     session_store=None,
+    project_root=None,
 ) -> AgentService:
     """Assemble the runtime. The only place the four services meet.
 
@@ -2494,6 +2668,10 @@ def build_service(
         ),
         busy_profiles=busy_profiles,
         tools=tools,
+        # Where project-level skills are read and written. None means the
+        # working directory, which is what the app wants; a test pins it, so
+        # that writing a project skill cannot mean writing into the checkout.
+        project_root=project_root,
     )
 
     def turn_session(session_id: str):
