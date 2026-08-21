@@ -557,13 +557,33 @@ class RowUI:
         silent here, but its objection is to a *toast*: a notification for
         every stray escape sequence would be noise on top of the screen. A
         word in the footer costs nothing, cannot cover anything, and goes away
-        on its own — the poll timeout repaints twice a second, so the hint
-        expires with the window rather than sitting there until the next key.
+        on its own — ``next_wake`` books the repaint that clears it, so the
+        hint expires with the window rather than sitting there until the next
+        key.
         """
         return (
             self._esc_armed_at is not None
             and self.clock() - self._esc_armed_at <= ESC_STOP_WINDOW
         )
+
+    def next_wake(self) -> float | None:
+        """Seconds until this frame goes stale on its own, or None.
+
+        The loop repaints because something happened — a key, an event, a
+        resize — and not on a timer, so anything that changes by the clock
+        alone has to say when it will. Today that is the armed escape and
+        nothing else: "esc again to stop" is only true for
+        ``ESC_STOP_WINDOW``, and no keypress is coming to wipe it. Asked after
+        every frame, so a value that has already expired is None rather than
+        zero — zero would be a repaint that schedules another repaint.
+        """
+        if self._esc_armed_at is None:
+            return None
+        left = ESC_STOP_WINDOW - (self.clock() - self._esc_armed_at)
+        # A hair past the window rather than exactly on it: `_esc_armed` is
+        # true *at* the boundary, so waking there would redraw the same frame
+        # and then have nothing left to schedule — the hint would stick.
+        return left + 0.01 if left > 0 else None
 
     def _escape(self) -> bool:
         """Two escapes in quick succession stop the turn. One does nothing.

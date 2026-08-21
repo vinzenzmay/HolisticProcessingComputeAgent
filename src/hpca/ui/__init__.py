@@ -36,9 +36,10 @@ its letters, so reaching for shift+arrow threw you out of the box and into the
 chat. Escapes are now measured by shape and unknown ones are dropped whole.
 
 The content is real from M2 on: ``client`` fills ``state`` in from protocol
-events and the rows render that, so the only thing standing between this and a
-live conversation is the core on the other end of the connection (M3). What is
-deliberately still missing: mouse support, selecting text out of the *chat*,
+events and the rows render that. From M3 there is a real core behind it —
+``hpca --new-ui`` builds an ``AgentService`` over an ``InProcessConnection``
+and ``run`` drives stdin, that connection and SIGWINCH on one asyncio loop.
+What is deliberately still missing: mouse support, selecting text out of the *chat*,
 the turn display and approval prompts. Those are arguments *against* leaving
 Textual, so none of them is pretended solved — specs-ui-replacement.md §4 is
 the full list of what is absent and the order it arrives in.
@@ -59,5 +60,7 @@ The modules, per specs-ui-replacement.md §3:
 * ``app`` — layout, focus and key dispatch, with no I/O of its own;
 * ``demo`` — the sample content, served by a loopback core that speaks the
   same protocol a real one does;
-* ``run`` — argument parsing and the read/render loop.
+* ``run`` — the asyncio loop and the terminal's setup and teardown;
+* ``boot`` — the core in this process: the databases, the ``AgentService``, the
+  wire between them, and the order it all closes in.
 """

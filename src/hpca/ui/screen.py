@@ -1,13 +1,17 @@
-"""The raw terminal: alternate screen, differential repaint, resize.
+"""The raw terminal: alternate screen, differential repaint, terminal modes.
 
 The only module that writes to stdout, which is what keeps the rest of the
 package testable by calling ``render`` and comparing strings.
+
+Resizes used to live here too, as a self-pipe a ``select`` could watch. M3 put
+the loop on asyncio and ``loop.add_signal_handler(SIGWINCH, ...)`` *is* that
+pipe with a callback bolted on, so the class collapsed into the one line in
+``run.py`` its own docstring predicted.
 """
 
 from __future__ import annotations
 
 import os
-import signal
 import sys
 import termios
 import tty
@@ -34,104 +38,52 @@ ENTER_MODES = f"{ESC}[?1049h{ESC}[?25l{ESC}[?7l{PASTE_ON}{ESC}[2J"
 EXIT_MODES = f"{PASTE_OFF}{ESC}[?7h{ESC}[?25h{ESC}[?1049l"
 
 
-def _write(text: str) -> None:
-    sys.stdout.write(text)
-    sys.stdout.flush()
+class Screen:
+    """Raw terminal, alternate screen, differential repaint.
 
-
-class Resizes:
-    """SIGWINCH turned into something a poll can wait on.
-
-    The trap this avoids is the well-known one. A Python signal handler runs
-    between bytecodes, and since PEP 475 the interrupted ``select`` is
-    restarted underneath it, so setting a flag in the handler does not wake the
-    loop — the resize is not noticed until the poll times out, and until then
-    the frame is drawn at the old geometry.
-
-    The fix in both worlds is a self-pipe the poll can watch: the C-level
-    handler writes a byte, ``select`` returns, and the Python handler's flag is
-    read. ``asyncio``'s ``loop.add_signal_handler`` is exactly this pipe with a
-    callback bolted on, so when M2 moves run.py onto an asyncio loop, this
-    class collapses into ``loop.add_signal_handler(SIGWINCH, ...)`` setting the
-    same flag and nothing else about the loop changes.
-
-    Starts already pending: the first frame has no previous frame to diff
-    against, so it must be a full paint anyway.
+    ``fd`` and ``out`` are injectable so a test can drive a real ``Screen``
+    over a pipe: the differential paint and the mode strings are the two things
+    worth checking, and neither needs a terminal to be true. A file descriptor
+    that is not a tty simply keeps its line discipline — there is none to put
+    into raw mode — which is also what makes ``python -m hpca.ui.run`` fail
+    with a message rather than a ``termios.error`` when stdin is a pipe.
     """
 
-    def __init__(self) -> None:
-        self._pending = True
-        self._read = -1
-        self._write = -1
-        self._previous = None
-        self._previous_fd = -1
-
-    @property
-    def fd(self) -> int:
-        """The read end, for the loop's select list."""
-        return self._read
-
-    def __enter__(self) -> "Resizes":
-        self._read, self._write = os.pipe()
-        os.set_blocking(self._read, False)
-        os.set_blocking(self._write, False)
-        # Every signal writes its number here, which is all we want it for; the
-        # flag below says which one it was.
-        self._previous_fd = signal.set_wakeup_fd(
-            self._write, warn_on_full_buffer=False
-        )
-        if hasattr(signal, "SIGWINCH"):  # not a thing on Windows
-            self._previous = signal.getsignal(signal.SIGWINCH)
-            signal.signal(signal.SIGWINCH, self._caught)
-        return self
-
-    def __exit__(self, *exc) -> None:
-        if self._previous is not None:
-            signal.signal(signal.SIGWINCH, self._previous)
-            self._previous = None
-        signal.set_wakeup_fd(self._previous_fd)
-        for fd in (self._read, self._write):
-            if fd >= 0:
-                os.close(fd)
-        self._read = self._write = -1
-
-    def _caught(self, *_) -> None:
-        self._pending = True
-
-    def taken(self) -> bool:
-        """Whether the terminal changed size since this was last asked.
-
-        Draining is part of asking: the pipe exists to wake the poll, and a
-        byte left in it would wake every subsequent poll immediately.
-        """
-        if self._read >= 0:
-            try:
-                while os.read(self._read, 4096):
-                    pass
-            except BlockingIOError:
-                pass
-        was, self._pending = self._pending, False
-        return was
-
-
-class Screen:
-    """Raw terminal, alternate screen, differential repaint."""
-
-    def __init__(self) -> None:
-        self.fd = sys.stdin.fileno()
+    def __init__(self, fd: int | None = None, out=None) -> None:
+        self.fd = sys.stdin.fileno() if fd is None else fd
+        self._out = out
         self._saved: list | None = None
         self._prev: list[str] = []
 
+    def write(self, text: str) -> None:
+        """Straight to the terminal, no diff, no frame.
+
+        Used for what is said *outside* a frame — the wait at the end of
+        ``ui/boot.py``'s shutdown — which is why it flushes every time.
+        """
+        stream = sys.stdout if self._out is None else self._out
+        stream.write(text)
+        stream.flush()
+
     def __enter__(self) -> "Screen":
-        self._saved = termios.tcgetattr(self.fd)
-        tty.setraw(self.fd)
-        _write(ENTER_MODES)
+        if os.isatty(self.fd):
+            self._saved = termios.tcgetattr(self.fd)
+            tty.setraw(self.fd)
+        self.write(ENTER_MODES)
         return self
 
     def __exit__(self, *exc) -> None:
-        _write(EXIT_MODES)
+        """Never conditional on how the loop ended.
+
+        A traceback out of the loop must not leave the user in the alternate
+        screen with no cursor and no echo, so this is a context manager rather
+        than a pair of calls, and it puts the modes back before it restores the
+        line discipline — in the opposite order to ``__enter__``.
+        """
+        self.write(EXIT_MODES)
         if self._saved is not None:
             termios.tcsetattr(self.fd, termios.TCSADRAIN, self._saved)
+            self._saved = None
 
     def paint(self, lines: list[str], *, full: bool = False) -> None:
         out = [f"{ESC}[?2026h"]  # begin synchronised update
@@ -143,5 +95,5 @@ class Screen:
                 continue
             out.append(f"{ESC}[{row + 1};1H{ESC}[2K{line}")
         out.append(f"{ESC}[?2026l")
-        _write("".join(out))
+        self.write("".join(out))
         self._prev = list(lines)

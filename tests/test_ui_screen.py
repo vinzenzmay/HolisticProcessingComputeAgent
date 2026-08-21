@@ -1,17 +1,39 @@
-"""Tests for hpca.ui.screen: the terminal modes and the resize wake-up.
+"""Tests for hpca.ui.screen: the terminal modes and the differential paint.
 
-`Screen` itself needs a real terminal, so what is checked here is the two
-things that are decidable without one — the modes it turns on are the modes it
-turns off again, and a SIGWINCH reaches the poll instead of waiting for it to
-time out.
+`Screen` used to need a real terminal, so what could be checked here was only
+the mode strings. M3 made its fd and its output stream injectable — a
+descriptor that is not a tty simply keeps its line discipline — so the paint
+itself is testable too, over a pipe and a `StringIO`.
+
+The resize lives in `test_ui_run.py` now: it is `loop.add_signal_handler`, and
+a signal handler on the loop is only meaningful with a loop under it.
 """
 
+import io
 import os
-import signal
 
 import pytest
 
-from hpca.ui.screen import ENTER_MODES, EXIT_MODES, PASTE_OFF, PASTE_ON, Resizes
+from hpca.ui.ansi import ESC
+from hpca.ui.screen import ENTER_MODES, EXIT_MODES, PASTE_OFF, PASTE_ON, Screen
+
+
+@pytest.fixture
+def pipe():
+    read, write = os.pipe()
+    yield read, write
+    for fd in (read, write):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+@pytest.fixture
+def screen(pipe):
+    """A real `Screen` with nothing terminal about it."""
+    out = io.StringIO()
+    return Screen(fd=pipe[0], out=out), out
 
 
 class TestTerminalModes:
@@ -29,55 +51,66 @@ class TestTerminalModes:
         assert f"[?{mode}h" in EXIT_MODES or f"[?{mode}l" in EXIT_MODES
 
 
-class TestResizes:
-    def test_nothing_is_pending_before_a_signal(self):
-        with Resizes() as resizes:
-            resizes.taken()  # the first frame is always a full paint
-            assert resizes.taken() is False
+class TestEnterAndLeave:
+    def test_entering_writes_the_modes(self, screen):
+        scr, out = screen
+        with scr:
+            assert ENTER_MODES in out.getvalue()
 
-    def test_a_sigwinch_is_seen(self):
-        with Resizes() as resizes:
-            resizes.taken()
-            os.kill(os.getpid(), signal.SIGWINCH)
-            assert resizes.taken() is True
-
-    def test_and_only_once(self):
-        with Resizes() as resizes:
-            resizes.taken()
-            os.kill(os.getpid(), signal.SIGWINCH)
-            resizes.taken()
-            assert resizes.taken() is False
-
-    def test_the_first_frame_is_a_full_paint(self):
-        # There is no previous frame to diff against, so the loop must be told
-        # to draw the whole screen once before it starts trusting its baseline.
-        with Resizes() as resizes:
-            assert resizes.taken() is True
-
-    def test_the_signal_wakes_a_poll_that_would_otherwise_block(self):
-        # The point of the self-pipe: a bare handler runs between bytecodes and
-        # PEP 475 restarts the interrupted select, so the resize would not be
-        # noticed until the poll timed out.
-        import select
-
-        with Resizes() as resizes:
-            resizes.taken()
-            os.kill(os.getpid(), signal.SIGWINCH)
-            assert select.select([resizes.fd], [], [], 0)[0] == [resizes.fd]
-            resizes.taken()
-            assert select.select([resizes.fd], [], [], 0)[0] == []
-
-    def test_the_handler_is_put_back_afterwards(self):
-        before = signal.getsignal(signal.SIGWINCH)
-        with Resizes():
+    def test_leaving_writes_them_back(self, screen):
+        scr, out = screen
+        with scr:
             pass
-        assert signal.getsignal(signal.SIGWINCH) is before
+        assert out.getvalue().endswith(EXIT_MODES)
 
-    def test_and_so_is_the_wakeup_fd(self):
-        before = signal.set_wakeup_fd(-1)
-        signal.set_wakeup_fd(before)
-        with Resizes():
-            pass
-        after = signal.set_wakeup_fd(-1)
-        signal.set_wakeup_fd(after)
-        assert after == before
+    def test_a_traceback_still_leaves_the_terminal_usable(self, screen):
+        # The whole reason this is a context manager: an exception must not
+        # leave the user in the alternate screen with no cursor and no echo.
+        scr, out = screen
+        with pytest.raises(ZeroDivisionError), scr:
+            1 / 0
+        assert EXIT_MODES in out.getvalue()
+
+    def test_a_pipe_is_not_put_into_raw_mode(self, screen):
+        # There is no line discipline on a pipe to save and restore, and
+        # tcgetattr on one raises — which used to be the whole reason this
+        # class needed a terminal to be tested at all.
+        scr, _ = screen
+        with scr:
+            assert scr._saved is None
+
+
+class TestPaint:
+    def test_the_first_full_paint_clears_and_writes_every_row(self, screen):
+        scr, out = screen
+        scr.paint(["one", "two"], full=True)
+        painted = out.getvalue()
+        assert f"{ESC}[2J" in painted
+        assert "one" in painted and "two" in painted
+
+    def test_an_unchanged_row_is_not_written_again(self, screen):
+        scr, out = screen
+        scr.paint(["one", "two"], full=True)
+        out.truncate(0), out.seek(0)
+        scr.paint(["one", "different"])
+        painted = out.getvalue()
+        assert "different" in painted
+        assert "one" not in painted
+
+    def test_a_full_paint_writes_it_anyway(self, screen):
+        # What a resize needs: the diff baseline was taken at the old geometry
+        # and says nothing true about the new one.
+        scr, out = screen
+        scr.paint(["one", "two"], full=True)
+        out.truncate(0), out.seek(0)
+        scr.paint(["one", "two"], full=True)
+        assert "one" in out.getvalue()
+
+    def test_the_frame_is_one_synchronised_update(self, screen):
+        # Without ?2026 a wide frame tears: the terminal draws what has arrived
+        # so far and the rest lands on the next refresh.
+        scr, out = screen
+        scr.paint(["one"], full=True)
+        painted = out.getvalue()
+        assert painted.startswith(f"{ESC}[?2026h")
+        assert painted.endswith(f"{ESC}[?2026l")
