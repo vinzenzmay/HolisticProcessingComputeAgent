@@ -56,11 +56,36 @@ home = Path(tempfile.mkdtemp(prefix=f"hpca-smoke-{SCENARIO}-"))
 if SCENARIO == "down":
     # A backend that is configured and simply not answering: the tunnel case.
     # Port 20099 is chosen to be nothing; the point is the connect refusal.
-    (home / "settings.toml").write_text(
-        "[llm]\n"
-        'base_url = "http://127.0.0.1:20099/v1"\n'
-        'model = "nothing-listens-here"\n'
-        'api_key = "unused"\n'
+    #
+    # settings.JSON — `config.settings_path()` is `app_dir()/"settings.json"`.
+    # This was written as settings.toml first, which HPCA ignores entirely, so
+    # the scenario silently degraded into a second run of `bare` and reported
+    # a pass for a case it had not exercised. Hence the assertion below: a
+    # scenario that cannot prove it configured anything must fail loudly
+    # rather than quietly test nothing.
+    import json
+
+    (home / "settings.json").write_text(
+        json.dumps(
+            {
+                "llm": {
+                    "base_url": "http://127.0.0.1:20099/v1",
+                    "model": "nothing-listens-here",
+                    "api_key": "unused",
+                }
+            },
+            indent=2,
+        )
+    )
+    # Read it back through the real loader, so a schema change breaks this
+    # here rather than turning the scenario into a no-op again.
+    import os as _os
+
+    _os.environ["HPCA_HOME"] = str(home)
+    from hpca.config import Settings
+
+    assert Settings.load().llm.base_url.endswith(":20099/v1"), (
+        "the down scenario did not configure the backend it claims to"
     )
 
 env = dict(os.environ)
