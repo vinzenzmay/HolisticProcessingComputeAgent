@@ -214,6 +214,28 @@ added to `protocol.py` with tests, in the same style as what is there:
     incompatible with §3.2's append-only invariant. Needs a core-assigned entry
     identity and an update event.
 
+**Found during M6/M7, and the most serious thing on this list.** The core
+writes **no per-turn transcript log and no episodic index entries.**
+`TurnScheduler`'s `on_turn_result` hook names three consumers — "the transcript
+log, the episodic index and session titling" — and only titling is wired.
+`tui/app.py:_log_turn` has no counterpart, so in a core-driven run
+`<app_dir>/sessions/*.log` is never written and `session_search` indexes
+nothing, which silently breaks recall across sessions. Nine acceptance claims
+under "Thinking box, tool rows, logging" and two under "Core chat wiring"
+depend on it. **This must close before M9**, because after M9 there is no
+implementation left to compare against.
+
+Two smaller ones from the same work:
+
+- **Discovery is not on the wire.** `LLMEntry.discovered` exists and is always
+  `False`: nothing runs `scan_local_ports` or `discover_cluster_endpoints`, so
+  manage-LLMs' *discovered* panel and its rescan have no core behind them.
+  Adding a catalog entry is `backend.set`; **removing one has no command at
+  all**, which the screen's `r` key needs. (M8.)
+- **`specs-core-process.md` §4.1/§4.2 are behind again** — `llm.list`,
+  `profile.list`, `llm.catalog` and `profile.rows` are absent.
+  `tests/test_protocol.py` carries them with a comment saying so.
+
 Found during M4, recorded for the milestone that hits each:
 
 - **`turn.interrupt` recovers the user's message and then throws it away.**
