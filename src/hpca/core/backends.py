@@ -338,17 +338,12 @@ class BackendRegistry:
 
     # ------------------------------------------------------------- catalog
 
-    def choices(self) -> list[LLMBackend]:
-        """The configured catalog, entries and all, for callers inside the core.
-
-        Choosing is a front-end job — it was a modal — but the list being
-        chosen from belongs to the core, and so does what the choice is
-        stored as (`backend_for_new_session`).
-
-        Not what crosses the socket: these hold api keys. `catalog` is the
-        drawable form, and it is the only one a front-end ever sees.
-        """
-        return list(self._deps.settings.backends)
+    # The configured catalog with the api keys still on it was once offered
+    # here as `choices()`, "for callers inside the core". It had none: the two
+    # questions the core actually asks are `labels()` — what a command may pin
+    # an entry with — and `catalog()`, the drawable form that is the only one
+    # a front-end ever sees. `settings.backends` is where the list itself
+    # lives, and it is one attribute away for anyone who needs it whole.
 
     def labels(self) -> dict[str, LLMBackend]:
         """The catalog by the name a command may pin an entry with.

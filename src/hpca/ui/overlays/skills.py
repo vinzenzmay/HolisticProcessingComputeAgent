@@ -1,9 +1,11 @@
-"""A profile's own skills (`s` on the profiles screen, §4.3 items 27 and 33).
+"""The skills a profile may edit (`s` on the profiles screen, §4.3 items 27
+and 33).
 
-The profile's own copy only — shared and project skills are edited where they
-live, not from one profile's screen, which is the same rule the core enforces
-on the way in (`skill.save` writes into the profile's directory and nowhere
-else).
+Its own and this project's — the two levels a user owns, which is what
+`SkillInfo.removable` says and what the core answers `skill.get` and
+`skill.delete` for. Shared (`_shared/`) and shipped skills are neither listed
+nor editable here: removing or forking one would change every other profile
+that sees it, and the core refuses them on the way in as well.
 
 Enter opens one skill's raw file in the same editor the memories use, and `d`
 deletes one after asking. Both are sent as intents from here rather than

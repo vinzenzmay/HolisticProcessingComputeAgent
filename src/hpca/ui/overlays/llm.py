@@ -313,8 +313,10 @@ class LlmOverlay(Overlay):
             return True
         self.send(RemoveBackend(label))
         # Off the screen now and true when the next `llm.catalog` says so —
-        # the same shown-before-it-is-true bargain the mode bar makes, and the
-        # core does restate the catalog after a remove.
+        # the same shown-before-it-is-true bargain the mode bar makes. The
+        # core restates the catalog on *both* answers to `backend.remove`, the
+        # refusal included, so a row this took off optimistically comes back
+        # if it was never removed (`service._remove_backend`).
         self.configured = [x for x in self.configured if x.label != label]
         self.refresh()
         self.note = f"removed {label}"

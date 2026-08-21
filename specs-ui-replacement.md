@@ -435,21 +435,31 @@ this is the one milestone that parallelises cleanly across subagents.
 
 **M8 — commands and edges.** §4.3 items 24-25 and 35-40.
 
-**M9 is blocked until the list in [specs-ui-coverage.md](specs-ui-coverage.md)
-§3 is closed.** The audit taken before the step found 38 acceptance claims
-unimplemented, and three of them mean the app does not work rather than that it
-is missing a nicety: `BackendRegistry.auto_connect()` has no caller and nothing
-in the UI sends `backend.scan`/`probe`/`remove`, so a cluster user cannot
-connect at all; `ctx.queue_memory_edits` is set only in `tui/app.py`, so the
-`memory` tool is dead while the prompt still instructs the model to use it; and
-`trash.cleanup` and `run_curator_if_due` lose their only caller with the file
-being deleted, which is unbounded growth in an NFS home behind settings keys
-that silently do nothing.
+**M9 was blocked until the list in [specs-ui-coverage.md](specs-ui-coverage.md)
+§3 was closed; it no longer is.** The audit taken before the step found 38
+acceptance claims unimplemented, and three of them meant the app did not work
+rather than that it was missing a nicety: `BackendRegistry.auto_connect()` had
+no caller and nothing in the UI sent `backend.scan`/`probe`/`remove`, so a
+cluster user could not connect at all; `ctx.queue_memory_edits` was set only in
+`tui/app.py`, so the `memory` tool was dead while the prompt still instructed
+the model to use it; and `trash.cleanup` and `run_curator_if_due` lost their
+only caller with the file being deleted, which is unbounded growth in an NFS
+home behind settings keys that silently do nothing.
 
-Two of those were hidden by docstrings that had gone stale *within this
-milestone* — they still said discovery was unimplemented and the probe had no
-wire command, both of which earlier commits had made false. Anything the port
-still owes should be checked against behaviour, not against comments.
+All three are wired and tested, as is the fourth blocker — the lag probe of §8,
+which `ui/boot.py` now builds and `ui/run.py`'s loop starts and stops. What §3
+still lists as open is the injection warning on a flagged memory batch, the
+watchers column's arrangement (there is no `watch.move` on the wire), and
+memories not being re-read at a session boundary. None of the three stops the
+app working; all three should be booked as work, and the second is a working
+feature becoming a non-working one, so it is worth doing before the row UI
+becomes the default rather than after.
+
+Two of the original three were hidden by docstrings that had gone stale *within
+this milestone* — they still said discovery was unimplemented and the probe had
+no wire command, both of which earlier commits had made false. It happened
+again in the round of fixes that closed them, in eight more places. Anything
+the port still owes should be checked against behaviour, not against comments.
 
 **M9 — the deletion.** Remove `src/hpca/tui/`, drop `textual` from
 `pyproject.toml`, point `hpca` at the new UI, delete or rewrite the Textual
@@ -600,8 +610,12 @@ up, the fix is an index rather than a rewrite — but the number decides that, n
 the plan.
 
 Baselines are taken on `main` under Textual with the same content, so the
-comparison is like-for-like, and `looplag.py` already exists to record
-event-loop delay on both sides.
+comparison is like-for-like, and `looplag.py` records event-loop delay on both
+sides: `tui/app.py` starts it in `on_mount`, and on this side `ui/boot.py`
+builds it and `ui/run.py`'s loop starts and stops it. Both are off unless
+`$HPCA_LOOPLAG` is set and both append their block to `<app_dir>/looplag.log`,
+noted with whatever the variable was set to — which is what makes the two
+blocks tellable apart in one file.
 
 ---
 

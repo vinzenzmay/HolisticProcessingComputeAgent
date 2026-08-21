@@ -120,6 +120,12 @@ QUIT_QUESTION = "Really quit?"
 NOT_A_TURN = "this is a backend call, not a turn — nothing to stop"
 NOTHING_TO_STOP = "nothing running to stop"
 
+# And the third, which reads like a running turn and is not one: a turn parked
+# on an approval has been handed back to the user, and the core has no
+# `TurnState` left to interrupt. Answer it — either way — and it can be
+# stopped again (specs-ui-coverage.md §4).
+PARKED_ON_A_DECISION = "this turn is waiting for your answer — decide it first"
+
 # The title over the tunnel recipe an empty scan comes back with — the words
 # `tui/manage_llms.py` put on the same window, so a user who has seen it once
 # recognises it. The recipe itself is the core's (`autoconnect.offcluster_help`).
@@ -304,6 +310,12 @@ class RowUI:
         # would be a stack of modals nobody asked for, and the newer answer is
         # the one still worth reading.
         self._waiting_window: tuple[str, str] | None = None
+        # And the same slot for a *screen* the core answered for — today only
+        # the skill creator's form, which opens seconds after the request when
+        # the model has drafted something. Same reason, same rule: it is
+        # placed when it can be, rather than replacing whatever the user
+        # opened in the meantime (`land`, and §9.8 of the coverage audit).
+        self._waiting_screen: Overlay | None = None
 
     # ------------------------------------------------------ the open session
 
@@ -325,6 +337,33 @@ class RowUI:
         self.overlays = []
         if screen is not None:
             self.push(screen)
+
+    def land(self, screen: Overlay) -> None:
+        """Open a screen nobody just pressed a key for, without taking one away.
+
+        The asynchronous counterpart of the `overlay` setter, and the reason
+        it cannot be the setter: an answer that took the model several seconds
+        arrives long after the request, and in those seconds the user is free
+        to have opened the config editor and typed half a settings file into
+        it. `overlay =` would start a fresh stack and drop that on the floor
+        with no way back, which is exactly the hazard `window` parks for.
+
+        So it waits, and lands at the first moment it is not landing on top of
+        somebody. `boot._open_llm_screen` makes the same judgement by giving
+        up entirely; this one keeps the answer, because a drafted skill is
+        something the user asked for by name.
+        """
+        if self.overlay is not None:
+            self._waiting_screen = screen
+            return
+        self.overlay = screen
+
+    def _open_waiting_screen(self) -> None:
+        """Place a parked screen, if there is one and the rows are clear."""
+        if self._waiting_screen is None or self.overlay is not None:
+            return
+        screen, self._waiting_screen = self._waiting_screen, None
+        self.overlay = screen
 
     def push(self, screen: Overlay) -> None:
         """Put a screen on the stack and let it ask the core for things.
@@ -354,6 +393,11 @@ class RowUI:
             return
         self._closed(done)
         self._open_waiting_window()
+        # After the window, and only onto empty rows: a window that landed
+        # here keeps the screen parked one more close, which is the right
+        # order — the window is an answer to read, and this is a form to fill
+        # in.
+        self._open_waiting_screen()
 
     def _adopt(self, screen: Overlay) -> None:
         """A screen asked for a screen of its own. Give it one."""
@@ -520,10 +564,14 @@ class RowUI:
         # titler, a `/conclude` — is something in flight in that conversation
         # and the row has to say so, even though there is no turn to stop
         # (`state.Turn.busy` is the same distinction the spinner draws).
-        marks += WORKING_MARK if session.turn.busy or "working" in flags else " "
+        working = session.turn.busy or "working" in flags
+        marks += WORKING_MARK if working else " "
         # Last, and only where the other two are not: a row cannot be both
         # still working and finished, and a decision is the more urgent of the
-        # two things to say about a session that is not on screen.
+        # two things to say about a session that is not on screen. The same
+        # `working` the mark above was drawn from, or the "*" would overwrite
+        # a "⟳" the core's flag put there and nothing local knew about — a
+        # reconnect, or a second front-end (specs-ui-coverage.md §9.14).
         if session.updated and not (parked or session.turn.busy):
             marks = marks[0] + UPDATED_MARK
         return marks
@@ -1553,8 +1601,22 @@ class RowUI:
                 lambda yes: self._confirmed_stop(session_id, yes),
             )
         else:
-            self.note = NOT_A_TURN
+            self.note = self._why_not_stoppable()
             self.note_style = DIM
+
+    def _why_not_stoppable(self) -> str:
+        """Why the stop gesture did nothing, in the three shapes that has.
+
+        One answer for both halves of the gesture — `esc esc` and Enter on the
+        working row ask the same question — and all three are said rather than
+        papered over: "waiting for you" and "nothing running" are different
+        situations with different next steps, and the one thing none of them
+        may say is that a turn was stopped.
+        """
+        turn = self.session.turn
+        if turn.parked:
+            return PARKED_ON_A_DECISION
+        return NOT_A_TURN if turn.busy else NOTHING_TO_STOP
 
     def _confirmed_stop(self, session_id: str, yes: bool) -> None:
         """The answer to the interrupt dialog. A reply that landed while it
@@ -1621,6 +1683,26 @@ class RowUI:
             and self.clock() - self._esc_armed_at <= ESC_STOP_WINDOW
         )
 
+    def activity_label(self) -> str:
+        """What to blame a loop stall on, for the lag probe's spike list.
+
+        The same answer the spinner gives — "running read_file", "LLM
+        processing" — because that is already the app's own word for what it
+        is doing, so a spike in `looplag.log` names the step that caused it
+        rather than a time nobody can place (specs-core-process.md §8).
+
+        Every busy session, not just the one on screen: a turn in a
+        conversation the user has left blocks this loop exactly as hard as the
+        open one. Sorted and de-duplicated so that two sessions running the
+        same tool read as one step rather than two problems.
+
+        Called from inside a stall, on state that may be half-built, and its
+        answer is only ever a string in a log — so it is deliberately total:
+        no session, no turn, no blame.
+        """
+        live = sorted({x.turn.label for x in self.sessions if x.turn.busy})
+        return ", ".join(live) if live else "idle"
+
     def next_wake(self) -> float | None:
         """Seconds until this frame goes stale on its own, or None.
 
@@ -1682,11 +1764,11 @@ class RowUI:
             # rather than claimed: the footer used to report a stop it had not
             # made, on an idle session and even with nothing open at all —
             # and the same sentence is what four tests took as their proof
-            # that the interrupt reached the core. Which of the two answers it
-            # is matters: a spinner that cannot be stopped is a different
-            # thing from no spinner, and `_stop_from_the_row` already tells
-            # them apart.
-            self.note = NOT_A_TURN if self.session.turn.busy else NOTHING_TO_STOP
+            # that the interrupt reached the core. Which of the three answers
+            # it is matters: a spinner that cannot be stopped is a different
+            # thing from no spinner, and `_stop_from_the_row` gives the same
+            # three answers to the same question.
+            self.note = self._why_not_stoppable()
             self.note_style = DIM
             return True
         self.send(Interrupt(self.active_id))
@@ -1806,13 +1888,16 @@ class RowUI:
             # retyping the sentence they attached to it.
             self.toast(commands.unknown(name), "warning")
             return
-        if name in self.SCREEN_COMMANDS and self._screen_command(name, args):
-            # Ahead of the busy check on purpose: these three draw a screen
-            # and ask the core for nothing, so there is no worker for a
-            # running turn to collide with. Picking a thinking level while the
-            # model is thinking is the case that makes the point.
-            self.input.clear()
-            return
+        screen = name in self.SCREEN_COMMANDS
+        if screen and not self._asks_the_core(name, args):
+            # Ahead of the busy check on purpose, and only while it is true
+            # that these draw a screen and ask the core for nothing: with no
+            # worker to collide with there is nothing for a running turn to
+            # refuse. Picking a thinking level while the model is thinking is
+            # the case that makes the point.
+            if self._screen_command(name, args):
+                self.input.clear()
+                return
         if self.session.turn.busy:
             # A command that *does* reach the core acts on the UI and runs its
             # own exclusive worker, so there is nothing sensible to queue it
@@ -1821,6 +1906,13 @@ class RowUI:
             # refused. An ordinary message queues; this one waits for the user.
             self.note = "wait for this turn — a command cannot be queued"
             self.note_style = DIM
+            return
+        if screen and self._screen_command(name, args):
+            # The screen commands that *do* reach the core — a
+            # `/skill-creator <request>`, which is a model call — answered
+            # here, behind the guard, where the rest of the core-bound
+            # commands are.
+            self.input.clear()
             return
         command = next(x for x in commands.BUILTINS if x.name == name)
         if command.session and not self.active_id:
@@ -1842,6 +1934,19 @@ class RowUI:
             self.session.context.superseded()
         self.input.clear()
         self.note = f"/{name}"
+
+    def _asks_the_core(self, name: str, args: str) -> bool:
+        """Whether this screen command is a round trip after all (§9.7).
+
+        One of the three is: `/skill-creator <request>` drafts the skill with
+        the model, so it sends `skill.draft` and the core answers it by
+        putting *this session* to work. Run mid-turn that rewrites the running
+        turn's step label and restarts its elapsed clock — twice, once for the
+        draft and once for the blank that ends it — while the acceptance list
+        is explicit that the elapsed count answers "how long since I sent it".
+        So it waits behind the same guard every other core-bound command does.
+        """
+        return name == "skill-creator" and bool(args)
 
     def _screen_command(self, name: str, args: str) -> bool:
         """Draw the answer rather than send it. False falls through to the core."""
@@ -1865,7 +1970,8 @@ class RowUI:
             own = self._own_skills()
             if not own:
                 self.toast(
-                    f"profile “{self.profile}” has no skills of its own to remove",
+                    f"no skills to remove — “{self.profile}” has none of its "
+                    "own, and nor has this project",
                     "warning",
                 )
                 return True
@@ -1899,10 +2005,15 @@ class RowUI:
         A failed draft opens the *empty* form rather than losing the command —
         the user asked for a skill about something, and the worst answer is
         the one that takes the request away and says nothing.
+
+        `land`, not `overlay =`: this is the one screen in the app that opens
+        because the *core* answered, seconds after the key that asked for it,
+        and by then there may be a screen of somebody's own in front of it
+        (§9.8).
         """
         if error:
             self.toast(f"could not draft that skill ({error})", "warning")
-        self.overlay = self._skill_form(drafted, request)
+        self.land(self._skill_form(drafted, request))
 
     def _skill_named(self, name: str) -> tuple[str, str] | None:
         """The visible skill that `/name` names, or None. Built-ins win."""
@@ -2231,10 +2342,15 @@ class RowUI:
         for again: `profile.rows` fills `self.profiles`, and the picker adds
         what it knows besides — the core's own profile from `hello` and the
         profile of every session in the sidebar, so a conversation can be
-        started under a profile the list has not arrived for. The default
-        leads, then the rest in the order they were met — which puts the
-        profile the user is working in at the top of the list they are about
-        to pick from.
+        started under a profile the list has not arrived for.
+
+        The default leads, then the rest in the order they were met. Note what
+        that does *not* say: the working profile is second when it is not
+        `default`, and the cursor still starts on `default` — so a user
+        working under `hpc` picks `hpc` with one press of ↓ and gets the
+        fallback by pressing Enter twice. Putting the working profile first
+        instead is `specs-ui-coverage.md` §7's suggestion and is not what this
+        does today.
         """
         names: list[str] = []
         for name in (

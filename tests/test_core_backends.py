@@ -465,11 +465,6 @@ class TestNewSessionBackend:
         h.settings.backends = [backend_b()]
         assert h.registry.backend_for_new_session(backend_b().model_dump_json()) is None
 
-    def test_choices_are_the_configured_catalog(self, home):
-        h = Harness(home)
-        h.settings.backends = [backend_a(), backend_b()]
-        assert [b.model for b in h.registry.choices()] == ["qwen-a", "qwen-b"]
-
 
 class TestLabels:
     """The names both sides call a backend by — minted in one place so they

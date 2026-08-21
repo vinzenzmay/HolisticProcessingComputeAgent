@@ -3,7 +3,7 @@
 import pytest
 
 from hpca.db import connect, init_db
-from hpca.jobs import JobStore, poll_active
+from hpca.jobs import JobStore, apply_statuses
 from hpca.slurm import JobStatus
 
 
@@ -82,63 +82,49 @@ class TestJobStore:
         assert logs[0].log_path == "/logs/align.log"
 
 
-class StubSlurm:
-    def __init__(self, statuses):
-        self._statuses = statuses
-        self.queried: list[list[str]] = []
+class TestApplyStatuses:
+    """The fold `core.pollers.poll_jobs` runs on the DB thread.
 
-    async def status(self, job_ids):
-        self.queried.append(sorted(job_ids))
-        return {k: v for k, v in self._statuses.items() if k in job_ids}
+    These were once driven through `jobs.poll_active`, a wrapper that made the
+    sacct call itself. The core does the two halves separately — the store on
+    the DB thread, sacct on the loop — so the wrapper had no callers left and
+    went with this milestone (specs-ui-coverage.md §1, the one-caller sweep).
+    The fold it wrapped is where the behaviour was, and it stays tested here;
+    the *cycle* around it belongs to `tests/test_core_pollers.py`, which
+    covers the skipped query and the terminal job nothing asks about twice.
+    """
 
+    def fold(self, store, statuses) -> list:
+        return apply_statuses(store, store.active(), statuses)
 
-class TestPollActive:
-    async def test_reports_state_changes(self, store):
+    def test_reports_state_changes(self, store):
         add_job(store, "1")
         add_job(store, "2")
-        slurm = StubSlurm(
+        changes = self.fold(
+            store,
             {
                 "1": JobStatus(job_id="1", state="RUNNING", raw_state="RUNNING"),
                 "2": JobStatus(
                     job_id="2", state="COMPLETED", raw_state="COMPLETED", exit_code=0
                 ),
-            }
+            },
         )
-        changes = await poll_active(slurm, store)
         assert {(c.job_id, c.old_state, c.new_state) for c in changes} == {
             ("1", "SUBMITTED", "RUNNING"),
             ("2", "SUBMITTED", "COMPLETED"),
         }
         assert store.get("2").state == "COMPLETED"
 
-    async def test_unchanged_state_not_reported(self, store):
+    def test_unchanged_state_not_reported(self, store):
         add_job(store, "1")
-        slurm = StubSlurm(
-            {"1": JobStatus(job_id="1", state="RUNNING", raw_state="RUNNING")}
-        )
-        await poll_active(slurm, store)
-        changes = await poll_active(slurm, store)
-        assert changes == []
+        running = {"1": JobStatus(job_id="1", state="RUNNING", raw_state="RUNNING")}
+        self.fold(store, running)
+        assert self.fold(store, running) == []
 
-    async def test_job_unknown_to_sacct_stays_submitted(self, store):
+    def test_job_unknown_to_sacct_stays_submitted(self, store):
         # accounting lag right after submission: sacct may not know the job yet
         add_job(store, "1")
-        slurm = StubSlurm({})
-        changes = await poll_active(slurm, store)
-        assert changes == []
+        assert self.fold(store, {}) == []
         assert store.get("1").state == "SUBMITTED"
 
-    async def test_no_active_jobs_skips_query(self, store):
-        slurm = StubSlurm({})
-        await poll_active(slurm, store)
-        assert slurm.queried == []
 
-    async def test_terminal_jobs_not_polled_again(self, store):
-        add_job(store, "1")
-        slurm = StubSlurm(
-            {"1": JobStatus(job_id="1", state="FAILED", raw_state="FAILED",
-                            exit_code=1)}
-        )
-        await poll_active(slurm, store)
-        await poll_active(slurm, store)
-        assert len(slurm.queried) == 1

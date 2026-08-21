@@ -813,7 +813,12 @@ class UIClient:
         # in the transcript rather than only into a toast that expires. seq 0:
         # the core did not number this row and nothing may revise it.
         session.append(state.ChatEntry(kind="error", text=msg.error))
-        self.ui.refresh_sidebar()
+        # `replied`, exactly as the finished path does, and for the stronger
+        # version of the same reason: a background turn that broke also drops
+        # its "⟳" at the moment there is something to read, and what there is
+        # to read is the error above. Marked on both paths, which is what the
+        # Textual app did (§3.4) — `replied` refreshes the sidebar itself.
+        self.ui.replied(msg.session_id)
 
     def _usage(self, msg: protocol.TurnUsage) -> None:
         """What the last decision cost, and how long it took (`turn.usage`).

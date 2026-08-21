@@ -599,6 +599,31 @@ class TestTheSidebarMarkers:
         await wire.tell(protocol.TurnFinished(session_id="s2"))
         assert "*" in self.row_for(wire, "the second thing")
 
+    async def test_a_turn_that_failed_there_flags_it_too(self, wire):
+        # §3.4: the marker was set on `turn.finished` and not on `turn.failed`,
+        # so a background turn that broke cleared its "⟳", left the row blank,
+        # and put the error in a transcript nothing pointed at. The old TUI
+        # marked both paths, and a failure is the one you most want telling.
+        await started(wire)
+        await wire.tell(protocol.TurnStarted(session_id="s2"))
+        await wire.tell(
+            protocol.TurnFailed(session_id="s2", error="the backend hung up")
+        )
+        assert "*" in self.row_for(wire, "the second thing")
+
+    async def test_and_opening_it_clears_that_one_as_well(self, wire):
+        await started(wire)
+        await wire.tell(protocol.TurnFailed(session_id="s2", error="boom"))
+        await on_row(wire, SECOND)
+        await wire.press("enter")
+        assert "*" not in self.row_for(wire, "the second thing")
+
+    async def test_a_failure_in_the_open_session_flags_nothing(self, wire):
+        # It is already on screen — the error row is the notification.
+        await started(wire)
+        await wire.tell(protocol.TurnFailed(session_id="s1", error="boom"))
+        assert "*" not in self.row_for(wire, "the first thing")
+
     async def test_and_does_not_force_that_session_open(self, wire):
         await started(wire)
         await wire.tell(protocol.TurnFinished(session_id="s2"))
@@ -625,6 +650,21 @@ class TestTheSidebarMarkers:
         await wire.tell(protocol.TurnFinished(session_id="s2"))
         await wire.tell(protocol.TurnStarted(session_id="s2"))
         assert "⟳" in self.row_for(wire, "the second thing")
+
+    async def test_a_row_the_core_calls_working_says_that_too(self, wire):
+        # §9.14: the "⟳" is drawn from the core's flag *or* the local turn,
+        # and the "*" used to be suppressed only by the local half — so a
+        # session working with no local `turn.started` (a reconnect, or a
+        # second front-end) could be drawn as finished while it ran.
+        await started(wire)
+        await wire.tell(protocol.TurnFinished(session_id="s2"))
+        await wire.tell(
+            protocol.SessionRows(
+                rows=[ROWS[0], ROWS[1].model_copy(update={"flags": ["working"]})]
+            )
+        )
+        row = self.row_for(wire, "the second thing")
+        assert "⟳" in row and "*" not in row
 
     async def test_and_a_parked_decision_wins_over_both(self, wire):
         await started(wire)

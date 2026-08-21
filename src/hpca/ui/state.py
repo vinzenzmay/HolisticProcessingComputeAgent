@@ -256,6 +256,14 @@ class Turn:
     working: bool = False
     activity: str = ""
     started_at: str = ""
+    # Waiting for the user to approve or refuse a tool call. A turn parked
+    # there is *working* and is not stoppable: the scheduler emits
+    # `decision.requested` and returns without a `turn.finished`, having
+    # already popped its `TurnState` — so `Interrupt` finds nothing to
+    # interrupt and the core answers by emitting nothing at all. Kept on the
+    # turn rather than read off the session's `Decision` because it is what
+    # the working row's own hint is drawn from (specs-ui-coverage.md §4).
+    parked: bool = False
     # `started_at` parsed once, because the alternative is parsing an ISO
     # string ten times a second for as long as a turn runs.
     started_epoch: float | None = None
@@ -274,8 +282,15 @@ class Turn:
 
     @property
     def interruptible(self) -> bool:
-        """Whether stopping it is a thing that can be done."""
-        return self.working
+        """Whether stopping it is a thing that can be done.
+
+        Not merely whether something is running: the core will only stop a
+        turn it still holds a `TurnState` for, and a turn parked on an
+        approval is one it has already let go of. Saying so here is what keeps
+        the gesture honest — the alternative is a footer claiming a stop that
+        never happened, on the one path where a turn most often waits.
+        """
+        return self.working and not self.parked
 
     @property
     def label(self) -> str:
@@ -784,6 +799,10 @@ class SessionState:
         refusal someone was in the middle of writing every time the client
         reconnected.
         """
+        # Whatever else it is, this turn is now waiting on a person, and the
+        # core has let go of it: nothing about it can be stopped until it is
+        # answered.
+        self.turn.parked = True
         if self.decision is not None and self.decision.payload == payload:
             return self.decision
         self.decision = Decision(payload=payload)
@@ -791,6 +810,10 @@ class SessionState:
 
     def clear_decision(self) -> None:
         self.decision = None
+        # Answered, or its turn died. Either way the wait is over: the resume
+        # re-binds the anchor and the turn is a turn again, and where there is
+        # no turn `working` is already False.
+        self.turn.parked = False
 
     # -------------------------------------------------------------- the turn
 

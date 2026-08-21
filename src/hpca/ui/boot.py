@@ -16,9 +16,11 @@ iteration, so the day the core moves out only `Core.start` changes.
 then sqlite, then the RAG store, and only then the final sync home — because
 the sync must copy a quiesced database, and nothing may open a file inside the
 working dir after it has been removed. `specs-ui-acceptance.md` records it
-under "Node-local databases" and `tests/test_tui_dbcache.py` asserts it of the
-Textual app; the same guarantees hold here, and `tests/test_ui_boot.py`
-asserts them of this one.
+under "Node-local databases", and `tests/test_ui_boot.py` asserts it of this
+module — the order, the wait message and the Ctrl+C that does not obey it, the
+sync interval and what `0` means, the notices reaching the wire, and the
+logging pair below. (The Textual app's own copy of these guarantees is
+asserted by `tests/test_tui_dbcache.py`, which goes when `hpca/tui` does.)
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import shutil
 import signal
 from pathlib import Path
@@ -530,6 +533,46 @@ def _open_llm_screen(ui) -> None:
     ui.overlay = LlmOverlay(ui.catalog)
 
 
+def _lag_probe(ui):
+    """Event-loop scheduling delay, measured (specs-core-process.md §8).
+
+    The instrument for the measurement that justifies this whole
+    architecture: the case for moving the agent into its own process is that
+    synchronous work on the UI's loop makes it stutter, and that has to be a
+    number taken before and after — the Textual app took the "before", and
+    this is what takes the "after" against the same yardstick.
+
+    Off unless `$HPCA_LOOPLAG` is set, and a disabled probe starts no task and
+    touches nothing, which is what makes it safe to leave wired in
+    permanently. The label hook is the app's own word for what it is doing, so
+    a spike in the log names the step that caused it.
+    """
+    from hpca.looplag import LoopLagProbe
+
+    return LoopLagProbe(
+        enabled=bool(os.environ.get("HPCA_LOOPLAG")),
+        label=ui.activity_label,
+    )
+
+
+def _write_lag_report(probe) -> None:
+    """Leave the run's block in `<app_dir>/looplag.log`, if it measured one.
+
+    Here rather than in `ui/run.py` because this is the module that knows what
+    an app dir is — the loop is measured where it runs and the answer is
+    written down where answers live. A disabled probe writes nothing and says
+    so, so this needs no guard of its own; the `$HPCA_LOOPLAG` value rides
+    along as the block's note, which is what makes two blocks in one file
+    tellable apart ("baseline main", "row ui").
+    """
+    from hpca.config import app_dir
+
+    with contextlib.suppress(Exception):
+        probe.write_report(
+            app_dir() / "looplag.log", note=os.environ.get("HPCA_LOOPLAG", "")
+        )
+
+
 def _detect_slurm(settings):
     """Job tools are available when sbatch exists or a submit host is set."""
     from hpca.slurm import SlurmClient
@@ -578,6 +621,7 @@ async def start(
         on_no_backend=lambda: _open_llm_screen(ui),
     )
     client = UIClient(ui, ui_end)
+    probe = _lag_probe(ui)
     try:
         core.run()
         with quiet_terminal():
@@ -586,6 +630,9 @@ async def start(
                 client=client,
                 conn=ui_end,
                 screen=screen,
+                # Started and stopped by the loop it measures; the report is
+                # written below, where the app dir is known.
+                probe=probe,
                 # The one settings section the UI side needs: which tier the
                 # clipboard uses. Handed over from here because this is the
                 # module that reads the settings file — `ui/run.py` owns the
@@ -594,6 +641,10 @@ async def start(
                 clipboard=core.clipboard,
             )
     finally:
+        # First, and outside the terminal's restoration: a run that ended in a
+        # traceback is exactly the one whose lag block is worth having, and
+        # writing it costs nothing that the shutdown below needs.
+        _write_lag_report(probe)
         with contextlib.suppress(Exception):
             await ui_end.close()
         await core.stop(say=say)

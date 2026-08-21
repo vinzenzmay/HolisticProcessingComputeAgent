@@ -1381,6 +1381,14 @@ class AgentService:
                     text=f"There is no configured backend called \u201c{label}\u201d.",
                 )
             )
+            # And the catalog again, which is the half that was missing: a
+            # front-end takes the row off its own screen when it sends this
+            # (the shown-before-it-is-true bargain `overlays/llm.py` makes),
+            # so a refusal with no catalog behind it leaves the entry gone
+            # from the screen and present in the file \u2014 with a toast about a
+            # row that is no longer there. Every answer to `backend.remove`
+            # restates the truth.
+            self._emit_catalog()
             return
         self._deps.emit(Notify(text=f"Removed {entry.model}"))
         self._emit_catalog()
@@ -2317,7 +2325,12 @@ class AgentService:
         )
 
     def _remove_skill(self, session_id: str | None, args: str) -> None:
-        """`/skill-remove [name]`: delete one of this profile's own skills.
+        """`/skill-remove [name]`: delete a skill the user owns.
+
+        Two levels are theirs — this profile's own and this project's — and
+        both are offered here and removed by `delete_profile_skill`, because a
+        project skill is written from the creator like any other and would
+        otherwise be listed as removable and then refuse to go.
 
         Named rather than picked, because a picker is a screen: with a name
         this is `skill.delete` typed instead of chosen, and without one it
@@ -2339,8 +2352,8 @@ class AgentService:
         if not removable:
             self._deps.emit(
                 Notify(
-                    text=f"Profile “{profile}” has no skills of its own to "
-                    "remove.",
+                    text=f"Profile “{profile}” has no skills of its own, and "
+                    "this project has none either — nothing to remove.",
                 )
             )
             return

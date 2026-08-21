@@ -87,11 +87,19 @@ class Loop:
         client=None,
         conn=None,
         size=None,
+        probe=None,
     ) -> None:
         self.ui = ui
         self.screen = screen
         self.client = client
         self.conn = conn
+        # A `hpca.looplag.LoopLagProbe`, or None. This loop is the thing the
+        # measurement is *about* (specs-core-process.md §8) — the whole case
+        # for moving the agent into its own process is that synchronous work
+        # here makes the UI stutter — so the probe starts and stops with it.
+        # Where the report goes is the caller's business: this module never
+        # learns what an app dir is.
+        self.probe = probe
         self._size = size or (lambda: terminal_size(screen.fd))
         self.width, self.height = self._size()
         # What `decode` could not name yet, carried to the front of the next
@@ -132,6 +140,11 @@ class Loop:
         the wire *before* the frame that shows it being asked for.
         """
         loop = asyncio.get_running_loop()
+        if self.probe is not None:
+            # Before the reader and before the first frame: the startup paint
+            # and the first burst of events are themselves suspects, and a
+            # probe started after them would measure everything except.
+            self.probe.start()
         loop.add_reader(self.screen.fd, self._readable)
         with contextlib.suppress(AttributeError):
             self.ui.suspend = self.suspend
@@ -385,6 +398,12 @@ class Loop:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._events_task
             self._events_task = None
+        if self.probe is not None:
+            # Awaited, like the events task and for the same reason: a
+            # fire-and-forget cancel leaves a pending task at interpreter
+            # exit. The samples survive the stop — the report is written by
+            # whoever knows where reports go.
+            await self.probe.stop()
 
 
 def copier(screen: Screen, settings=None):
@@ -420,6 +439,7 @@ async def drive(
     conn=None,
     screen: Screen | None = None,
     clipboard=None,
+    probe=None,
 ) -> int:
     """Set the terminal up, run the loop, and put the terminal back.
 
@@ -436,7 +456,7 @@ async def drive(
             # saying so rather than the app failing to start over a clipboard.
             with contextlib.suppress(Exception):
                 ui.clipboard = copier(scr, clipboard)
-        return await Loop(ui, scr, client=client, conn=conn).run()
+        return await Loop(ui, scr, client=client, conn=conn, probe=probe).run()
 
 
 def main(argv: list[str] | None = None) -> int:

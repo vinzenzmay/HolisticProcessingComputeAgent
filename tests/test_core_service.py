@@ -343,15 +343,43 @@ class TestTurns:
         assert llm.prompts, "the model was never asked"
 
     async def test_the_prompt_carries_the_sessions_own_profile(
-        self, service, session, llm
+        self, service, conn, llm
     ):
+        """A profile's memories reach the system message of its own turns.
+
+        Every piece of this is tested in isolation — `system_prompt_text` in
+        `test_profiles.py`, `orchestrator_system_prompt` in `test_prompts.py`
+        — and the join in `service.system_prompt_for` was not: this test used
+        to assert that the content was a non-empty string, which is true of a
+        prompt with no memories in it at all (specs-ui-coverage.md §3.14 row
+        2). If the memories stopped arriving, nothing on screen would change
+        and nothing here would fail.
+
+        Two profiles, because "its own" is the claim: a turn in a background
+        session must be rendered for *that* session's profile rather than for
+        whichever one the core happens to be working under.
+        """
+        working = Profile.load("default")
+        working.add_memory(
+            "the working profile's own note", scope=MemoryScope.SYSTEM_PROMPT
+        )
+        working.save()
+        theirs = Profile.create("bioinformatics")
+        theirs.add_memory(
+            "BAMs live on /scratch/cohort", scope=MemoryScope.SYSTEM_PROMPT
+        )
+        theirs.save()
+        session = SessionStore(conn).create(
+            profile="bioinformatics", title="somebody else's"
+        )
+
         await service.handle(TurnSubmit(session_id=session.session_id, text="hello"))
         await _settle()
+
         system = llm.prompts[0][0]
         assert system["role"] == "system"
-        # Rendered for the running session, not for whatever the core's
-        # working profile happens to be.
-        assert isinstance(system["content"], str) and system["content"]
+        assert "BAMs live on /scratch/cohort" in system["content"]
+        assert "the working profile's own note" not in system["content"]
 
     async def test_the_user_message_reaches_the_model_with_its_sidecar(
         self, service, session, llm
@@ -3295,6 +3323,39 @@ class TestEditableBodies:
         assert body.profile == "default" and body.name == "qc-report"
         assert body.text == raw and body.error == ""
 
+    async def test_a_project_skill_opens_too_because_a_screen_offers_it(
+        self, service, project
+    ):
+        """§9.9: `skill.get` reaches every level the screens call removable.
+
+        `SkillSave` took a level and `delete_profile_skill` learnt about the
+        project's, and this stayed own-only — so a skill created at the
+        project level was drawn on the profile's skills screen, offered for
+        editing, and answered Enter with "has no skill of its own".
+        """
+        raw = "---\nname: run-cohort\ndescription: the cohort run\n---\n\n1. go\n"
+        await service.handle(
+            SkillSave(
+                profile="default", name="run-cohort", text=raw, level="project"
+            )
+        )
+        queue = subscribe(service)
+        await service.handle(SkillGet(profile="default", name="run-cohort"))
+        body = only(await drain(queue), "SkillBody")
+        assert body.text == raw and body.error == ""
+
+    async def test_but_a_shared_one_is_still_refused(self, service):
+        # Not this profile's to edit: a save would land in its own directory
+        # and silently fork the file every other profile sees.
+        write_skill(
+            Skill(name="ours", description="", triggers=[], body="s"),
+            "default",
+            level="global",
+        )
+        queue = subscribe(service)
+        await service.handle(SkillGet(profile="default", name="ours"))
+        assert only(await drain(queue), "SkillBody").error
+
     async def test_a_skill_the_profile_does_not_own_is_refused(self, service):
         queue = subscribe(service)
         await service.handle(SkillGet(profile="default", name="ghost"))
@@ -3564,9 +3625,28 @@ class TestBackendDiscovery:
         await service.handle(BackendScan())
         await wait_for(queue, "BackendScanned")
         await service.handle(BackendRemove(label="qwen-x"))
-        assert [e.severity for e in await drain(queue) if isinstance(e, Notify)] == [
-            "warning"
+        events = await drain(queue)
+        assert [e.severity for e in events if isinstance(e, Notify)] == ["warning"]
+
+    async def test_and_says_so_with_the_catalog_the_screen_must_redraw(
+        self, service
+    ):
+        """A refused remove restates the catalog (specs-ui-coverage.md §9.1).
+
+        The screen takes the row off itself when it sends `backend.remove` —
+        it cannot wait a round trip to stop drawing a row the user just
+        deleted — so a refusal that emitted only a warning left the entry
+        gone from the screen, present in the file, and the toast talking
+        about a row that was no longer there.
+        """
+        service._deps.settings.backends = [
+            LLMBackend(model="qwen-a", base_url="http://a/v1")
         ]
+        queue = subscribe(service)
+        await service.handle(BackendRemove(label="not-configured"))
+        events = await drain(queue)
+        assert [e.label for e in only(events, "LLMCatalog").entries] == ["qwen-a"]
+        assert [b.model for b in service._deps.settings.backends] == ["qwen-a"]
 
     async def test_a_session_is_pinned_by_label(self, service, session):
         # The form ctrl+l needs: the catalog carries no api_key, so an entry

@@ -767,16 +767,37 @@ class MemoryService:
         return self._read(path)
 
     def skill_body(self, profile: str, name: str) -> tuple[str, str]:
-        """One of a profile's own skill files, verbatim, and why not.
+        """One skill file the user owns, verbatim, and why not.
 
-        Own skills only, matching what :meth:`save_skill_file` writes and
-        :meth:`delete_profile_skill` removes: a shared or shipped skill is not
-        this profile's to edit, and handing its body to an editor whose save
-        would land in the profile's own directory would silently fork it.
+        The same two levels :meth:`delete_profile_skill` removes — this
+        profile's and this project's — because they are the two a front-end
+        draws as removable and offers to open (`SkillInfo.removable`). A
+        shared or shipped skill is still refused: it is not this profile's to
+        edit, and handing its body to an editor whose save would land in the
+        profile's own directory would silently fork it.
+
+        It was own-only for a milestone while the screens had already widened,
+        so a skill created at the project level appeared on the profile's
+        skills screen and answered Enter with "has no skill of its own"
+        (specs-ui-coverage.md §9.9).
         """
-        if not any(s.name == name for s in load_own_skills(profile)):
-            return "", f"Profile “{profile}” has no skill “{name}” of its own."
-        return self._read(skill_path(name, profile))
+        # Project before profile on a name clash, matching load precedence and
+        # `delete_profile_skill`: the file the user can see is the one they
+        # mean to open.
+        for skill in load_project_skills(project_root=self._project_root):
+            if skill.name == name:
+                return self._read(
+                    skill_path(
+                        name,
+                        profile,
+                        level="project",
+                        project_root=self._project_root,
+                    )
+                )
+        for skill in load_own_skills(profile):
+            if skill.name == name:
+                return self._read(skill_path(name, profile))
+        return "", f"Profile “{profile}” has no skill “{name}” of its own."
 
     def own_skills(self, profile: str) -> list[Skill]:
         """The skills a profile may edit and delete — its own, never shared."""

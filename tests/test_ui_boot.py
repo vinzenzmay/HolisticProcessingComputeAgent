@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import logging
 import os
 import signal
 import subprocess
@@ -26,8 +27,10 @@ import time
 import pytest
 
 from hpca import protocol
+from hpca.config import Settings
 from hpca.llm import ChatResponse
 from hpca.transport import InProcessConnection
+from hpca.ui import boot
 from hpca.ui.boot import (
     DB_SYNC_DONE_MESSAGE,
     DB_SYNC_INTERRUPT_MESSAGE,
@@ -250,6 +253,129 @@ class TestPeriodicSync:
         core.dbcache.sync = explode
         await core.sync()
         assert any("failed" in text for text in said)
+
+
+    async def test_an_interval_of_zero_means_the_exit_copy_only(self):
+        # `settings.database.sync_interval_s = 0` is the documented way to say
+        # "copy home when I leave and not before"; the timer is what has to
+        # honour it, and it is the same guard `dbcache.active` goes through.
+        core = build_core([])
+        cache = core.dbcache  # `_final_sync` lets go of it on the way out
+        core.sync_interval = 0
+        core.run()
+        await asyncio.sleep(0.05)
+        assert cache.syncs == 0
+        await core.stop(say=lambda text: None)
+        assert cache.released, "and the copy still happens on the way out"
+
+    async def test_the_interval_comes_from_the_settings_file(self, home, local):
+        settings = Settings.load()
+        settings.database.sync_interval_s = 12
+        built = await Core.start(settings=settings, llm=FakeLLM())
+        try:
+            assert built.sync_interval == 12
+        finally:
+            await built.stop(say=lambda text: None)
+
+
+class TestTheNotices:
+    """What happened before there was a UI to be told about it.
+
+    A declined local cache or a quarantined corrupt copy is decided in
+    `Core.start`, minutes before the first frame; it reaches the user as a
+    toast like everything else, which means it has to go on the wire.
+    """
+
+    async def test_they_arrive_as_toasts_after_hello(self):
+        ui_end, core_end = InProcessConnection.pair()
+        core = build_core([], notices=["another instance holds the lease"])
+        core.wire = core_end
+        core.run()
+        try:
+            events = aiter(ui_end)
+            assert (await anext(events)).type == protocol.Hello.TYPE
+            notice = protocol.parse(await anext(events))
+            assert isinstance(notice, protocol.Notify)
+            assert notice.text.startswith("Databases: ")
+            assert "another instance holds the lease" in notice.text
+            assert notice.severity == "warning"
+        finally:
+            await core.stop(say=lambda text: None)
+
+    async def test_a_clean_start_says_nothing_about_the_databases(self):
+        ui_end, core_end = InProcessConnection.pair()
+        core = build_core([])
+        core.wire = core_end
+        core.run()
+        try:
+            events = aiter(ui_end)
+            assert (await anext(events)).type == protocol.Hello.TYPE
+            await core.service.queue.put(protocol.Notify(text="something else"))
+            assert "Databases:" not in protocol.parse(await anext(events)).text
+        finally:
+            await core.stop(say=lambda text: None)
+
+    async def test_a_declined_cache_is_one(self, home, monkeypatch):
+        # The decision itself: local mode off in settings is a reason, and a
+        # reason is what becomes the notice.
+        settings = Settings.load()
+        settings.database.local_cache = False
+        cache, notices = boot._open_db_cache(settings, home)
+        assert notices == [], "declining what was never asked for is not news"
+        settings.database.local_cache = True
+        monkeypatch.setattr(
+            "hpca.dbcache.DbCache.acquire", lambda self: False
+        )
+        cache, notices = boot._open_db_cache(settings, home)
+        assert notices, "a cache that could not be taken is"
+
+
+class TestTheLoggers:
+    """Records into a file, and none of them onto a terminal in raw mode.
+
+    One WARNING reaching logging's last-resort handler lands in the middle of
+    a frame and stays there until the next full paint, so both of these are
+    about the *absence* of output as much as the presence of a file.
+    """
+
+    def test_a_file_logger_writes_where_it_says_and_nowhere_else(self, home):
+        log = boot.file_logger("hpca.test.dbcache", "dbcache.log")
+        log.warning("the lease was not free")
+        assert "the lease was not free" in (home / "dbcache.log").read_text()
+        assert log.propagate is False, "or it reaches stderr as well"
+
+    def test_and_attaching_it_twice_does_not_double_the_records(self, home):
+        boot.file_logger("hpca.test.twice", "twice.log")
+        log = boot.file_logger("hpca.test.twice", "twice.log")
+        log.warning("once")
+        assert (home / "twice.log").read_text().count("once") == 1
+
+    def test_the_quiet_terminal_takes_the_package_off_stderr(self, home):
+        package = logging.getLogger("hpca")
+        with boot.quiet_terminal():
+            assert package.propagate is False
+            logging.getLogger("hpca.something").warning("into the file")
+        assert "into the file" in (home / "ui.log").read_text()
+
+    def test_and_gives_the_logger_back_on_the_way_out(self, home):
+        # A UI is a guest in someone's process — this suite reads records off
+        # the root logger, and a front-end that permanently silenced `hpca`
+        # would take those assertions with it.
+        package = logging.getLogger("hpca")
+        before = (list(package.handlers), package.propagate, package.level)
+        with boot.quiet_terminal():
+            pass
+        assert (list(package.handlers), package.propagate, package.level) == before
+
+    def test_an_unwritable_app_dir_is_not_a_reason_not_to_start(
+        self, home, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "logging.FileHandler",
+            lambda *a, **kw: (_ for _ in ()).throw(OSError("read-only")),
+        )
+        with boot.quiet_terminal():
+            pass  # must not raise
 
 
 class TestSyncInterrupt:

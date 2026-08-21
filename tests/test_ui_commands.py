@@ -18,10 +18,11 @@ import sys
 import pytest
 
 from hpca.ui import commands
-from hpca.ui.app import INPUT, RowUI
+from hpca.ui.app import INPUT, SESSIONS, RowUI
 from hpca.ui.commands import BUILTINS, Command
 from hpca.ui.demo import build
 from hpca.ui.overlays import (
+    ConfigOverlay,
     InspectOverlay,
     SkillCreatorOverlay,
     SkillRemoveOverlay,
@@ -57,11 +58,15 @@ SKILLS = {
 }
 
 
-def app(skills=None, profile: str = "hpc") -> RowUI:
+def app(skills=None, profile: str = "hpc", bodies=None) -> RowUI:
     """A UI with one session, its profile's skills answered, box focused.
 
     No `recorded()`: a bare `RowUI` already records into ``ui.intents``, and
     wrapping it would put every intent in there twice.
+
+    ``bodies`` answers the editors that fetch what they show. The config
+    editor is the one used here — as the screen a user opens while a draft is
+    still out (specs-ui-coverage.md §9.8).
     """
     ui = RowUI(profiles=[ProfileInfo(name=profile)])
     session = SessionState("s1", profile=profile)
@@ -70,7 +75,7 @@ def app(skills=None, profile: str = "hpc") -> RowUI:
     ui.refresh_sidebar()
     ui.active = 0
     ui.focus = INPUT
-    return served(ui, {}, SKILLS if skills is None else skills)
+    return served(ui, bodies or {}, SKILLS if skills is None else skills)
 
 
 def press(ui: RowUI, *keys: str, width: int = 120, height: int = 40) -> RowUI:
@@ -586,6 +591,30 @@ class TestSkillCreator:
         assert sent(ui, RunCommand) == []
         assert "drafting" in ui.note
 
+    def test_a_draft_waits_for_a_running_turn_like_any_other_command(self):
+        """§9.7: `/skill-creator <request>` is not a screen-only command.
+
+        It sends `skill.draft`, and the core answers that with `_working` on
+        this very session — overwriting the running turn's step label and
+        restarting its elapsed clock, twice. The guard every other core-bound
+        command sits behind is what stops that, so this one sits there too,
+        and the request stays in the box to be sent again after the turn.
+        """
+        ui = app()
+        ui.session.turn.working = True
+        ui.session.turn.activity_is("running run_bash", "2026-01-01T09:00:00Z")
+        press(ui, *"/skill-creator something about queues", "enter")
+        assert sent(ui, DraftSkill) == [], "no draft while a turn is in flight"
+        assert ui.input.text() == "/skill-creator something about queues"
+        assert ui.session.turn.activity == "running run_bash", "the step is untouched"
+
+    def test_but_a_bare_one_still_opens_its_form_mid_turn(self):
+        # The reason the three screen commands are ahead of the guard at all:
+        # this one really does ask the core for nothing.
+        ui = app()
+        ui.session.turn.working = True
+        assert isinstance(self._form(ui).overlay, SkillCreatorOverlay)
+
     def test_and_a_bare_command_asks_for_none(self):
         ui = self._form()
         assert sent(ui, DraftSkill) == []
@@ -627,6 +656,38 @@ class TestSkillCreator:
         press(ui, "esc")
         assert ui.overlay is None
         assert sent(ui, SaveSkill) == []
+
+    def _drafting(self) -> RowUI:
+        """A draft out, and the config editor open over the rows meanwhile."""
+        ui = app(bodies={("settings", ()): '{"database": {"local_cache": true}}'})
+        press(ui, *"/skill-creator watch a run", "enter")
+        ui.focus = SESSIONS
+        press(ui, "c")
+        assert isinstance(ui.overlay, ConfigOverlay)
+        return ui
+
+    def test_a_landing_draft_leaves_a_screen_the_user_opened_alone(self):
+        """§9.8: a draft is seconds of model time, and the user is free.
+
+        Assigning `overlay` starts a fresh stack, so a config editor opened
+        while the draft was out — and everything typed into it — went out with
+        it. The draft is the interruption here; it is the one that waits.
+        """
+        ui = self._drafting()
+        ui.overlay.editor.set_text('{"database": {"local_cache": false}}')
+        ui.skill_drafted(SkillInfo("watch-run", "when a run needs", "1. squeue"))
+        assert isinstance(ui.overlay, ConfigOverlay), "the user's screen stays"
+        assert "local_cache" in screen(ui), "and so does what they typed into it"
+
+    def test_and_the_form_opens_the_moment_that_screen_closes(self):
+        # Parked, not dropped: the user asked for this form and gets it, at
+        # the first moment it is not landing on top of something.
+        ui = self._drafting()
+        ui.skill_drafted(SkillInfo("watch-run", "when a run needs", "1. squeue"))
+        assert isinstance(ui.overlay, ConfigOverlay), "it waited"
+        press(ui, "esc")
+        assert isinstance(ui.overlay, SkillCreatorOverlay)
+        assert "watch-run" in screen(ui)
 
     def test_the_level_is_the_profiles_by_default(self):
         ui = self._form()
@@ -691,10 +752,13 @@ class TestSkillRemove:
         assert ui.overlay is None
         assert sent(ui, DeleteSkill) == []
 
-    def test_no_own_skills_notifies_instead_of_opening_anything(self):
+    def test_no_removable_skills_notifies_instead_of_opening_anything(self):
+        # Both levels named, because both are what the picker would have
+        # offered: the profile's own and this project's (§9.9).
         ui = self._picker(app({"hpc": []}))
         assert ui.overlay is None
-        assert "no skills of its own" in ui.note
+        assert "no skills to remove" in ui.note
+        assert "none of its own" in ui.note and "project" in ui.note
 
     def test_a_named_skill_goes_to_the_core_instead(self):
         # `/skill-remove <name>` is a command the core answers; only the bare

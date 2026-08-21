@@ -578,6 +578,58 @@ def test_and_on_a_backend_call_it_says_which():
     assert stops(ui) == []
 
 
+def parked_on_an_approval() -> RowUI:
+    """A turn stopped dead waiting for an approval.
+
+    The scheduler has already popped its `TurnState` and returned without a
+    `turn.finished` (specs-ui-coverage.md §4), so nothing clears `working` and
+    an `Interrupt` sent now reaches a core that has no turn to stop.
+    """
+    ui = half_a_message()
+    ui.session.turn.working = True
+    ui.session.request_decision({"tool": "run_bash", "command": "rm -rf ~/data"})
+    ui.focus = INPUT
+    return ui
+
+
+def escaped_twice(ui: RowUI) -> RowUI:
+    ui.handle("esc", 120, 40)
+    ui._now += 0.2
+    ui.handle("esc", 120, 40)
+    return ui
+
+
+def test_a_turn_parked_on_an_approval_is_not_stopped_by_the_gesture():
+    # The outcome, not the sentence: what a stop *is* is one `Interrupt` on
+    # the wire, and the core answers this one by emitting nothing at all.
+    assert stops(escaped_twice(parked_on_an_approval())) == []
+
+
+def test_and_the_gesture_does_not_claim_it_stopped_one():
+    ui = escaped_twice(parked_on_an_approval())
+    assert ui.note != "stopped the turn"
+
+
+def test_and_the_working_row_stops_offering_the_stop_key():
+    ui = parked_on_an_approval()
+    ui.session.tick(ui.wall())
+    assert "esc esc" not in plain(ui.chat.tail.head)
+
+
+def test_answering_the_approval_makes_it_stoppable_again():
+    # The other half, and the reason this is not "a session with a decision
+    # can never be stopped": the resume re-binds the anchor, so the turn
+    # really is interruptible from the moment the answer goes out.
+    ui = parked_on_an_approval()
+    # What the core does with the answer: it clears the decision and resumes
+    # the same turn (`TurnScheduler.resolve_decision`), which re-binds the
+    # anchor an interrupt rolls back to.
+    ui.session.clear_decision()
+    ui.session.start_turn()
+    escaped_twice(ui)
+    assert stops(ui), "a resumed turn is a turn again"
+
+
 def test_two_escapes_too_far_apart_do_nothing():
     ui = clocked(build())
     ui.focus = INPUT

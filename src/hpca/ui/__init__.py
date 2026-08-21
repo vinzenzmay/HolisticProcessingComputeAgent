@@ -39,12 +39,15 @@ The content is real from M2 on: ``client`` fills ``state`` in from protocol
 events and the rows render that. From M3 there is a real core behind it —
 ``hpca --new-ui`` builds an ``AgentService`` over an ``InProcessConnection``
 and ``run`` drives stdin, that connection and SIGWINCH on one asyncio loop.
-M7 and M8 added the management overlays and the slash commands, and M9 the
-scan, the probe and the read-only window. What is deliberately still missing:
-mouse support and selecting text out of the *chat* — the terminal's own
-selection does the second one, which is why the mouse stays released.
-specs-ui-replacement.md §4 is the full list of what is absent, and
-specs-ui-coverage.md §3 is what an audit found still unwired.
+M7 and M8 added the management overlays and the slash commands, and M8a the
+endpoint scan, the startup backend check and the read-only window. M9 — the
+milestone that deletes ``hpca/tui`` — has not run yet. What is deliberately
+still missing: mouse support and selecting text out of the *chat* — the
+terminal's own selection does the second one, which is why the mouse stays
+released. specs-ui-replacement.md §4 is the full list of what is absent, and
+specs-ui-coverage.md §3 is an audit of it, most of which is now wired: what
+is still open there is the injection warning on a flagged memory batch, the
+watchers column's arrangement, and re-reading memories at a session boundary.
 
 The modules, per specs-ui-replacement.md §3:
 
