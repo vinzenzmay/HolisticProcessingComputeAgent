@@ -301,6 +301,16 @@ class TestEscapeTimeout:
         ui.sessions[0].turn.working = True
         h = await harness(ui)
         await h.press(b"\x1b")
+        # Wait for the first escape to be *named*, not merely for a frame to be
+        # painted. `ESC_TIMEOUT` is what turns a lone \x1b into "esc", and
+        # whether that timer has fired by the time a frame lands is a race —
+        # one this lost on a box running the suite across every core. Losing it
+        # puts both escapes in a single read, where they decode as something
+        # that is not two presses, and the gesture never arms. Waiting on the
+        # arming itself is also what the test means.
+        async with asyncio.timeout(2.0):
+            while ui._esc_armed_at is None:
+                await asyncio.sleep(0.001)
         await h.press(b"\x1b")
         assert [x.session_id for x in asked if isinstance(x, Interrupt)] == ["s1"]
 
