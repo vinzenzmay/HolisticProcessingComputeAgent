@@ -44,9 +44,9 @@ import tempfile
 import time
 from pathlib import Path
 
-# The flag that selects the row UI. M9 makes it the default and this list
-# becomes empty; the harness itself does not otherwise care which UI it drove.
-LAUNCH_ARGS = ["--new-ui"]
+# Extra argv for the run under test. Empty since the row UI became the only
+# front-end; kept as a seam because `--serve` (M11) will want a variant here.
+LAUNCH_ARGS: list[str] = []
 
 SCENARIO = sys.argv[1] if len(sys.argv) > 1 else "bare"
 BUDGET = float(sys.argv[2]) if len(sys.argv) > 2 else 12.0

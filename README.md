@@ -74,8 +74,8 @@ your skills (invoke a skill with `/<skill>`; see *Skills* below).
 ## Features
 
 * **Three-column TUI** — sessions on the left, the chat with the agent in the
-  middle, and live local sub-processes and Slurm jobs on the right. Built on
-  [Textual](https://textual.textualize.io/).
+  middle, and live local sub-processes and Slurm jobs on the right. Drawn
+  directly to the terminal, with no UI framework underneath.
 * **Concurrent per-session turns** — each session runs its own agent turn
   independently, with a per-session model line, working indicator, and context
   meter, so one session can be busy while you work in another.

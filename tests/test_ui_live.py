@@ -51,7 +51,7 @@ async def _await_event(seen: list, kind: str, timeout: float) -> object:
 
 
 class _Live:
-    """A booted core, a client and a UI, wired the way `hpca --new-ui` wires them."""
+    """A booted core, a client and a UI, wired the way `hpca` wires them."""
 
     def __init__(self, core: Core, ui: RowUI, client: UIClient, seen: list) -> None:
         self.core, self.ui, self.client, self.seen = core, ui, client, seen

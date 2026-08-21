@@ -6,9 +6,6 @@ And helpers that more than one test module needs — importing one test module
 from another would drag its fixtures and collection along with it.
 """
 
-import asyncio
-from time import monotonic
-
 import pytest
 
 
@@ -32,58 +29,26 @@ def isolated_project_dir(monkeypatch, tmp_path_factory):
     monkeypatch.chdir(tmp_path_factory.mktemp("cwd"))
 
 
-async def wait_for_screen(app, pilot, screen_type, *, timeout_s=10.0):
-    """Pause until the modal is actually up, rather than counting pauses.
-
-    A fixed number of pauses is a guess about scheduling, and the guess is
-    what fails: the work between the keypress and the screen being pushed can
-    be a model round trip (/memorize) or just a local refresh (the skills
-    list), and on a box running the suite across every core even the short one
-    can outlast a handful of pauses. That is why these only ever failed in the
-    parallel run and never when the test was run on its own. Waiting on the
-    condition makes the test say what it means and stops the result depending
-    on how busy the machine is.
-
-    The worker cannot simply be awaited: it pushes the screen and then blocks
-    on the user's answer, so ``wait_for_complete`` would deadlock against the
-    very modal this is waiting for.
-    """
-    deadline = monotonic() + timeout_s
-    while monotonic() < deadline:
-        if isinstance(app.screen, screen_type):
-            return app.screen
-        await pilot.pause()
-        # Yield properly rather than spinning: the whole point is not to make
-        # a loaded machine any busier.
-        await asyncio.sleep(0.01)
-    raise AssertionError(
-        f"{screen_type.__name__} never appeared within {timeout_s}s; "
-        f"on screen: {type(app.screen).__name__}"
-    )
-
-
 @pytest.fixture(autouse=True)
 def no_startup_backend_modal(monkeypatch):
-    """Keep the startup "no backend is answering" modal out of the unit tests.
+    """Keep the startup "no backend is answering" screen out of the unit tests.
 
-    The real app ends startup by probing the active backend and opening the
-    manage-LLMs screen when nothing answers (``_ensure_backend_connected``).
-    Under the suite nothing ever answers — settings point at a default
-    localhost URL and no server is running — so without this every TUI test
-    would find a modal on top of whatever it was driving, and would probe the
-    network to get it. Tests that cover the check turn it back on for their
-    own app instance.
+    Startup ends by probing the active backend and opening the manage-LLMs
+    screen when nothing answers. Under the suite nothing ever answers —
+    settings point at a default localhost URL and no server is running — so
+    without this every UI test would find that screen on top of whatever it
+    was driving, and would probe the network to get it. Tests that cover the
+    check turn it back on for their own service.
 
-    Both front-ends, because both end startup the same way: the core does the
-    probing now (``AgentService.startup`` → ``BackendRegistry.ensure_connected``)
-    and `ui/boot.py` opens the screen on its answer, so switching it off has to
-    happen where the probe is.
+    Switched off at the core, which is where the probing happens
+    (``AgentService.startup`` → ``BackendRegistry.ensure_connected``);
+    `ui/boot.py` only opens the screen on the answer it gets back. It used to
+    have to be switched off in two places, because the Textual app probed for
+    itself.
 
-    Imported inside the fixture: most of the suite never touches the TUI, and
-    importing Textual for it at collection time is pure cost.
+    Imported inside the fixture rather than at module scope: most of the suite
+    never stands up a service, and this file is imported for every test.
     """
     from hpca.core.service import AgentService
-    from hpca.tui.app import HpcaApp
 
-    monkeypatch.setattr(HpcaApp, "startup_backend_check", False)
     monkeypatch.setattr(AgentService, "startup_backend_check", False)

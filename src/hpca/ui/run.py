@@ -463,12 +463,12 @@ def main(argv: list[str] | None = None) -> int:
     """`python -m hpca.ui.run --demo`: the UI over synthetic content.
 
     The demo's loopback core is the test double for everything the real entry
-    point (`hpca --new-ui`, see `hpca/__main__.py`) does with an
+    point (`hpca`, see `hpca/__main__.py`) does with an
     `AgentService`, and it stays that way: it needs no database, no backend and
     no event loop of its own, so it is the fastest way to look at a frame.
     """
     parser = argparse.ArgumentParser(
-        description="Row-oriented HPCA UI (no Textual)."
+        description="Row-oriented HPCA UI, over synthetic content."
     )
     parser.add_argument(
         "--demo",
@@ -481,11 +481,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if not args.demo:
-        # The real core is stood up by `python -m hpca --new-ui`, which owns
+        # The real core is stood up by `python -m hpca`, which owns
         # the databases and the shutdown order; saying so beats standing up a
         # second, subtly different startup path here.
         print(
-            "hpca.ui.run only knows --demo; the real UI is `hpca --new-ui`.",
+            "hpca.ui.run only knows --demo; the real UI is `hpca`.",
             file=sys.stderr,
         )
         return 2

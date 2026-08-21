@@ -10,9 +10,10 @@ feature and is worth keeping to hand:
     rather than the model running out of room, so the fill level has to be
     visible *before* that happens, not explained afterwards.
 
-Copied rather than imported because `tui/` is being deleted (M9) and these two
-functions are the only part of that module with no Textual in it; copied rather
-than reimplemented because they already have tests (`tests/test_context_bar.py`)
+Copied out of `tui/` rather than imported, back when that package still
+existed: these two functions were the only part of it with no Textual in them.
+Copied rather than reimplemented because they already have tests
+(`tests/test_context_bar.py`)
 and rewriting a formatter from its output is how a bar ends up one cell wider
 on a full window than on an empty one.
 

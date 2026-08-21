@@ -660,29 +660,36 @@ def run_python(code: str) -> subprocess.CompletedProcess:
 
 
 class TestArgv:
-    def test_importing_the_entry_point_costs_neither_front_end(self):
-        # §4.2 item 10: `main()` argparses before importing either side, so a
-        # core process never imports the UI and the UI never imports Textual.
+    # §4.2 item 10. The rule survived the deletion of the second front-end and
+    # matters more without it, because M11's `--serve` is the reason it exists:
+    # a core process that imported the UI on its way to deciding it was not one
+    # would pay for a terminal driver to run a graph nobody is watching.
+    def test_importing_the_entry_point_costs_no_front_end(self):
         result = run_python(
             "import sys, hpca.__main__; "
-            "assert 'textual' not in sys.modules, 'Textual came with it'; "
-            "assert 'hpca.ui.app' not in sys.modules, 'the row UI came with it'"
+            "assert 'hpca.ui.app' not in sys.modules, 'the UI came with it'; "
+            "assert 'textual' not in sys.modules, 'Textual came back'"
         )
         assert result.returncode == 0, result.stderr
 
     def test_and_parsing_argv_does_not_either(self):
         result = run_python(
             "import sys, hpca.__main__ as m; "
-            "m.build_parser().parse_args(['--new-ui']); "
-            "assert 'textual' not in sys.modules, 'the parser dragged it in'"
+            "m.build_parser().parse_args(['--profile', 'hpc']); "
+            "assert 'hpca.ui.app' not in sys.modules, 'the parser dragged it in'"
         )
         assert result.returncode == 0, result.stderr
 
-    def test_the_new_ui_is_opt_in(self):
+    def test_the_retired_new_ui_flag_is_gone(self):
+        # It selected the row UI while there were two. Left as an assertion
+        # rather than deleted: `hpca --new-ui` is in a shell history or two,
+        # and argparse rejecting it is the answer, not quietly accepting it.
+        import pytest
+
         from hpca.__main__ import build_parser
 
-        assert build_parser().parse_args([]).new_ui is False
-        assert build_parser().parse_args(["--new-ui"]).new_ui is True
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["--new-ui"])
 
     def test_a_profile_can_be_named(self):
         from hpca.__main__ import build_parser
@@ -693,5 +700,5 @@ class TestArgv:
         from hpca.__main__ import main
 
         monkeypatch.setattr("sys.stdin", io.StringIO())
-        assert main(["--new-ui"]) == 2
+        assert main([]) == 2
         assert "terminal" in capsys.readouterr().err

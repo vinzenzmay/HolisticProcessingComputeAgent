@@ -37,12 +37,12 @@ chat. Escapes are now measured by shape and unknown ones are dropped whole.
 
 The content is real from M2 on: ``client`` fills ``state`` in from protocol
 events and the rows render that. From M3 there is a real core behind it —
-``hpca --new-ui`` builds an ``AgentService`` over an ``InProcessConnection``
+``hpca`` builds an ``AgentService`` over an ``InProcessConnection``
 and ``run`` drives stdin, that connection and SIGWINCH on one asyncio loop.
 M7 and M8 added the management overlays and the slash commands, and M8a the
-endpoint scan, the startup backend check and the read-only window. M9 — the
-milestone that deletes ``hpca/tui`` — has not run yet. What is deliberately
-still missing: mouse support and selecting text out of the *chat* — the
+endpoint scan, the startup backend check and the read-only window. M9 deleted
+``hpca/tui`` and the Textual dependency with it, so this is now the only
+front-end. What is deliberately still missing: mouse support and selecting text out of the *chat* — the
 terminal's own selection does the second one, which is why the mouse stays
 released. specs-ui-replacement.md §4 is the full list of what is absent, and
 specs-ui-coverage.md §3 is an audit of it, most of which is now wired: what

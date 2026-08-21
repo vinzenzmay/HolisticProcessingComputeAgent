@@ -44,9 +44,9 @@ logger = logging.getLogger("hpca.ui.boot")
 # app looks hung — the UI is gone and the shell prompt is not back yet — and
 # copying three databases home over NFS is seconds to minutes.
 #
-# The same three strings as `tui/app.py`'s, and copied rather than imported:
-# importing them would drag Textual into the front-end that exists to replace
-# it. M9 deletes that module and leaves these as the only copies.
+# These were copied out of `tui/app.py` rather than imported, because importing
+# them would have dragged Textual into the front-end that existed to replace
+# it. That module is gone and these are now simply where the strings live.
 DB_SYNC_WAIT_MESSAGE = (
     "please WAIT a moment while the chat log databases are being copied ..."
 )
@@ -594,7 +594,7 @@ async def start(
     screen=None,
     say=_say,
 ) -> int:
-    """The whole `hpca --new-ui` run: build, draw, shut down.
+    """The whole `hpca` run: build, draw, shut down.
 
     The nesting is the shutdown order. `Screen` restores the terminal on the
     way out of its `with`, including out of a traceback, and the core is
