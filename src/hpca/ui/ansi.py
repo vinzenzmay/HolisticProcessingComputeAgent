@@ -45,6 +45,30 @@ BLUE = f"{ESC}[38;5;68m"
 # Joiners ask for the glyph after them, so a slice must never end on one.
 JOINERS = "‍‌"
 
+# The UI's own furniture, every character of it one cell wide.
+#
+# This exists because the ASCII fast path below missed almost everything it
+# was written for. Nearly every row this UI draws carries a rule, a marker or
+# an arrow — `── chat ──`, `▸ ● qwen`, `↑↓ line` — and one non-ASCII character
+# is enough to drop the whole row onto the per-character path. The fast path
+# was therefore fastest on exactly the rows the UI does not have.
+#
+# Correctness is not taken on trust: `char_width` remains the authority and
+# `test_ui_ansi.py` asserts that it returns 1 for every character in here.
+# A glyph added to the UI and not to this set is merely slower; a glyph added
+# to this set that is not one cell wide fails the suite.
+ONE_CELL_GLYPHS = (
+    "─│└▌▏█"          # rules, gutters, the cursor block and the meter
+    "▸▾●○★•"          # row markers and the backend dots
+    "→←↑↓⇧⇥⌫⏎⟳↺⇔"     # the key hints, and the working spinner's cousin
+    "…—–·›“”§✓✗⚠≤÷"   # typography and status marks
+    "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"     # the braille spinner frames
+)
+
+# Printable ASCII plus the above. `frozenset.issuperset` walks the string in C,
+# which is what makes checking cheaper than measuring.
+_ONE_CELL = frozenset(map(chr, range(0x20, 0x7F))) | frozenset(ONE_CELL_GLYPHS)
+
 
 # --------------------------------------------------------------- cell widths
 
@@ -81,6 +105,8 @@ def cell_width(text: str) -> int:
     """
     if text.isascii() and text.isprintable():
         return len(text)
+    if _ONE_CELL.issuperset(text):
+        return len(text)
     return sum(map(char_width, text))
 
 
@@ -97,9 +123,28 @@ def fit_index(text: str, start: int, cells: int) -> int:
     `pad` measures with, so it runs once per drawn row. One cell per character
     means the answer is arithmetic, and a slice cannot land inside a glyph
     when every glyph is one cell wide.
+
+    **The fast path is taken on a window, never on the whole string, and that
+    is load-bearing rather than tidy.** No answer can depend on a character
+    further than ``cells`` past ``start`` — a run that wide is already full —
+    so at most that many need looking at. Scanning the whole string instead
+    makes this O(length) where the loop below is O(cells): the loop stops the
+    moment the budget is used. A single chat entry can be a megabyte and is
+    measured once per frame it is visible in, so the difference is the
+    difference between 0.06 ms and 6 ms a frame. `tests/test_ui_perf.py`
+    holds the case that proves it.
     """
-    if text.isascii() and text.isprintable():
-        return min(len(text), start + max(0, cells))
+    room = max(0, cells)
+    # One character past the budget, and that one is what makes this correct.
+    # Zero-width characters follow the character they modify and come along
+    # free, so a window cut exactly at the budget would drop a combining mark
+    # that belongs inside it. Including the next character means any such mark
+    # is *in* the window, where it fails the all-one-cell test and sends the
+    # answer to the loop below. When the window does pass, the character past
+    # the budget is known to be one cell wide, so it is known not to come.
+    window = text[start : start + room + 1]
+    if (window.isascii() and window.isprintable()) or _ONE_CELL.issuperset(window):
+        return min(len(text), start + room)
     used, at, n = 0, start, len(text)
     while at < n:
         step = char_width(text[at])

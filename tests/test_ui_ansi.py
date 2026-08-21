@@ -8,9 +8,11 @@ wrapped around it afterwards.
 from hpca.ui.ansi import (
     CYAN,
     DIM,
+    ONE_CELL_GLYPHS,
     RESET,
     REVERSE,
     cell_width,
+    char_width,
     fold,
     footer_line,
     pad,
@@ -117,6 +119,39 @@ class TestCellWidth:
         # and arrow in this UI is ambiguous-width, so widening them would
         # break every frame the tests above assert.
         assert cell_width("──▌▸▾●○…↑⇧") == 10
+
+
+class TestTheGlyphTable:
+    """`ONE_CELL_GLYPHS` is an optimisation, never a second opinion.
+
+    It lets a row of the UI's own furniture take the arithmetic path instead
+    of being measured character by character. That is only sound while every
+    character in it really is one cell wide, and `char_width` is the authority
+    on that — so the table is checked against it rather than against a list
+    someone typed. A glyph the UI draws that is missing from the table is
+    merely slower; a glyph in the table that is not one cell wide would
+    silently shift every row it appears in, and fails here instead.
+    """
+
+    def test_every_glyph_in_it_is_one_cell_by_the_authority(self):
+        wrong = {ch: char_width(ch) for ch in ONE_CELL_GLYPHS if char_width(ch) != 1}
+        assert not wrong, wrong
+
+    def test_it_holds_no_duplicates(self):
+        # Not correctness, but a duplicate means two people added the same
+        # glyph and neither noticed the other's line.
+        assert len(set(ONE_CELL_GLYPHS)) == len(ONE_CELL_GLYPHS)
+
+    def test_the_fast_path_agrees_with_the_slow_one(self):
+        # The property that matters: taking the shortcut never changes the
+        # answer. Checked against a real row rather than a synthetic string.
+        row = "── chat ─────────── line 12/40 ──"
+        assert cell_width(row) == sum(char_width(c) for c in row)
+
+    def test_a_wide_character_still_defeats_it(self):
+        # The table must not be reachable for a row containing anything it
+        # does not name — that is what keeps CJK and emoji correct.
+        assert cell_width("▸ " + WIDE) == 2 + 4
 
 
 class TestPadCountsCells:

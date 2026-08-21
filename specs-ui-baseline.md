@@ -13,7 +13,8 @@ checked. So it was re-taken, on both sides, before the deletion.
 comfortably.** Textual does not cost 44 ms at 300 entries — it costs about
 13 ms. But it *does* grow with conversation length, and by 5000 entries a
 keypress costs 104 ms at the median and 882 ms at p95, which is a UI that has
-stopped working. The row UI is flat at ~0.19 ms from 100 entries to 20,000.
+stopped working. The row UI is flat from 100 entries to 20,000 — at ~0.19 ms
+when this was written, and at ~0.08 ms since M10 (§5, §7).
 
 ---
 
@@ -167,12 +168,82 @@ justified by the 1000-entry column and above, by the 15-second cold open, and by
 the two pathologies that have nothing to do with length — not by the 300-entry
 case, which is merely unpleasant.
 
-## 5. Known cost in the new UI, for M10
+## 5. What M10 did about it, and what it found
 
-`fit_index` is roughly half of frame time. The ASCII fast path added here
-(`text.isascii() and text.isprintable()` → one cell per character) misses more
-often than it should, because the UI's own furniture — `─ ▸ ▾ ● ○ › ↑ ⇧` — is
-non-ASCII, so most drawn rows contain at least one character that drops the
-whole row onto the per-character path. A width table for the handful of glyphs
-this UI actually draws would recover most of it. Not urgent at 10× inside
-budget, and worth doing before anyone measures again.
+The prediction in this section was that `fit_index` was roughly half of frame
+time, because the ASCII fast path missed: the UI's own furniture — `─ ▸ ▾ ● ○
+› ↑ ⇧` — is non-ASCII, so nearly every drawn row contained at least one
+character that dropped the whole row onto the per-character path. The fast
+path was fastest on exactly the rows this UI does not have.
+
+That was right, and the fix (`ansi.ONE_CELL_GLYPHS`, a set of the one-cell
+glyphs the UI draws, checked with `frozenset.issuperset`) is worth more than
+expected. Measured back-to-back in one process:
+
+| | table off | table on |
+|---|---|---|
+| 100 entries | 0.224 ms | 0.082 ms |
+| 1000 entries | 0.226 ms | 0.085 ms |
+| 5000 entries | 0.219 ms | 0.082 ms |
+
+**2.7× off the frame, and still flat.** The table is an optimisation and never
+a second opinion: `char_width` remains the authority and `test_ui_ansi.py`
+asserts it returns 1 for every character in the table, so a glyph that is not
+one cell wide fails the suite rather than shifting a row.
+
+### The regression it caused, and why the new tests exist
+
+The first version of that fast path scanned the **whole string**, and a chat
+entry can be a megabyte. `pad` measures with `fit_index` precisely so the cost
+is the width of the row rather than the length of the string — the old
+per-character loop is O(cells), because it stops the moment the budget is
+used — so scanning made a 1 MB message cost **6.16 ms a frame**, against
+0.061 ms for fifty ordinary ones. A hundredfold regression, in the exact case
+§2 records Textual failing at.
+
+`tests/test_ui_perf.py::test_one_enormous_message_costs_no_more_than_many_ordinary_ones`
+caught it on the first run. The fix is to take the fast path on a window of
+`cells + 1` characters, never the whole string; the `+ 1` is load-bearing,
+because a zero-width combining mark follows the character it modifies and a
+window cut exactly at the budget would drop one. That correctness case was
+caught by an existing test the moment the window was introduced.
+
+## 6. The dimensions as standing tests
+
+§8 of specs-ui-replacement.md listed the dimensions; they are now
+`tests/test_ui_perf.py`, one test each, with the Textual figure being guarded
+against named in the docstring. Two kinds of assertion, and the second is the
+one that bites:
+
+- an **absolute** budget (2 ms) catches a constant-factor blowup, and is
+  deliberately loose because the suite runs across every core and a tight
+  threshold would be flaky rather than interesting;
+- a **ratio** — cost at 5000 entries over cost at 100 — catches the shape.
+  It is ~1.0 today and would be in the tens if a frame started walking the
+  conversation, and it is invariant to how fast or how loaded the box is,
+  because both halves are measured in the same run. Frame time is ~0.08 ms
+  against a 2 ms budget, so a regression would have to be 25× before the
+  absolute number noticed; the ratio notices at 4×.
+
+Medians throughout, not means: one GC pause drags a mean far enough to fail a
+test that is measuring something else.
+
+## 7. Where it stands after M10
+
+Same machine, idle. These supersede the row-UI figures in §3.
+
+| scenario | median |
+|---|---|
+| entries-100 | 0.076 ms |
+| entries-1000 | 0.077 ms |
+| entries-5000 | 0.077 ms |
+| **entries-20000** | **0.076 ms** |
+| one-message-1mb | 0.115 ms |
+| width-40 | 0.068 ms |
+| width-120 | 0.075 ms |
+| width-400 | 0.115 ms |
+
+Flat in entry count to 20,000, cost tracking terminal *area* rather than
+conversation length, and the 1 MB message now cheaper than the 0.159 ms §3
+recorded for it. Against Textual's 103.9 ms median and 881.9 ms p95 at 5000
+entries, the ratio is now ~1,350× and ~11,500×.
