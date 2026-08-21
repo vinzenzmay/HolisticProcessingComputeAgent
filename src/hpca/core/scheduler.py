@@ -27,13 +27,53 @@ snapshot, its skills, its recalled context, its tool context — belongs to the
 memory and backend services. The scheduler takes a :class:`TurnPreparer` and
 stays ignorant of all of it, which is what lets it be tested with a two-line
 fake instead of a profile tree and a fake LLM.
+
+## Drawing a turn as it happens
+
+This is also where a turn becomes chat. A front-end that has a session open
+must see the conversation happen without ever asking for a snapshot (§4.2
+property 1), and everything it sees comes from here: the message the turn
+started with, the tool calls as they are made, the results filling into the
+rows those calls drew, and the reply.
+
+The hard part is not emitting them; it is emitting them so that a session
+re-opened afterwards looks *identical*. A `chat.reset` is
+`transcript.build_entries` over the checkpointed thread, and that function
+**folds** a turn's reasoning and tool exchanges into a single ``thinking``
+entry. Live rows that were shaped differently would make the screen rearrange
+itself the moment the user re-opened the session — the bug the old UI had, and
+paid for by rebuilding the whole log every turn.
+
+So the two are reconciled by construction, on three rules:
+
+1. **The same function shapes both.** The working box is
+   `transcript.thinking_entry` in the live path and in the fold; the turn's
+   message is `build_entries` over that one message, so a recalled-memory row
+   appears live exactly where the fold puts it.
+2. **A row is named by its position in the turn.** `build_entries` walks
+   messages in order and only ever extends its output or revises its last
+   entry, so entry *n* of a turn keeps meaning the same row as the turn grows.
+   That is what makes the position a safe row identity — and it is why a call
+   and its result share one `Entry.seq` rather than becoming two rows.
+3. **The fold has the last word.** When the graph returns, the turn's rows are
+   rebuilt with `build_entries` over the state it produced and re-emitted
+   against the seqs already drawn: same position, `chat.update`; new position,
+   `chat.append`. Anything the live path could not know — above all the
+   model's reasoning, which arrives in the checkpointed state and not through
+   a callback — appears then, in the place the fold gives it. Only the turn's
+   own rows cross, never the transcript, so this is a delta and not the
+   per-turn rebuild this protocol exists to delete.
+
+A turn parked on an approval keeps its live record: the resume is the same
+*logical* turn, its rows continue the same box, and the fold agrees because
+nothing flushed that box in between.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from time import monotonic
 from typing import Any, Awaitable, Callable, Protocol
@@ -59,6 +99,7 @@ from hpca.protocol import (
     TurnFinished,
     TurnStarted,
 )
+from hpca.transcript import THINKING, Step, build_entries, live_step, thinking_entry
 
 logger = logging.getLogger("hpca.core.scheduler")
 
@@ -66,6 +107,61 @@ logger = logging.getLogger("hpca.core.scheduler")
 # is offered only in this phase: it is the one point where telling the backend
 # to stop means anything, and the only one with a prompt to hand back.
 LLM_WAIT_ACTIVITY = "LLM processing"
+
+
+def wire_entry(entry, seq: int) -> Entry:
+    """One `transcript.Entry` as the protocol's twin of it, named ``seq``.
+
+    Converted by field name rather than by hand: the two classes are asserted
+    to have the same shape (`test_protocol`), and ``extra="forbid"`` turns a
+    drift between them into a failure here — at the boundary, on the first
+    entry — instead of a field that is quietly missing from every chat.
+
+    Lives here rather than in `core.service` because this module is what names
+    rows, and the reset and the deltas have to shape them the same way.
+    """
+    return Entry.model_validate({**asdict(entry), "seq": seq})
+
+
+def _as_steps(parts) -> list[Step]:
+    """Working parts as the render model, whichever twin they arrived as.
+
+    A `chat.reset` hands them back as `protocol.Part` and the fold produces
+    `transcript.Step`; the two have the same fields by construction (asserted
+    in `test_protocol`) and only the second knows how to take a result. One
+    conversion here beats two shapes of "the open box" downstream.
+    """
+    return [
+        part
+        if isinstance(part, Step)
+        else Step(**(part.model_dump() if hasattr(part, "model_dump") else part))
+        for part in parts
+    ]
+
+
+@dataclass
+class LiveTurn:
+    """The rows one *logical* turn has drawn, and the box it is still filling.
+
+    Logical, not per graph invocation: a turn parked on an approval and resumed
+    is one conversation exchange and one working box, which is how
+    `build_entries` folds it, so this record has to survive the park (see the
+    module docstring's rule 3).
+
+    ``rows`` is the whole point — the ``Entry.seq`` of each row drawn for this
+    turn, in the order the fold produces them, so the reconcile can address
+    row *n* rather than guess at it.
+    """
+
+    # The index of the message this turn began with. What `build_entries` is
+    # given as ``start`` to produce this turn's rows and nobody else's, and
+    # what tells a `chat.reset` which of its entries belong to this turn.
+    start: int | None = None
+    rows: list[int] = field(default_factory=list)
+    # The working box's parts, accumulated as the graph reports them, and the
+    # row they are drawn as (0 = not drawn yet).
+    parts: list[Step] = field(default_factory=list)
+    thinking_seq: int = 0
 
 
 @dataclass
@@ -167,8 +263,10 @@ class TurnScheduler:
         self._decisions: dict[str, dict] = {}
         self._shutting_down = False
         # session_id -> the last chat row name handed out for it. See
-        # _next_entry_seq; the queue is the only thing minting rows today.
+        # _next_entry_seq; every row the core draws is minted here.
         self._entry_seqs: dict[str, int] = {}
+        # session_id -> the rows its current turn has drawn. See LiveTurn.
+        self._live: dict[str, LiveTurn] = {}
         # The coalesced drain scheduled by submit_event; see _schedule_drain.
         self._drain_task: asyncio.Task | None = None
 
@@ -268,11 +366,11 @@ class TurnScheduler:
         one thing allowed to restart it, because a `chat.reset` is exactly the
         frame that tells the UI to forget the names it held.
 
-        It lives here because the queue was the first thing to mint rows.
-        Anything else that starts emitting them must take its numbers from
-        this same counter — two allocators would hand the same name to two
-        rows — and at that point the counter belongs on `CoreDeps`, beside
-        `emit`.
+        It lives here because the queue was the first thing to mint rows, and
+        it stayed here when turns began drawing their own: two allocators
+        would hand the same name to two rows, so there is one, and it is the
+        scheduler's because every row the core draws belongs to a turn or to
+        the queue in front of one.
         """
         nxt = self._entry_seqs.get(session_id, 0) + 1
         self._entry_seqs[session_id] = nxt
@@ -309,47 +407,38 @@ class TurnScheduler:
         self._pending.remove(work)
         return work.text
 
-    def rebase_rows(
-        self, session_id: str, *, drawn: int, messages: int
-    ) -> list[Entry]:
+    def rebase_rows(self, session_id: str, *, entries: list[Entry]) -> list[Entry]:
         """Restart a session's row names after a `chat.reset`, and hand back
         the rows that reset cannot contain.
 
         A reset renumbers from 1 (see `protocol.Entry.seq`), so the counter has
-        to be told where the new numbering ended: ``drawn`` is how many entries
-        the reset carries. Skipping that would leave the queue holding names
-        from a generation the UI has just dropped, and the promotion or the
-        unqueue that follows would address a row nobody has.
+        to be told where the new numbering ended: ``entries`` is what the reset
+        carries. Skipping that would leave the queue holding names from a
+        generation the UI has just dropped, and the promotion or the unqueue
+        that follows would address a row nobody has.
 
-        What comes back is everything on screen that is not in the
-        checkpointed thread, in the order it is drawn after it:
+        Two jobs, and both exist because a reset renames every row on screen.
 
-        * the message of a turn already in flight, when the copy just read
-          predates it. ``messages`` is the length of that copy and
-          ``interrupt_keep`` is what the thread measured before this turn
-          appended to it, so a copy no longer than that cannot hold it yet;
-        * every message still queued behind that turn.
+        **The running turn is re-bound.** Its record (:class:`LiveTurn`) holds
+        the names it drew, and those names are gone. If the copy just read
+        already contains the turn's own message — found by the index the turn
+        started at, not by counting — the reset has drawn its rows for us and
+        the record adopts them, working box included. If it does not, the
+        message is a moment away from being checkpointed and the reset would
+        show a session with the user's own sentence missing, so it is re-drawn
+        here along with whatever the turn has done since.
 
-        The UI used to re-add both itself (`tui/app.py:4585`) out of state it
-        owned. It owns neither now, so a session re-opened mid-turn would
-        silently lose its type-ahead without this — the gap
-        specs-ui-replacement.md §4.2 records.
+        **What was never in the thread comes back:** every message still
+        queued behind that turn. The UI used to re-add all of this itself
+        (`tui/app.py:4585`) out of state it owned. It owns none of it now — the
+        gap specs-ui-replacement.md §4.2 records.
         """
-        self._entry_seqs[session_id] = max(drawn, 0)
+        self._entry_seqs[session_id] = max(len(entries), 0)
         rows: list[Entry] = []
         ts = self._turns.get(session_id)
-        if ts is not None and ts.user_text is not None:
-            # None means the turn has not reached the graph at all yet, so
-            # nothing it sent can be in the copy.
-            keep = ts.interrupt_keep
-            if keep is None or messages <= keep:
-                rows.append(
-                    Entry(
-                        kind="user",
-                        text=ts.user_text,
-                        seq=self._next_entry_seq(session_id),
-                    )
-                )
+        live = self._live.get(session_id)
+        if ts is not None and live is not None and ts.user_text is not None:
+            rows += self._rebase_turn(session_id, ts, live, entries)
         for work in self._pending:
             if work.kind != "user" or work.session_id != session_id:
                 continue
@@ -357,6 +446,54 @@ class TurnScheduler:
             rows.append(
                 Entry(kind="queued", text=work.text, seq=work.entry_seq)
             )
+        return rows
+
+    def _rebase_turn(
+        self,
+        session_id: str,
+        ts: TurnState,
+        live: LiveTurn,
+        entries: list[Entry],
+    ) -> list[Entry]:
+        """Re-bind a running turn's row record to a `chat.reset`'s numbering.
+
+        See :meth:`rebase_rows`. The turn's message is found by its index — the
+        thread position it took, which the turn recorded before it ran — rather
+        than by comparing lengths: an index either is in the copy or is not,
+        and the answer does not depend on counting the same thing twice.
+        """
+        start = live.start
+        position = (
+            next(
+                (i for i, entry in enumerate(entries) if entry.index == start), None
+            )
+            if start is not None
+            else None
+        )
+        if position is not None:
+            # The copy holds this turn already, so the reset has drawn it. Its
+            # own account of the working box supersedes the live one: it is
+            # the same fold a re-open would show, and it carries the reasoning
+            # the live path never sees.
+            live.rows = [entry.seq for entry in entries[position:]]
+            self._adopt_working(live, entries[position:])
+            return []
+        # The copy predates the turn's own message by a moment. Re-draw what
+        # is on screen and nowhere else: the message, and the working done
+        # since — the parts, unlike the message, may genuinely not be
+        # checkpointed yet (a call is announced before its result lands).
+        live.rows = []
+        rows: list[Entry] = []
+        for entry in self._message_entries(ts.user_text or "", ts.plan.api_content):
+            seq = self._next_entry_seq(session_id)
+            live.rows.append(seq)
+            rows.append(wire_entry(entry, seq))
+        if live.parts:
+            live.thinking_seq = self._next_entry_seq(session_id)
+            live.rows.append(live.thinking_seq)
+            rows.append(wire_entry(thinking_entry(live.parts), live.thinking_seq))
+        else:
+            live.thinking_seq = 0
         return rows
 
     def submit_event(self, session_id: str, text: str) -> None:
@@ -427,26 +564,17 @@ class TurnScheduler:
                 if item.kind == "user":
                     session = self._session_for(sid)
                     if session is not None:
-                        if item.entry_seq:
-                            # It was drawn as queued; the same row is now the
-                            # message that ran. An update rather than a second
-                            # row, and sent before the turn is announced, so
-                            # nothing is ever on screen as still waiting behind
-                            # a turn that is already itself.
-                            self._deps.emit(
-                                ChatUpdate(
-                                    session_id=sid,
-                                    entry=Entry(
-                                        kind="user",
-                                        text=item.text,
-                                        seq=item.entry_seq,
-                                    ),
-                                )
-                            )
+                        # ``entry_seq`` is the row it was drawn as while it
+                        # waited, if it waited at all. Handed to the turn
+                        # rather than promoted here: one place draws a turn's
+                        # opening rows (`_open_turn_rows`), so the row that was
+                        # queued and the row that never had to be cannot end
+                        # up shaped differently.
                         self.start_turn(
                             session,
                             user_text=item.text,
                             forced_skill=item.forced_skill,
+                            entry_seq=item.entry_seq,
                         )
                 else:
                     await self._deliver(sid, item.text)
@@ -493,20 +621,211 @@ class TurnScheduler:
         user_text: str | None = None,
         resume: Command | None = None,
         forced_skill: Any = None,
+        entry_seq: int = 0,
     ) -> asyncio.Task:
         """Begin a turn for one session.
 
         It stays that session's turn even if the user switches away while the
         model works: everything it touches is captured in its TurnPlan here,
         not read from whatever session happens to be open when the reply lands.
+
+        ``entry_seq`` names the ``queued`` row this message was already drawn
+        as, when it had to wait; 0 when it starts at once. Either way its rows
+        are drawn here, before the turn is announced, so nothing is ever on
+        screen as still waiting behind a turn that is already itself.
         """
         plan = self._prepare(session, user_text=user_text, forced_skill=forced_skill)
         ts = TurnState(session=session, plan=plan, user_text=user_text)
         self._turns[session.session_id] = ts
+        if user_text is not None:
+            self._open_turn_rows(
+                session.session_id,
+                user_text,
+                plan.api_content,
+                entry_seq=entry_seq,
+            )
         self._deps.emit(TurnStarted(session_id=session.session_id))
         self._emit_activity(ts)
         ts.task = asyncio.ensure_future(self._run(session, ts, resume=resume))
         return ts.task
+
+    # ------------------------------------------------------- drawing the turn
+
+    def _message_entries(self, text: str, api_content: str | None) -> list[Any]:
+        """The rows one message opens a turn with, as the fold will draw them.
+
+        Through `build_entries` rather than by hand, over the one message the
+        turn is about, because the fold makes decisions this would otherwise
+        have to repeat and eventually get wrong: a completion reporting in is
+        an ``event`` row and not a ``user`` one, and a message that recalled
+        something from memory is followed by a ``recall`` row saying what.
+
+        The index the fold gives here is meaningless — this list holds one
+        message, not the thread — so it is cleared. The row is not addressable
+        for a rewind while its own turn runs anyway (``rewind_blocker``), and
+        the reconcile at the end of the turn fills in the real one.
+        """
+        message: dict = {"role": "user", "content": text}
+        if api_content is not None:
+            message["api_content"] = api_content
+        entries = build_entries([message])
+        for entry in entries:
+            entry.index = -1
+        return entries
+
+    def _open_turn_rows(
+        self, session_id: str, text: str, api_content: str | None, *, entry_seq: int
+    ) -> None:
+        """Draw the message a turn starts from, and begin its row record.
+
+        A queued message is *revised* into its ``user`` row rather than drawn
+        again below the one the user is already looking at — the promotion
+        `chat.update` exists for (§4.2). Anything the message brought with it
+        (a recall row) is appended after it, in the fold's order.
+        """
+        live = LiveTurn()  # a new logical turn: last turn's rows are settled
+        self._live[session_id] = live
+        for position, entry in enumerate(self._message_entries(text, api_content)):
+            if position == 0 and entry_seq:
+                live.rows.append(entry_seq)
+                self._deps.emit(
+                    ChatUpdate(
+                        session_id=session_id, entry=wire_entry(entry, entry_seq)
+                    )
+                )
+                continue
+            seq = self._next_entry_seq(session_id)
+            live.rows.append(seq)
+            self._deps.emit(
+                ChatAppend(session_id=session_id, entry=wire_entry(entry, seq))
+            )
+
+    def report_step(self, session_id: str, payload: dict) -> None:
+        """One tool exchange as it happens (the graph's ``on_step``).
+
+        The call the moment it is made, and the result filled into that same
+        row when it lands — not a second row below it, which is why
+        `Part.done` and `chat.update` exist. A turn can spend minutes in
+        tools, and an activity line saying "running run_bash" does not say
+        what it is running.
+
+        The result finds its call the way `build_entries` does: the earliest
+        one still waiting, so a model that made two calls before either
+        answered gets them back in the order it asked. A result with no call
+        to land on stands as its own part — that happens when a `chat.reset`
+        adopted the checkpoint's version of this box between the two halves,
+        and the reconcile puts it right when the turn ends.
+        """
+        live = self._live.get(session_id)
+        if live is None:
+            # Nothing is drawing rows for this session — a turn that started
+            # before the last reset, or one already reconciled. Its work is in
+            # the state, and the next reset shows it.
+            return
+        if payload.get("kind") == "call":
+            live.parts.append(live_step(payload))
+        else:
+            call = next(
+                (p for p in live.parts if p.kind == "call" and not p.done), None
+            )
+            if call is not None:
+                call.attach(str(payload.get("text", "")))
+            else:
+                live.parts.append(live_step(payload))
+        self._draw_working(session_id, live)
+
+    def _draw_working(self, session_id: str, live: LiveTurn) -> None:
+        """The working box, drawn the first time and revised after that."""
+        entry = thinking_entry(live.parts)
+        if live.thinking_seq:
+            self._deps.emit(
+                ChatUpdate(
+                    session_id=session_id,
+                    entry=wire_entry(entry, live.thinking_seq),
+                )
+            )
+            return
+        live.thinking_seq = self._next_entry_seq(session_id)
+        live.rows.append(live.thinking_seq)
+        self._deps.emit(
+            ChatAppend(
+                session_id=session_id, entry=wire_entry(entry, live.thinking_seq)
+            )
+        )
+
+    def _reconcile(self, session_id: str, result: Any) -> None:
+        """Re-state this turn's rows from the state the graph produced.
+
+        The fold has the last word (module docstring, rule 3). Everything the
+        live path could not know arrives here — the model's reasoning above
+        all, which is checkpointed state and reaches nobody through a callback
+        — and it arrives in the position `build_entries` gives it, which is
+        the position a re-opened session will give it too.
+
+        Positional addressing is safe because `build_entries` walks messages
+        in order: as a turn grows it only extends its entry list or revises
+        the last entry, so entry *n* of a turn keeps naming the same row. A
+        position that already has a name is revised; one that does not is
+        appended and named.
+
+        Only this turn's own rows are rebuilt — ``start`` is the message it
+        began with — so this is a delta, not the per-turn transcript rebuild
+        the protocol exists to delete.
+        """
+        live = self._live.get(session_id)
+        if live is None:
+            # A turn nobody drew: only reachable for a resume whose parked
+            # half belongs to a core that has since restarted, so there is no
+            # record of which rows are its own. Emitting nothing leaves the
+            # reply to the next `chat.reset`, which is late but never wrong —
+            # rows guessed at from this invocation alone would be a second
+            # working box under the one already on screen.
+            return
+        if live.start is None:
+            # A turn whose thread length could not be read before it ran; the
+            # graph reports where its own messages began.
+            live.start = result.first_new
+        entries = build_entries(
+            list(result.messages),
+            list(result.thinking),
+            list(result.calls),
+            start=live.start,
+        )
+        for position, entry in enumerate(entries):
+            if position < len(live.rows):
+                self._deps.emit(
+                    ChatUpdate(
+                        session_id=session_id,
+                        entry=wire_entry(entry, live.rows[position]),
+                    )
+                )
+                continue
+            seq = self._next_entry_seq(session_id)
+            live.rows.append(seq)
+            self._deps.emit(
+                ChatAppend(session_id=session_id, entry=wire_entry(entry, seq))
+            )
+        self._adopt_working(live, entries)
+
+    def _adopt_working(self, live: LiveTurn, entries: list[Any]) -> None:
+        """Re-point the open box at what the fold just said it contains.
+
+        Only matters when the turn parked on an approval: the resume is the
+        same logical turn and its next tool call has to land in the same box,
+        which by then holds parts the live path never saw (reasoning) and
+        parts it saw in a different shape. Taking the fold's copy is what
+        keeps the two from diverging over a long, repeatedly-gated turn.
+        """
+        for position, entry in enumerate(entries):
+            if entry.kind == THINKING:
+                live.parts = _as_steps(entry.parts)
+                live.thinking_seq = live.rows[position]
+                return
+        live.parts, live.thinking_seq = [], 0
+
+    def _close_turn(self, session_id: str) -> None:
+        """This turn's rows are settled; the next one starts a new record."""
+        self._live.pop(session_id, None)
 
     def report_activity(self, session_id: str, activity: str) -> None:
         """What a session's turn is doing right now.
@@ -534,13 +853,19 @@ class TurnScheduler:
         session_id = session.session_id
         if ts.user_text is not None:
             # Where to roll back to if this turn is interrupted: captured
-            # before run_turn appends the user message.
+            # before run_turn appends the user message. It is also the index
+            # that message is about to take, which is what tells a `chat.reset`
+            # which of its entries belong to this turn (`rebase_rows`) and
+            # where the reconcile starts folding.
             try:
                 ts.interrupt_keep = await thread_message_count(
                     self._graph, session_id=session_id
                 )
             except Exception:
                 ts.interrupt_keep = None
+            live = self._live.get(session_id)
+            if live is not None:
+                live.start = ts.interrupt_keep
         try:
             result = await run_turn(
                 self._graph,
@@ -553,6 +878,9 @@ class TurnScheduler:
             raise  # an interrupt; _interrupt owns the cleanup
         except Exception as e:
             logger.exception("turn failed")
+            # No result to fold, so the rows drawn so far are the last word on
+            # this turn: closing the record stops a later turn revising them.
+            self._close_turn(session_id)
             self._deps.emit(TurnFailed(session_id=session_id, error=str(e)))
             return
         finally:
@@ -562,6 +890,13 @@ class TurnScheduler:
             # Whatever queued behind this turn starts as soon as this unwinds.
             asyncio.ensure_future(self.drain())
 
+        # Before anything else that could fail: what happened is what the user
+        # is waiting to see, and a titler blowing up must not cost them the
+        # reply. Synchronous, so these frames are queued ahead of the drain the
+        # `finally` above just scheduled — the next turn's rows can only follow
+        # this one's.
+        self._reconcile(session_id, result)
+
         if self._on_turn_result is not None:
             try:
                 await self._on_turn_result(session, result, ts.plan)
@@ -570,12 +905,15 @@ class TurnScheduler:
 
         if result.interrupt is not None:
             # Parked on an approval: the thread cannot move without an answer.
+            # The row record stays — the resume continues this same turn, and
+            # its next tool call belongs in the box already on screen.
             self._awaiting_approval.add(session_id)
             self._decisions[session_id] = dict(result.interrupt)
             self._deps.emit(
                 DecisionRequested(session_id=session_id, payload=dict(result.interrupt))
             )
             return
+        self._close_turn(session_id)
         self._deps.emit(TurnFinished(session_id=session_id, reply=result.reply))
 
     # ------------------------------------------------------------- approvals
@@ -637,6 +975,11 @@ class TurnScheduler:
             except (Exception, asyncio.CancelledError):
                 pass
         self._turns.pop(session_id, None)
+        # The rows this turn drew describe messages that are about to leave
+        # the thread. Nothing may revise them again; what replaces them is the
+        # `chat.reset` the caller sends once the rollback has landed, which is
+        # the only frame that can take a row off the screen.
+        self._close_turn(session_id)
         self._deps.emit(TurnActivity(session_id=session_id, activity=""))
         try:
             await rollback_thread(self._graph, session_id=session_id, keep=keep)
@@ -657,6 +1000,7 @@ class TurnScheduler:
         self._awaiting_approval.discard(session_id)
         # Its rows went with it; nothing can address them again.
         self._entry_seqs.pop(session_id, None)
+        self._live.pop(session_id, None)
 
     async def shutdown(self) -> None:
         """Stop accepting work and let in-flight turns unwind.

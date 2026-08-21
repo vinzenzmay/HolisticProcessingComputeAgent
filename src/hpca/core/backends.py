@@ -39,7 +39,7 @@ from hpca.discover import DiscoveredBackend
 from hpca.embeddings import EmbeddingClient
 from hpca.llm import LLMClient
 from hpca.logs import LoggedLLM
-from hpca.protocol import ContextEstimate, Notify
+from hpca.protocol import ContextEstimate, Notify, TurnUsage
 from hpca.sessions import SessionStore
 
 if TYPE_CHECKING:
@@ -422,7 +422,31 @@ class BackendRegistry:
         if not prompt_tokens:
             return
         self._context_used[session_id] = int(prompt_tokens)
-        self._emit_estimate(session_id)
+        self._emit_measured(session_id)
+
+    def _emit_measured(self, session_id: str) -> None:
+        """The backend's own count for one session (`turn.usage`).
+
+        A separate event from `context.estimate` because the two are different
+        claims about the same number: this one was reported by the model
+        server, the other is arithmetic over the stored history. The protocol
+        carries no measured/estimated flag, so the distinction has to be the
+        event type — and a client that draws them the same way is free to,
+        while one that marks an estimate with a "~" can.
+
+        Every path that restates a *known* fill goes through here rather than
+        through `_emit_estimate`, including a backend switch: a client that has
+        already seen a measured count ignores a later estimate for the same
+        session (it is a guess about a number it knows), so restating a new
+        window as an estimate would silently fail to move the meter.
+        """
+        self._deps.emit(
+            TurnUsage(
+                session_id=session_id,
+                prompt_tokens=self._context_used.get(session_id, 0),
+                max_model_len=self.max_model_len_for(session_id),
+            )
+        )
 
     def estimate_context(self, session_id: str, values: dict) -> None:
         """How full a reopened session's context already is.
@@ -434,7 +458,7 @@ class BackendRegistry:
         one — always supersedes the estimate.
         """
         if self._context_used.get(session_id):
-            self._emit_estimate(session_id)
+            self._emit_measured(session_id)
             return
         messages = list(values.get("messages", []))
         compacted = values.get("compacted")
@@ -453,17 +477,23 @@ class BackendRegistry:
         self._context_used.pop(session_id, None)
 
     def _emit_estimate(self, session_id: str, *, used: int | None = None) -> None:
-        """Say how full one session's window is.
+        """Say how full one session's window is, as far as anyone can tell.
 
-        `ContextEstimate` carries no measured/estimated flag, so the number is
-        all that crosses and the precedence rule — a measured count always
-        beats an estimate — is applied here rather than left to whoever draws
-        it. A window of 0 means "not known yet": the protocol field is not
+        The precedence rule — a measured count always beats an estimate — is
+        applied here rather than left to whoever draws it: asked to restate a
+        session that has already reported real usage, this says so on the
+        measured channel instead (see `_emit_measured`).
+
+        A window of 0 means "not known yet": the protocol field is not
         optional, and an unknown window is exactly what the probe below exists
         to fix.
         """
         if used is None:
-            used = self._context_used.get(session_id, 0)
+            measured = self._context_used.get(session_id)
+            if measured:
+                self._emit_measured(session_id)
+                return
+            used = 0
         self._deps.emit(
             ContextEstimate(
                 session_id=session_id,

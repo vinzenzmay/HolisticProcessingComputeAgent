@@ -31,9 +31,9 @@ satisfy with a lambda.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from contextlib import suppress
-from dataclasses import asdict
 from typing import Any
 
 from hpca.agent.builtin_tools import default_tool_registry
@@ -63,14 +63,16 @@ from hpca.core.backends import BackendRegistry
 from hpca.core.deps import CoreDeps
 from hpca.core.memory_service import MemoryService
 from hpca.core.pollers import Pollers
-from hpca.core.scheduler import TurnPlan, TurnScheduler
+from hpca.core.scheduler import TurnPlan, TurnScheduler, wire_entry
 from hpca.episodic import EpisodicStore
 from hpca.protocol import (
+    PROTOCOL_VERSION,
     ChatReset,
     ConfirmRequested,
     ConfirmResolve,
+    DecisionRequested,
     DecisionResolve,
-    Entry,
+    Hello,
     Message,
     Notify,
     SessionClose,
@@ -140,15 +142,40 @@ class AgentService:
     # ------------------------------------------------------------- event fan
 
     def subscribe(self) -> asyncio.Queue:
-        """A queue that receives every event from now on.
+        """A queue that receives every event from now on, greeting first.
 
         Unbounded on purpose: dropping an event to protect the core would
         desynchronise a renderer that has no way to notice it happened. A
         client too slow to keep up is a client that should be disconnected,
         which is the transport's call, not this one's.
+
+        Two frames are put on it before it is handed back, and both go to this
+        client only rather than through `_fan_out` — they are a handshake, not
+        news, and a second front-end attaching must not make the first one
+        re-run its version check or redraw a prompt it is already showing.
+
+        `hello` is the first (§4.2), because everything after it is read
+        against a protocol version. A decision the core is parked on follows,
+        because it is the one piece of session state that *asks a question*: a
+        turn cannot move until it is answered, and a client that never hears
+        about it shows a session that appears to have simply stopped. That is
+        the latent bug §4.4 names — the parked decision used to live in the
+        UI's own memory, so restarting the front-end lost the only copy of a
+        question a graph thread was still blocked on.
         """
         queue: asyncio.Queue = asyncio.Queue()
         self._subscribers.append(queue)
+        queue.put_nowait(
+            Hello(
+                version=PROTOCOL_VERSION,
+                profile=self._deps.profile,
+                settings_digest=_settings_digest(self._deps.settings),
+            )
+        )
+        for session_id, payload in self._scheduler.pending_decisions().items():
+            queue.put_nowait(
+                DecisionRequested(session_id=session_id, payload=dict(payload))
+            )
         return queue
 
     def unsubscribe(self, queue: asyncio.Queue) -> None:
@@ -228,7 +255,13 @@ class AgentService:
             await self._scheduler.drain()
             return
         if isinstance(command, TurnInterrupt):
-            await self._scheduler.interrupt(command.session_id)
+            if await self._scheduler.interrupt(command.session_id) is None:
+                return
+            # The interrupt rolls the abandoned attempt out of the thread, so
+            # the rows drawn for it now describe messages that are gone. A
+            # delta cannot take a row off the screen; a reset can, and this is
+            # the same case `session.rollback` is — an open of what is left.
+            await self._reset_chat(command.session_id)
             return
         if isinstance(command, TurnUnqueue):
             text = self._scheduler.unqueue(command.session_id, command.seq)
@@ -368,12 +401,11 @@ class AgentService:
         that no longer exists.
         """
         values = await self._thread_values(session_id)
-        messages = list(values.get("messages", []))
         entries = [
-            _wire_entry(entry, seq)
+            wire_entry(entry, seq)
             for seq, entry in enumerate(
                 build_entries(
-                    messages,
+                    list(values.get("messages", [])),
                     values.get("thinking", []),
                     values.get("calls", []),
                 ),
@@ -382,10 +414,10 @@ class AgentService:
         ]
         # What the checkpoint cannot know about: the message of a turn that is
         # running right now, and everything typed ahead behind it. Numbered by
-        # the scheduler, which owns the counter this reset just re-based.
-        entries += self._scheduler.rebase_rows(
-            session_id, drawn=len(entries), messages=len(messages)
-        )
+        # the scheduler, which owns the counter this reset just re-based — and
+        # which also re-binds a running turn's rows to the names above, so the
+        # deltas that follow revise the rows this reset actually drew.
+        entries += self._scheduler.rebase_rows(session_id, entries=entries)
         self._deps.emit(ChatReset(session_id=session_id, entries=entries))
         self._backends.estimate_context(session_id, values)
 
@@ -859,6 +891,10 @@ def build_service(
         ),
         max_model_len=lambda sid: backends.max_model_len_for(sid),
         on_usage=lambda sid, usage: backends.note_usage(sid, usage),
+        # Each tool call and its result, the moment it happens. The scheduler
+        # takes it because it is the thing that names chat rows: a call has to
+        # appear as a row and its result has to land in that same row.
+        on_step=lambda sid, step: scheduler_ref["scheduler"].report_step(sid, step),
         mode_fn=lambda sid: _mode_for(sessions, settings, sid),
         effort_fn=lambda sid: _effort_for(sessions, settings, sid),
     )
@@ -945,15 +981,23 @@ def build_service(
     return service
 
 
-def _wire_entry(entry, seq: int) -> Entry:
-    """One `transcript.Entry` as the protocol's twin of it, named ``seq``.
+def _settings_digest(settings) -> str:
+    """A short fingerprint of the settings, for `hello`.
 
-    Converted by field name rather than by hand: the two classes are asserted
-    to have the same shape (`test_protocol`), and ``extra="forbid"`` turns a
-    drift between them into a failure here — at the boundary, on the first
-    entry — instead of a field that is quietly missing from every chat.
+    A digest and not the settings: they hold api keys, and a front-end that
+    only needs to notice "these changed under me" has no business being handed
+    them (§4.2 rule 2 in spirit — the UI does not read the core's state, it is
+    told what it has to draw). Short because it is compared, never inspected.
+
+    A settings object the core cannot serialise still has to produce something
+    — the tests build services around fakes — so a failure here is a digest of
+    nothing rather than a core that cannot greet a client.
     """
-    return Entry.model_validate({**asdict(entry), "seq": seq})
+    try:
+        blob = settings.model_dump_json()
+    except Exception:
+        blob = repr(settings)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
 
 
 def _mode_for(sessions, settings, session_id: str) -> str:

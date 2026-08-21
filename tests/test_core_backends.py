@@ -28,7 +28,7 @@ from hpca.core.deps import CoreDeps
 from hpca.db import connect, init_db
 from hpca.discover import DiscoveredBackend
 from hpca.llm import LLMError
-from hpca.protocol import ContextEstimate, Notify
+from hpca.protocol import ContextEstimate, Notify, TurnUsage
 from hpca.sessions import SessionStore
 from hpca.slurm import SlurmError
 
@@ -245,6 +245,11 @@ class Harness:
     @property
     def estimates(self) -> list[ContextEstimate]:
         return [e for e in self.events if isinstance(e, ContextEstimate)]
+
+    @property
+    def usages(self) -> list[TurnUsage]:
+        """The measured half of the meter: what the backend itself counted."""
+        return [e for e in self.events if isinstance(e, TurnUsage)]
 
 
 @pytest.fixture
@@ -493,10 +498,12 @@ class TestContextAccounting:
         h.registry.note_usage(b, {"prompt_tokens": 120})
         assert h.registry.measured_for(a) == 700
         assert h.registry.measured_for(b) == 120
-        assert [(e.session_id, e.used, e.window) for e in h.estimates] == [
-            (a, 700, 1000),
-            (b, 120, 2000),
-        ]
+        # `turn.usage`, not `context.estimate`: the backend counted this, and
+        # the event type is the only place that distinction can live.
+        assert [
+            (e.session_id, e.prompt_tokens, e.max_model_len) for e in h.usages
+        ] == [(a, 700, 1000), (b, 120, 2000)]
+        assert h.estimates == []
 
     def test_a_background_sessions_count_is_kept_not_dropped(self, home):
         # Whether it reaches a screen is the renderer's call: the event names
@@ -506,7 +513,7 @@ class TestContextAccounting:
         h.deps.focused_session_id = a
         h.registry.note_usage(b, {"prompt_tokens": 4242})
         assert h.registry.measured_for(b) == 4242
-        assert h.estimates[-1].session_id == b
+        assert h.usages[-1].session_id == b
 
     def test_a_report_without_a_prompt_count_says_nothing(self, home):
         h = Harness(home)
@@ -527,7 +534,11 @@ class TestContextAccounting:
         session_id = h.session()
         h.registry.note_usage(session_id, {"prompt_tokens": 900})
         h.registry.estimate_context(session_id, {"messages": [_msg("x" * 40)]})
-        assert h.estimates[-1].used == 900
+        # Re-opening a session that already reported usage restates the
+        # measured number on the measured channel — a client that knows the
+        # real count is entitled to ignore a guess at the same thread.
+        assert h.usages[-1].prompt_tokens == 900
+        assert h.estimates == []
 
     def test_the_estimate_measures_the_folded_view(self, home):
         # Compaction is what the model will actually receive; estimating the

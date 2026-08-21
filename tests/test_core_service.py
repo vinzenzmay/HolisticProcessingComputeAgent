@@ -20,6 +20,7 @@ from hpca.core.service import build_service
 from hpca.db import connect, init_db
 from hpca.llm import ChatResponse
 from hpca.protocol import (
+    PROTOCOL_VERSION,
     ConfirmResolve,
     DecisionResolve,
     SessionClose,
@@ -54,8 +55,12 @@ class FakeLLM:
 
     async def chat(self, messages, *, json_schema=None, **kwargs):
         self.prompts.append(messages)
-        text = self._outputs.pop(0) if self._outputs else respond()
-        return ChatResponse(content=text)
+        answer = self._outputs.pop(0) if self._outputs else respond()
+        # A queued answer may be a whole `ChatResponse` when the test cares
+        # about what rides alongside the content — reasoning, token counts.
+        if isinstance(answer, ChatResponse):
+            return answer
+        return ChatResponse(content=answer)
 
     async def supports_constrained_decoding(self):
         return True
@@ -103,6 +108,19 @@ def session(conn):
     return SessionStore(conn).create(profile="default", title="a session")
 
 
+def subscribe(service):
+    """A subscriber's queue, wound past the frames every client is handed.
+
+    `hello` is the first one, and a parked decision follows it; both are
+    handshake, not news, so the tests that assert what a *command* produced
+    start after them. `TestHandshake` is where they are asserted directly.
+    """
+    queue = service.subscribe()
+    while not queue.empty():
+        queue.get_nowait()
+    return queue
+
+
 async def drain(queue):
     """Everything emitted so far, without waiting for more."""
     events = []
@@ -120,28 +138,94 @@ class TestAssembly:
         assert service is not None
 
     async def test_a_subscriber_receives_what_the_core_says(self, service, session):
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(TurnSubmit(session_id=session.session_id, text="hi"))
         events = await drain(queue)
         assert "TurnStarted" in kinds(events)
 
     async def test_two_subscribers_both_see_it(self, service, session):
-        first, second = service.subscribe(), service.subscribe()
+        first, second = subscribe(service), subscribe(service)
         await service.handle(TurnSubmit(session_id=session.session_id, text="hi"))
         assert kinds(await drain(first)) == kinds(await drain(second))
 
     async def test_an_unsubscribed_queue_stops_receiving(self, service, session):
-        queue = service.subscribe()
+        queue = subscribe(service)
         service.unsubscribe(queue)
         await service.handle(TurnSubmit(session_id=session.session_id, text="hi"))
         assert await drain(queue) == []
+
+
+class TestHandshake:
+    """What a client is told the moment it subscribes, before it asks anything.
+
+    Two things, and both are state a front-end cannot work out for itself: who
+    the core is (§4.2 `hello`), and any decision already parked and waiting for
+    an answer (§4.4). The second is the fix for a real latent bug — a parked
+    decision used to be UI-process memory, so a restart left a session stuck on
+    an interrupt with nothing on screen to answer it.
+    """
+
+    async def test_hello_is_the_first_frame(self, service):
+        queue = service.subscribe()
+        first = queue.get_nowait()
+        assert type(first).__name__ == "Hello"
+        assert first.version == PROTOCOL_VERSION
+        assert first.profile == "default"
+        # A digest rather than the settings themselves: a front-end must be
+        # able to notice they changed without being handed the api keys.
+        assert first.settings_digest
+
+    async def test_the_digest_follows_the_settings(self, home, conn, llm):
+        async def db(fn):
+            return fn(conn)
+
+        def greeting(settings):
+            built = build_service(
+                settings=settings,
+                app_dir=home,
+                db=db,
+                conn=conn,
+                checkpointer=InMemorySaver(),
+                llm=llm,
+            )
+            return built.subscribe().get_nowait()
+
+        settings = Settings.load()
+        before = greeting(settings)
+        settings.agent.default_mode = "auto"
+        assert greeting(settings).settings_digest != before.settings_digest
+
+    async def test_the_handshake_goes_only_to_the_arriving_client(self, service):
+        established = subscribe(service)
+        service.subscribe()  # a second client arrives
+        # The greeting is that client's, not a broadcast: a reconnect must not
+        # make every other front-end re-run its version check.
+        assert await drain(established) == []
+
+    async def test_a_parked_decision_is_re_emitted_to_a_new_client(
+        self, service, session
+    ):
+        service._scheduler._decisions[session.session_id] = {"tool": "run_bash"}
+        events = await drain(service.subscribe())
+        parked = only(events, "DecisionRequested")
+        assert parked.session_id == session.session_id
+        assert parked.payload == {"tool": "run_bash"}
+        # After the greeting: a client runs its version check first.
+        assert kinds(events).index("Hello") < kinds(events).index(
+            "DecisionRequested"
+        )
+
+    async def test_a_client_arriving_with_nothing_parked_gets_only_hello(
+        self, service, session
+    ):
+        assert kinds(await drain(service.subscribe())) == ["Hello"]
 
 
 class TestTurns:
     async def test_a_submitted_turn_reaches_the_model_and_comes_back(
         self, service, session, llm
     ):
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(
             TurnSubmit(session_id=session.session_id, text="which BAMs?")
         )
@@ -176,7 +260,7 @@ class TestTurns:
         assert "count the reads" in (last.get("api_content") or last["content"])
 
     async def test_submitting_to_a_session_that_does_not_exist_says_so(self, service):
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(TurnSubmit(session_id="nope", text="hi"))
         events = await drain(queue)
         assert kinds(events) == ["Notify"]
@@ -184,6 +268,20 @@ class TestTurns:
 
     async def test_interrupting_nothing_is_harmless(self, service, session):
         await service.handle(TurnInterrupt(session_id=session.session_id))
+
+    async def test_interrupting_takes_the_abandoned_rows_off_the_screen(
+        self, service, session, llm
+    ):
+        # The interrupt rolls the abandoned attempt out of the thread, so the
+        # rows drawn for it describe messages that no longer exist. A delta
+        # cannot un-draw a row; the reset that follows is the same case a
+        # rollback is — an open of what is left.
+        release = await park_turn(service, llm, session.session_id)
+        queue = subscribe(service)
+        await service.handle(TurnInterrupt(session_id=session.session_id))
+        assert only(await drain(queue), "ChatReset").entries == []
+        release.set()
+        await service.stop()
 
 
 class TestTypeAhead:
@@ -216,7 +314,7 @@ class TestTypeAhead:
         entered, release = await self.park(service, llm)
         await service.handle(TurnSubmit(session_id=session.session_id, text="first"))
         await asyncio.wait_for(entered.wait(), timeout=5)
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(TurnSubmit(session_id=session.session_id, text="second"))
 
         appended = [e for e in await drain(queue) if type(e).__name__ == "ChatAppend"]
@@ -232,10 +330,12 @@ class TestTypeAhead:
         self, service, session
     ):
         # Nothing is waiting, so the turn starts — and a "queued" row would
-        # then have to be un-drawn a moment later.
-        queue = service.subscribe()
+        # then have to be un-drawn a moment later. The message is still drawn,
+        # as the ordinary `user` row it already is.
+        queue = subscribe(service)
         await service.handle(TurnSubmit(session_id=session.session_id, text="hi"))
-        assert "ChatAppend" not in kinds(await drain(queue))
+        appended = [e for e in await drain(queue) if type(e).__name__ == "ChatAppend"]
+        assert [(e.entry.kind, e.entry.text) for e in appended] == [("user", "hi")]
         await service.stop()
 
     async def test_cancelling_hands_the_text_back(self, service, session, llm):
@@ -244,7 +344,7 @@ class TestTypeAhead:
         entered, release = await self.park(service, llm)
         await service.handle(TurnSubmit(session_id=session.session_id, text="first"))
         await asyncio.wait_for(entered.wait(), timeout=5)
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(TurnSubmit(session_id=session.session_id, text="second"))
         row = [e for e in await drain(queue) if type(e).__name__ == "ChatAppend"][0]
 
@@ -264,7 +364,7 @@ class TestTypeAhead:
         # The turn ahead finished while the dialog was open. Refused the way
         # every un-carry-out-able command is refused: a warning, no state
         # change, and nothing for the UI to guess at.
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(TurnUnqueue(session_id=session.session_id, seq=1))
         events = await drain(queue)
         assert kinds(events) == ["Notify"] and events[0].severity == "warning"
@@ -280,22 +380,37 @@ class TestTypeAhead:
         entered, release = await self.park(service, llm)
         await service.handle(TurnSubmit(session_id=session.session_id, text="first"))
         await asyncio.wait_for(entered.wait(), timeout=5)
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(TurnSubmit(session_id=session.session_id, text="second"))
         row = [e for e in await drain(queue) if type(e).__name__ == "ChatAppend"][0]
 
         release.set()
+        seen: list = []
         for _ in range(60):
-            events = await drain(queue)
-            updates = [e for e in events if type(e).__name__ == "ChatUpdate"]
-            if updates:
+            seen += await drain(queue)
+            # By its seq, not by position: the turn ahead re-states its own
+            # rows as it finishes, so several updates cross in this window.
+            promotion = [
+                e
+                for e in seen
+                if type(e).__name__ == "ChatUpdate"
+                and e.entry.seq == row.entry.seq
+            ]
+            if promotion:
                 break
             await _yield()
         else:
             raise AssertionError("the queued row was never promoted")
-        assert (updates[0].entry.seq, updates[0].entry.kind) == (
-            row.entry.seq, "user"
+        assert (promotion[0].entry.kind, promotion[0].entry.text) == (
+            "user",
+            "second",
         )
+        # And no second row was drawn for it.
+        assert not [
+            e
+            for e in seen
+            if type(e).__name__ == "ChatAppend" and e.entry.text == "second"
+        ]
         await service.stop()
 
 
@@ -330,7 +445,7 @@ async def run_turn(service, session_id, text="hi"):
     """One turn, start to finish, driven the way a front-end drives it."""
     import asyncio
 
-    queue = service.subscribe()
+    queue = subscribe(service)
     try:
         await service.handle(TurnSubmit(session_id=session_id, text=text))
         loop = asyncio.get_running_loop()
@@ -373,7 +488,7 @@ class TestSessionList:
         self, service, conn, session
     ):
         other = SessionStore(conn).create(profile="default", title="the other one")
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionList())
         rows = only(await drain(queue), "SessionRows").rows
         # The store's order, not one the core invents: newest first is a
@@ -393,13 +508,13 @@ class TestSessionList:
         pinned = SessionStore(conn).create(
             profile="default", title="pinned", backend=backend
         )
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionList())
         rows = {r.session_id: r for r in only(await drain(queue), "SessionRows").rows}
         assert rows[pinned.session_id].model == "gemma-3-27b"
 
     async def test_a_bootstrap_session_names_no_model(self, service, session):
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionList())
         rows = only(await drain(queue), "SessionRows").rows
         # Not the app's default model: the row says what this conversation is
@@ -408,7 +523,7 @@ class TestSessionList:
 
     async def test_a_running_turn_marks_its_row(self, service, session, llm):
         release = await park_turn(service, llm, session.session_id)
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionList())
         assert only(await drain(queue), "SessionRows").rows[0].flags == ["working"]
         release.set()
@@ -418,14 +533,14 @@ class TestSessionList:
         # The other state a user working elsewhere has to be able to see. Set
         # on the scheduler because that is where a parked decision lives now.
         service._scheduler._decisions[session.session_id] = {"tool": "run_bash"}
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionList())
         assert only(await drain(queue), "SessionRows").rows[0].flags == ["decision"]
 
 
 class TestSessionNew:
     async def test_a_new_session_is_announced_and_then_listed(self, service):
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionNew(profile="default"))
         events = await drain(queue)
         # created first: the UI has to open it, and a sidebar cannot say which
@@ -435,7 +550,7 @@ class TestSessionNew:
         assert created.session_id in {r.session_id for r in events[1].rows}
 
     async def test_it_is_created_under_the_profile_asked_for(self, service, conn):
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionNew(profile="bioinformatics"))
         created = only(await drain(queue), "SessionCreated").row
         assert created.profile == "bioinformatics"
@@ -446,7 +561,7 @@ class TestSessionNew:
         blob = json.dumps(
             {"model": "qwen3-32b", "base_url": "http://localhost:20001/v1"}
         )
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionNew(profile="default", backend=blob))
         created = only(await drain(queue), "SessionCreated").row
         assert created.model == "qwen3-32b"
@@ -456,7 +571,7 @@ class TestSessionNew:
     async def test_an_unusable_backend_falls_back_rather_than_stranding_it(
         self, service
     ):
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionNew(profile="default", backend="not json"))
         assert only(await drain(queue), "SessionCreated").row.model == ""
 
@@ -464,7 +579,7 @@ class TestSessionNew:
 class TestSessionOpen:
     async def test_opening_sends_the_whole_transcript_once(self, service, session):
         await run_turn(service, session.session_id, "which BAMs?")
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionOpen(session_id=session.session_id))
         reset = only(await drain(queue), "ChatReset")
         assert reset.session_id == session.session_id
@@ -473,7 +588,7 @@ class TestSessionOpen:
 
     async def test_every_row_arrives_named_from_one(self, service, session):
         await run_turn(service, session.session_id, "hello")
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionOpen(session_id=session.session_id))
         reset = only(await drain(queue), "ChatReset")
         # A reset re-bases the numbering; the UI drops the names it held.
@@ -482,7 +597,7 @@ class TestSessionOpen:
         )
 
     async def test_an_empty_session_opens_empty(self, service, session):
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionOpen(session_id=session.session_id))
         assert only(await drain(queue), "ChatReset").entries == []
 
@@ -490,7 +605,7 @@ class TestSessionOpen:
         self, service, session
     ):
         await run_turn(service, session.session_id, "hello")
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionOpen(session_id=session.session_id))
         events = await drain(queue)
         # Nothing has been sent this run, so the fill is derived from the
@@ -498,7 +613,7 @@ class TestSessionOpen:
         assert only(events, "ContextEstimate").session_id == session.session_id
 
     async def test_opening_a_session_that_is_gone_says_so(self, service):
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionOpen(session_id="nope"))
         events = await drain(queue)
         assert kinds(events) == ["Notify"] and events[0].severity == "warning"
@@ -513,7 +628,7 @@ class TestSessionOpen:
         await service.handle(
             TurnSubmit(session_id=session.session_id, text="and the CRAMs?")
         )
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionOpen(session_id=session.session_id))
         reset = only(await drain(queue), "ChatReset")
         assert [(e.kind, e.text) for e in reset.entries][-1] == (
@@ -531,7 +646,7 @@ class TestSessionOpen:
         await service.handle(
             TurnSubmit(session_id=session.session_id, text="and the CRAMs?")
         )
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionOpen(session_id=session.session_id))
         row = only(await drain(queue), "ChatReset").entries[-1]
 
@@ -543,10 +658,297 @@ class TestSessionOpen:
         await service.stop()
 
 
+def apply_deltas(events, session_id):
+    """The chat a front-end holds after applying what it was sent, in order.
+
+    A renderer in three lines, and deliberately strict about the two rules the
+    protocol asks of it: a reset replaces everything, and an update addresses a
+    row by `Entry.seq` and nothing else. An update naming a row nobody has is
+    raised rather than turned into a new row — a client that invented one would
+    hide exactly the desynchronisation this is here to catch.
+    """
+    rows: list = []
+    for event in events:
+        name = type(event).__name__
+        if getattr(event, "session_id", None) != session_id:
+            continue
+        if name == "ChatReset":
+            rows = list(event.entries)
+        elif name == "ChatAppend":
+            rows.append(event.entry)
+        elif name == "ChatUpdate":
+            for position, row in enumerate(rows):
+                if row.seq == event.entry.seq:
+                    rows[position] = event.entry
+                    break
+            else:
+                raise AssertionError(
+                    f"chat.update for row {event.entry.seq}, which was never drawn"
+                )
+    return rows
+
+
+def calling(tool: str, **arguments) -> str:
+    """One tool_call decision, as the envelope protocol carries it."""
+    return json.dumps(
+        {"action": "tool_call", "tool": tool, "arguments": arguments}
+    )
+
+
+class TestTheTurnAsItHappens:
+    """What a front-end with a session open sees while the turn runs.
+
+    This is the property the whole protocol is for: the conversation arrives as
+    deltas, and re-opening the session afterwards produces the *same* rows. The
+    second half is the one that is easy to get wrong — a `chat.reset` folds a
+    turn's reasoning and tool calls into one working box, so live rows shaped
+    any other way make the screen rearrange itself the moment the user comes
+    back, which is the bug the old UI paid for by rebuilding the whole log
+    every turn.
+    """
+
+    @pytest.fixture
+    def target(self, home):
+        path = home / "reads.tsv"
+        path.write_text("sample\tcount\na\t7\n")
+        return path
+
+    async def run_with_a_call(self, service, session, llm, target, *, reasoning=""):
+        """One turn that reads a file and then answers. Returns its events."""
+        llm._outputs = [
+            ChatResponse(
+                content=calling("read_file", path=str(target)),
+                reasoning=reasoning,
+            ),
+            respond("seven reads"),
+        ]
+        queue = subscribe(service)
+        await service.handle(
+            TurnSubmit(session_id=session.session_id, text="how many reads?")
+        )
+        return await wait_for(queue, "TurnFinished"), queue
+
+    async def test_the_call_is_a_row_before_the_result_exists(
+        self, service, session, llm, target
+    ):
+        events, _ = await self.run_with_a_call(service, session, llm, target)
+        drawn = [
+            e
+            for e in events
+            if type(e).__name__ in ("ChatAppend", "ChatUpdate")
+            and e.entry.parts
+        ]
+        first = drawn[0].entry
+        # The call is on screen while it is still running: one part, named,
+        # and with nothing in the result half yet.
+        assert [(p.kind, p.tool, p.done) for p in first.parts] == [
+            ("call", "read_file", False)
+        ]
+        await service.stop()
+
+    async def test_the_result_lands_in_the_row_the_call_drew(
+        self, service, session, llm, target
+    ):
+        events, _ = await self.run_with_a_call(service, session, llm, target)
+        drawn = [
+            e
+            for e in events
+            if type(e).__name__ in ("ChatAppend", "ChatUpdate")
+            and e.entry.parts
+        ]
+        call_row = drawn[0].entry.seq
+        filled = [
+            e.entry
+            for e in drawn
+            if e.entry.seq == call_row
+            and any(p.done and p.result for p in e.entry.parts)
+        ]
+        assert filled, "the result never reached the row the call drew"
+        assert "sample" in filled[0].parts[0].result
+        # And it never became a row of its own: one exchange, one row.
+        assert [type(e).__name__ for e in drawn if e.entry.seq != call_row] == []
+        await service.stop()
+
+    async def test_the_reply_arrives_without_anyone_asking_for_a_snapshot(
+        self, service, session, llm, target
+    ):
+        events, _ = await self.run_with_a_call(service, session, llm, target)
+        rows = apply_deltas(events, session.session_id)
+        assert [r.kind for r in rows] == ["user", "thinking", "assistant"]
+        assert (rows[0].text, rows[-1].text) == ("how many reads?", "seven reads")
+        # Nothing resent the transcript to achieve that (§4.2 property 1).
+        assert "ChatReset" not in kinds(events)
+        await service.stop()
+
+    async def test_re_opening_afterwards_yields_the_rows_the_deltas_built(
+        self, service, session, llm, target
+    ):
+        # The one that matters: what the user watched happen and what they get
+        # back when they return have to be the same rows, seq for seq.
+        events, queue = await self.run_with_a_call(
+            service, session, llm, target, reasoning="the counts are in column 2"
+        )
+        live = apply_deltas(events, session.session_id)
+
+        await service.handle(SessionOpen(session_id=session.session_id))
+        reopened = only(await drain(queue), "ChatReset").entries
+        assert reopened == live
+        await service.stop()
+
+    async def test_the_models_reasoning_is_in_the_working_box(
+        self, service, session, llm, target
+    ):
+        # Reasoning reaches nobody through a callback — it is checkpointed
+        # state — so it arrives with the fold at the end of the turn, in the
+        # place the fold gives it: ahead of the call it led to.
+        events, _ = await self.run_with_a_call(
+            service, session, llm, target, reasoning="column 2 holds the counts"
+        )
+        working = apply_deltas(events, session.session_id)[1]
+        assert [p.kind for p in working.parts] == ["reasoning", "call"]
+        assert working.parts[0].text == "column 2 holds the counts"
+        assert working.reasoning_chars == len("column 2 holds the counts")
+        await service.stop()
+
+    async def test_the_backends_token_count_is_announced(
+        self, service, session, llm
+    ):
+        llm._outputs = [
+            ChatResponse(content=respond("done"), usage={"prompt_tokens": 4321})
+        ]
+        queue = subscribe(service)
+        await service.handle(TurnSubmit(session_id=session.session_id, text="hi"))
+        events = await wait_for(queue, "TurnFinished")
+        # The context meter's measured half; without it the bar only ever
+        # shows the estimate a re-open derives from stored history.
+        assert only(events, "TurnUsage").prompt_tokens == 4321
+        await service.stop()
+
+    async def test_re_opening_mid_turn_re_binds_the_rows_it_is_drawing(
+        self, service, session, llm, target
+    ):
+        # A reset renumbers every row on screen, including the working box a
+        # turn is still filling. If the turn kept the old names, the update
+        # carrying its result would address a row the client no longer has —
+        # which `apply_deltas` refuses to invent, so this fails loudly.
+        import asyncio
+
+        entered, release = asyncio.Event(), asyncio.Event()
+        answer, rounds = llm.chat, {"n": 0}
+
+        async def gated(messages, **kwargs):
+            rounds["n"] += 1
+            if rounds["n"] == 2:  # the tool exchange is checkpointed by now
+                entered.set()
+                await release.wait()
+            return await answer(messages, **kwargs)
+
+        llm._outputs = [calling("read_file", path=str(target)), respond("seven")]
+        llm.chat = gated
+        queue = subscribe(service)
+        await service.handle(
+            TurnSubmit(session_id=session.session_id, text="how many reads?")
+        )
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        await service.handle(SessionOpen(session_id=session.session_id))
+        release.set()
+
+        live = apply_deltas(await wait_for(queue, "TurnFinished"), session.session_id)
+        await service.handle(SessionOpen(session_id=session.session_id))
+        assert only(await drain(queue), "ChatReset").entries == live
+        await service.stop()
+
+    async def test_a_turn_in_a_session_nobody_is_looking_at_still_says_so(
+        self, service, conn, session, llm, target
+    ):
+        # The core does not know what is on screen and must not decide from it
+        # (§4.2 rule 3): the event names its session and the UI drops what it
+        # is not showing.
+        other = SessionStore(conn).create(profile="default", title="the other one")
+        await service.handle(SessionFocus(session_id=other.session_id))
+        events, _ = await self.run_with_a_call(service, session, llm, target)
+        assert [r.kind for r in apply_deltas(events, session.session_id)] == [
+            "user",
+            "thinking",
+            "assistant",
+        ]
+        await service.stop()
+
+
+class TestAParkedApproval:
+    """A turn that stops to ask, driven through a real graph interrupt.
+
+    The scheduler's own tests assert the bookkeeping against a fake; this one
+    exists because the park is where the row reconciliation is hardest. A
+    parked turn and its resume are *one* exchange as far as `build_entries` is
+    concerned — one working box, holding the call, the answer to it, and
+    whatever came after — so the two graph invocations have to draw one box
+    between them or a re-open rearranges the screen.
+    """
+
+    async def park(self, service, session, llm):
+        """Ask for something manual mode will not run unasked."""
+        llm._outputs = [
+            calling("run_bash", content_lines=["rm -rf /scratch/old"]),
+            respond("left it alone"),
+        ]
+        queue = subscribe(service)
+        await service.handle(
+            TurnSubmit(session_id=session.session_id, text="clear the scratch dir")
+        )
+        return queue, await wait_for(queue, "DecisionRequested")
+
+    async def test_the_graph_parking_asks(self, service, session, llm):
+        _, events = await self.park(service, session, llm)
+        asked = only(events, "DecisionRequested")
+        assert asked.session_id == session.session_id
+        assert asked.payload["tool"] == "run_bash"
+        # Manual mode gates execution as well as destruction (§3.5).
+        assert asked.payload["kind"] in ("execution", "destructive")
+        # Nothing says the turn finished: it cannot, until this is answered.
+        assert "TurnFinished" not in kinds(events)
+        await service.stop()
+
+    async def test_answering_clears_the_prompt_and_finishes_the_turn(
+        self, service, session, llm
+    ):
+        queue, events = await self.park(service, session, llm)
+        await service.handle(
+            DecisionResolve(
+                session_id=session.session_id,
+                approved=False,
+                reason="that is the real data",
+            )
+        )
+        events += await wait_for(queue, "TurnFinished")
+        assert "DecisionCleared" in kinds(events)
+        assert only(events, "TurnFinished").reply == "left it alone"
+        await service.stop()
+
+    async def test_the_refusal_lands_in_the_row_that_asked_for_it(
+        self, service, session, llm
+    ):
+        queue, events = await self.park(service, session, llm)
+        await service.handle(
+            DecisionResolve(session_id=session.session_id, approved=False)
+        )
+        events += await wait_for(queue, "TurnFinished")
+        rows = apply_deltas(events, session.session_id)
+        # One working box across both halves of the turn, not two.
+        assert [r.kind for r in rows] == ["user", "thinking", "assistant"]
+        assert [(p.kind, p.tool, p.failed) for p in rows[1].parts] == [
+            ("call", "run_bash", True)
+        ]
+
+        await service.handle(SessionOpen(session_id=session.session_id))
+        assert only(await drain(queue), "ChatReset").entries == rows
+        await service.stop()
+
+
 class TestSessionClose:
     async def test_closing_forgets_what_was_open(self, service, session):
         await service.handle(SessionFocus(session_id=session.session_id))
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionClose())
         assert service._deps.focused_session_id is None
         events = await drain(queue)
@@ -561,7 +963,7 @@ class TestSessionClose:
 
 class TestSessionRename:
     async def test_a_rename_lands_and_is_listed(self, service, session, conn):
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(
             SessionRename(session_id=session.session_id, title="BAM QC")
         )
@@ -570,7 +972,7 @@ class TestSessionRename:
         assert SessionStore(conn).get(session.session_id).title == "BAM QC"
 
     async def test_an_empty_title_is_refused(self, service, session, conn):
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(
             SessionRename(session_id=session.session_id, title="   ")
         )
@@ -579,7 +981,7 @@ class TestSessionRename:
         assert SessionStore(conn).get(session.session_id).title == "a session"
 
     async def test_renaming_a_session_that_is_gone_says_so(self, service):
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionRename(session_id="nope", title="x"))
         assert (await drain(queue))[0].severity == "warning"
 
@@ -588,7 +990,7 @@ class TestSessionRetitle:
     async def test_the_model_names_the_conversation(self, service, session, llm):
         await run_turn(service, session.session_id, "how many reads?")
         llm._outputs = [json.dumps({"title": "Read counting"})]
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionRetitle(session_id=session.session_id))
         events = await wait_for(queue, "SessionRows")
         assert only(events, "SessionRows").rows[0].title == "Read counting"
@@ -610,7 +1012,7 @@ class TestSessionRetitle:
 
         llm.chat = gated
         await service.handle(SessionRetitle(session_id=session.session_id))
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionList())  # answered while titling waits
         assert "SessionRows" in kinds(await drain(queue))
         release.set()
@@ -619,7 +1021,7 @@ class TestSessionRetitle:
     async def test_an_empty_conversation_has_nothing_to_summarize(
         self, service, session
     ):
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionRetitle(session_id=session.session_id))
         events = await wait_for(queue, "Notify")
         assert kinds(events) == ["Notify"] and events[0].severity == "warning"
@@ -629,7 +1031,7 @@ class TestSessionRetitle:
     ):
         await run_turn(service, session.session_id, "hello")
         llm._outputs = []  # every attempt answers with the turn JSON instead
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionRetitle(session_id=session.session_id))
         events = await wait_for(queue, "Notify")
         assert any(
@@ -641,7 +1043,7 @@ class TestSessionRetitle:
 class TestSessionDelete:
     async def test_the_row_and_its_history_go(self, service, session, conn):
         await run_turn(service, session.session_id, "hello")
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionDelete(session_id=session.session_id))
         events = await drain(queue)
         assert only(events, "SessionRows").rows == []
@@ -692,7 +1094,7 @@ class TestSessionDelete:
         await service.stop()
 
     async def test_deleting_a_session_that_is_gone_says_so(self, service):
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionDelete(session_id="nope"))
         assert (await drain(queue))[0].severity == "warning"
 
@@ -703,7 +1105,7 @@ class TestRollback:
     ):
         await run_turn(service, session.session_id, "first")
         await run_turn(service, session.session_id, "second")
-        queue = service.subscribe()
+        queue = subscribe(service)
         # Cut before the second user message — the index the core itself put
         # on that entry.
         await service.handle(
@@ -719,7 +1121,7 @@ class TestRollback:
         self, service, session, llm
     ):
         release = await park_turn(service, llm, session.session_id)
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(
             SessionRollback(session_id=session.session_id, index=0)
         )
@@ -733,7 +1135,7 @@ class TestRollback:
         self, service, session
     ):
         await run_turn(service, session.session_id, "first")
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(
             SessionRollback(session_id=session.session_id, index=99)
         )
@@ -746,7 +1148,7 @@ class TestRollback:
         self, service, session
     ):
         await run_turn(service, session.session_id, "first")
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(
             SessionRollback(session_id=session.session_id, index=0)
         )
@@ -755,7 +1157,7 @@ class TestRollback:
         assert only(events, "ContextEstimate").used == 0
 
     async def test_rolling_back_a_session_that_is_gone_says_so(self, service):
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionRollback(session_id="nope", index=0))
         assert (await drain(queue))[0].severity == "warning"
 
@@ -766,7 +1168,7 @@ class TestFork:
     ):
         await run_turn(service, session.session_id, "first")
         await run_turn(service, session.session_id, "second")
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionFork(session_id=session.session_id, index=2))
         events = await drain(queue)
         created = only(events, "SessionCreated").row
@@ -782,7 +1184,7 @@ class TestFork:
     ):
         await run_turn(service, session.session_id, "first")
         await run_turn(service, session.session_id, "second")
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionFork(session_id=session.session_id, index=2))
         fork = only(await drain(queue), "SessionCreated").row
 
@@ -802,7 +1204,7 @@ class TestFork:
         # Pinned after the turn: a session pointed at a real endpoint would
         # dial it, and this test has no backend to answer.
         store.set_backend(source.session_id, blob)
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionFork(session_id=source.session_id, index=0))
         row = only(await drain(queue), "SessionCreated").row
         # Not on the wire, so a front-end cannot fork a conversation into a
@@ -821,7 +1223,7 @@ class TestFork:
         # exists for.
         await run_turn(service, session.session_id, "first")
         release = await park_turn(service, llm, session.session_id)
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionFork(session_id=session.session_id, index=0))
         assert "SessionCreated" in kinds(await drain(queue))
         release.set()
@@ -832,7 +1234,7 @@ class TestFork:
     ):
         await run_turn(service, session.session_id, "first")
         before = len(SessionStore(conn).list_all())
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionFork(session_id=session.session_id, index=99))
         events = await drain(queue)
         assert kinds(events) == ["Notify"] and events[0].severity == "warning"
@@ -850,7 +1252,7 @@ class TestFork:
 
         monkeypatch.setattr("hpca.core.service.fork_thread", explode)
         before = len(SessionStore(conn).list_all())
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionFork(session_id=session.session_id, index=0))
         events = await drain(queue)
         assert any(
@@ -859,7 +1261,7 @@ class TestFork:
         assert len(SessionStore(conn).list_all()) == before
 
     async def test_forking_a_session_that_is_gone_says_so(self, service):
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionFork(session_id="nope", index=0))
         assert (await drain(queue))[0].severity == "warning"
 
@@ -873,7 +1275,7 @@ class TestAConversationEndToEnd:
     """
 
     async def test_the_whole_round_trip(self, service, llm):
-        queue = service.subscribe()
+        queue = subscribe(service)
 
         await service.handle(SessionList())
         assert only(await drain(queue), "SessionRows").rows == []
@@ -916,7 +1318,7 @@ class TestAConversationEndToEnd:
 
 class TestFocus:
     async def test_focus_is_recorded_and_repaints(self, service, session):
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(SessionFocus(session_id=session.session_id))
         assert service._deps.focused_session_id == session.session_id
         # force=True on focus: a client that just opened a session has a blank
@@ -930,7 +1332,7 @@ class TestFocus:
 
 class TestConfirmations:
     async def test_a_question_is_asked_and_its_answer_runs_the_action(self, service):
-        queue = service.subscribe()
+        queue = subscribe(service)
         ran = []
 
         async def on_yes():
@@ -943,7 +1345,7 @@ class TestConfirmations:
         assert ran == [True]
 
     async def test_a_no_runs_nothing(self, service):
-        queue = service.subscribe()
+        queue = subscribe(service)
         ran = []
         service.ask("Learn this?", lambda: _record(ran))
         events = await drain(queue)
@@ -954,7 +1356,7 @@ class TestConfirmations:
         await service.handle(ConfirmResolve(id="q99", confirmed=True))
 
     async def test_the_same_answer_twice_runs_once(self, service):
-        queue = service.subscribe()
+        queue = subscribe(service)
         ran = []
         service.ask("Learn this?", lambda: _record(ran))
         key = (await drain(queue))[0].id
@@ -963,7 +1365,7 @@ class TestConfirmations:
         assert ran == [True]
 
     async def test_a_failing_action_is_reported_not_raised(self, service):
-        queue = service.subscribe()
+        queue = subscribe(service)
 
         async def boom():
             raise RuntimeError("the signature file is read-only")
@@ -983,7 +1385,7 @@ class TestRobustness:
     ):
         # One bad frame must not be able to end a session: the far side of
         # this is a socket.
-        queue = service.subscribe()
+        queue = subscribe(service)
 
         def explode(*a, **k):
             raise RuntimeError("scheduler is on fire")
@@ -999,14 +1401,14 @@ class TestRobustness:
         # Most of §4.1 is not dispatched yet. Silence would let a front-end
         # wait forever for something that was never going to happen, so an
         # unhandled command must say so.
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(Shutdown.model_construct(TYPE="shutdown"))
         await service.stop()
 
     async def test_answering_a_decision_nobody_is_parked_on_is_harmless(
         self, service
     ):
-        queue = service.subscribe()
+        queue = subscribe(service)
         await service.handle(DecisionResolve(session_id="s1", approved=True))
         # Not an error: a stale answer is exactly what arrives when a turn
         # resolved between the prompt being drawn and the key being pressed.

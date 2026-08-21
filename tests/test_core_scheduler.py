@@ -16,6 +16,7 @@ from hpca.agent.graph import TurnResult
 from hpca.core import scheduler as scheduler_module
 from hpca.core.deps import CoreDeps
 from hpca.core.scheduler import LLM_WAIT_ACTIVITY, TurnPlan, TurnScheduler
+from hpca.protocol import Entry
 
 
 class FakeSession:
@@ -111,6 +112,17 @@ def sched(deps, sessions, graph_calls):
 
 def kinds(events):
     return [type(e).__name__ for e in events]
+
+
+def reset_rows(count):
+    """A `chat.reset`'s entries, as far as `rebase_rows` reads them.
+
+    Numbered from 1 and carrying the message index each row is, which is how
+    the scheduler recognises a running turn's own message among them.
+    """
+    return [
+        Entry(kind="user", text=f"m{i}", index=i, seq=i + 1) for i in range(count)
+    ]
 
 
 def queued_seqs(events, session_id="s1"):
@@ -211,11 +223,15 @@ class TestQueuedRows:
         self, sched, events
     ):
         # Nothing is waiting, so the turn starts — and a "queued" row would
-        # have to be un-drawn a moment later.
+        # have to be un-drawn a moment later. It is still drawn: a turn's own
+        # message is a chat row whether or not it had to wait for one.
         assert sched.submit_user("s1", "hello") is False
         await sched.drain()
         await settle()
-        assert "ChatAppend" not in kinds(events)
+        appended = [e for e in events if type(e).__name__ == "ChatAppend"]
+        assert [(e.entry.kind, e.entry.text) for e in appended] == [
+            ("user", "hello")
+        ]
 
     async def test_every_row_gets_its_own_name_per_session(
         self, sched, events, graph_calls
@@ -339,6 +355,93 @@ class TestQueuedRows:
         assert sched.unqueue("s1", 1) is None
 
 
+class TestLiveSteps:
+    """A tool call as a row, and the result landing in that same row.
+
+    The scheduler half of it: what `on_step` does to the chat, without a graph
+    to produce the payloads. The end-to-end version (a real graph, a real tool)
+    is in `test_core_service.py`.
+    """
+
+    async def working(self, sched, graph_calls):
+        """A turn parked on the model, with its rows already drawn."""
+        graph_calls["gates"]["s1"] = asyncio.Event()
+        sched.submit_user("s1", "what is in the BAM?")
+        await sched.drain()
+        await settle()
+
+    def rows(self, events, kind=None):
+        return [
+            e.entry
+            for e in events
+            if type(e).__name__ in ("ChatAppend", "ChatUpdate")
+            and (kind is None or type(e).__name__ == kind)
+        ]
+
+    async def test_a_call_is_drawn_the_moment_it_is_made(
+        self, sched, events, graph_calls
+    ):
+        await self.working(sched, graph_calls)
+        events.clear()
+        sched.report_step("s1", {"kind": "call", "tool": "read_file"})
+
+        assert kinds(events) == ["ChatAppend"]
+        entry = events[0].entry
+        assert entry.kind == "thinking" and entry.seq > 0
+        # Nothing in the result half: the tool has not answered yet, and a row
+        # that showed an empty result would read as a tool that answered with
+        # nothing.
+        assert [(p.kind, p.tool, p.done) for p in entry.parts] == [
+            ("call", "read_file", False)
+        ]
+        graph_calls["gates"]["s1"].set()
+        await settle()
+
+    async def test_the_result_fills_the_row_the_call_drew(
+        self, sched, events, graph_calls
+    ):
+        await self.working(sched, graph_calls)
+        events.clear()
+        sched.report_step("s1", {"kind": "call", "tool": "read_file"})
+        drawn = events[0].entry.seq
+        sched.report_step(
+            "s1", {"kind": "step", "text": "[tool result] read_file: 40 lines"}
+        )
+
+        # An update, not a second row: one exchange is one row (`Part.done`).
+        assert kinds(events) == ["ChatAppend", "ChatUpdate"]
+        entry = events[-1].entry
+        assert entry.seq == drawn
+        assert [(p.done, p.result) for p in entry.parts] == [(True, "40 lines")]
+        graph_calls["gates"]["s1"].set()
+        await settle()
+
+    async def test_two_calls_are_answered_in_the_order_they_were_asked(
+        self, sched, events, graph_calls
+    ):
+        await self.working(sched, graph_calls)
+        for tool in ("read_file", "list_scripts"):
+            sched.report_step("s1", {"kind": "call", "tool": tool})
+        events.clear()
+        sched.report_step("s1", {"kind": "step", "text": "[tool result] x: first"})
+
+        # The earliest call still waiting takes it — the same rule the fold
+        # uses, so a re-open cannot pair them up differently.
+        parts = events[-1].entry.parts
+        assert [(p.tool, p.result) for p in parts] == [
+            ("read_file", "first"),
+            ("list_scripts", ""),
+        ]
+        graph_calls["gates"]["s1"].set()
+        await settle()
+
+    async def test_a_step_for_a_session_with_no_turn_is_ignored(
+        self, sched, events
+    ):
+        sched.report_step("s1", {"kind": "call", "tool": "read_file"})
+        assert events == []
+
+
 class TestRebasedRows:
     """What a `chat.reset` has to carry that the thread does not hold.
 
@@ -350,7 +453,7 @@ class TestRebasedRows:
     async def test_the_counter_restarts_where_the_reset_ended(self, sched):
         # A reset renumbers from 1, so the next row the session mints must
         # follow the entries the reset carried, not the ones it replaced.
-        sched.rebase_rows("s1", drawn=7, messages=7)
+        sched.rebase_rows("s1", entries=reset_rows(7))
         assert sched._next_entry_seq("s1") == 8
 
     async def test_queued_messages_come_back_as_rows_after_the_transcript(
@@ -364,10 +467,11 @@ class TestRebasedRows:
         sched.submit_user("s1", "second")
         sched.submit_user("s1", "third")
 
-        rows = sched.rebase_rows("s1", drawn=5, messages=5)
-        # The running turn's message is in the copy (5 > interrupt_keep of 4),
-        # so only the two waiting behind it are re-drawn — numbered after the
-        # transcript, in the order they will run.
+        rows = sched.rebase_rows("s1", entries=reset_rows(5))
+        # The running turn's message is in the copy — the reset carries an
+        # entry for message 4, which is where the turn started — so only the
+        # two waiting behind it are re-drawn, numbered after the transcript,
+        # in the order they will run.
         assert [(r.kind, r.text, r.seq) for r in rows] == [
             ("queued", "second", 6),
             ("queued", "third", 7),
@@ -388,7 +492,7 @@ class TestRebasedRows:
         sched.submit_user("s1", "second")
         old = sched._pending[-1].entry_seq
 
-        row = sched.rebase_rows("s1", drawn=2, messages=2)[-1]
+        row = sched.rebase_rows("s1", entries=reset_rows(2))[-1]
         assert row.seq != old, "the reset must hand out a fresh name"
         assert sched.unqueue("s1", old) is None
         assert sched.unqueue("s1", row.seq) == "second"
@@ -407,15 +511,63 @@ class TestRebasedRows:
         await sched.drain()
         await settle()
 
-        rows = sched.rebase_rows("s1", drawn=4, messages=4)
+        rows = sched.rebase_rows("s1", entries=reset_rows(4))
         assert [(r.kind, r.text) for r in rows] == [
             ("user", "what is in the BAM?")
         ]
         graph_calls["gates"]["s1"].set()
         await settle()
 
+    async def test_a_running_turns_rows_are_re_bound_to_the_resets_names(
+        self, sched, graph_calls
+    ):
+        # The names the turn drew under are gone — the reset renumbered from 1.
+        # If the turn kept them, the update carrying its next tool result would
+        # address a row the front-end no longer has, and be dropped.
+        graph_calls["gates"]["s1"] = asyncio.Event()
+        graph_calls["counts"]["s1"] = 2
+        sched.submit_user("s1", "what is in the BAM?")
+        await sched.drain()
+        await settle()
+        sched.report_step("s1", {"kind": "call", "tool": "read_file"})
+
+        entries = reset_rows(3) + [
+            Entry(kind="thinking", text="", index=-1, seq=4)
+        ]
+        assert sched.rebase_rows("s1", entries=entries) == []
+        live = sched._live["s1"]
+        # The turn began at message 2, so the reset's third row is its message
+        # and everything after it belongs to the turn as well.
+        assert live.rows == [3, 4]
+        assert live.thinking_seq == 4
+        graph_calls["gates"]["s1"].set()
+        await settle()
+
+    async def test_a_turns_working_box_comes_back_with_its_message(
+        self, sched, graph_calls
+    ):
+        # The copy predates the turn, so neither its message nor the call it
+        # has already announced is in the reset. A call is announced before it
+        # returns and its exchange is checkpointed only after — so a re-open in
+        # that window would otherwise show a session doing nothing.
+        graph_calls["gates"]["s1"] = asyncio.Event()
+        graph_calls["counts"]["s1"] = 4
+        sched.submit_user("s1", "what is in the BAM?")
+        await sched.drain()
+        await settle()
+        sched.report_step("s1", {"kind": "call", "tool": "read_file"})
+
+        rows = sched.rebase_rows("s1", entries=reset_rows(4))
+        assert [(r.kind, r.seq) for r in rows] == [("user", 5), ("thinking", 6)]
+        assert [(p.kind, p.tool, p.done) for p in rows[1].parts] == [
+            ("call", "read_file", False)
+        ]
+        assert sched._live["s1"].rows == [5, 6]
+        graph_calls["gates"]["s1"].set()
+        await settle()
+
     async def test_an_idle_session_gets_nothing_extra(self, sched):
-        assert sched.rebase_rows("s1", drawn=3, messages=3) == []
+        assert sched.rebase_rows("s1", entries=reset_rows(3)) == []
 
     async def test_one_sessions_reset_leaves_another_alone(
         self, sched, graph_calls
@@ -427,7 +579,7 @@ class TestRebasedRows:
         sched.submit_user("s2", "second")
         before = sched._pending[-1].entry_seq
 
-        sched.rebase_rows("s1", drawn=9, messages=9)
+        sched.rebase_rows("s1", entries=reset_rows(9))
         assert sched._pending[-1].entry_seq == before
         graph_calls["gates"]["s2"].set()
         await settle()
@@ -438,8 +590,10 @@ class TestEvents:
         sched.submit_user("s1", "hello")
         await sched.drain()
         await settle()
-        assert kinds(events)[0] == "TurnStarted"
-        assert kinds(events)[-1] == "TurnFinished"
+        names = kinds(events)
+        # The message is on screen before the spinner that belongs to it.
+        assert names[:2] == ["ChatAppend", "TurnStarted"]
+        assert names[-1] == "TurnFinished"
         assert events[-1].reply == "done"
 
     async def test_the_clock_stops_when_the_turn_does(self, sched, events):

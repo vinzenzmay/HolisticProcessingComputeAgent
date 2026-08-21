@@ -348,6 +348,32 @@ def live_step(payload: dict) -> Step:
     return result_step(str(payload.get("text", "")))
 
 
+def thinking_entry(parts: list[Step]) -> Entry:
+    """The one entry a turn's working folds into.
+
+    Public, and the only place that fold is written, because two callers have
+    to agree about it exactly: :func:`build_entries` closing the box at the end
+    of a turn, and the core drawing the same box *while* the turn runs (see
+    ``hpca.core.scheduler``). If those two disagreed by a field, a re-opened
+    session would visibly rearrange itself against what the user watched
+    happen — which is the bug the old chat rebuild paid for.
+
+    The counters are derived from the parts rather than passed in: a result
+    lands by filling in the call it answers (:meth:`Step.attach`), so "how many
+    steps" is exactly "how many parts have their answer", and asking the parts
+    is the only version of that count which cannot drift from what is shown.
+    """
+    return Entry(
+        kind=THINKING,
+        text=_block(parts),
+        steps=sum(1 for part in parts if part.kind != "reasoning" and part.done),
+        reasoning_chars=sum(
+            len(part.text) for part in parts if part.kind == "reasoning"
+        ),
+        parts=list(parts),
+    )
+
+
 def clip(text: str) -> str:
     if len(text) <= ARGUMENTS_CHARS:
         return text
@@ -399,15 +425,7 @@ def build_entries(
     def flush() -> None:
         nonlocal pending, steps, reasoning_chars
         if pending:
-            entries.append(
-                Entry(
-                    kind=THINKING,
-                    text=_block(pending),
-                    steps=steps,
-                    reasoning_chars=reasoning_chars,
-                    parts=list(pending),
-                )
-            )
+            entries.append(thinking_entry(pending))
         pending, steps, reasoning_chars = [], 0, 0
 
     def open_calls(index: int) -> None:
