@@ -214,6 +214,35 @@ added to `protocol.py` with tests, in the same style as what is there:
     incompatible with §3.2's append-only invariant. Needs a core-assigned entry
     identity and an update event.
 
+Found during M4, recorded for the milestone that hits each:
+
+- **`turn.interrupt` recovers the user's message and then throws it away.**
+  `scheduler.interrupt()` returns the text so it can be put back in the entry
+  box — the behaviour `specs-ui-acceptance.md` calls "hands the user's message
+  back", including "to *its own* session, not whichever session is now on
+  screen". No event carries it; `turn.unqueued` belongs to the queue. (M5.)
+- **A resume after a core restart draws nothing.** With no live turn record —
+  the parked half belonged to a dead process — the reconcile deliberately emits
+  nothing rather than a second working box, so the reply appears only on the
+  next `chat.reset`. Reachable exactly through the newly-fixed "a parked
+  decision survives a restart" path, which is what makes it M5's. (M5.)
+- **A turn that *fails* leaves its live rows unreconciled**, because there is no
+  result to fold. They settle as drawn. (M5.)
+- **`turn.usage` carries no completion tokens and no wall clock**, so the
+  meter's `· 14.2 tok/s` has no channel. The meter state is built and tested;
+  nothing can set it. (M8.)
+- **Thinking effort has no event.** `ThinkingSet` is a command only, so the
+  meter's `· think medium` likewise has state and no source. (M7, with
+  `/thinking`.)
+- **`TurnStarted` carries no `started_at`**, so the elapsed clock only starts at
+  the first `turn.activity`. (M5.)
+- **`TurnActivity(activity="")` has two senders** — the scheduler just before
+  `turn.finished`, and the memory service, which has no turn at all — so the UI
+  disambiguates on whether a turn is working. Worth a wire distinction. (M8.)
+- **`boot.py` emits its own `hello`** before subscribing, and `subscribe()` now
+  sends one too. Harmless, since the handler is idempotent, but one of them
+  should go. (M5.)
+
 Three smaller gaps, recorded here for the milestone that hits each:
 
 - **`chat.reset` must re-emit queued rows.** A session re-opened while a turn
