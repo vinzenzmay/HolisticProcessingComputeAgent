@@ -863,8 +863,14 @@ def test_a_reset_forgets_every_open_entry():
     # numbering — so a `seq` still held as open afterwards would be naming a
     # row the core has renumbered, which is the one thing keying by identity
     # must not be allowed to get wrong.
+    #
+    # Not "nothing is open": a message shows its words without being opened,
+    # so what the set has to be is exactly the rows of the transcript that
+    # just arrived, and nothing else.
     ui, _, _, _ = rolled_back()
-    assert ui.chat.expanded == set()
+    assert ui.chat.expanded == {
+        item.key for item in ui.chat.items if item.kind != "thinking"
+    }
 
 
 def test_the_frame_is_still_exact_after_a_rollback():

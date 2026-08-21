@@ -2151,9 +2151,14 @@ class RowUI:
         OSC 52, the multiplexer wrapping and the file fallback, and which
         already takes an injected ``emit`` — so nothing about copying is
         rewritten here and this method only decides *what* is copied. The
-        entry's own text, not the row it is drawn as: `you   ` and the tool
-        markers are decoration, and pasting them back into a shell is a paper
-        cut every time.
+        entry's own text, not the lines it is drawn as: the label line and the
+        tool markers are decoration, and pasting them back into a shell is a
+        paper cut every time.
+
+        Still worth its key now that a message's own lines are drawn flush and
+        a mouse selection of them is already clean — because this one copies
+        the *row*, whole, without having to drag across a reply that runs off
+        the bottom of the pane.
         """
         if self.clipboard is None:
             self.toast("no clipboard is wired up here", "warning")

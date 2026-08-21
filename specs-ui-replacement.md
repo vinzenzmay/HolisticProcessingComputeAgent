@@ -182,6 +182,30 @@ list, and it is the bulk of the work.
    released. A keyboard-driven copy of the row under the cursor covers the
    rest (§5, `y`).
 
+   "For free" turned out to be half true, and the other half is v0.27.0.
+   A terminal selects whole screen columns, so every column the UI spent in
+   front of a line of the conversation landed in the paste buffer with it:
+   the chat drew `▌ ▸ you   what is the coverage?`, and an opened message's
+   body under six spaces of indent. What the terminal gave back was the words
+   with the furniture still attached.
+
+   The fix is a property of the chat pane and not of the copy path:
+   `Pane(flush=True)` draws content lines at column 0 with no gutter and no
+   indent, and `state.entry_item` moves the speaker onto a label line of its
+   own so there is nothing left on the words' own lines. The rule the two
+   make together — **flush is verbatim, indented is the UI talking** — is
+   what a reader can rely on: a turn's working, a notice and a step's head
+   keep their furniture, and a message's text and a tool's output do not.
+   `tests/test_ui_pane.py::TestTheChatSelectsClean` is the promise.
+
+   Two things came with it. A message shows its words rather than one
+   truncated line of them, because a label line with nothing under it until
+   you press → is not a transcript — `state.FOLDED_KINDS` is now the whole of
+   what the chat still folds, and it holds only `thinking`. And the chat's
+   line list therefore grew from one line per entry to one per line of prose
+   (12,900 lines at 5000 entries, against 5000), which is why `Pane.extend`
+   exists: see §4.2 property 1 and `test_ui_perf.py::TestARowArriving`.
+
 ### 4.2 Protocol gaps
 
 The protocol covers most of the surface. Four things are missing and must be

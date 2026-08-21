@@ -52,7 +52,7 @@ from hpca.ui.overlays import (
     choice,
 )
 from hpca.ui.state import BackendInfo, ProfileInfo
-from tests.ui_harness import Wire, connected, frame, plain, widths
+from tests.ui_harness import Wire, connected, frame, on_entry, plain, widths
 
 # Two conversations under two profiles, one of them the default — which is the
 # one the sidebar does *not* tag.
@@ -699,7 +699,7 @@ class TestTheRewindIsConnected:
     async def at_q2(self, w: Wire) -> Wire:
         await started(w)
         w.ui.focus = CHAT
-        w.ui.chat.cursor = 2  # q2
+        on_entry(w.ui.chat, 2)  # q2
         await w.press("enter")
         assert isinstance(w.ui.overlay, RewindOverlay)
         return w
@@ -775,7 +775,7 @@ class TestTheRewindIsConnected:
         await started(wire)
         await wire.tell(protocol.TurnStarted(session_id="s1"))
         wire.ui.focus = CHAT
-        wire.ui.chat.cursor = 2
+        on_entry(wire.ui.chat, 2)
         await wire.press("enter", "f")
         assert wire.peer.last(protocol.SessionFork).index == 2
 
@@ -931,7 +931,7 @@ class TestDrafts:
     async def test_a_reused_message_becomes_that_sessions_draft(self, wire):
         await self.two_sessions(wire)
         wire.ui.focus = CHAT
-        wire.ui.chat.cursor = 2
+        on_entry(wire.ui.chat, 2)
         await wire.press("enter", "c")
         await self.switch_to(wire, SECOND)
         await self.switch_to(wire, FIRST)
@@ -947,7 +947,7 @@ class TestDrafts:
         """
         await self.two_sessions(w)
         w.ui.focus = CHAT
-        w.ui.chat.cursor = 2
+        on_entry(w.ui.chat, 2)
         await w.press("enter")  # the rewind, opened in s1
         w.ui.open_session("s2")
         await w.press("c")  # …and answered while s2 is on screen

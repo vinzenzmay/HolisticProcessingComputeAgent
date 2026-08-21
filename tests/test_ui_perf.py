@@ -28,6 +28,15 @@ run.
 enough to fail a test that is measuring something else. The median of
 per-frame samples is what specs-ui-baseline.md reports and what is asserted
 here.
+
+**The frame is not the only clock.** A frame slices a cached list of lines,
+so it is flat for free; the list itself is built by whatever *changes* the
+conversation, and that is the second cost, paid per arriving row rather than
+per keypress. It only became worth a test when the chat started drawing every
+message's text: the cached list went from one line per entry to one per line
+of prose, and a rebuild per arriving row would have put the O(conversation)
+event back after all the work of taking it out. `TestARowArriving` is that
+dimension.
 """
 
 import statistics
@@ -39,6 +48,7 @@ from hpca import protocol
 from hpca.ui.app import RowUI
 from hpca.ui.client import UIClient
 from hpca.ui.demo import DemoCore, build
+from hpca.ui.state import ChatEntry
 
 WIDTH, HEIGHT = 120, 40
 FRAMES = 200
@@ -83,6 +93,29 @@ def wired(entries: list[protocol.Entry]) -> RowUI:
     # reference back, and a collected client stops answering mid-measurement.
     ui._perf_keepalive = (core, client)
     return ui
+
+
+def append_ms(ui, rows: int = 200) -> float:
+    """Median ms for one row arriving *and the frame that shows it*.
+
+    Both halves, because the cost can hide in either. `invalidate` is nearly
+    free in itself and hands the whole bill to the next `flat`, so an append
+    timed on its own reads as instant however much work it just booked — the
+    first version of this measured exactly that and could not tell `extend`
+    from the rebuild it replaced.
+    """
+    ui.render(WIDTH, HEIGHT)  # so there is a cache to keep or to drop
+    session, inner = ui.session, WIDTH - 2
+    samples = []
+    for n in range(rows):
+        entry = ChatEntry(
+            kind="assistant", text="a reply of ordinary length", seq=10**6 + n
+        )
+        started = time.perf_counter()
+        session.append(entry)
+        ui.chat.flat(inner)
+        samples.append((time.perf_counter() - started) * 1000)
+    return statistics.median(samples)
 
 
 def replies(count: int, text: str = "a reply of quite ordinary length") -> list:
@@ -155,6 +188,41 @@ def test_a_hundred_kilobyte_draft_does_not_slow_the_frame():
     ui = build(chat=100)
     ui.sessions[ui.active].draft.set_text("y" * 100_000)
     assert frame_ms(ui) < BUDGET_MS
+
+
+class TestARowArriving:
+    """A message landing costs that message, not the conversation behind it.
+
+    This is `Pane.extend`, and it is the half of the append-only invariant
+    (specs-ui-replacement.md §3.2) that is actually spent rather than merely
+    kept: the flattened line list is added to, so what a row costs is the
+    lines that row draws.
+
+    It matters more than it used to. The chat now shows every message's words
+    instead of one truncated line of them, so its line list is as long as the
+    conversation is *wide* — 12,900 lines at 5000 entries against 5000 before
+    — and a rebuild per arriving row would have been an O(conversation) event
+    on the busiest path there is. During a turn these arrive per tool call.
+    """
+
+    def test_it_does_not_grow_with_the_conversation(self):
+        small = append_ms(build(chat=100))
+        large = append_ms(build(chat=5000))
+        assert large / small < FLAT, f"{small:.4f} -> {large:.4f} ms"
+
+    @pytest.mark.parametrize("entries", [100, 5000])
+    def test_and_stays_far_under_a_frame(self, entries: int):
+        # Well under, because it is on the path a turn takes per tool call and
+        # a frame is the thing it must not delay.
+        assert append_ms(build(chat=entries)) < BUDGET_MS
+
+    def test_the_row_it_took_is_on_screen(self):
+        # The measurement above is worthless if `extend` quietly dropped what
+        # it was given, so the same path is checked for the row itself.
+        ui = build(chat=100)
+        before = len(ui.chat.flat(WIDTH - 2))
+        ui.session.append(ChatEntry(kind="assistant", text="one\ntwo", seq=10**6))
+        assert len(ui.chat.flat(WIDTH - 2)) == before + 3  # a label and two lines
 
 
 # ------------------------------------------------- cost tracks area, not n

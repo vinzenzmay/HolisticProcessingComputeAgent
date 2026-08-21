@@ -41,6 +41,15 @@ GREEN = f"{ESC}[38;5;71m"
 YELLOW = f"{ESC}[38;5;179m"
 RED = f"{ESC}[38;5;167m"
 BLUE = f"{ESC}[38;5;68m"
+# The two the conversation itself is drawn in, and the only colours chosen for
+# a *reading* job rather than a signalling one: everything above marks
+# something (a state, a rule, a warning), while these two carry paragraphs of
+# text that somebody is going to sit and read. So they are bright — near-white
+# for the user's own words, and a clear amber for the agent's — where the
+# muted 179 the agent used to be drawn in read as grey against a dark
+# terminal, which is the one thing a wall of prose must not do.
+WHITE = f"{ESC}[38;5;255m"
+AMBER = f"{ESC}[38;5;215m"
 
 # Joiners ask for the glyph after them, so a slice must never end on one.
 JOINERS = "‍‌"

@@ -42,9 +42,13 @@ and ``run`` drives stdin, that connection and SIGWINCH on one asyncio loop.
 M7 and M8 added the management overlays and the slash commands, and M8a the
 endpoint scan, the startup backend check and the read-only window. M9 deleted
 ``hpca/tui`` and the Textual dependency with it, so this is now the only
-front-end. What is deliberately still missing: mouse support and selecting text out of the *chat* — the
-terminal's own selection does the second one, which is why the mouse stays
-released. specs-ui-replacement.md §4 is the full list of what is absent, and
+front-end. v0.27.0 made the chat pane *flush*: a message's words are drawn at
+column 0 with no gutter, no marker and no indent, and the speaker is a label
+line above them — because the terminal's own drag-to-select takes whole
+columns, and every one the UI spent in front of a line of the conversation
+came along with it. Anything at column 0 is verbatim; anything indented is the
+UI talking. What is deliberately still missing: mouse support, which is what
+keeps that selection working at all, so the mouse stays released. specs-ui-replacement.md §4 is the full list of what is absent, and
 specs-ui-coverage.md §3 is an audit of it, most of which is now wired: what
 is still open there is the injection warning on a flagged memory batch, the
 watchers column's arrangement, and re-reading memories at a session boundary.
@@ -56,7 +60,8 @@ The modules, per specs-ui-replacement.md §3:
 * ``screen`` — the raw terminal: alternate screen, differential repaint;
 * ``keys`` — one read off the wire into key names;
 * ``editor`` — the shared multi-line buffer;
-* ``pane`` — one navigable list of entries, each named by its own key;
+* ``pane`` — one navigable list of entries, each named by its own key, and
+  the ``flush`` mode the chat is drawn in;
 * ``approval`` — the inline decision prompt: what a gated call says about
   itself, and the box that refuses it;
 * ``state`` — the plain dataclasses the rows are drawn from: sessions, chat,

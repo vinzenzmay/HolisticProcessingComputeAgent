@@ -473,7 +473,9 @@ class TestLiveStepRows:
             )
         )
         await wire.tell(protocol.TurnFinished(session_id="s1"))
-        assert wire.ui.chat.expanded == set()
+        # The box the UI opened by itself, and only that one — the messages
+        # around it were never folded and are not folded now.
+        assert "2" not in wire.ui.chat.expanded
         assert "1 steps" in wire.screen() or "1 step" in wire.screen()
 
     async def test_but_a_box_the_user_opened_stays_open(self, wire):

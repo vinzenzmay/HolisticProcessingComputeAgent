@@ -137,19 +137,42 @@ def served(ui: RowUI, bodies=None, skills=None) -> RowUI:
     return ui
 
 
+def on_entry(pane, index: int, width: int = 118) -> int:
+    """Put a pane's cursor on the first line of the entry at ``index``.
+
+    An entry is as many lines as its text needs, so a test that wants to be
+    *on* one cannot count lines to get there — which is what every caller of
+    this used to do, back when a chat row was one truncated line.
+    """
+    for row, (owner, _, _) in enumerate(pane.flat(width)):
+        if owner == index:
+            pane.cursor = row
+            return row
+    raise AssertionError(f"no entry at {index}")
+
+
 def on_own_message(ui: RowUI, nth: int = 4) -> int:
     """Put the chat cursor on the nth message the user wrote — not the first,
-    so that a fork or a rollback actually has a conversation to cut."""
+    so that a fork or a rollback actually has a conversation to cut.
+
+    Counted per *entry* and not per line: a message is as many lines as its
+    text needs, and a walk that counted lines would find the fourth one four
+    lines into the first.
+    """
     ui.focus = CHAT
     ui.chat.cursor = 0
-    seen = 0
+    seen, last = 0, -1
     while True:
         index = ui.chat.current(118)
-        if ui.chat.items[index].kind == "user":
-            seen += 1
-            if seen == nth:
-                assert index > 0, "the cut has to be mid-conversation to mean anything"
-                return index
+        if index != last:
+            last = index
+            if ui.chat.items[index].kind == "user":
+                seen += 1
+                if seen == nth:
+                    assert index > 0, (
+                        "the cut has to be mid-conversation to mean anything"
+                    )
+                    return index
         was = ui.chat.cursor
         ui.chat.move(1, 20, 118)
         if ui.chat.cursor == was:

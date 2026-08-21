@@ -7,8 +7,36 @@ from dataclasses import dataclass, field
 from hpca.ui.ansi import BOLD, CYAN, DIM, RESET, REVERSE, fold, pad, rule
 
 
+class Wrapped:
+    """A row that remembers its ``body`` wrapped, so nothing wraps it twice.
+
+    The flattened line list is rebuilt whenever a row is revised, and without
+    this that rebuild re-wraps every open body on the pane. Measured on a
+    5000-entry chat with every message showing: wrapping was 60% of the
+    rebuild, and it is the half that grows with how much *text* the
+    conversation holds rather than with how many rows it has — a megabyte in
+    one message is a megabyte re-folded on the next event that revises
+    anything.
+
+    The memo is per row, so revising one row costs that row. It is keyed by
+    width because a resize is the one thing that legitimately invalidates it,
+    and it assumes ``body`` is replaced rather than mutated in place — which
+    is what every builder here does: `state.entry_item` returns a new row for
+    a revised entry rather than editing the old one.
+    """
+
+    body: list[str]
+
+    def folded(self, width: int) -> list[str]:
+        memo = getattr(self, "_folded", None)
+        if memo is None or memo[0] != width:
+            memo = (width, [piece for raw in self.body for piece in fold(raw, width)])
+            self._folded = memo
+        return memo[1]
+
+
 @dataclass
-class Fold:
+class Fold(Wrapped):
     """One part of an entry, foldable on its own inside the entry's own fold.
 
     A turn's working is one row when it is over — "14 steps · read_file →
@@ -24,7 +52,7 @@ class Fold:
 
 
 @dataclass
-class Item:
+class Item(Wrapped):
     """One entry: a single line, plus the body it opens into.
 
     ``kind`` and ``text`` are what Enter needs: the log has to be able to say
@@ -70,9 +98,25 @@ class Pane:
     ``<key>/<n>`` beneath it.
     """
 
-    def __init__(self, name: str, items: list[Item]) -> None:
+    def __init__(
+        self, name: str, items: list[Item], *, flush: bool = False
+    ) -> None:
         self.name = name
         self.items = items
+        # Whether the rows on this pane are *text somebody will select*.
+        #
+        # A pane spends four columns before a character of its content is
+        # drawn — two on the gutter that bands the current entry, two more on
+        # the fold marker, and four again on the indent under it — and a
+        # terminal's own drag-to-select takes every one of them along with the
+        # words. Selecting out of the chat is the terminal's job here
+        # (specs-ui-replacement.md §4.1 item 6), so on the one pane whose rows
+        # are somebody's prose the columns come off: content lines start at
+        # column 0 with nothing in front of them, and the current entry is
+        # marked by weight instead of by a character. The lists — sessions,
+        # watchers, the overlays — keep the gutter, because a title in a list
+        # is not something anyone pastes into a shell.
+        self.flush = flush
         # Keys, not positions: see `key_at`.
         self.expanded: set[str] = set()
         self.cursor = 0  # index into the flattened line list
@@ -108,43 +152,98 @@ class Pane:
         keys: list[str] = []
         openable: set[str] = set()
         for index, item in enumerate(self.items):
-            key = self.key_at(index)
-            if item.openable:
-                openable.add(key)
-            opened = key in self.expanded
-            marker = ("▾" if opened else "▸") if item.openable else " "
-            lines.append((index, f"{marker} {item.head}", True))
-            keys.append(key)
-            if not opened:
-                continue
-            for raw in item.body:
-                # Folded by cells rather than by characters: a body line of
-                # CJK holds half as many characters in the same row, and
-                # counting them would leave the row over the width and the
-                # padding to truncate what did not fit.
-                for piece in fold(raw, max(8, width - 4)):
-                    lines.append((index, f"    {piece}", False))
-                    keys.append(key)
-            for n, part in enumerate(item.folds):
-                sub = f"{key}/{n}"
-                if part.body:
-                    openable.add(sub)
-                sub_open = sub in self.expanded
-                mark = ("▾" if sub_open else "▸") if part.body else " "
-                lines.append((index, f"  {mark} {part.head}", True))
-                keys.append(sub)
-                if not sub_open:
-                    continue
-                for raw in part.body:
-                    for piece in fold(raw, max(8, width - 6)):
-                        lines.append((index, f"      {piece}", False))
-                        keys.append(sub)
+            rows, names, opens = self._item_lines(index, item, width)
+            lines += rows
+            keys += names
+            openable |= opens
         if self.tail is not None:
             lines.append(self._tail_line())
             keys.append(self.key_at(len(self.items)))
         self._flat, self._keys, self._openable = lines, keys, openable
         self._flat_width = width
         return lines
+
+    def _item_lines(
+        self, index: int, item: Item, width: int
+    ) -> tuple[list[tuple[int, str, bool]], list[str], set[str]]:
+        """The lines one row draws as, what each belongs to, and what opens.
+
+        Split out of `flat` so `extend` can ask for one row's worth without
+        rebuilding the pane — see there for why that matters.
+
+        The indent is where `flush` shows up. Content lines lose it entirely;
+        the head lines that carry a marker keep theirs, because those are the
+        pane talking *about* the row rather than the row itself, and the two
+        are meant to be told apart at a glance. Anything at column 0 is
+        verbatim and selects as-is; anything indented is furniture.
+        """
+        body_pad = "" if self.flush else "    "
+        step_pad = "" if self.flush else "      "
+        lines: list[tuple[int, str, bool]] = []
+        keys: list[str] = []
+        openable: set[str] = set()
+        key = self.key_at(index)
+        if item.openable:
+            openable.add(key)
+        opened = key in self.expanded
+        marker = ("▾" if opened else "▸") if item.openable else " "
+        lines.append((index, f"{marker} {item.head}", True))
+        keys.append(key)
+        if not opened:
+            # Closed: neither its words nor its steps. Both hang off the same
+            # marker, which is what "open the row" means.
+            return lines, keys, openable
+        # Folded by cells rather than by characters: a body line of CJK holds
+        # half as many characters in the same row, and counting them would
+        # leave the row over the width and the padding to truncate what did
+        # not fit.
+        for piece in item.folded(max(8, width - len(body_pad))):
+            lines.append((index, f"{body_pad}{piece}", False))
+            keys.append(key)
+        for n, part in enumerate(item.folds):
+            sub = f"{key}/{n}"
+            if part.body:
+                openable.add(sub)
+            sub_open = sub in self.expanded
+            mark = ("▾" if sub_open else "▸") if part.body else " "
+            lines.append((index, f"  {mark} {part.head}", True))
+            keys.append(sub)
+            if not sub_open:
+                continue
+            for piece in part.folded(max(8, width - len(step_pad))):
+                lines.append((index, f"{step_pad}{piece}", False))
+                keys.append(sub)
+        return lines, keys, openable
+
+    def extend(self, item: Item) -> None:
+        """Add a row without throwing the flattened line list away.
+
+        The counterpart of the chat's append-only invariant
+        (specs-ui-replacement.md §3.2), and what that invariant is *for*: a
+        message arriving costs the lines that message draws, not a re-flatten
+        of the conversation behind it. `invalidate` would be correct and
+        O(conversation) — the shape this UI exists to not have, and one that
+        only became expensive once the chat started showing every message's
+        text rather than one truncated line of it.
+
+        A pane whose cache is already cold simply takes the row: the next
+        `flat` was going to build the whole list anyway.
+        """
+        self.items.append(item)
+        if self._flat is None:
+            return
+        # The live row sits after the last entry, so it moves down one.
+        if self.tail is not None:
+            self._flat.pop()
+            self._keys.pop()
+        index = len(self.items) - 1
+        lines, keys, openable = self._item_lines(index, item, self._flat_width)
+        self._flat += lines
+        self._keys += keys
+        self._openable |= openable
+        if self.tail is not None:
+            self._flat.append(self._tail_line())
+            self._keys.append(self.key_at(len(self.items)))
 
     def _tail_line(self) -> tuple[int, str, bool]:
         return (len(self.items), f"  {self.tail.head}", True)
@@ -395,7 +494,15 @@ class Pane:
 
     def render(self, width: int, height: int, *, focused: bool) -> list[str]:
         """The pane as exactly ``height`` lines: a title, then the body."""
-        inner = max(8, width - 2)  # two columns go to the gutter
+        # Two columns are reserved whether or not this pane spends them on a
+        # gutter. A flush pane draws its content at column 0 and leaves the
+        # slack on the right, which is worth two columns of nothing: every
+        # caller that asks a pane where its cursor is — `app.py` has a
+        # terminal width and no opinion about gutters — would otherwise have
+        # to know which panes are flush, and one that guessed wrong would ask
+        # `flat` for a width it is not cached at and rebuild it every
+        # keystroke.
+        inner = max(8, width - 2)
         lines = self.flat(inner)
         body_h = max(1, height - 1)
         self._scroll_into_view(body_h, len(lines))
@@ -410,16 +517,31 @@ class Pane:
                 out.append(" " * width)
                 continue
             owner, text, is_head = lines[row]
-            gutter = "▌ " if owner == current else "  "
+            here = owner == current
+            gutter = "" if self.flush else ("▌ " if here else "  ")
             painted = pad(gutter + text, width)
             item = self.item_at(owner)
             if row == self.cursor:
                 # The unfocused pane still shows where it was left, dimmed —
                 # that is the "memory" being visible rather than merely kept.
                 painted = (REVERSE if focused else DIM + REVERSE) + painted + RESET
+            elif item is not None and item.accent:
+                # Head *and* body, where it used to be the head alone: a
+                # message is drawn in its speaker's colour down to its last
+                # line rather than as a coloured first line over a grey wall.
+                # Dim is what a row with no colour of its own gets, and a
+                # turn's tool output is the whole of that — the one body here
+                # that really is secondary to what is around it.
+                painted = item.accent + painted + RESET
+                if here and self.flush and is_head:
+                    painted = BOLD + painted
             elif not is_head:
                 painted = DIM + painted + RESET
-            elif item is not None and item.accent:
-                painted = item.accent + painted + RESET
+            elif here and self.flush:
+                # No gutter column to band the current entry with, so it is
+                # marked by weight instead — and on the head line only,
+                # because a paragraph in bold is not an indication, it is a
+                # shout.
+                painted = BOLD + painted + RESET
             out.append(painted)
         return out

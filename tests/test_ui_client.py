@@ -27,7 +27,7 @@ from hpca.transport import InProcessConnection
 from hpca.ui.app import CHAT, INPUT, SESSIONS, WATCHERS, RowUI
 from hpca.ui import state
 from hpca.ui.client import UIClient
-from tests.ui_harness import Peer, Wire, clocked, plain, settle, widths
+from tests.ui_harness import Peer, Wire, clocked, on_entry, plain, settle, widths
 
 ROWS = [
     protocol.SessionRow(
@@ -732,7 +732,7 @@ class TestTheRewind:
     async def at_the_second_ask(self, wire) -> Wire:
         await started(wire, list(self.ENTRIES))
         wire.ui.focus = CHAT
-        wire.ui.chat.cursor = 2
+        on_entry(wire.ui.chat, 2)
         await wire.press("enter")
         assert wire.ui.overlay is not None, "enter on your own message opens the rewind"
         return wire
@@ -766,7 +766,7 @@ class TestTheRewind:
         # aimed at whatever -1 resolves to.
         await started(wire, list(self.ENTRIES))
         wire.ui.focus = CHAT
-        wire.ui.chat.cursor = 1
+        on_entry(wire.ui.chat, 1)
         await wire.press("enter")
         assert wire.ui.overlay is None
         assert wire.ui.focus == INPUT

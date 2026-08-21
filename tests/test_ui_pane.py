@@ -7,20 +7,31 @@ on whether it has a body at all.
 
 from hpca.ui.app import CHAT, SESSIONS, WATCHERS
 from hpca.ui.demo import build
-from hpca.ui.pane import Item, Pane
-from tests.ui_harness import widths
+from hpca.ui.pane import Fold, Item, Pane
+from hpca.ui.state import ChatEntry
+from tests.ui_harness import frame, plain, widths
 
 # 120 columns of terminal, minus the two the gutter takes.
 INNER = 118
 
 
-def on_an_entry_with_a_body(ui):
-    """Walk the chat cursor down to the first entry that has something to open."""
+def on_a_closed_entry(ui):
+    """Walk the chat cursor down to the first entry that is *closed* and has
+    something to open.
+
+    Closed is the part that has to be looked for. A message shows its words
+    without being opened, so the only rows the chat still folds are the turns'
+    working — which is what these tests are therefore about, and what the
+    arrow keys have to keep working on.
+    """
     pane = ui.chat
     pane.cursor = 0
-    while not pane.items[pane.current(INNER)].body:
+    for _ in range(len(pane.flat(INNER))):
+        at = pane.current(INNER)
+        if pane.items[at].openable and not pane.is_open(at):
+            return pane, at
         pane.move(1, 20, INNER)
-    return pane, pane.current(INNER)
+    raise AssertionError("the demo has no closed entry to open")
 
 
 def chat_ui():
@@ -32,26 +43,26 @@ def chat_ui():
 class TestArrowsOpenAndCloseEntries:
     def test_right_opens_the_entry(self):
         ui = chat_ui()
-        pane, item = on_an_entry_with_a_body(ui)
+        pane, item = on_a_closed_entry(ui)
         ui.handle("right", 120, 40)
         assert pane.is_open(item)
 
     def test_the_row_got_longer(self):
         ui = chat_ui()
-        pane, _ = on_an_entry_with_a_body(ui)
+        pane, _ = on_a_closed_entry(ui)
         before = len(pane.flat(INNER))
         ui.handle("right", 120, 40)
         assert len(pane.flat(INNER)) > before
 
     def test_and_the_cursor_sits_on_its_head_line(self):
         ui = chat_ui()
-        pane, item = on_an_entry_with_a_body(ui)
+        pane, item = on_a_closed_entry(ui)
         ui.handle("right", 120, 40)
         assert pane.current(INNER) == item
 
     def test_right_again_steps_into_the_open_entry(self):
         ui = chat_ui()
-        pane, _ = on_an_entry_with_a_body(ui)
+        pane, _ = on_a_closed_entry(ui)
         ui.handle("right", 120, 40)
         head = pane.cursor
         ui.handle("right", 120, 40)
@@ -59,14 +70,14 @@ class TestArrowsOpenAndCloseEntries:
 
     def test_without_closing_it(self):
         ui = chat_ui()
-        pane, item = on_an_entry_with_a_body(ui)
+        pane, item = on_a_closed_entry(ui)
         ui.handle("right", 120, 40)
         ui.handle("right", 120, 40)
         assert pane.is_open(item)
 
     def test_left_closes_it_from_inside_the_body(self):
         ui = chat_ui()
-        pane, item = on_an_entry_with_a_body(ui)
+        pane, item = on_a_closed_entry(ui)
         ui.handle("right", 120, 40)
         ui.handle("right", 120, 40)
         ui.handle("left", 120, 40)
@@ -74,7 +85,7 @@ class TestArrowsOpenAndCloseEntries:
 
     def test_and_puts_you_back_on_its_head_line(self):
         ui = chat_ui()
-        pane, _ = on_an_entry_with_a_body(ui)
+        pane, _ = on_a_closed_entry(ui)
         ui.handle("right", 120, 40)
         head = pane.cursor
         ui.handle("right", 120, 40)
@@ -83,7 +94,7 @@ class TestArrowsOpenAndCloseEntries:
 
     def test_left_on_a_closed_entry_does_nothing(self):
         ui = chat_ui()
-        pane, _ = on_an_entry_with_a_body(ui)
+        pane, _ = on_a_closed_entry(ui)
         # Not "nothing is open": the demo's session is mid-turn, and a turn's
         # steps open themselves while they arrive.
         was = set(pane.expanded)
@@ -97,7 +108,7 @@ class TestArrowsOpenAndCloseEntries:
 
     def test_shift_right_opens_every_entry(self):
         ui = chat_ui()
-        pane, _ = on_an_entry_with_a_body(ui)
+        pane, _ = on_a_closed_entry(ui)
         ui.handle("shift-right", 120, 40)
         entries = {
             pane.key_at(i) for i, x in enumerate(pane.items) if x.openable
@@ -108,7 +119,7 @@ class TestArrowsOpenAndCloseEntries:
         # "Open everything" means the second level too — otherwise a turn's
         # steps would be open and what each of them returned would not.
         ui = chat_ui()
-        pane, _ = on_an_entry_with_a_body(ui)
+        pane, _ = on_a_closed_entry(ui)
         ui.handle("shift-right", 120, 40)
         steps = {
             f"{pane.key_at(i)}/{n}"
@@ -120,7 +131,7 @@ class TestArrowsOpenAndCloseEntries:
 
     def test_shift_left_closes_them_all(self):
         ui = chat_ui()
-        pane, _ = on_an_entry_with_a_body(ui)
+        pane, _ = on_a_closed_entry(ui)
         ui.handle("shift-right", 120, 40)
         ui.handle("shift-left", 120, 40)
         assert pane.expanded == set()
@@ -128,7 +139,7 @@ class TestArrowsOpenAndCloseEntries:
     def test_e_no_longer_opens_anything(self):
         # `e` was an earlier expand key; it is a free letter now.
         ui = chat_ui()
-        pane, _ = on_an_entry_with_a_body(ui)
+        pane, _ = on_a_closed_entry(ui)
         # Not "nothing is open": the demo's session is mid-turn, and a turn's
         # steps open themselves while they arrive.
         was = set(pane.expanded)
@@ -318,3 +329,156 @@ class TestRowsAreKeyedByIdentity:
         pane.reorder(1, 10, 40)
         assert pane.expanded == {"#1"}
         assert pane.items[1].head == "one"
+
+
+class TestTheChatSelectsClean:
+    """The chat is what people copy out of, so nothing may precede its words.
+
+    Selecting text out of the chat is the terminal's own drag-to-select in
+    this UI — the mouse is deliberately left released so it keeps working
+    (specs-ui-replacement.md §4.1 items 5 and 6) — and a terminal selects
+    whole screen columns. So every column the pane spends in front of a line
+    of the conversation is a character that lands in the paste buffer, and
+    these tests are that promise: a message's own lines start at column 0 and
+    are the text and nothing else.
+
+    The rows that are *not* somebody's words keep their furniture, and that is
+    the other half of the rule this asserts: indented means the UI talking,
+    flush means verbatim.
+    """
+
+    SAID = ["the first line of it", "and the second, which is different"]
+
+    def a_chat_with(self, *entries):
+        ui = build(chat=0)
+        session = ui.session
+        session.reset(list(entries))
+        ui.focus = CHAT
+        return ui
+
+    def said(self, seq=1, kind="user"):
+        return ChatEntry(kind=kind, text="\n".join(self.SAID), seq=seq)
+
+    def test_a_message_line_is_drawn_at_column_zero(self):
+        ui = self.a_chat_with(self.said())
+        drawn = [x.rstrip() for x in frame(ui, 120, 40)]
+        assert self.SAID[0] in drawn
+        assert self.SAID[1] in drawn
+
+    def test_and_that_is_true_of_the_agents_words_too(self):
+        ui = self.a_chat_with(self.said(kind="assistant"))
+        assert self.SAID[0] in [x.rstrip() for x in frame(ui, 120, 40)]
+
+    def test_and_of_a_line_that_had_to_be_wrapped(self):
+        # The wrap is where an indent would come back if it came back
+        # anywhere: a continuation line is drawn by the pane, not by the core.
+        long = "word " * 60
+        ui = self.a_chat_with(ChatEntry(kind="assistant", text=long.strip(), seq=1))
+        wrapped = [x for x in frame(ui, 120, 40) if x.startswith("word")]
+        assert len(wrapped) > 1, "the text has to have wrapped to mean anything"
+
+    def test_the_label_is_a_line_of_its_own(self):
+        # …which is what buys the line below it: there is nothing left on the
+        # message's own lines to have to select around.
+        ui = self.a_chat_with(self.said())
+        drawn = [x.rstrip() for x in frame(ui, 120, 40)]
+        assert "  you" in drawn or "▾ you" in drawn or "▸ you" in drawn
+        assert not any(x.endswith("you " + self.SAID[0]) for x in drawn)
+
+    def test_a_row_the_ui_wrote_keeps_its_furniture(self):
+        # A turn's working is the UI talking about the conversation. It is
+        # indented, it is not verbatim, and nobody pastes it.
+        ui = self.a_chat_with(ChatEntry(kind="thinking", seq=1, steps=3))
+        assert any(x.startswith("  ") and "3 steps" in x for x in frame(ui, 120, 40))
+
+    def test_the_lists_still_have_their_gutter(self):
+        # Only the chat is flush. A sidebar row is a title, not a paste, and
+        # the band that says which one the cursor is in is worth two columns
+        # there.
+        ui = build()
+        drawn = [plain(x) for x in ui.session_pane.render(120, 8, focused=True)]
+        assert any(x.startswith("▌ ") for x in drawn)
+
+    def test_and_the_chat_has_none_at_all(self):
+        # Not one line of it, wherever the cursor happens to be — the band is
+        # drawn on every line of the entry the cursor is in, so a chat that
+        # kept it would put a character in front of a message being read.
+        ui = build()
+        ui.chat.cursor = 0
+        top = [plain(x) for x in ui.chat.render(120, 30, focused=True)]
+        ui.chat.cursor = 10**9
+        bottom = [plain(x) for x in ui.chat.render(120, 30, focused=True)]
+        assert not any(x.startswith("▌") for x in top + bottom)
+
+
+class TestAppendingWithoutReflattening:
+    """`Pane.extend`: a row arriving costs that row.
+
+    The chat draws every message's text, so its flattened line list is now as
+    long as the conversation is *wide* rather than as long as it is deep, and
+    rebuilding it on each arriving row would be the O(conversation) event this
+    whole UI exists to not have. These are the two halves of that: the cache
+    is added to rather than dropped, and what it ends up holding is exactly
+    what a rebuild would have produced.
+    """
+
+    def two_rows(self):
+        pane = Pane("p", [Item(head="first", body=["a", "b"])])
+        pane.expanded = {"#0", "#1"}
+        return pane
+
+    def test_extending_agrees_with_rebuilding(self):
+        grown = self.two_rows()
+        grown.flat(40)
+        grown.extend(Item(head="second", body=["c", "d"]))
+        built = Pane("p", list(grown.items))
+        built.expanded = set(grown.expanded)
+        assert grown.flat(40) == built.flat(40)
+
+    def test_and_does_not_drop_the_cache_to_do_it(self):
+        pane = self.two_rows()
+        was = pane.flat(40)
+        pane.extend(Item(head="second"))
+        assert pane.flat(40) is was, "the list was rebuilt rather than added to"
+
+    def test_a_cold_pane_just_takes_the_row(self):
+        pane = Pane("p", [])
+        pane.extend(Item(head="only"))
+        assert [x[1] for x in pane.flat(40)] == ["  only"]
+
+    def test_the_live_row_stays_last(self):
+        # The spinner is pinned after the last entry, so a row arriving goes
+        # in front of it rather than under it.
+        pane = self.two_rows()
+        pane.set_tail(Item(head="working"))
+        pane.flat(40)
+        pane.extend(Item(head="second"))
+        assert pane.flat(40)[-1][1].strip() == "working"
+
+    def test_and_what_opens_is_known_about_the_new_row(self):
+        pane = self.two_rows()
+        pane.flat(40)
+        pane.extend(Item(head="second", body=["c"], key="k"))
+        pane.cursor = len(pane.flat(40)) - 1
+        assert pane.expand(40), "the row it just took cannot be opened"
+
+
+class TestABodyIsWrappedOnce:
+    def test_the_same_lines_come_back(self):
+        item = Item(head="h", body=["a rather long line that will have to wrap"])
+        assert item.folded(12) == item.folded(12)
+
+    def test_and_the_second_time_is_the_same_list(self):
+        # Identity, not equality: this is the memo the rebuild leans on.
+        item = Item(head="h", body=["a rather long line that will have to wrap"])
+        assert item.folded(12) is item.folded(12)
+
+    def test_a_different_width_wraps_again(self):
+        item = Item(head="h", body=["a rather long line that will have to wrap"])
+        assert item.folded(12) != item.folded(80)
+
+    def test_a_step_body_is_memoised_too(self):
+        # Tool output is the biggest body on the pane — four hundred lines of
+        # log is routine — so it is the one that most needs not to be re-folded.
+        part = Fold(head="run_bash", body=["a line of output"] * 40)
+        assert part.folded(20) is part.folded(20)

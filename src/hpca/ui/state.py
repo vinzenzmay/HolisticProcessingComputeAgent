@@ -23,7 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from hpca.ui.ansi import BLUE, DIM, GREEN, RED, YELLOW
+from hpca.ui.ansi import AMBER, DIM, GREEN, RED, WHITE, YELLOW
 from hpca.ui.approval import Decision
 from hpca.ui.editor import Editor
 from hpca.ui.meter import render_bar, severity
@@ -36,6 +36,20 @@ OWN_MESSAGE_KINDS = ("user", "queued")
 
 # What a step's label is padded to in an opened entry, so tool names line up.
 TOOL_COLUMN = 14
+
+# The kinds whose row is folded away until somebody opens it.
+#
+# Everything else shows its words: a transcript you have to unfold one message
+# at a time is not a transcript, and the reason the chat used to draw each
+# entry as one truncated line was that the line had the speaker's label on it
+# and could not afford both. Now the label is a line of its own and the words
+# are underneath it, so there is nothing to truncate and no reason to fold.
+#
+# A turn's working is the exception, and stays the exception: it is the UI's
+# own bookkeeping about the conversation rather than anything anyone said, and
+# folding it into one box per turn is what keeps a hundred-step turn readable
+# as a list (specs-ui-acceptance.md, "The thinking box").
+FOLDED_KINDS = ("thinking",)
 
 # The mode line's copy, lifted from `tui/mode_bar.py` — the hint is the whole
 # value of the row: "auto" and "full-auto" differ by whether a destructive
@@ -145,23 +159,42 @@ def part_fold(part: ChatPart) -> Fold:
 
 
 def entry_item(entry: ChatEntry) -> Item:
-    """The row an entry draws as.
+    """The row an entry draws as: who said it, and underneath, what they said.
 
     The one place a `ChatEntry` becomes something with colours in it, so that
     every path into the chat — reset, append, update — produces the same row
     for the same entry, and an update genuinely replaces what it revises.
+
+    **Why the words are not on the same line as the label.** They used to be:
+    a row read `you   annotate the cohort BAMs`, indented under a gutter and a
+    fold marker. That is four columns of furniture in front of every line of
+    the conversation, and a terminal's drag-to-select takes all four along
+    with the text — which matters here because selecting out of the chat is
+    the terminal's job in this UI and not the UI's own
+    (specs-ui-replacement.md §4.1 item 6). So the label is a line of its own
+    and the message is `body`, which `Pane(flush=True)` draws at column 0 with
+    nothing in front of it: what you drag across is what you paste.
+
+    The rows that are *not* somebody's words keep their one-line form — a
+    turn's working, a memory recall, a notice. Those are the UI talking about
+    the conversation, they are short by construction, and nobody pastes them.
     """
     said = _one_line(entry.text)
-    body = entry.text.split("\n") if "\n" in entry.text else []
+    # Empty rather than one blank line: an assistant row is appended before
+    # its first token arrives, and `[""]` would make it openable and give it a
+    # marker pointing at nothing.
+    body = entry.text.split("\n") if entry.text else []
     # Every row carries the core's name for it, which is what `chat.update`
     # addresses and what `Pane.expanded` remembers.
     row = dict(kind=entry.kind, text=entry.text, key=str(entry.seq))
     if entry.kind == "user":
-        return Item(head=f"you   {said}", accent=BLUE, **row)
+        return Item(head="you", body=body, accent=WHITE, **row)
     if entry.kind == "queued":
-        return Item(head=f"…     {said}", accent=DIM, **row)
+        # Still the user's own words, and still copyable as such — the label
+        # is what says they have not been sent yet.
+        return Item(head="you · queued", body=body, accent=DIM, **row)
     if entry.kind == "error":
-        return Item(head=f"!     {said}", body=body, accent=RED, **row)
+        return Item(head="error", body=body, accent=RED, **row)
     if entry.kind == "thinking":
         steps = entry.steps or len(entry.parts)
         names = [x.tool or x.kind for x in entry.parts if x.tool or x.kind]
@@ -170,20 +203,20 @@ def entry_item(entry: ChatEntry) -> Item:
         # `tui/app.py`'s ThinkingBox and StepBox had between them, minus the
         # two widget classes.
         return Item(
-            head=f"      {steps} steps" + (f" · {summary}" if summary else ""),
+            head=f"{steps} steps" + (f" · {summary}" if summary else ""),
             folds=[part_fold(part) for part in entry.parts],
             **row,
         )
     if entry.kind in ("event", "recall"):
         mark = "↺" if entry.kind == "recall" else "·"
-        return Item(head=f"      {mark} {said}", body=body, accent=DIM, **row)
+        return Item(head=f"{mark} {said}", accent=DIM, **row)
     # Anything else is drawn as the agent talking, including a kind this
     # renderer has never heard of: the text is what matters and dropping the
     # row would lose it.
     return Item(
-        head=f"hpca  {said}",
-        body=body or [entry.text],
-        accent=YELLOW,
+        head="hpca",
+        body=body,
+        accent=AMBER,
         **{**row, "kind": entry.kind or "assistant"},
     )
 
@@ -669,7 +702,9 @@ class SessionState:
         # draft, so restoring the draft restores them. Only the cursor is
         # state, and this is the one place it can belong to the same session.
         self.menu_at = 0
-        self.chat = Pane("chat", [])
+        # The one flush pane: its rows are prose somebody is going to select
+        # with the mouse, so it spends no columns in front of them.
+        self.chat = Pane("chat", [], flush=True)
         # The folds this UI opened by itself, because their steps were
         # arriving while the user watched. Remembered so that the end of the
         # turn can close exactly those and leave alone whatever the user
@@ -716,7 +751,11 @@ class SessionState:
         self._rows = {
             entry.seq: i for i, entry in enumerate(self.entries) if entry.seq
         }
-        self.chat.expanded.clear()
+        self.chat.expanded = {
+            str(entry.seq)
+            for entry in self.entries
+            if entry.kind not in FOLDED_KINDS
+        }
         self.chat.invalidate()
         self.chat.cursor = 10**9  # open at the newest, as the old app does
         self.loaded = True
@@ -726,8 +765,9 @@ class SessionState:
         if entry.seq:
             self._rows[entry.seq] = len(self.entries)
         self.entries.append(entry)
-        self.chat.items.append(entry_item(entry))
-        if self.turn.busy and entry.kind == "thinking" and entry.seq:
+        if entry.kind not in FOLDED_KINDS:
+            self.chat.expanded.add(str(entry.seq))
+        elif self.turn.busy and entry.kind == "thinking" and entry.seq:
             # A turn's steps arrive while it works, and a fold that opened
             # only after the turn ended would show them all at once, after the
             # fact — "the call is on screen *while* the tool runs" is the
@@ -735,7 +775,12 @@ class SessionState:
             # merely animated. The turn's end closes it again.
             self._live.add(str(entry.seq))
             self.chat.expanded.add(str(entry.seq))
-        self.chat.invalidate()
+        # `extend`, not `items.append` + `invalidate`: what is open has just
+        # been decided, so the row's lines can be built now and added to the
+        # cache rather than the whole conversation re-flattened on the next
+        # frame. This is the append-only invariant (§3.2) being spent rather
+        # than merely kept.
+        self.chat.extend(entry_item(entry))
         self.chat.cursor = 10**9
         self.loaded = True
 

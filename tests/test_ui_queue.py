@@ -21,7 +21,7 @@ import pytest
 from hpca import protocol
 from hpca.ui.app import CHAT, INPUT, SESSIONS
 from hpca.ui.overlays import QueuedOverlay
-from tests.ui_harness import connected, plain
+from tests.ui_harness import connected, on_entry, plain
 
 STARTED = "2026-08-21T10:00:00+00:00"
 EPOCH = datetime.fromisoformat(STARTED).timestamp()
@@ -211,7 +211,11 @@ class TestTheCancelDialog:
         await queued(wire, 7, "run it again")
         await queued(wire, 8, "run it again")
         wire.ui.focus = CHAT
-        await wire.press("end", "up", "up", "enter", "x")
+        # The first of the two, named as an entry rather than counted back in
+        # lines from the working row — a queued message draws as many lines as
+        # its text needs.
+        on_entry(wire.ui.chat, len(wire.ui.chat.items) - 2)
+        await wire.press("enter", "x")
         assert wire.peer.last(protocol.TurnUnqueue).seq == 7
 
     async def test_escape_leaves_it_queued(self, wire):

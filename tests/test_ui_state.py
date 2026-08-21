@@ -8,7 +8,7 @@ import the protocol.
 
 from __future__ import annotations
 
-from hpca.ui.ansi import BLUE, RED
+from hpca.ui.ansi import AMBER, RED, WHITE
 from hpca.ui.state import (
     ChatEntry,
     ChatPart,
@@ -37,10 +37,37 @@ class TestEntriesBecomeRows:
         assert (item.kind, item.text) == ("user", "run it again")
 
     def test_and_are_marked_as_yours(self):
-        assert entry_item(entry(1)).accent == BLUE
+        # White, where the agent is amber: the two colours the conversation is
+        # actually read in, and the reason neither is one of the muted ones
+        # the rest of the UI signals with.
+        assert entry_item(entry(1)).accent == WHITE
 
-    def test_a_head_line_is_one_line(self):
+    def test_and_the_agent_gets_a_colour_of_its_own(self):
+        assert entry_item(entry(1, "assistant", "hello")).accent == AMBER
+
+    def test_a_message_puts_its_words_under_a_label_of_its_own(self):
+        # The head says who is speaking and nothing else, so that every line
+        # with words on it is drawn flush at column 0 and can be selected out
+        # of the terminal without a label or an indent coming with it.
         item = entry_item(entry(1, "assistant", "first\nsecond\nthird"))
+        assert item.head == "hpca"
+        assert item.body == ["first", "second", "third"]
+
+    def test_and_yours_says_you(self):
+        item = entry_item(entry(1, text="run it again"))
+        assert (item.head, item.body) == ("you", ["run it again"])
+
+    def test_an_empty_row_has_nothing_to_open(self):
+        # An assistant row is appended before its first token arrives, and a
+        # body of one blank line would give it a marker pointing at nothing.
+        assert entry_item(entry(1, "assistant", "")).body == []
+
+    def test_a_notice_is_still_collapsed_to_one_line(self):
+        # The rows that are the UI talking *about* the conversation keep their
+        # one-line form — they are short by construction and nobody pastes
+        # them — and a head that carried a newline would break the layout
+        # under it.
+        item = entry_item(entry(1, "event", "first\nsecond\nthird"))
         assert "\n" not in item.head
         assert "first second third" in item.head
 
@@ -123,15 +150,18 @@ class TestEntriesBecomeRows:
         assert "a note" in item.folds[0].head
 
     def test_a_queued_message_is_drawn_as_the_chat_it_will_become(self):
+        # Still the user's words and still copyable as such; the label is what
+        # says they have not been sent yet.
         item = entry_item(entry(2, "queued", "the next thing"))
         assert item.kind == "queued"
-        assert "the next thing" in item.head
+        assert item.body == ["the next thing"]
+        assert "queued" in item.head
 
     def test_a_kind_nobody_taught_it_still_draws(self):
         # The client drops events it cannot draw; a *kind* it has not seen is a
         # different thing — the row exists and the text is what matters.
         item = entry_item(entry(1, "something-new", "still readable"))
-        assert "still readable" in item.head
+        assert item.body == ["still readable"]
 
 
 # --------------------------------------------------------------- the chat
@@ -183,11 +213,13 @@ class TestTheChatIsAppendOnly:
 
     def test_a_reset_forgets_what_was_open(self):
         # The numbering is re-based, so a key still held would name a row the
-        # core has since given to something else.
+        # core has since given to something else. What is open afterwards is
+        # decided by the new transcript alone — its messages, which show their
+        # words, and not one key from before it.
         session = self.loaded()
-        session.chat.expanded = {"1", "2"}
-        session.reset([entry(1, text="only this")])
-        assert session.chat.expanded == set()
+        session.chat.expanded = {"1", "2", "9"}
+        session.reset([entry(1, text="only this"), entry(2, "thinking")])
+        assert session.chat.expanded == {"1"}
 
     def test_a_reset_lets_an_estimate_speak_again(self):
         session = self.loaded()
