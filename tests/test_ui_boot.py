@@ -486,15 +486,22 @@ class TestTheWholeRun:
                     NO_BACKEND_MESSAGE in toast.text for toast in made[0].toasts
                 )
 
+            def opened() -> bool:
+                return any(isinstance(x, LlmOverlay) for x in made[0].overlays)
+
             for _ in range(400):
                 await asyncio.sleep(0.01)
                 # The warning is emitted before the screen is asked for and
                 # delivered after it, so waiting for the later of the two is
                 # what makes this deterministic rather than lucky.
-                if said() and isinstance(made[0].overlay, LlmOverlay):
+                if said() and opened():
                     break
             assert made, "no UI was built"
-            assert isinstance(made[0].overlay, LlmOverlay)
+            # Anywhere on the stack, not necessarily on top: the manage-LLMs
+            # screen scans as it opens, and an empty scan legitimately pushes
+            # the tunnel recipe over it. Asserting the top screen would make
+            # this pass or fail on whether the sweep beat the assertion.
+            assert opened()
             # And it says why it is there, rather than appearing unbidden.
             assert said()
         finally:

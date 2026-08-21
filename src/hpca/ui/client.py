@@ -253,6 +253,23 @@ class UIClient:
                     session_id=intent.session_id or None,
                 )
             )
+        elif isinstance(intent, state.ScanBackends):
+            # Nothing to carry: the core runs both searches and answers with a
+            # sequence of frames rather than one reply, so the screen that
+            # asked fills as they arrive (`protocol.BackendScan`).
+            self.command(protocol.BackendScan())
+        elif isinstance(intent, state.ProbeBackend):
+            # The one place a key travels UI → core, and not a hole in the
+            # rule that keeps keys off the wire: the user typed it into the
+            # form a keystroke ago and nothing sends it back. None rather than
+            # "" for a probe with no key, which is how the wire spells it.
+            self.command(
+                protocol.BackendProbe(
+                    base_url=intent.base_url, api_key=intent.api_key or None
+                )
+            )
+        elif isinstance(intent, state.RemoveBackend):
+            self.command(protocol.BackendRemove(label=intent.label))
         elif isinstance(intent, state.SetProfile):
             self.command(protocol.ProfileSet(name=intent.name))
         elif isinstance(intent, state.SaveProfile):
@@ -655,6 +672,51 @@ class UIClient:
             if catalog is not None:
                 catalog(self.ui.catalog)
 
+    def _probed(self, msg: protocol.BackendProbed) -> None:
+        """`backend.probed`: what one endpoint answered, to the form that asked.
+
+        Three outcomes and no status enum, because the two fields already say
+        it (`protocol.BackendProbed`): rows are the models it serves — one
+        auto-fills the form, several are a picker — no rows with ``needs_key``
+        is an endpoint that is up and refused the key, and neither is nothing
+        OpenAI-shaped answering at all.
+
+        Addressed by ``base_url`` rather than delivered to whatever is on
+        screen: a probe of a node that has gone away costs the full timeout,
+        and by then the form may have been escaped or pointed somewhere else.
+        """
+        self.ui.probed(
+            msg.base_url,
+            [
+                state.BackendInfo(
+                    label=entry.label,
+                    model=entry.model,
+                    base_url=entry.base_url,
+                    context=entry.max_model_len or 0,
+                    needs_key=entry.needs_key,
+                    reachable=entry.reachable,
+                )
+                for entry in msg.models
+            ],
+            needs_key=msg.needs_key,
+        )
+
+    def _scanned(self, msg: protocol.BackendScanned) -> None:
+        """`backend.scanned`: the scan is over, and what its emptiness meant.
+
+        The rows are already on screen — every hit restated the catalog — so
+        this frame is only the verdict, which is the half a front-end cannot
+        reach: whether "nothing found" means the cluster declared an endpoint
+        anyway, or that what is configured still answers, or that we are off
+        the cluster and the user needs the tunnel recipe.
+        """
+        self.ui.scanned(
+            found=msg.found,
+            cluster=msg.cluster,
+            notice=msg.notice,
+            help_text=msg.help,
+        )
+
     def _profiles(self, msg: protocol.ProfileRows) -> None:
         """The profiles, whole — the answer to `profile.list`.
 
@@ -733,8 +795,16 @@ class UIClient:
             session.end_turn()
 
     def _finished(self, msg: protocol.TurnFinished) -> None:
+        """A turn is over — and if nobody was watching it, the row says so.
+
+        `turn.finished` for a session that is not on screen is the only signal
+        there is that a background conversation has something new in it: the
+        "⟳" it was carrying goes out at exactly the moment there is something
+        to read (§4.3 item 15). The core cannot flag this — which session is
+        on screen is this front-end's fact — so `RowUI.replied` marks it here.
+        """
         self._session(msg.session_id).end_turn()
-        self.ui.refresh_sidebar()
+        self.ui.replied(msg.session_id)
 
     def _failed(self, msg: protocol.TurnFailed) -> None:
         session = self._session(msg.session_id)
@@ -746,8 +816,19 @@ class UIClient:
         self.ui.refresh_sidebar()
 
     def _usage(self, msg: protocol.TurnUsage) -> None:
+        """What the last decision cost, and how long it took (`turn.usage`).
+
+        All four fields, and the last two are why the meter can draw
+        `· 14.2 tok/s` at all: the core measures the completion and times the
+        request, and passes the pair rather than a rate because dividing them
+        is a rendering decision (`protocol.TurnUsage`). `state.Context` is
+        where that division lives, so this stays a handful of arguments.
+        """
         self._session(msg.session_id).context.measure(
-            msg.prompt_tokens, msg.max_model_len
+            msg.prompt_tokens,
+            msg.max_model_len,
+            completion_tokens=msg.completion_tokens,
+            request_seconds=msg.request_seconds,
         )
 
     def _estimate(self, msg: protocol.ContextEstimate) -> None:
@@ -947,6 +1028,8 @@ UIClient._HANDLERS = {
     protocol.SessionRows.__name__: UIClient._rows,
     protocol.SessionCreated.__name__: UIClient._created,
     protocol.LLMCatalog.__name__: UIClient._catalog,
+    protocol.BackendProbed.__name__: UIClient._probed,
+    protocol.BackendScanned.__name__: UIClient._scanned,
     protocol.ProfileRows.__name__: UIClient._profiles,
     protocol.ChatReset.__name__: UIClient._reset,
     protocol.ChatAppend.__name__: UIClient._append,

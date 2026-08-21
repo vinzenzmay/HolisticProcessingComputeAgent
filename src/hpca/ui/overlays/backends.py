@@ -23,6 +23,14 @@ MARK_COLOURS: dict[bool | None, str] = {True: GREEN, False: DIM, None: DIM}
 # choosing one. Not "the one this screen would pick".
 ACTIVE = "★"
 
+# What a scan puts in the model field of an endpoint that answered its probe
+# with a 401: it is up, and the model name is behind the key. `hpca.discover`
+# mints it; the string is copied rather than imported for the reason
+# `app.DEFAULT_PROFILE` is — nothing under `hpca.ui` imports the rest of the
+# package to read one constant — and `tests/test_ui_overlays.py` holds the two
+# to each other.
+KEY_REQUIRED = "(api key required)"
+
 
 def context_label(size: int) -> str:
     """`112k` — a context length as the width of a column allows."""

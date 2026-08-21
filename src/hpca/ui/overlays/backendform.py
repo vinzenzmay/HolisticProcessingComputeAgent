@@ -7,21 +7,25 @@ read. Four fields, tab between them, and the whole thing is one `Overlay`
 rather than four widgets, because a form is a list of one-line editors and the
 list is what makes tab mean something.
 
-**The probe is not here.** `tui/backend_form.py` made an authenticated
-`/v1/models` call on enter, both to validate the key and to auto-fill the
-model and the context from the answer. That call belongs to the core (rule 2
-of §4.2: the UI opens no sockets of its own) and there is no command on the
-wire for it yet. Until there is, enter *saves* — the core validates the blob
-against the real settings model and refuses an unusable one with a `notify`,
-which is the same verdict arriving one round trip later.
+**Enter probes; ctrl+s saves anyway.** `tui/backend_form.py` made an
+authenticated `/v1/models` call on enter, and the answer does three jobs at
+once: it says whether anything OpenAI-shaped is there, it validates the key
+that was typed, and it names the models — one auto-fills the blank model
+field, several open a picker. The call itself belongs to the core (rule 2 of
+§4.2: this UI opens no sockets), and it is `backend.probe`, which landed with
+the scan. What survives from before it did is the escape hatch: ctrl+s saves
+without asking anything, which is what you want for an endpoint that is
+momentarily down but whose URL and model id you already know — and the way
+past a key the endpoint rejected but you know is right.
 """
 
 from __future__ import annotations
 
 from hpca.ui.ansi import BOLD, CYAN, DIM, RESET, pad
 from hpca.ui.editor import Editor
-from hpca.ui.overlays.base import BACK_KEYS, Overlay
-from hpca.ui.state import BackendInfo, SetBackend
+from hpca.ui.overlays.backends import backend_item
+from hpca.ui.overlays.base import BACK_KEYS, ListOverlay, Overlay
+from hpca.ui.state import BackendInfo, ProbeBackend, SetBackend
 
 URL, MODEL, KEY, CONTEXT = "base_url", "model", "api_key", "max_model_len"
 
@@ -30,17 +34,68 @@ URL, MODEL, KEY, CONTEXT = "base_url", "model", "api_key", "max_model_len"
 # knows both, and typing them is only necessary when it cannot be asked.
 FIELDS = [
     (URL, "endpoint url", "http://localhost:20001/v1"),
-    (MODEL, "model", "blank: whatever the endpoint serves"),
+    (MODEL, "model", "blank: enter asks the endpoint what it serves"),
     (KEY, "api key", "blank: none needed"),
     (CONTEXT, "context length", "blank: whatever the endpoint reports"),
 ]
 
 NEED_URL = "an endpoint url is needed — e.g. http://localhost:20001/v1"
 NEED_NUMBER = "context length must be a whole number"
+CHECKING = "asking the endpoint what it serves…"
+# The three things a probe can come back with. Each one ends in the way past
+# it, because a form that reports a refusal without saying what to do next is
+# a form the user escapes out of.
+KEY_REFUSED = (
+    "the endpoint is there and refused that key — fix it, "
+    "or press ctrl+s to save anyway"
+)
+NO_ANSWER = "nothing answered at {url} — press ctrl+s to save it anyway"
+ANSWERED = "{model} — enter saves it"
+PICK_MODEL = "that endpoint serves several — pick one"
 # What a key looks like on screen. Shown as dots for the reason the Textual
 # form used `password=True`: this window is over a terminal somebody may be
 # screen-sharing, and the key is the one field on it that is a secret.
 MASK = "•"
+PICKER_TAG = "models"
+
+
+def same_endpoint(one: str, other: str) -> bool:
+    """Whether two endpoint URLs name the same thing, trailing slash aside.
+
+    A probe is answered by the URL it was asked about (`BackendProbed`), and
+    the core echoes back what it was given — so the comparison is this side's,
+    and the one difference that shows up in practice is a `/v1` against a
+    `/v1/`.
+    """
+    return one.rstrip("/") == other.rstrip("/")
+
+
+class ModelPickerOverlay(ListOverlay):
+    """One endpoint, several models: which of them this backend is.
+
+    `protocol.BackendProbed.models` is a list of `LLMEntry`, drawn by the same
+    row renderer the catalog uses, because a probed model carries the same
+    four facts as a catalogued one.
+    """
+
+    title = "which model"
+    name = "models"
+
+    def __init__(self, models: list[BackendInfo]) -> None:
+        super().__init__(backend_item(x, star=False) for x in models)
+        self.models = list(models)
+        self.chosen: BackendInfo | None = None
+
+    def keymap(self) -> list[tuple[str, str]]:
+        return [("↑↓", "move"), ("enter", "use this one"), ("esc", "cancel")]
+
+    def chose(self, item) -> bool:
+        if item is None:
+            return True
+        self.chosen = next(
+            (x for x in self.models if x.label == item.key), None
+        )
+        return False
 
 
 class BackendFormOverlay(Overlay):
@@ -76,6 +131,13 @@ class BackendFormOverlay(Overlay):
         # it is blank and editable, otherwise the model.
         self.at = 1 if self.locked_url or base_url else 0
         self.backend: dict | None = None
+        # Whether a probe has come back happy for what is in the fields *now*.
+        # Cleared by every edit, because a key typed after an endpoint said yes
+        # is a key nothing has checked, and enter would otherwise save it as
+        # though it had been.
+        self.checked = False
+        # Whether one is out. Only the note reads it; nothing here blocks.
+        self.probing = False
 
     # ------------------------------------------------------------- the frame
 
@@ -88,7 +150,8 @@ class BackendFormOverlay(Overlay):
     def keymap(self) -> list[tuple[str, str]]:
         return [
             ("tab", "next field"),
-            ("enter", "save"),
+            ("enter", "save" if self.checked else "check the endpoint"),
+            ("^s", "save without checking"),
             ("esc", "cancel"),
         ]
 
@@ -139,17 +202,98 @@ class BackendFormOverlay(Overlay):
             self.at = (self.at - 1) % len(FIELDS)
             return True
         if key == "enter":
+            return self.save() if self.checked else self.probe()
+        if key == "ctrl-s":
+            # The deliberate escape hatch: an endpoint that is momentarily
+            # down, or a key a proxy rejects but the user knows is right, is
+            # still a backend worth having in the catalog.
             return self.save()
         if self.field() == URL and self.locked_url:
             return True
         self.values[self.field()].handle(key)
         self.note = ""
+        self.checked = False
         return True
 
     def paste(self, text: str) -> None:
         if self.field() == URL and self.locked_url:
             return
         self.values[self.field()].insert_text(text.replace("\n", " ").strip())
+        self.checked = False
+
+    # ------------------------------------------------------------- the probe
+
+    def probe(self) -> bool:
+        """Ask the core what this endpoint serves (`backend.probe`).
+
+        Nothing is waited for: the answer comes back through `probed`, which
+        may be a whole timeout later, and the form stays exactly as usable as
+        it was — escape still closes it and ctrl+s still saves it.
+        """
+        if not self.value(URL):
+            self.note = NEED_URL
+            self.at = 0
+            return True
+        self.probing = True
+        self.note = CHECKING
+        self.send(ProbeBackend(self.value(URL), self.value(KEY)))
+        return True
+
+    def probed(
+        self,
+        base_url: str,
+        models: list[BackendInfo],
+        needs_key: bool = False,
+    ) -> None:
+        """`backend.probed`, if it is about the endpoint this form is on.
+
+        Three outcomes in two fields (`protocol.BackendProbed`) and each is
+        answered here rather than by closing: what the user typed stays on
+        screen in every one of them, which is the whole difference between a
+        rejected key that can be fixed and one that has to be retyped.
+        """
+        if not same_endpoint(base_url, self.value(URL)):
+            return  # answered after the URL moved on; not ours
+        self.probing = False
+        if not models:
+            self.note = (
+                KEY_REFUSED if needs_key else NO_ANSWER.format(url=base_url)
+            )
+            if needs_key:
+                self.at = [x[0] for x in FIELDS].index(KEY)
+            return
+        if len(models) > 1:
+            self.note = PICK_MODEL
+            self.open(ModelPickerOverlay(models), PICKER_TAG)
+            return
+        self.fill_from(models[0])
+
+    def fill_from(self, entry: BackendInfo) -> None:
+        """What the endpoint said, into the two fields it can answer for.
+
+        The model and the context length, and neither is overwritten blindly:
+        a user who typed a model id meant it, and the probe is confirming the
+        endpoint rather than correcting them.
+        """
+        if not self.value(MODEL):
+            self.values[MODEL].set_text(entry.model)
+        if not self.value(CONTEXT) and entry.context:
+            self.values[CONTEXT].set_text(str(entry.context))
+        self.checked = True
+        self.note = ANSWERED.format(model=self.value(MODEL) or entry.model)
+
+    def child_closed(self, child) -> None:
+        if child.tag != PICKER_TAG or child.chosen is None:
+            return
+        # A picked model is the answer the single-model case got for free.
+        self.values[MODEL].set_text(child.chosen.model)
+        self.values[CONTEXT].set_text(
+            str(child.chosen.context) if child.chosen.context else ""
+        )
+        self.checked = True
+        self.note = ANSWERED.format(model=child.chosen.model)
+
+    # -------------------------------------------------------------- the save
 
     def save(self) -> bool:
         """Everything that can be checked without a socket, then send it."""

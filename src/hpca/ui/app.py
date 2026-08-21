@@ -112,6 +112,19 @@ MENU_ROWS = 8
 # inside (specs-ui-acceptance.md, "Backends").
 QUIT_QUESTION = "Really quit?"
 
+# What a completed stop gesture says when there was no turn under it, in the
+# two shapes that has. A backend call that is not a turn — a compaction, the
+# titler, a silent `/conclude` — has no turn to roll back and says so; an idle
+# session has nothing at all. Both are `esc esc` and Enter on the working row
+# giving the same answer to the same question.
+NOT_A_TURN = "this is a backend call, not a turn — nothing to stop"
+NOTHING_TO_STOP = "nothing running to stop"
+
+# The title over the tunnel recipe an empty scan comes back with — the words
+# `tui/manage_llms.py` put on the same window, so a user who has seen it once
+# recognises it. The recipe itself is the core's (`autoconnect.offcluster_help`).
+NO_ENDPOINTS = "no llm endpoints found"
+
 # What the config editor's fetch is addressed by. There is one settings file,
 # so the key is a constant — it exists so that the answer can be routed the
 # same way a profile's or a skill's is (`RowUI.body_arrived`).
@@ -124,6 +137,13 @@ SETTINGS_KEY = ("settings", ())
 # `session.rows` — a marker that waited for the next sidebar repaint would lag
 # a whole poll behind the event that caused it.
 DECISION_MARK, WORKING_MARK = "!", "⟳"
+
+# And the third state §4.3 item 15 asks for, which the core has no flag for
+# and could not have one: a reply landed in this conversation while the user
+# was reading another. Without it a background turn's row shows "⟳" while it
+# runs and goes blank the instant it finishes — the exact moment there is
+# something new in it — and two conversations become indistinguishable.
+UPDATED_MARK = "*"
 
 # The row that is not a session. First, where it is in the Textual sidebar and
 # for the same reason: on a cluster this is the only way to start a
@@ -230,11 +250,11 @@ class RowUI:
         self._esc_armed_at: float | None = None
         # Everything the overlays draw and nothing else reads. Handed in
         # rather than fetched, for the reason every screen in `overlays/` is:
-        # the UI opens no files and no sockets (rule 2 of §4.2). There is no
-        # `profile.list` and no catalog event on the wire yet, so `client.py`
-        # fills these from what it can and the shapes are `state.ProfileInfo`
-        # and `state.BackendInfo` — whatever carries them later fills exactly
-        # those.
+        # the UI opens no files and no sockets (rule 2 of §4.2). Both now come
+        # down the wire — `profile.rows` and `llm.catalog` — and `client.py`
+        # fills these in from them; a UI built without one (a test, the demo's
+        # first frame) draws what it was handed and is corrected by the first
+        # event that says otherwise.
         # What the config editor shows before the file it asks for arrives —
         # the last one that did, or whatever a UI with no wire behind it was
         # handed. The editor fetches on open either way (`settings.get`).
@@ -279,6 +299,11 @@ class RowUI:
         # returning anything.
         self.suspend: Callable[[Callable[[], None]], None] | None = None
         self.edit_profile: Callable[[str], None] | None = None
+        # A window that arrived while a screen was open, waiting for the
+        # screen to close (`window`). One slot: two of these queued at once
+        # would be a stack of modals nobody asked for, and the newer answer is
+        # the one still worth reading.
+        self._waiting_window: tuple[str, str] | None = None
 
     # ------------------------------------------------------ the open session
 
@@ -323,8 +348,12 @@ class RowUI:
             parent = self.overlays[-1]
             parent.child_closed(done)
             self._adopt(parent)
-        else:
-            self._closed(done)
+            # A window that arrived while this child was up: the screen under
+            # it may be one that takes it (the recipe, over manage-LLMs).
+            self._open_waiting_window()
+            return
+        self._closed(done)
+        self._open_waiting_window()
 
     def _adopt(self, screen: Overlay) -> None:
         """A screen asked for a screen of its own. Give it one."""
@@ -492,7 +521,26 @@ class RowUI:
         # and the row has to say so, even though there is no turn to stop
         # (`state.Turn.busy` is the same distinction the spinner draws).
         marks += WORKING_MARK if session.turn.busy or "working" in flags else " "
+        # Last, and only where the other two are not: a row cannot be both
+        # still working and finished, and a decision is the more urgent of the
+        # two things to say about a session that is not on screen.
+        if session.updated and not (parked or session.turn.busy):
+            marks = marks[0] + UPDATED_MARK
         return marks
+
+    def replied(self, session_id: str) -> None:
+        """A turn finished. If it was not the one on screen, flag its row.
+
+        The half of §4.3 item 15 M6 shipped without: "⟳" says a conversation
+        is busy and nothing said it had *answered*. A reply must not pull the
+        user out of what they are reading (the acceptance list is explicit
+        that it does not force the session open), so the whole of it is one
+        marker in the sidebar, cleared by opening the session.
+        """
+        session = self.session_for(session_id)
+        if session_id != self.active_id:
+            session.updated = True
+        self.refresh_sidebar()
 
     def refresh_sidebar(self) -> None:
         """Redraw the session list: which one is open, and what each is doing.
@@ -564,6 +612,9 @@ class RowUI:
         open answers no keypress at all.
         """
         self._select(session_id)
+        # Opening it is the one thing that can be read as having read it, so
+        # the "*" goes here rather than on the next frame that draws the chat.
+        self.session_for(session_id).updated = False
         self.refresh_sidebar()
         # The highlight follows what is open, the way the Textual sidebar set
         # its index after every reload: the sidebar's first row is
@@ -620,6 +671,47 @@ class RowUI:
         head = f"{title}: " if title else ""
         self._note = head + " ".join(safe(text).split())
         self.note_style = RED if severity == "error" else YELLOW
+        # And, when it is a heading over a block, the window as well. `title`
+        # is the signal (`protocol.Notify.title`): the core sets it exactly
+        # where an answer is a heading plus a body — the skills a profile can
+        # see, the summary `/compact` just wrote — and a body of more lines
+        # than a toast can carry is one that was being read as
+        # "… more in the log", where it never was.
+        if title and len(text.splitlines()) > toasts.MAX_BODY:
+            self.window(title, text)
+
+    def window(self, title: str, body: str) -> None:
+        """Text too long to be a toast, in a window that waits for escape (31).
+
+        `RowUI.inspect` with one rule on top of it: it does not land on a
+        screen the user opened for something else. The tunnel recipe is the
+        case that made the rule — a scan can finish while the connection form
+        it was started from is being typed into, and "a modal must not land on
+        top of someone mid-typing" is what `tui/manage_llms.py` parked it for.
+        So it is remembered and placed the moment it can be, which is the
+        acceptance list's "waits for a form the user already opened".
+
+        A screen that is *expecting* an answer of its own takes it straight
+        away (`Overlay.welcomes_window`): manage-LLMs asked for the scan, and
+        parking the recipe until manage-LLMs closed would hide it behind the
+        one screen it is about.
+        """
+        self._waiting_window = (title, body)
+        self._open_waiting_window()
+
+    def _open_waiting_window(self) -> None:
+        """Place a waiting window, if there is one and it may be placed."""
+        top = self.overlay
+        if self._waiting_window is None or (
+            top is not None and not top.welcomes_window
+        ):
+            return
+        title, body = self._waiting_window
+        self._waiting_window = None
+        if top is None:
+            self.inspect(title, body)
+        else:
+            self.push(InspectOverlay(body, title=title))
 
     # ------------------------------------------------- the slash commands
 
@@ -1461,7 +1553,7 @@ class RowUI:
                 lambda yes: self._confirmed_stop(session_id, yes),
             )
         else:
-            self.note = "this is a backend call, not a turn — nothing to stop"
+            self.note = NOT_A_TURN
             self.note_style = DIM
 
     def _confirmed_stop(self, session_id: str, yes: bool) -> None:
@@ -1481,7 +1573,7 @@ class RowUI:
         opened in — which is not necessarily the one on screen by the time it
         closes."""
         if overlay.choice == COPY:
-            self.reuse_message(overlay.message)
+            self.reuse_message(overlay.message, overlay.session_id)
             return
         if overlay.choice == FORK:
             self.send(Fork(overlay.session_id, overlay.seq))
@@ -1492,19 +1584,26 @@ class RowUI:
         # cursor in the box for itself.
         self.focus = INPUT
 
-    def reuse_message(self, text: str) -> None:
+    def reuse_message(self, text: str, session_id: str = "") -> None:
         """Put one of your own past messages back in the box, to send again or
         edit into the next one — usually a command that needs a word changed,
         which is otherwise retyped off the screen.
+
+        Into the draft of the session it was *taken from*, which is what the
+        rewind promises ("an intent aimed at the session it was opened in —
+        which is not necessarily the one on screen by the time it closes").
+        That is the whole of `hand_back`'s errand already, so this goes
+        through it rather than keeping a second copy of the rule that once
+        disagreed with it.
 
         Added to whatever is already being written rather than replacing it, so
         activating a message can never lose a draft. It starts its own line,
         except after a draft left ending in whitespace — that space is how you
         say "continue here" (``rerun this: `` + the old command).
         """
-        self._into_draft(self.session, text)
-        self.focus = INPUT  # cursor behind the reused text, ready to send
-        self.note = "copied into the message box"
+        self.hand_back(
+            session_id or self.active_id, text, note="copied into the message box"
+        )
 
     def _esc_armed(self) -> bool:
         """Whether a first escape is still waiting for its second.
@@ -1578,8 +1677,19 @@ class RowUI:
         if first is None or now - first > ESC_STOP_WINDOW:
             return False
         self._esc_armed_at = None  # spent: a third press opens a fresh pair
-        if self.active_id:
-            self.send(Interrupt(self.active_id))
+        if not (self.active_id and self.session.turn.interruptible):
+            # The gesture completed and there was nothing for it to do. Said
+            # rather than claimed: the footer used to report a stop it had not
+            # made, on an idle session and even with nothing open at all —
+            # and the same sentence is what four tests took as their proof
+            # that the interrupt reached the core. Which of the two answers it
+            # is matters: a spinner that cannot be stopped is a different
+            # thing from no spinner, and `_stop_from_the_row` already tells
+            # them apart.
+            self.note = NOT_A_TURN if self.session.turn.busy else NOTHING_TO_STOP
+            self.note_style = DIM
+            return True
+        self.send(Interrupt(self.active_id))
         self.note = "stopped the turn"
         return True
 
@@ -1721,6 +1831,15 @@ class RowUI:
         # profile is asking (`core.service._list_skills`), and it is empty —
         # null on the wire — exactly when there is nothing open.
         self.send(RunCommand(name, args, self.active_id))
+        if command.folds:
+            # `/compact` rewrites the thread without taking a message out of
+            # it, so no `chat.reset` follows and nothing else would ever
+            # unstick the measured fill: the bar would keep showing the
+            # pre-fold 92%, unmarked, for as long as the session stayed quiet.
+            # Said here, where the command is known, rather than waited for —
+            # the core's fresh `context.estimate` is a round trip away and the
+            # number on screen is wrong the moment the command goes out.
+            self.session.context.superseded()
         self.input.clear()
         self.note = f"/{name}"
 
@@ -2051,13 +2170,68 @@ class RowUI:
         """A read-only window over text too long to be a toast (item 31)."""
         self.overlay = InspectOverlay(body, title=title)
 
+    # ------------------------------------------------ what a scan answers with
+
+    def probed(
+        self,
+        base_url: str,
+        models: list[BackendInfo],
+        *,
+        needs_key: bool = False,
+    ) -> None:
+        """`backend.probed`: what one endpoint answered, to whoever asked.
+
+        Addressed by endpoint rather than delivered to whatever is on screen:
+        a probe of a node that has gone away costs the full timeout, and by
+        then the form may have been escaped or pointed somewhere else. A
+        screen that recognises the URL takes it; nobody recognising it is a
+        question whose asker has gone, and the answer is dropped rather than
+        toasted at a user who has moved on.
+        """
+        for screen in list(self.overlays):
+            answer = getattr(screen, "probed", None)
+            if answer is not None:
+                answer(base_url, models, needs_key)
+        if self.overlays:
+            # A probe that has to be *chosen* between opens a picker, and a
+            # screen opened outside a keypress still has to be adopted — the
+            # one in `handle` only ever sees what a key asked for.
+            self._adopt(self.overlays[-1])
+
+    def scanned(
+        self,
+        *,
+        found: int = 0,
+        cluster: int = 0,
+        notice: str = "",
+        help_text: str = "",
+    ) -> None:
+        """`backend.scanned`: the scan is over, and what its emptiness meant.
+
+        The rows are already drawn — every hit restated the catalog — so this
+        is the verdict, and the two texts are rendered differently on purpose
+        (`protocol.BackendScanned`): ``notice`` is a passing remark and goes
+        in a toast, ``help`` is the tunnel recipe and needs a window that
+        holds a selection and waits to be dismissed. Both empty means the scan
+        found things and there is nothing to explain.
+        """
+        for screen in self.overlays:
+            done = getattr(screen, "scanned", None)
+            if done is not None:
+                done(found, cluster)
+        if notice:
+            self.toast(notice)
+        if help_text:
+            self.window(NO_ENDPOINTS, help_text)
+
     def _profile_rows(self) -> list[Item]:
         """The profiles a new conversation can be started under.
 
-        Assembled from what the UI has already been told rather than fetched,
-        because there is no `profile.list` on the wire yet (§4.3 item 27, M7):
-        the core's own profile from `hello`, the profile of every session in
-        the sidebar, and whatever the profiles screen was handed. The default
+        Assembled from what the UI has already been told rather than asked
+        for again: `profile.rows` fills `self.profiles`, and the picker adds
+        what it knows besides — the core's own profile from `hello` and the
+        profile of every session in the sidebar, so a conversation can be
+        started under a profile the list has not arrived for. The default
         leads, then the rest in the order they were met — which puts the
         profile the user is working in at the top of the list they are about
         to pick from.

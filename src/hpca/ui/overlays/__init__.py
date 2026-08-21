@@ -13,7 +13,10 @@ profiles list needs three — sets ``child`` and `RowUI` stacks it.
 
 from __future__ import annotations
 
-from hpca.ui.overlays.backendform import BackendFormOverlay
+from hpca.ui.overlays.backendform import (
+    BackendFormOverlay,
+    ModelPickerOverlay,
+)
 from hpca.ui.overlays.backends import backend_head, backend_item, row_key
 from hpca.ui.overlays.base import (
     BACK_KEYS,
@@ -96,6 +99,7 @@ __all__ = [
     "ListOverlay",
     "LlmOverlay",
     "MemoryReviewOverlay",
+    "ModelPickerOverlay",
     "NewSessionOverlay",
     "Overlay",
     "ProfilesOverlay",

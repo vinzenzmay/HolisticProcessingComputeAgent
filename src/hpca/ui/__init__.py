@@ -39,11 +39,12 @@ The content is real from M2 on: ``client`` fills ``state`` in from protocol
 events and the rows render that. From M3 there is a real core behind it —
 ``hpca --new-ui`` builds an ``AgentService`` over an ``InProcessConnection``
 and ``run`` drives stdin, that connection and SIGWINCH on one asyncio loop.
-What is deliberately still missing: mouse support, selecting text out of the
-*chat*, the slash commands and the management overlays. Those are arguments
-*against* leaving Textual, so none of them is pretended solved —
-specs-ui-replacement.md §4 is the full list of what is absent and the order it
-arrives in.
+M7 and M8 added the management overlays and the slash commands, and M9 the
+scan, the probe and the read-only window. What is deliberately still missing:
+mouse support and selecting text out of the *chat* — the terminal's own
+selection does the second one, which is why the mouse stays released.
+specs-ui-replacement.md §4 is the full list of what is absent, and
+specs-ui-coverage.md §3 is what an audit found still unwired.
 
 The modules, per specs-ui-replacement.md §3:
 

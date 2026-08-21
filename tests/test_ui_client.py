@@ -496,6 +496,66 @@ class TestTheContextMeter:
         )
         assert "~500 / 10,000 (5%)" in wire.screen()
 
+    # ---------------------------------------------- the speed (§6, §3.14 #9)
+
+    async def test_the_speed_is_the_pair_the_core_sent_divided(self, wire):
+        # `client._usage` dropped both of these, so `· tok/s` could never
+        # appear — while `state.py` said "nothing on the wire carries either".
+        await started(wire)
+        await wire.tell(
+            protocol.TurnUsage(
+                session_id="s1",
+                prompt_tokens=2000,
+                max_model_len=10000,
+                completion_tokens=210,
+                request_seconds=50.0,
+            )
+        )
+        assert "· 4.2 tok/s" in wire.screen()
+
+    async def test_a_fast_turn_drops_the_decimal(self, wire):
+        await started(wire)
+        await wire.tell(
+            protocol.TurnUsage(
+                session_id="s1",
+                prompt_tokens=2000,
+                max_model_len=10000,
+                completion_tokens=840,
+                request_seconds=10.0,
+            )
+        )
+        assert "· 84 tok/s" in wire.screen()
+
+    async def test_a_restatement_with_no_generation_keeps_the_last_rate(
+        self, wire
+    ):
+        # A session restated after a backend switch has a prompt size and no
+        # fresh generation behind it (`protocol.TurnUsage`), and 0/None must
+        # not become "0.0 tok/s".
+        await started(wire)
+        await wire.tell(
+            protocol.TurnUsage(
+                session_id="s1",
+                prompt_tokens=2000,
+                max_model_len=10000,
+                completion_tokens=210,
+                request_seconds=50.0,
+            ),
+            protocol.TurnUsage(
+                session_id="s1", prompt_tokens=2500, max_model_len=10000
+            ),
+        )
+        assert "· 4.2 tok/s" in wire.screen()
+
+    async def test_and_a_session_that_generated_nothing_shows_no_rate(self, wire):
+        await started(wire)
+        await wire.tell(
+            protocol.TurnUsage(
+                session_id="s1", prompt_tokens=2000, max_model_len=10000
+            )
+        )
+        assert "tok/s" not in wire.screen()
+
 
 # -------------------------------------------------------------- the panels
 
@@ -592,11 +652,23 @@ class TestKeysBecomeCommands:
 
     async def test_esc_esc_interrupts_the_open_session(self, wire):
         await started(wire)
+        await wire.tell(protocol.TurnStarted(session_id="s1"))
         clocked(wire.ui)
         await wire.press("esc")
         wire.ui._now += 0.2
         await wire.press("esc")
         assert wire.peer.last(protocol.TurnInterrupt).session_id == "s1"
+
+    async def test_and_with_no_turn_running_it_sends_nothing(self, wire):
+        # §4: the gesture used to report a stop it had not made, on an idle
+        # session and even with nothing open at all.
+        await started(wire)
+        clocked(wire.ui)
+        await wire.press("esc")
+        wire.ui._now += 0.2
+        await wire.press("esc")
+        assert wire.peer.took(protocol.TurnInterrupt) == []
+        assert "stopped" not in wire.ui.note
 
     async def test_one_esc_interrupts_nothing(self, wire):
         await started(wire)

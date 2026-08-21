@@ -6,10 +6,26 @@ feed keys, read the frame back and look at it".
 
 import pytest
 
-from hpca.ui.app import CHAT, INPUT, SESSIONS, WATCHERS, RowUI
+from hpca.ui.app import (
+    CHAT,
+    INPUT,
+    NOT_A_TURN,
+    NOTHING_TO_STOP,
+    SESSIONS,
+    WATCHERS,
+    RowUI,
+)
 from hpca.ui.demo import build
 from hpca.ui.keys import PASTE, decode
-from tests.ui_harness import clocked, frame, on_own_message, plain, widths
+from hpca.ui.state import Interrupt
+from tests.ui_harness import (
+    clocked,
+    frame,
+    on_own_message,
+    plain,
+    recorded,
+    widths,
+)
 
 SIZES = [(80, 24), (120, 40), (200, 60), (60, 14), (40, 10), (100, 8)]
 ROW_NAMES = ["sessions", "chat", "message", "watchers"]
@@ -418,9 +434,17 @@ def test_the_frame_is_still_exact_with_an_empty_watcher_row():
 
 
 def half_a_message() -> RowUI:
-    ui = clocked(build())
+    # `recorded`, because the note is not evidence: the four tests that used
+    # "stopped the turn" as their proof would all have passed with the
+    # `Interrupt` deleted (specs-ui-coverage.md §4). What the gesture does is
+    # send one, so that is what these read.
+    ui = recorded(clocked(build()))
     ui.focus = INPUT
     return typed(ui, "half a message")
+
+
+def stops(ui: RowUI) -> list:
+    return [x for x in ui.intents if isinstance(x, Interrupt)]
 
 
 def test_one_esc_does_not_leave_the_box():
@@ -477,7 +501,14 @@ def armed_then_stopped() -> RowUI:
 
 
 def test_the_second_esc_stops_the_turn():
-    assert armed_then_stopped().note == "stopped the turn"
+    ui = armed_then_stopped()
+    assert stops(ui), "the note is not the evidence; the command is"
+    assert ui.note == "stopped the turn"
+
+
+def test_and_it_names_the_session_it_was_aimed_at():
+    ui = armed_then_stopped()
+    assert stops(ui)[-1].session_id == ui.active_id
 
 
 def test_and_the_hint_is_gone():
@@ -509,12 +540,42 @@ def test_but_it_is_armed_for_a_fourth():
 
 def test_the_fourth_stops_again():
     ui = armed_then_stopped()
+    # The demo core answers the first interrupt by ending the turn, so there
+    # has to be another one running for a second stop to mean anything —
+    # which is the whole point of the fix: the gesture reports what it did.
+    ui.session.turn.working = True
     ui._now += 0.2
     ui.note = ""
     ui.handle("esc", 120, 40)
     ui._now += 0.1
     ui.handle("esc", 120, 40)
     assert ui.note == "stopped the turn"
+    assert len(stops(ui)) == 2
+
+
+def test_a_completed_gesture_with_nothing_running_claims_nothing():
+    # §4: `esc esc` on an idle session used to say the turn was stopped.
+    ui = half_a_message()
+    ui.session.turn.working = False
+    ui.session.turn.activity = ""
+    ui.handle("esc", 120, 40)
+    ui._now += 0.2
+    ui.handle("esc", 120, 40)
+    assert ui.note == NOTHING_TO_STOP
+    assert stops(ui) == [], "and it sends nothing, either"
+
+
+def test_and_on_a_backend_call_it_says_which():
+    # A compaction or the titler: a spinner is turning and there is no turn
+    # behind it. The same answer Enter on the working row gives.
+    ui = half_a_message()
+    ui.session.turn.working = False
+    ui.session.turn.activity = "writing a title"
+    ui.handle("esc", 120, 40)
+    ui._now += 0.2
+    ui.handle("esc", 120, 40)
+    assert ui.note == NOT_A_TURN
+    assert stops(ui) == []
 
 
 def test_two_escapes_too_far_apart_do_nothing():
@@ -528,11 +589,12 @@ def test_two_escapes_too_far_apart_do_nothing():
 
 @pytest.mark.parametrize("row", [CHAT, SESSIONS, WATCHERS])
 def test_esc_esc_stops_from_the_row_too(row):
-    ui = clocked(build())
+    ui = recorded(clocked(build()))
     ui.focus = row
     ui.handle("esc", 120, 40)
     ui._now += 0.1
     ui.handle("esc", 120, 40)
+    assert stops(ui), "from every row, and on the wire rather than in a note"
     assert ui.note == "stopped the turn"
 
 

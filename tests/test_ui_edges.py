@@ -394,7 +394,8 @@ class TestTheEditorItself:
     resolution order, the round trip through a file, and what happens when it
     exits badly. `hpca.editor.resolve_editor` is not reimplemented, so the
     "settings, then $VISUAL, then $EDITOR, then nano" order is its own test
-    (`tests/test_memory_ops.py`); this checks that this side uses it.
+    (`tests/test_editor.py::TestResolveEditor` — the pointer here used to name
+    a file that does not exist); this checks that this side uses it.
     """
 
     def _editor(self, tmp_path, body: str, code: int = 0) -> str:

@@ -1,10 +1,14 @@
 """The read-only window (§4.3 item 31): text too long to be a toast.
 
-`/skills-list` opens it, and so does the tunnel recipe manage-LLMs offers when
-a scan finds nothing — text that has to be *retyped into a shell*, which is
-the whole reason it is a window that waits for escape rather than a toast that
-goes away on its own. With the mouse released the terminal's own selection
-copies it, which is the argument for leaving the mouse released (§4.1 item 6).
+Two callers, and they arrive by two routes. A `notify` with a *title* over
+more lines than a toast can carry is a heading plus a block — `/skills-list`,
+the summary `/compact` just wrote — and `RowUI.toast` sends those here rather
+than cutting them to three lines and pointing at a log that does not record
+them. The other is the tunnel recipe manage-LLMs offers when a scan finds
+nothing: text that has to be *retyped into a shell*, which is the whole reason
+this waits for escape rather than going away on its own. With the mouse
+released the terminal's own selection copies it, which is the argument for
+leaving the mouse released (§4.1 item 6).
 
 Nothing is editable and nothing is chosen: the only keys are the ones that
 scroll, and escape.

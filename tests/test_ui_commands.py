@@ -22,6 +22,7 @@ from hpca.ui.app import INPUT, RowUI
 from hpca.ui.commands import BUILTINS, Command
 from hpca.ui.demo import build
 from hpca.ui.overlays import (
+    InspectOverlay,
     SkillCreatorOverlay,
     SkillRemoveOverlay,
     ThinkingOverlay,
@@ -320,6 +321,113 @@ class TestTheSevenBuiltins:
         press(ui, *"/compact", "enter")
         assert sent(ui, RunCommand) == []
         assert "no session open" in ui.note
+
+
+class TestWhatACompactDoesToTheMeter:
+    """specs-ui-coverage.md §3.6: both halves were green and the seam was not.
+
+    The core folds the thread and re-derives the fill (`forget_session` then
+    `estimate_context`), and deliberately sends no `chat.reset` — a fold
+    rewrites the conversation without taking a message out of it. So nothing
+    ever cleared `Context.measured`, `Context.estimate` went on returning
+    early, and a session compacted at 92% stayed at 92% indefinitely.
+    """
+
+    def measured(self) -> RowUI:
+        ui = app()
+        ui.session.context.measure(9200, 10000)
+        return ui
+
+    def test_the_measured_number_stops_claiming_to_be_measured(self):
+        ui = self.measured()
+        assert ui.session.context.measured
+        press(ui, *"/compact", "enter")
+        assert not ui.session.context.measured
+
+    def test_and_the_bar_says_so_with_the_tilde(self):
+        ui = self.measured()
+        press(ui, *"/compact", "enter")
+        assert "~9,200 / 10,000" in screen(ui)
+
+    def test_and_the_fresh_estimate_is_no_longer_ignored(self):
+        ui = self.measured()
+        press(ui, *"/compact", "enter")
+        ui.session.context.estimate(1200, 10000)
+        assert "~1,200 / 10,000" in screen(ui)
+
+    def test_the_fill_is_not_blanked_in_the_meantime(self):
+        # Not `reset()`: the number is stale, not gone, and "no reply yet" on
+        # a conversation with a hundred entries would be the worse lie.
+        ui = self.measured()
+        press(ui, *"/compact", "enter")
+        assert ui.session.context.known
+        assert "no reply yet" not in screen(ui)
+
+    def test_a_command_that_does_not_fold_leaves_it_alone(self):
+        ui = self.measured()
+        press(ui, *"/conclude", "enter")
+        assert ui.session.context.measured
+
+    def test_a_refused_compact_leaves_it_alone_too(self):
+        ui = self.measured()
+        ui.session.turn.working = True
+        press(ui, *"/compact", "enter")
+        assert ui.session.context.measured
+
+
+class TestALongAnswerGetsAWindow:
+    """§3.7: `notify` carries a title, and a heading over a block is not a toast.
+
+    `/skills-list` prints two lines per skill and `/compact` answers with the
+    summary itself; both were being cut to three lines and "… more in the
+    log", where they never were — the log records turns, not command answers.
+    `RowUI.inspect` was built and tested for exactly this and had no caller.
+    """
+
+    def listing(self) -> str:
+        return "\n".join(f"• skill-{i}\n    what it does" for i in range(6))
+
+    def test_a_titled_block_opens_the_window(self):
+        ui = app()
+        ui.toast(self.listing(), title="Skills · profile “hpc”")
+        assert isinstance(ui.overlay, InspectOverlay)
+        assert "skill-5" in screen(ui)
+
+    def test_and_the_heading_is_the_window_title(self):
+        ui = app()
+        ui.toast(self.listing(), title="Skills · profile “hpc”")
+        assert "Skills · profile “hpc”" in screen(ui)
+
+    def test_and_it_stays_until_escape(self):
+        ui = app()
+        ui.toast(self.listing(), title="Skills")
+        assert isinstance(press(ui, "x").overlay, InspectOverlay)
+        assert press(ui, "esc").overlay is None
+
+    def test_a_one_liner_with_a_heading_is_still_a_toast(self):
+        # The xhigh warning is a heading over one long paragraph, and it is
+        # meant to be read and dismissed rather than opened.
+        ui = app()
+        ui.toast("x" * 400, title="Thinking: xhigh — NOT USABLE")
+        assert ui.overlay is None
+
+    def test_and_so_is_a_block_with_no_heading_at_all(self):
+        ui = app()
+        ui.toast("one\ntwo\nthree\nfour\nfive")
+        assert ui.overlay is None
+
+    def test_the_toast_is_raised_either_way(self):
+        ui = app()
+        ui.toast(self.listing(), title="Skills")
+        assert ui.toasts, "the footer note and the block are not replaced by it"
+
+    def test_it_waits_rather_than_covering_a_screen_the_user_opened(self):
+        ui = app()
+        press(ui, *"/thinking", "enter")
+        ui.toast(self.listing(), title="Skills")
+        assert isinstance(ui.overlay, ThinkingOverlay)
+        press(ui, "esc")
+        assert isinstance(ui.overlay, InspectOverlay)
 
 
 class TestAnUnknownCommand:

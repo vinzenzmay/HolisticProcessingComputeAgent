@@ -20,6 +20,7 @@ from hpca.ui.overlays import (
     PREVIEW_CHARS,
     BackendFormOverlay,
     ConfigOverlay,
+    ModelPickerOverlay,
     HelpOverlay,
     InspectOverlay,
     LlmOverlay,
@@ -32,9 +33,13 @@ from hpca.ui.overlays import (
     TextEditOverlay,
     ThinkingOverlay,
 )
+from hpca.ui.overlays.backends import KEY_REQUIRED
 from hpca.ui.state import (
     BackendInfo,
     CopyProfile,
+    ProbeBackend,
+    RemoveBackend,
+    ScanBackends,
     CreateProfile,
     DeleteProfile,
     DeleteSkill,
@@ -721,8 +726,148 @@ class TestManageLlms:
         body = screen(opened("m"))
         assert "●" in body and "○" in body and "★" in body
 
-    def test_nothing_is_discovered_and_it_says_why(self):
-        assert "nothing discovered" in screen(opened("m"))
+    def test_the_scan_goes_out_when_the_screen_opens(self):
+        # §3.1: the core has implemented and tested the scan since `efb9b3f`
+        # and nothing in the UI ever sent it — while this screen's docstring
+        # said discovery "is not implemented anywhere".
+        assert sent(opened("m"), ScanBackends)
+
+    def test_and_the_panel_fills_from_the_frames_it_answers_with(self):
+        # The demo core answers the way a real one does: a catalog per hit.
+        assert "mistral-small-3.1" in screen(opened("m"))
+
+    def test_a_scan_that_finds_nothing_says_so_on_the_panel(self):
+        overlay = LlmOverlay(catalog())
+        overlay.scanned(0, 0)
+        assert "nothing discovered" in "\n".join(
+            plain(x) for x in overlay.render(120, 30)
+        )
+
+    def test_and_says_what_it_found_when_it_finds_something(self):
+        assert "2 endpoint(s) found" in screen(opened("m"))
+
+    def test_the_screen_takes_keys_while_the_scan_is_still_out(self):
+        # "The UI stays responsive and closable during a slow scan": nothing
+        # here waits on the answer, so a screen whose scan never comes back
+        # still moves, and still closes.
+        overlay = LlmOverlay(catalog())
+        overlay.scanning = True
+        assert overlay.handle("ctrl-down", 120, 30) is True
+        assert overlay.handle("esc", 120, 30) is False
+
+    def test_a_rescan_asks_again(self):
+        ui = opened("m")
+        press(ui, "s")
+        assert len(sent(ui, ScanBackends)) == 2
+
+    def test_a_discovered_row_already_configured_is_not_drawn_twice(self):
+        # `core/backends.py` emits discovered rows without excluding the
+        # configured ones, so the dedup the Textual screen did at save time
+        # has to happen here or the endpoint appears under two labels.
+        rows = catalog() + [
+            BackendInfo(
+                label="qwen3-27b-fp8 @ a",
+                model="qwen3-27b-fp8",
+                base_url="http://a/v1",
+                discovered=True,
+            )
+        ]
+        assert LlmOverlay(rows).discovered == []
+
+    def test_the_tunnel_recipe_opens_over_the_screen_that_asked(self):
+        ui = opened("m")
+        ui.scanned(found=0, cluster=0, help_text="ssh -L 20001:node042:20001 …")
+        assert isinstance(ui.overlay, InspectOverlay)
+        assert "ssh -L" in screen(ui)
+
+    def test_and_escaping_it_lands_back_on_manage_llms(self):
+        ui = opened("m")
+        ui.scanned(found=0, cluster=0, help_text="ssh -L 20001:node042:20001 …")
+        assert isinstance(press(ui, "esc").overlay, LlmOverlay)
+
+    def test_it_waits_for_a_form_the_user_already_opened(self):
+        ui = press(opened("m"), "a")
+        ui.scanned(found=0, cluster=0, help_text="ssh -L 20001:node042:20001 …")
+        assert isinstance(ui.overlay, BackendFormOverlay)
+
+    def test_and_arrives_when_the_form_closes(self):
+        ui = press(opened("m"), "a")
+        ui.scanned(found=0, cluster=0, help_text="ssh -L 20001:node042:20001 …")
+        press(ui, "esc")
+        assert isinstance(ui.overlay, InspectOverlay)
+
+    def test_a_notice_is_a_toast_and_not_a_window(self):
+        # "An empty scan with a backend up says only 'nothing new'."
+        ui = opened("m")
+        ui.scanned(found=0, cluster=0, notice="Nothing new on localhost")
+        assert isinstance(ui.overlay, LlmOverlay)
+        assert "Nothing new on localhost" in ui.note
+
+    def test_r_removes_a_configured_backend_after_asking(self):
+        ui = opened("m")
+        press(ui, "ctrl-down", "r")
+        assert "Remove" in screen(ui)
+        assert sent(ui, RemoveBackend) == []
+        press(ui, "y")
+        assert sent(ui, RemoveBackend)[-1].label.startswith("qwen3-27b-fp8")
+
+    def test_and_denying_keeps_it(self):
+        ui = opened("m")
+        press(ui, "ctrl-down", "r", "n")
+        assert sent(ui, RemoveBackend) == []
+        assert "qwen3-27b-fp8" in screen(ui)
+
+    def test_and_the_row_goes_before_the_core_answers(self):
+        ui = opened("m")
+        label = ui.overlay.configured[0].label
+        press(ui, "ctrl-down", "r", "y")
+        assert label not in [x.label for x in ui.overlay.configured]
+
+    def test_enter_on_a_locked_row_opens_the_key_form(self):
+        overlay = LlmOverlay(
+            [
+                BackendInfo(
+                    label="locked",
+                    model=KEY_REQUIRED,
+                    base_url="http://c/v1",
+                    needs_key=True,
+                    discovered=True,
+                )
+            ]
+        )
+        assert overlay.handle("enter", 120, 30) is True
+        form = overlay.child
+        assert form.value("base_url") == "http://c/v1"
+        assert form.value("model") == "", "the sentinel is not a model name"
+        assert form.field() == "api_key" or form.locked_url
+
+    def test_and_a_cluster_row_keeps_the_model_it_was_told(self):
+        # The manifest names the model of an endpoint the sweep could only get
+        # a 401 out of; retyping it would be work we were spared.
+        overlay = LlmOverlay(
+            [
+                BackendInfo(
+                    label="qwen @ node042",
+                    model="qwen3-27b-fp8",
+                    base_url="http://node042:20001/v1",
+                    needs_key=True,
+                    discovered=True,
+                )
+            ]
+        )
+        overlay.handle("enter", 120, 30)
+        assert overlay.child.value("model") == "qwen3-27b-fp8"
+
+    def test_the_sentinel_is_the_one_the_scanner_mints(self):
+        from hpca.discover import KEY_REQUIRED as MINTED
+
+        assert KEY_REQUIRED == MINTED
+
+    def test_remove_is_inert_on_the_discovered_panel(self):
+        ui = opened("m")
+        press(ui, "r")
+        assert sent(ui, RemoveBackend) == []
+        assert "not in the catalog" in screen(ui)
 
     def test_the_footer_offers_add_only_on_the_discovered_panel(self):
         ui = opened("m")
@@ -743,7 +888,7 @@ class TestManageLlms:
         type_text(ui, "http://new/v1")
         press(ui, "tab")
         type_text(ui, "mistral")
-        press(ui, "enter")
+        press(ui, "ctrl-s")
         saved = sent(ui, SetBackend)[-1]
         assert saved.backend["base_url"] == "http://new/v1"
         assert saved.session_id == "", "the global half: no session named"
@@ -753,7 +898,7 @@ class TestManageLlms:
         type_text(ui, "http://new/v1")
         press(ui, "tab")
         type_text(ui, "mistral")
-        press(ui, "enter")
+        press(ui, "ctrl-s")
         assert isinstance(ui.overlay, LlmOverlay)
         assert "mistral" in screen(ui)
 
@@ -803,7 +948,7 @@ class TestBackendForm:
         form.at = 3
         for ch in "many":
             form.handle(ch, 100, 20)
-        assert form.handle("enter", 100, 20) is True
+        assert form.handle("ctrl-s", 100, 20) is True
         assert "whole number" in form.note
 
     def test_the_key_is_masked(self):
@@ -820,8 +965,113 @@ class TestBackendForm:
         form.at = 2
         for ch in "s3cret":
             form.handle(ch, 100, 20)
-        form.handle("enter", 100, 20)
+        form.handle("ctrl-s", 100, 20)
         assert form.sent[-1].backend["api_key"] == "s3cret"
+
+    # ------------------------------------------------- the probe (§3.1, M8a)
+
+    def test_enter_probes_rather_than_saving(self):
+        form = BackendFormOverlay(base_url="http://x/v1")
+        assert form.handle("enter", 100, 20) is True
+        assert form.sent == [ProbeBackend("http://x/v1", "")]
+        assert form.backend is None, "nothing is saved until it answers"
+
+    def test_the_typed_key_goes_with_it(self):
+        form = BackendFormOverlay(base_url="http://x/v1")
+        form.at = 2
+        for ch in "s3cret":
+            form.handle(ch, 100, 20)
+        form.handle("enter", 100, 20)
+        assert form.sent[-1].api_key == "s3cret"
+
+    def test_one_model_fills_the_form_in(self):
+        form = BackendFormOverlay(base_url="http://x/v1")
+        form.handle("enter", 100, 20)
+        form.probed(
+            "http://x/v1",
+            [BackendInfo(label="qwen3", model="qwen3", context=112000)],
+        )
+        assert form.value("model") == "qwen3"
+        assert form.value("max_model_len") == "112000"
+
+    def test_and_the_next_enter_saves_it(self):
+        form = BackendFormOverlay(base_url="http://x/v1")
+        form.handle("enter", 100, 20)
+        form.probed("http://x/v1", [BackendInfo(label="q", model="q")])
+        assert form.handle("enter", 100, 20) is False
+        assert form.sent[-1].backend["model"] == "q"
+
+    def test_editing_after_a_probe_makes_enter_check_again(self):
+        form = BackendFormOverlay(base_url="http://x/v1")
+        form.probed("http://x/v1", [BackendInfo(label="q", model="q")])
+        form.at = 2
+        form.handle("k", 100, 20)  # a key nothing has checked
+        assert form.handle("enter", 100, 20) is True
+        assert isinstance(form.sent[-1], ProbeBackend)
+
+    def test_a_rejected_key_warns_and_keeps_the_input(self):
+        form = BackendFormOverlay(base_url="http://x/v1")
+        form.at = 2
+        for ch in "wrong":
+            form.handle(ch, 100, 20)
+        form.probed("http://x/v1", [], needs_key=True)
+        assert "refused that key" in form.note
+        assert form.value("api_key") == "wrong"
+        assert form.field() == "api_key", "the cursor lands where the fix is"
+
+    def test_and_ctrl_s_saves_it_anyway(self):
+        form = BackendFormOverlay(base_url="http://x/v1", model="m")
+        form.probed("http://x/v1", [], needs_key=True)
+        assert "ctrl+s" in form.note
+        assert form.handle("ctrl-s", 100, 20) is False
+        assert form.sent[-1].backend["base_url"] == "http://x/v1"
+
+    def test_nothing_answering_is_told_apart_from_a_refused_key(self):
+        form = BackendFormOverlay(base_url="http://x/v1")
+        form.probed("http://x/v1", [], needs_key=False)
+        assert "nothing answered" in form.note
+
+    def test_an_answer_for_another_endpoint_is_not_ours(self):
+        form = BackendFormOverlay(base_url="http://x/v1")
+        form.probed("http://elsewhere/v1", [BackendInfo(label="q", model="q")])
+        assert form.value("model") == ""
+
+    def test_a_trailing_slash_is_still_the_same_endpoint(self):
+        form = BackendFormOverlay(base_url="http://x/v1")
+        form.probed("http://x/v1/", [BackendInfo(label="q", model="q")])
+        assert form.value("model") == "q"
+
+    def test_several_models_open_a_picker(self):
+        form = BackendFormOverlay(base_url="http://x/v1")
+        form.probed(
+            "http://x/v1",
+            [
+                BackendInfo(label="qwen3", model="qwen3", context=112000),
+                BackendInfo(label="llama", model="llama-3.3-70b"),
+            ],
+        )
+        assert isinstance(form.child, ModelPickerOverlay)
+
+    def test_and_picking_one_fills_the_form(self):
+        form = BackendFormOverlay(base_url="http://x/v1")
+        form.probed(
+            "http://x/v1",
+            [
+                BackendInfo(label="qwen3", model="qwen3", context=112000),
+                BackendInfo(label="llama", model="llama-3.3-70b"),
+            ],
+        )
+        picker = form.child
+        picker.handle("down", 100, 20)
+        assert picker.handle("enter", 100, 20) is False
+        form.child_closed(picker)
+        assert form.value("model") == "llama-3.3-70b"
+
+    def test_the_picker_reaches_the_form_through_the_app(self):
+        ui = press(opened("m"), "a")
+        type_text(ui, "http://many/v1")
+        press(ui, "enter")
+        assert isinstance(ui.overlay, ModelPickerOverlay)
 
     def test_escape_saves_nothing(self):
         form = BackendFormOverlay(base_url="http://x/v1", model="m")
@@ -939,6 +1189,16 @@ class TestMemoryReview:
 # inside frames. Every screen, at the three widths the port is measured at.
 
 
+def scanning_llms(rows) -> LlmOverlay:
+    """Manage-LLMs mid-sweep: an empty panel with a sentence in it, which is a
+    different row from a panel with endpoints in it."""
+    overlay = LlmOverlay([x for x in rows if not x.discovered])
+    overlay.scanning = True
+    overlay.note = "scanning…"
+    overlay.refresh()
+    return overlay
+
+
 def all_screens() -> dict:
     catalog_rows = catalog()
     return {
@@ -950,7 +1210,9 @@ def all_screens() -> dict:
         "thinking": ThinkingOverlay("medium", session_id="s1"),
         "switch": SwitchLlmOverlay(catalog_rows, session_id="s1"),
         "llms": LlmOverlay(catalog_rows),
+        "scanning": scanning_llms(catalog_rows),
         "form": BackendFormOverlay(base_url="http://x/v1"),
+        "models": ModelPickerOverlay(catalog_rows),
         "inspect": InspectOverlay("a line\n" * 40, title="skills"),
         "memory": MemoryReviewOverlay(proposals(), "s1"),
         "prompt": PromptOverlay("a name", title="new profile", hint="short"),

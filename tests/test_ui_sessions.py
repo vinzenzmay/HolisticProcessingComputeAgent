@@ -413,10 +413,11 @@ class TestRetitle:
 
     async def test_a_background_titling_lights_the_row_and_not_the_chat(self, wire):
         # The claim is that retitling a highlighted-but-not-open session lights
-        # its sidebar row and never the chat spinner. The UI half is asserted
-        # here; the core does not yet *say* it is titling — `session.retitle`
-        # emits no `turn.activity` (`core.service._retitle`) — so the event is
-        # scripted rather than provoked.
+        # its sidebar row and never the chat spinner. The event is scripted
+        # rather than provoked because this file's core is a scripted peer, not
+        # because the real one is silent: `session.retitle` does emit
+        # `turn.activity` (`core.service._retitle`, asserted in
+        # `test_core_service.py`). The comment here used to claim it did not.
         await started(wire)
         await on_row(wire, SECOND)
         await wire.press("t")
@@ -588,6 +589,50 @@ class TestTheSidebarMarkers:
         await wire.tell(protocol.TurnStarted(session_id="s2"))
         await wire.tell(protocol.TurnFinished(session_id="s2"))
         assert "⟳" not in self.row_for(wire, "the second thing")
+
+    async def test_a_reply_to_a_session_you_left_flags_the_row(self, wire):
+        # §3.4: `⟳` went out the instant the turn finished — the exact moment
+        # there is something new to read — and nothing took its place, so two
+        # background conversations were indistinguishable.
+        await started(wire)
+        await wire.tell(protocol.TurnStarted(session_id="s2"))
+        await wire.tell(protocol.TurnFinished(session_id="s2"))
+        assert "*" in self.row_for(wire, "the second thing")
+
+    async def test_and_does_not_force_that_session_open(self, wire):
+        await started(wire)
+        await wire.tell(protocol.TurnFinished(session_id="s2"))
+        assert wire.ui.active_id == "s1"
+
+    async def test_opening_it_clears_the_flag(self, wire):
+        await started(wire)
+        await wire.tell(protocol.TurnFinished(session_id="s2"))
+        await on_row(wire, SECOND)
+        await wire.press("enter")
+        assert "*" not in self.row_for(wire, "the second thing")
+
+    async def test_a_reply_to_the_open_session_flags_nothing(self, wire):
+        await started(wire)
+        await wire.tell(protocol.TurnStarted(session_id="s1"))
+        await wire.tell(protocol.TurnFinished(session_id="s1"))
+        assert "*" not in self.row_for(wire, "the first thing")
+
+    async def test_a_still_working_row_says_that_instead(self, wire):
+        # Two turns in one background session: the second is still running,
+        # and "there is something new" is the less useful of the two things
+        # to say about it.
+        await started(wire)
+        await wire.tell(protocol.TurnFinished(session_id="s2"))
+        await wire.tell(protocol.TurnStarted(session_id="s2"))
+        assert "⟳" in self.row_for(wire, "the second thing")
+
+    async def test_and_a_parked_decision_wins_over_both(self, wire):
+        await started(wire)
+        await wire.tell(protocol.TurnFinished(session_id="s2"))
+        await wire.tell(
+            protocol.DecisionRequested(session_id="s2", payload={"tool": "rm"})
+        )
+        assert "!" in self.row_for(wire, "the second thing")
 
     async def test_a_non_default_profile_is_tagged(self, wire):
         await started(wire)
@@ -852,12 +897,41 @@ class TestDrafts:
         await self.switch_to(wire, FIRST)
         assert wire.ui.input.text() == "q2"
 
+    async def rewind_answered_elsewhere(self, w: Wire) -> Wire:
+        """Open the rewind in s1, land on s2, and take the copy.
+
+        The switch is `open_session` rather than a keypress because the dialog
+        owns the keyboard while it is up — which is exactly the situation
+        `_rewind`'s docstring is about: "the session it was opened in … is not
+        necessarily the one on screen by the time it closes".
+        """
+        await self.two_sessions(w)
+        w.ui.focus = CHAT
+        w.ui.chat.cursor = 2
+        await w.press("enter")  # the rewind, opened in s1
+        w.ui.open_session("s2")
+        await w.press("c")  # …and answered while s2 is on screen
+        return w
+
+    async def test_and_it_belongs_to_the_session_it_was_taken_from(self, wire):
+        # §4: the copy went into whatever was on screen when the dialog
+        # closed, contradicting `_rewind`'s own docstring — and the test above
+        # could not catch it, because it only ever copies into the open one.
+        await self.rewind_answered_elsewhere(wire)
+        assert wire.ui.input.text() == "", "s2's box is untouched"
+        assert wire.ui.session_for("s1").draft.text() == "q2"
+
+    async def test_and_says_where_it_went(self, wire):
+        await self.rewind_answered_elsewhere(wire)
+        assert "the first thing" in wire.ui.note
+
     async def test_a_parked_slash_draft_does_not_bring_its_menu_back(self, wire):
-        # The claim is "a parked `/…` draft brings its autocomplete menu back
-        # with it". The menu is §4.3 item 25 and belongs to M8; there is no
-        # menu in this build for a draft to bring back. The *draft* survives,
-        # which is the half this milestone owns — recorded here so the missing
-        # half is visible rather than merely absent.
+        # Half of "a parked `/…` draft brings its autocomplete menu back with
+        # it": the *draft* survives a switch, which is the half that lives on
+        # `SessionState`. The menu half arrived with M8 and is asserted where
+        # the menu is — `test_ui_commands.py::TestAParkedDraft`. This comment
+        # used to say there was no menu in this build, which the two files
+        # then contradicted each other about (specs-ui-coverage.md §6).
         await self.two_sessions(wire)
         wire.ui.focus = INPUT
         await wire.press(*"/comp")

@@ -336,9 +336,13 @@ class Context:
     measured: bool = False
     known: bool = False
     # Completion tokens over the last request's wall clock, and the session's
-    # thinking level. Nothing on the wire carries either yet (`turn.usage` has
-    # prompt_tokens alone and there is no thinking event at all), so today
-    # these are only ever set locally — see `tests/test_ui_meter.py`.
+    # thinking level. Both arrive from the core: `turn.usage` carries
+    # ``completion_tokens`` and ``request_seconds`` as the pair rather than as
+    # a rate — dividing them is a rendering decision, and a client that wanted
+    # "3.4s for 210 tokens" instead could not get that back out of a rate —
+    # and the effort rides on `session.rows`. None until something has been
+    # generated; never zero, because "nothing was counted" and "nothing was
+    # produced" are different facts and only one of them is worth drawing.
     speed: float | None = None
     effort: str | None = None
 
@@ -387,13 +391,33 @@ class Context:
             text += f" · think {self.effort}"
         return text
 
-    def measure(self, used: int, window: int | None = None) -> None:
-        """What the backend said the last prompt cost (`turn.usage`)."""
+    def measure(
+        self,
+        used: int,
+        window: int | None = None,
+        *,
+        completion_tokens: int = 0,
+        request_seconds: float | None = None,
+    ) -> None:
+        """What the backend said the last prompt cost (`turn.usage`).
+
+        The rate is worked out here rather than sent as one, which is what
+        `protocol.TurnUsage` asks for: the token count is the backend's and
+        the wall clock is ours, and a front-end that wanted to show the two
+        numbers could not recover them from a ready-made rate.
+
+        A restatement carries neither — a session whose backend was switched
+        has a prompt size and no fresh generation behind it — and leaves the
+        last rate alone rather than replacing it with a zero, since "nothing
+        was generated just now" is not "this backend generates nothing".
+        """
         self.used = used
         if window:
             self.window = window
         self.measured = True
         self.known = True
+        if completion_tokens and request_seconds:
+            self.speed = completion_tokens / request_seconds
 
     def estimate(self, used: int, window: int) -> None:
         """A character-derived figure for a session with no reply yet.
@@ -409,6 +433,22 @@ class Context:
         self.used = used
         self.window = window
         self.known = True
+
+    def superseded(self) -> None:
+        """This measurement is no longer about this thread (`/compact`).
+
+        A fold rewrites the conversation without taking a message out of it,
+        so the core deliberately sends no `chat.reset` — and without one the
+        measured 92% from before the fold would sit there, unmarked and
+        wrong, until the next reply. `reset` is too strong: the number is
+        stale rather than gone, and blanking the bar between the command and
+        the core's fresh `context.estimate` would flicker "no reply yet" onto
+        a conversation that has had plenty of them.
+
+        So the fill stays and stops claiming to be measured — it draws with
+        the `~` — and the estimate that follows is allowed to speak again.
+        """
+        self.measured = False
 
     def reset(self) -> None:
         """A different thread is a different number; showing the previous one
@@ -628,6 +668,13 @@ class SessionState:
         # what parks the half-typed refusal across a switch (§4.4).
         self.decision: Decision | None = None
         self.proposals: list[Proposal] = []
+        # A reply landed here while the user was looking at another
+        # conversation (§4.3 item 15). Local, because the core has no flag for
+        # it and could not have one: "you have not read this" is a fact about
+        # which session is on *this* screen, and a second front-end watching
+        # the same core has a different answer to it. Cleared by opening the
+        # session, which is the only thing that can be read as having read it.
+        self.updated = False
         self.entries: list[ChatEntry] = []
         # seq -> position in `entries` / `chat.items`, which are parallel.
         # The map, not a scan: a `chat.update` during a long turn arrives once
@@ -1188,6 +1235,45 @@ class DraftSkill:
 
 
 @dataclass(frozen=True)
+class ScanBackends:
+    """`backend.scan`: look for endpoints nobody has configured yet.
+
+    No arguments, because there is nothing to narrow: the core runs both
+    searches (the localhost port sweep and the cluster's manifest dir) and
+    neither finds the other's hits. The answer is a sequence — `llm.catalog`
+    again for every hit, then `backend.scanned` with the verdict — so the
+    screen that asked fills as it goes and stays closable throughout.
+    """
+
+
+@dataclass(frozen=True)
+class ProbeBackend:
+    """`backend.probe`: what does this endpoint serve, and is this key good?
+
+    The connection form cannot answer it itself (rule 2 of §4.2, and the
+    endpoint may be on a node this process cannot reach). ``api_key`` is the
+    one thing that travels UI → core, and only because the user has just
+    typed it into the form: nothing sends it back, and it never joins the
+    catalog (`protocol.BackendProbe`).
+    """
+
+    base_url: str
+    api_key: str = ""
+
+
+@dataclass(frozen=True)
+class RemoveBackend:
+    """`backend.remove`: drop a configured entry, by the name the picker knows.
+
+    By label rather than by value, for `protocol.BackendRemove`'s reason: what
+    the screen is holding is a catalog row, which has no key on it, and an
+    entry named by a rebuilt blob is one a missing key could fail to match.
+    """
+
+    label: str
+
+
+@dataclass(frozen=True)
 class RunCommand:
     """A slash command: `/compact`, `/thinking`, `/skills-list`, `/<skill>`.
 
@@ -1232,4 +1318,7 @@ Intent = (
     | Fetch
     | FetchSkills
     | DraftSkill
+    | ScanBackends
+    | ProbeBackend
+    | RemoveBackend
 )

@@ -123,6 +123,12 @@ class Overlay:
     # What the parent opened this screen *for*, since one editor serves the
     # memories, the archive and a skill body. Set by whoever opens the child.
     tag = ""
+    # Whether an answer that arrives as a *window* may be drawn over this
+    # screen (`RowUI.window`). False everywhere except the screen that asked
+    # the question: a scan finishing while a form is being typed into must
+    # park its recipe rather than land on top of it, and the same window
+    # landing on manage-LLMs — which asked for the scan — is where it belongs.
+    welcomes_window = False
 
     def __init__(self) -> None:
         self.note = ""

@@ -27,6 +27,7 @@ from hpca.transport import InProcessConnection
 from hpca.ui.app import RowUI
 from hpca.ui.client import UIClient
 from hpca.ui.keys import PASTE_END, PASTE_START
+from hpca.ui.state import Interrupt, SessionState
 from hpca.ui.run import Loop, drive, terminal_size
 from hpca.ui.screen import EXIT_MODES, Screen
 from tests.ui_harness import Peer
@@ -287,13 +288,21 @@ class TestEscapeTimeout:
     ):
         # End to end through the real UI: two escapes inside the window ask the
         # core to stop the turn, and half an arrow key does not.
+        #
+        # It asks by sending an intent, and that is what this asserts. It used
+        # to assert a note in the frame, which passed against a UI holding no
+        # sessions at all — a phrase the UI wrote whether or not anything had
+        # been stopped. The keystrokes were real and the proof was not.
         monkeypatch.setattr("hpca.ui.run.ESC_TIMEOUT", 0.01)
         ui = RowUI()
-        ui.sessions = []
+        asked: list = []
+        ui.send = asked.append
+        ui.sessions = [SessionState("s1", title="a turn in flight")]
+        ui.sessions[0].turn.working = True
         h = await harness(ui)
         await h.press(b"\x1b")
         await h.press(b"\x1b")
-        assert "stopped the turn" in "".join(h.frame)
+        assert [x.session_id for x in asked if isinstance(x, Interrupt)] == ["s1"]
 
     async def test_and_half_an_arrow_key_never_arms_it(self, harness, monkeypatch):
         monkeypatch.setattr("hpca.ui.run.ESC_TIMEOUT", 5.0)
