@@ -9,13 +9,15 @@ against a two-line fake, which is the argument for the extraction in one file.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 
 from hpca.agent.graph import TurnResult
 from hpca.core import scheduler as scheduler_module
 from hpca.core.deps import CoreDeps
-from hpca.core.scheduler import LLM_WAIT_ACTIVITY, TurnPlan, TurnScheduler
+from hpca.core.scheduler import TurnPlan, TurnScheduler
 from hpca.protocol import Entry
 
 
@@ -49,6 +51,19 @@ def deps(events, tmp_path):
     )
 
 
+class FakeGraph:
+    """The one thing the scheduler asks of a graph object directly: what a
+    thread holds. Everything else goes through the module-level entry points
+    `graph_calls` replaces, which is why this is a single method."""
+
+    def __init__(self, state: dict) -> None:
+        self._state = state
+
+    async def aget_state(self, config):
+        thread_id = config["configurable"]["thread_id"]
+        return SimpleNamespace(values=self._state.get(thread_id))
+
+
 @pytest.fixture
 def graph_calls(monkeypatch):
     """Replace the four graph entry points the scheduler uses.
@@ -63,6 +78,9 @@ def graph_calls(monkeypatch):
         "results": {},
         "gates": {},
         "counts": {},
+        # What each thread holds, for the one read that is not a call:
+        # `FakeGraph.aget_state`.
+        "state": {},
     }
 
     async def fake_run_turn(graph, *, session_id, user_text=None, resume=None,
@@ -102,7 +120,7 @@ def graph_calls(monkeypatch):
 def sched(deps, sessions, graph_calls):
     return TurnScheduler(
         deps,
-        graph=object(),
+        graph=FakeGraph(graph_calls["state"]),
         prepare=lambda session, *, user_text=None, forced_skill=None: TurnPlan(
             api_content=f"api:{user_text}" if user_text else None
         ),
@@ -596,6 +614,25 @@ class TestEvents:
         assert names[-1] == "TurnFinished"
         assert events[-1].reply == "done"
 
+    async def test_the_start_says_when_the_turn_began(
+        self, sched, events, graph_calls
+    ):
+        # The elapsed clock a user reads is "how long since I sent it", so it
+        # starts with the turn rather than with the first thing the turn gets
+        # round to reporting — a wait on the backend's first answer is the
+        # longest silence there is, and it is not free.
+        graph_calls["gates"]["s1"] = asyncio.Event()
+        sched.submit_user("s1", "hello")
+        await sched.drain()
+        started = [e for e in events if type(e).__name__ == "TurnStarted"][0]
+        activity = [e for e in events if type(e).__name__ == "TurnActivity"][0]
+        datetime.fromisoformat(started.started_at)  # ISO 8601, as everything is
+        # The same stamp the activity carries: two clocks for one turn would
+        # disagree by however long the first round took.
+        assert started.started_at == activity.started_at
+        graph_calls["gates"]["s1"].set()
+        await settle()
+
     async def test_the_clock_stops_when_the_turn_does(self, sched, events):
         sched.submit_user("s1", "hello")
         await sched.drain()
@@ -635,6 +672,101 @@ class TestEvents:
             "backend refused"
         )
         assert not sched.is_busy("s1")
+
+
+class TestAFailedTurnsRows:
+    """What is left on screen when a turn breaks instead of finishing.
+
+    There is no result to fold, so without this the rows settle exactly as the
+    live path drew them — a working box whose last call is still spinning for
+    a result that is never coming, and which a re-opened session would draw
+    differently. The thread is the answer: what the graph checkpointed before
+    it broke is what a `chat.reset` will show.
+    """
+
+    async def failing_turn(self, sched, graph_calls, *, state):
+        """A turn that draws a call, then breaks. Returns once it has."""
+        graph_calls["counts"]["s1"] = 0  # the thread starts empty
+        graph_calls["gates"]["s1"] = asyncio.Event()
+        graph_calls["results"]["s1"] = RuntimeError("connection refused")
+        graph_calls["state"]["s1"] = state
+        sched.submit_user("s1", "how many reads?")
+        await sched.drain()
+        await settle()
+        sched.report_step("s1", {"kind": "call", "tool": "read_file"})
+        graph_calls["gates"]["s1"].set()
+        await settle()
+
+    def state_with_a_finished_call(self):
+        """A thread that got its tool result and its reasoning checkpointed —
+        and then lost the backend on the round that would have answered."""
+        return {
+            "messages": [
+                {"role": "user", "content": "how many reads?"},
+                {"role": "user", "content": "[tool result] read_file: 40 lines"},
+            ],
+            "thinking": [{"after": 1, "reasoning": "column 2 holds the counts"}],
+            "calls": [{"after": 1, "tool": "read_file", "arguments": {}}],
+        }
+
+    async def test_the_rows_are_re_stated_from_what_the_thread_kept(
+        self, sched, events, graph_calls
+    ):
+        await self.failing_turn(
+            sched, graph_calls, state=self.state_with_a_finished_call()
+        )
+        box = [
+            e.entry
+            for e in events
+            if type(e).__name__ == "ChatUpdate" and e.entry.kind == "thinking"
+        ][-1]
+        # The fold's account, not the live one: the call has its result, and
+        # the reasoning that only ever existed in the checkpoint is there.
+        assert [(p.kind, p.done) for p in box.parts] == [
+            ("reasoning", False),
+            ("call", True),
+        ]
+        assert box.parts[0].text == "column 2 holds the counts"
+
+    async def test_the_failure_itself_is_not_a_row(
+        self, sched, events, graph_calls
+    ):
+        # It never entered the thread, so it travels as `turn.failed` — which
+        # is also what stops the spinner — and a front-end draws it as an
+        # ephemeral error entry of its own (§3.2). A row from here as well
+        # would put two of them on screen.
+        await self.failing_turn(
+            sched, graph_calls, state=self.state_with_a_finished_call()
+        )
+        drawn = [
+            e.entry.kind
+            for e in events
+            if type(e).__name__ in ("ChatAppend", "ChatUpdate")
+        ]
+        assert "error" not in drawn
+        failure = events[[type(e).__name__ for e in events].index("TurnFailed")]
+        assert "connection refused" in failure.error
+        assert any(
+            type(e).__name__ == "TurnActivity" and e.activity == "" for e in events
+        )
+
+    async def test_a_thread_it_cannot_read_still_reports_the_failure(
+        self, sched, events, graph_calls
+    ):
+        # A backend that died may have taken more with it. The rows then stand
+        # as they were drawn — there is nothing better to say — and the
+        # failure still reaches the user.
+        await self.failing_turn(sched, graph_calls, state=None)
+        assert "TurnFailed" in kinds(events)
+
+    async def test_the_next_turn_does_not_revise_the_failed_ones_rows(
+        self, sched, events, graph_calls
+    ):
+        # The record is closed with the turn: those rows are settled.
+        await self.failing_turn(
+            sched, graph_calls, state=self.state_with_a_finished_call()
+        )
+        assert "s1" not in sched._live
 
 
 class TestRewindGate:
@@ -778,6 +910,115 @@ class TestApprovals:
         assert [c["user_text"] for c in graph_calls["run_turn"]][-1] == "and then this"
 
 
+class TestAResumeFindsItsRows:
+    """Which rows the answer to an approval revises.
+
+    A parked exchange and its resume are one working box, so the resume has to
+    know the names of the rows that box was drawn as. Two ways those names can
+    change under it: the session is re-opened while it waits (a `chat.reset`
+    renumbers every row), or the turn that parked belonged to a core that has
+    since restarted and left no record at all.
+    """
+
+    # The reset a re-opened session gets while the exchange is parked: two
+    # settled rows, then the message this exchange is about and its box.
+    def reopened(self):
+        return [
+            Entry(kind="user", text="earlier", index=0, seq=1),
+            Entry(kind="assistant", text="answered", index=1, seq=2),
+            Entry(kind="user", text="clear the scratch dir", index=2, seq=3),
+            Entry(kind="thinking", text="", index=-1, seq=4),
+        ]
+
+    def resumed_result(self):
+        """What the graph returns once the answer goes back in: the whole
+        thread, with the exchange's call answered and the reply after it."""
+        return TurnResult(
+            reply="left it alone",
+            interrupt=None,
+            messages=[
+                {"role": "user", "content": "earlier"},
+                {"role": "assistant", "content": "answered"},
+                {"role": "user", "content": "clear the scratch dir"},
+                {"role": "user", "content": "[tool result] run_bash: SKIPPED"},
+                {"role": "assistant", "content": "left it alone"},
+            ],
+            calls=[{"after": 3, "tool": "run_bash", "arguments": {}}],
+            first_new=4,
+        )
+
+    async def park(self, sched, graph_calls):
+        graph_calls["counts"]["s1"] = 2  # two messages settled before this one
+        graph_calls["results"]["s1"] = TurnResult(
+            reply=None, interrupt={"tool": "run_bash", "kind": "execution"}
+        )
+        sched.submit_user("s1", "clear the scratch dir")
+        await sched.drain()
+        await settle()
+
+    def revised(self, events):
+        return [
+            e.entry.seq for e in events if type(e).__name__ == "ChatUpdate"
+        ]
+
+    async def test_a_reset_while_parked_re_binds_the_box_the_resume_fills(
+        self, sched, events, graph_calls
+    ):
+        # The turn ended when it parked, so there is no `TurnState` to find it
+        # by — but its rows are still on screen and still its own.
+        await self.park(sched, graph_calls)
+        sched.rebase_rows("s1", entries=self.reopened())
+        graph_calls["results"]["s1"] = self.resumed_result()
+        events.clear()
+
+        sched.resolve_decision("s1", approved=False)
+        await settle()
+        # The reset's names, not the ones the live path handed out before it.
+        assert self.revised(events) == [3, 4]
+
+    async def test_a_resume_after_a_restart_draws_into_the_rows_on_screen(
+        self, sched, events, graph_calls
+    ):
+        # The parked half belonged to a process that is gone: nothing here
+        # drew these rows. What is left to go on is the `chat.reset` that put
+        # the prompt on screen in the first place — without it the reply
+        # appears only at the next reset, which is the gap §4.2 records.
+        sched._decisions["s1"] = {"tool": "run_bash", "kind": "execution"}
+        sched._awaiting_approval.add("s1")
+        sched.rebase_rows("s1", entries=self.reopened())
+        graph_calls["results"]["s1"] = self.resumed_result()
+        events.clear()
+
+        sched.resolve_decision("s1", approved=False)
+        await settle()
+        assert self.revised(events) == [3, 4]
+        # And the reply is a row of its own, after the box — not a second copy
+        # of the exchange.
+        appended = [
+            e.entry for e in events if type(e).__name__ == "ChatAppend"
+        ]
+        assert [(e.kind, e.seq) for e in appended] == [("assistant", 5)]
+
+    async def test_with_nothing_on_screen_it_still_says_nothing(
+        self, sched, events, graph_calls
+    ):
+        # No reset, so no row names: a UI that has never been shown this
+        # session gets the reply from its next `chat.reset`. Guessing rows
+        # from the resume alone would draw a second working box under one the
+        # client may or may not have.
+        sched._decisions["s1"] = {"tool": "run_bash", "kind": "execution"}
+        sched._awaiting_approval.add("s1")
+        graph_calls["results"]["s1"] = self.resumed_result()
+        events.clear()
+
+        sched.resolve_decision("s1", approved=False)
+        await settle()
+        assert self.revised(events) == []
+        assert [
+            e.entry.seq for e in events if type(e).__name__ == "ChatAppend"
+        ] == []
+
+
 class TestBackgroundEvents:
     async def test_the_open_session_reacts_at_once(self, sched, deps, graph_calls):
         deps.focused_session_id = "s1"
@@ -843,16 +1084,61 @@ class TestInterrupt:
         sched.submit_user(session_id, "a long question")
         await sched.drain()
         await settle()
-        sched.report_activity(session_id, LLM_WAIT_ACTIVITY)
+        # The activity the graph reports while a turn waits on the backend.
+        sched.report_activity(session_id, "LLM processing")
 
-    async def test_only_while_parked_on_the_model(self, sched, graph_calls):
+    async def test_in_any_phase_of_the_sessions_own_turn(self, sched, graph_calls):
+        # Not only the wait on the model: a script that runs for minutes, or a
+        # chain of tool rounds gone astray, is exactly what a user wants to
+        # stop, and refusing there leaves them watching a spinner they cannot
+        # answer (`tui/app.py:_can_interrupt`, and the acceptance list's "a
+        # turn currently running a tool is interruptible").
         await self._park_on_the_model(sched, graph_calls)
         assert sched.can_interrupt("s1") is True
         sched.report_activity("s1", "running read_file")
-        assert sched.can_interrupt("s1") is False
+        assert sched.can_interrupt("s1") is True
 
     async def test_never_for_a_session_with_no_turn(self, sched):
         assert sched.can_interrupt("s1") is False
+
+    async def test_not_before_the_rollback_point_is_known(self, sched, graph_calls):
+        # The two things an abort needs are a message of the user's own to
+        # hand back and the point in the thread to roll back to. A turn a
+        # fraction of a second old has only the first.
+        graph_calls["gates"]["s1"] = asyncio.Event()
+        sched.submit_user("s1", "x")
+        await sched.drain()
+        sched._turns["s1"].interrupt_keep = None
+        assert sched.can_interrupt("s1") is False
+        graph_calls["gates"]["s1"].set()
+        await settle()
+
+    async def test_a_background_task_the_turn_started_outlives_it(
+        self, sched, graph_calls, monkeypatch
+    ):
+        # Cancelling ends the turn, not what the turn started: a script's
+        # monitor is a task of the core's (`runner.ProcessRunner.start`), not a
+        # child of the turn's, so the cancellation never reaches the work
+        # already in flight.
+        started: dict = {}
+
+        async def long_lived():
+            await asyncio.Event().wait()
+
+        async def spawns_then_parks(graph, *, session_id, **kwargs):
+            started["task"] = asyncio.ensure_future(long_lived())
+            await asyncio.Event().wait()  # and then waits, as a tool call does
+
+        monkeypatch.setattr(scheduler_module, "run_turn", spawns_then_parks)
+        sched.submit_user("s1", "start the long thing")
+        await sched.drain()
+        await settle()
+        try:
+            assert await sched.interrupt("s1") == "start the long thing"
+            await settle()
+            assert not started["task"].done()
+        finally:
+            started["task"].cancel()
 
     async def test_it_hands_the_message_back_and_rolls_the_thread_back(
         self, sched, graph_calls
@@ -868,6 +1154,76 @@ class TestInterrupt:
 
     async def test_interrupting_nothing_returns_nothing(self, sched):
         assert await sched.interrupt("s1") is None
+
+
+class TestStoppableAcrossAnApproval:
+    """An approval splits one exchange into two turns, and both must be
+    stoppable by the same gesture.
+
+    The resume carries no user message of its own — it is a `Command(resume=)`
+    on a thread that already holds the message — so without the anchor the
+    second half of every approved turn is a spinner nothing can answer, and
+    the rollback point it would need has been thrown away with the first
+    turn's state (`tui/app.py:_interrupt_anchor`).
+    """
+
+    async def _park_on_a_decision(self, sched, graph_calls):
+        graph_calls["counts"]["s1"] = 4
+        graph_calls["results"]["s1"] = TurnResult(
+            reply=None, interrupt={"tool": "run_bash", "kind": "execution"}
+        )
+        sched.submit_user("s1", "clear the scratch dir")
+        await sched.drain()
+        await settle()
+
+    async def test_the_resumed_turn_carries_the_same_anchor(
+        self, sched, graph_calls
+    ):
+        await self._park_on_a_decision(sched, graph_calls)
+        graph_calls["gates"]["s1"] = asyncio.Event()
+        sched.resolve_decision("s1", approved=True)
+        await settle()
+        ts = sched._turns["s1"]
+        # The message that started the exchange, and the point in the thread
+        # it started from — borrowed, not invented.
+        assert (ts.user_text, ts.interrupt_keep) == ("clear the scratch dir", 4)
+        assert sched.can_interrupt("s1") is True
+        graph_calls["gates"]["s1"].set()
+        await settle()
+
+    async def test_stopping_the_resume_rolls_back_the_whole_exchange(
+        self, sched, graph_calls
+    ):
+        await self._park_on_a_decision(sched, graph_calls)
+        graph_calls["gates"]["s1"] = asyncio.Event()
+        sched.resolve_decision("s1", approved=True)
+        await settle()
+
+        assert await sched.interrupt("s1") == "clear the scratch dir"
+        # Back to before the message, not to before the resume: the tool call
+        # the user approved is part of the attempt being abandoned.
+        assert graph_calls["rolled_back"] == [("s1", 4)]
+        assert not sched.is_busy("s1")
+
+    async def test_the_anchor_is_dropped_once_the_exchange_ends(
+        self, sched, graph_calls
+    ):
+        await self._park_on_a_decision(sched, graph_calls)
+        assert sched._anchors.get("s1") is not None  # the exchange is not over
+        graph_calls["results"]["s1"] = TurnResult(reply="done", interrupt=None)
+        sched.resolve_decision("s1", approved=True)
+        await settle()
+        # Answered for good: nothing left of this exchange to roll back to,
+        # and the next turn must not be handed the last one's message.
+        assert sched._anchors == {}
+        assert sched.can_interrupt("s1") is False
+
+    async def test_a_failed_turn_drops_its_anchor_too(self, sched, graph_calls):
+        graph_calls["results"]["s1"] = RuntimeError("backend refused")
+        sched.submit_user("s1", "x")
+        await sched.drain()
+        await settle()
+        assert sched._anchors == {}
 
 
 class TestLifecycle:

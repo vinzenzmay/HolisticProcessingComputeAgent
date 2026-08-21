@@ -750,8 +750,18 @@ class ChatUpdate(Event):
 
 
 class TurnStarted(Event):
+    """A turn began, and when.
+
+    ``started_at`` is the same stamp `turn.activity` carries, sent from the
+    turn's first frame rather than from its first activity report: the elapsed
+    clock the user reads is "how long since I sent it", and a turn is silent
+    for as long as the backend takes to answer the first time. The UI runs its
+    own clock off this; the core never ticks one.
+    """
+
     TYPE: ClassVar[str] = "turn.started"
     session_id: str
+    started_at: str = ""  # ISO 8601, as everything stored in hpca is
 
 
 class TurnActivity(Event):
@@ -804,6 +814,34 @@ class TurnUnqueued(Event):
     TYPE: ClassVar[str] = "turn.unqueued"
     session_id: str
     seq: int
+    text: str
+
+
+class TurnInterrupted(Event):
+    """A running turn was stopped: here is the message it was working on.
+
+    The sibling of `turn.unqueued`, and deliberately not the same event. Both
+    hand a message back to be edited and re-sent, and both are addressed so it
+    can return to *its own* session as a draft rather than to whatever is on
+    screen when the answer lands — but they say different things about the
+    chat, and a UI that treated them alike would get one of them wrong:
+
+    * `turn.unqueued` names a row and means "that row is gone"; everything
+      else stands, the turn ahead is still running and its spinner with it.
+      This one names no row: the rows the abandoned attempt drew describe
+      messages that have just left the thread, and a delta cannot take a row
+      off the screen. A `chat.reset` — an open of what is left — precedes this
+      event and is what un-draws them (`AgentService`'s `turn.interrupt`).
+    * After this one the turn is over: the spinner goes and the session is
+      free. A ``seq`` field here would be a number every client had to know to
+      ignore.
+
+    The shape is otherwise the queue's on purpose, so parking the text as that
+    session's draft is one routine on the UI side rather than two.
+    """
+
+    TYPE: ClassVar[str] = "turn.interrupted"
+    session_id: str
     text: str
 
 

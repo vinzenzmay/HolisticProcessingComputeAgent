@@ -283,6 +283,149 @@ class TestTurns:
         release.set()
         await service.stop()
 
+    async def test_the_message_comes_back_to_be_edited(
+        self, service, session, llm
+    ):
+        # The whole point of the abort: the user meant something slightly
+        # different, and gets their sentence back rather than retyping it.
+        release = await park_turn(service, llm, session.session_id)
+        queue = subscribe(service)
+        await service.handle(TurnInterrupt(session_id=session.session_id))
+        events = await drain(queue)
+        handed_back = only(events, "TurnInterrupted")
+        assert handed_back.text == "running"
+        # Addressed: the user may be looking at another session by now, and
+        # the message waits in the one it was typed in, as a draft.
+        assert handed_back.session_id == session.session_id
+        # After the reset, which has just re-stated the chat it belonged to.
+        assert kinds(events).index("ChatReset") < kinds(events).index(
+            "TurnInterrupted"
+        )
+        release.set()
+        await service.stop()
+
+    async def test_nothing_is_handed_back_when_nothing_was_stopped(
+        self, service, session
+    ):
+        # A stale gesture — the turn finished while the key was on its way —
+        # must not put a message into an entry box the user is typing in.
+        queue = subscribe(service)
+        await service.handle(TurnInterrupt(session_id=session.session_id))
+        assert "TurnInterrupted" not in kinds(await drain(queue))
+
+
+class TestStoppingATurnInEveryPhase:
+    """The phases an abort has to cover, driven through a real graph.
+
+    A turn does not spend its time waiting on the model. It spends it in
+    tools, and — when the model keeps producing output the middleware refuses
+    — going round a loop with no exit of its own. Both are what a user reaches
+    for the stop gesture in, and refusing there leaves them watching a spinner
+    they cannot answer.
+    """
+
+    def slow_tool(self):
+        import asyncio
+
+        from pydantic import BaseModel
+
+        from hpca.agent.tools import Tool, ToolRegistry
+
+        class SlowParams(BaseModel):
+            text: str = ""
+
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def handler(args, ctx):
+            entered.set()
+            await release.wait()
+            return "finished at last"
+
+        registry = ToolRegistry()
+        registry.register(
+            Tool(
+                name="slow_tool",
+                description="Takes its time",
+                params=SlowParams,
+                handler=handler,
+            )
+        )
+        return registry, entered, release
+
+    def service_with(self, home, conn, llm, tools):
+        async def db(fn):
+            return fn(conn)
+
+        return build_service(
+            settings=Settings.load(),
+            app_dir=home,
+            db=db,
+            conn=conn,
+            checkpointer=InMemorySaver(),
+            llm=llm,
+            tools=tools,
+        )
+
+    async def test_a_turn_running_a_tool_can_be_stopped(
+        self, home, conn, session
+    ):
+        import asyncio
+
+        tools, entered, release = self.slow_tool()
+        llm = FakeLLM([calling("slow_tool"), respond("done")])
+        service = self.service_with(home, conn, llm, tools)
+        queue = subscribe(service)
+        await service.handle(
+            TurnSubmit(session_id=session.session_id, text="run the thing")
+        )
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        # The phase a long script spends its minutes in.
+        assert service._scheduler.can_interrupt(session.session_id) is True
+
+        await service.handle(TurnInterrupt(session_id=session.session_id))
+        events = await drain(queue)
+        assert only(events, "TurnInterrupted").text == "run the thing"
+        assert only(events, "ChatReset").entries == []
+        release.set()
+        await service.stop()
+
+    async def test_it_breaks_the_decision_retry_loop(
+        self, home, conn, session
+    ):
+        # The phase with no exit of its own: the model keeps producing output
+        # the middleware rejects and the turn goes round feeding the rejection
+        # back. Cancelling lands on the loop's own await, so the next attempt
+        # is never made.
+        import asyncio
+
+        llm = FakeLLM()
+        entered, release = asyncio.Event(), asyncio.Event()
+        rounds = {"n": 0}
+
+        async def never_valid(messages, *, json_schema=None, **kwargs):
+            rounds["n"] += 1
+            if rounds["n"] >= 2:  # genuinely round the loop once first
+                entered.set()
+                await release.wait()
+            return ChatResponse(content="Let me think about that some more.")
+
+        llm.chat = never_valid
+        service = self.service_with(home, conn, llm, None)
+        queue = subscribe(service)
+        await service.handle(
+            TurnSubmit(session_id=session.session_id, text="do the impossible")
+        )
+        await asyncio.wait_for(entered.wait(), timeout=5)
+
+        await service.handle(TurnInterrupt(session_id=session.session_id))
+        assert only(await drain(queue), "TurnInterrupted").text == (
+            "do the impossible"
+        )
+        assert rounds["n"] == 2  # the loop stopped where it stood
+        assert not release.is_set()
+        assert not service._scheduler.is_busy(session.session_id)
+        await service.stop()
+
 
 class TestTypeAhead:
     """The queued-message channel: type ahead, see it, take it back.
@@ -462,6 +605,28 @@ async def run_turn(service, session_id, text="hi"):
         raise AssertionError(f"the turn never finished; saw {kinds(seen)}")
     finally:
         service.unsubscribe(queue)
+
+
+def gate_llm(llm):
+    """Hold the *next* model call open. Returns (entered, release).
+
+    The turn is then sitting somewhere a test can act on it — which is what
+    "the spinner is up and the user presses escape twice" looks like from
+    here.
+    """
+    import asyncio
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    answer = llm.chat
+
+    async def gated(messages, **kwargs):
+        llm.chat = answer  # only this one call is held
+        entered.set()
+        await release.wait()
+        return await answer(messages, **kwargs)
+
+    llm.chat = gated
+    return entered, release
 
 
 async def park_turn(service, llm, session_id):
@@ -942,6 +1107,238 @@ class TestAParkedApproval:
 
         await service.handle(SessionOpen(session_id=session.session_id))
         assert only(await drain(queue), "ChatReset").entries == rows
+        await service.stop()
+
+    async def test_it_does_not_stall_another_sessions_queue(
+        self, service, conn, session, llm
+    ):
+        # A parked thread cannot move until it is answered — but only its own.
+        # The rule the scheduler is written around, asserted here through a
+        # real interrupt rather than a fake result.
+        queue, _ = await self.park(service, session, llm)
+        other = SessionStore(conn).create(profile="default", title="the other one")
+        await service.handle(TurnSubmit(session_id=other.session_id, text="hi"))
+
+        finished = only(await wait_for(queue, "TurnFinished"), "TurnFinished")
+        assert finished.session_id == other.session_id
+        # And the parked one is still parked — its own queue is the only one
+        # the unanswered question holds up.
+        assert session.session_id in service._scheduler.pending_decisions()
+        await service.stop()
+
+    async def test_a_rollback_is_refused_while_it_waits(
+        self, service, session, llm
+    ):
+        # The resume would land on message indices the cut had removed. The
+        # answer is the reason, and it reaches the user as a warning.
+        queue, _ = await self.park(service, session, llm)
+        await service.handle(
+            SessionRollback(session_id=session.session_id, index=0)
+        )
+        events = await drain(queue)
+        assert "ChatReset" not in kinds(events)
+        assert "decision" in only(events, "Notify").text
+        await service.stop()
+
+    async def test_the_resumed_turn_is_still_stoppable(
+        self, service, session, llm
+    ):
+        # An approval splits one exchange into two turns. The second carries
+        # no user message of its own, and without the anchor it is a spinner
+        # nothing can answer — the case `tui/app.py:_interrupt_anchor` exists
+        # for, and the acceptance list's "after an approval, the resumed turn
+        # carries the same interrupt anchor".
+        import asyncio
+
+        queue, _ = await self.park(service, session, llm)
+        entered, release = gate_llm(llm)
+        await service.handle(
+            DecisionResolve(session_id=session.session_id, approved=False)
+        )
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert service._scheduler.can_interrupt(session.session_id) is True
+
+        await service.handle(TurnInterrupt(session_id=session.session_id))
+        events = await drain(queue)
+        # The message that started the exchange, and the whole exchange gone
+        # from the thread — the refused call included.
+        assert only(events, "TurnInterrupted").text == "clear the scratch dir"
+        assert only(events, "ChatReset").entries == []
+        release.set()
+        await service.stop()
+
+    async def test_the_anchor_goes_when_the_exchange_does(
+        self, service, session, llm
+    ):
+        queue, _ = await self.park(service, session, llm)
+        assert session.session_id in service._scheduler._anchors
+        await service.handle(
+            DecisionResolve(session_id=session.session_id, approved=False)
+        )
+        await wait_for(queue, "TurnFinished")
+        # Answered for good: the next turn must not be handed this one's
+        # message, and there is nothing left of it to roll back to.
+        assert service._scheduler._anchors == {}
+        await service.stop()
+
+
+class TestAResumeAfterACoreRestart:
+    """The half of an approval that outlives the process that asked.
+
+    The thread is parked at `interrupt()` in the checkpointer, so the question
+    survives; the turn that asked it does not, and with it goes the record of
+    which chat rows are that exchange's. Without something to bind to, the
+    resume can only stay silent and let the next `chat.reset` show the reply
+    — the gap specs-ui-replacement.md §4.2 records against M5.
+    """
+
+    def build(self, home, conn, checkpointer, llm):
+        async def db(fn):
+            return fn(conn)
+
+        return build_service(
+            settings=Settings.load(),
+            app_dir=home,
+            db=db,
+            conn=conn,
+            checkpointer=checkpointer,
+            llm=llm,
+        )
+
+    async def test_the_answer_lands_in_the_rows_already_on_screen(
+        self, home, conn, session
+    ):
+        checkpointer = InMemorySaver()
+        first = self.build(home, conn, checkpointer, FakeLLM(
+            [calling("run_bash", content_lines=["rm -rf /scratch/old"])]
+        ))
+        queue = subscribe(first)
+        await first.handle(
+            TurnSubmit(session_id=session.session_id, text="clear the scratch dir")
+        )
+        parked = only(
+            await wait_for(queue, "DecisionRequested"), "DecisionRequested"
+        )
+        await first.stop()
+
+        # A new core over the same store and the same checkpointer, holding
+        # the question the old one was parked on.
+        second = self.build(
+            home, conn, checkpointer, FakeLLM([respond("left it alone")])
+        )
+        second._scheduler._decisions[session.session_id] = dict(parked.payload)
+        second._scheduler._awaiting_approval.add(session.session_id)
+        queue = subscribe(second)
+
+        # The user opens the session to answer the prompt, which is what puts
+        # the parked exchange on screen — and names its rows.
+        await second.handle(SessionOpen(session_id=session.session_id))
+        reset = only(await drain(queue), "ChatReset")
+        # The message alone: a parked call is announced only once it is
+        # answered for, so the thread holds nothing else yet.
+        assert [e.kind for e in reset.entries] == ["user"]
+
+        await second.handle(
+            DecisionResolve(session_id=session.session_id, approved=False)
+        )
+        events = await wait_for(queue, "TurnFinished")
+        rows = apply_deltas([reset] + events, session.session_id)
+        # One working box across both cores, and the reply after it — not a
+        # second box, and not silence until the next open.
+        assert [r.kind for r in rows] == ["user", "thinking", "assistant"]
+        assert rows[-1].text == "left it alone"
+        assert [(p.tool, p.failed) for p in rows[1].parts] == [("run_bash", True)]
+
+        await second.handle(SessionOpen(session_id=session.session_id))
+        assert only(await drain(queue), "ChatReset").entries == rows
+        await second.stop()
+
+
+class TestAFailedTurn:
+    """A turn that breaks instead of finishing.
+
+    The rows it drew have no result to fold, so without reconciling them they
+    settle exactly as the live path left them — and a re-opened session would
+    then draw something else.
+    """
+
+    @pytest.fixture
+    def target(self, home):
+        path = home / "reads.tsv"
+        path.write_text("sample\tcount\na\t7\n")
+        return path
+
+    async def failing(self, service, session, llm, target):
+        """One round of real work, and then the backend goes away — a tunnel
+        dropped mid-turn, which is what this looks like on a cluster."""
+        llm._outputs = [
+            ChatResponse(
+                content=calling("read_file", path=str(target)),
+                reasoning="column 2 holds the counts",
+            )
+        ]
+        answer, rounds = llm.chat, {"n": 0}
+
+        async def then_dies(messages, **kwargs):
+            rounds["n"] += 1
+            if rounds["n"] > 1:
+                raise ConnectionError("connection refused")
+            return await answer(messages, **kwargs)
+
+        llm.chat = then_dies
+        queue = subscribe(service)
+        await service.handle(
+            TurnSubmit(session_id=session.session_id, text="how many reads?")
+        )
+        return queue, await wait_for(queue, "TurnFailed")
+
+    async def test_the_failure_is_reported_not_raised(
+        self, service, session, llm, target
+    ):
+        _, events = await self.failing(service, session, llm, target)
+        # What a front-end draws its error entry from (§3.2), carrying enough
+        # to say what went wrong.
+        assert "connection refused" in only(events, "TurnFailed").error
+        # And the spinner goes: an empty activity is how a renderer drops it.
+        assert any(
+            type(e).__name__ == "TurnActivity" and e.activity == ""
+            for e in events
+        )
+        await service.stop()
+
+    async def test_the_rows_it_drew_are_re_stated_from_the_thread(
+        self, service, session, llm, target
+    ):
+        # The working box is the fold's copy, not the half-drawn live one: the
+        # reasoning that only ever existed in the checkpoint is in it, exactly
+        # where a re-opened session puts it.
+        _, events = await self.failing(service, session, llm, target)
+        rows = apply_deltas(events, session.session_id)
+        assert [r.kind for r in rows] == ["user", "thinking"]
+        assert [p.kind for p in rows[1].parts] == ["reasoning", "call"]
+        assert rows[1].parts[0].text == "column 2 holds the counts"
+        assert rows[1].parts[1].done  # and its result, not a call still going
+        await service.stop()
+
+    async def test_the_session_is_free_again(
+        self, service, session, llm, target
+    ):
+        await self.failing(service, session, llm, target)
+        assert not service._scheduler.is_busy(session.session_id)
+        assert service._scheduler.rewind_blocker(session.session_id) is None
+        await service.stop()
+
+    async def test_re_opening_yields_the_rows_the_deltas_left(
+        self, service, session, llm, target
+    ):
+        # The property a failure must not be allowed to break: what the user
+        # is looking at and what they get back on re-open are the same rows,
+        # seq for seq. Unreconciled they are not — the box still holds a call
+        # with no result, and the fold's reasoning is missing from it.
+        queue, events = await self.failing(service, session, llm, target)
+        live = apply_deltas(events, session.session_id)
+        await service.handle(SessionOpen(session_id=session.session_id))
+        assert only(await drain(queue), "ChatReset").entries == live
         await service.stop()
 
 

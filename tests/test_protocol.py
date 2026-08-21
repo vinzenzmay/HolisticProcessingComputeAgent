@@ -39,6 +39,8 @@ from hpca.protocol import (
     SessionRollback,
     SessionRow,
     SessionRows,
+    TurnInterrupted,
+    TurnStarted,
     TurnSubmit,
     TurnUnqueue,
     TurnUnqueued,
@@ -99,6 +101,7 @@ SPEC_EVENTS = {
     "turn.finished",
     "turn.failed",
     "turn.unqueued",
+    "turn.interrupted",
     "decision.requested",
     "decision.cleared",
     "panel.update",
@@ -489,6 +492,51 @@ class TestQueuedMessages:
         # Cancelling lands where an interrupt lands: the text in the entry box.
         undone = TurnUnqueued(session_id="s1", seq=7, text="and then plot it")
         assert parse(decode(encode(undone.to_envelope()))) == undone
+
+
+class TestTheMessageAnInterruptRecovers:
+    """`turn.interrupted`: the stopped turn's message, handed back.
+
+    The queue's twin, and separate from it for the reason written on the
+    class — the two mean different things about the rows already on screen.
+    """
+
+    def test_it_carries_the_text_and_the_session_it_belongs_to(self):
+        # Addressed, because the answer can arrive after the user has switched
+        # away: the message waits as *that* session's draft, not as the
+        # visible one's.
+        handed_back = TurnInterrupted(session_id="s1", text="draft with a typo")
+        assert handed_back.session_id == "s1"
+        assert parse(decode(encode(handed_back.to_envelope()))) == handed_back
+
+    def test_it_names_no_row(self):
+        # A `chat.reset` has already taken the abandoned attempt's rows off the
+        # screen; a seq here would be a field every client had to ignore.
+        assert set(TurnInterrupted.model_fields) == {
+            "session_id",
+            "text",
+            "reply_to",
+        }
+
+    def test_it_is_not_the_queues_event(self):
+        # One handler for both would draw the queue's "drop that row" over a
+        # chat that has just been reset.
+        assert TurnInterrupted.TYPE != TurnUnqueued.TYPE
+
+
+class TestTheTurnsClock:
+    def test_the_start_says_when(self):
+        # "How long since I sent it" starts here, not at the first activity
+        # report: the wait for the backend's first answer is the longest
+        # silence in a turn, and it belongs on the clock.
+        started = TurnStarted(
+            session_id="s1", started_at="2026-08-20T10:00:00+00:00"
+        )
+        assert parse(decode(encode(started.to_envelope()))) == started
+
+    def test_a_start_with_no_stamp_still_parses(self):
+        # Defaulted, so a core that cannot read a clock still announces turns.
+        assert TurnStarted(session_id="s1").started_at == ""
 
 
 class TestChatAddressing:

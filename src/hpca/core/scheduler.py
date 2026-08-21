@@ -99,14 +99,17 @@ from hpca.protocol import (
     TurnFinished,
     TurnStarted,
 )
-from hpca.transcript import THINKING, Step, build_entries, live_step, thinking_entry
+from hpca.transcript import (
+    EVENT,
+    THINKING,
+    USER,
+    Step,
+    build_entries,
+    live_step,
+    thinking_entry,
+)
 
 logger = logging.getLogger("hpca.core.scheduler")
-
-# The activity string a turn wears while it is parked on the model. Interrupt
-# is offered only in this phase: it is the one point where telling the backend
-# to stop means anything, and the only one with a prompt to hand back.
-LLM_WAIT_ACTIVITY = "LLM processing"
 
 
 def wire_entry(entry, seq: int) -> Entry:
@@ -121,6 +124,23 @@ def wire_entry(entry, seq: int) -> Entry:
     rows, and the reset and the deltas have to shape them the same way.
     """
     return Entry.model_validate({**asdict(entry), "seq": seq})
+
+
+def _tail_exchange(entries: list[Entry]) -> list[Entry]:
+    """The last exchange in a `chat.reset`: its final message row and
+    everything drawn after it.
+
+    "Message row" is a `user` or `event` entry that is a thread message of its
+    own (``index`` >= 0) — the row `build_entries` opens a turn with. A
+    ``queued`` row is neither: it is not in the thread and has no index, which
+    is what keeps a typed-ahead message from being mistaken for the start of
+    the exchange a resume is about to continue.
+    """
+    for position in range(len(entries) - 1, -1, -1):
+        entry = entries[position]
+        if entry.kind in (USER, EVENT) and entry.index >= 0:
+            return list(entries[position:])
+    return []
 
 
 def _as_steps(parts) -> list[Step]:
@@ -261,12 +281,24 @@ class TurnScheduler:
         # session_id -> the graph interrupt payload it is parked on. See the
         # module docstring: this used to live in the UI and die with it.
         self._decisions: dict[str, dict] = {}
+        # What an interrupt needs — (the thread length before the message, the
+        # message) — kept per session for as long as the *exchange* lasts and
+        # not just for one turn. An approval ends the turn it parked; the
+        # resume starts a fresh one carrying no user message of its own, and
+        # without this it would be a turn nobody could stop and nothing could
+        # roll back (`tui/app.py:_interrupt_anchor`).
+        self._anchors: dict[str, tuple[int, str]] = {}
         self._shutting_down = False
         # session_id -> the last chat row name handed out for it. See
         # _next_entry_seq; every row the core draws is minted here.
         self._entry_seqs: dict[str, int] = {}
         # session_id -> the rows its current turn has drawn. See LiveTurn.
         self._live: dict[str, LiveTurn] = {}
+        # session_id -> the rows the last `chat.reset` drew for the exchange it
+        # ended on, as it named them. The one thing a resume can be re-bound to
+        # when the turn it continues was never drawn by this process. See
+        # _adopt_parked_turn.
+        self._last_exchange: dict[str, list[Entry]] = {}
         # The coalesced drain scheduled by submit_event; see _schedule_drain.
         self._drain_task: asyncio.Task | None = None
 
@@ -419,14 +451,20 @@ class TurnScheduler:
 
         Two jobs, and both exist because a reset renames every row on screen.
 
-        **The running turn is re-bound.** Its record (:class:`LiveTurn`) holds
-        the names it drew, and those names are gone. If the copy just read
-        already contains the turn's own message — found by the index the turn
-        started at, not by counting — the reset has drawn its rows for us and
-        the record adopts them, working box included. If it does not, the
-        message is a moment away from being checkpointed and the reset would
-        show a session with the user's own sentence missing, so it is re-drawn
-        here along with whatever the turn has done since.
+        **The unfinished exchange is re-bound.** Its record
+        (:class:`LiveTurn`) holds the names it drew, and those names are gone.
+        If the copy just read already contains the turn's own message — found
+        by the index the turn started at, not by counting — the reset has drawn
+        its rows for us and the record adopts them, working box included. If it
+        does not, the message is a moment away from being checkpointed and the
+        reset would show a session with the user's own sentence missing, so it
+        is re-drawn here along with whatever the turn has done since.
+
+        Unfinished, not running: a turn parked on an approval has ended (there
+        is no `TurnState` while it waits) and its record is still open, because
+        the answer resumes the same exchange into the same working box. Binding
+        only what was running would leave the resume revising rows from a
+        generation the UI has already dropped.
 
         **What was never in the thread comes back:** every message still
         queued behind that turn. The UI used to re-add all of this itself
@@ -434,10 +472,11 @@ class TurnScheduler:
         gap specs-ui-replacement.md §4.2 records.
         """
         self._entry_seqs[session_id] = max(len(entries), 0)
+        self._last_exchange[session_id] = _tail_exchange(entries)
         rows: list[Entry] = []
         ts = self._turns.get(session_id)
         live = self._live.get(session_id)
-        if ts is not None and live is not None and ts.user_text is not None:
+        if live is not None and (live.start is not None or ts is not None):
             rows += self._rebase_turn(session_id, ts, live, entries)
         for work in self._pending:
             if work.kind != "user" or work.session_id != session_id:
@@ -451,16 +490,22 @@ class TurnScheduler:
     def _rebase_turn(
         self,
         session_id: str,
-        ts: TurnState,
+        ts: TurnState | None,
         live: LiveTurn,
         entries: list[Entry],
     ) -> list[Entry]:
-        """Re-bind a running turn's row record to a `chat.reset`'s numbering.
+        """Re-bind an unfinished exchange's row record to a `chat.reset`'s
+        numbering.
 
         See :meth:`rebase_rows`. The turn's message is found by its index — the
         thread position it took, which the turn recorded before it ran — rather
         than by comparing lengths: an index either is in the copy or is not,
         and the answer does not depend on counting the same thing twice.
+
+        ``ts`` is None for an exchange parked on an approval: the turn ended
+        when it parked. Only the re-draw below needs it, and a parked exchange
+        never reaches it — its message has been checkpointed since, or the
+        graph could not have parked at all.
         """
         start = live.start
         position = (
@@ -477,6 +522,11 @@ class TurnScheduler:
             # the live path never sees.
             live.rows = [entry.seq for entry in entries[position:]]
             self._adopt_working(live, entries[position:])
+            return []
+        if ts is None or ts.user_text is None:
+            # Nothing to re-draw the exchange from. Only reachable if the
+            # thread lost the message a parked turn asked about, which is not
+            # a state the graph can produce; the next reset says what is real.
             return []
         # The copy predates the turn's own message by a moment. Re-draw what
         # is on screen and nowhere else: the message, and the working done
@@ -633,9 +683,22 @@ class TurnScheduler:
         as, when it had to wait; 0 when it starts at once. Either way its rows
         are drawn here, before the turn is announced, so nothing is ever on
         screen as still waiting behind a turn that is already itself.
+
+        A resume — an answered approval — is the second half of an exchange a
+        user message started, so it inherits that message's anchor: stopping it
+        rolls the thread back to the same point and hands the same text back.
+        Without that the resumed turn is a spinner nothing can answer.
         """
         plan = self._prepare(session, user_text=user_text, forced_skill=forced_skill)
-        ts = TurnState(session=session, plan=plan, user_text=user_text)
+        anchor = self._anchors.get(session.session_id) if resume is not None else None
+        ts = TurnState(
+            session=session,
+            plan=plan,
+            user_text=user_text if anchor is None else anchor[1],
+            # Filled once the pre-turn count is read — already known here for
+            # a resume, since the message it belongs to ran before it.
+            interrupt_keep=None if anchor is None else anchor[0],
+        )
         self._turns[session.session_id] = ts
         if user_text is not None:
             self._open_turn_rows(
@@ -644,7 +707,9 @@ class TurnScheduler:
                 plan.api_content,
                 entry_seq=entry_seq,
             )
-        self._deps.emit(TurnStarted(session_id=session.session_id))
+        self._deps.emit(
+            TurnStarted(session_id=session.session_id, started_at=ts.started_at)
+        )
         self._emit_activity(ts)
         ts.task = asyncio.ensure_future(self._run(session, ts, resume=resume))
         return ts.task
@@ -774,23 +839,38 @@ class TurnScheduler:
         """
         live = self._live.get(session_id)
         if live is None:
-            # A turn nobody drew: only reachable for a resume whose parked
-            # half belongs to a core that has since restarted, so there is no
-            # record of which rows are its own. Emitting nothing leaves the
-            # reply to the next `chat.reset`, which is late but never wrong —
-            # rows guessed at from this invocation alone would be a second
-            # working box under the one already on screen.
+            # A turn nobody drew, and nothing to bind it to: the resume's
+            # parked half belongs to a core that has since restarted and this
+            # session was never re-opened here, so there are no row names on
+            # screen to revise (`_adopt_parked_turn` is what recovers them
+            # when there are). Emitting nothing leaves the reply to the next
+            # `chat.reset`, which is late but never wrong — rows guessed at
+            # from this invocation alone would be a second working box under
+            # the one already drawn.
             return
         if live.start is None:
             # A turn whose thread length could not be read before it ran; the
             # graph reports where its own messages began.
             live.start = result.first_new
-        entries = build_entries(
+        self._fold_rows(
+            session_id,
+            live,
             list(result.messages),
             list(result.thinking),
             list(result.calls),
-            start=live.start,
         )
+
+    def _fold_rows(
+        self,
+        session_id: str,
+        live: LiveTurn,
+        messages: list[Any],
+        thinking: list[dict],
+        calls: list[dict],
+    ) -> None:
+        """This exchange's rows, re-stated from a thread state — the fold both
+        the end of a turn and the failure of one go through."""
+        entries = build_entries(messages, thinking, calls, start=live.start or 0)
         for position, entry in enumerate(entries):
             if position < len(live.rows):
                 self._deps.emit(
@@ -823,6 +903,73 @@ class TurnScheduler:
                 return
         live.parts, live.thinking_seq = [], 0
 
+    async def _reconcile_failed(self, session_id: str) -> None:
+        """Settle the rows of a turn that broke instead of finishing.
+
+        There is no result to fold, so without this the rows settle exactly as
+        the live path left them — including a working box whose last call is
+        still spinning for a result that is never coming, which is not how a
+        re-opened session would draw it. The thread is the answer: whatever
+        the graph checkpointed before it broke is what the next `chat.reset`
+        shows, so the same fold is run over it and this turn's rows are
+        re-stated to match. After it, what the user is looking at and what
+        they would get back are the same rows.
+
+        The failure itself is not a row here. It never entered the thread —
+        the model did not see it and the next turn must not — so it travels as
+        `turn.failed`, which is also what stops the spinner, and a front-end
+        draws it as an ephemeral `error` entry of its own
+        (specs-ui-replacement.md §3.2). Emitting one from here as well would
+        put two of them on screen.
+        """
+        live = self._live.get(session_id)
+        if live is None or live.start is None:
+            return  # nothing was drawn for this turn, or nothing it can find
+        try:
+            values = await self._thread_values(session_id)
+        except Exception:  # a backend that died may have taken more with it
+            logger.exception("could not re-state the rows of a failed turn")
+            return
+        self._fold_rows(
+            session_id,
+            live,
+            list(values.get("messages", [])),
+            list(values.get("thinking", []) or []),
+            list(values.get("calls", []) or []),
+        )
+
+    async def _thread_values(self, session_id: str) -> dict:
+        snapshot = await self._graph.aget_state(
+            {"configurable": {"thread_id": session_id}}
+        )
+        return snapshot.values or {}
+
+    def _adopt_parked_turn(self, session_id: str) -> None:
+        """Re-bind a resume to rows this process never drew.
+
+        The case: the turn that parked on the approval belonged to a core that
+        has since restarted, so its :class:`LiveTurn` is gone. The rows are
+        not — the session was re-opened to answer the prompt, and that
+        `chat.reset` drew the whole parked exchange and named every row of it.
+        Adopting those names is what lets the resume revise the working box
+        that is already on screen instead of the alternatives, both wrong: a
+        second working box appended below the first, or the silence
+        `_reconcile` falls back to, where the reply appears only on the next
+        reset.
+
+        The exchange is the reset's tail — its last user (or event) row and
+        everything after it — which is exactly the turn a parked approval
+        belongs to, since a thread parked at `interrupt()` cannot have moved
+        since. Nothing is emitted here; the fold at the end of the turn does
+        the drawing.
+        """
+        rows = self._last_exchange.get(session_id)
+        if not rows:
+            return
+        live = LiveTurn(start=rows[0].index, rows=[row.seq for row in rows])
+        self._live[session_id] = live
+        self._adopt_working(live, rows)
+
     def _close_turn(self, session_id: str) -> None:
         """This turn's rows are settled; the next one starts a new record."""
         self._live.pop(session_id, None)
@@ -851,12 +998,17 @@ class TurnScheduler:
 
     async def _run(self, session: Any, ts: TurnState, *, resume: Command | None) -> None:
         session_id = session.session_id
-        if ts.user_text is not None:
+        if resume is None and ts.user_text is not None:
             # Where to roll back to if this turn is interrupted: captured
             # before run_turn appends the user message. It is also the index
             # that message is about to take, which is what tells a `chat.reset`
             # which of its entries belong to this turn (`rebase_rows`) and
             # where the reconcile starts folding.
+            #
+            # Read only for a turn that brings its own message: a resume was
+            # handed both by the anchor, and re-reading the count here would
+            # measure a thread that already holds the message and roll the
+            # exchange back to halfway through itself.
             try:
                 ts.interrupt_keep = await thread_message_count(
                     self._graph, session_id=session_id
@@ -866,6 +1018,12 @@ class TurnScheduler:
             live = self._live.get(session_id)
             if live is not None:
                 live.start = ts.interrupt_keep
+            if ts.interrupt_keep is not None:
+                # Outlives this turn: an approval splits one exchange into
+                # several, and each of them has to stay stoppable.
+                self._anchors[session_id] = (ts.interrupt_keep, ts.user_text)
+        elif resume is not None and session_id not in self._live:
+            self._adopt_parked_turn(session_id)
         try:
             result = await run_turn(
                 self._graph,
@@ -878,9 +1036,11 @@ class TurnScheduler:
             raise  # an interrupt; _interrupt owns the cleanup
         except Exception as e:
             logger.exception("turn failed")
-            # No result to fold, so the rows drawn so far are the last word on
-            # this turn: closing the record stops a later turn revising them.
+            await self._reconcile_failed(session_id)
             self._close_turn(session_id)
+            # Nothing survives of this attempt to roll back to or hand back:
+            # the exchange ended where it broke.
+            self._anchors.pop(session_id, None)
             self._deps.emit(TurnFailed(session_id=session_id, error=str(e)))
             return
         finally:
@@ -914,6 +1074,9 @@ class TurnScheduler:
             )
             return
         self._close_turn(session_id)
+        # Answered for good: nothing left of this exchange to roll back to,
+        # and the next turn must not inherit this one's message.
+        self._anchors.pop(session_id, None)
         self._deps.emit(TurnFinished(session_id=session_id, reply=result.reply))
 
     # ------------------------------------------------------------- approvals
@@ -945,13 +1108,30 @@ class TurnScheduler:
     # ------------------------------------------------------------- interrupt
 
     def can_interrupt(self, session_id: str) -> bool:
-        """Only while a session's own *user* turn is parked on the model — the
-        one phase where telling the backend to stop makes sense, and the only
-        case with a prompt to hand back."""
+        """Whether this session's turn can be stopped right now.
+
+        Any phase of it — waiting on the model, or running a tool. It was once
+        only the wait on the model, on the reasoning that stopping the backend
+        is the only thing an abort really does. That is not how a turn spends
+        its time: a script that runs for minutes, or a chain of tool rounds
+        gone astray, is exactly what a user wants to stop, and refusing there
+        left them watching a spinner they could not answer
+        (`tui/app.py:_can_interrupt`, and specs-ui-acceptance.md's "a turn
+        currently running a tool is interruptible").
+
+        What cancelling mid-tool does NOT do is stop what the tool started: a
+        script runs on under its own monitor — a task of the core's, not of the
+        turn's — until it exits. The abort ends the *turn*, not the work
+        already in flight.
+
+        The two conditions that remain are what the abort needs: a message of
+        the user's own to hand back, and the point in the thread to roll back
+        to. A turn a fraction of a second old has only the first, and is
+        stoppable a moment later.
+        """
         ts = self._turns.get(session_id)
         return (
             ts is not None
-            and ts.activity == LLM_WAIT_ACTIVITY
             and ts.user_text is not None
             and ts.interrupt_keep is not None
         )
@@ -975,6 +1155,9 @@ class TurnScheduler:
             except (Exception, asyncio.CancelledError):
                 pass
         self._turns.pop(session_id, None)
+        # The exchange is over, however many turns it took: this rollback is
+        # the anchor being spent.
+        self._anchors.pop(session_id, None)
         # The rows this turn drew describe messages that are about to leave
         # the thread. Nothing may revise them again; what replaces them is the
         # `chat.reset` the caller sends once the rollback has landed, which is
@@ -998,9 +1181,11 @@ class TurnScheduler:
         self._pending = [w for w in self._pending if w.session_id != session_id]
         self._decisions.pop(session_id, None)
         self._awaiting_approval.discard(session_id)
+        self._anchors.pop(session_id, None)
         # Its rows went with it; nothing can address them again.
         self._entry_seqs.pop(session_id, None)
         self._live.pop(session_id, None)
+        self._last_exchange.pop(session_id, None)
 
     async def shutdown(self) -> None:
         """Stop accepting work and let in-flight turns unwind.

@@ -90,6 +90,7 @@ from hpca.protocol import (
     SessionRows,
     Shutdown,
     TurnInterrupt,
+    TurnInterrupted,
     TurnSubmit,
     TurnUnqueue,
     TurnUnqueued,
@@ -255,13 +256,22 @@ class AgentService:
             await self._scheduler.drain()
             return
         if isinstance(command, TurnInterrupt):
-            if await self._scheduler.interrupt(command.session_id) is None:
+            text = await self._scheduler.interrupt(command.session_id)
+            if text is None:
                 return
             # The interrupt rolls the abandoned attempt out of the thread, so
             # the rows drawn for it now describe messages that are gone. A
             # delta cannot take a row off the screen; a reset can, and this is
             # the same case `session.rollback` is — an open of what is left.
             await self._reset_chat(command.session_id)
+            # And the message itself comes back to be edited and re-sent —
+            # after the reset, because the chat it was in has just been
+            # re-stated, and addressed, because it belongs to the session it
+            # was typed in and not to whichever one is on screen when this
+            # lands (`protocol.TurnInterrupted`).
+            self._deps.emit(
+                TurnInterrupted(session_id=command.session_id, text=text)
+            )
             return
         if isinstance(command, TurnUnqueue):
             text = self._scheduler.unqueue(command.session_id, command.seq)
