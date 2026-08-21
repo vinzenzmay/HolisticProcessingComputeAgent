@@ -355,6 +355,21 @@ class TestPayloadShapes:
             "key", "text", "classes", "title", "kind", "ref"
         }
 
+    def test_a_session_row_says_which_model_the_session_talks_to(self):
+        # The sidebar and the message row both drew it, and a front-end cannot
+        # derive it: the backend is a JSON blob in the database, which §4.2
+        # rule 2 puts out of its reach.
+        row = SessionRow(session_id="s1", title="a session", model="gemma-3-27b")
+        assert parse(decode(encode(SessionRows(rows=[row]).to_envelope()))).rows == [
+            row
+        ]
+
+    def test_a_bootstrap_session_has_no_model_of_its_own(self):
+        # Empty rather than the app's default model name: the row says what
+        # this session is pinned to, and a session that pinned nothing is
+        # exactly what the absence means.
+        assert SessionRow(session_id="s1", title="a session").model == ""
+
     def test_an_entry_needs_only_a_kind_and_text(self):
         entry = Entry(kind="user", text="hi")
         assert (entry.steps, entry.reasoning_chars, entry.parts) == (0, 0, [])

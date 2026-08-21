@@ -33,13 +33,19 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import suppress
+from dataclasses import asdict
 from typing import Any
 
 from hpca.agent.builtin_tools import default_tool_registry
 from hpca.agent.context import ToolContext
 from hpca.agent.doc_tools import add_ask_docs, add_doc_tools
 from hpca.agent.file_tools import add_file_tools
-from hpca.agent.graph import build_graph
+from hpca.agent.graph import (
+    build_graph,
+    fork_thread,
+    rollback_thread,
+    thread_message_count,
+)
 from hpca.agent.job_tools import add_job_tools
 from hpca.agent.memory_context import build_memory_context, compose_api_content
 from hpca.agent.memory_tools import add_memory_tools
@@ -51,25 +57,43 @@ from hpca.agent.prompts import (
     orchestrator_system_prompt,
 )
 from hpca.agent.skill_tools import add_skill_tools
+from hpca.agent.titler import propose_title
 from hpca.agent.watch_tools import add_watch_tools
 from hpca.core.backends import BackendRegistry
 from hpca.core.deps import CoreDeps
 from hpca.core.memory_service import MemoryService
 from hpca.core.pollers import Pollers
 from hpca.core.scheduler import TurnPlan, TurnScheduler
+from hpca.episodic import EpisodicStore
 from hpca.protocol import (
+    ChatReset,
     ConfirmRequested,
     ConfirmResolve,
     DecisionResolve,
+    Entry,
     Message,
     Notify,
+    SessionClose,
+    SessionCreated,
+    SessionDelete,
     SessionFocus,
+    SessionFork,
+    SessionList,
+    SessionNew,
+    SessionOpen,
+    SessionRename,
+    SessionRetitle,
+    SessionRollback,
+    SessionRow,
+    SessionRows,
     Shutdown,
     TurnInterrupt,
     TurnSubmit,
     TurnUnqueue,
     TurnUnqueued,
 )
+from hpca.transcript import build_entries
+from hpca.watches import WatchStore
 
 logger = logging.getLogger("hpca.core.service")
 
@@ -87,6 +111,7 @@ class AgentService:
         scheduler: TurnScheduler,
         pollers: Pollers,
         sessions,
+        checkpointer: Any = None,
     ) -> None:
         self._deps = deps
         self._sessions = sessions
@@ -95,6 +120,11 @@ class AgentService:
         self._memory = memory
         self._scheduler = scheduler
         self._pollers = pollers
+        # Held only so a deleted session's history can go with it. The graph
+        # keeps its own reference and nothing else here reaches for it: a
+        # service that could read checkpoints would have a second way to know
+        # what a thread contains, next to `aget_state`.
+        self._checkpointer = checkpointer
         self._subscribers: list[asyncio.Queue] = []
         # Questions raised by a poll and not yet answered, keyed by the id that
         # crossed the wire. The continuation stays here: only the yes/no comes
@@ -103,6 +133,8 @@ class AgentService:
         self._confirmations: dict[str, Any] = {}
         self._confirm_seq = 0
         self._timers: list[asyncio.Task] = []
+        # Command work that outlives its dispatch — titling, today. See _spawn.
+        self._tasks: set[asyncio.Task] = set()
         self._stopped = False
 
     # ------------------------------------------------------------- event fan
@@ -143,17 +175,46 @@ class AgentService:
             self._deps.emit(Notify(severity="error", text=str(e)))
 
     async def _dispatch(self, command: Message) -> None:
+        if isinstance(command, SessionList):
+            self._emit_rows()
+            return
+        if isinstance(command, SessionNew):
+            self._new_session(command)
+            return
+        if isinstance(command, SessionOpen):
+            if self._known(command.session_id) is not None:
+                await self._reset_chat(command.session_id)
+            return
+        if isinstance(command, SessionClose):
+            await self._close_session()
+            return
+        if isinstance(command, SessionRename):
+            self._rename_session(command.session_id, command.title)
+            return
+        if isinstance(command, SessionRetitle):
+            if self._known(command.session_id) is not None:
+                # The model writes it, so this takes as long as a small
+                # generation does; awaiting it here would stall every command
+                # queued behind it on the same socket.
+                self._spawn(self._retitle(command.session_id))
+            return
+        if isinstance(command, SessionDelete):
+            await self._delete_session(command.session_id)
+            return
+        if isinstance(command, SessionFork):
+            await self._fork_session(command.session_id, command.index)
+            return
+        if isinstance(command, SessionRollback):
+            await self._rollback_session(command.session_id, command.index)
+            return
         if isinstance(command, SessionFocus):
             # The one sanctioned answer to "what is the user looking at".
             self._deps.focused_session_id = command.session_id
             await self._pollers.refresh_panel(force=True)
             return
         if isinstance(command, TurnSubmit):
-            session = self._session(command.session_id)
+            session = self._known(command.session_id)
             if session is None:
-                self._deps.emit(
-                    Notify(severity="warning", text="That session is gone.")
-                )
                 return
             # Whether it runs now or waits is the scheduler's answer, and so
             # is saying so: a message that has to queue is drawn by the
@@ -210,6 +271,337 @@ class AgentService:
             )
         )
 
+    # ------------------------------------------------------ session lifecycle
+
+    def _emit_rows(self) -> None:
+        """The sidebar, whole — the answer to `session.list` and the tail of
+        every command that changes what is in it.
+
+        Whole rather than incremental for the same reason `panel.update` is: a
+        row is a title, a profile, a mode, a model and a marker or two, and a
+        diff would need the core to model what the front-end drew. The chat is the thing that may not be resent
+        (§4.2 property 1), and it is resent by nothing here.
+        """
+        self._deps.emit(
+            SessionRows(rows=[self._row(s) for s in self._sessions.list_all()])
+        )
+
+    def _row(self, session) -> SessionRow:
+        """One session as the sidebar sees it.
+
+        The model is resolved here rather than stored on the row: what the
+        session holds is a backend blob, and the front-end may not read the
+        database to unpack it (§4.2 rule 2).
+        """
+        backend = self._backends.backend_for(session.session_id)
+        return SessionRow(
+            session_id=session.session_id,
+            title=session.title,
+            profile=session.profile,
+            mode=session.mode,
+            # Empty for the bootstrap client: the row says what this
+            # conversation is *pinned* to, and pinned to nothing is news.
+            model=backend.model if backend is not None else "",
+            flags=self._flags(session.session_id),
+        )
+
+    def _flags(self, session_id: str) -> list[str]:
+        """The render markers for one row — the two states a user working in
+        another session still has to see (`tui/app.py:_session_row_text`).
+
+        Both are emitted rather than the winner of the two: which mark takes
+        precedence is a drawing decision, and the core has no business making
+        it for a front-end it cannot see.
+        """
+        flags: list[str] = []
+        if session_id in self._scheduler.pending_decisions():
+            flags.append("decision")
+        if self._scheduler.is_busy(session_id):
+            flags.append("working")
+        return flags
+
+    def _known(self, session_id: str):
+        """That session, or None — and if None, said out loud.
+
+        A command naming a deleted session is not an error; it is what a
+        keypress against a stale sidebar looks like, and every session command
+        can be handed one. So it is refused the way every un-carry-out-able
+        command is: one warning, no state change, in one place.
+        """
+        session = self._session(session_id)
+        if session is None:
+            self._deps.emit(
+                Notify(severity="warning", text="That session is gone.")
+            )
+        return session
+
+    def _new_session(self, command: SessionNew) -> None:
+        """Make one, and say which it is.
+
+        `session.created` before `session.rows` on purpose: the UI has to open
+        it, and a sidebar cannot say which of its lines is new (see
+        `protocol.SessionCreated`).
+        """
+        settings = self._deps.settings
+        session = self._sessions.create(
+            profile=command.profile or self._deps.profile,
+            mode=settings.agent.default_mode,
+            # A blob, not a catalog index, so the choice survives the entry
+            # being dropped from the catalog later.
+            backend=self._backends.backend_for_new_session(command.backend),
+            thinking=settings.agent.default_thinking,
+        )
+        self._deps.emit(SessionCreated(row=self._row(session)))
+        self._emit_rows()
+
+    async def _reset_chat(self, session_id: str) -> None:
+        """The whole transcript for one session, renumbered from 1.
+
+        The only frame that may carry a chat wholesale, and so the only place
+        this is allowed to be called from: an open, and a rollback — which is
+        an open of what is left (§4.2 property 1). Anything else that resends a
+        chat is the per-turn rebuild this protocol exists to delete.
+
+        The context estimate goes with it because the two describe the same
+        thing: how much of the window this conversation already occupies. A
+        rollback in particular leaves the measured number describing a thread
+        that no longer exists.
+        """
+        values = await self._thread_values(session_id)
+        messages = list(values.get("messages", []))
+        entries = [
+            _wire_entry(entry, seq)
+            for seq, entry in enumerate(
+                build_entries(
+                    messages,
+                    values.get("thinking", []),
+                    values.get("calls", []),
+                ),
+                start=1,
+            )
+        ]
+        # What the checkpoint cannot know about: the message of a turn that is
+        # running right now, and everything typed ahead behind it. Numbered by
+        # the scheduler, which owns the counter this reset just re-based.
+        entries += self._scheduler.rebase_rows(
+            session_id, drawn=len(entries), messages=len(messages)
+        )
+        self._deps.emit(ChatReset(session_id=session_id, entries=entries))
+        self._backends.estimate_context(session_id, values)
+
+    async def _thread_values(self, session_id: str) -> dict:
+        snapshot = await self._graph.aget_state(
+            {"configurable": {"thread_id": session_id}}
+        )
+        return snapshot.values or {}
+
+    async def _close_session(self) -> None:
+        """Nothing is open any more.
+
+        Carries no session id (§4.1) because there is only ever one thing to
+        close: whatever the last `session.focus` named. The panel goes with it
+        — watches are session-scoped, so with no session focused there is
+        nothing of anyone's to show — and the measured context number is
+        dropped, so re-opening re-derives the fill from the stored history the
+        way it does after a restart.
+        """
+        closing = self._deps.focused_session_id
+        self._deps.focused_session_id = None
+        if closing is not None:
+            self._backends.forget_session(closing)
+        await self._pollers.refresh_panel(force=True)
+        self._emit_rows()
+
+    def _rename_session(self, session_id: str, title: str) -> None:
+        if self._known(session_id) is None:
+            return
+        if not title.strip():
+            # A nameless row is a row the user cannot find again. Refused
+            # here rather than stored, because the store would take it.
+            self._deps.emit(
+                Notify(severity="warning", text="A session needs a name.")
+            )
+            return
+        self._sessions.rename(session_id, title)
+        self._emit_rows()
+
+    async def _retitle(self, session_id: str) -> None:
+        """Ask the model to name this conversation (`session.retitle`).
+
+        Routed through the session's *own* client, not the bootstrap one: a
+        session pinned to a backend must not have its title written by
+        whichever model the core happens to be holding.
+        """
+        session = self._session(session_id)
+        if session is None:
+            return  # deleted while the request was in flight
+        messages = list((await self._thread_values(session_id)).get("messages", []))
+        if not messages:
+            self._deps.emit(
+                Notify(severity="warning", text="Nothing to summarize yet.")
+            )
+            return
+        try:
+            title = await propose_title(
+                self._backends.labelled_client("title", session_id=session_id),
+                messages,
+            )
+        except Exception:
+            # Naming is a nicety and the model refusing to do it is ordinary;
+            # it is reported, not raised (`tui/app.py:_propose_title`).
+            logger.exception("titling failed")
+            self._deps.emit(
+                Notify(severity="error", text="The model could not write a title.")
+            )
+            return
+        self._sessions.rename(session_id, title)
+        self._emit_rows()
+        self._deps.emit(Notify(text=f"Renamed to “{title}”"))
+
+    async def _delete_session(self, session_id: str) -> None:
+        """Drop a conversation: its row, its history, and what hung off it.
+
+        The plain-text log on disk is deliberately kept — it is the record
+        that the session existed at all — and so are the job and process rows,
+        which describe real work that outlives the conversation about it (see
+        `sessions.SessionStore.delete`). Everything else goes, and the
+        episodic index goes for a reason of its own: these are patient-data
+        environments, and a deleted conversation must not resurface through a
+        search.
+        """
+        session = self._known(session_id)
+        if session is None:
+            return
+        if self._deps.focused_session_id == session_id:
+            self._deps.focused_session_id = None
+        # Its queue, its parked decision and its row names go first, so
+        # nothing queued for it can start against a thread that is going away.
+        self._scheduler.forget_session(session_id)
+        self._backends.forget_session(session_id)
+        self._sessions.delete(session_id)
+        await self._deps.db(
+            lambda conn: EpisodicStore(conn).forget_session(session_id)
+        )
+        # Session-scoped too: left behind, they would be boxes no session can
+        # ever show while the pollers went on stat-ing their files forever.
+        await self._deps.db(
+            lambda conn: WatchStore(conn).forget_session(session_id)
+        )
+        if self._checkpointer is not None:
+            try:
+                await self._checkpointer.adelete_thread(session_id)
+            except Exception as e:  # the row is already gone; say so, move on
+                self._deps.emit(
+                    Notify(
+                        severity="warning",
+                        text=f"Chat history left behind: {e}",
+                    )
+                )
+        self._emit_rows()
+        await self._pollers.refresh_panel(force=True)
+        self._deps.emit(Notify(text=f"Deleted “{session.title}”"))
+
+    async def _fork_session(self, session_id: str, index: int) -> None:
+        """Branch a conversation into a new session, cut before ``index``.
+
+        Ungated on purpose (`protocol.SessionFork`): it only ever reads a
+        checkpoint snapshot of the source and only ever writes to a thread
+        nothing has touched, and branching off while the agent works is the
+        case forking exists for.
+
+        The new session's profile, backend and mode are copied here rather
+        than carried on the wire, so a front-end cannot fork a conversation
+        into a profile the user never chose.
+        """
+        source = self._known(session_id)
+        if source is None:
+            return
+        keep = await self._cut_point(session_id, index)
+        if keep is None:
+            return
+        fork = self._sessions.create(
+            profile=source.profile,
+            title=f"{source.title} (fork)",
+            mode=source.mode,
+            backend=source.backend,
+        )
+        try:
+            await fork_thread(
+                self._graph,
+                source_session_id=session_id,
+                target_session_id=fork.session_id,
+                keep=keep,
+            )
+        except Exception as e:
+            # An empty session nobody asked for is worse than no session: it
+            # would sit in the sidebar looking like the fork succeeded.
+            self._sessions.delete(fork.session_id)
+            self._deps.emit(Notify(severity="error", text=f"Fork failed: {e}"))
+            return
+        self._deps.emit(SessionCreated(row=self._row(fork)))
+        self._emit_rows()
+        self._deps.emit(
+            Notify(
+                text=f"Forked “{source.title}” — "
+                "this copy stops before that message."
+            )
+        )
+
+    async def _rollback_session(self, session_id: str, index: int) -> None:
+        """Trim a conversation back to before ``index``, in place.
+
+        Destructive and irreversible, so this half *is* gated: everything
+        `rewind_blocker` names either writes to the thread about to be
+        shortened or is parked inside it. The answer comes back as the reason
+        it gives, which is phrased to be shown.
+        """
+        if self._known(session_id) is None:
+            return
+        blocker = self._scheduler.rewind_blocker(session_id)
+        if blocker is not None:
+            self._deps.emit(
+                Notify(severity="warning", text=f"Cannot roll back: {blocker}")
+            )
+            return
+        keep = await self._cut_point(session_id, index)
+        if keep is None:
+            return
+        try:
+            await rollback_thread(self._graph, session_id=session_id, keep=keep)
+        except Exception as e:
+            self._deps.emit(
+                Notify(severity="error", text=f"Rollback failed: {e}")
+            )
+            return
+        # The measured fill described the untrimmed thread; re-derive it from
+        # what is left, exactly as re-opening the session would.
+        self._backends.forget_session(session_id)
+        await self._reset_chat(session_id)
+        self._deps.emit(
+            Notify(text="Rolled back — edit your message and send again.")
+        )
+
+    async def _cut_point(self, session_id: str, index: int) -> int | None:
+        """``index`` as the ``keep`` length the graph takes, or None.
+
+        The conversion `protocol._Rewind` deliberately keeps off the wire: the
+        UI names a message it was shown, `fork_thread` and `rollback_thread`
+        want a length, and the two are the same number only while that message
+        is still where the user saw it. An index the thread no longer has is
+        refused rather than truncating somewhere nobody pointed at — which is
+        precisely what would happen if the raw number were passed through.
+        """
+        count = await thread_message_count(self._graph, session_id=session_id)
+        if 0 <= index < count:
+            return index
+        self._deps.emit(
+            Notify(
+                severity="warning",
+                text="That message is no longer in this conversation.",
+            )
+        )
+        return None
+
     # ---------------------------------------------------------- confirmations
 
     def ask(self, question: str, on_yes) -> None:
@@ -240,6 +632,35 @@ class AgentService:
         if session_id is None:
             return None
         return self._sessions.get(session_id)
+
+    def _spawn(self, coro) -> asyncio.Task:
+        """Run a command's slow half without holding up the dispatch loop.
+
+        `handle` is called from a reader loop with one socket behind it, so a
+        handler that awaits a generation stalls every command queued after it.
+        Kept in a set so `stop` can cancel what is still in flight: a task that
+        outlives the databases raises into a loop nobody is reading.
+
+        Failures land where a failed command lands — a `notify` — rather than
+        in an unretrieved exception nobody sees. Reported from a done callback
+        rather than from a wrapper coroutine, because a wrapper that is
+        cancelled before its first step never awaits what it was given, and
+        the shutdown path cancels exactly there.
+        """
+        task = asyncio.ensure_future(coro)
+        self._tasks.add(task)
+
+        def finished(done: asyncio.Task) -> None:
+            self._tasks.discard(done)
+            if done.cancelled():
+                return
+            error = done.exception()
+            if error is not None:
+                logger.error("background command failed", exc_info=error)
+                self._deps.emit(Notify(severity="error", text=str(error)))
+
+        task.add_done_callback(finished)
+        return task
 
     def _skill_named(self, name: str | None, session) -> Any:
         """The named skill from the *session's* profile, not the core's.
@@ -284,12 +705,13 @@ class AgentService:
         if self._stopped:
             return
         self._stopped = True
-        for task in self._timers:
+        for task in [*self._timers, *self._tasks]:
             task.cancel()
-        for task in self._timers:
+        for task in [*self._timers, *self._tasks]:
             with suppress(Exception, asyncio.CancelledError):
                 await task
         self._timers.clear()
+        self._tasks.clear()
         await self._scheduler.shutdown()
         await self._backends.aclose()
 
@@ -511,6 +933,7 @@ def build_service(
         scheduler=scheduler,
         pollers=pollers,
         sessions=sessions,
+        checkpointer=checkpointer,
     )
     service_ref["service"] = service
     # Triage's "shall I learn this signature?" offer needs somewhere to ask.
@@ -520,6 +943,17 @@ def build_service(
     for event in events:
         service._fan_out(event)
     return service
+
+
+def _wire_entry(entry, seq: int) -> Entry:
+    """One `transcript.Entry` as the protocol's twin of it, named ``seq``.
+
+    Converted by field name rather than by hand: the two classes are asserted
+    to have the same shape (`test_protocol`), and ``extra="forbid"`` turns a
+    drift between them into a failure here — at the boundary, on the first
+    entry — instead of a field that is quietly missing from every chat.
+    """
+    return Entry.model_validate({**asdict(entry), "seq": seq})
 
 
 def _mode_for(sessions, settings, session_id: str) -> str:
@@ -544,14 +978,12 @@ def _make_tool_ctx(deps, session, log, *, skills, backends, tools) -> ToolContex
     the rest of the runtime moves on.
     """
     from hpca.config import app_dir as _app_dir
-    from hpca.episodic import EpisodicStore
     from hpca.jobs import JobStore
     from hpca.logs import LoggedLLM
     from hpca.rag import RagStore
     from hpca.runner import ProcessRunner
     from hpca.symbols import SymbolIndex
     from hpca.trash import TrashManager
-    from hpca.watches import WatchStore
 
     root = deps.app_dir or _app_dir()
     ctx = ToolContext(

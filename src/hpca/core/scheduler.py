@@ -263,12 +263,16 @@ class TurnScheduler:
     def _next_entry_seq(self, session_id: str) -> int:
         """The next chat row name for one session (`protocol.Entry.seq`).
 
-        Monotonic per session and never reused, so an update can only ever
-        find the row it means. It lives here because the queue is the only
-        thing minting rows today; when the transcript pipeline starts emitting
-        them it must take its numbers from this same counter — two allocators
-        would hand the same name to two rows — and at that point the counter
-        belongs on `CoreDeps`, beside `emit`.
+        Monotonic per session and never reused *within a reset generation*,
+        so an update can only ever find the row it means; `rebase_rows` is the
+        one thing allowed to restart it, because a `chat.reset` is exactly the
+        frame that tells the UI to forget the names it held.
+
+        It lives here because the queue was the first thing to mint rows.
+        Anything else that starts emitting them must take its numbers from
+        this same counter — two allocators would hand the same name to two
+        rows — and at that point the counter belongs on `CoreDeps`, beside
+        `emit`.
         """
         nxt = self._entry_seqs.get(session_id, 0) + 1
         self._entry_seqs[session_id] = nxt
@@ -304,6 +308,56 @@ class TurnScheduler:
             return None
         self._pending.remove(work)
         return work.text
+
+    def rebase_rows(
+        self, session_id: str, *, drawn: int, messages: int
+    ) -> list[Entry]:
+        """Restart a session's row names after a `chat.reset`, and hand back
+        the rows that reset cannot contain.
+
+        A reset renumbers from 1 (see `protocol.Entry.seq`), so the counter has
+        to be told where the new numbering ended: ``drawn`` is how many entries
+        the reset carries. Skipping that would leave the queue holding names
+        from a generation the UI has just dropped, and the promotion or the
+        unqueue that follows would address a row nobody has.
+
+        What comes back is everything on screen that is not in the
+        checkpointed thread, in the order it is drawn after it:
+
+        * the message of a turn already in flight, when the copy just read
+          predates it. ``messages`` is the length of that copy and
+          ``interrupt_keep`` is what the thread measured before this turn
+          appended to it, so a copy no longer than that cannot hold it yet;
+        * every message still queued behind that turn.
+
+        The UI used to re-add both itself (`tui/app.py:4585`) out of state it
+        owned. It owns neither now, so a session re-opened mid-turn would
+        silently lose its type-ahead without this — the gap
+        specs-ui-replacement.md §4.2 records.
+        """
+        self._entry_seqs[session_id] = max(drawn, 0)
+        rows: list[Entry] = []
+        ts = self._turns.get(session_id)
+        if ts is not None and ts.user_text is not None:
+            # None means the turn has not reached the graph at all yet, so
+            # nothing it sent can be in the copy.
+            keep = ts.interrupt_keep
+            if keep is None or messages <= keep:
+                rows.append(
+                    Entry(
+                        kind="user",
+                        text=ts.user_text,
+                        seq=self._next_entry_seq(session_id),
+                    )
+                )
+        for work in self._pending:
+            if work.kind != "user" or work.session_id != session_id:
+                continue
+            work.entry_seq = self._next_entry_seq(session_id)
+            rows.append(
+                Entry(kind="queued", text=work.text, seq=work.entry_seq)
+            )
+        return rows
 
     def submit_event(self, session_id: str, text: str) -> None:
         """A background completion reporting in — a finished process, a job

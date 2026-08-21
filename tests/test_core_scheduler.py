@@ -339,6 +339,100 @@ class TestQueuedRows:
         assert sched.unqueue("s1", 1) is None
 
 
+class TestRebasedRows:
+    """What a `chat.reset` has to carry that the thread does not hold.
+
+    Re-opening a session mid-turn is where this bites: the transcript in the
+    checkpoint knows nothing about a message still waiting in the queue, and
+    the front-end that used to re-add them from its own state has none.
+    """
+
+    async def test_the_counter_restarts_where_the_reset_ended(self, sched):
+        # A reset renumbers from 1, so the next row the session mints must
+        # follow the entries the reset carried, not the ones it replaced.
+        sched.rebase_rows("s1", drawn=7, messages=7)
+        assert sched._next_entry_seq("s1") == 8
+
+    async def test_queued_messages_come_back_as_rows_after_the_transcript(
+        self, sched, graph_calls
+    ):
+        graph_calls["gates"]["s1"] = asyncio.Event()
+        graph_calls["counts"]["s1"] = 4
+        sched.submit_user("s1", "running")
+        await sched.drain()
+        await settle()
+        sched.submit_user("s1", "second")
+        sched.submit_user("s1", "third")
+
+        rows = sched.rebase_rows("s1", drawn=5, messages=5)
+        # The running turn's message is in the copy (5 > interrupt_keep of 4),
+        # so only the two waiting behind it are re-drawn — numbered after the
+        # transcript, in the order they will run.
+        assert [(r.kind, r.text, r.seq) for r in rows] == [
+            ("queued", "second", 6),
+            ("queued", "third", 7),
+        ]
+        graph_calls["gates"]["s1"].set()
+        await settle()
+
+    async def test_a_re_drawn_queued_row_can_still_be_taken_back(
+        self, sched, graph_calls
+    ):
+        # The whole point of renumbering the queue rather than only the
+        # transcript: `turn.unqueue` names a row, and the name the UI now
+        # holds is the one this reset gave it.
+        graph_calls["gates"]["s1"] = asyncio.Event()
+        sched.submit_user("s1", "running")
+        await sched.drain()
+        await settle()
+        sched.submit_user("s1", "second")
+        old = sched._pending[-1].entry_seq
+
+        row = sched.rebase_rows("s1", drawn=2, messages=2)[-1]
+        assert row.seq != old, "the reset must hand out a fresh name"
+        assert sched.unqueue("s1", old) is None
+        assert sched.unqueue("s1", row.seq) == "second"
+        graph_calls["gates"]["s1"].set()
+        await settle()
+
+    async def test_a_running_message_the_thread_has_not_stored_is_re_drawn(
+        self, sched, graph_calls
+    ):
+        # The copy just read predates the turn's own message, which is what
+        # `interrupt_keep` measures. Without this the user re-opens a working
+        # session and their own sentence is missing from it.
+        graph_calls["gates"]["s1"] = asyncio.Event()
+        graph_calls["counts"]["s1"] = 4
+        sched.submit_user("s1", "what is in the BAM?")
+        await sched.drain()
+        await settle()
+
+        rows = sched.rebase_rows("s1", drawn=4, messages=4)
+        assert [(r.kind, r.text) for r in rows] == [
+            ("user", "what is in the BAM?")
+        ]
+        graph_calls["gates"]["s1"].set()
+        await settle()
+
+    async def test_an_idle_session_gets_nothing_extra(self, sched):
+        assert sched.rebase_rows("s1", drawn=3, messages=3) == []
+
+    async def test_one_sessions_reset_leaves_another_alone(
+        self, sched, graph_calls
+    ):
+        graph_calls["gates"]["s2"] = asyncio.Event()
+        sched.submit_user("s2", "running")
+        await sched.drain()
+        await settle()
+        sched.submit_user("s2", "second")
+        before = sched._pending[-1].entry_seq
+
+        sched.rebase_rows("s1", drawn=9, messages=9)
+        assert sched._pending[-1].entry_seq == before
+        graph_calls["gates"]["s2"].set()
+        await settle()
+
+
 class TestEvents:
     async def test_a_turn_announces_its_start_and_its_end(self, sched, events):
         sched.submit_user("s1", "hello")

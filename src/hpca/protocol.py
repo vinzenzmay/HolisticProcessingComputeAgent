@@ -264,6 +264,15 @@ class SessionRow(_Model):
     title: str
     profile: str = ""
     mode: str = ""
+    # The model this conversation is pinned to; empty when it talks to the
+    # bootstrap client. On the wire because two things drew it — the sidebar
+    # and the message row (§4.3 item 20) — and a front-end cannot work it out:
+    # the backend a session uses is a JSON blob in the database, which rule 2
+    # of §4.2 puts out of its reach, so the first real UI consumer had to drop
+    # the model line for want of this field. A bare name rather than the
+    # backend entry, because a label is all that is being drawn and shipping
+    # the entry would put an api_key on the wire to render one.
+    model: str = ""
     # Render markers the core owns because it owns the state behind them —
     # "working", "decision pending". Open-ended: the UI ignores what it does
     # not know how to draw.
