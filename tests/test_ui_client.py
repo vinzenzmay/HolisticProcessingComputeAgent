@@ -194,7 +194,8 @@ class TestTheCursorIsKeptByIdentity:
     async def positioned(self, wire) -> Wire:
         await started(wire)
         wire.ui.focus = SESSIONS
-        wire.ui.session_pane.cursor = 1  # the second row: "the second thing"
+        # Row 0 is `(new session)`, so the second conversation is line 2.
+        wire.ui.session_pane.cursor = 2
         assert wire.ui.session_pane.items[
             wire.ui.session_pane.current(wire.inner)
         ].key == "s2"
@@ -221,7 +222,7 @@ class TestTheCursorIsKeptByIdentity:
                 rows=[protocol.SessionRow(session_id="new", title="x"), *ROWS]
             )
         )
-        assert wire.ui.session_pane.cursor == 2
+        assert wire.ui.session_pane.cursor == 3
 
     async def test_an_open_row_stays_open_under_the_row_that_arrived(self, wire):
         await self.positioned(wire)
@@ -599,26 +600,26 @@ class TestKeysBecomeCommands:
     async def test_enter_on_a_session_opens_it(self, wire):
         await started(wire)
         wire.ui.focus = SESSIONS
-        wire.ui.session_pane.cursor = 1
+        wire.ui.session_pane.cursor = 2
         await wire.press("enter")
         assert wire.peer.last(protocol.SessionOpen).session_id == "s2"
 
     async def test_and_says_which_one_is_on_screen(self, wire):
         await started(wire)
         wire.ui.focus = SESSIONS
-        wire.ui.session_pane.cursor = 1
+        wire.ui.session_pane.cursor = 2
         await wire.press("enter")
         assert wire.peer.last(protocol.SessionFocus).session_id == "s2"
 
     async def test_going_back_does_not_ask_for_the_transcript_twice(self, wire):
         await started(wire)
         wire.ui.focus = SESSIONS
-        wire.ui.session_pane.cursor = 1
+        wire.ui.session_pane.cursor = 2
         await wire.press("enter")
         await wire.tell(protocol.ChatReset(session_id="s2", entries=[entry(1)]))
         wire.peer.clear()
         wire.ui.focus = SESSIONS
-        wire.ui.session_pane.cursor = 0
+        wire.ui.session_pane.cursor = 1
         await wire.press("enter")
         assert wire.peer.took(protocol.SessionOpen) == []
         assert wire.peer.last(protocol.SessionFocus).session_id == "s1"

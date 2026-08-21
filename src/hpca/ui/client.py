@@ -133,7 +133,26 @@ class UIClient:
         knowing the protocol exists.
         """
         session = getattr(intent, "session_id", "")
-        if isinstance(intent, state.OpenSession):
+        if isinstance(intent, state.NewSession):
+            # No session id in either direction: there is nothing to name yet,
+            # and what comes back is a `session.created` the UI opens. The
+            # backend string is passed through untouched — None rather than ""
+            # when nothing was chosen, because `protocol.SessionNew` spells
+            # "the core decides" as null.
+            self.command(
+                protocol.SessionNew(
+                    profile=intent.profile, backend=intent.backend or None
+                )
+            )
+        elif isinstance(intent, state.Rename):
+            self.command(
+                protocol.SessionRename(session_id=session, title=intent.title)
+            )
+        elif isinstance(intent, state.Retitle):
+            self.command(protocol.SessionRetitle(session_id=session))
+        elif isinstance(intent, state.DeleteSession):
+            self.command(protocol.SessionDelete(session_id=session))
+        elif isinstance(intent, state.OpenSession):
             self._opened = True
             # Two commands for one intent, and deliberately: the core has to be
             # told what is on screen every time (`session.focus` decides where a
@@ -337,7 +356,10 @@ class UIClient:
         session.model = msg.row.model
         session.flags = list(msg.row.flags)
         self.ui.adopt(session)
-        self.ui.open_session(session.session_id)
+        # Straight into the message box: a conversation that exists because
+        # the user asked for one — `session.new` or a fork — exists in order
+        # to be typed in, which is what `start_new_session` ended with too.
+        self.ui.open_session(session.session_id, land_in_box=True)
 
     def _reset(self, msg: protocol.ChatReset) -> None:
         self._session(msg.session_id).reset([_entry(e) for e in msg.entries])
@@ -375,8 +397,17 @@ class UIClient:
 
     def _activity(self, msg: protocol.TurnActivity) -> None:
         session = self._session(msg.session_id)
+        was = session.turn.busy
         session.turn.activity_is(msg.activity, msg.started_at)
         self._tick(session)
+        if session.turn.busy != was:
+            # A backend call that is not a turn — the titler, a compaction, a
+            # silent `/conclude` — starts and ends on this event alone, and
+            # the sidebar's "⟳" is how a user working in another conversation
+            # sees it (§4.3 item 15). Only on the edges: `turn.activity`
+            # arrives once per tool call, and repainting fourteen rows per
+            # step to say the same thing is the poll this UI does not have.
+            self.ui.refresh_sidebar()
         if not msg.activity and not session.turn.working:
             # A backend call that was never a turn, saying it is done. The
             # scheduler's own "" arrives just before `turn.finished` and is

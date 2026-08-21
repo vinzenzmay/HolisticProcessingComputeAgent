@@ -161,7 +161,7 @@ class TestAMessageSentWhileTheTurnRuns:
             protocol.DecisionRequested(session_id="s1", payload={"tool": "rm"})
         )
         wire.ui.focus = SESSIONS
-        wire.ui.session_pane.cursor = 1
+        wire.ui.session_pane.cursor = 2
         await wire.press("enter")
         wire.ui.focus = INPUT
         await wire.press(*"carry on", "enter")

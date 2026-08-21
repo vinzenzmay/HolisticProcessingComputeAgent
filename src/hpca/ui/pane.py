@@ -242,6 +242,26 @@ class Pane:
         if was in keys:
             self._go_to(keys.index(was), width)
 
+    def here(self) -> str:
+        """The key of the row the cursor is on, at the width last drawn.
+
+        For the callers that have a cursor and no terminal size — the footer,
+        which lists the keys that apply to whatever the sidebar is pointing
+        at. A key rather than an index, because the answer outlives a repaint.
+        """
+        return self.key_at(self.current(max(8, self._flat_width)))
+
+    def show(self, key: str) -> None:
+        """Put the cursor on the row with that key, if the row is here.
+
+        The counterpart of `replace`, and it takes no width for the same
+        reason: whoever calls it — the sidebar, when a session is opened from
+        somewhere other than this pane — knows a session id and not a terminal
+        size, and the width only decides which flattened line the cursor lands
+        on. The last one this pane was drawn at is the right answer for that.
+        """
+        self._go_to_key(key, max(8, self._flat_width))
+
     def current(self, width: int) -> int:
         lines = self.flat(width)
         if not lines:

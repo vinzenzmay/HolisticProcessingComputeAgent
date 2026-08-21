@@ -12,8 +12,15 @@ from hpca.ui.overlays.base import Overlay
 from hpca.ui.overlays.config import ConfigOverlay
 from hpca.ui.overlays.help import HelpOverlay
 from hpca.ui.overlays.llm import LlmOverlay
+from hpca.ui.overlays.newsession import (
+    BACKEND,
+    PROFILE,
+    NewSessionOverlay,
+    choice,
+)
 from hpca.ui.overlays.profiles import ProfilesOverlay
 from hpca.ui.overlays.queued import UNQUEUE, QueuedOverlay
+from hpca.ui.overlays.rename import EMPTY_REFUSAL, RenameOverlay
 from hpca.ui.overlays.rewind import (
     COPY,
     FORK,
@@ -24,17 +31,23 @@ from hpca.ui.overlays.rewind import (
 )
 
 __all__ = [
+    "BACKEND",
     "COPY",
+    "EMPTY_REFUSAL",
     "FORK",
     "PREVIEW_CHARS",
     "PREVIEW_LINES",
+    "PROFILE",
     "ROLLBACK",
     "UNQUEUE",
     "ConfigOverlay",
     "HelpOverlay",
     "LlmOverlay",
+    "NewSessionOverlay",
     "Overlay",
     "ProfilesOverlay",
     "QueuedOverlay",
+    "RenameOverlay",
     "RewindOverlay",
+    "choice",
 ]

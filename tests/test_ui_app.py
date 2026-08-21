@@ -229,7 +229,10 @@ def switched_to_the_second() -> RowUI:
     ui = build()
     ui.chat  # noqa: B018 — looking at the first session is what loads it
     ui.focus = SESSIONS
+    # Two rows down from the top, because the top row is `(new session)`,
+    # which is not a conversation.
     ui.handle("home", 120, 40)
+    ui.handle("down", 120, 40)
     ui.handle("down", 120, 40)
     ui.handle("enter", 120, 40)
     ui.render(120, 40)  # drawing the new session is what loads it
@@ -260,6 +263,7 @@ def test_the_chat_row_is_a_different_conversation():
     ui.focus = SESSIONS
     ui.handle("home", 120, 40)
     ui.handle("down", 120, 40)
+    ui.handle("down", 120, 40)
     ui.handle("enter", 120, 40)
     assert ui.chat is not first_chat
 
@@ -269,6 +273,7 @@ def test_what_is_drawn_actually_changed():
     first_text = frame(ui, 120, 40)
     ui.focus = SESSIONS
     ui.handle("home", 120, 40)
+    ui.handle("down", 120, 40)
     ui.handle("down", 120, 40)
     ui.handle("enter", 120, 40)
     assert frame(ui, 120, 40) != first_text

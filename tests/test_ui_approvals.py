@@ -270,7 +270,7 @@ class TestADecisionInAnotherSession:
     async def test_opening_it_reveals_the_prompt(self, wire):
         await parked(wire, BASH_GATE, session_id="s2")
         wire.ui.focus = SESSIONS
-        wire.ui.session_pane.cursor = 1
+        wire.ui.session_pane.cursor = 2
         await wire.press("enter")
         assert "Run this — run_bash?" in wire.screen()
         assert wire.ui.focus == DECISION
@@ -278,7 +278,7 @@ class TestADecisionInAnotherSession:
     async def test_and_answering_it_there_names_that_session(self, wire):
         await parked(wire, BASH_GATE, session_id="s2")
         wire.ui.focus = SESSIONS
-        wire.ui.session_pane.cursor = 1
+        wire.ui.session_pane.cursor = 2
         await wire.press("enter", "y")
         assert wire.peer.last(protocol.DecisionResolve).session_id == "s2"
 
@@ -434,12 +434,12 @@ class TestTheHalfWrittenReasonIsADraft:
     async def test_it_waits_in_its_own_session_across_a_switch(self, wire):
         await self.at_the_box(wire)
         wire.ui.focus = SESSIONS
-        wire.ui.session_pane.cursor = 1
+        wire.ui.session_pane.cursor = 2
         await wire.press("enter")  # to s2, which is parked on its own copy
         assert "the shards are still open" not in wire.screen()
         assert "(y) run script" in wire.screen(), "s2's is still at the question"
         wire.ui.focus = SESSIONS
-        wire.ui.session_pane.cursor = 0
+        wire.ui.session_pane.cursor = 1
         await wire.press("enter")
         assert "the shards are still open" in wire.screen()
 

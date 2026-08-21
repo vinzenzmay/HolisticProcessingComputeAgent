@@ -40,9 +40,10 @@ class HelpOverlay(Overlay):
             "sessions row",
             [
                 ("enter", "open it and go straight to the message box"),
+                ("enter", "on (new session): pick a profile, then start one"),
                 ("r", "rename"),
                 ("t", "ask the llm for a title"),
-                ("d", "delete"),
+                ("d", "delete (asks first; the log on disk is kept)"),
             ],
         ),
         (

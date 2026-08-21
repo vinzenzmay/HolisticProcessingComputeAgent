@@ -24,10 +24,13 @@ from hpca.ui.overlays import (
     ConfigOverlay,
     HelpOverlay,
     LlmOverlay,
+    NewSessionOverlay,
     Overlay,
     ProfilesOverlay,
     QueuedOverlay,
+    RenameOverlay,
     RewindOverlay,
+    choice,
 )
 from hpca.ui.pane import Item, Pane
 from hpca.ui.state import (
@@ -37,12 +40,16 @@ from hpca.ui.state import (
     Confirm,
     CycleMode,
     Decide,
+    DeleteSession,
     Drop,
     Fork,
     Intent,
     Interrupt,
+    NewSession,
     OpenSession,
     Peek,
+    Rename,
+    Retitle,
     Rollback,
     SessionState,
     SidebarRow,
@@ -86,6 +93,28 @@ DECISION_SHARE = 2
 # a whole poll behind the event that caused it.
 DECISION_MARK, WORKING_MARK = "!", "⟳"
 
+# The row that is not a session. First, where it is in the Textual sidebar and
+# for the same reason: on a cluster this is the only way to start a
+# conversation, and a fresh install's sidebar is otherwise empty. Its key is in
+# the `#` namespace `Pane.key_at` keeps for rows that are not addressed by an
+# id, so it can never collide with a session's.
+NEW_SESSION_KEY = "#new"
+NEW_SESSION_ROW = "(new session)"
+
+# The profile every session has unless it was given another one
+# (`hpca.profiles.DEFAULT_PROFILE`, copied rather than imported so the key
+# dispatch keeps its one-way dependency on `ui/`). Sessions under it are drawn
+# without a tag: naming the default on every row spends the sidebar's width
+# saying the same word fourteen times.
+DEFAULT_PROFILE = "default"
+
+# What deleting one asks first, and it says what survives: the transcript on
+# disk is deliberately kept (`core.service._delete_session`), and a user who
+# does not know that will not delete anything.
+DELETE_QUESTION = (
+    "Really delete “{title}”? The chat is dropped; its log on disk is kept."
+)
+
 # How the status row spends the width it has (§4.3 items 18 and 19). Three
 # things want a permanent row of their own — the meter, the mode and the model
 # — and on an 80x24 terminal three rows out of twenty-two is a tenth of the
@@ -107,6 +136,23 @@ STATUS_TIERS = (
 METER_STYLES = {"warn": YELLOW, "danger": BOLD + RED}
 
 
+def _profile_name(item: Item) -> str:
+    """The profile a row of the profiles screen is about.
+
+    That screen's rows are drawn as `name` padded out to a column of counts,
+    and its own Enter reads the name back the same way. Parsed rather than
+    carried because those rows are handed in as `Item`s by whoever built the
+    screen, and until a `profile.list` event exists (M7) there is nothing
+    better to read them off.
+
+    A parenthesised row is not a profile — `(new profile)` is that screen's
+    own "make one" line — and a picker offering it would start a conversation
+    under a profile of that name.
+    """
+    name = item.head.split("  ")[0].strip("▸▾ ")
+    return "" if name.startswith("(") else name
+
+
 class RowUI:
     MIN_CHAT = 4
     MAX_INPUT = 6
@@ -119,6 +165,7 @@ class RowUI:
         settings_json: str = "",
         llms: tuple[list[Item], list[Item]] | None = None,
         profiles: list[Item] | None = None,
+        backends: list[Item] | None = None,
         send: Callable[[Intent], None] | None = None,
     ) -> None:
         # The sidebar's order, and the store behind it. Two things, because an
@@ -163,6 +210,11 @@ class RowUI:
         self._settings_json = settings_json
         self._llms = llms or ([], [])
         self._profiles = profiles or []
+        # The catalog a new session may be pinned to: `head` is drawn, `text`
+        # is what the core wants back. Empty until something fills it — which
+        # is the state a real run is in today, and exactly the case the
+        # Textual flow answered by skipping the picker (§4.3 item 28 is M7).
+        self._backends = backends or []
 
     # ------------------------------------------------------ the open session
 
@@ -290,10 +342,19 @@ class RowUI:
         self.refresh_sidebar()
 
     def _select(self, session_id: str) -> None:
-        """Point `active` at that session, or at the first one if it is gone."""
+        """Point `active` at that session, or at nothing if it is not here.
+
+        -1 rather than 0, because "the session that was open has gone" and
+        "the first session is open" are different facts and only one of them
+        is true after a delete: snapping to row 0 would draw a ● on a
+        conversation the core was never told is on screen, whose chat has
+        never been asked for. Nothing open is a state the rows already draw
+        (`session` falls back to `_blank`), and the first list to arrive is
+        answered by `client._rows` opening its first row for real.
+        """
         self.active = next(
             (i for i, x in enumerate(self.sessions) if x.session_id == session_id),
-            0,
+            -1,
         )
 
     def _marks(self, session: SessionState) -> str:
@@ -308,7 +369,11 @@ class RowUI:
         # still a decision waiting for an answer.
         parked = session.decision is not None or "decision" in flags
         marks = DECISION_MARK if parked else " "
-        marks += WORKING_MARK if session.turn.working or "working" in flags else " "
+        # `busy`, not `working`: a silent backend call — a compaction, the
+        # titler, a `/conclude` — is something in flight in that conversation
+        # and the row has to say so, even though there is no turn to stop
+        # (`state.Turn.busy` is the same distinction the spinner draws).
+        marks += WORKING_MARK if session.turn.busy or "working" in flags else " "
         return marks
 
     def refresh_sidebar(self) -> None:
@@ -321,57 +386,94 @@ class RowUI:
         """
         self.session_pane.replace(
             [
-                Item(
-                    head=(
-                        f"{'●' if i == self.active else '○'} "
-                        f"{self._marks(session)} {session.title[:40]:<42}"
-                        + " · ".join(
-                            x for x in (session.profile, session.mode) if x
-                        )
-                    ),
-                    body=[
-                        f"session {session.session_id}",
-                        f"{len(session.entries)} entries"
-                        + (
-                            f" · {session.context.label()}"
-                            if session.context.label()
-                            else ""
+                # The one row that is not a conversation, and the only way to
+                # start one. First, so it is on screen without scrolling a
+                # sidebar that shows a quarter of the terminal.
+                Item(head=NEW_SESSION_ROW, key=NEW_SESSION_KEY),
+                *(
+                    Item(
+                        head=(
+                            f"{'●' if i == self.active else '○'} "
+                            f"{self._marks(session)} {session.title[:40]:<42}"
+                            + " · ".join(
+                                x for x in (self._tag(session), session.mode) if x
+                            )
                         ),
-                        f"{session.watch_count} watches"
-                        + (" · open" if i == self.active else ""),
-                    ],
-                    accent=GREEN if i == self.active else "",
-                    key=session.session_id,
-                )
-                for i, session in enumerate(self.sessions)
+                        body=[
+                            f"session {session.session_id}",
+                            f"{len(session.entries)} entries"
+                            + (
+                                f" · {session.context.label()}"
+                                if session.context.label()
+                                else ""
+                            ),
+                            f"{session.watch_count} watches"
+                            + (" · open" if i == self.active else ""),
+                        ],
+                        accent=GREEN if i == self.active else "",
+                        key=session.session_id,
+                    )
+                    for i, session in enumerate(self.sessions)
+                ),
             ]
         )
 
-    def open_session(self, session_id: str, *, announce: bool = True) -> None:
+    def _tag(self, session: SessionState) -> str:
+        """The profile a row is tagged with, and nothing for the default one.
+
+        A tag is there to say "this conversation is not under the profile you
+        would assume"; the default on every row says only that there are rows.
+        """
+        return "" if session.profile == DEFAULT_PROFILE else session.profile
+
+    def open_session(
+        self,
+        session_id: str,
+        *,
+        announce: bool = True,
+        land_in_box: bool = False,
+    ) -> None:
         """Look at this conversation, and tell the core that we are.
 
         ``announce`` is off for the one the client opens by itself when the
         first sidebar arrives: the footer note answers a keypress, and there
         was none.
+
+        ``land_in_box`` is for a session that exists *because* the user asked
+        for one — a new session, a fork — where the next thing to do is type
+        in it. Off by default, because opening a conversation from the sidebar
+        decides that for itself (`_enter_session`), and the client's own first
+        open answers no keypress at all.
         """
         self._select(session_id)
         self.refresh_sidebar()
+        # The highlight follows what is open, the way the Textual sidebar set
+        # its index after every reload: the sidebar's first row is
+        # `(new session)`, and a cursor left sitting on it would answer the
+        # next Enter by making a conversation rather than opening this one.
+        self.session_pane.show(session_id)
         if self.session.decision is not None and self.focus != WATCHERS:
             # It was flagged with a "!" while it was in the background; being
             # opened is what reveals it, and the cursor lands where it can be
             # answered.
             self.focus = DECISION
+        elif land_in_box:
+            self.focus = INPUT
         if announce:
             self.note = f"opened “{self.session.title}”"
         self.send(OpenSession(session_id))
 
-    def _switch(self, index: int) -> None:
-        if index < 0 or index >= len(self.sessions):
+    def _switch(self, session_id: str) -> None:
+        """Open the session with that id. By id, because the sidebar's rows
+        are not one-for-one with `self.sessions` — the first of them is not a
+        session at all — and because a repaint can move a row under the
+        cursor between the keypress and this."""
+        if not session_id or session_id not in self._states:
             return
-        if index == self.active:
+        if session_id == self.active_id:
             self.note = "already open"
             return
-        self.open_session(self.sessions[index].session_id)
+        self.open_session(session_id)
 
     def toast(
         self, text: str, severity: str = "information", timeout: float | None = None
@@ -658,7 +760,12 @@ class RowUI:
                 ("q", "quit"),
             ]
         rows = [("↑↓", "line"), ("→←", "open"), ("⇧→←", "open all")]
-        if self.focus == SESSIONS:
+        if self.focus == SESSIONS and self.session_pane.here() == NEW_SESSION_KEY:
+            # The three session keys do nothing on this row, so the footer
+            # does not offer them: a key list that lies is worse than a short
+            # one (specs-ui-acceptance.md, "rename keys are inert").
+            rows += [("enter", "start a session")]
+        elif self.focus == SESSIONS:
             rows += [("enter", "switch"), ("r", "rename"), ("t", "retitle"), ("d", "delete")]
         elif self.focus == CHAT:
             rows += [("i", "write"), ("enter", "reuse"), ("⇧tab", "mode")]
@@ -717,6 +824,19 @@ class RowUI:
             self._queued(overlay)
         elif isinstance(overlay, RewindOverlay) and overlay.choice:
             self._rewind(overlay)
+        elif isinstance(overlay, NewSessionOverlay) and overlay.chosen:
+            # Only now, at the end of both stages: the command that makes a
+            # conversation is sent once, and escaping either picker sends none.
+            self.send(NewSession(overlay.profile, overlay.backend))
+            self.note = f"new session under “{overlay.profile}”"
+        elif isinstance(overlay, RenameOverlay) and overlay.name:
+            self.send(Rename(overlay.session_id, overlay.name))
+            # Shown before the core answers, like the mode bar: the next
+            # `session.rows` is what makes it true, and what puts it back if
+            # the core refuses.
+            self.session_for(overlay.session_id).title = overlay.name
+            self.refresh_sidebar()
+            self.note = f"renamed to “{overlay.name}”"
 
     # -------------------------------------------------- the generic yes/no
 
@@ -1166,27 +1286,145 @@ class RowUI:
             self.note = "moved" if moved else ""
         elif key == "enter":
             if self.focus == SESSIONS:
-                self._switch(self.session_pane.current(inner))
-                # Straight to the box: opening a session is something you do
-                # in order to say something in it — unless it is parked on a
-                # decision, which is the thing to do in it first.
-                self.focus = (
-                    DECISION if self.session.decision is not None else INPUT
-                )
+                self._enter_session(self._sidebar_key(inner))
             elif self.focus == CHAT:
                 self._activate_chat(inner)
             elif self.focus == WATCHERS:
                 self._watch(Peek, "peeking at the log", inner)
         elif key == "r" and self.focus == SESSIONS:
-            self.note = "rename: a modal in the real app"
+            self._rename(self._sidebar_key(inner))
         elif key == "t" and self.focus == SESSIONS:
-            self.note = "asking the llm for a title"
+            self._retitle(self._sidebar_key(inner))
         elif key == "d":
             if self.focus == SESSIONS:
-                self.note = "delete session (confirm)"
+                self._confirm_delete(self._sidebar_key(inner))
             else:
                 self._watch(Drop, "unwatched", inner)
         return True
+
+    # ------------------------------------------------------- the session keys
+
+    def _sidebar_key(self, inner: int) -> str:
+        """What the sidebar cursor is pointing at: a session id, or the row
+        that is not one. The three session keys and Enter all start here, so
+        "inert on `(new session)`" is one comparison rather than four."""
+        return self.session_pane.key_at(self.session_pane.current(inner))
+
+    def _enter_session(self, key: str) -> None:
+        """Enter in the sidebar: open that conversation, or start one."""
+        if key == NEW_SESSION_KEY:
+            self._new_session()
+            return
+        self._switch(key)
+        # Straight to the box: opening a session is something you do in order
+        # to say something in it — unless it is parked on a decision, which is
+        # the thing to do in it first.
+        self.focus = DECISION if self.session.decision is not None else INPUT
+
+    def _new_session(self) -> None:
+        """The two-stage picker (§4.3 item 14). Nothing is asked for until it
+        closes with a choice, so escaping it creates nothing."""
+        self.overlay = NewSessionOverlay(self._profile_rows(), list(self._backends))
+
+    def _profile_rows(self) -> list[Item]:
+        """The profiles a new conversation can be started under.
+
+        Assembled from what the UI has already been told rather than fetched,
+        because there is no `profile.list` on the wire yet (§4.3 item 27, M7):
+        the core's own profile from `hello`, the profile of every session in
+        the sidebar, and whatever the profiles screen was handed. The default
+        leads, then the rest in the order they were met — which puts the
+        profile the user is working in at the top of the list they are about
+        to pick from.
+        """
+        names: list[str] = []
+        for name in (
+            DEFAULT_PROFILE,
+            self.core_profile,
+            *(x.profile for x in self.sessions),
+            *(_profile_name(x) for x in self._profiles),
+        ):
+            if name and name not in names:
+                names.append(name)
+        counts: dict[str, int] = {}
+        for session in self.sessions:
+            counts[session.profile] = counts.get(session.profile, 0) + 1
+        return [choice(name, self._profile_detail(name, counts)) for name in names]
+
+    @staticmethod
+    def _profile_detail(name: str, counts: dict[str, int]) -> str:
+        """What a profile row says about itself: how much is already under it,
+        and whether it is the one a session gets by not choosing."""
+        said = []
+        if counts.get(name):
+            said.append(f"{counts[name]} session" + ("s" if counts[name] > 1 else ""))
+        if name == DEFAULT_PROFILE:
+            said.append("the fallback")
+        return " · ".join(said)
+
+    def _rename(self, key: str) -> None:
+        """`r`: the name, prefilled and editable. Inert on `(new session)`."""
+        session = self._states.get(key)
+        if session is None:
+            return
+        self.overlay = RenameOverlay(session.title, key)
+
+    def _retitle(self, key: str) -> None:
+        """`t`: ask the model. Which model, and whether there is anything to
+        summarise, are the core's to answer."""
+        if key not in self._states:
+            return
+        self.send(Retitle(key))
+        self.note = "asking the llm for a title"
+
+    def _confirm_delete(self, key: str) -> None:
+        """`d`: ask, then delete. Inert on `(new session)`."""
+        session = self._states.get(key)
+        if session is None:
+            return
+        title = session.title or key
+        self.ask(
+            DELETE_QUESTION.format(title=title),
+            lambda yes: self._delete(key, title, yes),
+        )
+
+    def _delete(self, session_id: str, title: str, yes: bool) -> None:
+        """The answer to the delete question.
+
+        The row is taken off here rather than waited for: `session.rows` says
+        what the core holds, and `sync_sessions` deliberately keeps the *open*
+        session's state even when the core stops listing it — so a delete that
+        only sent a command would leave the deleted conversation's chat and
+        half-typed draft on screen until something else switched away from it.
+        """
+        if not yes:
+            self.note = "kept"
+            return
+        self.send(DeleteSession(session_id))
+        self.forget(session_id)
+        self.note = f"deleted “{title}”"
+
+    def forget(self, session_id: str) -> None:
+        """Take a conversation off the UI: its row, its chat and its draft.
+
+        Its draft in particular, which is the one piece of it that lives
+        nowhere else (specs-ui-acceptance.md, "Drafts"): the chat can be asked
+        for again and the row will come back in the next `session.rows`, but
+        an unsent message belongs to the session and goes with it.
+
+        Deleting the one on screen leaves nothing open, which is what the
+        Textual app did by closing the session: the chat empties, the message
+        box has nowhere to send to, and the cursor goes back to the sidebar —
+        the only row with anything left to do.
+        """
+        if self._states.pop(session_id, None) is None:
+            return
+        was = self.active_id
+        self.sessions = [x for x in self.sessions if x.session_id != session_id]
+        self._select("" if was == session_id else was)
+        self.refresh_sidebar()
+        if was == session_id:
+            self.focus = SESSIONS
 
     def _cycle_mode(self) -> None:
         """Ask for the next mode. Which one that is, this does not know.

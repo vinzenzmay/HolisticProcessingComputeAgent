@@ -30,6 +30,7 @@ from hpca import protocol
 from hpca.ui.ansi import GREEN
 from hpca.ui.app import RowUI
 from hpca.ui.client import UIClient
+from hpca.ui.overlays import choice
 from hpca.ui.pane import Item
 
 TASKS = [
@@ -69,6 +70,10 @@ PROFILES = ["hpc", "writing", "default"]
 # The real three (`hpca.agent.modes.MODES`), so that the mode bar's colours
 # and its hints are the ones a user will actually see.
 MODES = ["auto", "manual", "full-auto"]
+
+# What a conversation is called before anything has been said in it — the
+# store's placeholder, and what a session made from `(new session)` shows.
+UNTITLED = "(untitled)"
 # Two backends, so switching session moves the model line (§4.3 item 20) and
 # not only the title.
 MODELS = ["qwen3-27b-fp8", "llama-3.3-70b", ""]
@@ -284,6 +289,19 @@ def sample_llms() -> tuple[list[Item], list[Item]]:
     return discovered, configured
 
 
+def sample_backends() -> list[Item]:
+    """The catalog a new session may be pinned to.
+
+    `head` is drawn and `text` is what goes back to the core, which is the
+    whole of what the UI knows about a backend — see `NewSessionOverlay`.
+    """
+    return [
+        choice("cluster-qwen", "qwen3-27b-fp8 · 112k · the active default"),
+        choice("tunnel-qwen", "qwen3-27b-fp8 · 112k · through an ssh tunnel"),
+        choice("big-llama", "llama-3.3-70b · 128k · not answering"),
+    ]
+
+
 class DemoCore:
     """A core made of lists: it answers commands with the events a real one
     would, and holds the transcripts so that a fork or a rollback means
@@ -321,6 +339,7 @@ class DemoCore:
         self._entries: dict[str, list[protocol.Entry]] = {}
         self._watches: dict[str, list[protocol.PanelRow]] = {}
         self._forks = 0
+        self._made = 0
         # One session is left mid-turn, because a turn in flight is the thing
         # M4b builds and a demo that only ever shows finished conversations
         # cannot show it: opening this one starts the spinner, hands it a tool
@@ -584,6 +603,68 @@ class DemoCore:
         self.rows[self._index(cmd.session_id)].mode = cmd.mode
         self.emit(protocol.SessionRows(rows=list(self.rows)))
 
+    def _do_SessionNew(self, cmd: protocol.SessionNew) -> None:
+        """A conversation with nothing in it, under the profile that was
+        picked — `session.created` first, because the UI has to open it."""
+        self._made += 1
+        row = protocol.SessionRow(
+            session_id=f"new{self._made:04x}",
+            title=UNTITLED,
+            profile=cmd.profile or "hpc",
+            mode=MODES[0],
+            model=cmd.backend or "",
+        )
+        self.rows.insert(0, row)
+        self._sizes[row.session_id] = 0
+        self._watch_counts[row.session_id] = 0
+        self._entries[row.session_id] = []
+        self.emit(protocol.SessionCreated(row=row))
+        self.emit(protocol.SessionRows(rows=list(self.rows)))
+
+    def _do_SessionRename(self, cmd: protocol.SessionRename) -> None:
+        if not cmd.title.strip():
+            self.emit(
+                protocol.Notify(
+                    severity="warning", text="A session needs a name."
+                )
+            )
+            return
+        self.rows[self._index(cmd.session_id)].title = cmd.title
+        self.emit(protocol.SessionRows(rows=list(self.rows)))
+
+    def _do_SessionRetitle(self, cmd: protocol.SessionRetitle) -> None:
+        """There is no model behind the demo, so the "title" is the first
+        thing that was said — which is what the real core falls back to."""
+        entries = self.entries(cmd.session_id)
+        said = next((e.text for e in entries if e.kind == "user"), "")
+        if not said:
+            self.emit(
+                protocol.Notify(
+                    severity="warning", text="Nothing to summarize yet."
+                )
+            )
+            return
+        title = " ".join(said.split()[:6])
+        self.rows[self._index(cmd.session_id)].title = title
+        self.emit(protocol.SessionRows(rows=list(self.rows)))
+        self.emit(protocol.Notify(text=f"Renamed to \u201c{title}\u201d"))
+
+    def _do_SessionDelete(self, cmd: protocol.SessionDelete) -> None:
+        gone = [r for r in self.rows if r.session_id == cmd.session_id]
+        self.rows = [r for r in self.rows if r.session_id != cmd.session_id]
+        self._entries.pop(cmd.session_id, None)
+        self._watches.pop(cmd.session_id, None)
+        self._live.pop(cmd.session_id, None)
+        # A turn and a parked approval go with the conversation, the way
+        # `TurnScheduler.forget_session` drops them in the real core.
+        if self._busy == cmd.session_id:
+            self._busy = ""
+        if self._parked == cmd.session_id:
+            self._parked = ""
+        self.emit(protocol.SessionRows(rows=list(self.rows)))
+        for row in gone:
+            self.emit(protocol.Notify(text=f"Deleted \u201c{row.title}\u201d"))
+
     def _do_SessionFork(self, cmd: protocol.SessionFork) -> None:
         source = self.rows[self._index(cmd.session_id)]
         self._forks += 1
@@ -670,6 +751,7 @@ def build(chat: int = 400, sessions: int = 14, watchers: int = 5) -> RowUI:
         settings_json=SETTINGS_JSON,
         llms=sample_llms(),
         profiles=sample_profiles(),
+        backends=sample_backends(),
     )
     core = DemoCore(chat=chat, sessions=sessions, watchers=watchers)
     client = UIClient(ui, send=core.handle)

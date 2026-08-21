@@ -718,6 +718,53 @@ class SidebarRow:
 
 
 @dataclass(frozen=True)
+class NewSession:
+    """Start a conversation, under this profile and this backend.
+
+    The one intent that names no session, because the point of it is that
+    there is not one yet — the core makes it and says which it is
+    (`protocol.SessionCreated`), and the UI opens what comes back rather than
+    guessing an id.
+
+    ``backend`` is opaque here on purpose: what identifies a backend is the
+    core's business (`core.backends.backend_for_new_session`), and the UI only
+    ever hands back the string the catalog it was given handed it. Empty means
+    "whatever the core would have picked", which is what a run with no
+    configured backends gets.
+    """
+
+    profile: str = ""
+    backend: str = ""
+
+
+@dataclass(frozen=True)
+class Rename:
+    """Give this conversation the name the user typed."""
+
+    session_id: str
+    title: str
+
+
+@dataclass(frozen=True)
+class Retitle:
+    """Ask the model to name this conversation.
+
+    No title travels with it: the UI is asking for one, not supplying one, and
+    which model is asked is the core's decision — a session pinned to a
+    backend must not be named by whichever model the core happens to hold.
+    """
+
+    session_id: str
+
+
+@dataclass(frozen=True)
+class DeleteSession:
+    """Drop this conversation. Asked first — `RowUI.ask` owns the question."""
+
+    session_id: str
+
+
+@dataclass(frozen=True)
 class OpenSession:
     """Show me this conversation."""
 
@@ -825,7 +872,11 @@ class Drop:
 
 
 Intent = (
-    OpenSession
+    NewSession
+    | Rename
+    | Retitle
+    | DeleteSession
+    | OpenSession
     | Submit
     | Interrupt
     | Fork
