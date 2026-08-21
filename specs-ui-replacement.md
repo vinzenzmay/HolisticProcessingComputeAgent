@@ -467,11 +467,28 @@ all bucket A. `test-live` keeps working throughout.
 
 ## 8. Performance
 
-The whole reason for the exercise, so it is measured rather than asserted. The
-prototype's claim is 0.015 ms per scroll+render at 5000 chat entries, flat in
-entry count, against Textual's 44 ms p95 at 300 messages — measured when the
-prototype was first written and recorded only in `8b790e7`'s commit message,
-which is why M10 re-takes both sides rather than trusting the number.
+The whole reason for the exercise, so it is measured rather than asserted.
+**Both sides have now been measured: see [specs-ui-baseline.md](specs-ui-baseline.md).**
+
+The figure this plan originally quoted — Textual at 44 ms p95 for 300 messages,
+from `8b790e7`'s commit message — **did not reproduce**. Textual costs about
+13 ms there. The justification is nonetheless stronger than that number was,
+and better located:
+
+- Textual's *repaint* is flat in conversation length (~1.5 ms at any size). It
+  is not the problem and the row UI has no real advantage there.
+- Textual's *arrange pass* is O(conversation): 2.9 ms at 100 entries, 18 ms at
+  1000, 126 ms at 5000 and 994 ms at p95. A scroll invalidates layout, so a
+  scroll pays it.
+- 15 seconds to first draw at 5000 entries, from mounting one widget per entry.
+- A single 1 MB message costs 587 ms at p95; 1000 sessions cost 117 ms of
+  layout, neither of which is about conversation length at all.
+- The row UI is flat at ~0.19 ms from 100 entries to 20,000, and its cost tracks
+  terminal *area* rather than content.
+
+The row UI's own previously published figures (0.009–0.018 ms) were optimistic
+by about 10× and are superseded by the same document. M10 keeps the remaining
+dimensions and adds thresholds as tests.
 
 Benchmarks to land as tests with thresholds:
 
