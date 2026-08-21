@@ -733,6 +733,67 @@ class MemoryService:
 
     # ----------------------------------------------------- profile / skills
 
+    def profile_body(self, name: str, kind: str) -> tuple[str, str]:
+        """One editable profile file as text, and why it could not be read.
+
+        The read half of :meth:`save_profile_memories` /
+        :meth:`save_profile_archive`, and it belongs beside them because they
+        are the pair that has to agree about *which bytes*: the save writes
+        verbatim, so a read that returned anything but the file itself would
+        turn every edit into a silent rewrite of what it failed to show.
+
+        Hence the raw file rather than ``Profile.load(name).render()``, which
+        is what a front-end was doing. A memory file the parser choked on is
+        exactly the one someone opens an editor to fix, and rendering the
+        parsed subset back would delete the lines it could not read — with the
+        user believing they had just saved them.
+
+        Returns ``(text, error)``. A file that is not there is "", not an
+        error: a fresh profile has no archive yet, and refusing to open an
+        editor over it would leave no way to write the first line. An error is
+        for a name nothing answers to, or a file that exists and would not be
+        read — both cases where an editor must refuse rather than edit blind.
+        """
+        if name not in Profile.list_profiles():
+            return "", f"There is no profile called “{name}”."
+        if kind == "archive":
+            path = curator.archive_path(name)
+        elif kind == "memories":
+            path = Profile.path_for(name)
+        else:  # pragma: no cover - the protocol only admits the two kinds
+            return "", f"There is no “{kind}” to edit."
+        return self._read(path)
+
+    def skill_body(self, profile: str, name: str) -> tuple[str, str]:
+        """One of a profile's own skill files, verbatim, and why not.
+
+        Own skills only, matching what :meth:`save_skill_file` writes and
+        :meth:`delete_profile_skill` removes: a shared or shipped skill is not
+        this profile's to edit, and handing its body to an editor whose save
+        would land in the profile's own directory would silently fork it.
+        """
+        if not any(s.name == name for s in load_own_skills(profile)):
+            return "", f"Profile “{profile}” has no skill “{name}” of its own."
+        return self._read(skill_path(name, profile))
+
+    def own_skills(self, profile: str) -> list[Skill]:
+        """The skills a profile may edit and delete — its own, never shared."""
+        return load_own_skills(profile)
+
+    @staticmethod
+    def _read(path: Path) -> tuple[str, str]:
+        """``(text, error)`` for one file. Missing is empty, not an error."""
+        try:
+            return path.read_text(), ""
+        except FileNotFoundError:
+            return "", ""
+        except OSError as e:
+            return "", f"Could not read {path.name}: {e.strerror or e}"
+        except UnicodeDecodeError:
+            # A file an editor cannot show is a file a verbatim save would
+            # destroy; better to refuse than to hand back a lossy decode.
+            return "", f"{path.name} is not text."
+
     def save_profile_memories(self, name: str, text: str) -> None:
         """Persist the raw memory text a user edited; report parse trouble but
         never lose their edits — the file is theirs to fix by hand (§6.4)."""

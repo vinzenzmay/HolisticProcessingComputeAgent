@@ -37,8 +37,19 @@ from hpca.protocol import (
     SessionCreated,
     SessionFork,
     SessionRollback,
+    BackendProbed,
+    BackendScanned,
+    BackendSet,
     LLMCatalog,
     LLMEntry,
+    ProfileBody,
+    ProfileGet,
+    SettingsBody,
+    SettingsSave,
+    SkillBody,
+    SkillGet,
+    SkillRow,
+    SkillRows,
     ProfileRow,
     ProfileRows,
     SessionNew,
@@ -84,6 +95,21 @@ SPEC_COMMANDS = {
     # never had, added because a front-end cannot draw either by inference.
     "llm.list",
     "profile.list",
+    # Nor these. §4.1 gave the four editable things a *write* command each and
+    # no way to read what was about to be overwritten, which is not a missing
+    # convenience — `profile.save` writes verbatim, so an editor opened over a
+    # body it could not fetch truncates the file. See `TestTheReadPaths`.
+    "profile.get",
+    "skill.list",
+    "skill.get",
+    "settings.get",
+    "settings.save",
+    # And the three the manage-LLMs screen needs behind it: an endpoint check,
+    # a scan for endpoints nobody has configured, and the removal that §4.1's
+    # add-only catalog left with no command at all.
+    "backend.probe",
+    "backend.scan",
+    "backend.remove",
     "profile.set",
     "profile.save",
     "profile.create",
@@ -104,6 +130,12 @@ SPEC_EVENTS = {
     "session.created",
     "llm.catalog",
     "profile.rows",
+    "profile.body",
+    "skill.rows",
+    "skill.body",
+    "settings.body",
+    "backend.probed",
+    "backend.scanned",
     "chat.reset",
     "chat.append",
     "chat.update",
@@ -807,3 +839,124 @@ class TestTheProfileListing:
         # the same profile, so one flag could not answer both.
         row = ProfileRow(name="hpc", working=True)
         assert (row.is_default, row.working) == (False, True)
+
+
+class TestTheReadPaths:
+    """The four editors' `get` half — the invariant, not a convenience.
+
+    Every one of these has had a *write* command since §4.1 and no way to read
+    what it was about to write over, so a front-end read the app dir itself,
+    which is precisely the rule §4.2 spends its second paragraph on. The shape
+    they all share is that the body is verbatim and that "empty" and
+    "unreadable" are told apart, because the save behind them truncates.
+    """
+
+    def test_the_read_names_the_same_thing_the_write_does(self):
+        # Same two words, so an editor cannot fetch one file and save another.
+        assert set(ProfileGet.model_fields) == {"name", "kind"}
+
+    def test_a_body_is_told_apart_from_a_body_that_could_not_be_read(self):
+        empty = ProfileBody(name="default", kind="archive")
+        broken = ProfileBody(
+            name="default", kind="memories", error="permission denied"
+        )
+        assert (empty.text, empty.error) == ("", "")
+        assert broken.text == "" and broken.error
+        # And that is the whole difference an editor may open on: identical
+        # text, opposite verdicts.
+
+    def test_a_profile_body_round_trips(self):
+        body = ProfileBody(
+            name="hpc", kind="memories", text="## [rag]\n- lives in /data\n"
+        )
+        assert parse(decode(encode(body.to_envelope()))).text == body.text
+
+    def test_only_the_two_editable_kinds_are_addressable(self):
+        # Not a path: a front-end may name these two files and nothing else.
+        with pytest.raises(ProtocolError):
+            parse(
+                Envelope(
+                    type="profile.get",
+                    payload={"name": "default", "kind": "/etc/passwd"},
+                )
+            )
+
+    def test_a_skill_listing_draws_a_menu_and_carries_no_bodies(self):
+        assert set(SkillRow.model_fields) == {"name", "description"}
+        rows = SkillRows(
+            profile="hpc", skills=[SkillRow(name="qc", description="run QC")]
+        )
+        assert "text" not in rows.model_dump_json()
+
+    def test_a_skill_body_is_fetched_one_at_a_time(self):
+        body = SkillBody(profile="hpc", name="qc", text="---\nname: qc\n---\n")
+        assert parse(decode(encode(body.to_envelope()))).text == body.text
+        assert set(SkillGet.model_fields) == {"profile", "name"}
+
+    def test_the_settings_cross_as_text_not_as_a_model(self):
+        # Text both ways, because the file is what is edited: parsing it into
+        # a model here would make the protocol carry a second copy of the
+        # settings schema, and normalising it would rewrite what the user is
+        # looking at.
+        assert set(SettingsSave.model_fields) == {"text"}
+        assert set(SettingsBody.model_fields) == {"text", "error", "reply_to"}
+
+    def test_a_refused_save_says_why_and_still_describes_the_file(self):
+        refused = SettingsBody(text="{}", error="invalid: llm.model — required")
+        assert refused.error and refused.text == "{}"
+
+
+class TestNamingABackend:
+    """`backend.set` by label — what a picker can actually send back.
+
+    The catalog carries no api_key by design, so a front-end handed one row
+    cannot reconstruct the entry it names. With only the by-value form, ctrl+l
+    could not switch a session to a key-locked backend at all.
+    """
+
+    def test_a_backend_can_be_named_by_its_catalog_label(self):
+        entry = LLMEntry(label="qwen3-32b @ node07:20001", model="qwen3-32b")
+        command = BackendSet(label=entry.label, session_id="s1")
+        assert command.label == entry.label and command.backend == {}
+
+    def test_the_whole_entry_form_survives(self):
+        # A hand-filled connection form names a backend that is in no catalog
+        # yet, so there is no label for it to be named by.
+        command = BackendSet(
+            backend={"model": "qwen3-32b", "base_url": "http://h/v1"}
+        )
+        assert command.label == "" and command.backend["model"] == "qwen3-32b"
+
+    def test_removal_names_the_entry_the_same_way(self):
+        assert set(protocol.BackendRemove.model_fields) == {"label"}
+
+
+class TestProbingAndScanning:
+    def test_a_probe_carries_the_key_out_and_never_back(self):
+        assert set(protocol.BackendProbe.model_fields) == {"base_url", "api_key"}
+        answered = BackendProbed(
+            base_url="http://h/v1",
+            models=[LLMEntry(label="qwen", model="qwen", needs_key=True)],
+        )
+        assert "api_key" not in answered.model_dump_json()
+
+    def test_three_probe_outcomes_without_a_status_field(self):
+        nothing = BackendProbed(base_url="http://h/v1")
+        locked = BackendProbed(base_url="http://h/v1", needs_key=True)
+        served = BackendProbed(
+            base_url="http://h/v1", models=[LLMEntry(label="q", model="q")]
+        )
+        assert (nothing.models, nothing.needs_key) == ([], False)
+        assert (locked.models, locked.needs_key) == ([], True)
+        assert served.models and served.needs_key is False
+
+    def test_an_empty_scan_carries_the_verdict_not_just_the_count(self):
+        # "Nothing found" means three different things, and which one it is
+        # depends on probes only the core runs.
+        quiet = BackendScanned(found=0, cluster=1)
+        nothing_new = BackendScanned(found=0, notice="Nothing new on localhost")
+        offcluster = BackendScanned(found=0, help="ssh -fN -L ...")
+        assert (quiet.notice, quiet.help) == ("", "")
+        assert nothing_new.notice and not nothing_new.help
+        assert offcluster.help and not offcluster.notice
+

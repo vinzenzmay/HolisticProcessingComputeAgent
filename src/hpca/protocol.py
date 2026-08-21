@@ -374,6 +374,18 @@ class LLMEntry(_Model):
     discovered: bool = False
 
 
+class SkillRow(_Model):
+    """One line of a profile's skill menu (`skill.rows`).
+
+    What the menu draws and nothing else. The body is `skill.get`'s answer,
+    fetched when an editor opens rather than carried here — a listing has no
+    use for it, and one carried here would be stale by the time it is edited.
+    """
+
+    name: str
+    description: str = ""
+
+
 class ProfileRow(_Model):
     """One line of the profiles screen (`tui/profiles_screen.py`).
 
@@ -658,13 +670,85 @@ class ThinkingSet(Command):
 
 
 class BackendSet(Command):
+    """Point a session — or everything without one — at a backend.
+
+    Two ways of naming it, because there are two situations and only one of
+    them can be named by value.
+
+    ``label`` names an entry of the catalog the core just sent
+    (`LLMEntry.label`). This is the form a picker uses, and it exists because
+    the catalog deliberately carries no api_key: with only the blob form, a
+    front-end could not switch a session to a key-locked backend at all — it
+    would have to send back an entry it was never given the key for, and the
+    core would build a client that 401s. Naming the entry lets the key stay
+    where it already is.
+
+    ``backend`` is a whole `LLMBackend` as JSON, for the one case a label
+    cannot cover: a hand-filled connection form names a backend that is not in
+    the catalog yet, so there is no label to name it by. Opaque on purpose —
+    duplicating a settings model in the protocol would give it two definitions
+    to drift apart, and the core validates it against the real one anyway.
+
+    A label wins when both are set: it is the more specific of the two, and a
+    front-end that sends both has already been handed the entry.
+    """
+
     TYPE: ClassVar[str] = "backend.set"
-    # An `LLMBackend` as JSON. Opaque on purpose: duplicating a settings model
-    # in the protocol would give it two definitions to drift apart, and the
-    # core validates it against the real one anyway.
     backend: dict[str, Any] = Field(default_factory=dict)
+    label: str = ""
     # None sets the default backend rather than one session's.
     session_id: str | None = None
+
+
+class BackendProbe(Command):
+    """Ask one endpoint what it serves — the connection form's check.
+
+    The form cannot answer this itself (§4.2 rule 2, and the endpoint may be
+    on a node the front-end cannot reach), and the answer does three jobs at
+    once: it says whether anything OpenAI-shaped is there, it validates the
+    key that was typed, and it names the models so a blank model field can be
+    auto-filled — or a picker offered when the endpoint serves several.
+
+    ``api_key`` is the one place a key travels UI → core, and it is not a leak
+    of the rule that keeps keys off the wire: the user has just typed it into
+    the form, the core is the only side that can spend it, and nothing sends
+    it back. Answered by `backend.probed`.
+    """
+
+    TYPE: ClassVar[str] = "backend.probe"
+    base_url: str
+    api_key: str | None = None
+
+
+class BackendScan(Command):
+    """Look for endpoints nobody has configured yet — manage-LLMs' rescan.
+
+    Two searches under one command, because a backend can be reached two ways
+    and neither search finds the other's hits: a localhost port sweep finds
+    the SSH-tunnelled ones, and the cluster's manifest dir declares the ones
+    living on a compute node's own IP, which no localhost scan can see.
+
+    Slow — the sweep is tens of thousands of ports — so it is answered
+    incrementally: every hit restates `llm.catalog` with the new row flagged
+    `discovered`, and `backend.scanned` closes the run. A front-end may drop
+    the whole thing by simply not drawing further frames; the scan does not
+    hold a screen open.
+    """
+
+    TYPE: ClassVar[str] = "backend.scan"
+
+
+class BackendRemove(Command):
+    """Drop a catalog entry, named the way a picker knows it.
+
+    The other half of `backend.set`, which is what adds one. By label rather
+    than by value for the same reason the by-label set exists: what the screen
+    is holding is an `LLMEntry`, which has no key to send back, and an entry
+    identified by a re-sent blob would be one a wrong key could fail to match.
+    """
+
+    TYPE: ClassVar[str] = "backend.remove"
+    label: str
 
 
 class LLMList(Command):
@@ -705,6 +789,26 @@ class ProfileList(Command):
 class ProfileSet(Command):
     TYPE: ClassVar[str] = "profile.set"
     name: str
+
+
+class ProfileGet(Command):
+    """Fetch the body an editor is about to open — and about to overwrite.
+
+    The read half of `profile.save`, and it exists because the write half
+    writes *verbatim*: an editor opened over a body it could not fetch would
+    save an empty buffer over the file. `profile.rows` carries a memory
+    *count*, which is what a listing draws and is no use to an editor.
+
+    Named by the same two words the save is (``name``, ``kind``) rather than
+    by a path, so a front-end can neither read nor write anything but the two
+    files it is allowed to edit; a general "give me this file" command would
+    be exactly the `run_bash`-shaped endpoint this protocol is careful not to
+    be. Answered by `profile.body`.
+    """
+
+    TYPE: ClassVar[str] = "profile.get"
+    name: str
+    kind: Literal["memories", "archive"]
 
 
 class ProfileSave(Command):
@@ -749,6 +853,70 @@ class SkillSave(_SkillEdit):
 
 class SkillDelete(_SkillEdit):
     TYPE: ClassVar[str] = "skill.delete"
+
+
+class SkillList(Command):
+    """What skills this profile has of its own — answered by `skill.rows`.
+
+    Only the profile's own, which is what the screen may edit and delete: a
+    shipped or shared skill is not one profile's to change (`skill.save`
+    writes into the profile's directory and nowhere else).
+    """
+
+    TYPE: ClassVar[str] = "skill.list"
+    profile: str
+
+
+class SkillGet(Command):
+    """One skill's file, verbatim — the body `skill.save` will overwrite.
+
+    Separate from `skill.list` rather than folded into its rows, for two
+    reasons. A listing is drawn for every skill and a body is opened for one,
+    so shipping forty bodies to draw a menu is waste; and a body fetched when
+    the menu was drawn is a body that can be minutes stale by the time the
+    editor opens over it — which, with a verbatim save behind it, is how an
+    edit made elsewhere gets silently reverted. Answered by `skill.body`.
+    """
+
+    TYPE: ClassVar[str] = "skill.get"
+    profile: str
+    name: str
+
+
+class SettingsGet(Command):
+    """The settings file as text — answered by `settings.body`.
+
+    Verbatim, api keys and all, and that is deliberate rather than an
+    oversight of the rule that keeps keys out of `llm.catalog`. This is the
+    one screen whose *purpose* is editing that file; it saves what it shows,
+    so a redacted body would delete every key the user has on the next save,
+    and a catalog row is drawn for people who are not editing keys at all.
+    """
+
+    TYPE: ClassVar[str] = "settings.get"
+
+
+class SettingsSave(Command):
+    """Write the settings file, and make the change take effect.
+
+    Validation is split, because the two halves answer different questions at
+    different speeds. A front-end can tell whether the text is *JSON* with the
+    standard library and no idea what a setting is, which is the check an
+    editor needs synchronously to refuse to close. Whether it is a valid
+    `Settings` — which fields exist, what they may hold — is the core's model
+    to know, so the core re-validates and refuses the write, saying why; a
+    front-end is not asked to carry a copy of the schema in order to be
+    trusted with it.
+
+    Applying is the half that has no other home: only the core can rebuild the
+    clients it built at startup, which is why the old front-end could do
+    nothing better than say "applies on next start". Answered by
+    `settings.body` (what actually landed on disk, normalised) plus whatever
+    the change set in motion.
+    """
+
+    TYPE: ClassVar[str] = "settings.save"
+    text: str
 
 
 class ProcessKill(Command):
@@ -853,11 +1021,126 @@ class LLMCatalog(Event):
     probed: bool = False
 
 
+class BackendProbed(Event):
+    """What one endpoint answered — the reply to `backend.probe`.
+
+    Three outcomes, told apart without a status enum because the two fields
+    already say it: rows and nothing else means it answered and these are the
+    models it serves (one auto-fills the form, several are a picker); no rows
+    with ``needs_key`` means it is there but the key was missing or refused;
+    no rows and no ``needs_key`` means nothing OpenAI-shaped answered at all.
+
+    `LLMEntry` rather than a shape of its own, because a probed model is drawn
+    by the same row renderer as a catalogued one and carries the same four
+    facts. ``label`` is the model id here — the entry is not in a catalog yet,
+    so there is nothing for a label to disambiguate it from.
+    """
+
+    TYPE: ClassVar[str] = "backend.probed"
+    base_url: str
+    models: list[LLMEntry] = Field(default_factory=list)
+    needs_key: bool = False
+
+
+class BackendScanned(Event):
+    """A scan is over, and what its emptiness meant (`backend.scan`).
+
+    The rows themselves have already arrived — each hit restates
+    `llm.catalog` — so this frame exists for the verdict, which is the part a
+    front-end cannot reach: "nothing found" means something different
+    depending on whether the cluster's manifests declared an endpoint and
+    whether anything already configured still answers, and both of those are
+    the core's probes.
+
+    Two texts rather than one, because they are rendered differently and the
+    difference is the point. ``notice`` is a passing remark — nothing new
+    turned up — and belongs in a toast. ``help`` is the tunnel recipe for the
+    off-cluster case: several lines that have to be retyped into a shell, so
+    it needs a window that holds a selection and waits to be dismissed. Both
+    empty means the scan found things and there is nothing to explain.
+    """
+
+    TYPE: ClassVar[str] = "backend.scanned"
+    # How many endpoints the two searches turned up, so a status line can say
+    # so without counting rows it may have chosen not to draw.
+    found: int = 0
+    cluster: int = 0
+    notice: str = ""
+    help: str = ""
+
+
 class ProfileRows(Event):
     """The profiles, whole — the answer to `profile.list`."""
 
     TYPE: ClassVar[str] = "profile.rows"
     rows: list[ProfileRow] = Field(default_factory=list)
+
+
+class ProfileBody(Event):
+    """One editable body, verbatim — the answer to `profile.get`.
+
+    ``text`` is the file exactly as it is on disk, not a re-rendered version
+    of what the core parsed out of it: a memory file the parser choked on is
+    precisely the one a user opens the editor to fix, and handing back the
+    parsed subset would quietly delete the lines it could not read.
+
+    ``error`` is what separates "this file is empty" from "this file could not
+    be read", which look identical in ``text`` and must not: an editor may
+    open over the first and must refuse the second, because the save behind it
+    writes verbatim. Empty ``error`` is the only permission to edit.
+    """
+
+    TYPE: ClassVar[str] = "profile.body"
+    name: str
+    kind: Literal["memories", "archive"]
+    text: str = ""
+    error: str = ""
+
+
+class SkillRows(Event):
+    """A profile's own skills, as a menu draws them — answered to `skill.list`.
+
+    Name and description only. The body is a separate fetch (`skill.get`) and
+    deliberately not here: see that command for why a body carried by a
+    listing is a body that goes stale before it is edited.
+    """
+
+    TYPE: ClassVar[str] = "skill.rows"
+    profile: str
+    skills: list[SkillRow] = Field(default_factory=list)
+
+
+class SkillBody(Event):
+    """One skill file, verbatim — the answer to `skill.get`.
+
+    ``error`` carries the same meaning as `ProfileBody.error`, and for the
+    same reason: `skill.save` writes what it is given.
+    """
+
+    TYPE: ClassVar[str] = "skill.body"
+    profile: str
+    name: str
+    text: str = ""
+    error: str = ""
+
+
+class SettingsBody(Event):
+    """The settings file as text — answered to `settings.get`, and restated
+    after a `settings.save`.
+
+    Restated on save because what lands on disk is not what was sent: the core
+    writes the validated model back out, so keys get their canonical order and
+    every default the file omitted becomes explicit. A front-end that kept its
+    own copy of the text it sent would show something the file no longer says.
+
+    ``error`` is why a save was refused — the pydantic verdict, one line, on
+    the text that did not get written. The body then still describes the file
+    that is still there.
+    """
+
+    TYPE: ClassVar[str] = "settings.body"
+    text: str = ""
+    error: str = ""
 
 
 class ChatReset(Event):

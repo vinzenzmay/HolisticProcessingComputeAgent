@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import TYPE_CHECKING, Any, Callable
@@ -33,11 +34,18 @@ from typing import TYPE_CHECKING, Any, Callable
 import httpx
 
 from hpca.agent import compact
-from hpca.autoconnect import AutoConnectPlan, plan_auto_connect
+from hpca.autoconnect import AutoConnectPlan, offcluster_help, plan_auto_connect
 from hpca.cluster_endpoints import discover_cluster_endpoints
 from hpca.config import LLMBackend, LLMSettings, llm_settings_for
 from hpca.core.deps import CoreDeps
-from hpca.discover import DiscoveredBackend, is_reachable
+from hpca.discover import (
+    KEY_REQUIRED,
+    DiscoveredBackend,
+    is_reachable,
+    ordered_ports,
+    probe_endpoint,
+    scan_local_ports,
+)
 from hpca.embeddings import EmbeddingClient
 from hpca.llm import LLMClient
 from hpca.logs import LoggedLLM
@@ -51,6 +59,34 @@ if TYPE_CHECKING:
 # a bare `LLMClient(...)` call so a test can count constructions and closes
 # without a socket ever being opened.
 ClientFactory = Callable[[LLMSettings], Any]
+
+# The localhost sweep, as a seam. Injected rather than called directly so a
+# test can drive `scan` without opening 64k sockets — and so the thread hop
+# around it (see `BackendRegistry._scan_local`) is exercised either way.
+PortScanner = Callable[..., Any]
+
+
+@dataclass
+class ScanResult:
+    """What one `backend.scan` turned up, and the state it has to be read
+    against.
+
+    Three fields because "the scan found nothing" is not one outcome. A
+    localhost sweep that finds nothing while the cluster's manifests declare a
+    live endpoint is a normal day on a compute node; the same empty sweep with
+    every configured backend also unreachable is the off-cluster case, and the
+    user needs the tunnel recipe. Only something holding all three can tell
+    those apart, which is why the verdict is minted here (`verdict`) rather
+    than left to whoever draws the panel.
+    """
+
+    local: list[DiscoveredBackend] = field(default_factory=list)
+    cluster: list[DiscoveredBackend] = field(default_factory=list)
+    reachable: dict[str, bool] = field(default_factory=dict)
+
+    @property
+    def found(self) -> int:
+        return len(self.local) + len(self.cluster)
 
 
 def autoconnect_logger(app_dir: Path) -> logging.Logger:
@@ -111,6 +147,7 @@ class BackendRegistry:
         client_factory: ClientFactory = LLMClient,
         on_reload: Callable[[], None] | None = None,
         probe_transport: httpx.AsyncBaseTransport | None = None,
+        port_scanner: PortScanner = scan_local_ports,
         logger: logging.Logger | None = None,
     ) -> None:
         self._deps = deps
@@ -144,7 +181,15 @@ class BackendRegistry:
         # the app, which is what this used to be.
         self._on_reload = on_reload
         self._probe_transport = probe_transport
+        self._port_scanner = port_scanner
         self._logger = logger
+        # Endpoints a scan turned up that nobody has configured. Kept here
+        # rather than in the front-end because they are catalog rows with a
+        # flag on them (`protocol.LLMEntry.discovered`) — the same list, so a
+        # screen showing two panels is splitting one answer rather than
+        # keeping two in step. They outlive the scan so a second `llm.list`
+        # still draws them; only a rescan replaces them.
+        self._discovered: list[DiscoveredBackend] = []
         # The window the bootstrap backend reports when asked, and the last
         # measured prompt size per session — a different thread is a different
         # context, so this can never be one number.
