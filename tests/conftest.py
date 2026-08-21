@@ -74,9 +74,16 @@ def no_startup_backend_modal(monkeypatch):
     network to get it. Tests that cover the check turn it back on for their
     own app instance.
 
+    Both front-ends, because both end startup the same way: the core does the
+    probing now (``AgentService.startup`` → ``BackendRegistry.ensure_connected``)
+    and `ui/boot.py` opens the screen on its answer, so switching it off has to
+    happen where the probe is.
+
     Imported inside the fixture: most of the suite never touches the TUI, and
     importing Textual for it at collection time is pure cost.
     """
+    from hpca.core.service import AgentService
     from hpca.tui.app import HpcaApp
 
     monkeypatch.setattr(HpcaApp, "startup_backend_check", False)
+    monkeypatch.setattr(AgentService, "startup_backend_check", False)

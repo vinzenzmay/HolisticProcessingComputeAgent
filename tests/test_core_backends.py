@@ -23,7 +23,11 @@ import pytest
 
 from hpca.agent.compact import CHARS_PER_TOKEN
 from hpca.config import LLMBackend, Settings
-from hpca.core.backends import BackendRegistry, autoconnect_logger
+from hpca.core.backends import (
+    NO_BACKEND_MESSAGE,
+    BackendRegistry,
+    autoconnect_logger,
+)
 from hpca.core.deps import CoreDeps
 from hpca.db import connect, init_db
 from hpca.discover import KEY_REQUIRED, DiscoveredBackend
@@ -937,6 +941,100 @@ class TestAutoConnect:
         assert await h.registry.auto_activate(discovered) is False
         assert len(h.factory.built) == built_before  # no client rebuilt
         assert h.events == []
+
+
+class TestTheStartupCheck:
+    """Whether the backend a new session would talk to actually answers.
+
+    The last step of startup and the one the rest of the UI cannot show:
+    settings name a backend whether or not anything is listening, so a dead
+    tunnel looks exactly like a live one until the first turn fails. The
+    answer here is what decides whether the front-end opens manage-LLMs.
+    """
+
+    def active(self, h, port, **overrides):
+        """Point the settings at an endpoint the mock transport routes."""
+        backend = LLMBackend(
+            model="qwen-a", base_url=f"http://localhost:{port}/v1", **overrides
+        )
+        h.settings.activate_backend(backend)
+        return backend
+
+    async def test_a_backend_that_answers_is_connected_and_silent(
+        self, home
+    ):
+        h = Harness(home, probe_transport=make_transport({20001: serve("qwen-a")}))
+        self.active(h, 20001)
+        assert await h.registry.ensure_connected() is True
+        assert h.events == []
+
+    async def test_nothing_answering_says_why(self, home):
+        h = Harness(home, probe_transport=make_transport({}))
+        self.active(h, 20001)
+        assert await h.registry.ensure_connected() is False
+        assert h.notices[-1].severity == "warning"
+        assert h.notices[-1].text == NO_BACKEND_MESSAGE
+
+    async def test_a_key_locked_backend_is_not_connected(self, home):
+        # Up, but not for us: without a working key the first turn would 401
+        # just as surely as if the tunnel were down.
+        h = Harness(home, probe_transport=make_transport({20001: locked}))
+        self.active(h, 20001)
+        assert await h.registry.ensure_connected() is False
+
+    async def test_and_the_key_it_carries_is_the_one_that_has_to_work(
+        self, home
+    ):
+        # Not the pool: a key that unlocks the endpoint but is not the one on
+        # this backend does not make this backend usable.
+        h = Harness(
+            home, probe_transport=make_transport({20001: keyed("qwen-a", "good")})
+        )
+        h.settings.llm_api_keys = ["good"]
+        self.active(h, 20001, api_key="stale")
+        assert await h.registry.ensure_connected() is False
+        h.settings.llm.api_key = "good"
+        assert await h.registry.ensure_connected() is True
+
+    async def test_nothing_configured_at_all_is_not_connected(self, home):
+        # First run: there is no endpoint to probe, and the screen that fixes
+        # that is the same one a dead tunnel needs.
+        h = Harness(home, probe_transport=make_transport({}))
+        h.settings.llm.base_url = ""
+        assert await h.registry.ensure_connected() is False
+        assert h.notices[-1].text == NO_BACKEND_MESSAGE
+
+    async def test_a_probe_that_explodes_leaves_the_user_alone(
+        self, home, monkeypatch
+    ):
+        # A check must never be the thing that interrupts a working startup:
+        # what it cannot answer, it does not answer *for*. `probe_endpoint`
+        # swallows everything httpx can raise, so the failure this guards
+        # against is one it does not — patched here rather than fabricated
+        # through the transport, which would only prove the swallowing.
+        async def explode(*args, **kwargs):
+            raise ValueError("something probe_endpoint does not catch")
+
+        h = Harness(home, probe_transport=make_transport({}))
+        monkeypatch.setattr("hpca.core.backends.probe_endpoint", explode)
+        self.active(h, 20001)
+        assert await h.registry.ensure_connected() is True
+        assert h.events == []
+
+    async def test_an_auto_connected_cluster_llm_counts_as_connected(
+        self, home, tmp_path
+    ):
+        """The check runs *after* auto-connect, not beside it: the backend it
+        probes is the one auto-connect just activated."""
+        h = Harness(
+            home,
+            **cluster(
+                tmp_path, [("111", 20001, "model-a")], {20001: serve("model-a")}
+            ),
+        )
+        h.settings.llm.base_url = "http://localhost:9999/v1"  # nothing there
+        await h.registry.auto_connect()
+        assert await h.registry.ensure_connected() is True
 
 
 class TestCatalog:

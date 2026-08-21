@@ -16,12 +16,13 @@ import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
 from hpca.config import LLMBackend, Settings, settings_path
-from hpca.core.service import build_service
+from hpca.core.service import AgentService, build_service
 from hpca.db import connect, init_db
 from hpca.episodic import EpisodicStore
 from hpca.llm import ChatResponse
 from hpca.jobs import JobStore
 from hpca.memory_ops import MemoryOp
+from hpca.agent.struggle import STRUGGLE_KIND
 from hpca.profiles import MemoryScope, Profile
 from hpca.protocol import (
     PROTOCOL_VERSION,
@@ -361,6 +362,41 @@ class TestTurns:
         await _settle()
         last = llm.prompts[0][-1]
         assert "count the reads" in (last.get("api_content") or last["content"])
+
+    async def test_a_request_that_resembles_a_past_struggle_warns_first(
+        self, service, session, llm
+    ):
+        """§4.4, and the fourth thing whose only caller was `tui/app.py`.
+
+        The model gets the same notes as a memory-context block either way
+        (`recall_lines`); this is the half addressed to the *user*, and it is
+        worth saying before the turn rather than after it fails again.
+        """
+        profile = Profile.load(session.profile)
+        profile.add_memory(
+            "STAR ran out of memory\nkeywords: star",
+            scope=MemoryScope.RAG,
+            kind=STRUGGLE_KIND,
+        )
+        profile.save()
+        service._memory.invalidate(session.profile)
+        queue = subscribe(service)
+        await service.handle(
+            TurnSubmit(session_id=session.session_id, text="run star again")
+        )
+        warnings = [
+            e
+            for e in await drain(queue)
+            if type(e).__name__ == "Notify" and e.severity == "warning"
+        ]
+        assert any("struggled with this before" in w.text for w in warnings)
+
+    async def test_and_an_unremarkable_one_does_not(self, service, session, llm):
+        queue = subscribe(service)
+        await service.handle(
+            TurnSubmit(session_id=session.session_id, text="run star again")
+        )
+        assert "Notify" not in kinds(await drain(queue))
 
     async def test_submitting_to_a_session_that_does_not_exist_says_so(self, service):
         queue = subscribe(service)
@@ -3873,6 +3909,49 @@ class TestMemoryReview:
         kept = [m.text for m in Profile.load("default").memories]
         assert {"reviewed fact", "flagged fact"} <= set(kept)
 
+    async def test_the_memory_tool_reaches_the_queue_conclude_reads(
+        self, service, session, llm
+    ):
+        """The `memory` tool's one wire: `ToolContext.queue_memory_edits`.
+
+        The three tests above prime the queue in Python, which is exactly why
+        none of them noticed that no turn could reach it — the tool answered
+        "Memory flagging is not available in this context" while the system
+        prompt went on telling the model to use it. This one goes the whole
+        way: the model flags a fact mid-turn, and `/conclude` offers that fact.
+        """
+        llm._outputs = [
+            calling(
+                "memory",
+                operations=[
+                    {"op": "add", "scope": "rag", "text": "scratch is /work"}
+                ],
+            ),
+            respond("noted"),
+        ]
+        queue = subscribe(service)
+        await service.handle(
+            TurnSubmit(session_id=session.session_id, text="remember that")
+        )
+        events = await wait_for(queue, "TurnFinished")
+        results = [
+            part.result
+            for event in events
+            for entry in [getattr(event, "entry", None)]
+            if entry is not None
+            for part in entry.parts
+            if part.tool == "memory" and part.done
+        ]
+        assert results and all("Noted 1 memory change" in r for r in results)
+
+        # And the fact is there to be offered when the user asks for it.
+        llm._outputs = [json.dumps({"proposals": []})]
+        await service.handle(
+            CommandRun(name="conclude", session_id=session.session_id)
+        )
+        offer = only(await wait_for(queue, "MemoryProposals"), "MemoryProposals")
+        assert "scratch is /work" in offer.proposals[0].text
+
     async def test_a_conversation_with_nothing_in_it_is_not_reviewed(
         self, service, session, llm
     ):
@@ -4351,6 +4430,133 @@ class TestRobustness:
         # Not an error: a stale answer is exactly what arrives when a turn
         # resolved between the prompt being drawn and the key being pressed.
         assert [e for e in await drain(queue) if type(e).__name__ == "Notify"] == []
+
+
+class TestStartup:
+    """What happens once, before anyone types anything.
+
+    All of it lived in `tui/app.py`'s `on_mount` and had exactly one caller
+    each (`specs-ui-coverage.md` §3.1, §3.3), so deleting that module deleted
+    the behaviour with it: the trash was never swept, the curator never ran,
+    and nothing ever discovered — or checked — a backend.
+    """
+
+    @staticmethod
+    def backup(home, name="kept.txt", *, at=None):
+        """One backup in the app dir's trash, optionally aged past its TTL."""
+        from hpca.trash import TrashManager
+
+        source = home / name
+        source.write_text("before")
+        entry = TrashManager(
+            home / "trash", backup_limit_bytes=1024**3
+        ).backup(source)
+        directory = entry.trashed_path.parent
+        if at is not None:
+            meta = directory / "meta.json"
+            payload = json.loads(meta.read_text())
+            payload["trashed_at"] = at
+            meta.write_text(json.dumps(payload))
+        return directory
+
+    @pytest.fixture
+    def trashed(self, home):
+        return self.backup(home, at="2001-01-01T00:00:00+00:00")
+
+    @pytest.fixture
+    def startup_check(self, monkeypatch):
+        """Turn the backend check back on (the suite disables it wholesale —
+        `tests/conftest.py`), for the tests that are about the check."""
+        monkeypatch.setattr(AgentService, "startup_backend_check", True)
+
+    async def test_the_trash_is_swept(self, service, trashed):
+        queue = subscribe(service)
+        await service.startup()
+        assert not trashed.exists()
+        assert "Trash" in only(await drain(queue), "Notify").text
+
+    async def test_a_backup_inside_its_ttl_is_left_alone(self, service, home):
+        entry = self.backup(home)
+        queue = subscribe(service)
+        await service.startup()
+        assert entry.exists()
+        assert await drain(queue) == []  # nothing to say
+
+    async def test_a_trash_that_cannot_be_swept_does_not_stop_startup(
+        self, service, monkeypatch
+    ):
+        def explode(self, ttl_days):
+            raise OSError("the NFS home went away")
+
+        monkeypatch.setattr("hpca.trash.TrashManager.cleanup", explode)
+        assert await service.startup() is True
+
+    async def test_the_curator_runs(self, service, monkeypatch):
+        ran: list[int] = []
+        monkeypatch.setattr(
+            service._memory, "run_curator_if_due", lambda: ran.append(1) or {}
+        )
+        await service.startup()
+        assert ran == [1]
+
+    async def test_the_curator_decides_for_itself_whether_it_is_due(
+        self, service, monkeypatch
+    ):
+        # The interval is the curator's own business (`curator_interval_days`,
+        # 0 disables it); startup's job is to give it the one chance to ask.
+        passes: list[int] = []
+        monkeypatch.setattr(
+            "hpca.curator.run", lambda *a, **k: passes.append(1) or {}
+        )
+        service._deps.settings.memory.curator_interval_days = 0
+        await service.startup()
+        assert passes == []
+
+    async def test_it_connects_before_it_checks(
+        self, service, monkeypatch, startup_check
+    ):
+        """Order, not both: the backend the check probes is the one
+        auto-connect just activated, so a cluster LLM counts as connected."""
+        order: list[str] = []
+
+        async def auto_connect(**kwargs):
+            order.append("auto-connect")
+
+        async def ensure_connected():
+            order.append("check")
+            return True
+
+        monkeypatch.setattr(service._backends, "auto_connect", auto_connect)
+        monkeypatch.setattr(service._backends, "ensure_connected", ensure_connected)
+        assert await service.startup() is True
+        assert order == ["auto-connect", "check"]
+
+    async def test_nothing_answering_is_the_answer_startup_returns(
+        self, service, monkeypatch, startup_check
+    ):
+        # What the front-end opens the manage-LLMs screen on.
+        async def nothing():
+            return False
+
+        monkeypatch.setattr(service._backends, "ensure_connected", nothing)
+        assert await service.startup() is False
+
+    async def test_the_check_can_be_switched_off(
+        self, service, monkeypatch, startup_check
+    ):
+        """The suite's own escape hatch (`tests/conftest.py`), because under
+        it nothing ever answers and a probe on every core would be a network
+        call in a hermetic test."""
+        probed: list[int] = []
+
+        async def probe():
+            probed.append(1)
+            return False
+
+        monkeypatch.setattr(service._backends, "ensure_connected", probe)
+        monkeypatch.setattr(AgentService, "startup_backend_check", False)
+        assert await service.startup() is True
+        assert probed == []
 
 
 class TestShutdown:

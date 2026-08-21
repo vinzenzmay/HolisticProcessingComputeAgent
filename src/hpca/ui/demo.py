@@ -311,6 +311,30 @@ def sample_catalog() -> list[protocol.LLMEntry]:
     ]
 
 
+# What the demo's first scan turns up, one row per frame. Neither shares a
+# base_url with `sample_catalog`, because a discovered row for something
+# already configured is the duplicate the screen dedups away — worth having a
+# demo that shows two rows rather than one that silently shows none.
+DISCOVERED = [
+    protocol.LLMEntry(
+        label="mistral-small @ localhost:20003",
+        model="mistral-small-3.1",
+        base_url="http://localhost:20003/v1",
+        max_model_len=32000,
+        reachable=True,
+        discovered=True,
+    ),
+    protocol.LLMEntry(
+        label="(api key required) @ 10.12.4.90:20001",
+        model="(api key required)",
+        base_url="http://10.12.4.90:20001/v1",
+        needs_key=True,
+        reachable=True,
+        discovered=True,
+    ),
+]
+
+
 class DemoCore:
     """A core made of lists: it answers commands with the events a real one
     would, and holds the transcripts so that a fork or a rollback means
@@ -365,6 +389,11 @@ class DemoCore:
         # has to be noticed in the sidebar rather than being what opens first.
         self._parked = self.rows[4].session_id if len(self.rows) > 4 else ""
         self._live: dict[str, protocol.Entry] = {}
+        # What the manage-LLMs screen has done to the catalog: the scans it
+        # has run, what they turned up, and what `r` removed.
+        self._scans = 0
+        self._found: list[protocol.LLMEntry] = []
+        self._removed: set[str] = set()
 
     # ------------------------------------------------------------- content
 
@@ -634,6 +663,13 @@ class DemoCore:
         self.emit(protocol.SessionCreated(row=row))
         self.emit(protocol.SessionRows(rows=list(self.rows)))
 
+    def _catalog(self) -> list[protocol.LLMEntry]:
+        """What the catalog is *now*: the configured rows a remove has not
+        taken away, plus whatever the running scan has turned up so far."""
+        return [
+            x for x in sample_catalog() if x.label not in self._removed
+        ] + list(self._found)
+
     def _do_LLMList(self, cmd: protocol.LLMList) -> None:
         """The catalog, and — when probes were asked for — the catalog again.
 
@@ -642,7 +678,7 @@ class DemoCore:
         settled frame would never show the mark a client has to draw for "not
         asked yet".
         """
-        entries = sample_catalog()
+        entries = self._catalog()
         self.emit(
             protocol.LLMCatalog(
                 entries=[e.model_copy(update={"reachable": None}) for e in entries]
@@ -650,6 +686,87 @@ class DemoCore:
         )
         if cmd.probe:
             self.emit(protocol.LLMCatalog(entries=entries, probed=True))
+
+    def _do_BackendScan(self, cmd: protocol.BackendScan) -> None:
+        """The scan, in the shape a real one answers in (`protocol.BackendScan`).
+
+        Every hit restates the catalog, so the discovered panel fills a row at
+        a time and the closing `backend.scanned` carries the verdict. The
+        demo's loopback is synchronous, so the frames arrive in one breath
+        rather than over a minute — the *order* is what the screen is being
+        shown, and it is the order that decides whether it can fill
+        incrementally at all.
+
+        A second scan finds nothing on purpose, which is the other half of
+        what this screen has to draw: the off-cluster case, where the verdict
+        is a tunnel recipe in a window rather than rows in a panel.
+        """
+        self._scans += 1
+        # Cleared first and said so, as the core does: a rescan must take a
+        # row for an endpoint that has gone away off the screen when the sweep
+        # *starts*, not when it ends.
+        self._found = []
+        self.emit(protocol.LLMCatalog(entries=self._catalog()))
+        if self._scans > 1:
+            self.emit(
+                protocol.BackendScanned(
+                    help=(
+                        "No LLM endpoints found.\n\n"
+                        "You are probably not on the cluster. Open a tunnel:\n\n"
+                        "    ssh -N -L 20001:node042:20001 login.example.org\n"
+                        "    ssh -N -L 20000:node042:20000 login.example.org\n\n"
+                        "Then press s here to scan again."
+                    )
+                )
+            )
+            return
+        for found in DISCOVERED:
+            self._found.append(found)
+            self.emit(protocol.LLMCatalog(entries=self._catalog()))
+        self.emit(
+            protocol.BackendScanned(found=len(self._found), cluster=1)
+        )
+
+    def _do_BackendProbe(self, cmd: protocol.BackendProbe) -> None:
+        """`backend.probed`, in all three of its shapes.
+
+        Which one depends on the URL, so that the form's three branches — a
+        refused key, an endpoint that serves one model, an endpoint that
+        serves several — can all be reached from the demo rather than only
+        from a test.
+        """
+        if "locked" in cmd.base_url and not cmd.api_key:
+            self.emit(
+                protocol.BackendProbed(base_url=cmd.base_url, needs_key=True)
+            )
+            return
+        if "nothing" in cmd.base_url:
+            self.emit(protocol.BackendProbed(base_url=cmd.base_url))
+            return
+        models = ["qwen3-27b-fp8", "llama-3.3-70b"] if "many" in cmd.base_url else [
+            "qwen3-27b-fp8"
+        ]
+        self.emit(
+            protocol.BackendProbed(
+                base_url=cmd.base_url,
+                models=[
+                    protocol.LLMEntry(
+                        label=name,
+                        model=name,
+                        base_url=cmd.base_url,
+                        max_model_len=112000,
+                        reachable=True,
+                        discovered=True,
+                    )
+                    for name in models
+                ],
+            )
+        )
+
+    def _do_BackendRemove(self, cmd: protocol.BackendRemove) -> None:
+        self._removed.add(cmd.label)
+        self.emit(protocol.Notify(text=f"Removed {cmd.label}"))
+        self.emit(protocol.LLMCatalog(entries=self._catalog(), probed=True))
 
     def _do_ProfileList(self, cmd: protocol.ProfileList) -> None:
         """`profile.rows`: counts and flags, which is all the event carries.

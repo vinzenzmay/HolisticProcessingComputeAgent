@@ -61,6 +61,14 @@ from hpca.sessions import SessionStore
 if TYPE_CHECKING:
     from hpca.logs import SessionLog
 
+# Said once, at the end of startup, when nothing is listening where the
+# settings say a backend is. The parenthesis is the way back: the front-end
+# opens the manage-LLMs screen on this answer, and a user who closes it needs
+# to know which key reopens it.
+NO_BACKEND_MESSAGE = (
+    "No LLM backend is answering — pick or configure one here (m reopens this)."
+)
+
 # How a client is built from the settings that describe it. A seam rather than
 # a bare `LLMClient(...)` call so a test can count constructions and closes
 # without a socket ever being opened.
@@ -1167,6 +1175,50 @@ class BackendRegistry:
         elif plan.notice:
             self._deps.emit(Notify(text=plan.notice))
         return plan
+
+    async def ensure_connected(self) -> bool:
+        """Whether the active backend answers — the last step of startup.
+
+        Without a live backend the app cannot do the one thing it is for, and
+        that used to show up only as a failed first turn: the settings say a
+        backend is configured, so nothing on screen looks wrong. This is the
+        moment to say otherwise. Auto-connect has already had its say, so if
+        the active backend still does not answer there is either nothing
+        configured yet (first run) or the tunnel to the cluster is down — and
+        both are fixed on the same screen, which the front-end opens on a
+        `False` here (`ui/boot.py`).
+
+        Only the *active* backend is probed: it is what a new session talks
+        to. Another catalog entry may well be up, and the screen shows it as
+        ● connected, one keypress away.
+
+        "Answers" means a usable answer — model rows we can actually reach
+        with the key this backend carries. A server that 401s the key we have
+        (or that we have no key for) is up, but not for us, and the first turn
+        would fail exactly as if it were down. Hence `probe_endpoint` rather
+        than `is_reachable`, which counts an unauthenticated 401 as reachable,
+        and hence no pool keys: a key that unlocks the endpoint but is not the
+        one on this backend does not make this backend usable.
+        """
+        llm = self._deps.settings.llm
+        if llm.base_url and llm.model:
+            try:
+                rows = await probe_endpoint(
+                    llm.base_url,
+                    api_key=llm.api_key,
+                    transport=self._probe_transport,
+                )
+            except Exception:
+                # A check must never be the thing that interrupts a working
+                # startup: what it cannot answer, it does not answer for.
+                self.logger.exception(
+                    "startup check: probing %s failed", llm.base_url
+                )
+                return True
+            if any(row.model != KEY_REQUIRED for row in rows):
+                return True
+        self._deps.emit(Notify(severity="warning", text=NO_BACKEND_MESSAGE))
+        return False
 
     def ensure_catalog(self, discovered: DiscoveredBackend) -> LLMBackend:
         """The catalog entry for a discovered endpoint, adding it if new."""

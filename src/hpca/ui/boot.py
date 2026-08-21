@@ -158,6 +158,7 @@ class Core:
         notices: list[str] | None = None,
         profile: str = "default",
         clipboard=None,
+        on_no_backend=None,
     ) -> None:
         self.service = service
         self.wire = wire
@@ -175,6 +176,13 @@ class Core:
         # `ClipboardSettings`, handed on to `ui/run.py` so that `y` can copy.
         # This module reads the settings file; nothing above it does.
         self.clipboard = clipboard
+        # What to do when startup ends with nothing answering. The core makes
+        # the decision — it owns the settings and the probe — and this is the
+        # half of the answer only a front-end can carry out: opening the
+        # screen that fixes it. A callback rather than an event because there
+        # is no frame for "open a screen" and, in the process split this
+        # module is the seam for, the day there is one it lands here.
+        self.on_no_backend = on_no_backend
         self._tasks: list[asyncio.Task] = []
         self._syncing = False
         self._sync_failing = False
@@ -193,6 +201,7 @@ class Core:
         slurm=None,
         app_dir: Path | None = None,
         wire: Connection | None = None,
+        on_no_backend=None,
     ) -> "Core":
         """Everything the runtime needs, opened in the one order that works."""
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -252,6 +261,7 @@ class Core:
             notices=notices,
             profile=profile,
             clipboard=settings.clipboard,
+            on_no_backend=on_no_backend,
         )
         return core
 
@@ -262,12 +272,42 @@ class Core:
         commands in, databases home. Started together because the handshake is
         the first event out and a UI that never receives it never asks for a
         session list.
+
+        The fourth task is not a pump but the once-only startup pass, and it
+        is a task for the reason it was a worker in `tui/app.py`'s `on_mount`:
+        it talks to the network, and the first frame must not wait for it.
         """
         self.service.start_timers()
         self._tasks.append(asyncio.ensure_future(self._events_out()))
         self._tasks.append(asyncio.ensure_future(self._commands_in()))
+        self._tasks.append(asyncio.ensure_future(self._startup()))
         if self.dbcache is not None and self.dbcache.active and self.sync_interval > 0:
             self._tasks.append(asyncio.ensure_future(self._sync_timer()))
+
+    async def _startup(self) -> None:
+        """The core's one startup pass, and the one answer it needs a UI for.
+
+        `AgentService.startup` sweeps the trash, gives the curator its chance
+        and connects to whatever the cluster offers, then says whether a
+        backend is actually answering. It is not this module's business how
+        any of that is decided — but "nothing is" has to become a *screen*,
+        and only a front-end has one.
+
+        Every part of it is best-effort, so a failure here is logged and
+        dropped rather than raised: a startup that cannot reach a controller
+        is still a startup, and the alternative is a task exception into a
+        loop that is drawing a frame.
+        """
+        try:
+            connected = await self.service.startup()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("the startup pass failed")
+            return
+        if not connected and self.on_no_backend is not None:
+            with contextlib.suppress(Exception):
+                self.on_no_backend()
 
     async def _events_out(self) -> None:
         """Everything the core says, onto the wire, in the order it said it."""
@@ -469,6 +509,27 @@ def _open_db_cache(settings, root: Path):
     return cache, notices
 
 
+def _open_llm_screen(ui) -> None:
+    """Manage-LLMs, opened because startup found nothing answering.
+
+    The same screen `m` opens and drawn from the same catalog, so what the
+    user gets is a screen they can also reach on their own rather than a modal
+    that only exists at startup. The core has already said *why* — the warning
+    it emits arrives as a toast — and that warning is also what repaints the
+    frame: it is on the wire before this runs, so the client applies it, wakes
+    the loop, and the screen this opened is drawn with the explanation over it.
+
+    Not over an open screen. A probe takes a couple of seconds, and by then
+    the user may have opened something of their own or be on their way out;
+    the notification alone is better than a screen landing under their hands.
+    """
+    from hpca.ui.overlays import LlmOverlay
+
+    if ui.overlay is not None:
+        return
+    ui.overlay = LlmOverlay(ui.catalog)
+
+
 def _detect_slurm(settings):
     """Job tools are available when sbatch exists or a submit host is set."""
     from hpca.slurm import SlurmClient
@@ -502,6 +563,7 @@ async def start(
     from hpca.ui.run import drive
 
     ui_end, core_end = InProcessConnection.pair()
+    ui = RowUI()
     core = await Core.start(
         settings=settings,
         profile=profile,
@@ -510,8 +572,11 @@ async def start(
         slurm=slurm,
         app_dir=app_dir,
         wire=core_end,
+        # The one thing the core cannot do about a dead backend: put the
+        # screen that fixes it in front of the user (`specs-auto-connect.md`,
+        # and `tui/app.py`'s `_ensure_backend_connected` before it).
+        on_no_backend=lambda: _open_llm_screen(ui),
     )
-    ui = RowUI()
     client = UIClient(ui, ui_end)
     try:
         core.run()

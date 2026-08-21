@@ -257,6 +257,14 @@ SESSION_TITLE_MAX = 40
 class AgentService:
     """The whole runtime behind one command/event surface."""
 
+    # Whether `startup` ends by checking that the active backend actually
+    # answers (`BackendRegistry.ensure_connected`). On for the real app; the
+    # unit suite switches it off wholesale (tests/conftest.py) because under
+    # it nothing ever answers — the settings point at a default localhost URL
+    # and no server is running — so every core built in a test would open a
+    # socket to say so. The tests that cover the check turn it back on.
+    startup_backend_check = True
+
     def __init__(
         self,
         deps: CoreDeps,
@@ -413,6 +421,16 @@ class AgentService:
             # than in the scheduler because it is a *typed* message that does
             # it: an event delivered into a session names nothing.
             self._name_provisionally(session, command.text)
+            # And, before the turn goes anywhere, what the request resembles
+            # (§4.4). The model gets the same notes as a memory-context block
+            # when the turn is prepared; this is the half addressed to the
+            # user, and it is worth saying before the attempt rather than
+            # after it fails the same way twice. Under the session's own
+            # profile, not the working one — a background session's struggles
+            # are the ones this message will run into.
+            self._memory.warn_about_struggles(
+                command.text, memory=self._memory.snapshot(session.profile)
+            )
             # Whether it runs now or waits is the scheduler's answer, and so
             # is saying so: a message that has to queue is drawn by the
             # scheduler as a `queued` chat row, because only the scheduler
@@ -2548,6 +2566,62 @@ class AgentService:
 
     # ------------------------------------------------------------- lifecycle
 
+    async def startup(self) -> bool:
+        """Everything that happens once, before anyone types anything.
+
+        The other half of `start_timers`: that one arranges the work that
+        repeats, this one is the work that happens exactly once, and all of it
+        used to be `tui/app.py`'s `on_mount` — which is why every piece of it
+        had exactly one caller and lost it when that module went
+        (`specs-ui-coverage.md` §3.1, §3.3).
+
+        It is core work rather than front-end work for one reason each: the
+        sweep and the curator are driven by settings keys (`trash_ttl_days`,
+        `curator_interval_days`) that rule 2 of §4.2 puts out of a front-end's
+        reach, and both report what they did as events. The connect step owns
+        the catalog and the probe. What is *not* here is the screen: the
+        answer this returns is what `ui/boot.py` opens manage-LLMs on.
+
+        Returns whether a backend is answering. Best-effort throughout — a
+        startup that cannot sweep a directory is still a startup.
+        """
+        self._sweep_trash()
+        self._memory.run_curator_if_due()
+        # Discover and connect what the cluster offers *first*, so that the
+        # check below probes the backend auto-connect just activated rather
+        # than whatever the settings named before it ran.
+        await self._backends.auto_connect()
+        if not self.startup_backend_check:
+            return True
+        return await self._backends.ensure_connected()
+
+    def _sweep_trash(self) -> None:
+        """Drop file backups past their TTL (`safety.trash_ttl_days`).
+
+        Every file the agent edits leaves a backup under `<app_dir>/trash`,
+        and `<app_dir>` is the NFS home this project goes out of its way to
+        keep small — so a sweep that never runs is a home that grows without
+        bound and a settings key that silently does nothing.
+        """
+        from hpca.trash import TrashManager
+
+        settings = self._deps.settings
+        try:
+            removed = TrashManager(
+                self._deps.app_dir / "trash",
+                backup_limit_bytes=int(settings.safety.backup_limit_gb * 1024**3),
+            ).cleanup(settings.safety.trash_ttl_days)
+        except Exception:  # an unreadable trash dir is not a failed startup
+            logger.exception("the trash sweep failed")
+            return
+        if removed:
+            self._deps.emit(
+                Notify(
+                    text=f"Trash: cleaned up {removed} expired "
+                    f"entr{'y' if removed == 1 else 'ies'}"
+                )
+            )
+
     def start_timers(self) -> None:
         """Run the pollers on their own cadences.
 
@@ -2789,7 +2863,13 @@ def build_service(
         log = open_log(settings, session)
         return TurnPlan(
             ctx=_make_tool_ctx(
-                deps, session, log, skills=skills, backends=backends, tools=tools
+                deps,
+                session,
+                log,
+                skills=skills,
+                backends=backends,
+                tools=tools,
+                memory=memory,
             ),
             memory=turn_memory,
             skills=skills,
@@ -2907,11 +2987,20 @@ def _effort_for(sessions, settings, session_id: str) -> str:
     return stored or settings.agent.default_thinking
 
 
-def _make_tool_ctx(deps, session, log, *, skills, backends, tools) -> ToolContext:
+def _make_tool_ctx(
+    deps, session, log, *, skills, backends, tools, memory=None
+) -> ToolContext:
     """A tool context bound to one session and its transcript.
 
     Built per turn, as before, so a turn keeps its own runner and log however
     the rest of the runtime moves on.
+
+    ``memory`` is what makes the `memory` tool work at all: flagging is the one
+    tool that writes into a *service* rather than into a store, so without it
+    every call answers "Memory flagging is not available in this context" while
+    `MEMORY_GUIDANCE` goes on telling the model to use the tool. Optional
+    because a context can legitimately be built without one (a test, a
+    sub-agent loop), and the tool already says so when it is.
     """
     from hpca.config import app_dir as _app_dir
     from hpca.jobs import JobStore
@@ -2948,6 +3037,16 @@ def _make_tool_ctx(deps, session, log, *, skills, backends, tools) -> ToolContex
         embedder=backends.embedder,
         episodic=EpisodicStore(deps.conn),
         skills=skills,
+        # Bound to this session, because the queue `/conclude` drains is
+        # per-session: a fact flagged in one conversation must not be offered
+        # for approval at the end of another.
+        queue_memory_edits=(
+            None
+            if memory is None
+            else lambda operations: memory.queue_edits(
+                session.session_id, operations
+            )
+        ),
     )
     if log is not None:
         ctx.llm = LoggedLLM(

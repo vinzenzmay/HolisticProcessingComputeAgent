@@ -89,9 +89,11 @@ class Recorder:
 
 
 class FakeService:
-    def __init__(self, order: list[str]) -> None:
+    def __init__(self, order: list[str], *, connected: bool = True) -> None:
         self.order = order
         self.queue: asyncio.Queue = asyncio.Queue()
+        self.started = 0
+        self._connected = connected
 
     def subscribe(self):
         return self.queue
@@ -104,6 +106,12 @@ class FakeService:
 
     def start_timers(self):
         pass
+
+    async def startup(self):
+        self.started += 1
+        if isinstance(self._connected, Exception):
+            raise self._connected
+        return self._connected
 
 
 class FakeCache:
@@ -134,10 +142,13 @@ class Aio(Recorder):
         self.order.append(self.name)
 
 
-def build_core(order: list[str], *, active: bool = True) -> Core:
+def build_core(
+    order: list[str], *, active: bool = True, service=None, **kwargs
+) -> Core:
     return Core(
-        FakeService(order),
+        service if service is not None else FakeService(order),
         InProcessConnection(),
+        **kwargs,
         dbcache=FakeCache(order, active=active),
         dbio=Aio(order, "dbio"),
         db=Recorder(order, "sqlite"),
@@ -276,6 +287,51 @@ class TestSyncInterrupt:
         assert signal.getsignal(signal.SIGINT) is before
 
 
+class TestStartupPass:
+    """The once-only work `tui/app.py` did on mount, and what it answers with.
+
+    The core does all of it (`AgentService.startup`); what belongs here is the
+    one part of it that is a *screen* — nothing answering opens manage-LLMs,
+    because a front-end is the only thing that can open one.
+    """
+
+    async def opened(self, **kwargs):
+        """Run one core's startup to completion; returns whether it asked for
+        the screen, and the service it ran."""
+        order: list[str] = []
+        asked: list[int] = []
+        service = FakeService(order, **kwargs)
+        core = build_core(
+            order, service=service, on_no_backend=lambda: asked.append(1)
+        )
+        core.run()
+        for _ in range(20):
+            await asyncio.sleep(0)
+        await core.stop(say=lambda text: None)
+        return bool(asked), service
+
+    async def test_the_service_gets_its_one_startup_pass(self):
+        # Trash, curator, auto-connect and the check — all of it had exactly
+        # one caller, and this is now that caller.
+        _, service = await self.opened()
+        assert service.started == 1
+
+    async def test_nothing_answering_opens_the_screen_that_fixes_it(self):
+        asked, _ = await self.opened(connected=False)
+        assert asked
+
+    async def test_a_backend_that_answers_leaves_the_user_alone(self):
+        asked, _ = await self.opened(connected=True)
+        assert not asked
+
+    async def test_a_startup_that_explodes_is_not_a_failed_run(self):
+        # Best-effort throughout: discovery, a curator pass and an NFS sweep
+        # are none of them worth refusing to start over.
+        asked, service = await self.opened(connected=RuntimeError("boom"))
+        assert service.started == 1
+        assert not asked
+
+
 # ------------------------------------------------------------ the real thing
 
 
@@ -387,6 +443,66 @@ class TestTheWholeRun:
         assert painted.index(DB_SYNC_WAIT_MESSAGE) < painted.index(
             DB_SYNC_DONE_MESSAGE
         )
+
+    async def test_nothing_answering_puts_manage_llms_on_the_screen(
+        self, home, local, monkeypatch
+    ):
+        """The whole wire, end to end: the core probes, finds nothing, says so
+        — and the front-end this file builds opens the screen that fixes it.
+
+        Both halves were green on their own for a milestone
+        (`specs-ui-coverage.md` §3.1): `auto_connect` had ten tests and no
+        caller, and the UI had a manage-LLMs screen nothing could open.
+        """
+        from hpca.core.backends import NO_BACKEND_MESSAGE
+        from hpca.core.service import AgentService
+        from hpca.ui.app import RowUI
+        from hpca.ui.overlays import LlmOverlay
+
+        async def nothing_answers(*args, **kwargs):
+            return []
+
+        monkeypatch.setattr(AgentService, "startup_backend_check", True)
+        monkeypatch.setattr("hpca.core.backends.probe_endpoint", nothing_answers)
+
+        made: list[RowUI] = []
+
+        class Watched(RowUI):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                made.append(self)
+
+        monkeypatch.setattr("hpca.ui.app.RowUI", Watched)
+
+        read, write = os.pipe()
+        out = io.StringIO()
+        screen = Screen(fd=read, out=out)
+        run = asyncio.ensure_future(
+            start(llm=FakeLLM(), screen=screen, say=lambda text: None)
+        )
+        try:
+            def said() -> bool:
+                return bool(made) and any(
+                    NO_BACKEND_MESSAGE in toast.text for toast in made[0].toasts
+                )
+
+            for _ in range(400):
+                await asyncio.sleep(0.01)
+                # The warning is emitted before the screen is asked for and
+                # delivered after it, so waiting for the later of the two is
+                # what makes this deterministic rather than lucky.
+                if said() and isinstance(made[0].overlay, LlmOverlay):
+                    break
+            assert made, "no UI was built"
+            assert isinstance(made[0].overlay, LlmOverlay)
+            # And it says why it is there, rather than appearing unbidden.
+            assert said()
+        finally:
+            os.write(write, b"\x1b")  # close the screen, then quit
+            await asyncio.sleep(0.2)
+            os.write(write, b"\x03")
+            await asyncio.wait_for(run, 20.0)
+            os.close(read), os.close(write)
 
     async def test_the_databases_are_home_afterwards(self, home, local):
         read, write = os.pipe()
