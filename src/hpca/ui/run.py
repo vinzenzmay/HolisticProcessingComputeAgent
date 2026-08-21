@@ -15,9 +15,12 @@ untouched as they were under `select`.
 
 **A repaint is caused, not polled.** The old loop woke twice a second whether
 or not anything had happened. Here every input sets one `asyncio.Event` and
-the loop paints once per wake, so an idle UI costs nothing at all — and the one
-thing that changes with no input, the armed-escape hint, is booked by
-`RowUI.next_wake()` for exactly when it expires.
+the loop paints once per wake, so an idle UI costs nothing at all — and the
+two things that change with no input, the armed-escape hint and the spinner,
+are booked by `RowUI.next_wake()` for exactly when each next differs. A
+spinner therefore costs ten wakes a second while a turn is in flight and
+nothing whatsoever when none is, which is the same bargain without a timer
+belonging to a widget.
 """
 
 from __future__ import annotations

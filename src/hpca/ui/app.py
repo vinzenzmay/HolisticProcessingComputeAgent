@@ -7,11 +7,12 @@ what makes the whole UI testable by calling ``render()`` and comparing strings.
 from __future__ import annotations
 
 import time
+from collections import namedtuple
 from collections.abc import Callable
 
 from hpca import __version__ as VERSION
 from hpca.ui.ansi import BOLD, CYAN, DIM, GREEN, RED, RESET, REVERSE, YELLOW
-from hpca.ui.ansi import cell_width, footer_line, pad, rule
+from hpca.ui.ansi import cell_width, cut, footer_line, pad, rule
 from hpca.ui.editor import Editor
 from hpca.ui.keys import NEWLINE_KEYS, is_paste, paste_text
 from hpca.ui.overlays import (
@@ -27,8 +28,10 @@ from hpca.ui.overlays import (
 )
 from hpca.ui.pane import Item, Pane
 from hpca.ui.state import (
+    MODE_COLOURS,
     OWN_MESSAGE_KINDS,
     Confirm,
+    CycleMode,
     Drop,
     Fork,
     Intent,
@@ -40,6 +43,7 @@ from hpca.ui.state import (
     SidebarRow,
     Submit,
     Toast,
+    mode_line,
 )
 
 # How long a first escape stays armed for a second one to complete the stop
@@ -58,6 +62,26 @@ SESSIONS, CHAT, INPUT, WATCHERS = range(4)
 # `session.rows` — a marker that waited for the next sidebar repaint would lag
 # a whole poll behind the event that caused it.
 DECISION_MARK, WORKING_MARK = "!", "⟳"
+
+# How the status row spends the width it has (§4.3 items 18 and 19). Three
+# things want a permanent row of their own — the meter, the mode and the model
+# — and on an 80x24 terminal three rows out of twenty-two is a tenth of the
+# screen spent on things that do not change. So they share one row and give
+# ground in this order, richest first: the mode's key hint goes, then its
+# sentence, then the meter's picture, and what is left is the two facts that
+# cannot be worked out from anything else — which mode is on, and how full the
+# window is. The model rides on the message row's own rule and costs nothing.
+StatusTier = namedtuple("StatusTier", "hint switch cells")
+STATUS_TIERS = (
+    StatusTier(hint=True, switch=True, cells=28),
+    StatusTier(hint=True, switch=False, cells=28),
+    StatusTier(hint=True, switch=False, cells=14),
+    StatusTier(hint=False, switch=False, cells=14),
+    StatusTier(hint=False, switch=False, cells=0),
+)
+
+# What the meter's severity paints it (`ui.meter.severity`).
+METER_STYLES = {"warn": YELLOW, "danger": BOLD + RED}
 
 
 class RowUI:
@@ -106,6 +130,11 @@ class RowUI:
         # the second half of a stop. Injectable so the headless check can drive
         # the clock instead of sleeping through the window.
         self.clock = time.monotonic
+        # And the wall clock, which is a different question and needs a
+        # different answer: "how long has this turn been running" is measured
+        # against a stamp the *core* took (`TurnActivity.started_at`), and the
+        # two processes share a wall clock and not a monotonic one.
+        self.wall = time.time
         self._esc_armed_at: float | None = None
         self._learnings = learnings or {}
         self._settings_json = settings_json
@@ -158,16 +187,22 @@ class RowUI:
 
     @property
     def mode(self) -> str:
-        return self.session.mode or "agent"
+        """The open session's mode, and no default of its own.
+
+        There is no such thing as the app's mode: it is a per-session dial,
+        and a header that invented one would be naming a mode no session is
+        in — which was survivable while the fallback happened to be a mode
+        that existed, and stopped being so when `plan` was retired.
+        """
+        return self.session.mode
 
     @property
     def model(self) -> str:
-        """Empty until something puts a model on the wire.
+        """The backend the open session is pinned to, as `session.rows` said.
 
-        `protocol.SessionRow` carries the title, the profile, the mode and the
-        render flags, and nothing about the backend a session is pinned to — so
-        the model line (§4.3 item 20) has nothing to read yet, and draws as the
-        absence rather than as a guess.
+        Per session and not per app: two conversations can be on two different
+        servers, which is the whole reason `ctrl+l` switches one of them. Empty
+        with no session open, and empty for a session on the bootstrap client.
         """
         return self.session.model
 
@@ -223,6 +258,7 @@ class RowUI:
             session.title = row.title
             session.profile = row.profile
             session.mode = row.mode
+            session.model = row.model
             session.flags = list(row.flags)
             self.sessions.append(session)
         keep = {x.session_id for x in self.sessions} | {was}
@@ -266,7 +302,9 @@ class RowUI:
                     head=(
                         f"{'●' if i == self.active else '○'} "
                         f"{self._marks(session)} {session.title[:40]:<42}"
-                        f"{session.profile} · {session.mode or 'agent'}"
+                        + " · ".join(
+                            x for x in (session.profile, session.mode) if x
+                        )
                     ),
                     body=[
                         f"session {session.session_id}",
@@ -349,7 +387,7 @@ class RowUI:
         can use it.
         """
         avail = max(8, height - 2)  # header and footer
-        inp = self._input_h(width)
+        inp = self._input_h(width) + self._status_h()
         quarter = max(2, avail // 4)
         inner = max(8, width - 2)
         top = max(2, min(1 + len(self.panes[0].flat(inner)), quarter))
@@ -364,9 +402,31 @@ class RowUI:
         middle = avail - top - bottom - inp
         if middle < 1:  # a terminal too short for the design at all
             top = bottom = 2
-            inp = 2
-            middle = max(1, avail - 6)
+            inp = 2 + self._status_h()
+            middle = max(1, avail - 4 - inp)
         return [top, middle, inp, bottom]
+
+    def _status_h(self) -> int:
+        """Whether the mode/meter row is on screen at all.
+
+        Nothing to say costs nothing: with no session open there is no mode
+        and no window, and the row would be a blank line between the chat and
+        the message box.
+        """
+        return 1 if self._status_left() or self._status_right(28) else 0
+
+    def _status_left(self, *, hint: bool = True, switch: bool = True) -> str:
+        """The mode bar. Per-session, so it is hidden without a session."""
+        if not self.active_id:
+            return ""
+        return mode_line(self.session.mode, hint=hint, switch=switch)
+
+    def _status_right(self, cells: int) -> str:
+        """The context meter, or nothing before the core has said anything."""
+        context = self.session.context
+        if not self.active_id or not (context.known or context.window):
+            return ""
+        return context.bar(cells)
 
     # -------------------------------------------------------------- drawing
 
@@ -385,9 +445,13 @@ class RowUI:
             (INPUT, None, heights[2]),
             (WATCHERS, self.panes[2], heights[3]),
         ]
+        # The spinner is a function of the clock, so the frame asks the clock
+        # for it here rather than anything pushing frames at the UI.
+        self.session.tick(self.wall())
         for slot, pane, pane_h in order:
             if slot == INPUT:
-                out += self._render_input(width, pane_h)
+                status = self._render_status(width)
+                out += status + self._render_input(width, pane_h - len(status))
             else:
                 out += pane.render(width, pane_h, focused=self.focus == slot)
         note, style = self.note, self.note_style
@@ -398,15 +462,43 @@ class RowUI:
             out.insert(len(out) - 1, " " * width)
         return out[:height]
 
+    def _render_status(self, width: int) -> list[str]:
+        """The mode bar and the context meter, sharing one row.
+
+        Which is the layout answer to five new things wanting rows: two of
+        them take one row between them, the model takes none (it is on the
+        message rule), and the spinner and the live steps take none either —
+        they are rows *of the chat*, which is the pane that has the slack.
+        """
+        if not self._status_h():
+            return []
+        left, right = "", ""
+        for tier in STATUS_TIERS:
+            left = self._status_left(hint=tier.hint, switch=tier.switch)
+            right = self._status_right(tier.cells)
+            if cell_width(left) + 1 + cell_width(right) <= width:
+                break
+        else:  # narrower than the poorest tier: the mode alone, clipped
+            left, right = cut(left, max(0, width - 1)), ""
+        gap = width - cell_width(left) - cell_width(right)
+        meter = METER_STYLES.get(self.session.context.severity, DIM)
+        return [
+            MODE_COLOURS.get(self.session.mode, DIM)
+            + left
+            + RESET
+            + " " * gap
+            + meter
+            + right
+            + RESET
+        ]
+
     def _render_input(self, width: int, height: int) -> list[str]:
         focused = self.focus == INPUT
-        # Built from what is actually known: the model comes from nothing on
-        # the wire yet, and the context meter is empty until the core has
-        # either measured or estimated one.
-        right = " · ".join(
-            x for x in (self.mode, self.model, self.session.context.label()) if x
-        )
-        title = rule("message", width, right)
+        # The model line (§4.3 item 20): which backend this session is pinned
+        # to, on the rule of the row you type into, because that is the row
+        # the answer will be written by. Empty — and so absent — when no
+        # session is open to be pinned to anything.
+        title = rule("message", width, self.model)
         out = [(BOLD + CYAN if focused else DIM) + title + RESET]
         rows = max(1, height - 1)
         body = self.input.render(self._input_body(width), rows, focused=focused)
@@ -416,7 +508,9 @@ class RowUI:
         return out[:height]
 
     def _header(self, width: int) -> str:
-        left = f" HPCA {VERSION}  ·  {self.profile}  ·  {self.mode}"
+        left = "  ·  ".join(
+            x for x in (f" HPCA {VERSION}", self.profile, self.mode) if x
+        )
         right = f"{self.frame_ms:5.2f}ms  ·  ? keys  "
         gap = width - cell_width(left) - cell_width(right)
         text = left + " " * gap + right if gap > 0 else left
@@ -455,7 +549,7 @@ class RowUI:
         if self.focus == SESSIONS:
             rows += [("enter", "switch"), ("r", "rename"), ("t", "retitle"), ("d", "delete")]
         elif self.focus == CHAT:
-            rows += [("i", "write"), ("enter", "reuse")]
+            rows += [("i", "write"), ("enter", "reuse"), ("⇧tab", "mode")]
         else:
             rows += [("enter", "peek"), ("d", "unwatch"), ("alt-↑↓", "move")]
         return rows + [("m", "llms"), ("a", "profiles"), ("c", "config")] + common
@@ -504,11 +598,15 @@ class RowUI:
     def _activate_chat(self, width: int) -> None:
         """Enter in the chat log.
 
-        On one of your own messages it opens the rewind. On anything else it
-        moves to the message box, which is what app.py answers an Enter it has
-        nothing better to do with.
+        On the working row it stops the turn; on one of your own messages it
+        opens the rewind. On anything else it moves to the message box, which
+        is what app.py answers an Enter it has nothing better to do with.
         """
-        entry = self.session.entry_at(self.chat.current(width))
+        position = self.chat.current(width)
+        if self.chat.is_tail(position):
+            self._stop_from_the_row()
+            return
+        entry = self.session.entry_at(position)
         if entry is not None and entry.kind in OWN_MESSAGE_KINDS:
             # The row's own name, not its position: the cut is decided by the
             # user now and carried out by the core later, and a turn appending
@@ -516,6 +614,22 @@ class RowUI:
             self.overlay = RewindOverlay(entry.text, entry.seq, self.active_id)
         else:
             self.focus = INPUT
+
+    def _stop_from_the_row(self) -> None:
+        """Enter on the working row: the aimed half of the stop gesture.
+
+        Not every spinner can be stopped. A backend call that is not a turn —
+        a silent `/conclude`, a compaction, the titler — has no turn to roll
+        back, and the honest answer to Enter on it is to say so: a key that
+        looked like it did something and did not is worse than one that
+        explains itself.
+        """
+        if self.session.turn.interruptible:
+            self.send(Interrupt(self.active_id))
+            self.note = "stopped the turn"
+        else:
+            self.note = "this is a backend call, not a turn — nothing to stop"
+            self.note_style = DIM
 
     def _rewind(self, overlay: RewindOverlay) -> None:
         """What the rewind decided, as an intent aimed at the session it was
@@ -571,19 +685,32 @@ class RowUI:
 
         The loop repaints because something happened — a key, an event, a
         resize — and not on a timer, so anything that changes by the clock
-        alone has to say when it will. Today that is the armed escape and
-        nothing else: "esc again to stop" is only true for
-        ``ESC_STOP_WINDOW``, and no keypress is coming to wipe it. Asked after
-        every frame, so a value that has already expired is None rather than
-        zero — zero would be a repaint that schedules another repaint.
+        alone has to say when it will. Two things do, and the answer is the
+        sooner of them: the armed escape, which is only true for
+        ``ESC_STOP_WINDOW`` and has no keypress coming to wipe it, and the
+        spinner, which turns.
+
+        The spinner deliberately goes through here rather than being given a
+        timer of its own. A widget that repaints itself is a poll by another
+        name, and it is a poll that runs whether or not the terminal is even
+        being looked at; this way the one loop still wakes exactly once per
+        thing that will have changed, and an idle UI with no turn in flight
+        still costs nothing at all.
+
+        Asked after every frame, so a value that has already expired is None
+        rather than zero — zero would be a repaint that schedules another
+        repaint.
         """
-        if self._esc_armed_at is None:
-            return None
-        left = ESC_STOP_WINDOW - (self.clock() - self._esc_armed_at)
-        # A hair past the window rather than exactly on it: `_esc_armed` is
-        # true *at* the boundary, so waking there would redraw the same frame
-        # and then have nothing left to schedule — the hint would stick.
-        return left + 0.01 if left > 0 else None
+        waits = [self.session.next_wake(self.wall())]
+        if self._esc_armed_at is not None:
+            left = ESC_STOP_WINDOW - (self.clock() - self._esc_armed_at)
+            # A hair past the window rather than exactly on it: `_esc_armed`
+            # is true *at* the boundary, so waking there would redraw the same
+            # frame and then have nothing left to schedule — the hint would
+            # stick.
+            waits.append(left + 0.01 if left > 0 else None)
+        due = [x for x in waits if x is not None]
+        return min(due) if due else None
 
     def _escape(self) -> bool:
         """Two escapes in quick succession stop the turn. One does nothing.
@@ -615,7 +742,14 @@ class RowUI:
             self._send()
         elif key in NEWLINE_KEYS:
             self.input.newline()
-        elif key in ("ctrl-up", "shift-tab"):
+        elif key == "shift-tab":
+            # Cycling the mode is the one thing shift+tab does, and it has to
+            # work from here: deciding the agent may act unasked is a thought
+            # you have *while writing the message*, not one you leave the box
+            # to act on. The Textual app bound it `priority=True` for exactly
+            # that reason. ctrl+↑ is how you leave the box.
+            self._cycle_mode()
+        elif key == "ctrl-up":
             self.focus = CHAT
         elif key == "ctrl-down":
             self.focus = WATCHERS
@@ -666,6 +800,13 @@ class RowUI:
             self.overlay = ProfilesOverlay(list(self._profiles), self._learnings)
         elif key == "c":
             self.overlay = ConfigOverlay(self._settings_json)
+        elif key == "shift-tab" and self.focus == CHAT:
+            # The mode is a per-session dial, so the key means something only
+            # where a session's conversation is: here and in the message box
+            # (see `_handle_input`). From the sessions and watchers rows
+            # shift+tab keeps moving between rows, which is what the Textual
+            # app's `check_action` decided for the same reason.
+            self._cycle_mode()
         elif key in ("ctrl-down", "tab"):
             self.focus = slots[(slots.index(self.focus) + 1) % len(slots)]
         elif key in ("ctrl-up", "shift-tab"):
@@ -718,6 +859,18 @@ class RowUI:
             else:
                 self._watch(Drop, "unwatched", inner)
         return True
+
+    def _cycle_mode(self) -> None:
+        """Ask for the next mode. Which one that is, this does not know.
+
+        `client.py` resolves the cycle (`hpca.agent.next_mode`) and persists
+        it, because the modes are the agent's list and a key dispatcher that
+        held a copy of it would be a second place for it to be wrong.
+        """
+        if not self.active_id:
+            self.note = "no session open"
+            return
+        self.send(CycleMode(self.active_id))
 
     def _watch(self, intent: type, note: str, inner: int) -> None:
         """Peek at or drop the watch box under the cursor.

@@ -24,6 +24,7 @@ client over a real `InProcessConnection`.
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 
 from hpca import protocol
 from hpca.ui.ansi import GREEN
@@ -65,7 +66,12 @@ REPLIES = [
 ]
 
 PROFILES = ["hpc", "writing", "default"]
-MODES = ["agent", "agent", "plan"]
+# The real three (`hpca.agent.modes.MODES`), so that the mode bar's colours
+# and its hints are the ones a user will actually see.
+MODES = ["auto", "manual", "full-auto"]
+# Two backends, so switching session moves the model line (§4.3 item 20) and
+# not only the title.
+MODELS = ["qwen3-27b-fp8", "llama-3.3-70b", ""]
 
 SETTINGS_JSON = """{
   "llm": {
@@ -270,6 +276,7 @@ class DemoCore:
                 title=TASKS[i % len(TASKS)],
                 profile=PROFILES[i % len(PROFILES)],
                 mode=MODES[i % len(MODES)],
+                model=MODELS[i % len(MODELS)],
             )
             for i in range(sessions)
         ]
@@ -288,6 +295,12 @@ class DemoCore:
         self._entries: dict[str, list[protocol.Entry]] = {}
         self._watches: dict[str, list[protocol.PanelRow]] = {}
         self._forks = 0
+        # One session is left mid-turn, because a turn in flight is the thing
+        # M4b builds and a demo that only ever shows finished conversations
+        # cannot show it: opening this one starts the spinner, hands it a tool
+        # that never answers, and waits to be interrupted.
+        self._busy = self.rows[0].session_id if self.rows else ""
+        self._live: dict[str, protocol.Entry] = {}
 
     # ------------------------------------------------------------- content
 
@@ -345,6 +358,74 @@ class DemoCore:
         )
         self._estimate(cmd.session_id)
         self._panel(cmd.session_id)
+        if cmd.session_id == self._busy:
+            self._start_live_turn(cmd.session_id)
+
+    def _start_live_turn(self, session_id: str) -> None:
+        """A turn caught mid-tool: the spinner, and the steps so far.
+
+        Three events, in the order a real core sends them — `turn.started`
+        says there is something to stop, `chat.append` puts the working on
+        screen *while* it happens, and `turn.activity` names the tool and
+        stamps when the turn began, twelve seconds ago so the clock has
+        something to count.
+        """
+        entries = self.entries(session_id)
+        live = protocol.Entry(
+            kind="thinking",
+            text="",
+            seq=len(entries) + 1,
+            steps=3,
+            parts=[
+                protocol.Part(
+                    kind="call",
+                    text="",
+                    tool="read_file",
+                    target="/scratch/proj/cohort/run3/logs/merge_vcf.log",
+                    result="412 lines\n[12:41:07] merging shard 3 of 8",
+                    done=True,
+                ),
+                protocol.Part(
+                    kind="reasoning",
+                    text=(
+                        "Two shards wrote to the same temp path; check which "
+                        "of them is still open before retrying the merge."
+                    ),
+                    done=True,
+                ),
+                protocol.Part(
+                    kind="call",
+                    text="",
+                    tool="run_bash",
+                    target="lsof /scratch/proj/cohort/run3/tmp",
+                    done=False,  # the live row: a call with no result yet
+                ),
+            ],
+        )
+        entries.append(live)
+        self._live[session_id] = live
+        self.emit(protocol.TurnStarted(session_id=session_id))
+        self.emit(protocol.ChatAppend(session_id=session_id, entry=live))
+        self.emit(
+            protocol.TurnActivity(
+                session_id=session_id,
+                activity="running run_bash",
+                started_at=(
+                    datetime.now(timezone.utc) - timedelta(seconds=12)
+                ).isoformat(),
+            )
+        )
+
+    def _finish_live_turn(self, session_id: str, result: str) -> None:
+        """Fill the live row's waiting call *in that row* (`chat.update`)."""
+        live = self._live.pop(session_id, None)
+        if live is None:
+            return
+        if session_id == self._busy:
+            self._busy = ""
+        live.parts[-1].result = result
+        live.parts[-1].done = True
+        self.emit(protocol.ChatUpdate(session_id=session_id, entry=live))
 
     def _do_SessionFocus(self, cmd: protocol.SessionFocus) -> None:
         if cmd.session_id:
@@ -371,6 +452,7 @@ class DemoCore:
 
     def _do_TurnSubmit(self, cmd: protocol.TurnSubmit) -> None:
         entries = self.entries(cmd.session_id)
+        self._finish_live_turn(cmd.session_id, "no such process")
         self.emit(protocol.TurnStarted(session_id=cmd.session_id))
         said = protocol.Entry(
             kind="user",
@@ -395,7 +477,13 @@ class DemoCore:
         )
 
     def _do_TurnInterrupt(self, cmd: protocol.TurnInterrupt) -> None:
+        self._finish_live_turn(cmd.session_id, "interrupted")
         self.emit(protocol.TurnFinished(session_id=cmd.session_id))
+
+    def _do_ModeSet(self, cmd: protocol.ModeSet) -> None:
+        """Persist the mode and say so, which is the sidebar's copy of it."""
+        self.rows[self._index(cmd.session_id)].mode = cmd.mode
+        self.emit(protocol.SessionRows(rows=list(self.rows)))
 
     def _do_SessionFork(self, cmd: protocol.SessionFork) -> None:
         source = self.rows[self._index(cmd.session_id)]

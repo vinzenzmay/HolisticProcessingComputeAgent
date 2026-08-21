@@ -15,13 +15,12 @@ class HelpOverlay(Overlay):
         (
             "anywhere",
             [
-                ("^↑ ^↓", "move between rows (tab / shift-tab also)"),
+                ("^↑ ^↓", "move between rows (tab / shift-tab outside the chat)"),
                 ("esc esc", "stop the agent, from any row — one esc does nothing"),
                 ("m", "manage llms"),
                 ("a", "profiles & learnings"),
                 ("c", "config editor"),
                 ("^l", "switch llm for this session"),
-                ("shift-tab", "cycle agent mode"),
                 ("?", "this list"),
                 ("q", "quit"),
             ],
@@ -50,6 +49,9 @@ class HelpOverlay(Overlay):
             "chat row",
             [
                 ("i", "go to the message box"),
+                ("shift-tab", "cycle this session's agent mode"),
+                ("enter", "on the working row: stop the turn"),
+                ("→ →", "open a turn into its steps, then a step into its result"),
                 ("enter", "on one of your own messages: fork, roll back, copy"),
                 ("enter", "on anything else: go to the message box"),
             ],

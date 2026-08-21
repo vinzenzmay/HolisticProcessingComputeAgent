@@ -84,19 +84,39 @@ class TestArrowsOpenAndCloseEntries:
     def test_left_on_a_closed_entry_does_nothing(self):
         ui = chat_ui()
         pane, _ = on_an_entry_with_a_body(ui)
+        # Not "nothing is open": the demo's session is mid-turn, and a turn's
+        # steps open themselves while they arrive.
+        was = set(pane.expanded)
         ui.handle("right", 120, 40)
         head = pane.cursor
         ui.handle("right", 120, 40)
         ui.handle("left", 120, 40)
         ui.handle("left", 120, 40)
         assert pane.cursor == head
-        assert not pane.expanded
+        assert pane.expanded == was
 
     def test_shift_right_opens_every_entry(self):
         ui = chat_ui()
         pane, _ = on_an_entry_with_a_body(ui)
         ui.handle("shift-right", 120, 40)
-        assert len(pane.expanded) == sum(1 for x in pane.items if x.body)
+        entries = {
+            pane.key_at(i) for i, x in enumerate(pane.items) if x.openable
+        }
+        assert entries and entries <= pane.expanded
+
+    def test_and_every_step_inside_one(self):
+        # "Open everything" means the second level too — otherwise a turn's
+        # steps would be open and what each of them returned would not.
+        ui = chat_ui()
+        pane, _ = on_an_entry_with_a_body(ui)
+        ui.handle("shift-right", 120, 40)
+        steps = {
+            f"{pane.key_at(i)}/{n}"
+            for i, x in enumerate(pane.items)
+            for n, part in enumerate(x.folds)
+            if part.body
+        }
+        assert steps and steps <= pane.expanded
 
     def test_shift_left_closes_them_all(self):
         ui = chat_ui()
@@ -109,8 +129,11 @@ class TestArrowsOpenAndCloseEntries:
         # `e` was an earlier expand key; it is a free letter now.
         ui = chat_ui()
         pane, _ = on_an_entry_with_a_body(ui)
+        # Not "nothing is open": the demo's session is mid-turn, and a turn's
+        # steps open themselves while they arrive.
+        was = set(pane.expanded)
         ui.handle("e", 120, 40)
-        assert pane.expanded == set()
+        assert pane.expanded == was
         assert ui.overlay is None
 
 

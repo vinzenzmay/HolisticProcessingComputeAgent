@@ -453,7 +453,7 @@ class TestTheContextMeter:
         await wire.tell(
             protocol.ContextEstimate(session_id="s1", used=1000, window=10000)
         )
-        assert "~10% ctx" in wire.screen()
+        assert "~1,000 / 10,000 (10%)" in wire.screen()
 
     async def test_a_measurement_is_not(self, wire):
         await started(wire)
@@ -462,8 +462,8 @@ class TestTheContextMeter:
                 session_id="s1", prompt_tokens=2000, max_model_len=10000
             )
         )
-        assert "20% ctx" in wire.screen()
-        assert "~20% ctx" not in wire.screen()
+        assert "2,000 / 10,000 (20%)" in wire.screen()
+        assert "~2,000" not in wire.screen()
 
     async def test_a_measurement_beats_an_estimate(self, wire):
         await started(wire)
@@ -473,7 +473,7 @@ class TestTheContextMeter:
             ),
             protocol.ContextEstimate(session_id="s1", used=9000, window=10000),
         )
-        assert "20% ctx" in wire.screen()
+        assert "2,000 / 10,000 (20%)" in wire.screen()
 
     async def test_until_the_thread_it_measured_is_gone(self, wire):
         await started(wire)
@@ -486,7 +486,7 @@ class TestTheContextMeter:
         await wire.tell(
             protocol.ContextEstimate(session_id="s1", used=500, window=10000)
         )
-        assert "~5% ctx" in wire.screen()
+        assert "~500 / 10,000 (5%)" in wire.screen()
 
 
 # -------------------------------------------------------------- the panels

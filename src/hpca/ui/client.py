@@ -30,6 +30,7 @@ from collections import Counter
 from collections.abc import Callable
 
 from hpca import protocol
+from hpca.agent.modes import next_mode
 from hpca.transport import Connection
 from hpca.ui import state
 from hpca.ui.ansi import GREEN, RED
@@ -149,12 +150,31 @@ class UIClient:
             )
         elif isinstance(intent, state.Interrupt):
             self.command(protocol.TurnInterrupt(session_id=session))
+        elif isinstance(intent, state.CycleMode):
+            self._cycle_mode(session)
         elif isinstance(intent, state.Fork | state.Rollback):
             self._rewind(intent)
         elif isinstance(intent, state.Peek | state.Drop):
             self._watch(intent)
         else:  # pragma: no cover - every Intent member is handled above
             logger.warning("no command for %r", intent)
+
+    def _cycle_mode(self, session_id: str) -> None:
+        """The next mode, worked out here and shown before the core answers.
+
+        Here because the cycle is `hpca.agent`'s (`next_mode`), and a key
+        dispatcher holding its own copy of the mode list would be a second
+        place for it to be wrong. Shown immediately because the bar is the
+        feedback for the keypress: the core persists it and the next
+        `session.rows` says so, and if the core refuses, that same repaint is
+        what puts the bar back.
+        """
+        session = self._session(session_id)
+        session.mode = next_mode(session.mode)
+        self.ui.refresh_sidebar()
+        self.command(
+            protocol.ModeSet(session_id=session_id, mode=session.mode)
+        )
 
     def _rewind(self, intent: state.Fork | state.Rollback) -> None:
         """A row the user pointed at, as the message index the wire wants.
@@ -272,6 +292,7 @@ class UIClient:
                     title=row.title,
                     profile=row.profile,
                     mode=row.mode,
+                    model=row.model,
                     flags=tuple(row.flags),
                 )
                 for row in msg.rows
@@ -293,6 +314,7 @@ class UIClient:
         session.title = msg.row.title
         session.profile = msg.row.profile
         session.mode = msg.row.mode
+        session.model = msg.row.model
         session.flags = list(msg.row.flags)
         self.ui.adopt(session)
         self.ui.open_session(session.session_id)
@@ -310,22 +332,40 @@ class UIClient:
             # it (`protocol.ChatUpdate`).
             self.dropped["chat.update"] += 1
 
+    def _tick(self, session: state.SessionState) -> None:
+        """Put the working row where the turn's state now says it goes.
+
+        Done here as well as at render time because the row is *navigable*: a
+        pane whose live row only appeared when a frame was drawn would answer
+        "end" with the wrong row for one keypress, and Enter on that row is
+        the interrupt.
+        """
+        session.tick(self.ui.wall())
+
     def _started(self, msg: protocol.TurnStarted) -> None:
         session = self._session(msg.session_id)
-        session.turn.working = True
+        session.start_turn()
+        self._tick(session)
         self.ui.refresh_sidebar()
 
     def _activity(self, msg: protocol.TurnActivity) -> None:
-        self._session(msg.session_id).turn.activity_is(msg.activity, msg.started_at)
+        session = self._session(msg.session_id)
+        session.turn.activity_is(msg.activity, msg.started_at)
+        self._tick(session)
+        if not msg.activity and not session.turn.working:
+            # A backend call that was never a turn, saying it is done. The
+            # scheduler's own "" arrives just before `turn.finished` and is
+            # answered there; this is the other emitter (`memory_service`),
+            # which has no turn to finish.
+            session.end_turn()
 
     def _finished(self, msg: protocol.TurnFinished) -> None:
-        session = self._session(msg.session_id)
-        session.turn = state.Turn()
+        self._session(msg.session_id).end_turn()
         self.ui.refresh_sidebar()
 
     def _failed(self, msg: protocol.TurnFailed) -> None:
         session = self._session(msg.session_id)
-        session.turn = state.Turn()
+        session.end_turn()
         # A failure the user has to be able to find again afterwards, so it goes
         # in the transcript rather than only into a toast that expires. seq 0:
         # the core did not number this row and nothing may revise it.
@@ -333,18 +373,15 @@ class UIClient:
         self.ui.refresh_sidebar()
 
     def _usage(self, msg: protocol.TurnUsage) -> None:
-        context = self._session(msg.session_id).context
-        context.used = msg.prompt_tokens
-        if msg.max_model_len:
-            context.window = msg.max_model_len
-        context.measured = True
+        self._session(msg.session_id).context.measure(
+            msg.prompt_tokens, msg.max_model_len
+        )
 
     def _estimate(self, msg: protocol.ContextEstimate) -> None:
-        context = self._session(msg.session_id).context
-        if context.measured:
-            return  # a measured fill beats a guess at the same thread
-        context.used = msg.used
-        context.window = msg.window
+        # A measured fill beats a guess at the same thread; `Context.estimate`
+        # is where that precedence lives, since `context.estimate` carries no
+        # flag saying which of the two it is.
+        self._session(msg.session_id).context.estimate(msg.used, msg.window)
 
     def _decision(self, msg: protocol.DecisionRequested) -> None:
         self._session(msg.session_id).decision = dict(msg.payload)

@@ -75,7 +75,10 @@ class TestEntriesBecomeRows:
         )
         assert "read_file → edit_file → run_bash …" in item.head
 
-    def test_a_step_opens_into_its_call_and_its_result(self):
+    def test_a_step_is_a_fold_of_its_own(self):
+        # One box per turn, opening into its steps, each of those opening into
+        # what the tool returned — a tool result is routinely a whole file,
+        # and the steps either side of it have to stay readable as a list.
         item = entry_item(
             ChatEntry(
                 kind="thinking",
@@ -91,8 +94,8 @@ class TestEntriesBecomeRows:
                 ],
             )
         )
-        assert item.body[0].split() == ["read_file", "/scratch/run.log"]
-        assert "412 lines" in item.body[1]
+        assert item.folds[0].head.split() == ["read_file", "/scratch/run.log"]
+        assert item.folds[0].body == ["412 lines"]
 
     def test_a_call_still_running_says_so(self):
         # `Part.done` is the whole of how a client tells a finished tool
@@ -104,7 +107,20 @@ class TestEntriesBecomeRows:
                 parts=[ChatPart(kind="call", tool="run_bash", done=False)],
             )
         )
-        assert item.body == ["run_bash …"]
+        assert [x.head for x in item.folds] == ["run_bash …"]
+
+    def test_a_result_with_no_call_of_its_own_still_gets_a_row(self):
+        # The half-exchange the graph reports when a result arrives with
+        # nothing to attach it to: it is still something that happened.
+        item = entry_item(
+            ChatEntry(
+                kind="thinking",
+                seq=3,
+                parts=[ChatPart(kind="step", text="a note", result="ok", done=True)],
+            )
+        )
+        assert len(item.folds) == 1
+        assert "a note" in item.folds[0].head
 
     def test_a_queued_message_is_drawn_as_the_chat_it_will_become(self):
         item = entry_item(entry(2, "queued", "the next thing"))

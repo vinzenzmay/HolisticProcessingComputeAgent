@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import asyncio
 import re
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 from hpca import protocol
+from hpca.transport import InProcessConnection
 from hpca.ui.ansi import cell_width
 from hpca.ui.app import CHAT, RowUI
 from hpca.ui.client import UIClient
@@ -52,6 +54,18 @@ def clocked(ui: RowUI) -> RowUI:
     """Drive the escape window by hand instead of sleeping through it."""
     ui._now = 100.0
     ui.clock = lambda: ui._now
+    return ui
+
+
+def at_wall(ui: RowUI, when: float) -> RowUI:
+    """Put the *wall* clock at an instant, which is a different clock.
+
+    The escape window is measured with `clock` (monotonic, a gesture); how
+    long a turn has been running is measured with `wall` against a stamp the
+    core took (`TurnActivity.started_at`), and the two processes share a wall
+    clock and not a monotonic one.
+    """
+    ui.wall = lambda: when
     return ui
 
 
@@ -120,6 +134,28 @@ class Peer:
 
     def clear(self) -> None:
         self.commands.clear()
+
+
+@asynccontextmanager
+async def connected(ui: RowUI | None = None):
+    """A UI, a client and a scripted core, over a real pair of connections.
+
+    The transport is not mocked: `InProcessConnection.pair()` is the same
+    object `coreproc` hands the client, so the edges — a closed peer, a
+    dropped frame — behave here as they do in a real run.
+    """
+    ui = RowUI() if ui is None else ui
+    ours, theirs = InProcessConnection.pair()
+    client = UIClient(ui, ours)
+    peer = Peer(theirs)
+    tasks = [asyncio.create_task(client.run()), asyncio.create_task(peer.listen())]
+    try:
+        yield Wire(ui, client, peer)
+    finally:
+        await ours.close()
+        await theirs.close()
+        for task in tasks:
+            task.cancel()
 
 
 @dataclass

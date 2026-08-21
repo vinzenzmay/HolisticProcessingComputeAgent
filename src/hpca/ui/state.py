@@ -21,10 +21,12 @@ Two shapes cross the seam in each direction:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 
-from hpca.ui.ansi import BLUE, DIM, RED, YELLOW
+from hpca.ui.ansi import BLUE, DIM, GREEN, RED, YELLOW
 from hpca.ui.editor import Editor
-from hpca.ui.pane import Item, Pane
+from hpca.ui.meter import render_bar, severity
+from hpca.ui.pane import Fold, Item, Pane
 
 # The kinds of chat entry that are the user's own words, and so the ones Enter
 # offers the rewind on. `queued` counts: it is a message the user wrote, drawn
@@ -33,6 +35,38 @@ OWN_MESSAGE_KINDS = ("user", "queued")
 
 # What a step's label is padded to in an opened entry, so tool names line up.
 TOOL_COLUMN = 14
+
+# The mode line's copy, lifted from `tui/mode_bar.py` — the hint is the whole
+# value of the row: "auto" and "full-auto" differ by whether a destructive
+# operation stops to ask, which is not something a user should have to
+# remember from the name.
+MODE_HINTS = {
+    "manual": "scripts run only with your approval",
+    "auto": "works until the task is done",
+    "full-auto": "asks for nothing, destructive ops included",
+}
+# ctrl+m is carriage return in most terminals, so shift+tab is the binding
+# that always works (§5).
+MODE_SWITCH_HINT = "shift+tab to switch"
+MODE_COLOURS = {"manual": YELLOW, "auto": GREEN, "full-auto": RED}
+
+
+def mode_line(mode: str, *, hint: bool = True, switch: bool = True) -> str:
+    """`mode: full auto — asks for nothing…`, in one of three lengths.
+
+    The two suffixes come off in the order they can be spared: the key that
+    changes it is discoverable from `?`, and the sentence is a reminder rather
+    than news, but *which mode is on* is a safety fact and never drops.
+    """
+    if not mode:
+        return ""
+    label = mode.replace("-", " ")  # "full-auto" reads as "full auto"
+    text = f"mode: {label}"
+    if hint and MODE_HINTS.get(mode):
+        text += f" — {MODE_HINTS[mode]}"
+    if switch:
+        text += f" · {MODE_SWITCH_HINT}"
+    return text
 
 
 # ------------------------------------------------------------------- the chat
@@ -85,16 +119,28 @@ def _one_line(text: str) -> str:
     return " ".join(text.split())
 
 
-def _part_lines(part: ChatPart) -> list[str]:
-    """One step, opened: what was called, and what came back."""
+def part_fold(part: ChatPart) -> Fold:
+    """One step, as a row of its own inside the turn's fold.
+
+    The head is the call — the tool and what it was aimed at — and the body is
+    what came back. Two levels rather than one because a tool result is
+    routinely a whole file: the steps of a turn have to stay readable as a
+    list, and the four hundred lines `read_file` returned must be one more
+    keypress away rather than in between the steps either side of it.
+
+    A call whose result has not landed says so with a trailing "…", because
+    the alternative is a row that looks finished and is not (`Part.done`) —
+    and that mark is exactly what a live step row is: the call, on screen,
+    while the tool is still running.
+    """
     label = part.tool or part.kind or "step"
     detail = part.target or _one_line(part.text)
     head = f"{label:<{TOOL_COLUMN}}{detail}".rstrip()
-    if not part.result:
-        # A call whose result has not landed says so, because the alternative
-        # is a row that looks finished and is not (`Part.done`).
-        return [head] if part.done else [f"{head} …"]
-    return [head] + [f"{' ' * TOOL_COLUMN}{line}" for line in part.result.split("\n")]
+    if not part.done and not part.result:
+        head = f"{head} …"
+    if part.failed:
+        head = f"{head}  ✗"
+    return Fold(head=head, body=part.result.split("\n") if part.result else [])
 
 
 def entry_item(entry: ChatEntry) -> Item:
@@ -119,12 +165,12 @@ def entry_item(entry: ChatEntry) -> Item:
         steps = entry.steps or len(entry.parts)
         names = [x.tool or x.kind for x in entry.parts if x.tool or x.kind]
         summary = " → ".join(names[:3]) + (" …" if len(names) > 3 else "")
-        lines: list[str] = []
-        for part in entry.parts:
-            lines += _part_lines(part)
+        # One collapsed box per turn, opening into its steps: the shape
+        # `tui/app.py`'s ThinkingBox and StepBox had between them, minus the
+        # two widget classes.
         return Item(
             head=f"      {steps} steps" + (f" · {summary}" if summary else ""),
-            body=lines,
+            folds=[part_fold(part) for part in entry.parts],
             **row,
         )
     if entry.kind in ("event", "recall"):
@@ -144,6 +190,49 @@ def entry_item(entry: ChatEntry) -> Item:
 # ------------------------------------------------------------- the turn and it
 
 
+# The spinner, and how fast it turns. 0.1s is 10 frames a second: fast enough
+# to read as motion, and slow enough that a session over a loaded SSH link
+# spends a tenth of the repaints a 0.08s spinner would. Nothing else on the
+# screen changes by the clock, so this interval *is* the UI's idle cost while
+# a turn runs — see `RowUI.next_wake`, which books exactly one wake per frame
+# rather than reintroducing a poll.
+SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+SPINNER_INTERVAL = 0.1
+
+# What the spinner says when the core has not named a step yet. The graph's own
+# wording for the wait that is not a tool (`agent/graph.py` reports "LLM
+# processing", "running <tool>", "compacting context"), so the two never
+# disagree about what to call it.
+DEFAULT_ACTIVITY = "LLM processing"
+
+# Both routes are named because they are not interchangeable: enter has to be
+# aimed at this line, which is the harder thing to do precisely when the agent
+# is filling the log, while esc esc works from wherever the user already is.
+INTERRUPT_HINT = "(enter or esc esc to interrupt)"
+
+# What the working row is called, in the two namespaces a row has: the key a
+# pane remembers it by, and the kind a keypress recognises it as. Neither can
+# collide with an entry's — a `seq` is a number and an entry kind comes from
+# the protocol's list.
+WORKING_KEY = "#working"
+WORKING_KIND = "working"
+
+
+def _epoch(stamp: str) -> float | None:
+    """The core's ISO stamp as seconds, or None if it did not send one.
+
+    None rather than "now": a spinner with no stamp counts from zero and says
+    nothing false, whereas seeding it with the local clock would claim the
+    turn started when this frame was drawn.
+    """
+    if not stamp:
+        return None
+    try:
+        return datetime.fromisoformat(stamp).timestamp()
+    except ValueError:
+        return None
+
+
 @dataclass
 class Turn:
     """What a session's turn is doing, as far as the UI is concerned.
@@ -151,18 +240,80 @@ class Turn:
     ``started_at`` is the core's stamp rather than a local clock, so the
     elapsed count survives the UI being slow — and it is only taken when the
     *activity* changes, because a repeated `turn.activity` for the same work is
-    a heartbeat, not a restart (§3.2).
+    a heartbeat, not a restart (§3.2). Holding it here rather than on the
+    spinner is also what makes "how long since I sent it" survive a session
+    switch: leaving redraws the row, and a clock owned by the row would start
+    again from zero on the way back.
+
+    ``working`` and ``activity`` are separately meaningful, and the difference
+    is what the interrupt hint is read off. A `turn.started` means there is a
+    turn to stop; a `turn.activity` on its own is a backend call that is not a
+    turn — a silent `/conclude`, a compaction, the titler — which still has to
+    time itself and still has nothing to abort.
     """
 
     working: bool = False
     activity: str = ""
     started_at: str = ""
+    # `started_at` parsed once, because the alternative is parsing an ISO
+    # string ten times a second for as long as a turn runs.
+    started_epoch: float | None = None
 
     def activity_is(self, activity: str, started_at: str) -> None:
         if activity and activity == self.activity:
             return  # the same work, said again: the clock keeps running
         self.activity = activity
         self.started_at = started_at
+        self.started_epoch = _epoch(started_at)
+
+    @property
+    def busy(self) -> bool:
+        """Whether anything is in flight worth drawing a spinner for."""
+        return self.working or bool(self.activity)
+
+    @property
+    def interruptible(self) -> bool:
+        """Whether stopping it is a thing that can be done."""
+        return self.working
+
+    @property
+    def label(self) -> str:
+        return self.activity or DEFAULT_ACTIVITY
+
+    def elapsed(self, now: float) -> int:
+        """Whole seconds since the turn started — not since this step did.
+
+        The number answers "how long since I asked?", which is the question
+        the user actually has while waiting. Timing each step separately read
+        better in theory but hid the total: a turn that spent a minute across
+        four steps never showed a number above twenty.
+        """
+        if self.started_epoch is None:
+            return 0
+        return max(0, int(now - self.started_epoch))
+
+    def frame(self, now: float) -> str:
+        """The braille glyph for this instant.
+
+        Derived from the clock rather than advanced by a tick, so the spinner
+        needs nothing to drive it: any frame drawn at time *t* shows the same
+        glyph, and a UI that repaints only when something changed can work out
+        when this one next will (`next_frame`).
+        """
+        base = now - (self.started_epoch or 0.0)
+        return SPINNER_FRAMES[int(base / SPINNER_INTERVAL) % len(SPINNER_FRAMES)]
+
+    def next_frame(self, now: float) -> float:
+        """Seconds until `frame` would answer differently."""
+        base = now - (self.started_epoch or 0.0)
+        return SPINNER_INTERVAL - (base % SPINNER_INTERVAL)
+
+    def line(self, now: float) -> str:
+        """The working row: spinner, step, clock, and how to stop it."""
+        seconds = self.elapsed(now)
+        elapsed = f" {seconds}s" if seconds else ""
+        hint = f"  {INTERRUPT_HINT}" if self.interruptible else ""
+        return f"{self.frame(now)} {self.label}…{elapsed}{hint}"
 
 
 @dataclass
@@ -172,21 +323,100 @@ class Context:
     ``measured`` is what `turn.usage` sets and `context.estimate` respects — a
     real prompt_tokens from the backend beats a local estimate, and the
     estimate only speaks again once the thread it described is gone (a reset).
+
+    ``known`` is a different question from ``measured`` and both are needed: a
+    session with no reply yet has no number at all, and drawing that as a
+    precise zero would say the window is empty when what is true is that
+    nobody has counted. The bar is only drawn once something has.
     """
 
     used: int = 0
     window: int = 0
     measured: bool = False
+    known: bool = False
+    # Completion tokens over the last request's wall clock, and the session's
+    # thinking level. Nothing on the wire carries either yet (`turn.usage` has
+    # prompt_tokens alone and there is no thinking event at all), so today
+    # these are only ever set locally — see `tests/test_ui_meter.py`.
+    speed: float | None = None
+    effort: str | None = None
 
     @property
     def percent(self) -> int:
         return round(100 * self.used / self.window) if self.window else 0
+
+    @property
+    def severity(self) -> str:
+        """ok / warn / danger / unknown — what the meter is coloured by."""
+        if not self.known:
+            return "ok"
+        return severity(self.used, self.window)
 
     def label(self) -> str:
         """`31% ctx`, or `~31% ctx` while it is only an estimate."""
         if not self.window:
             return ""
         return f"{'' if self.measured else '~'}{self.percent}% ctx"
+
+    def bar(self, cells: int = 28, *, speed: bool = True, effort: bool = True) -> str:
+        """The meter as one line, as long as the room allows.
+
+        ``cells`` at 0 drops the picture and keeps the numbers; the two
+        suffixes come off after that. Order matters: the fill is the thing
+        that changes what the user should do next, and it is the last to go.
+        """
+        if not self.known:
+            window = f"{self.window:,}" if self.window else "unknown"
+            text = f"context: window {window} · no reply yet"
+        else:
+            text = render_bar(
+                self.used, self.window, cells=cells, estimated=not self.measured
+            )
+            if speed and self.speed:
+                # One decimal only where it carries information (slow turns).
+                rate = (
+                    f"{self.speed:.1f}" if self.speed < 10 else f"{self.speed:,.0f}"
+                )
+                text += f" · {rate} tok/s"
+        # Last, and abbreviated: on a narrow terminal the right end of this
+        # line is the first thing to go, and the fill is what must survive.
+        # Shown before the first reply too — a session left on xhigh looks
+        # identical to one on off until the wait.
+        if effort and self.effort:
+            text += f" · think {self.effort}"
+        return text
+
+    def measure(self, used: int, window: int | None = None) -> None:
+        """What the backend said the last prompt cost (`turn.usage`)."""
+        self.used = used
+        if window:
+            self.window = window
+        self.measured = True
+        self.known = True
+
+    def estimate(self, used: int, window: int) -> None:
+        """A character-derived figure for a session with no reply yet.
+
+        Reopening a long session should show it is nearly full *before* the
+        next message is sent, not after the reply that overflows it. A
+        measured number always supersedes this — and says so here rather than
+        at the call site, because `context.estimate` carries no flag to tell
+        the two apart.
+        """
+        if self.measured:
+            return
+        self.used = used
+        self.window = window
+        self.known = True
+
+    def reset(self) -> None:
+        """A different thread is a different number; showing the previous one
+        until the next reply would be a lie. The window survives, because it
+        belongs to the backend rather than to the conversation."""
+        self.used = 0
+        self.measured = False
+        self.known = False
+        self.speed = None
 
 
 @dataclass
@@ -242,11 +472,17 @@ class SessionState:
         self.profile = profile
         self.mode = mode
         self.flags = list(flags)
-        # Not on the wire: `protocol.SessionRow` carries no model. Kept so the
-        # message row has somewhere to read one from when it does (M4).
+        # `protocol.SessionRow.model`: the backend this conversation is pinned
+        # to, as a bare name. Drawn on the message row (§4.3 item 20) and
+        # empty for a session that talks to the bootstrap client.
         self.model = model
         self.draft = Editor(wrap=True)
         self.chat = Pane("chat", [])
+        # The folds this UI opened by itself, because their steps were
+        # arriving while the user watched. Remembered so that the end of the
+        # turn can close exactly those and leave alone whatever the user
+        # opened by hand.
+        self._live: set[str] = set()
         self.watchers = Pane("watchers", [])
         self.turn = Turn()
         self.context = Context()
@@ -270,8 +506,10 @@ class SessionState:
         """
         self.entries = list(entries)
         # The thread this described is gone, so a fresh estimate may speak
-        # again (`protocol.SessionRollback`).
-        self.context.measured = False
+        # again (`protocol.SessionRollback`), and the number that described it
+        # is not this conversation's any more.
+        self.context.reset()
+        self._live.clear()
         self.chat.items = [entry_item(entry) for entry in self.entries]
         self._rows = {
             entry.seq: i for i, entry in enumerate(self.entries) if entry.seq
@@ -287,6 +525,14 @@ class SessionState:
             self._rows[entry.seq] = len(self.entries)
         self.entries.append(entry)
         self.chat.items.append(entry_item(entry))
+        if self.turn.busy and entry.kind == "thinking" and entry.seq:
+            # A turn's steps arrive while it works, and a fold that opened
+            # only after the turn ended would show them all at once, after the
+            # fact — "the call is on screen *while* the tool runs" is the
+            # claim, and it is what makes a long turn legible rather than
+            # merely animated. The turn's end closes it again.
+            self._live.add(str(entry.seq))
+            self.chat.expanded.add(str(entry.seq))
         self.chat.invalidate()
         self.chat.cursor = 10**9
         self.loaded = True
@@ -316,6 +562,52 @@ class SessionState:
     def entry_of(self, seq: int) -> ChatEntry | None:
         row = self._rows.get(seq)
         return None if row is None else self.entries[row]
+
+    # -------------------------------------------------------------- the turn
+
+    def start_turn(self) -> None:
+        """`turn.started`: there is now something to stop."""
+        self.turn.working = True
+
+    def end_turn(self) -> None:
+        """`turn.finished` / `turn.failed`: the spinner goes and the live steps
+        fold back into the one box per turn that the transcript keeps.
+
+        Only the folds this UI opened by itself are closed. A step the user
+        opened to read stays open — the turn ending is not a reason to take
+        away what someone was in the middle of reading.
+        """
+        self.turn = Turn()
+        if self._live:
+            self.chat.expanded -= self._live
+            self._live.clear()
+            self.chat.invalidate()
+        self.chat.set_tail(None)
+
+    def tick(self, now: float) -> None:
+        """Put the working row where it belongs for this instant, or take it away.
+
+        Called once per frame, and deliberately the only thing that is: the
+        spinner is a function of the clock (`Turn.frame`), so a frame of it
+        rewrites one cached line rather than relaying out the log — the
+        performance requirement the Textual `WorkingIndicator` paid 44ms of
+        loop lag to learn (specs-ui-acceptance.md, "The spinner").
+
+        It is a *row*, after the last message, because Enter on it is the
+        interrupt gesture and because typing ahead must never bury it: rows
+        arriving push it down the log, and it is still the last of them.
+        """
+        if not self.turn.busy:
+            if self.chat.tail is not None:
+                self.chat.set_tail(None)
+            return
+        self.chat.set_tail(
+            Item(head=self.turn.line(now), kind=WORKING_KIND, key=WORKING_KEY)
+        )
+
+    def next_wake(self, now: float) -> float | None:
+        """When this session's frame stops being true on its own."""
+        return self.turn.next_frame(now) if self.turn.busy else None
 
     # ------------------------------------------------------------ the panels
 
@@ -353,6 +645,7 @@ class SidebarRow:
     title: str = ""
     profile: str = ""
     mode: str = ""
+    model: str = ""
     flags: tuple[str, ...] = ()
 
 
@@ -401,6 +694,19 @@ class Rollback:
 
 
 @dataclass(frozen=True)
+class CycleMode:
+    """Move this session to the next agent mode.
+
+    "The next one", not "this one": which modes exist and what follows what is
+    the agent's business (`hpca.agent.next_mode`), and a key that had to name
+    the destination would be the key deciding it. `client.py` resolves it and
+    sends the `mode.set` that persists it.
+    """
+
+    session_id: str
+
+
+@dataclass(frozen=True)
 class Peek:
     """What is this watch box saying right now?"""
 
@@ -415,5 +721,5 @@ class Drop:
 
 
 Intent = (
-    OpenSession | Submit | Interrupt | Fork | Rollback | Peek | Drop
+    OpenSession | Submit | Interrupt | Fork | Rollback | CycleMode | Peek | Drop
 )

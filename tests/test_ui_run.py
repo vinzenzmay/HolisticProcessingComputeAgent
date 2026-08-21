@@ -18,6 +18,7 @@ import asyncio
 import io
 import os
 import signal
+from datetime import datetime, timezone
 
 import pytest
 
@@ -397,6 +398,41 @@ class TestEvents:
             await peer.conn.send(protocol.Notify(text=f"toast {i}"))
         await h.settle(1)
         assert len(h.painted) - painted < 20
+
+    async def test_a_turn_in_flight_keeps_the_spinner_turning(self, wired):
+        # The end-to-end of the wake strategy: nothing is pushing frames at
+        # the UI and there is no timer inside the spinner, so a turning
+        # spinner is `next_wake` booking one repaint per frame it owes.
+        h, _, peer = wired
+        await peer.conn.send(
+            protocol.SessionRows(
+                rows=[protocol.SessionRow(session_id="s1", title="one")]
+            )
+        )
+        await peer.conn.send(protocol.TurnStarted(session_id="s1"))
+        await peer.conn.send(
+            protocol.TurnActivity(
+                session_id="s1",
+                activity="running run_bash",
+                started_at=datetime.now(timezone.utc).isoformat(),
+            )
+        )
+        await h.settle(1)
+        painted = len(h.painted)
+        await _until(lambda: len(h.painted) >= painted + 2, timeout=3.0)
+
+    async def test_and_stops_asking_for_frames_when_it_ends(self, wired):
+        h, _, peer = wired
+        await peer.conn.send(
+            protocol.SessionRows(
+                rows=[protocol.SessionRow(session_id="s1", title="one")]
+            )
+        )
+        await peer.conn.send(protocol.TurnStarted(session_id="s1"))
+        await h.settle(1)
+        await peer.conn.send(protocol.TurnFinished(session_id="s1"))
+        await h.settle(1)
+        assert h.ui.next_wake() is None
 
     async def test_the_core_hanging_up_ends_the_loop(self, wired):
         h, _, peer = wired
