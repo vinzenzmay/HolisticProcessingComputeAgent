@@ -39,10 +39,11 @@ The content is real from M2 on: ``client`` fills ``state`` in from protocol
 events and the rows render that. From M3 there is a real core behind it —
 ``hpca --new-ui`` builds an ``AgentService`` over an ``InProcessConnection``
 and ``run`` drives stdin, that connection and SIGWINCH on one asyncio loop.
-What is deliberately still missing: mouse support, selecting text out of the *chat*,
-the turn display and approval prompts. Those are arguments *against* leaving
-Textual, so none of them is pretended solved — specs-ui-replacement.md §4 is
-the full list of what is absent and the order it arrives in.
+What is deliberately still missing: mouse support, selecting text out of the
+*chat*, the slash commands and the management overlays. Those are arguments
+*against* leaving Textual, so none of them is pretended solved —
+specs-ui-replacement.md §4 is the full list of what is absent and the order it
+arrives in.
 
 The modules, per specs-ui-replacement.md §3:
 
@@ -52,6 +53,8 @@ The modules, per specs-ui-replacement.md §3:
 * ``keys`` — one read off the wire into key names;
 * ``editor`` — the shared multi-line buffer;
 * ``pane`` — one navigable list of entries, each named by its own key;
+* ``approval`` — the inline decision prompt: what a gated call says about
+  itself, and the box that refuses it;
 * ``state`` — the plain dataclasses the rows are drawn from: sessions, chat,
   turn, context, and the intents a keypress becomes;
 * ``client`` — the one module that knows the protocol: events become state,

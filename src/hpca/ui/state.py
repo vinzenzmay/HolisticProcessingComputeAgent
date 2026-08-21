@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from hpca.ui.ansi import BLUE, DIM, GREEN, RED, YELLOW
+from hpca.ui.approval import Decision
 from hpca.ui.editor import Editor
 from hpca.ui.meter import render_bar, severity
 from hpca.ui.pane import Fold, Item, Pane
@@ -428,10 +429,22 @@ class Toast:
 
 @dataclass
 class Confirm:
-    """A yes/no question that is not a tool approval (`confirm.requested`)."""
+    """A yes/no question, from the core or from the UI itself.
 
-    id: str
-    question: str
+    ``id`` is `confirm.requested`'s: the core holds the continuation (today,
+    the coroutine that writes a learned log signature) and only the yes/no
+    crosses back. It is empty for the eleven local questions — really quit,
+    delete this session, interrupt this turn — which have no core state
+    waiting on them and are answered by ``on_answer`` alone.
+    """
+
+    id: str = ""
+    question: str = ""
+    # What to do with the answer here, when the answer is this side's business.
+    # A callable rather than a verdict flag because the eleven call sites do
+    # eleven different things, and the alternative is the UI holding a little
+    # enum of what it is currently asking about.
+    on_answer: object = None
 
 
 @dataclass
@@ -486,7 +499,10 @@ class SessionState:
         self.watchers = Pane("watchers", [])
         self.turn = Turn()
         self.context = Context()
-        self.decision: dict | None = None
+        # The approval this conversation is parked on, if it is parked on one.
+        # Per session and held here rather than in one shared bar, which is
+        # what parks the half-typed refusal across a switch (§4.4).
+        self.decision: Decision | None = None
         self.proposals: list[Proposal] = []
         self.entries: list[ChatEntry] = []
         # seq -> position in `entries` / `chat.items`, which are parallel.
@@ -553,6 +569,29 @@ class SessionState:
         self.chat.invalidate()
         return True
 
+    def remove(self, seq: int) -> ChatEntry | None:
+        """Take one row back off the chat. The single exception to §3.2.
+
+        Append-only "between resets" has exactly one hole in it, and the
+        protocol is the one that cuts it: `turn.unqueued` says "drop its row,
+        keep its text". A message that was never in the graph cannot be
+        removed by a `chat.reset` — there is nothing for the core to re-read
+        that would leave it out — so the event names the row and the UI drops
+        it. Nothing else may use this: every other row on screen is a record
+        of something that happened.
+        """
+        row = self._rows.pop(seq, None) if seq else None
+        if row is None:
+            return None
+        entry = self.entries.pop(row)
+        self.chat.items.pop(row)
+        # The map is positions into a list that just got shorter.
+        self._rows = {k: (v - 1 if v > row else v) for k, v in self._rows.items()}
+        self.chat.expanded.discard(str(seq))
+        self._live.discard(str(seq))
+        self.chat.invalidate()
+        return entry
+
     def entry_at(self, position: int) -> ChatEntry | None:
         """The entry a pane position is showing, if it is showing one."""
         if 0 <= position < len(self.entries):
@@ -563,11 +602,40 @@ class SessionState:
         row = self._rows.get(seq)
         return None if row is None else self.entries[row]
 
+    # ---------------------------------------------------------- the decision
+
+    def request_decision(self, payload: dict) -> Decision:
+        """`decision.requested` for this conversation.
+
+        The same payload arriving again is the same question — the core
+        re-emits a parked decision on subscribe (§4.4) — so the stage and the
+        half-typed reason are left alone. Rebuilding them would throw away a
+        refusal someone was in the middle of writing every time the client
+        reconnected.
+        """
+        if self.decision is not None and self.decision.payload == payload:
+            return self.decision
+        self.decision = Decision(payload=payload)
+        return self.decision
+
+    def clear_decision(self) -> None:
+        self.decision = None
+
     # -------------------------------------------------------------- the turn
 
-    def start_turn(self) -> None:
-        """`turn.started`: there is now something to stop."""
+    def start_turn(self, started_at: str = "") -> None:
+        """`turn.started`: there is now something to stop, and a clock to run.
+
+        The stamp is the core's, and it is taken here rather than waiting for
+        the first `turn.activity`: the two carry the same instant (the
+        scheduler stamps the turn once, `TurnState.started_at`), and the gap
+        between them is exactly the silent wait on the backend's first
+        answer — the part of a slow turn the user most wants a number for.
+        """
         self.turn.working = True
+        if started_at and not self.turn.started_at:
+            self.turn.started_at = started_at
+            self.turn.started_epoch = _epoch(started_at)
 
     def end_turn(self) -> None:
         """`turn.finished` / `turn.failed`: the spinner goes and the live steps
@@ -707,6 +775,42 @@ class CycleMode:
 
 
 @dataclass(frozen=True)
+class Decide:
+    """Answer the approval this session is parked on.
+
+    One intent for both verdicts, carrying the reason with the refusal,
+    because they are one answer: the turn resumes with a verdict either way
+    and the model must not be told "no" twice. ``reason`` is empty for an
+    approval and for a refusal nobody explained.
+    """
+
+    session_id: str
+    approved: bool
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class Unqueue:
+    """Take a typed-ahead message back out of this session's queue.
+
+    By ``seq``, the core's name for the row, and never by position: the turn
+    ahead of it can finish while the dialog is open, and every position behind
+    it then shifts by one (`protocol.TurnUnqueue`).
+    """
+
+    session_id: str
+    seq: int
+
+
+@dataclass(frozen=True)
+class Answer:
+    """The yes/no to a `confirm.requested`, by the id it asked under."""
+
+    id: str
+    confirmed: bool
+
+
+@dataclass(frozen=True)
 class Peek:
     """What is this watch box saying right now?"""
 
@@ -721,5 +825,15 @@ class Drop:
 
 
 Intent = (
-    OpenSession | Submit | Interrupt | Fork | Rollback | CycleMode | Peek | Drop
+    OpenSession
+    | Submit
+    | Interrupt
+    | Fork
+    | Rollback
+    | CycleMode
+    | Decide
+    | Unqueue
+    | Answer
+    | Peek
+    | Drop
 )

@@ -50,10 +50,29 @@ class HelpOverlay(Overlay):
             [
                 ("i", "go to the message box"),
                 ("shift-tab", "cycle this session's agent mode"),
-                ("enter", "on the working row: stop the turn"),
+                ("enter", "on the working row: stop the turn (asks first)"),
                 ("→ →", "open a turn into its steps, then a step into its result"),
                 ("enter", "on one of your own messages: fork, roll back, copy"),
+                ("enter", "on a queued message: cancel it, or copy it"),
                 ("enter", "on anything else: go to the message box"),
+            ],
+        ),
+        (
+            "the decision prompt",
+            [
+                ("y", "approve — run it"),
+                ("n", "refuse, and say what should be different"),
+                ("esc", "refuse without saying why"),
+                ("enter", "in the box: send the reason with the refusal"),
+                ("⇧enter", "in the box: new line"),
+                ("^↑", "leave it unanswered — the half-typed reason waits"),
+            ],
+        ),
+        (
+            "a yes/no question",
+            [
+                ("y", "yes"),
+                ("n / esc", "no — escape is an answer here, not a way past"),
             ],
         ),
         (

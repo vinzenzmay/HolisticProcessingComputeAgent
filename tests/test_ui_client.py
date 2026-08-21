@@ -692,7 +692,10 @@ class TestTheRewind:
         assert wire.ui.focus == INPUT
 
     async def test_and_an_own_message_with_no_index_is_refused(self, wire):
-        await started(wire, [entry(1, text="queued, not sent yet", kind="queued")])
+        # `index` -1 on a row that *is* the user's own words: the rewind opens
+        # (it is a message), and the cut is refused when it turns out to name
+        # no thread message.
+        await started(wire, [entry(1, text="not in the thread yet")])
         wire.ui.focus = CHAT
         wire.ui.chat.cursor = 0
         await wire.press("enter", "f")
@@ -734,21 +737,26 @@ class TestTheRewind:
 
 
 class TestWhatTheClientDrops:
-    async def test_an_event_with_no_job_is_dropped_and_counted(self, wire):
-        # `turn.unqueued` is M5's; §3.2's rule is that a client ignores what it
-        # cannot draw, and the count is how that stays a decision rather than
-        # an oversight.
+    async def test_an_event_naming_a_row_we_do_not_have_is_counted(self, wire):
+        # §3.2's rule is that a client ignores what it cannot draw, and the
+        # count is how that stays a decision rather than an oversight. A
+        # `turn.unqueued` for a row this chat never had is one of those: there
+        # is nothing to remove.
         await started(wire)
         await wire.tell(
-            protocol.TurnUnqueued(session_id="s1", seq=4, text="taken back")
+            protocol.TurnUnqueued(session_id="s1", seq=44, text="taken back")
         )
         assert wire.client.dropped["turn.unqueued"] == 1
 
-    async def test_and_nothing_on_screen_moved(self, wire):
+    async def test_but_the_text_still_comes_back(self, wire):
+        # The row is the UI's business and may already have been redrawn; the
+        # *text* is the core's and is why the event carries it at all
+        # (`protocol.TurnUnqueued`).
         await started(wire)
-        before = wire.screen()
-        await wire.tell(protocol.TurnUnqueued(session_id="s1", seq=4, text="x"))
-        assert wire.screen() == before
+        await wire.tell(
+            protocol.TurnUnqueued(session_id="s1", seq=44, text="taken back")
+        )
+        assert wire.ui.input.text() == "taken back"
 
     async def test_a_frame_that_is_not_a_message_at_all_is_dropped(self, wire):
         await started(wire)

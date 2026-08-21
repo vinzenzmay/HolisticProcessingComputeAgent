@@ -113,11 +113,25 @@ def test_alt_enter_grows_the_row():
 
 
 def test_enter_sends():
+    # The demo's first session is the one left mid-turn, so what comes back is
+    # the queued row rather than an answer: one row, and the box cleared for
+    # whatever is typed next (specs-ui-acceptance.md, "Queueing while a turn
+    # runs").
     ui = typed(in_the_box(), "hello there")
     before = len(ui.panes[1].items)
     ui.handle("enter", 120, 40)
-    assert len(ui.panes[1].items) == before + 2
+    assert len(ui.panes[1].items) == before + 1
+    assert ui.panes[1].items[-1].kind == "queued"
     assert ui.input.text() == ""
+
+
+def test_enter_on_an_idle_session_gets_an_answer():
+    ui = build()
+    ui.open_session(ui.sessions[2].session_id)  # neither busy nor parked
+    ui.focus = INPUT
+    before = len(ui.panes[1].items)
+    typed(ui, "hello there").handle("enter", 120, 40)
+    assert len(ui.panes[1].items) == before + 2
 
 
 def test_ctrl_up_returns_to_chat():

@@ -274,17 +274,33 @@ class TestTheWorkingIndicator:
 
 
 class TestStoppingItFromTheRow:
-    async def test_enter_on_the_working_row_interrupts_the_turn(self, wire):
+    async def test_enter_on_the_working_row_asks_before_stopping_it(self, wire):
+        # The aimed half of the gesture confirms; `esc esc` does not, because
+        # the doubling is already the confirmation (M5b, "Interrupting").
         await working(wire)
         wire.ui.focus = CHAT
         await wire.press("end", "enter")
+        assert "Interrupt this turn" in wire.screen()
+        assert wire.peer.took(protocol.TurnInterrupt) == []
+
+    async def test_and_confirming_interrupts_the_turn(self, wire):
+        await working(wire)
+        wire.ui.focus = CHAT
+        await wire.press("end", "enter", "y")
         assert wire.peer.last(protocol.TurnInterrupt).session_id == "s1"
 
     async def test_and_says_so(self, wire):
         await working(wire)
         wire.ui.focus = CHAT
-        await wire.press("end", "enter")
+        await wire.press("end", "enter", "y")
         assert wire.ui.note == "stopped the turn"
+
+    async def test_declining_leaves_the_turn_running(self, wire):
+        await working(wire)
+        wire.ui.focus = CHAT
+        await wire.press("end", "enter", "n")
+        assert wire.peer.took(protocol.TurnInterrupt) == []
+        assert spinner_lines(wire), "the spinner is still there"
 
     async def test_a_call_that_is_not_a_turn_says_why_it_cannot(self, wire):
         await wire.tell(

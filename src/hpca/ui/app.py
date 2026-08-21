@@ -13,25 +13,30 @@ from collections.abc import Callable
 from hpca import __version__ as VERSION
 from hpca.ui.ansi import BOLD, CYAN, DIM, GREEN, RED, RESET, REVERSE, YELLOW
 from hpca.ui.ansi import cell_width, cut, footer_line, pad, rule
+from hpca.ui.approval import decision_height, render_decision
 from hpca.ui.editor import Editor
 from hpca.ui.keys import NEWLINE_KEYS, is_paste, paste_text
 from hpca.ui.overlays import (
     COPY,
     FORK,
     ROLLBACK,
+    UNQUEUE,
     ConfigOverlay,
     HelpOverlay,
     LlmOverlay,
     Overlay,
     ProfilesOverlay,
+    QueuedOverlay,
     RewindOverlay,
 )
 from hpca.ui.pane import Item, Pane
 from hpca.ui.state import (
     MODE_COLOURS,
     OWN_MESSAGE_KINDS,
+    Answer,
     Confirm,
     CycleMode,
+    Decide,
     Drop,
     Fork,
     Intent,
@@ -43,6 +48,7 @@ from hpca.ui.state import (
     SidebarRow,
     Submit,
     Toast,
+    Unqueue,
     mode_line,
 )
 
@@ -53,7 +59,24 @@ from hpca.ui.state import (
 # is not evidence that the user wants the turn dead. Two in a second are.
 ESC_STOP_WINDOW = 1.0
 
-SESSIONS, CHAT, INPUT, WATCHERS = range(4)
+# The four rows, and the prompt that is not a row. DECISION is a focus target
+# without a pane: the inline approval sits at the foot of the chat column
+# (§4.3 item 21), it takes keys while it is unanswered, and it is deliberately
+# not in the ↑/↓ ring — you arrive at it because a decision arrived, and you
+# leave it by answering.
+SESSIONS, CHAT, INPUT, WATCHERS, DECISION = range(5)
+
+# The question the aimed half of the stop gesture asks first. Enter on the
+# working row is a key that can be hit while steering through a log the agent
+# is writing into, so it confirms; `esc esc` does not, because the doubling is
+# already the confirmation (specs-ui-acceptance.md, "Stopping a turn").
+INTERRUPT_QUESTION = "Interrupt this turn and re-edit your last message?"
+
+# What the prompt may take of the screen. Half of what is left after the header
+# and the footer, which is the row UI's version of DecisionBar's `max-height:
+# 60%`: a decision has to be readable, and the conversation it is about has to
+# stay on screen behind it.
+DECISION_SHARE = 2
 
 
 # The sidebar markers §4.3 item 15 asks for, and the flag strings the core
@@ -333,6 +356,11 @@ class RowUI:
         """
         self._select(session_id)
         self.refresh_sidebar()
+        if self.session.decision is not None and self.focus != WATCHERS:
+            # It was flagged with a "!" while it was in the background; being
+            # opened is what reveals it, and the cursor lands where it can be
+            # answered.
+            self.focus = DECISION
         if announce:
             self.note = f"opened “{self.session.title}”"
         self.send(OpenSession(session_id))
@@ -387,7 +415,11 @@ class RowUI:
         can use it.
         """
         avail = max(8, height - 2)  # header and footer
-        inp = self._input_h(width) + self._status_h()
+        inp = (
+            self._input_h(width)
+            + self._status_h()
+            + self._decision_h(width, height)
+        )
         quarter = max(2, avail // 4)
         inner = max(8, width - 2)
         top = max(2, min(1 + len(self.panes[0].flat(inner)), quarter))
@@ -402,9 +434,25 @@ class RowUI:
         middle = avail - top - bottom - inp
         if middle < 1:  # a terminal too short for the design at all
             top = bottom = 2
-            inp = 2 + self._status_h()
+            inp = 2 + self._status_h() + self._decision_h(width, height)
             middle = max(1, avail - 4 - inp)
         return [top, middle, inp, bottom]
+
+    def _decision_h(self, width: int, height: int) -> int:
+        """Rows the inline approval wants, or none because there is none.
+
+        Taken out of the chat's share rather than given a row of its own,
+        because that is what "inline, at the foot of the chat column" means in
+        a layout made of rows: the prompt pushes the conversation up and the
+        conversation is still there behind it — the property a modal would
+        lose, and the reason this is not one (`ui/approval.py`).
+        """
+        decision = self.session.decision
+        if decision is None:
+            return 0
+        return decision_height(
+            decision, width, max(3, max(8, height - 2) // DECISION_SHARE)
+        )
 
     def _status_h(self) -> int:
         """Whether the mode/meter row is on screen at all.
@@ -437,7 +485,9 @@ class RowUI:
             out.append(footer_line(self.overlay.footer(), width))
             while len(out) < height:
                 out.insert(len(out) - 1, " " * width)
-            return out[:height]
+            # A confirmation can be asked *about* an overlay — remove this
+            # skill, delete this profile — so it is drawn over that too.
+            return self._over_confirm(out[:height], width)
         heights = self._heights(height, width)
         order = [
             (SESSIONS, self.panes[0], heights[0]),
@@ -450,8 +500,12 @@ class RowUI:
         self.session.tick(self.wall())
         for slot, pane, pane_h in order:
             if slot == INPUT:
+                prompt = self._render_decision(width, height)
                 status = self._render_status(width)
-                out += status + self._render_input(width, pane_h - len(status))
+                out += prompt + status
+                out += self._render_input(
+                    width, pane_h - len(status) - len(prompt)
+                )
             else:
                 out += pane.render(width, pane_h, focused=self.focus == slot)
         note, style = self.note, self.note_style
@@ -460,7 +514,49 @@ class RowUI:
         out.append(footer_line(self._keys(), width, note, style))
         while len(out) < height:
             out.insert(len(out) - 1, " " * width)
-        return out[:height]
+        out = out[:height]
+        return self._over_confirm(out, width)
+
+    def _render_decision(self, width: int, height: int) -> list[str]:
+        """The open session's approval, and only the open session's.
+
+        A decision waiting in a background conversation is somebody else's
+        question: it lights the sidebar's "!" (`_marks`) and puts nothing on
+        this screen, which is the whole reason the prompt is inline instead of
+        modal. Opening that session is what reveals it.
+        """
+        decision = self.session.decision
+        if decision is None:
+            return []
+        return render_decision(
+            decision,
+            width,
+            self._decision_h(width, height),
+            focused=self.focus == DECISION,
+        )
+
+    def _over_confirm(self, out: list[str], width: int) -> list[str]:
+        """The generic yes/no, drawn over the finished frame (§4.3 item 22).
+
+        Over rather than in: a confirmation is asked *about* what is on screen
+        — really quit, interrupt this turn, apply this signature — and it can
+        arrive on top of an overlay, which is what the Textual app's
+        ConfirmScreen did by being pushed on the screen stack. It is also the
+        one thing here that is deliberately modal: it is a question with two
+        answers and no third thing to be doing meanwhile.
+        """
+        question = self.confirm
+        if question is None:
+            return out
+        rows = [
+            YELLOW + rule("confirm", width) + RESET,
+            BOLD + pad(f"  {question.question}", width) + RESET,
+            DIM + pad("  (y) yes · (n) no · (esc) no", width) + RESET,
+        ]
+        rows = rows[: len(out)]  # a terminal too short for the question
+        at = max(0, (len(out) - len(rows)) // 2)
+        out[at : at + len(rows)] = rows
+        return out
 
     def _render_status(self, width: int) -> list[str]:
         """The mode bar and the context meter, sharing one row.
@@ -529,6 +625,22 @@ class RowUI:
         # that goes. Leaving the message box is ^↑, not escape: escape has a
         # job now.
         common = [("^↑^↓", "row"), ("esc esc", "stop"), ("?", "keys"), ("q", "quit")]
+        if self.confirm is not None:
+            return [("y", "yes"), ("n", "no"), ("esc", "no")]
+        if self.focus == DECISION:
+            decision = self.session.decision
+            if decision is not None and not decision.asking:
+                return [
+                    ("enter", "send the reason"),
+                    ("esc", "no reason"),
+                    ("⇧enter", "new line"),
+                ]
+            return [
+                ("y", "approve"),
+                ("n", "deny"),
+                ("esc", "deny, no reason"),
+                ("^↑", "row"),
+            ]
         if self.focus == INPUT:
             # Spelled out rather than built from ``common`` so that send and
             # stop come first — the message box is where you sit while a turn
@@ -560,12 +672,23 @@ class RowUI:
         if is_paste(key):
             self._paste(paste_text(key))
             return True
+        if self.confirm is not None:
+            # First, and above the overlay: a confirmation is asked over
+            # whatever raised it, and it is answered before anything else can
+            # be done (see `_over_confirm`).
+            return self._handle_confirm(key)
         if self.overlay is not None:
             overlay = self.overlay
             if not overlay.handle(key, width, height - 2):
                 self.overlay = None
                 self._closed(overlay)
             return True
+        if self.focus == DECISION:
+            # After the overlay, because a decision can arrive while a screen
+            # is open: the screen keeps the keys until it closes, and the
+            # prompt — which is underneath it, not over it — has them the
+            # moment it does.
+            return self._handle_decision(key)
         if self.focus == INPUT:
             return self._handle_input(key)
         return self._handle_row(key, width, height)
@@ -590,8 +713,181 @@ class RowUI:
 
     def _closed(self, overlay: Overlay) -> None:
         """A screen that answered with something the rows have to act on."""
-        if isinstance(overlay, RewindOverlay) and overlay.choice:
+        if isinstance(overlay, QueuedOverlay) and overlay.choice:
+            self._queued(overlay)
+        elif isinstance(overlay, RewindOverlay) and overlay.choice:
             self._rewind(overlay)
+
+    # -------------------------------------------------- the generic yes/no
+
+    def ask(
+        self,
+        question: str,
+        on_answer: Callable[[bool], None] | None = None,
+        *,
+        confirm_id: str = "",
+    ) -> None:
+        """Put a yes/no on screen. The answer goes wherever it belongs.
+
+        Two kinds of caller, one dialog. The UI's own questions pass
+        ``on_answer`` and nothing is waiting on the other side of a socket for
+        them. `confirm.requested` passes ``confirm_id``: the core is holding a
+        continuation under that id and only the verdict crosses back
+        (`protocol.ConfirmResolve`), which is why the question need not name a
+        session — a triage offer comes from a poll, not a conversation.
+        """
+        self.confirm = Confirm(
+            id=confirm_id, question=question, on_answer=on_answer
+        )
+
+    def _handle_confirm(self, key: str) -> bool:
+        """y, n, escape. Anything else is ignored rather than passed on: a
+        modal that leaked its keys would act on the screen behind it."""
+        if key == "quit":
+            return False
+        if key == "y":
+            self._answer(True)
+        elif key in ("n", "esc"):
+            # Escape is "no" and not "ask me later": the question is a gate,
+            # and a gate with a way past it that answers neither is a turn
+            # parked on nothing.
+            self._answer(False)
+        return True
+
+    def _answer(self, confirmed: bool) -> None:
+        question, self.confirm = self.confirm, None
+        if question is None:  # pragma: no cover - guarded by the caller
+            return
+        if question.id:
+            self.send(Answer(question.id, confirmed))
+        if callable(question.on_answer):
+            question.on_answer(confirmed)
+
+    def confirm_requested(self, confirm_id: str, question: str) -> None:
+        """`confirm.requested`, which the Textual UI never drew at all."""
+        self.ask(question, confirm_id=confirm_id)
+
+    # ------------------------------------------------------ the decision
+
+    def decision_arrived(self, session_id: str) -> None:
+        """A session is parked on an approval — this one, or another one.
+
+        Another one changes exactly one thing about the frame: the "!" in the
+        sidebar (§3.2 property 1). This one puts the prompt up and lands on it
+        so its keys work at once — but only from the chat column, because a
+        decision must never pull the cursor out of the sessions or watchers
+        row the user is working in.
+        """
+        self.refresh_sidebar()
+        if session_id == self.active_id and self.focus in (CHAT, INPUT):
+            self.focus = DECISION
+
+    def decision_cleared(self, session_id: str) -> None:
+        """The core says that decision is gone (answered, or its turn died)."""
+        self.refresh_sidebar()
+        if session_id == self.active_id and self.focus == DECISION:
+            self.focus = INPUT
+
+    def _handle_decision(self, key: str) -> bool:
+        """The two stages, and the keys each of them owns.
+
+        The reason box takes the letters the y/n stage was using — it is a
+        text field, and "n" in the middle of "not this path" is not a verdict
+        — which is why the stage gates the keys rather than both being live at
+        once (`DecisionBar.check_action` did the same with `check_action`).
+        """
+        if key == "quit":
+            return False
+        decision = self.session.decision
+        if decision is None:  # answered, or its session went away
+            self.focus = INPUT
+            return True
+        if decision.asking:
+            if key == "y":
+                self._resolve(True)
+            elif key == "n":
+                # Not an answer yet: the refusal is sent once the box says
+                # why, or says nothing.
+                decision.decline()
+            elif key == "esc":
+                self._resolve(False)
+            elif key == "ctrl-up":
+                self.focus = CHAT
+            elif key in ("ctrl-down", "tab", "i"):
+                self.focus = INPUT
+            return True
+        if key == "enter":
+            self._resolve(False, decision.reason_text())
+        elif key == "esc":
+            self._resolve(False)
+        elif key in NEWLINE_KEYS:
+            decision.reason.newline()
+        elif key == "ctrl-up":
+            self.focus = CHAT  # the half-written reason stays where it is
+        elif key == "ctrl-down":
+            self.focus = INPUT
+        else:
+            decision.reason.handle(key)
+        return True
+
+    def _resolve(self, approved: bool, reason: str = "") -> None:
+        """Answer the open session's decision and let the turn go on.
+
+        Cleared here rather than waiting for `decision.cleared` to come back:
+        the prompt has been answered, and a question that stays on screen
+        until the core agrees is a question the user can answer twice.
+        """
+        session = self.session
+        if session.decision is None:
+            return
+        session.clear_decision()
+        self.refresh_sidebar()
+        self.focus = INPUT
+        self.send(Decide(session.session_id, approved, reason))
+        self.note = "approved" if approved else "declined"
+
+    # ------------------------------------------------------- the queue
+
+    def _queued(self, overlay: QueuedOverlay) -> None:
+        """What the queued-message dialog decided, for the session it was
+        opened in — which need not be the one on screen when it closes."""
+        if overlay.choice == UNQUEUE:
+            # By seq: a turn finishing while the dialog sat open shifts every
+            # position in the queue, and the row's own name cannot drift. The
+            # text comes back on `turn.unqueued`, from the core, because by
+            # then the row may have been redrawn.
+            self.send(Unqueue(overlay.session_id, overlay.seq))
+            self.note = "cancelling that message"
+            return
+        self.hand_back(overlay.session_id, overlay.message, note="copied")
+
+    def hand_back(self, session_id: str, text: str, *, note: str = "") -> None:
+        """A message the core gave back, into *that* session's draft.
+
+        Not the visible one. An interrupt's rollback and a cancelled queued
+        message both answer asynchronously, and the user can be looking at
+        another conversation by the time they do — dropping the text into
+        whichever entry happens to be on screen would put one session's words
+        into another's turn.
+        """
+        session = self.session_for(session_id)
+        self._into_draft(session, text)
+        if session_id == self.active_id:
+            self.focus = INPUT
+            self.note = note or "the message is back in the box"
+        else:
+            title = session.title or session_id
+            self.note = f"“{title}” — the message is waiting there"
+
+    def _into_draft(self, session: SessionState, text: str) -> None:
+        """Added to whatever is already being written rather than replacing
+        it, so nothing the user typed can be lost by a message coming back. It
+        starts its own line, except after a draft left ending in whitespace —
+        that space is how you say "continue here"."""
+        draft = session.draft.text()
+        if draft and not draft[-1].isspace():
+            draft += "\n"
+        session.draft.set_text(draft + text)
 
     # -------------------------------------------------------- the chat rewind
 
@@ -607,7 +903,11 @@ class RowUI:
             self._stop_from_the_row()
             return
         entry = self.session.entry_at(position)
-        if entry is not None and entry.kind in OWN_MESSAGE_KINDS:
+        if entry is not None and entry.kind == "queued":
+            # A message that has not reached the model yet: the offer is to
+            # take it back, not to rewind to it (§4.3 item 34).
+            self.overlay = QueuedOverlay(entry.text, entry.seq, self.active_id)
+        elif entry is not None and entry.kind in OWN_MESSAGE_KINDS:
             # The row's own name, not its position: the cut is decided by the
             # user now and carried out by the core later, and a turn appending
             # in between moves every position after it.
@@ -625,11 +925,30 @@ class RowUI:
         explains itself.
         """
         if self.session.turn.interruptible:
-            self.send(Interrupt(self.active_id))
-            self.note = "stopped the turn"
+            # Asked, unlike `esc esc`: this key is aimed at a row in a log the
+            # agent is writing into, so it is the one that can be hit by
+            # accident. The dialog can sit open long enough for the reply to
+            # land, so what it decided is re-checked before it is sent.
+            session_id = self.active_id
+            self.ask(
+                INTERRUPT_QUESTION,
+                lambda yes: self._confirmed_stop(session_id, yes),
+            )
         else:
             self.note = "this is a backend call, not a turn — nothing to stop"
             self.note_style = DIM
+
+    def _confirmed_stop(self, session_id: str, yes: bool) -> None:
+        """The answer to the interrupt dialog. A reply that landed while it
+        was open makes it a no-op — there is no longer a turn to stop."""
+        if not yes:
+            return
+        if not self.session_for(session_id).turn.interruptible:
+            self.note = "that turn finished while you were deciding"
+            self.note_style = DIM
+            return
+        self.send(Interrupt(session_id))
+        self.note = "stopped the turn"
 
     def _rewind(self, overlay: RewindOverlay) -> None:
         """What the rewind decided, as an intent aimed at the session it was
@@ -657,10 +976,7 @@ class RowUI:
         except after a draft left ending in whitespace — that space is how you
         say "continue here" (``rerun this: `` + the old command).
         """
-        draft = self.input.text()
-        if draft and not draft[-1].isspace():
-            draft += "\n"
-        self.input.set_text(draft + text)
+        self._into_draft(self.session, text)
         self.focus = INPUT  # cursor behind the reused text, ready to send
         self.note = "copied into the message box"
 
@@ -774,6 +1090,15 @@ class RowUI:
         if not self.active_id:
             self.note = "no session open"
             return
+        if text.startswith("/") and self.session.turn.busy:
+            # A slash command acts on the UI and runs its own exclusive
+            # worker, so there is nothing sensible to queue it behind — and a
+            # `/compact` that ran an hour later against a thread the turn had
+            # since changed would be worse than one that was refused. An
+            # ordinary message queues; this one waits for the user.
+            self.note = "wait for this turn — a command cannot be queued"
+            self.note_style = DIM
+            return
         self.send(Submit(self.active_id, text))
         self.input.clear()
         self.note = "sent"
@@ -843,8 +1168,11 @@ class RowUI:
             if self.focus == SESSIONS:
                 self._switch(self.session_pane.current(inner))
                 # Straight to the box: opening a session is something you do
-                # in order to say something in it.
-                self.focus = INPUT
+                # in order to say something in it — unless it is parked on a
+                # decision, which is the thing to do in it first.
+                self.focus = (
+                    DECISION if self.session.decision is not None else INPUT
+                )
             elif self.focus == CHAT:
                 self._activate_chat(inner)
             elif self.focus == WATCHERS:

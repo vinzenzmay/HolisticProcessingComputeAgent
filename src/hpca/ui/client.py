@@ -150,6 +150,26 @@ class UIClient:
             )
         elif isinstance(intent, state.Interrupt):
             self.command(protocol.TurnInterrupt(session_id=session))
+        elif isinstance(intent, state.Decide):
+            # The half-typed reason was a UI draft until this moment; only the
+            # finished string crosses (specs-core-process.md §4.4).
+            self.command(
+                protocol.DecisionResolve(
+                    session_id=session,
+                    approved=intent.approved,
+                    reason=intent.reason,
+                )
+            )
+        elif isinstance(intent, state.Unqueue):
+            self.command(
+                protocol.TurnUnqueue(session_id=session, seq=intent.seq)
+            )
+        elif isinstance(intent, state.Answer):
+            # By id, not by session: a `confirm.requested` need not belong to
+            # a conversation at all — a triage offer comes from a poll.
+            self.command(
+                protocol.ConfirmResolve(id=intent.id, confirmed=intent.confirmed)
+            )
         elif isinstance(intent, state.CycleMode):
             self._cycle_mode(session)
         elif isinstance(intent, state.Fork | state.Rollback):
@@ -344,7 +364,12 @@ class UIClient:
 
     def _started(self, msg: protocol.TurnStarted) -> None:
         session = self._session(msg.session_id)
-        session.start_turn()
+        # The stamp comes with the event because the clock the user reads is
+        # "how long since I sent it", and a turn is silent for as long as the
+        # backend takes to answer the first time — a spinner that only started
+        # counting at the first `turn.activity` would show nothing for that
+        # whole wait (`protocol.TurnStarted`).
+        session.start_turn(msg.started_at)
         self._tick(session)
         self.ui.refresh_sidebar()
 
@@ -384,15 +409,43 @@ class UIClient:
         self._session(msg.session_id).context.estimate(msg.used, msg.window)
 
     def _decision(self, msg: protocol.DecisionRequested) -> None:
-        self._session(msg.session_id).decision = dict(msg.payload)
-        self.ui.refresh_sidebar()
+        # The same payload twice is the same question — the core re-emits a
+        # parked decision on subscribe (§4.4) — so a refusal half-written when
+        # the socket dropped survives the reconnect.
+        self._session(msg.session_id).request_decision(dict(msg.payload))
+        self.ui.decision_arrived(msg.session_id)
 
     def _decision_cleared(self, msg: protocol.DecisionCleared) -> None:
-        self._session(msg.session_id).decision = None
-        self.ui.refresh_sidebar()
+        self._session(msg.session_id).clear_decision()
+        self.ui.decision_cleared(msg.session_id)
 
     def _confirm(self, msg: protocol.ConfirmRequested) -> None:
-        self.ui.confirm = state.Confirm(id=msg.id, question=msg.question)
+        self.ui.confirm_requested(msg.id, msg.question)
+
+    def _unqueued(self, msg: protocol.TurnUnqueued) -> None:
+        """A typed-ahead message taken back: its row goes, its text stays.
+
+        The one event that removes a chat row, and the protocol is what makes
+        it an exception to §3.2 rather than the UI deciding: the message was
+        never in the graph, so no `chat.reset` could take it off the screen.
+        The text goes to the draft of the session it was typed in — which need
+        not be the one on screen, since the answer can arrive after a switch.
+        """
+        session = self._session(msg.session_id)
+        if session.remove(msg.seq) is None:
+            self.dropped["turn.unqueued"] += 1
+        self.ui.hand_back(msg.session_id, msg.text)
+
+    def _interrupted(self, msg: protocol.TurnInterrupted) -> None:
+        """A stopped turn's message, back to the session it was typed in.
+
+        `turn.unqueued`'s sibling and deliberately not the same event: this one
+        names no row, because the `chat.reset` that precedes it has already
+        un-drawn the abandoned attempt (`protocol.TurnInterrupted`). All that
+        is left to do with it is the half both share — park the text as that
+        session's draft, which is why they share the routine.
+        """
+        self.ui.hand_back(msg.session_id, msg.text)
 
     def _panel(self, msg: protocol.PanelUpdate) -> None:
         # A panel without a session belongs to the profile rather than to a
@@ -435,6 +488,8 @@ UIClient._HANDLERS = {
     protocol.TurnActivity.__name__: UIClient._activity,
     protocol.TurnFinished.__name__: UIClient._finished,
     protocol.TurnFailed.__name__: UIClient._failed,
+    protocol.TurnUnqueued.__name__: UIClient._unqueued,
+    protocol.TurnInterrupted.__name__: UIClient._interrupted,
     protocol.TurnUsage.__name__: UIClient._usage,
     protocol.ContextEstimate.__name__: UIClient._estimate,
     protocol.DecisionRequested.__name__: UIClient._decision,

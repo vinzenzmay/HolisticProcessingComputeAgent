@@ -107,6 +107,32 @@ LEARNINGS = {
 }
 
 TOOLS = ["read_file", "edit_file", "create_file", "run_bash", "list_dir"]
+
+# The gated call one demo session is parked on (§4.3 item 21). Built the way
+# the graph builds one: an execution gate in manual mode, with the script the
+# user is actually deciding about, the tool's schema blurb it must NOT show, a
+# plumbing argument it must drop, and the script's own lines among the
+# arguments so the prompt can be seen not repeating them above the block.
+DEMO_DECISION = {
+    "tool": "run_bash",
+    "kind": "execution",
+    "description": (
+        "Run a registered script as a tracked background process for work "
+        "that outlives this turn; returns a process id to poll."
+    ),
+    "arguments": {
+        "key": "merge_vcf",
+        "content_lines": ["set -euo pipefail", "bcftools merge -o merged.vcf"],
+        "timeout_s": 600,
+    },
+    "script": (
+        "#!/bin/bash\n"
+        "set -euo pipefail\n"
+        "workdir=/scratch/proj/cohort/run3\n"
+        "rm -f $workdir/tmp/shard_*.partial\n"
+        "bcftools merge -Oz -o $workdir/merged.vcf.gz $workdir/shards/*.vcf.gz"
+    ),
+}
 WATCH_STATES = [
     ("RUNNING", "watch watch-live"),
     ("PENDING", "watch watch-idle"),
@@ -300,6 +326,12 @@ class DemoCore:
         # cannot show it: opening this one starts the spinner, hands it a tool
         # that never answers, and waits to be interrupted.
         self._busy = self.rows[0].session_id if self.rows else ""
+        # And one left parked on an approval, for the same reason: the inline
+        # prompt is what M5 builds. The fifth row rather than the second, and
+        # deliberately: it is a session in manual mode, which is the gate the
+        # payload above is, and it is far enough down the list that the "!"
+        # has to be noticed in the sidebar rather than being what opens first.
+        self._parked = self.rows[4].session_id if len(self.rows) > 4 else ""
         self._live: dict[str, protocol.Entry] = {}
 
     # ------------------------------------------------------------- content
@@ -350,6 +382,15 @@ class DemoCore:
 
     def _do_SessionList(self, cmd: protocol.SessionList) -> None:
         self.emit(protocol.SessionRows(rows=list(self.rows)))
+        if self._parked:
+            # Re-emitted on subscribe, as a real core does with a decision it
+            # is holding (§4.4): a turn parked before the front-end existed
+            # must still be answerable once one arrives.
+            self.emit(
+                protocol.DecisionRequested(
+                    session_id=self._parked, payload=dict(DEMO_DECISION)
+                )
+            )
 
     def _do_SessionOpen(self, cmd: protocol.SessionOpen) -> None:
         entries = self.entries(cmd.session_id)
@@ -452,6 +493,17 @@ class DemoCore:
 
     def _do_TurnSubmit(self, cmd: protocol.TurnSubmit) -> None:
         entries = self.entries(cmd.session_id)
+        if cmd.session_id in (self._busy, self._parked):
+            # One turn per session: what arrives while that one runs is
+            # queued, and the queued row is what the user gets back.
+            waiting = protocol.Entry(
+                kind="queued", text=cmd.text, seq=len(entries) + 1
+            )
+            entries.append(waiting)
+            self.emit(
+                protocol.ChatAppend(session_id=cmd.session_id, entry=waiting)
+            )
+            return
         self._finish_live_turn(cmd.session_id, "no such process")
         self.emit(protocol.TurnStarted(session_id=cmd.session_id))
         said = protocol.Entry(
@@ -479,6 +531,53 @@ class DemoCore:
     def _do_TurnInterrupt(self, cmd: protocol.TurnInterrupt) -> None:
         self._finish_live_turn(cmd.session_id, "interrupted")
         self.emit(protocol.TurnFinished(session_id=cmd.session_id))
+
+    def _do_TurnUnqueue(self, cmd: protocol.TurnUnqueue) -> None:
+        """Take the queued row back, by the name the core gave it.
+
+        A `seq` that is no longer queued is refused with a warning rather than
+        an event — it has already started, and stopping that is a different
+        question (`protocol.TurnUnqueue`).
+        """
+        entries = self.entries(cmd.session_id)
+        found = next(
+            (e for e in entries if e.seq == cmd.seq and e.kind == "queued"),
+            None,
+        )
+        if found is None:
+            self.emit(
+                protocol.Notify(
+                    severity="warning",
+                    text="Too late — that message is already running.",
+                )
+            )
+            return
+        entries.remove(found)
+        self.emit(
+            protocol.TurnUnqueued(
+                session_id=cmd.session_id, seq=found.seq, text=found.text
+            )
+        )
+
+    def _do_DecisionResolve(self, cmd: protocol.DecisionResolve) -> None:
+        """The answer to the parked approval: the prompt goes and the turn
+        goes on, with a refusal's reason recorded where the user can read it
+        back — which is where the model reads it too."""
+        if cmd.session_id == self._parked:
+            self._parked = ""
+        self.emit(protocol.DecisionCleared(session_id=cmd.session_id))
+        entries = self.entries(cmd.session_id)
+        said = "ran the script" if cmd.approved else "skipped the script"
+        if cmd.reason:
+            said += f" \u2014 \u201c{cmd.reason}\u201d"
+        note = protocol.Entry(kind="event", text=said, seq=len(entries) + 1)
+        entries.append(note)
+        self.emit(protocol.ChatAppend(session_id=cmd.session_id, entry=note))
+        self.emit(protocol.TurnFinished(session_id=cmd.session_id))
+
+    def _do_ConfirmResolve(self, cmd: protocol.ConfirmResolve) -> None:
+        yes = "yes" if cmd.confirmed else "no"
+        self.emit(protocol.Notify(text=f"confirmation {cmd.id}: {yes}"))
 
     def _do_ModeSet(self, cmd: protocol.ModeSet) -> None:
         """Persist the mode and say so, which is the sidebar's copy of it."""
