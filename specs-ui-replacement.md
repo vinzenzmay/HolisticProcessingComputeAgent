@@ -214,6 +214,30 @@ added to `protocol.py` with tests, in the same style as what is there:
     incompatible with §3.2's append-only invariant. Needs a core-assigned entry
     identity and an update event.
 
+**Found during M7, and it breaks an invariant rather than merely missing a
+feature.** The overlays that *edit* a profile's memories, its archive, a skill
+file and `settings.json` have **no read path on the wire**: `profile.rows`
+carries a count, not a body, and there is no `profile.get`, `skill.list`,
+`settings.get` or `settings.save`. Since `profile.save` writes verbatim, an
+editor opened over an unfetched body would truncate the file — so the UI
+currently reads all four out of the app dir itself.
+
+That is `specs-core-process.md` §4.2 rule 2 — *"The UI never reads the
+database"* — and the rule is not decorative: it is what deletes the poll
+timers, `DbIO` and the `_is_active_session` checks from the front-end, and it is
+what makes a socket-separated core possible at all in M11. A stopgap here is
+the kind of thing that silently becomes the architecture. **Close before M9.**
+
+Three smaller consequences of the same missing surface, all in M8's way:
+
+- **`ctrl+l` cannot switch to a key-locked backend.** `backend.set` is the only
+  command that pins a session and it wants a whole `LLMBackend` including the
+  key, which the catalog rightly never carries. Wants a by-label form.
+- **No `backend.probe`**, so the connection form cannot check an endpoint,
+  auto-fill the model, or offer the multi-model picker.
+- **Discovery is still not on the wire** (above), so manage-LLMs has no
+  discovered panel, no rescan, and no `r` — there is no remove command either.
+
 **Found during M6/M7, and the most serious thing on this list.** The core
 writes **no per-turn transcript log and no episodic index entries.**
 `TurnScheduler`'s `on_turn_result` hook names three consumers — "the transcript
