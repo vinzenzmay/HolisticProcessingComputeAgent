@@ -37,6 +37,8 @@ from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Any
 
+from pydantic import ValidationError
+
 from hpca.agent.builtin_tools import default_tool_registry
 from hpca.agent.context import ToolContext
 from hpca.agent.doc_tools import add_ask_docs, add_doc_tools
@@ -61,7 +63,7 @@ from hpca.agent.prompts import (
 from hpca.agent.skill_tools import add_skill_tools
 from hpca.agent.titler import propose_title
 from hpca.agent.watch_tools import add_watch_tools
-from hpca.config import LLMBackend
+from hpca.config import LLMBackend, Settings, settings_path
 from hpca.core.backends import BackendRegistry
 from hpca.core.deps import CoreDeps
 from hpca.core.memory_service import KIND_REFLECTION, MemoryService
@@ -74,6 +76,11 @@ from hpca.logs import open_log
 from hpca.profiles import DEFAULT_PROFILE, Profile
 from hpca.protocol import (
     PROTOCOL_VERSION,
+    BackendProbe,
+    BackendProbed,
+    BackendRemove,
+    BackendScan,
+    BackendScanned,
     BackendSet,
     ChatReset,
     CommandRun,
@@ -90,9 +97,11 @@ from hpca.protocol import (
     ModeSet,
     Notify,
     ProcessKill,
+    ProfileBody,
     ProfileCreate,
     ProfileDelete,
     ProfileDuplicate,
+    ProfileGet,
     ProfileList,
     ProfileRow,
     ProfileRows,
@@ -111,8 +120,16 @@ from hpca.protocol import (
     SessionRollback,
     SessionRow,
     SessionRows,
+    SettingsBody,
+    SettingsGet,
+    SettingsSave,
     Shutdown,
+    SkillBody,
     SkillDelete,
+    SkillGet,
+    SkillList,
+    SkillRow,
+    SkillRows,
     SkillSave,
     ThinkingSet,
     TurnActivity,
@@ -447,6 +464,20 @@ class AgentService:
         if isinstance(command, BackendSet):
             await self._set_backend(command)
             return
+        if isinstance(command, BackendRemove):
+            self._remove_backend(command.label)
+            return
+        if isinstance(command, BackendProbe):
+            # A round trip to an endpoint that may not be there, so it is not
+            # allowed to hold up the frames queued behind it on one socket.
+            self._spawn(self._probe_backend(command))
+            return
+        if isinstance(command, BackendScan):
+            # Tens of thousands of ports. Awaiting it here would mean no
+            # session could speak until the sweep finished — which is the
+            # whole reason the old screen ran it in a worker.
+            self._spawn(self._scan_backends())
+            return
         if isinstance(command, LLMList):
             self._emit_catalog()
             if command.probe:
@@ -461,6 +492,9 @@ class AgentService:
         if isinstance(command, ProfileSet):
             await self._set_profile(command.name)
             return
+        if isinstance(command, ProfileGet):
+            self._emit_profile_body(command)
+            return
         if isinstance(command, ProfileSave):
             self._save_profile(command)
             return
@@ -473,11 +507,23 @@ class AgentService:
         if isinstance(command, ProfileDelete):
             await self._delete_profile(command.name)
             return
+        if isinstance(command, SkillList):
+            self._emit_skills(command.profile)
+            return
+        if isinstance(command, SkillGet):
+            self._emit_skill_body(command)
+            return
         if isinstance(command, SkillSave):
             self._save_skill(command)
             return
         if isinstance(command, SkillDelete):
             self._memory.delete_profile_skill(command.profile, command.name)
+            return
+        if isinstance(command, SettingsGet):
+            self._emit_settings()
+            return
+        if isinstance(command, SettingsSave):
+            await self._save_settings(command.text)
             return
         if isinstance(command, WatchPeek):
             await self._peek_watch(command.watch_id)
@@ -1232,16 +1278,28 @@ class AgentService:
         modelled a second time in the protocol — which is why it crosses as an
         opaque dict, and why an unusable one is refused here.
         """
-        try:
-            backend = LLMBackend.model_validate(command.backend)
-        except Exception as e:
-            # A front-end sending a shape the settings model does not accept is
-            # a bug on its side; pinning a session to it would strand the
-            # conversation on a backend nothing can build a client from.
-            self._deps.emit(
-                Notify(severity="error", text=f"Not a usable backend: {e}")
-            )
-            return
+        backend = None
+        if command.label:
+            # The picker's form, and the only one that can name a key-locked
+            # backend: the catalog it was drawn from carries no key, so an
+            # entry sent back by value would build a client that 401s. Naming
+            # the entry lets the key stay where it already is.
+            backend, problem = self._backends.resolve_label(command.label)
+            if backend is None:
+                self._deps.emit(Notify(severity="warning", text=problem))
+                return
+        if backend is None:
+            try:
+                backend = LLMBackend.model_validate(command.backend)
+            except Exception as e:
+                # A front-end sending a shape the settings model does not
+                # accept is a bug on its side; pinning a session to it would
+                # strand the conversation on a backend nothing can build a
+                # client from.
+                self._deps.emit(
+                    Notify(severity="error", text=f"Not a usable backend: {e}")
+                )
+                return
         if command.session_id is None:
             await self._backends.set_default(
                 backend, busy=bool(self._scheduler.busy_sessions())
@@ -1262,6 +1320,68 @@ class AgentService:
         )
         if switched:
             self._emit_rows()  # the row carries the model name
+
+    def _remove_backend(self, label: str) -> None:
+        """`backend.remove`: drop a catalog entry the screen's `r` pointed at.
+
+        Inert on anything that is not a configured entry, which is what the
+        old screen's binding was: a discovered row is not in the file, so
+        there is nothing there to remove.
+        """
+        entry = self._backends.remove(label)
+        if entry is None:
+            self._deps.emit(
+                Notify(
+                    severity="warning",
+                    text=f"There is no configured backend called \u201c{label}\u201d.",
+                )
+            )
+            return
+        self._deps.emit(Notify(text=f"Removed {entry.model}"))
+        self._emit_catalog()
+
+    async def _probe_backend(self, command: BackendProbe) -> None:
+        """`backend.probe`: what does this endpoint serve, and is that key good?
+
+        The connection form cannot answer this itself — §4.2 rule 2, and the
+        endpoint may be on a node the front-end cannot reach — and the answer
+        does three jobs at once: whether anything OpenAI-shaped is there,
+        whether the key works, and what to auto-fill the model field with
+        (or offer as a picker, when the endpoint serves several).
+        """
+        self._deps.emit(
+            await self._backends.probe(command.base_url, command.api_key)
+        )
+
+    async def _scan_backends(self) -> None:
+        """`backend.scan`: find endpoints nobody has configured yet.
+
+        The rows arrive as they are found — every hit restates `llm.catalog`
+        with the new row flagged `discovered` — because the sweep takes long
+        enough that a panel filling only at the end would look hung for the
+        whole of it. `backend.scanned` closes the run and carries the one part
+        a front-end cannot work out: what an empty scan *meant*.
+        """
+        # Cleared first and said so, because a rescan replaces what the last
+        # one found: a row for an endpoint that has since gone away must come
+        # off the screen when the sweep starts, not linger until it ends.
+        self._backends.forget_discovered()
+        self._emit_catalog()
+        result = await self._backends.scan(
+            on_found=lambda _: self._emit_catalog()
+        )
+        notice, help_text = result.verdict(self._deps.settings)
+        # The last catalog frame carries the probes this scan already paid for,
+        # so a screen does not have to ask for them again with `llm.list`.
+        self._emit_catalog(reachable=result.reachable)
+        self._deps.emit(
+            BackendScanned(
+                found=result.found,
+                cluster=len(result.cluster),
+                notice=notice,
+                help=help_text,
+            )
+        )
 
     def _emit_catalog(self, reachable: dict[str, bool] | None = None) -> None:
         """The LLM catalog, whole (`protocol.LLMCatalog`).
@@ -1362,6 +1482,29 @@ class AgentService:
         self._emit_profiles()
         await self._pollers.refresh_panel(force=True)
 
+    def _emit_profile_body(self, command: ProfileGet) -> None:
+        """`profile.get`: the file an editor is about to open — and overwrite.
+
+        The read half of `_save_profile`, and the reason it exists is that the
+        write half writes *verbatim*: an editor opened over a body it could not
+        fetch saves an empty buffer over the file. Before this the front-end
+        read the app dir itself, which is §4.2 rule 2 — the rule that lets the
+        core sit behind a socket at all.
+
+        A refusal travels in the same frame rather than as a `notify`: the
+        editor has to know it may not open, and a toast is not an answer to a
+        request that named a file (`protocol.ProfileBody.error`).
+        """
+        text, error = self._memory.profile_body(command.name, command.kind)
+        self._deps.emit(
+            ProfileBody(
+                name=command.name,
+                kind=command.kind,
+                text=text,
+                error=error,
+            )
+        )
+
     def _save_profile(self, command: ProfileSave) -> None:
         """`profile.save`: write back what the user edited in $EDITOR (§4.4).
 
@@ -1441,6 +1584,51 @@ class AgentService:
         self._emit_rows()
         self._emit_profiles()
 
+    def _emit_skills(self, profile: str) -> None:
+        """`skill.list`: the profile's own skills, as a menu draws them.
+
+        Own only, matching what `skill.save` writes and `skill.delete`
+        removes: a shipped or shared skill is not one profile's to change, and
+        offering it in a menu whose editor saves into this profile's directory
+        would silently fork it.
+
+        A profile whose skill dir cannot be read lists nothing rather than
+        taking the screen down — the same bargain `_emit_profiles` makes, and
+        for the same reason: the screen is partly how such a profile gets
+        fixed.
+        """
+        try:
+            skills = self._memory.own_skills(profile)
+        except Exception:
+            logger.exception("could not list skills for %s", profile)
+            skills = []
+        self._deps.emit(
+            SkillRows(
+                profile=profile,
+                skills=[
+                    SkillRow(name=skill.name, description=skill.description)
+                    for skill in skills
+                ],
+            )
+        )
+
+    def _emit_skill_body(self, command: SkillGet) -> None:
+        """`skill.get`: one skill file, verbatim.
+
+        Separate from the listing for the reason `protocol.SkillGet` gives: a
+        body carried by a menu is a body that is already stale by the time the
+        editor opens over it, and the save behind it writes what it is given.
+        """
+        text, error = self._memory.skill_body(command.profile, command.name)
+        self._deps.emit(
+            SkillBody(
+                profile=command.profile,
+                name=command.name,
+                text=text,
+                error=error,
+            )
+        )
+
     def _save_skill(self, command: SkillSave) -> None:
         """`skill.save`: persist a skill file verbatim, front matter and all.
 
@@ -1457,6 +1645,120 @@ class AgentService:
             )
             return
         self._memory.save_skill_file(command.profile, command.name, command.text)
+
+    # --------------------------------------------------------------- settings
+
+    def _settings_text(self) -> str:
+        """The settings file as it stands, for an editor to open over.
+
+        The file itself rather than a dump of the loaded object, because the
+        file is what the save overwrites: a body re-rendered from the parsed
+        model would silently drop whatever the model could not read, and a file
+        the model cannot read is exactly the one someone opens this editor to
+        fix.
+
+        A file that is not there — a first run — is the model's own defaults,
+        which is what `Settings.load` would use and so a truthful starting
+        point rather than an empty buffer that the next save would make real.
+        """
+        try:
+            return settings_path().read_text()
+        except OSError:
+            try:
+                return self._deps.settings.model_dump_json(indent=2) + "\n"
+            except Exception:  # pragma: no cover - a settings object that is a fake
+                return "{}"
+
+    def _emit_settings(self, error: str = "") -> None:
+        """`settings.body`: the file, and why a save of it was refused.
+
+        The body is always the file that is *there*, refusal or not: an editor
+        that reopened on text the core rejected would be showing something the
+        file does not say (`protocol.SettingsBody`).
+        """
+        self._deps.emit(SettingsBody(text=self._settings_text(), error=error))
+
+    async def _save_settings(self, text: str) -> None:
+        """`settings.save`: write the file, then make the change take effect.
+
+        Validation is split, and this is the half that cannot be delegated. A
+        front-end can tell whether the text is *JSON* with the standard library
+        and no idea what a setting is, which is the check an editor needs
+        synchronously in order to refuse to close. Whether it is a valid
+        `Settings` is this model's own question, so it is asked here — and
+        asked again even when the front-end says it already did, because the
+        file this refuses is a core that will not start next time.
+
+        Applying is the half that had no other home. The old front-end wrote
+        the file and toasted "llm and database changes apply on the next
+        start", which was not a policy but the absence of this command: only
+        the core can rebuild the clients it built at startup.
+        """
+        try:
+            incoming = Settings.model_validate_json(text)
+        except ValueError as e:
+            # Refused, and nothing was written: the body the front-end gets
+            # back still describes the file that is still there.
+            self._emit_settings(error=_settings_problem(e))
+            return
+        try:
+            incoming.save()
+        except OSError as e:
+            self._emit_settings(error=f"could not write the settings: {e}")
+            return
+        # Kept before the swap, because what has to be rebuilt is decided by
+        # what actually changed — rebuilding the world on every save would
+        # drop every session's measured context for an edited log level.
+        before = self._deps.settings.model_copy(deep=True)
+        self._adopt_settings(incoming)
+        self._emit_settings()
+        await self._apply_settings(before)
+
+    def _adopt_settings(self, incoming: Settings) -> None:
+        """Make the running settings *be* the saved ones, field by field.
+
+        In place rather than by rebinding `CoreDeps.settings`, because the
+        object has other holders: whoever built the core passed it in and still
+        reads it (the boot sequence, the db cache). Rebinding would leave them
+        describing a file that no longer exists — the quietest possible version
+        of this bug, since both copies stay individually consistent.
+        """
+        settings = self._deps.settings
+        for field in type(incoming).model_fields:
+            setattr(settings, field, getattr(incoming, field))
+
+    async def _apply_settings(self, before: Settings) -> None:
+        """Rebuild whatever the edit invalidated.
+
+        Three things can change under a running core, and only two of them can
+        be honoured: the clients this process built, it can build again; where
+        the databases live it cannot, because they are open and every service
+        holds a connection. So that one is said out loud rather than silently
+        half-applied — which is the difference between the old blanket toast
+        and this: it names the setting that really does wait for a restart, and
+        stops claiming it of the LLM.
+        """
+        settings = self._deps.settings
+        if settings.llm != before.llm:
+            # The bootstrap client was built from the old section, and every
+            # session that pinned no backend of its own is talking through it.
+            await self._backends.reload(
+                busy=bool(self._scheduler.busy_sessions())
+            )
+        if settings.llm != before.llm or settings.backends != before.backends:
+            # A different active endpoint moves the ★, and an edited list is a
+            # different set of rows.
+            self._emit_catalog()
+        if settings.rag != before.rag:
+            await self._backends.reload_embedder()
+        if settings.database != before.database:
+            self._deps.emit(
+                Notify(
+                    severity="warning",
+                    text="Database settings apply on the next start — the "
+                    "databases are already open.",
+                )
+            )
 
     # ---------------------------------------------------------------- watches
 
@@ -2372,6 +2674,25 @@ def build_service(
     for event in events:
         service._fan_out(event)
     return service
+
+
+def _settings_problem(error: ValueError) -> str:
+    """Pydantic's verdict on a settings file, in one line.
+
+    One line because it is drawn beside an editor that has to stay on screen:
+    the full report runs to several, and a front-end that pasted all of it
+    would push the box out of the terminal. The *first* problem rather than a
+    summary of all of them, because a settings file is fixed one field at a
+    time, and the first is the one the cursor should go to.
+
+    Here rather than in the front-end that used to hold a copy of it: knowing
+    what a setting is, is what makes this the core's answer (§4.2 rule 2).
+    """
+    if isinstance(error, ValidationError) and error.errors():
+        first = error.errors()[0]
+        where = ".".join(str(x) for x in first.get("loc", ())) or "settings"
+        return f"invalid: {where} — {first.get('msg', 'not accepted')}"
+    return f"invalid: {str(error).splitlines()[0]}"
 
 
 def _settings_digest(settings) -> str:

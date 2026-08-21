@@ -26,7 +26,7 @@ from hpca.config import LLMBackend, Settings
 from hpca.core.backends import BackendRegistry, autoconnect_logger
 from hpca.core.deps import CoreDeps
 from hpca.db import connect, init_db
-from hpca.discover import DiscoveredBackend
+from hpca.discover import KEY_REQUIRED, DiscoveredBackend
 from hpca.llm import LLMError
 from hpca.protocol import ContextEstimate, Notify, TurnUsage
 from hpca.sessions import SessionStore
@@ -132,6 +132,48 @@ def write_manifest(dir_path, jobid, port, model, role="llm", **overrides):
     }
     data.update(overrides)
     (dir_path / f"{jobid}-{port}.json").write_text(json.dumps(data))
+
+
+def keyed(model_id, key, max_model_len=131072):
+    """An endpoint that 401s unless it is given exactly ``key``."""
+
+    def handle(request):
+        if request.headers.get("Authorization") != f"Bearer {key}":
+            return httpx.Response(401, text="unauthorized")
+        return serve(model_id, max_model_len)(request)
+
+    return handle
+
+
+def serves(*model_ids):
+    """One endpoint offering several models — the picker case."""
+    body = {
+        "object": "list",
+        "data": [
+            {"id": m, "object": "model", "max_model_len": 4096}
+            for m in model_ids
+        ],
+    }
+    return lambda request: httpx.Response(200, json=body)
+
+
+async def fake_scan(hits, *, watcher=None):
+    """A `scan_local_ports` stand-in that reports ``hits`` one at a time.
+
+    Takes the shape the real one has, including `on_found` firing per hit
+    while the sweep is still running — which is the behaviour the incremental
+    catalog depends on, and the reason this is a seam at all.
+    """
+
+    async def scanner(ports, *, progress=None, on_found=None, api_keys=()):
+        if watcher is not None:
+            watcher(ports, list(api_keys))
+        for hit in hits:
+            if on_found is not None:
+                on_found(hit)
+        return list(hits)
+
+    return scanner
 
 
 def serve(model_id, max_model_len=131072):
@@ -949,3 +991,323 @@ class TestAutoconnectLogger:
                 logger.removeHandler(handler)
                 handler.close()
             logger.propagate = True
+
+
+# --- probing one endpoint ----------------------------------------------------
+
+
+class TestProbingAnEndpoint:
+    """`backend.probe` — the connection form's check, answered by the core.
+
+    Three outcomes told apart without a status enum, because the two fields
+    already say it (`protocol.BackendProbed`): rows are what it serves, no rows
+    with `needs_key` is an endpoint that is there and refused us, and neither
+    is nothing OpenAI-shaped answering at all.
+    """
+
+    async def test_one_model_comes_back_ready_to_auto_fill_the_form(self, home):
+        h = Harness(
+            home, probe_transport=make_transport({20001: serve("qwen-a", 4096)})
+        )
+        probed = await h.registry.probe("http://localhost:20001/v1")
+        assert probed.base_url == "http://localhost:20001/v1"
+        assert [(e.model, e.max_model_len) for e in probed.models] == [
+            ("qwen-a", 4096)
+        ]
+        assert probed.needs_key is False
+
+    async def test_several_models_are_all_offered(self, home):
+        # The picker case: the form cannot choose for the user, so it is handed
+        # every id the endpoint named.
+        h = Harness(
+            home,
+            probe_transport=make_transport({20001: serves("qwen-a", "qwen-b")}),
+        )
+        probed = await h.registry.probe("http://localhost:20001/v1")
+        assert [e.model for e in probed.models] == ["qwen-a", "qwen-b"]
+
+    async def test_nothing_there_is_not_the_same_as_needing_a_key(self, home):
+        h = Harness(home, probe_transport=make_transport({}))
+        probed = await h.registry.probe("http://localhost:20001/v1")
+        assert probed.models == [] and probed.needs_key is False
+
+    async def test_a_locked_endpoint_says_so_and_names_no_model(self, home):
+        # The sentinel never crosses as a model: "(api key required)" is not an
+        # id, and a catalog row built from it would be one nothing can serve.
+        h = Harness(home, probe_transport=make_transport({20001: locked}))
+        probed = await h.registry.probe("http://localhost:20001/v1")
+        assert probed.needs_key is True and probed.models == []
+
+    async def test_a_key_that_works_unlocks_the_models(self, home):
+        h = Harness(
+            home,
+            probe_transport=make_transport({20001: keyed("qwen-a", "sk-good")}),
+        )
+        probed = await h.registry.probe(
+            "http://localhost:20001/v1", "sk-good"
+        )
+        assert [e.model for e in probed.models] == ["qwen-a"]
+        # And it joins the pool, so the next scan resolves locked ports inline
+        # instead of listing sentinels.
+        assert h.settings.llm_api_keys == ["sk-good"]
+
+    async def test_a_rejected_key_is_reported_as_rejected(self, home):
+        # Not quietly retried against the pool: the form is validating *this*
+        # key, and a success on a stored one would leave the user believing a
+        # bad key works.
+        h = Harness(
+            home,
+            probe_transport=make_transport({20001: keyed("qwen-a", "sk-good")}),
+        )
+        h.settings.llm_api_keys = ["sk-good"]
+        probed = await h.registry.probe("http://localhost:20001/v1", "sk-bad")
+        assert probed.needs_key is True and probed.models == []
+        assert h.settings.llm_api_keys == ["sk-good"]
+
+    async def test_a_bare_check_tries_every_key_we_have(self, home):
+        # No key typed: this is the re-probe that turns a scan's sentinel into
+        # a named model without another form.
+        h = Harness(
+            home,
+            probe_transport=make_transport({20001: keyed("qwen-a", "sk-good")}),
+        )
+        h.settings.llm_api_keys = ["sk-good"]
+        probed = await h.registry.probe("http://localhost:20001/v1")
+        assert [e.model for e in probed.models] == ["qwen-a"]
+        assert probed.models[0].needs_key is True
+
+    async def test_the_pool_includes_keys_already_on_configured_backends(
+        self, home
+    ):
+        h = Harness(home)
+        h.settings.llm_api_keys = ["sk-one"]
+        h.settings.backends = [backend_a(api_key="sk-two"), backend_b()]
+        assert h.registry.key_pool() == ["sk-one", "sk-two"]
+
+
+# --- scanning ----------------------------------------------------------------
+
+
+class TestScanning:
+    """`backend.scan` — two searches, because a backend can be reached two
+    ways and neither search finds the other's hits."""
+
+    async def test_a_hit_becomes_a_flagged_catalog_row(self, home):
+        found = DiscoveredBackend(
+            base_url="http://127.0.0.1:20001/v1", model="qwen-x",
+            max_model_len=4096,
+        )
+        h = Harness(home, port_scanner=await fake_scan([found]))
+        result = await h.registry.scan()
+        assert result.found == 1
+        row = h.registry.catalog()[-1]
+        assert row.discovered and row.model == "qwen-x" and row.label == "qwen-x"
+        assert row.reachable is True and row.active is False
+
+    async def test_each_hit_is_announced_while_the_sweep_is_still_running(
+        self, home
+    ):
+        # The property the incremental panel rests on: the catalog is restated
+        # per hit, not once at the end, because the sweep is tens of thousands
+        # of ports and a panel that filled only at the end would look hung.
+        hits = [
+            DiscoveredBackend(base_url=f"http://127.0.0.1:2000{n}/v1", model=f"m{n}")
+            for n in (1, 2)
+        ]
+        seen: list[int] = []
+        h = Harness(home, port_scanner=await fake_scan(hits))
+        await h.registry.scan(on_found=lambda _: seen.append(len(h.registry.catalog())))
+        # One row on the first call, two on the second: the row is remembered
+        # before it is announced, so whatever the callback restates has it.
+        assert seen == [1, 2]
+
+    async def test_the_sweep_runs_off_the_loop_it_would_otherwise_starve(
+        self, home
+    ):
+        import asyncio
+
+        outer = asyncio.get_running_loop()
+        loops: list[object] = []
+
+        async def scanner(ports, *, progress=None, on_found=None, api_keys=()):
+            loops.append(asyncio.get_running_loop())
+            return []
+
+        h = Harness(home, port_scanner=scanner)
+        await h.registry.scan()
+        assert loops and loops[0] is not outer
+
+    async def test_known_ports_are_scanned_first_and_new_ones_remembered(
+        self, home
+    ):
+        seen: list[list[int]] = []
+        found = DiscoveredBackend(
+            base_url="http://127.0.0.1:20001/v1", model="qwen-x"
+        )
+        h = Harness(
+            home,
+            port_scanner=await fake_scan(
+                [found], watcher=lambda ports, keys: seen.append(list(ports[:2]))
+            ),
+        )
+        h.settings.known_llm_ports = [51900]
+        h.settings.backends = [
+            LLMBackend(model="qwen-a", base_url="http://localhost:41999/v1")
+        ]
+        await h.registry.scan()
+        assert seen[0] == [51900, 41999]
+        # And the hit's port joins them, so the next scan starts there.
+        assert 20001 in h.settings.known_llm_ports
+        assert 20001 in Settings.load().known_llm_ports
+
+    async def test_a_rescan_replaces_what_the_last_one_found(self, home):
+        gone = DiscoveredBackend(base_url="http://127.0.0.1:1/v1", model="old")
+        h = Harness(home, port_scanner=await fake_scan([gone]))
+        await h.registry.scan()
+        h.registry._port_scanner = await fake_scan([])
+        await h.registry.scan()
+        # An endpoint that has since gone away must stop being offered.
+        assert [e for e in h.registry.catalog() if e.discovered] == []
+
+    async def test_a_cluster_endpoint_reaches_the_catalog_the_sweep_cannot_see(
+        self, home, tmp_path
+    ):
+        h = Harness(
+            home,
+            port_scanner=await fake_scan([]),
+            **cluster(tmp_path, [("1", 20001, "qwen-c")], {20001: serve("qwen-c")}),
+        )
+        result = await h.registry.scan()
+        assert len(result.cluster) == 1
+        assert [e.model for e in h.registry.catalog() if e.discovered] == [
+            "qwen-c"
+        ]
+
+    async def test_the_same_endpoint_found_twice_is_one_row(self, home, tmp_path):
+        # A login node with a tunnel to the very server a manifest names: both
+        # passes report it, and the manifest is the one that knows its name.
+        both = DiscoveredBackend(
+            base_url=f"http://{IP}:20001/v1", model="qwen-c"
+        )
+        h = Harness(
+            home,
+            port_scanner=await fake_scan([both]),
+            **cluster(tmp_path, [("1", 20001, "qwen-c")], {20001: serve("qwen-c")}),
+        )
+        await h.registry.scan()
+        assert len([e for e in h.registry.catalog() if e.discovered]) == 1
+
+    async def test_a_discovered_name_that_collides_is_still_reachable(self, home):
+        # The two lists cross as one catalog, so a discovered row reusing a
+        # configured row's name would make `backend.set` resolve the wrong one.
+        h = Harness(
+            home,
+            port_scanner=await fake_scan(
+                [DiscoveredBackend(base_url="http://127.0.0.1:20001/v1", model="qwen-a")]
+            ),
+        )
+        h.settings.backends = [backend_a()]
+        await h.registry.scan()
+        labels = [e.label for e in h.registry.catalog()]
+        assert labels == ["qwen-a", "qwen-a @ 127.0.0.1:20001"]
+        entry, problem = h.registry.resolve_label("qwen-a @ 127.0.0.1:20001")
+        assert problem == "" and entry.base_url == "http://127.0.0.1:20001/v1"
+
+
+class TestWhatAnEmptyScanMeant:
+    """The verdict — the part a front-end cannot reach, because "nothing found"
+    is three different situations depending on the rest of the state."""
+
+    def result(self, **kwargs):
+        from hpca.core.backends import ScanResult
+
+        return ScanResult(**kwargs)
+
+    def test_finding_something_needs_no_explanation(self, home):
+        h = Harness(home)
+        found = [DiscoveredBackend(base_url="http://x/v1", model="m")]
+        assert self.result(local=found).verdict(h.settings) == ("", "")
+
+    def test_a_cluster_hit_is_not_the_off_cluster_case(self, home):
+        # The sweep structurally cannot see a compute node's own IP, so an
+        # empty sweep beside a manifest hit means nothing is wrong.
+        h = Harness(home)
+        cluster_hit = [DiscoveredBackend(base_url="http://x/v1", model="m")]
+        assert self.result(cluster=cluster_hit).verdict(h.settings) == ("", "")
+
+    def test_nothing_new_when_a_configured_backend_still_answers(self, home):
+        h = Harness(home)
+        notice, help_text = self.result(reachable={"qwen-a": True}).verdict(
+            h.settings
+        )
+        assert "Nothing new" in notice and help_text == ""
+
+    def test_every_backend_down_gets_the_tunnel_recipe(self, home):
+        # Several lines that have to be retyped into a shell, so it wants a
+        # window that holds a selection rather than a toast.
+        h = Harness(home)
+        h.settings.endpoints.endpoints_dir = "/data/manifests"
+        notice, help_text = self.result(reachable={"qwen-a": False}).verdict(
+            h.settings
+        )
+        assert notice == ""
+        assert "ssh -fN" in help_text and "/data/manifests" in help_text
+
+    def test_nothing_configured_at_all_gets_it_too(self, home):
+        assert "ssh -fN" in self.result().verdict(Harness(home).settings)[1]
+
+
+# --- removing ----------------------------------------------------------------
+
+
+class TestRemovingAnEntry:
+    def test_an_entry_goes_by_the_name_a_picker_knows_it_by(self, home):
+        h = Harness(home)
+        h.settings.backends = [backend_a(), backend_b()]
+        assert h.registry.remove("qwen-a").model == "qwen-a"
+        assert [b.model for b in h.settings.backends] == ["qwen-b"]
+        assert [b.model for b in Settings.load().backends] == ["qwen-b"]
+
+    def test_a_label_nothing_answers_to_removes_nothing(self, home):
+        h = Harness(home)
+        h.settings.backends = [backend_a()]
+        assert h.registry.remove("ghost") is None
+        assert len(h.settings.backends) == 1
+
+    async def test_a_discovered_row_is_not_in_the_file_to_remove(self, home):
+        # Which is why the old screen's `r` was inert on that panel.
+        h = Harness(
+            home,
+            port_scanner=await fake_scan(
+                [DiscoveredBackend(base_url="http://127.0.0.1:1/v1", model="qwen-x")]
+            ),
+        )
+        await h.registry.scan()
+        assert h.registry.remove("qwen-x") is None
+
+    def test_removing_the_active_one_is_allowed(self, home):
+        # It leaves `settings.llm` describing an endpoint the catalog no longer
+        # lists — the state a fresh install is already in — and refusing would
+        # make the entry a user most wants to replace the one they cannot.
+        h = Harness(home)
+        h.settings.backends = [backend_a()]
+        h.settings.activate_backend(backend_a())
+        assert h.registry.remove("qwen-a") is not None
+        assert h.settings.backends == []
+
+    async def test_a_locked_scan_hit_cannot_be_pinned_by_label(self, home):
+        h = Harness(
+            home,
+            port_scanner=await fake_scan(
+                [
+                    DiscoveredBackend(
+                        base_url="http://127.0.0.1:20001/v1",
+                        model=KEY_REQUIRED,
+                        needs_key=True,
+                    )
+                ]
+            ),
+        )
+        await h.registry.scan()
+        entry, problem = h.registry.resolve_label(KEY_REQUIRED)
+        assert entry is None and "api key" in problem

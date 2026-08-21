@@ -49,7 +49,13 @@ from hpca.discover import (
 from hpca.embeddings import EmbeddingClient
 from hpca.llm import LLMClient
 from hpca.logs import LoggedLLM
-from hpca.protocol import ContextEstimate, LLMEntry, Notify, TurnUsage
+from hpca.protocol import (
+    BackendProbed,
+    ContextEstimate,
+    LLMEntry,
+    Notify,
+    TurnUsage,
+)
 from hpca.sessions import SessionStore
 
 if TYPE_CHECKING:
@@ -87,6 +93,34 @@ class ScanResult:
     @property
     def found(self) -> int:
         return len(self.local) + len(self.cluster)
+
+    def verdict(self, settings) -> tuple[str, str]:
+        """What this scan's emptiness means: ``(notice, help)``, both often "".
+
+        Minted here because it is the one reading that needs all three fields
+        at once, and a front-end holding only the rows would have to guess.
+
+        The localhost sweep is what is being explained — a manifest hit is a
+        cluster endpoint the sweep structurally cannot see, so finding one
+        means nothing is wrong and there is nothing to say. With neither, the
+        configured catalog decides which of two different things happened: a
+        backend that still answers makes this a scan that simply turned up
+        nothing *new* (a passing remark), and none answering is the
+        off-cluster case, where the user needs the tunnel recipe — several
+        lines to retype into a shell, so it wants a window that holds a
+        selection rather than a toast that dismisses itself.
+        """
+        if self.local or self.cluster:
+            return "", ""
+        if any(self.reachable.values()):
+            return (
+                "Nothing new on localhost — the backends you already have "
+                "still answer.",
+                "",
+            )
+        return "", offcluster_help(
+            settings.endpoints.login_target(), settings.endpoints.endpoints_dir
+        )
 
 
 def autoconnect_logger(app_dir: Path) -> logging.Logger:
@@ -355,7 +389,7 @@ class BackendRegistry:
         """
         settings = self._deps.settings
         results = reachable or {}
-        return [
+        rows = [
             LLMEntry(
                 label=label,
                 model=entry.model,
@@ -369,6 +403,116 @@ class BackendRegistry:
             )
             for label, entry in self.labels().items()
         ]
+        # And what a scan turned up, in the same list with a flag on it. The
+        # manage-LLMs screen draws two panels out of this; they are two views
+        # of one answer rather than two lists that have to be kept in step,
+        # which is what made the old screen's dedup a screen-side problem.
+        rows += [
+            LLMEntry(
+                label=label,
+                model=found.model,
+                base_url=found.base_url,
+                max_model_len=found.max_model_len,
+                needs_key=found.needs_key,
+                active=(
+                    settings.llm.base_url == found.base_url
+                    and settings.llm.model == found.model
+                ),
+                # It answered a probe moments ago — a 401 included, which is
+                # an endpoint that is up and wants a key.
+                reachable=True,
+                discovered=True,
+            )
+            for label, found in self.discovered_labels().items()
+        ]
+        return rows
+
+    def discovered_labels(self) -> dict[str, DiscoveredBackend]:
+        """What a scan turned up, by the name a command may pin one with.
+
+        Minted against the configured labels as well as against each other,
+        because the two travel as one catalog: a discovered row reusing a
+        configured row's name would make `backend.set` ambiguous in the one
+        direction the user cannot see — the row they pointed at is not the
+        entry the core would resolve.
+        """
+        out: dict[str, DiscoveredBackend] = {}
+        taken = set(self.labels())
+        for found in self._discovered:
+            label = found.model
+            if label in taken:
+                label = f"{found.model} @ {urlparse(found.base_url).netloc}"
+            base, seq = label, 2
+            while label in taken:
+                label = f"{base} #{seq}"
+                seq += 1
+            taken.add(label)
+            out[label] = found
+        return out
+
+    def resolve_label(self, label: str) -> tuple[LLMBackend | None, str]:
+        """The backend a command's label names, or why it names none.
+
+        Configured entries first, then what a scan turned up — because the
+        screen's "add this to the list" is a `backend.set` on a discovered row
+        (`specs-ui-replacement.md` §4.2), and because a label is the only way
+        to name a key-locked backend without putting its key on the wire.
+
+        A key-locked scan hit resolves to nothing on purpose: `KEY_REQUIRED`
+        is a sentinel, not a model id, so an entry built from it would be a
+        catalog row nothing can serve. That needs the key form, which is a
+        different gesture, so it gets its own sentence rather than the generic
+        "no such backend".
+        """
+        entry = self.labels().get(label)
+        if entry is not None:
+            return entry, ""
+        found = self.discovered_labels().get(label)
+        if found is None:
+            return None, f"There is no backend called \u201c{label}\u201d."
+        if found.model == KEY_REQUIRED:
+            return None, (
+                f"{urlparse(found.base_url).netloc} needs an api key — check "
+                "it with one first, and its model name comes back with it."
+            )
+        return (
+            LLMBackend(
+                model=found.model,
+                base_url=found.base_url,
+                api_key=found.api_key,
+                max_model_len=found.max_model_len,
+            ),
+            "",
+        )
+
+    def remove(self, label: str) -> LLMBackend | None:
+        """Drop a catalog entry, named the way a picker knows it.
+
+        The other half of the `backend.set` that adds one. Configured entries
+        only: a discovered row is not in the file, so "removing" one would
+        remove something nobody wrote — which is exactly why the old screen's
+        `r` was inert on that panel.
+
+        The active backend is not exempt. Dropping it leaves `settings.llm`
+        describing an endpoint the catalog no longer lists, which is the state
+        a fresh install is already in and which both the picker and
+        auto-connect handle; refusing would make the entry a user most wants
+        to replace the one entry they cannot remove.
+        """
+        entry = self.labels().get(label)
+        if entry is None:
+            return None
+        settings = self._deps.settings
+        settings.backends = [
+            backend
+            for backend in settings.backends
+            if not (
+                backend.base_url == entry.base_url
+                and backend.model == entry.model
+            )
+        ]
+        settings.save()
+        return entry
 
     async def probe_catalog(self) -> dict[str, bool]:
         """Ask every configured endpoint whether it answers, all at once.
@@ -402,6 +546,203 @@ class BackendRegistry:
 
         answers = await asyncio.gather(*(ask(entry) for _, entry in entries))
         return {label: bool(ok) for (label, _), ok in zip(entries, answers)}
+
+    # ---------------------------------------------------- probe and discover
+
+    def key_pool(self) -> list[str]:
+        """Every key that could unlock a locked endpoint, order-stable.
+
+        The remembered pool plus the keys already sitting on configured
+        backends: a key typed once for one backend is a key worth trying
+        against the next 401, which is what turns a "(api key required)" row
+        into a named model without another form.
+        """
+        settings = self._deps.settings
+        keys = list(settings.llm_api_keys)
+        for backend in settings.backends:
+            if backend.api_key and backend.api_key not in keys:
+                keys.append(backend.api_key)
+        return keys
+
+    async def probe(
+        self, base_url: str, api_key: str | None = None
+    ) -> BackendProbed:
+        """Ask one endpoint what it serves (`backend.probe`).
+
+        Three answers in two fields, as `protocol.BackendProbed` describes:
+        rows are the models it serves (one auto-fills a form, several are a
+        picker), no rows with ``needs_key`` is an endpoint that is there and
+        refused us, and neither is nothing OpenAI-shaped answering at all.
+
+        The key pool is offered only when the caller typed no key of its own,
+        which is the split the two old call sites had: a form validating a
+        typed key must report *that* key rejected rather than quietly succeed
+        on a stored one, while a bare check should try everything we have. A
+        typed key that works is remembered, so the next scan resolves locked
+        ports inline instead of listing sentinels.
+        """
+        try:
+            rows = await probe_endpoint(
+                base_url,
+                api_key=api_key or None,
+                api_keys=() if api_key else self.key_pool(),
+                transport=self._probe_transport,
+            )
+        except Exception:
+            # A probe is a question, not a turn: an endpoint that fails in a
+            # way `probe_endpoint` does not catch reads as "nothing answered".
+            rows = []
+        locked = [row for row in rows if row.model == KEY_REQUIRED]
+        rows = [row for row in rows if row.model != KEY_REQUIRED]
+        if rows and api_key:
+            settings = self._deps.settings
+            if settings.remember_llm_key(api_key):
+                settings.save()
+        return BackendProbed(
+            base_url=base_url,
+            models=[
+                LLMEntry(
+                    # The model id: this entry is in no catalog yet, so there
+                    # is nothing for a label to disambiguate it from.
+                    label=row.model,
+                    model=row.model,
+                    base_url=row.base_url,
+                    max_model_len=row.max_model_len,
+                    needs_key=row.needs_key,
+                    reachable=True,
+                    discovered=True,
+                )
+                for row in rows
+            ],
+            needs_key=bool(locked) and not rows,
+        )
+
+    async def scan(
+        self, on_found: Callable[[DiscoveredBackend], None] | None = None
+    ) -> ScanResult:
+        """Look for endpoints nobody has configured yet (`backend.scan`).
+
+        Two searches, run together because neither finds the other's hits: the
+        localhost sweep finds SSH-tunnelled backends, and the cluster's
+        manifest dir declares the ones living on a compute node's own IP,
+        which no localhost scan can see.
+
+        ``on_found`` fires per hit, on this loop, so the catalog can be
+        restated while the sweep is still running — the sweep is tens of
+        thousands of ports and a screen that filled only at the end would look
+        hung for the whole of it.
+
+        The result carries the reachability of the *configured* catalog too,
+        because that is half of what an empty scan means (`ScanResult`).
+        """
+        self.forget_discovered()
+        settings = self._deps.settings
+        cluster, local, reachable = await asyncio.gather(
+            self._scan_cluster(on_found),
+            self._scan_local(on_found),
+            self.probe_catalog(),
+        )
+        # Cluster first, deduped on (base_url, model): on a login node with a
+        # tunnel to the very server a manifest names, both passes report the
+        # same endpoint, and the manifest is the one that knows its name.
+        seen: set[tuple[str, str]] = set()
+        ordered: list[DiscoveredBackend] = []
+        for backend in [*cluster, *local]:
+            key = (backend.base_url, backend.model)
+            if key not in seen:
+                seen.add(key)
+                ordered.append(backend)
+        self._discovered = ordered
+        if settings.remember_llm_ports(b.base_url for b in local):
+            settings.save()  # the next scan starts with these ports
+        return ScanResult(local=local, cluster=cluster, reachable=reachable)
+
+    def forget_discovered(self) -> None:
+        """Drop what the last scan turned up.
+
+        A rescan replaces rather than adds: an endpoint that has since gone
+        away must stop being offered. Separate from `scan` so the caller can
+        say so *before* the sweep starts — those rows are stale from the
+        moment a rescan is asked for, and leaving them up for the length of a
+        64k-port sweep is the same lie the old panel told.
+        """
+        self._discovered = []
+
+    async def _scan_cluster(self, on_found) -> list[DiscoveredBackend]:
+        """The manifest pass. Off-cluster there is no Slurm and no manifests,
+        and this contributes nothing rather than failing."""
+        if self._deps.slurm is None:
+            return []
+        settings = self._deps.settings
+        try:
+            endpoints = await discover_cluster_endpoints(
+                settings.endpoints.dir_path(),
+                self._deps.slurm,
+                api_keys=self.key_pool(),
+                transport=self._probe_transport,
+            )
+        except Exception:
+            # Never in silence: an empty panel on a node with servers running
+            # is exactly the outcome that needs explaining, and the reason each
+            # manifest was dropped is already written there.
+            self.logger.exception("scan: cluster discovery failed")
+            return []
+        # Only the LLM role: the embeddings server is auto-wired to RAG and is
+        # not a backend anyone picks.
+        for backend in endpoints.llms:
+            self._note_discovered(backend, on_found)
+        return list(endpoints.llms)
+
+    async def _scan_local(self, on_found) -> list[DiscoveredBackend]:
+        """The localhost sweep, in a thread with its own loop.
+
+        Tens of thousands of connect attempts on the core's loop would starve
+        every session's turn for the length of the sweep — the Textual screen
+        had the same problem and solved it the same way. Hits come back
+        through `call_soon_threadsafe` because `deps.emit` puts events on
+        asyncio queues, and those are not thread-safe.
+        """
+        loop = asyncio.get_running_loop()
+        keys = self.key_pool()
+        ports = ordered_ports(self._priority_ports())
+
+        def hit(backend: DiscoveredBackend) -> None:
+            loop.call_soon_threadsafe(self._note_discovered, backend, on_found)
+
+        def sweep():
+            return asyncio.run(
+                self._port_scanner(ports, on_found=hit, api_keys=keys)
+            )
+
+        try:
+            return list(await asyncio.to_thread(sweep))
+        except Exception:
+            self.logger.exception("scan: localhost sweep failed")
+            return []
+
+    def _note_discovered(self, backend: DiscoveredBackend, on_found) -> None:
+        """One hit, on this loop: remembered, then announced.
+
+        Remembered first so that whatever `on_found` restates already contains
+        the row — the catalog is rebuilt from `_discovered`, not handed the
+        backend.
+        """
+        key = (backend.base_url, backend.model)
+        if any((b.base_url, b.model) == key for b in self._discovered):
+            return
+        self._discovered.append(backend)
+        if on_found is not None:
+            on_found(backend)
+
+    def _priority_ports(self) -> list[int]:
+        """Ports worth trying first: ones that have served an LLM before, then
+        the configured backends' own."""
+        settings = self._deps.settings
+        configured = (urlparse(b.base_url).port for b in settings.backends)
+        return [
+            *settings.known_llm_ports,
+            *(port for port in configured if port is not None),
+        ]
 
     def backend_for_new_session(
         self, requested: LLMBackend | str | None = None
@@ -588,6 +929,29 @@ class BackendRegistry:
         if old is not None:
             await _close_quietly(old)
         await self.discover_context_window()
+        return True
+
+    async def reload_embedder(self) -> bool:
+        """Rebuild RAG's client from the settings as they now stand.
+
+        The sibling of :meth:`reload` for the other client this registry owns,
+        and a different entry point from :meth:`wire_embedding` on purpose:
+        that one is *told* an endpoint by auto-connect and writes it into the
+        settings, while this one reads settings that have already changed —
+        which is what a hand-edited file is (`settings.save`).
+
+        Unconditional, because the caller is the one holding the before and
+        after and has already decided the section moved; and unlike the
+        bootstrap client there is no injected-by-the-host case to respect (see
+        the constructor: the embedder is owned either way).
+        """
+        rag = self._deps.settings.rag
+        old = self.embedder
+        self.embedder = EmbeddingClient(
+            base_url=rag.embedding_base_url, model=rag.embedding
+        )
+        if old is not None:
+            await _close_quietly(old)
         return True
 
     # --------------------------------------------------- context accounting

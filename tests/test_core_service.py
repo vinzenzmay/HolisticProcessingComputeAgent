@@ -15,7 +15,7 @@ import json
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
-from hpca.config import LLMBackend, Settings
+from hpca.config import LLMBackend, Settings, settings_path
 from hpca.core.service import build_service
 from hpca.db import connect, init_db
 from hpca.episodic import EpisodicStore
@@ -25,6 +25,9 @@ from hpca.memory_ops import MemoryOp
 from hpca.profiles import MemoryScope, Profile
 from hpca.protocol import (
     PROTOCOL_VERSION,
+    BackendProbe,
+    BackendRemove,
+    BackendScan,
     BackendSet,
     Command,
     CommandRun,
@@ -39,6 +42,7 @@ from hpca.protocol import (
     ProfileCreate,
     ProfileDelete,
     ProfileDuplicate,
+    ProfileGet,
     ProfileList,
     ProfileSave,
     ProfileSet,
@@ -52,8 +56,12 @@ from hpca.protocol import (
     SessionRename,
     SessionRetitle,
     SessionRollback,
+    SettingsGet,
+    SettingsSave,
     Shutdown,
     SkillDelete,
+    SkillGet,
+    SkillList,
     SkillSave,
     ThinkingSet,
     TurnInterrupt,
@@ -2971,6 +2979,448 @@ class TestSkillFiles:
     async def test_deleting_one_that_is_not_there_says_so(self, service):
         queue = subscribe(service)
         await service.handle(SkillDelete(profile="default", name="ghost"))
+        assert only(await drain(queue), "Notify").severity == "warning"
+
+
+class TestEditableBodies:
+    """The read half of every editor — `profile.get`, `skill.list`, `skill.get`.
+
+    The invariant they exist for is not "a convenient way to fetch a file": it
+    is that the *writes* beside them (`profile.save`, `skill.save`) write
+    verbatim, so an editor that could not read the body it is opening over
+    would save an empty buffer on top of it. Before these the front-end read
+    the app dir itself, which is §4.2 rule 2 and the rule that lets the core
+    sit behind a socket.
+    """
+
+    async def test_a_memory_file_arrives_exactly_as_it_is_on_disk(
+        self, service
+    ):
+        # Verbatim, not `Profile.load(...).render()`: a line the parser could
+        # not read is precisely why someone opens the editor, and a re-rendered
+        # body would delete it behind their back.
+        raw = (
+            "---\nname: default\n---\n\n## [system_prompt]\n"
+            "- kept\n((mangled\n"
+        )
+        path = Profile.path_for("default")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(raw)
+        queue = subscribe(service)
+        await service.handle(ProfileGet(name="default", kind="memories"))
+        body = only(await drain(queue), "ProfileBody")
+        assert body.name == "default" and body.kind == "memories"
+        assert body.text == raw and body.error == ""
+
+    async def test_an_archive_that_was_never_written_may_still_be_edited(
+        self, service
+    ):
+        # Empty and no error: a fresh profile has no archive, and refusing to
+        # open an editor over it would leave no way to write the first line.
+        queue = subscribe(service)
+        await service.handle(ProfileGet(name="default", kind="archive"))
+        body = only(await drain(queue), "ProfileBody")
+        assert body.text == "" and body.error == ""
+
+    async def test_an_archive_is_read_back_whole(self, service):
+        from hpca.curator import archive_path
+
+        path = archive_path("default")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("- retired: the old cluster\n")
+        queue = subscribe(service)
+        await service.handle(ProfileGet(name="default", kind="archive"))
+        assert "old cluster" in only(await drain(queue), "ProfileBody").text
+
+    async def test_a_profile_that_does_not_exist_answers_with_a_refusal(
+        self, service
+    ):
+        # An error rather than a `notify`: the editor asked for a named file
+        # and has to learn it may not open. Empty error is the only permission.
+        queue = subscribe(service)
+        await service.handle(ProfileGet(name="ghost", kind="memories"))
+        body = only(await drain(queue), "ProfileBody")
+        assert body.error and body.text == ""
+
+    async def test_what_is_fetched_is_what_a_save_then_writes(self, service):
+        # The round trip the whole shape exists for: an editor opens over what
+        # `profile.get` handed it and saves the buffer back, so anything the
+        # fetch failed to carry is anything the save deletes.
+        await service.handle(
+            ProfileSave(
+                name="default",
+                kind="memories",
+                text="## [rag]\n- the cohort lives in /data/cohort\n",
+            )
+        )
+        queue = subscribe(service)
+        await service.handle(ProfileGet(name="default", kind="memories"))
+        body = only(await drain(queue), "ProfileBody")
+        assert "/data/cohort" in body.text
+        await service.handle(
+            ProfileSave(
+                name="default",
+                kind="memories",
+                text=body.text + "- and the reference is /data/ref\n",
+            )
+        )
+        await service.handle(ProfileGet(name="default", kind="memories"))
+        text = only(await drain(queue), "ProfileBody").text
+        assert "/data/cohort" in text and "/data/ref" in text
+
+    async def test_the_skill_menu_carries_names_and_descriptions(self, service):
+        write_skill(
+            Skill(name="qc-report", description="run QC", triggers=[], body="s"),
+            "default",
+        )
+        queue = subscribe(service)
+        await service.handle(SkillList(profile="default"))
+        rows = only(await drain(queue), "SkillRows")
+        assert rows.profile == "default"
+        assert [(r.name, r.description) for r in rows.skills] == [
+            ("qc-report", "run QC")
+        ]
+
+    async def test_the_menu_lists_only_what_this_profile_may_edit(
+        self, service
+    ):
+        # A shared skill is not one profile's to change: `skill.save` writes
+        # into the profile's own directory, so offering it here would fork it.
+        write_skill(
+            Skill(
+                name="shared-one",
+                description="every profile",
+                triggers=[],
+                body="s",
+            ),
+            "default",
+            level="global",
+        )
+        write_skill(
+            Skill(name="mine", description="just here", triggers=[], body="s"),
+            "default",
+        )
+        queue = subscribe(service)
+        await service.handle(SkillList(profile="default"))
+        assert [
+            r.name for r in only(await drain(queue), "SkillRows").skills
+        ] == ["mine"]
+
+    async def test_a_skill_file_arrives_verbatim(self, service):
+        raw = "---\nname: qc-report\ndescription: run QC\n---\n\n1. sort\n"
+        await service.handle(
+            SkillSave(profile="default", name="qc-report", text=raw)
+        )
+        queue = subscribe(service)
+        await service.handle(SkillGet(profile="default", name="qc-report"))
+        body = only(await drain(queue), "SkillBody")
+        assert body.profile == "default" and body.name == "qc-report"
+        assert body.text == raw and body.error == ""
+
+    async def test_a_skill_the_profile_does_not_own_is_refused(self, service):
+        queue = subscribe(service)
+        await service.handle(SkillGet(profile="default", name="ghost"))
+        body = only(await drain(queue), "SkillBody")
+        assert body.error and body.text == ""
+
+
+class TestSettingsFile:
+    """`settings.get` / `settings.save` — the one screen whose subject is the
+    file itself, and the only command that can make an edit of it take effect.
+
+    Validation is split deliberately: a front-end can tell whether text is
+    JSON, but which fields exist and what they may hold is this model's
+    question, so the core re-asks it and refuses in its own words. Applying has
+    no other home at all — the old front-end wrote the file and toasted
+    "applies on the next start", which was the absence of this command rather
+    than a policy.
+    """
+
+    async def test_the_file_is_answered_as_it_stands(self, service):
+        settings_path().write_text('{"editor": "hx"}')
+        queue = subscribe(service)
+        await service.handle(SettingsGet())
+        body = only(await drain(queue), "SettingsBody")
+        assert body.text == '{"editor": "hx"}' and body.error == ""
+
+    async def test_a_file_that_was_never_written_answers_with_the_defaults(
+        self, service
+    ):
+        # What `Settings.load` would use, so the editor opens on a truthful
+        # starting point rather than an empty buffer the next save makes real.
+        assert not settings_path().exists()
+        queue = subscribe(service)
+        await service.handle(SettingsGet())
+        body = only(await drain(queue), "SettingsBody")
+        assert Settings.model_validate_json(body.text).llm.model
+
+    async def test_a_save_writes_the_file_and_restates_what_landed(
+        self, service
+    ):
+        queue = subscribe(service)
+        await service.handle(SettingsSave(text='{"editor": "hx"}'))
+        body = only(await drain(queue), "SettingsBody")
+        # Not the text that was sent: the core writes the validated model back
+        # out, so every default the file omitted is now explicit.
+        assert body.error == ""
+        assert Settings.model_validate_json(body.text).editor == "hx"
+        assert Settings.load().editor == "hx"
+
+    async def test_the_running_core_adopts_what_was_saved(self, service):
+        settings = service._deps.settings
+        await service.handle(SettingsSave(text='{"editor": "hx"}'))
+        # The same object, updated in place: whoever built the core passed it
+        # in and still reads it, so rebinding would leave them describing a
+        # file that no longer exists.
+        assert service._deps.settings is settings
+        assert settings.editor == "hx"
+
+    async def test_a_shape_the_model_refuses_is_not_written(self, service):
+        settings_path().write_text('{"editor": "hx"}\n')
+        queue = subscribe(service)
+        await service.handle(
+            SettingsSave(text='{"database": {"sync_interval_s": -5}}')
+        )
+        body = only(await drain(queue), "SettingsBody")
+        assert body.error.startswith("invalid: database.sync_interval_s")
+        # One line, because it is drawn beside an editor that stays on screen.
+        assert "\n" not in body.error
+        # And the body still describes the file that is still there.
+        assert body.text == '{"editor": "hx"}\n'
+        assert Settings.load().editor == "hx"
+
+    async def test_text_that_is_not_json_is_refused_in_the_cores_words(
+        self, service
+    ):
+        queue = subscribe(service)
+        await service.handle(SettingsSave(text="not json at all"))
+        assert only(await drain(queue), "SettingsBody").error
+        assert not settings_path().exists()
+
+    async def test_a_changed_llm_section_rebuilds_the_clients(self, service):
+        # The half only the core can do: the bootstrap client every un-pinned
+        # session talks through was built from the old section.
+        rebuilt: list[bool] = []
+
+        async def reload(*, busy=False):
+            rebuilt.append(busy)
+            return True
+
+        service._backends.reload = reload
+        queue = subscribe(service)
+        await service.handle(
+            SettingsSave(
+                text=json.dumps(
+                    {"llm": {"base_url": "http://localhost:9/v1", "model": "m"}}
+                )
+            )
+        )
+        assert rebuilt == [False]
+        # The ★ moved with it, so the catalog is restated.
+        assert "LLMCatalog" in kinds(await drain(queue))
+
+    async def test_a_save_that_leaves_the_llm_alone_rebuilds_nothing(
+        self, service
+    ):
+        rebuilt: list[bool] = []
+
+        async def reload(*, busy=False):
+            rebuilt.append(busy)
+            return True
+
+        service._backends.reload = reload
+        await service.handle(SettingsSave(text='{"editor": "hx"}'))
+        assert rebuilt == []
+
+    async def test_database_settings_are_said_to_wait_for_a_restart(
+        self, service
+    ):
+        # The one section that genuinely cannot be applied: the databases are
+        # open and every service holds a connection. Named, rather than the old
+        # blanket toast that claimed it of the LLM as well.
+        queue = subscribe(service)
+        await service.handle(
+            SettingsSave(text=json.dumps({"database": {"local_cache": False}}))
+        )
+        toast = only(await drain(queue), "Notify")
+        assert toast.severity == "warning" and "next start" in toast.text
+
+
+class TestBackendDiscovery:
+    """The three commands the manage-LLMs screen and the connection form need:
+    `backend.probe`, `backend.scan`, `backend.remove` — plus the by-label
+    `backend.set` that lets a key-locked entry be pinned without its key ever
+    crossing the wire.
+    """
+
+    def transport(self, routes):
+        """An httpx transport routing on port; absent ports look unreachable."""
+        import httpx
+
+        def handle(request):
+            answer = routes.get(request.url.port)
+            if answer is None:
+                raise httpx.ConnectError("refused", request=request)
+            return answer(request)
+
+        return httpx.MockTransport(handle)
+
+    def serves(self, *models):
+        import httpx
+
+        body = {
+            "object": "list",
+            "data": [
+                {"id": m, "object": "model", "max_model_len": 4096}
+                for m in models
+            ],
+        }
+        return lambda request: httpx.Response(200, json=body)
+
+    def scanner(self, hits, *, wait=None):
+        async def scan(ports, *, progress=None, on_found=None, api_keys=()):
+            if wait is not None:
+                wait.wait(5)
+            for hit in hits:
+                if on_found is not None:
+                    on_found(hit)
+            return list(hits)
+
+        return scan
+
+    def hit(self, port, model):
+        from hpca.discover import DiscoveredBackend
+
+        return DiscoveredBackend(
+            base_url=f"http://127.0.0.1:{port}/v1", model=model, max_model_len=4096
+        )
+
+    async def test_an_endpoint_is_asked_what_it_serves(self, service):
+        service._backends._probe_transport = self.transport(
+            {20001: self.serves("qwen-a", "qwen-b")}
+        )
+        queue = subscribe(service)
+        await service.handle(BackendProbe(base_url="http://localhost:20001/v1"))
+        probed = only(await wait_for(queue, "BackendProbed"), "BackendProbed")
+        assert probed.base_url == "http://localhost:20001/v1"
+        # Several models is the picker case; one would auto-fill the form.
+        assert [e.model for e in probed.models] == ["qwen-a", "qwen-b"]
+        assert probed.needs_key is False
+
+    async def test_an_endpoint_that_is_not_there_answers_all_the_same(
+        self, service
+    ):
+        # The form is waiting on this frame; a silence would leave it checking
+        # forever.
+        service._backends._probe_transport = self.transport({})
+        queue = subscribe(service)
+        await service.handle(BackendProbe(base_url="http://localhost:20001/v1"))
+        probed = only(await wait_for(queue, "BackendProbed"), "BackendProbed")
+        assert probed.models == [] and probed.needs_key is False
+
+    async def test_a_scan_fills_the_catalog_as_it_goes_and_then_closes(
+        self, service
+    ):
+        service._backends._port_scanner = self.scanner(
+            [self.hit(20001, "qwen-x"), self.hit(20002, "qwen-y")]
+        )
+        queue = subscribe(service)
+        await service.handle(BackendScan())
+        events = await wait_for(queue, "BackendScanned")
+        catalogs = [e for e in events if type(e).__name__ == "LLMCatalog"]
+        # One frame per hit, so the panel fills while the sweep is running —
+        # not one frame at the end, which is what looks hung.
+        assert [len(c.entries) for c in catalogs] == [0, 1, 2, 2]
+        assert all(e.discovered for e in catalogs[-1].entries)
+        scanned = only(events, "BackendScanned")
+        assert scanned.found == 2 and scanned.cluster == 0
+        # Something was found, so there is nothing to explain.
+        assert scanned.notice == "" and scanned.help == ""
+
+    async def test_an_empty_scan_off_the_cluster_carries_the_tunnel_recipe(
+        self, service
+    ):
+        # The verdict is the part a front-end cannot reach: "nothing found"
+        # means something different depending on whether anything configured
+        # still answers, and that is the core's probe.
+        service._backends._port_scanner = self.scanner([])
+        queue = subscribe(service)
+        await service.handle(BackendScan())
+        scanned = only(await wait_for(queue, "BackendScanned"), "BackendScanned")
+        assert scanned.found == 0
+        assert "ssh -fN" in scanned.help and scanned.notice == ""
+
+    async def test_a_slow_scan_does_not_stop_the_core_answering(self, service):
+        # The sweep is tens of thousands of ports. Awaited on the dispatch
+        # loop it would mean no session could speak until it finished.
+        import threading
+
+        release = threading.Event()
+        service._backends._port_scanner = self.scanner([], wait=release)
+        queue = subscribe(service)
+        await service.handle(BackendScan())
+        await service.handle(SessionList())
+        assert "SessionRows" in kinds(await drain(queue))
+        release.set()
+        await wait_for(queue, "BackendScanned")
+
+    async def test_a_configured_entry_is_removed_by_its_label(self, service):
+        service._deps.settings.backends = [
+            LLMBackend(model="qwen-a", base_url="http://a/v1"),
+            LLMBackend(model="qwen-b", base_url="http://b/v1"),
+        ]
+        queue = subscribe(service)
+        await service.handle(BackendRemove(label="qwen-a"))
+        events = await drain(queue)
+        assert only(events, "Notify").text == "Removed qwen-a"
+        assert [e.label for e in only(events, "LLMCatalog").entries] == ["qwen-b"]
+        assert [b.model for b in Settings.load().backends] == ["qwen-b"]
+
+    async def test_removing_something_that_is_not_configured_is_inert(
+        self, service
+    ):
+        # A discovered row is not in the file — which is why the old screen's
+        # `r` did nothing on that panel.
+        service._backends._port_scanner = self.scanner([self.hit(20001, "qwen-x")])
+        queue = subscribe(service)
+        await service.handle(BackendScan())
+        await wait_for(queue, "BackendScanned")
+        await service.handle(BackendRemove(label="qwen-x"))
+        assert [e.severity for e in await drain(queue) if isinstance(e, Notify)] == [
+            "warning"
+        ]
+
+    async def test_a_session_is_pinned_by_label(self, service, session):
+        # The form ctrl+l needs: the catalog carries no api_key, so an entry
+        # sent back by value could not name a key-locked backend at all.
+        service._deps.settings.backends = [
+            LLMBackend(model="qwen-a", base_url="http://a/v1", api_key="sk-secret")
+        ]
+        queue = subscribe(service)
+        await service.handle(
+            BackendSet(label="qwen-a", session_id=session.session_id)
+        )
+        rows = {r.session_id: r for r in only(await drain(queue), "SessionRows").rows}
+        assert rows[session.session_id].model == "qwen-a"
+        stored = json.loads(SessionStore(service._deps.conn).get(
+            session.session_id
+        ).backend)
+        # The key stayed where it already was.
+        assert stored["api_key"] == "sk-secret"
+
+    async def test_a_scan_hit_can_be_added_to_the_catalog_by_label(self, service):
+        service._backends._port_scanner = self.scanner([self.hit(20001, "qwen-x")])
+        queue = subscribe(service)
+        await service.handle(BackendScan())
+        await wait_for(queue, "BackendScanned")
+        await service.handle(BackendSet(label="qwen-x"))
+        assert [b.model for b in Settings.load().backends] == ["qwen-x"]
+
+    async def test_a_label_nothing_answers_to_is_refused(self, service, session):
+        queue = subscribe(service)
+        await service.handle(
+            BackendSet(label="ghost", session_id=session.session_id)
+        )
         assert only(await drain(queue), "Notify").severity == "warning"
 
 
