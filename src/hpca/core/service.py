@@ -128,10 +128,46 @@ from hpca.protocol import (
 from hpca.runner import kill_unowned
 from hpca.skills import load_own_skills, load_project_skills, load_skills
 from hpca.thinking import EFFORT_HINTS, EFFORTS, XHIGH_WARNING
-from hpca.transcript import build_entries
+from hpca.transcript import (
+    ASSISTANT,
+    ERROR,
+    EVENT,
+    RECALL,
+    THINKING,
+    USER,
+    Entry,
+    build_entries,
+)
 from hpca.watches import KIND_LOG, WatchStore, peek, watch_lines
 
 logger = logging.getLogger("hpca.core.service")
+
+# What each kind of entry is called in the transcript file. The heading is for
+# a human reading the log months later, not for a parser, so it says "agent"
+# rather than "assistant" and names what a `recall` entry actually is.
+LOG_KINDS = {
+    USER: "user",
+    ASSISTANT: "agent",
+    ERROR: "error",
+    EVENT: "background",
+    RECALL: "recalled from memory",
+}
+
+
+def _write_entries(log, entries: list[Entry]) -> None:
+    """Append one turn's entries to its session log. Blocking, by design: the
+    caller runs it off the loop (see `AgentService._record_turn_tail`).
+
+    A thinking entry carries its gist in the heading — "thinking (2,104 chars
+    reasoning · 3 steps)" — because the block under it is long and the line
+    above it is what a reader skims.
+    """
+    for entry in entries:
+        kind = LOG_KINDS.get(entry.kind, entry.kind)
+        if entry.kind == THINKING:
+            kind = f"thinking ({entry.summary()})"
+        log.write(kind, entry.text)
+
 
 # The slash commands this core answers — the seven built-ins of §4.1. Kept as
 # a set rather than inferred from the handler chain because it is also what
@@ -749,21 +785,144 @@ class AgentService:
     async def after_turn(self, session, result, plan) -> None:
         """What follows a turn that is not the turn's own business.
 
-        Wired to `TurnScheduler`'s `on_turn_result`, which existed for exactly
-        this and had nothing passed to it — so no session was ever titled after
-        its first exchange and `session.retitle` was the whole of naming.
+        Wired to `TurnScheduler`'s `on_turn_result`, which names three
+        consumers — the transcript log, the episodic index and session titling
+        — and for four milestones had nothing passed to it at all: no session
+        was ever titled, `<app_dir>/chatlogs` was never written, and
+        `session_search` indexed nothing, so recall across sessions silently
+        stopped working while the screen looked exactly the same.
 
-        Nothing here may fail a turn, and the scheduler already guarantees that
-        by catching; what it cannot do is decide *when*. A turn parked on an
+        The order is the point. Recording comes first because it describes
+        what has *already* happened and cannot be reconstructed later, while
+        titling is a fresh model call that can fail, take a second, or be
+        skipped entirely; running it first would put the record behind it.
+
+        And the two halves stop at different points. A turn parked on an
         approval has not finished — the exchange continues in the resume — so
-        naming it now would summarise half a conversation and, worse, spend the
-        one attempt doing it (`tui/app.py` returns at the same point).
+        naming it now would summarise half a conversation and spend the one
+        attempt doing it (`tui/app.py` returns at the same point). Its
+        transcript, though, is written now: what the model did before it asked
+        is what the user is being asked to judge, and the resume logs only the
+        tail that follows.
+
+        Nothing here may fail a turn; the scheduler guarantees that by
+        catching, and each half catches its own besides.
         """
+        await self._record_turn_tail(
+            session,
+            self._entries_of(result, start=getattr(result, "first_new", 0)),
+            getattr(plan, "log", None),
+        )
         if getattr(result, "interrupt", None) is not None:
             return
         await self._title_after_turn(
             session, list(getattr(result, "messages", []) or []), plan
         )
+
+    async def after_failed_turn(self, session, plan, error, first_new) -> None:
+        """A turn that broke instead of finishing, written down anyway.
+
+        Wired to `on_turn_error`. There is no result to read, so the tail is
+        read back out of the checkpoint instead — a failure does not roll the
+        thread back (an interrupt does; see `TurnScheduler.interrupt`), so
+        whatever the turn got through is still there, and it is the same fold
+        the reconcile has just put on screen. The error goes under it as its
+        own entry, which is what turns a log that stops mid-conversation into
+        one that says why.
+
+        `tui/app.py` logged the error alone, which left the question that
+        provoked it out of the file entirely.
+        """
+        entries = []
+        if first_new is not None:
+            try:
+                values = await self._thread_values(session.session_id)
+            except Exception:  # a backend that died may have taken more with it
+                logger.exception("could not read a failed turn's messages")
+                values = {}
+            entries = build_entries(
+                list(values.get("messages", [])),
+                list(values.get("thinking", []) or []),
+                list(values.get("calls", []) or []),
+                start=int(first_new),
+            )
+        entries.append(Entry(kind=ERROR, text=str(error)))
+        await self._record_turn_tail(session, entries, getattr(plan, "log", None))
+
+    @staticmethod
+    def _entries_of(result, *, start) -> list[Entry]:
+        """One turn's tail, as a human reads it.
+
+        Only the tail — `first_new` on — because the log is appended to and
+        the index is added to: re-reading a whole conversation every turn is
+        what would put the first message in the file five times.
+        """
+        return build_entries(
+            list(getattr(result, "messages", []) or []),
+            list(getattr(result, "thinking", []) or []),
+            list(getattr(result, "calls", []) or []),
+            start=int(start or 0),
+        )
+
+    async def _record_turn_tail(self, session, entries: list, log) -> None:
+        """The two records a turn leaves behind: the transcript and the index.
+
+        Neither may fail the turn, and they fail independently — a full disk
+        must not cost the session its recall, and an index that cannot be
+        written must not cost it the transcript.
+        """
+        if log is not None and entries:
+            try:
+                # On a thread: this is an append to a file that is very likely
+                # on an NFS home, and specs-core-process.md §1 names exactly
+                # that as a latency source the loop must not carry.
+                await asyncio.to_thread(_write_entries, log, entries)
+            except Exception:  # SessionLog swallows OSError; this is the rest
+                logger.exception("writing the session log failed")
+        await self._record_turn(session, entries, log)
+
+    async def _record_turn(self, session, entries: list, log) -> None:
+        """Put this turn's conversation into the episodic index (Phase 2).
+
+        User and assistant entries only. Thinking folds every tool call and
+        result into one entry, and indexing that would drown BM25 in tool
+        vocabulary — a query would match the session that ran the most
+        commands rather than the one that discussed the subject.
+
+        Off the loop, because the FTS5 triggers make this the heaviest write a
+        turn does, and best-effort, because recall is a convenience and the
+        reply is not: a failure is written into the transcript and dropped.
+        """
+        turns = [
+            (entry.kind, entry.text)
+            for entry in entries
+            if entry.kind in (USER, ASSISTANT)
+        ]
+        if not turns:
+            return
+        session_id, profile = session.session_id, session.profile
+
+        def record(conn) -> None:
+            from hpca.sessions import SessionStore
+
+            # The user may delete the session while this waits its turn on the
+            # db thread; recording then would leave rows that search can find
+            # and `session.delete` can no longer reach.
+            if SessionStore(conn).get(session_id) is None:
+                return
+            EpisodicStore(conn).record(
+                session_id=session_id, profile=profile, entries=turns
+            )
+
+        try:
+            await self._deps.db(record)
+        except Exception as e:
+            logger.exception("episodic index write failed")
+            if log is not None:
+                with suppress(Exception):
+                    await asyncio.to_thread(
+                        log.write, "error", f"episodic index write failed: {e}"
+                    )
 
     async def _title_after_turn(self, session, messages: list, plan) -> None:
         """Give a freshly-started conversation the model's name for it, once.
@@ -2164,13 +2323,20 @@ def build_service(
         The scheduler is built before the service and must stay that way — it
         is handed to the constructor — so the hook goes through the same
         forward reference `emit` uses. Passing *something* here is the fix for
-        a real regression: `on_turn_result` exists for exactly this and had
-        nothing wired to it, so a conversation was never named after its first
-        exchange and `session.retitle` was the whole of titling.
+        a real regression: `on_turn_result` exists for the transcript log, the
+        episodic index and titling, and had nothing wired to it, so no
+        conversation was named after its first exchange, no session log was
+        written and `session_search` had nothing to find.
         """
         holder = service_ref.get("service")
         if holder is not None:
             await holder.after_turn(session, result, plan)
+
+    async def after_failed_turn(session, plan, error, first_new) -> None:
+        """The same, for a turn that produced no result to work from."""
+        holder = service_ref.get("service")
+        if holder is not None:
+            await holder.after_failed_turn(session, plan, error, first_new)
 
     scheduler = TurnScheduler(
         deps,
@@ -2178,6 +2344,7 @@ def build_service(
         prepare=prepare,
         session_for=sessions.get,
         on_turn_result=after_turn,
+        on_turn_error=after_failed_turn,
     )
     scheduler_ref["scheduler"] = scheduler
 

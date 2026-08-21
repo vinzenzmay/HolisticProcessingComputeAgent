@@ -241,6 +241,11 @@ class TurnState:
     plan: TurnPlan
     task: asyncio.Task | None = None
     interrupt_keep: int | None = None
+    # Where this turn's own messages begin in the thread — what `TurnResult`
+    # calls ``first_new``, measured before the turn ran so a turn that never
+    # produces a result still knows which tail is its own. Read only by the
+    # failure hook; a turn that finishes carries the same number back itself.
+    first_new: int | None = None
     # The user message this turn is running (None for a resume or an event).
     # The interrupt hands it back to the entry for editing.
     user_text: str | None = None
@@ -265,6 +270,9 @@ class TurnScheduler:
         prepare: TurnPreparer,
         session_for: SessionLookup,
         on_turn_result: Callable[[Any, Any, TurnPlan], Awaitable[None]] | None = None,
+        on_turn_error: (
+            Callable[[Any, TurnPlan, Exception, int | None], Awaitable[None]] | None
+        ) = None,
     ) -> None:
         self._deps = deps
         self._graph = graph
@@ -275,6 +283,14 @@ class TurnScheduler:
         # off this; none of them is the scheduler's business, and none of them
         # may be allowed to fail a turn.
         self._on_turn_result = on_turn_result
+        # The same door for a turn that produced no result: (session, plan,
+        # error, first_new). A failure is still something that happened, and
+        # the transcript is the record of what happened — a run whose backend
+        # died mid-turn otherwise leaves a log file with the question missing
+        # and no reason for the silence. ``first_new`` is where this turn's
+        # messages start in the thread, so the same tail can be read back out
+        # of the checkpoint; None when it could not be measured.
+        self._on_turn_error = on_turn_error
         self._turns: dict[str, TurnState] = {}
         self._pending: list[PendingWork] = []
         self._awaiting_approval: set[str] = set()
@@ -1041,6 +1057,7 @@ class TurnScheduler:
                 )
             except Exception:
                 ts.interrupt_keep = None
+            ts.first_new = ts.interrupt_keep
             live = self._live.get(session_id)
             if live is not None:
                 live.start = ts.interrupt_keep
@@ -1048,8 +1065,20 @@ class TurnScheduler:
                 # Outlives this turn: an approval splits one exchange into
                 # several, and each of them has to stay stoppable.
                 self._anchors[session_id] = (ts.interrupt_keep, ts.user_text)
-        elif resume is not None and session_id not in self._live:
-            self._adopt_parked_turn(session_id)
+        elif resume is not None:
+            # Measured, not inherited: the anchor points at the message that
+            # opened the whole exchange, whose half has already been logged.
+            # What this half adds starts where the parked thread stopped. The
+            # count is safe to read here precisely because it is not the
+            # rollback point — see the anchor above.
+            try:
+                ts.first_new = await thread_message_count(
+                    self._graph, session_id=session_id
+                )
+            except Exception:
+                ts.first_new = None
+            if session_id not in self._live:
+                self._adopt_parked_turn(session_id)
         try:
             result = await run_turn(
                 self._graph,
@@ -1067,6 +1096,13 @@ class TurnScheduler:
             # Nothing survives of this attempt to roll back to or hand back:
             # the exchange ended where it broke.
             self._anchors.pop(session_id, None)
+            if self._on_turn_error is not None:
+                try:
+                    await self._on_turn_error(session, ts.plan, e, ts.first_new)
+                except Exception:  # a log is never worth a second failure
+                    logger.exception("post-turn handling of a failure failed")
+            # After the record, as on the finished path: what a client is told
+            # about is what has already been written down.
             self._deps.emit(TurnFailed(session_id=session_id, error=str(e)))
             return
         finally:

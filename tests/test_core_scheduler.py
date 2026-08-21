@@ -1301,3 +1301,109 @@ class TestPostTurn:
         await sched.drain()
         await settle()
         assert "TurnFinished" in kinds(events)
+
+    async def test_the_error_hook_sees_a_turn_that_broke_and_where_it_began(
+        self, deps, sessions, graph_calls, events
+    ):
+        # A failure produces no result, so the second hook is the only way the
+        # transcript hears about it at all — and it carries the index the
+        # turn's own messages start at, since reading its tail back out of the
+        # checkpoint is the only place they still exist.
+        seen = []
+
+        async def on_error(session, plan, error, first_new):
+            seen.append((session.session_id, str(error), first_new, plan.api_content))
+
+        graph_calls["counts"]["s1"] = 4
+        graph_calls["results"]["s1"] = RuntimeError("backend refused")
+        sched = TurnScheduler(
+            deps,
+            graph=object(),
+            prepare=lambda s, *, user_text=None, forced_skill=None: TurnPlan(
+                api_content=f"api:{user_text}"
+            ),
+            session_for=sessions.get,
+            on_turn_error=on_error,
+        )
+        sched.submit_user("s1", "hello")
+        await sched.drain()
+        await settle()
+        assert seen == [("s1", "backend refused", 4, "api:hello")]
+
+    async def test_the_failure_is_announced_after_it_is_recorded(
+        self, deps, sessions, graph_calls, events
+    ):
+        # The same order the finished path keeps: what a client is told about
+        # has already been written down, so a front-end reacting to the
+        # failure never races the record of it.
+        order = []
+
+        async def on_error(session, plan, error, first_new):
+            order.append("recorded")
+
+        graph_calls["results"]["s1"] = RuntimeError("backend refused")
+        sched = TurnScheduler(
+            deps,
+            graph=object(),
+            prepare=lambda s, *, user_text=None, forced_skill=None: TurnPlan(),
+            session_for=sessions.get,
+            on_turn_error=on_error,
+        )
+        sched.submit_user("s1", "hello")
+        await sched.drain()
+        await settle()
+        order += [type(e).__name__ for e in events if type(e).__name__ == "TurnFailed"]
+        assert order == ["recorded", "TurnFailed"]
+
+    async def test_a_broken_error_hook_never_swallows_the_failure(
+        self, deps, sessions, graph_calls, events
+    ):
+        async def on_error(session, plan, error, first_new):
+            raise RuntimeError("the log is on fire")
+
+        graph_calls["results"]["s1"] = RuntimeError("backend refused")
+        sched = TurnScheduler(
+            deps,
+            graph=object(),
+            prepare=lambda s, *, user_text=None, forced_skill=None: TurnPlan(),
+            session_for=sessions.get,
+            on_turn_error=on_error,
+        )
+        sched.submit_user("s1", "hello")
+        await sched.drain()
+        await settle()
+        assert "TurnFailed" in kinds(events)
+        assert not sched.is_busy("s1")
+
+    async def test_a_resume_is_told_where_its_own_half_starts(
+        self, deps, sessions, graph_calls, events
+    ):
+        # Not the anchor: that points at the message the whole exchange began
+        # with, whose half was already recorded when the turn parked. What the
+        # resume adds starts where the parked thread stopped.
+        seen = []
+
+        async def on_error(session, plan, error, first_new):
+            seen.append(first_new)
+
+        sched = TurnScheduler(
+            deps,
+            graph=object(),
+            prepare=lambda s, *, user_text=None, forced_skill=None: TurnPlan(),
+            session_for=sessions.get,
+            on_turn_error=on_error,
+        )
+        graph_calls["counts"]["s1"] = 2  # the thread before the user message
+        graph_calls["results"]["s1"] = TurnResult(
+            reply=None, interrupt={"tool": "run_bash"}
+        )
+        sched.submit_user("s1", "clear the scratch dir")
+        await sched.drain()
+        await settle()
+        graph_calls["counts"]["s1"] = 6  # the parked exchange, as checkpointed
+        graph_calls["results"]["s1"] = RuntimeError("backend refused")
+        sched.resolve_decision("s1", approved=True)
+        await settle()
+        assert seen == [6]
+        # And the rollback point is still the anchor, untouched by the read.
+        assert sched._anchors.get("s1") is None  # spent by the failure

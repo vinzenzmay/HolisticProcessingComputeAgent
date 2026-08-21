@@ -18,6 +18,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from hpca.config import LLMBackend, Settings
 from hpca.core.service import build_service
 from hpca.db import connect, init_db
+from hpca.episodic import EpisodicStore
 from hpca.llm import ChatResponse
 from hpca.jobs import JobStore
 from hpca.memory_ops import MemoryOp
@@ -63,6 +64,7 @@ from hpca.protocol import (
 )
 from hpca.sessions import SessionStore
 from hpca.skills import Skill, load_own_skills, write_skill
+from hpca.transcript import RESULT_RULE
 from hpca.watches import KIND_JOB, KIND_LOG, WatchStore
 
 
@@ -301,13 +303,11 @@ class TestTurns:
         await service.handle(
             TurnSubmit(session_id=session.session_id, text="which BAMs?")
         )
-        for _ in range(30):
-            events = await drain(queue)
-            if "TurnFinished" in kinds(events):
-                break
-            await _yield()
-        else:
-            raise AssertionError("the turn never finished")
+        # Waited for by condition, not by counting loop turns: a finished turn
+        # goes through the session log and the episodic index on their own
+        # threads before it is announced, and no number of `sleep(0)`s is a
+        # thread hop. See `wait_for`.
+        await wait_for(queue, "TurnFinished")
         assert llm.prompts, "the model was never asked"
 
     async def test_the_prompt_carries_the_sessions_own_profile(
@@ -1836,6 +1836,319 @@ class TestAutomaticTitling:
         llm._outputs = [respond(), json.dumps({"title": "Read counting"})]
         await run_turn(service, fresh.session_id, "how many reads?")
         assert "Read counting (by llm)" in _transcript(home)
+
+
+class TestTheTranscriptLog:
+    """`<app_dir>/chatlogs/*.log`: the durable, greppable record of a run.
+
+    Written by the core and by nothing else, which is the whole of this
+    class's reason to exist — `on_turn_result` names the transcript log as
+    one of its three consumers and only titling was ever wired to it, so a
+    core-driven run wrote a file with a rename line in it and no conversation.
+
+    Every claim here was carried by `test_tui_thinking_logs.py` against the
+    widget class that is about to be deleted.
+    """
+
+    async def test_a_turn_is_logged_with_its_thinking_and_its_answer(
+        self, service, session, llm, home
+    ):
+        llm._outputs = [
+            ChatResponse(content=respond("Four BAMs match."), reasoning="Count them.")
+        ]
+        await run_turn(service, session.session_id, "which BAMs?")
+        text = _transcript(home)
+        assert "] user\nwhich BAMs?" in text
+        assert "thinking" in text and "Count them." in text
+        assert "] agent\nFour BAMs match." in text
+        # In the order it happened: the file is read top to bottom.
+        assert text.index("which BAMs?") < text.index("Count them.")
+        assert text.index("Count them.") < text.index("Four BAMs match.")
+
+    async def test_the_call_is_written_to_the_session_log(
+        self, service, session, llm, home
+    ):
+        target = home / "reads.tsv"
+        target.write_text("sample\tcount\na\t7\n")
+        llm._outputs = [calling("read_file", path=str(target)), respond("seven")]
+        await run_turn(service, session.session_id, "how many reads?")
+        text = _transcript(home)
+        # One heading for the exchange, with the call and what it returned
+        # under it — the same reading of the turn the chat draws, so the tool
+        # is named once in both.
+        assert text.count("— read_file") == 1
+        assert str(target) in text
+        assert RESULT_RULE in text and "sample" in text
+
+    async def test_a_subagents_query_and_reply_are_logged_under_the_tool(
+        self, home, conn, llm, saver
+    ):
+        async def db(fn):
+            return fn(conn)
+
+        service = build_service(
+            settings=Settings.load(),
+            app_dir=home,
+            db=db,
+            conn=conn,
+            checkpointer=saver,
+            llm=llm,
+            tools=_subagent_tools(),
+        )
+        fresh = SessionStore(conn).create(profile="default", title="asking")
+        llm._outputs = [
+            calling("ask_docs", question="what is a BAM?"),
+            "binary alignment map",
+            respond("ok"),
+        ]
+        await run_turn(service, fresh.session_id, "explain BAMs")
+        text = _transcript(home)
+        # The model calls a tool makes on its own are the turn's too, and they
+        # are logged under the tool's name rather than as the orchestrator's.
+        assert "subagent:ask_docs query" in text
+        assert "user: what is a BAM?" in text
+        assert "subagent:ask_docs reply" in text
+        assert "binary alignment map" in text
+        await service.stop()
+
+    async def test_a_parked_approval_is_written_down_before_it_is_answered(
+        self, service, session, llm, home
+    ):
+        llm._outputs = [
+            calling("run_bash", content_lines=["rm -rf /scratch/old"]),
+            respond("left it alone"),
+        ]
+        queue = subscribe(service)
+        await service.handle(
+            TurnSubmit(session_id=session.session_id, text="clear the scratch dir")
+        )
+        await wait_for(queue, "DecisionRequested")
+        # The half that has happened is in the file while the question is
+        # still on screen: a core that dies waiting for an answer must not
+        # take the conversation with it.
+        assert "] user\nclear the scratch dir" in _transcript(home)
+        await service.handle(
+            DecisionResolve(session_id=session.session_id, approved=False)
+        )
+        await wait_for(queue, "TurnFinished")
+        text = _transcript(home)
+        # And the resume adds only what followed: one exchange, written once,
+        # however many graph invocations it took.
+        assert text.count("] user\nclear the scratch dir") == 1
+        assert text.count("rm -rf /scratch/old") == 1
+        assert "] agent\nleft it alone" in text
+        await service.stop()
+
+    async def test_reopening_a_session_does_not_re_log_it(
+        self, service, session, llm, home
+    ):
+        await run_turn(service, session.session_id, "first question")
+        await service.handle(SessionOpen(session_id=session.session_id))
+        await _settle()
+        await run_turn(service, session.session_id, "second question")
+        text = _transcript(home)
+        # Only the tail of each turn is written, so re-reading a conversation
+        # never duplicates it. Logged entries are counted, not mentions.
+        assert text.count("] user\nfirst question") == 1
+        assert text.count("] user\nsecond question") == 1
+
+    async def test_each_session_gets_its_own_file(
+        self, service, session, conn, llm, home
+    ):
+        other = SessionStore(conn).create(profile="default", title="the other one")
+        await run_turn(service, session.session_id, "first")
+        await run_turn(service, other.session_id, "second")
+        files = sorted((home / "chatlogs").glob("*.log"))
+        assert len(files) == 2
+        # And each holds its own conversation, not whichever was on screen.
+        contents = [path.read_text() for path in files]
+        assert any("first" in text and "second" not in text for text in contents)
+        assert any("second" in text and "first" not in text for text in contents)
+
+    async def test_errors_are_logged(self, service, session, llm, home):
+        async def dead(messages, **kwargs):
+            raise ConnectionError("backend unreachable")
+
+        llm.chat = dead
+        queue = subscribe(service)
+        await service.handle(TurnSubmit(session_id=session.session_id, text="hi"))
+        await wait_for(queue, "TurnFailed")
+        text = _transcript(home)
+        assert "backend unreachable" in text
+        # And what the user asked before it broke: a transcript that drops the
+        # question keeps no record of the exchange at all.
+        assert "] user\nhi" in text
+        await service.stop()
+
+    async def test_logging_off_writes_nothing(self, home, conn, llm, saver):
+        settings = Settings.load()
+        settings.logging.enabled = False
+
+        async def db(fn):
+            return fn(conn)
+
+        service = build_service(
+            settings=settings,
+            app_dir=home,
+            db=db,
+            conn=conn,
+            checkpointer=saver,
+            llm=llm,
+        )
+        fresh = SessionStore(conn).create(profile="default", title="quiet")
+        await run_turn(service, fresh.session_id, "hello")
+        assert not (home / "chatlogs").exists()
+        await service.stop()
+
+    async def test_switching_logging_off_takes_effect_at_once(
+        self, service, session, llm, home
+    ):
+        await run_turn(service, session.session_id, "logged question")
+        service._deps.settings.logging.enabled = False
+        await run_turn(service, session.session_id, "private question")
+        text = _transcript(home)
+        assert "logged question" in text
+        # The next turn, not the next session: the log is opened per turn.
+        assert "private question" not in text
+
+
+class TestTheEpisodicIndex:
+    """Recall across sessions (redesign Phase 2), which is invisible until it
+    is gone: nothing on screen changes when the index stops being written,
+    and `session_search` simply never finds anything again."""
+
+    async def test_a_turn_is_recallable_from_a_later_session(
+        self, service, session, conn, llm
+    ):
+        llm._outputs = [respond("STAR needs about 32 GB for the human index.")]
+        await run_turn(
+            service, session.session_id, "how much memory does STAR need?"
+        )
+        later = SessionStore(conn).create(profile="default", title="later")
+        hits = EpisodicStore(conn).search(
+            "STAR memory", profile="default", exclude_session_id=later.session_id
+        )
+        assert [hit.session_id for hit in hits] == [session.session_id]
+        # Reported bookends-first: what was asked, and what it came to.
+        assert "how much memory does STAR need?" in hits[0].goal
+        assert "32 GB" in hits[0].resolution
+
+    async def test_the_agent_recalls_it_through_session_search(
+        self, service, session, conn, llm
+    ):
+        llm._outputs = [respond("STAR needs about 32 GB for the human index.")]
+        await run_turn(
+            service, session.session_id, "how much memory does STAR need?"
+        )
+        later = SessionStore(conn).create(profile="default", title="later")
+        llm._outputs = [
+            calling("session_search", query="STAR memory"),
+            respond("32 GB, as before"),
+        ]
+        queue = subscribe(service)
+        await service.handle(
+            TurnSubmit(session_id=later.session_id, text="and STAR again?")
+        )
+        await wait_for(queue, "TurnFinished")
+        # The tool's answer is fed back as a tool result; no model call was
+        # spent finding it.
+        results = [
+            str(message["content"])
+            for prompt in llm.prompts
+            for message in prompt
+            if str(message["content"]).startswith("[tool result] session_search")
+        ]
+        assert results and "32 GB" in results[-1]
+        await service.stop()
+
+    async def test_tool_traffic_is_not_indexed(
+        self, service, session, conn, llm, home
+    ):
+        target = home / "reads.tsv"
+        target.write_text("sample\tcount\na\t7\n")
+        llm._outputs = [
+            ChatResponse(
+                content=calling("read_file", path=str(target)),
+                reasoning="the counts are in column 2",
+            ),
+            respond("seven reads"),
+        ]
+        await run_turn(service, session.session_id, "how many reads?")
+        rows = conn.execute(
+            "SELECT role, content FROM messages WHERE session_id = ? "
+            "ORDER BY turn_no",
+            (session.session_id,),
+        ).fetchall()
+        # BM25 over tool vocabulary matches everything: only what the two
+        # sides of the conversation said is indexed.
+        assert [row["role"] for row in rows] == ["user", "assistant"]
+        assert [row["content"] for row in rows] == [
+            "how many reads?",
+            "seven reads",
+        ]
+
+    async def test_an_interrupted_turn_leaves_nothing_behind(
+        self, service, session, conn, llm
+    ):
+        release = await park_turn(service, llm, session.session_id)
+        await service.handle(TurnInterrupt(session_id=session.session_id))
+        release.set()
+        await _settle()
+        # The interrupt rolled its messages out of the thread; indexing them
+        # would leave search describing a conversation that never happened.
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM messages WHERE session_id = ?",
+            (session.session_id,),
+        ).fetchone()["n"] == 0
+        await service.stop()
+
+    async def test_a_deleted_session_is_never_indexed_behind_its_deletion(
+        self, service, session, conn, llm
+    ):
+        # The write crosses a thread, so the session can be gone by the time
+        # it lands; recording then would leave rows search can find and
+        # nothing can delete.
+        entries = [_Entry("user", "a question"), _Entry("assistant", "an answer")]
+        SessionStore(conn).delete(session.session_id)
+        await service._record_turn(session, entries, None)
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM messages WHERE session_id = ?",
+            (session.session_id,),
+        ).fetchone()["n"] == 0
+
+
+class _Entry:
+    """Enough of a transcript entry for the recording half to read."""
+
+    def __init__(self, kind: str, text: str) -> None:
+        self.kind, self.text = kind, text
+
+
+def _subagent_tools():
+    """A registry with one tool that runs its own model call (§4.2)."""
+    from pydantic import BaseModel, Field
+
+    from hpca.agent.tools import Tool, ToolRegistry
+
+    class AskParams(BaseModel):
+        question: str = Field(description="What to ask the docs")
+
+    async def ask(args, ctx):
+        response = await ctx.llm.chat(
+            [{"role": "user", "content": args.question}]
+        )
+        return response.content
+
+    registry = ToolRegistry()
+    registry.register(
+        Tool(
+            name="ask_docs",
+            description="Ask the docs",
+            params=AskParams,
+            handler=ask,
+        )
+    )
+    return registry
 
 
 class _Parked:
