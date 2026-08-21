@@ -138,3 +138,45 @@ Both were failures the eval caught, fixed in `skill_drafter.SYSTEM_PROMPT`:
   took it to 3/3, without the model dropping the real tools the conversation
   had established (`papermill`, `--mem`, `cProfile`, `line_profiler` all
   survive, parameterised).
+
+---
+
+# smoke_pty — does the real binary come up in a real terminal?
+
+Everything else in `tests/` drives the UI through a harness that never opens a
+pty: `Screen` writes into a buffer, keys arrive as method calls, and the
+terminal is assumed. The first run on a cluster node is where that assumption
+gets tested for the first time. This opens a real pty, runs the real console
+script under it, feeds it a quit, and prints what it painted.
+
+It answers the one question the suite cannot: what does a fresh install do
+when **nothing answers**? Two scenarios, two failures wearing the same face:
+
+```sh
+pixi run -e dev python evals/smoke_pty.py bare 14   # empty $HPCA_HOME
+pixi run -e dev python evals/smoke_pty.py down 14   # settings name a dead port
+```
+
+`bare` is a UI question — does it tell the user, and offer the fix? `down` is
+a networking one: a TCP connect to a port with nothing behind it is the
+startup path most likely to *hang* rather than fail, and a hang here is a UI
+that never draws. Both must reach a painted frame, an open manage-LLMs
+screen, and exit 0. Exit code is 0 when clean, 1 on a traceback or a non-zero
+child; the throwaway `$HPCA_HOME` is kept only on failure, so there is
+something to look at when there is.
+
+No backend needed — the point is that there isn't one. It does sweep the
+network for endpoints, so what the discovered list contains depends on the
+box, and on a dev machine with tunnels up it will not be empty.
+
+## Measured, v0.25.0 (before the Textual deletion)
+
+Both scenarios: full layout painted, the no-backend warning opened by itself,
+the sweep finished (`6 endpoint(s) found` on a box with local ollama and two
+tunnels), the exit sync printed its wait message, exit 0, no traceback.
+Frame times in the status line ran 0.08–0.53 ms.
+
+One thing to know before reading the output as a bug: with a `settings.toml`
+naming a backend, the *configured* panel still says "no backends configured".
+That panel lists the **catalog**, which is a different list from
+`settings.llm` — correct, and confusing exactly once.
