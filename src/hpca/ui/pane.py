@@ -4,22 +4,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from hpca.ui.ansi import BOLD, CYAN, DIM, RESET, REVERSE, fold, pad, rule
+from hpca.ui.ansi import BOLD, CYAN, DIM, RESET, REVERSE, clip, fold, pad, rule
 
 
 class Wrapped:
     """A row that remembers its ``body`` wrapped, so nothing wraps it twice.
 
-    The flattened line list is rebuilt whenever a row is revised, and without
-    this that rebuild re-wraps every open body on the pane. Measured on a
-    5000-entry chat with every message showing: wrapping was 60% of the
-    rebuild, and it is the half that grows with how much *text* the
-    conversation holds rather than with how many rows it has — a megabyte in
-    one message is a megabyte re-folded on the next event that revises
-    anything.
+    The flattened line list is rebuilt whenever a row is revised, and every
+    row on the pane is measured again when it is. Without a memo that means
+    re-wrapping every open body on each rebuild — work that grows with how
+    much *text* the conversation holds rather than with how many rows it has,
+    and 60% of a rebuild on a 5000-entry chat with the messages open.
+    `Item.clipped` is the same bargain for the closed ones, which is a third
+    of a rebuild when they are.
 
     The memo is per row, so revising one row costs that row. It is keyed by
-    width because a resize is the one thing that legitimately invalidates it,
+    width, because a resize is the one thing that legitimately invalidates it,
     and it assumes ``body`` is replaced rather than mutated in place — which
     is what every builder here does: `state.entry_item` returns a new row for
     a revised entry rather than editing the old one.
@@ -33,7 +33,6 @@ class Wrapped:
             memo = (width, [piece for raw in self.body for piece in fold(raw, width)])
             self._folded = memo
         return memo[1]
-
 
 @dataclass
 class Fold(Wrapped):
@@ -70,15 +69,38 @@ class Item(Wrapped):
     addressed as ``<key>/<n>``, so the third step of a turn stays open across
     the `chat.update` that revises the row, and cannot be inherited by
     whatever step ends up third next time.
+
+    ``preview`` is the one line a *closed* row shows of what it is hiding —
+    the whole of `body` on one line, clipped to the terminal with `ansi.clip`.
+    It is what makes a folded conversation still readable as one: a column of
+    `you` and `hpca` labels with nothing between them says who spoke and not a
+    word of what was said. A row with no preview closes to its head alone,
+    which is right for the rows whose head already summarises them (a turn's
+    working: "8 steps · edit_file → run_bash …").
     """
 
     head: str
     body: list[str] = field(default_factory=list)
+    preview: str = ""
     accent: str = ""
     kind: str = ""
     text: str = ""
     key: str = ""
     folds: list[Fold] = field(default_factory=list)
+
+    def clipped(self, cells: int) -> str:
+        """``preview``, cut to one line — the closed row's half of `folded`.
+
+        On `Item` rather than on `Wrapped` because `preview` is: a step has a
+        body and no preview, and reaching for one through a defaulted
+        ``getattr`` would make a row that quietly previews nothing look the
+        same as a row that has nothing to preview.
+        """
+        memo = getattr(self, "_clipped", None)
+        if memo is None or memo[0] != cells:
+            memo = (cells, clip(self.preview, cells))
+            self._clipped = memo
+        return memo[1]
 
     @property
     def openable(self) -> bool:
@@ -190,8 +212,13 @@ class Pane:
         lines.append((index, f"{marker} {item.head}", True))
         keys.append(key)
         if not opened:
-            # Closed: neither its words nor its steps. Both hang off the same
-            # marker, which is what "open the row" means.
+            # Closed: neither its words nor its steps — both hang off the same
+            # marker, which is what "open the row" means — but one line of
+            # what it is hiding, if it has one to give.
+            if item.preview:
+                room = max(8, width - len(body_pad))
+                lines.append((index, body_pad + item.clipped(room), False))
+                keys.append(key)
             return lines, keys, openable
         # Folded by cells rather than by characters: a body line of CJK holds
         # half as many characters in the same row, and counting them would
@@ -222,9 +249,7 @@ class Pane:
         (specs-ui-replacement.md §3.2), and what that invariant is *for*: a
         message arriving costs the lines that message draws, not a re-flatten
         of the conversation behind it. `invalidate` would be correct and
-        O(conversation) — the shape this UI exists to not have, and one that
-        only became expensive once the chat started showing every message's
-        text rather than one truncated line of it.
+        O(conversation), which is the shape this UI exists to not have.
 
         A pane whose cache is already cold simply takes the row: the next
         `flat` was going to build the whole list anyway.

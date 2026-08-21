@@ -213,13 +213,11 @@ class TestTheChatIsAppendOnly:
 
     def test_a_reset_forgets_what_was_open(self):
         # The numbering is re-based, so a key still held would name a row the
-        # core has since given to something else. What is open afterwards is
-        # decided by the new transcript alone — its messages, which show their
-        # words, and not one key from before it.
+        # core has since given to something else.
         session = self.loaded()
-        session.chat.expanded = {"1", "2", "9"}
-        session.reset([entry(1, text="only this"), entry(2, "thinking")])
-        assert session.chat.expanded == {"1"}
+        session.chat.expanded = {"1", "2"}
+        session.reset([entry(1, text="only this")])
+        assert session.chat.expanded == set()
 
     def test_a_reset_lets_an_estimate_speak_again(self):
         session = self.loaded()

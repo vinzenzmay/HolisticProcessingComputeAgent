@@ -252,37 +252,38 @@ entries, the ratio is now ~1,350× and ~11,500×.
 
 Everything above is the *frame*, and the frame slices a cached list of lines.
 Nothing here had ever measured what builds that list — which is fine while a
-chat row is one line, and stopped being fine the moment the chat started
-drawing every message's words (specs-ui-replacement.md §4.1 item 6). The
-cached list went from one line per entry to one per line of prose:
+chat row is one line, and stopped being fine when the row became a label plus
+its words (specs-ui-replacement.md §4.1 item 6). A closed message is now two
+lines rather than one and an open one is as many as its text needs:
 
 | chat | flattened lines | rebuild |
 |---|---|---|
-| 100 | 265 | 0.046 ms |
-| 1000 | 2,590 | 0.476 ms |
-| 5000 | 12,921 | 2.730 ms |
+| 100 | 172 | 0.038 ms |
+| 1000 | 1,672 | 0.365 ms |
+| 5000 | 8,338 | 2.091 ms |
 
 A rebuild per arriving row would therefore have been an O(conversation) event
 on the busiest path there is — during a turn, one per tool call. Two things
 keep it off:
 
 - **`Pane.extend`.** The chat is append-only (§3.2), so a row arriving is
-  added to the cached list instead of dropping it. Measured at 0.0023 ms and
+  added to the cached list instead of dropping it. Measured at 0.0019 ms and
   flat from 100 to 5000 entries; the rebuild it replaced was 1.08 ms at 5000
-  even with everything collapsed, so the append path is now ~470× cheaper
-  than it was *before* messages started showing their words.
-- **`Wrapped.folded`.** Each row remembers its body wrapped to a width.
-  Wrapping was 60% of a rebuild and is the half that grows with how much text
-  a conversation holds rather than how many rows: a 1 MB message rebuilds in
-  0.34 ms instead of re-folding a megabyte.
+  back when a row was one line, so the append path is now ~570× cheaper than
+  it was *before* any of this.
+- **`Wrapped.folded` / `Wrapped.clipped`.** Each row remembers how its text
+  came out at a width. Both halves earn it: wrapping was 60% of a rebuild
+  with the messages open, clipping a third of one with them closed (2.09 ms
+  at 5000 entries against 3.66 ms before the preview was memoised). A 1 MB
+  message costs its wrap once instead of on every rebuild.
 
 What is still a rebuild is `chat.update` — a row revised in place, whose line
-count can change. That is 2.7 ms at 5000 entries, it fires a few times a turn
+count can change. That is 2.1 ms at 5000 entries, it fires a few times a turn
 rather than per frame or per token, and it is the one path here that is still
 O(conversation). Noted rather than fixed.
 
-Frame time is unchanged by any of this: 0.072 ms at 100 entries and 0.072 ms
-at 20,000, with a 1 MB message at 0.059 ms.
+Frame time is unchanged by any of this: 0.070 ms at 100 entries and 0.071 ms
+at 20,000, with a 1 MB message at 0.045 ms.
 
 `tests/test_ui_perf.py::TestARowArriving` is the standing test. Its first
 version measured `session.append` alone and could not tell `extend` from the

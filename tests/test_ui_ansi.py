@@ -6,6 +6,7 @@ wrapped around it afterwards.
 """
 
 from hpca.ui.ansi import (
+    CLIP,
     CYAN,
     DIM,
     ONE_CELL_GLYPHS,
@@ -13,6 +14,7 @@ from hpca.ui.ansi import (
     REVERSE,
     cell_width,
     char_width,
+    clip,
     fold,
     footer_line,
     pad,
@@ -208,6 +210,46 @@ class TestFold:
 
     def test_and_a_wide_character_is_never_split_across_two(self):
         assert all(x in ("中", "文") for line in fold(WIDE * 5, 3) for x in line)
+
+
+class TestClip:
+    """One line of a message, and whether it says it is only one line.
+
+    The mark is `" [...]"` and deliberately not the `"…"` `pad` truncates
+    with: that one means the terminal is this wide, and this one means there
+    is more of this message and → will show it. Only the second has a gesture
+    attached, so the two are not allowed to look the same.
+    """
+
+    def test_what_fits_is_left_alone(self):
+        assert clip("short enough", 40) == "short enough"
+
+    def test_and_exactly_the_budget_still_fits(self):
+        assert clip("abcde", 5) == "abcde"
+
+    def test_what_does_not_fit_says_so(self):
+        assert clip("a rather longer line than that", 20).endswith(CLIP)
+
+    def test_and_stays_inside_the_budget(self):
+        for width in range(7, 40):
+            assert cell_width(clip("a rather longer line than that", width)) <= width
+
+    def test_the_mark_reads_as_one_space_after_the_last_word(self):
+        # The cut lands on a space often enough that not stripping it would
+        # show " [...]" behind a gap half the time and not the other half.
+        assert not clip("aaa bbbbbbbbbbbb", 12).endswith("  [...]")
+
+    def test_a_pane_too_narrow_to_say_both_keeps_the_words(self):
+        # Six cells are the mark alone. Below that the mark would be the whole
+        # line, which tells the reader nothing they can act on.
+        assert clip("abcdefgh", 4) == "abcd"
+
+    def test_a_wide_character_is_never_split_by_it(self):
+        cut = clip(WIDE * 20, 15)
+        assert all(x in ("中", "文") for x in cut.removesuffix(CLIP).rstrip())
+
+    def test_it_is_measured_in_cells_and_not_characters(self):
+        assert cell_width(clip(WIDE * 20, 21)) <= 21
 
 
 class TestReverseKeepsGlyphsWhole:

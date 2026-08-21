@@ -47,8 +47,10 @@ column 0 with no gutter, no marker and no indent, and the speaker is a label
 line above them — because the terminal's own drag-to-select takes whole
 columns, and every one the UI spent in front of a line of the conversation
 came along with it. Anything at column 0 is verbatim; anything indented is the
-UI talking. What is deliberately still missing: mouse support, which is what
-keeps that selection working at all, so the mouse stays released. specs-ui-replacement.md §4 is the full list of what is absent, and
+UI talking. A closed row shows one line of what it holds, clipped with a
+``[...]``; → opens it into the wrapped text. What is deliberately still
+missing: mouse support, which is what keeps that selection working at all, so
+the mouse stays released. specs-ui-replacement.md §4 is the full list of what is absent, and
 specs-ui-coverage.md §3 is an audit of it, most of which is now wired: what
 is still open there is the injection warning on a flagged memory batch, the
 watchers column's arrangement, and re-reading memories at a session boundary.

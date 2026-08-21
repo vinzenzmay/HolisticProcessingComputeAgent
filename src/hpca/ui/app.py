@@ -2155,10 +2155,10 @@ class RowUI:
         tool markers are decoration, and pasting them back into a shell is a
         paper cut every time.
 
-        Still worth its key now that a message's own lines are drawn flush and
-        a mouse selection of them is already clean — because this one copies
-        the *row*, whole, without having to drag across a reply that runs off
-        the bottom of the pane.
+        Still worth its key now that an opened message's lines are drawn flush
+        and a mouse selection of them is already clean — because this one
+        copies the *row*, whole, from a closed one, without opening it and
+        without dragging across a reply that runs off the bottom of the pane.
         """
         if self.clipboard is None:
             self.toast("no clipboard is wired up here", "warning")

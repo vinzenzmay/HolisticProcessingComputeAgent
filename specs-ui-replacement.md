@@ -198,13 +198,25 @@ list, and it is the bulk of the work.
    keep their furniture, and a message's text and a tool's output do not.
    `tests/test_ui_pane.py::TestTheChatSelectsClean` is the promise.
 
-   Two things came with it. A message shows its words rather than one
-   truncated line of them, because a label line with nothing under it until
-   you press → is not a transcript — `state.FOLDED_KINDS` is now the whole of
-   what the chat still folds, and it holds only `thinking`. And the chat's
-   line list therefore grew from one line per entry to one per line of prose
-   (12,900 lines at 5000 entries, against 5000), which is why `Pane.extend`
-   exists: see §4.2 property 1 and `test_ui_perf.py::TestARowArriving`.
+   **What a closed row shows.** Moving the words off the head line takes the
+   preview with them, and a column of bare `you` / `hpca` labels says who
+   spoke and not a word of what was said. So `Item.preview` is the one line a
+   closed row draws under its label — the message on one line, clipped to the
+   terminal with `ansi.clip`. The mark is `[...]` and deliberately not the
+   `…` `pad` truncates with: that one means the terminal is this wide, this
+   one means there is more of this message and → will show it, and only the
+   second has a gesture attached. A row whose head already summarises it — a
+   turn's working, "8 steps · edit_file → run_bash …" — has no preview and
+   closes to the head alone.
+
+   So the shape is two lines a message closed, the full wrapped text open.
+   Opening is what a selection wants anyway: the clipped line carries a
+   `[...]` that is not part of what anyone said.
+
+   The line list still grew — 8,300 lines at 5000 entries against 5000 —
+   which is why `Pane.extend` exists: a row arriving is added to the cached
+   list instead of dropping it. See §4.2 property 1 and
+   `test_ui_perf.py::TestARowArriving`.
 
 ### 4.2 Protocol gaps
 

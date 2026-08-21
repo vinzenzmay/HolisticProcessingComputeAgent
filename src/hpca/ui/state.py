@@ -37,20 +37,6 @@ OWN_MESSAGE_KINDS = ("user", "queued")
 # What a step's label is padded to in an opened entry, so tool names line up.
 TOOL_COLUMN = 14
 
-# The kinds whose row is folded away until somebody opens it.
-#
-# Everything else shows its words: a transcript you have to unfold one message
-# at a time is not a transcript, and the reason the chat used to draw each
-# entry as one truncated line was that the line had the speaker's label on it
-# and could not afford both. Now the label is a line of its own and the words
-# are underneath it, so there is nothing to truncate and no reason to fold.
-#
-# A turn's working is the exception, and stays the exception: it is the UI's
-# own bookkeeping about the conversation rather than anything anyone said, and
-# folding it into one box per turn is what keeps a hundred-step turn readable
-# as a list (specs-ui-acceptance.md, "The thinking box").
-FOLDED_KINDS = ("thinking",)
-
 # The mode line's copy, lifted from `tui/mode_bar.py` — the hint is the whole
 # value of the row: "auto" and "full-auto" differ by whether a destructive
 # operation stops to ask, which is not something a user should have to
@@ -175,9 +161,17 @@ def entry_item(entry: ChatEntry) -> Item:
     and the message is `body`, which `Pane(flush=True)` draws at column 0 with
     nothing in front of it: what you drag across is what you paste.
 
-    The rows that are *not* somebody's words keep their one-line form — a
-    turn's working, a memory recall, a notice. Those are the UI talking about
-    the conversation, they are short by construction, and nobody pastes them.
+    **And why the row still closes.** A conversation whose every message shows
+    its whole self is a conversation you scroll rather than read: three
+    exchanges fill the pane and the shape of the thing is gone. So a closed
+    row is the label and *one* line — `preview`, clipped to the terminal with
+    a ``[...]`` that says there is more and that → will show it. Two lines a
+    message, which is what a log you can skim costs; the wrapped text and the
+    clean selection are one keypress in.
+
+    The rows that are *not* somebody's words have no preview and close to
+    their head alone — a turn's working already summarises itself ("8 steps ·
+    edit_file → run_bash …"), and a notice is one line to begin with.
     """
     said = _one_line(entry.text)
     # Empty rather than one blank line: an assistant row is appended before
@@ -188,13 +182,13 @@ def entry_item(entry: ChatEntry) -> Item:
     # addresses and what `Pane.expanded` remembers.
     row = dict(kind=entry.kind, text=entry.text, key=str(entry.seq))
     if entry.kind == "user":
-        return Item(head="you", body=body, accent=WHITE, **row)
+        return Item(head="you", body=body, preview=said, accent=WHITE, **row)
     if entry.kind == "queued":
         # Still the user's own words, and still copyable as such — the label
         # is what says they have not been sent yet.
-        return Item(head="you · queued", body=body, accent=DIM, **row)
+        return Item(head="you · queued", body=body, preview=said, accent=DIM, **row)
     if entry.kind == "error":
-        return Item(head="error", body=body, accent=RED, **row)
+        return Item(head="error", body=body, preview=said, accent=RED, **row)
     if entry.kind == "thinking":
         steps = entry.steps or len(entry.parts)
         names = [x.tool or x.kind for x in entry.parts if x.tool or x.kind]
@@ -216,6 +210,7 @@ def entry_item(entry: ChatEntry) -> Item:
     return Item(
         head="hpca",
         body=body,
+        preview=said,
         accent=AMBER,
         **{**row, "kind": entry.kind or "assistant"},
     )
@@ -751,11 +746,7 @@ class SessionState:
         self._rows = {
             entry.seq: i for i, entry in enumerate(self.entries) if entry.seq
         }
-        self.chat.expanded = {
-            str(entry.seq)
-            for entry in self.entries
-            if entry.kind not in FOLDED_KINDS
-        }
+        self.chat.expanded.clear()
         self.chat.invalidate()
         self.chat.cursor = 10**9  # open at the newest, as the old app does
         self.loaded = True
@@ -765,9 +756,7 @@ class SessionState:
         if entry.seq:
             self._rows[entry.seq] = len(self.entries)
         self.entries.append(entry)
-        if entry.kind not in FOLDED_KINDS:
-            self.chat.expanded.add(str(entry.seq))
-        elif self.turn.busy and entry.kind == "thinking" and entry.seq:
+        if self.turn.busy and entry.kind == "thinking" and entry.seq:
             # A turn's steps arrive while it works, and a fold that opened
             # only after the turn ended would show them all at once, after the
             # fact — "the call is on screen *while* the tool runs" is the
@@ -775,11 +764,11 @@ class SessionState:
             # merely animated. The turn's end closes it again.
             self._live.add(str(entry.seq))
             self.chat.expanded.add(str(entry.seq))
-        # `extend`, not `items.append` + `invalidate`: what is open has just
-        # been decided, so the row's lines can be built now and added to the
-        # cache rather than the whole conversation re-flattened on the next
-        # frame. This is the append-only invariant (§3.2) being spent rather
-        # than merely kept.
+        # `extend`, not `items.append` + `invalidate`: whether this row opens
+        # itself has just been decided, so its lines can be built now and
+        # added to the cache rather than the whole conversation re-flattened
+        # on the next frame. This is the append-only invariant (§3.2) being
+        # spent rather than merely kept.
         self.chat.extend(entry_item(entry))
         self.chat.cursor = 10**9
         self.loaded = True

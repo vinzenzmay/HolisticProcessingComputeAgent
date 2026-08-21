@@ -19,10 +19,9 @@ def on_a_closed_entry(ui):
     """Walk the chat cursor down to the first entry that is *closed* and has
     something to open.
 
-    Closed is the part that has to be looked for. A message shows its words
-    without being opened, so the only rows the chat still folds are the turns'
-    working — which is what these tests are therefore about, and what the
-    arrow keys have to keep working on.
+    Closed is the part that has to be looked for rather than assumed: a row
+    can be openable and already open, and a turn's steps open themselves while
+    they arrive, so "the first one with a body" is not the same question.
     """
     pane = ui.chat
     pane.cursor = 0
@@ -349,11 +348,12 @@ class TestTheChatSelectsClean:
 
     SAID = ["the first line of it", "and the second, which is different"]
 
-    def a_chat_with(self, *entries):
+    def a_chat_with(self, *entries, opened=True):
         ui = build(chat=0)
-        session = ui.session
-        session.reset(list(entries))
+        ui.session.reset(list(entries))
         ui.focus = CHAT
+        if opened:
+            ui.chat.expand_all(118)
         return ui
 
     def said(self, seq=1, kind="user"):
@@ -376,6 +376,38 @@ class TestTheChatSelectsClean:
         ui = self.a_chat_with(ChatEntry(kind="assistant", text=long.strip(), seq=1))
         wrapped = [x for x in frame(ui, 120, 40) if x.startswith("word")]
         assert len(wrapped) > 1, "the text has to have wrapped to mean anything"
+
+    def test_a_closed_message_shows_one_line_of_itself(self):
+        # Two lines a message when folded: who said it, and as much of what
+        # they said as the terminal holds. A column of bare labels would say
+        # who spoke and not a word of what was said.
+        ui = self.a_chat_with(self.said(), opened=False)
+        drawn = [x.rstrip() for x in frame(ui, 120, 40)]
+        assert "▸ you" in drawn
+        assert " ".join(self.SAID) in drawn  # short enough to survive whole
+
+    def test_and_says_so_when_there_is_more(self):
+        ui = self.a_chat_with(
+            ChatEntry(kind="assistant", text="a long reply. " * 40, seq=1),
+            opened=False,
+        )
+        clipped = [x.rstrip() for x in frame(ui, 120, 40) if x.startswith("a long")]
+        assert len(clipped) == 1, "a closed row draws one line and no more"
+        assert clipped[0].endswith(" [...]")
+
+    def test_and_that_line_is_flush_too(self):
+        # It is still a line of the conversation, so it still starts at
+        # column 0 — the mark at the end is the only thing on it that is not
+        # what was said.
+        ui = self.a_chat_with(self.said(), opened=False)
+        assert " ".join(self.SAID) in [x.rstrip() for x in frame(ui, 120, 40)]
+
+    def test_a_turn_closes_to_its_head_alone(self):
+        # Its head is already the summary, so a preview would repeat it.
+        ui = self.a_chat_with(ChatEntry(kind="thinking", seq=1, steps=3), opened=False)
+        drawn = [x.rstrip() for x in frame(ui, 120, 40)]
+        assert "  3 steps" in drawn
+        assert sum(1 for x in drawn if "steps" in x) == 1
 
     def test_the_label_is_a_line_of_its_own(self):
         # …which is what buys the line below it: there is nothing left on the
@@ -414,8 +446,8 @@ class TestTheChatSelectsClean:
 class TestAppendingWithoutReflattening:
     """`Pane.extend`: a row arriving costs that row.
 
-    The chat draws every message's text, so its flattened line list is now as
-    long as the conversation is *wide* rather than as long as it is deep, and
+    A chat row is a label and at least one line of what it holds, so the
+    flattened line list is longer than the conversation is deep, and
     rebuilding it on each arriving row would be the O(conversation) event this
     whole UI exists to not have. These are the two halves of that: the cache
     is added to rather than dropped, and what it ends up holding is exactly
@@ -482,3 +514,14 @@ class TestABodyIsWrappedOnce:
         # log is routine — so it is the one that most needs not to be re-folded.
         part = Fold(head="run_bash", body=["a line of output"] * 40)
         assert part.folded(20) is part.folded(20)
+
+    def test_a_closed_row_remembers_its_clipped_line(self):
+        # The other half, and the one that costs on an ordinary screen: most
+        # rows are closed, so most of a rebuild is clipping rather than
+        # folding. Measured on a 5000-entry chat, it was a third of it.
+        item = Item(head="you", preview="a line long enough to want cutting")
+        assert item.clipped(12) is item.clipped(12)
+
+    def test_and_clips_again_at_a_new_width(self):
+        item = Item(head="you", preview="a line long enough to want cutting")
+        assert item.clipped(12) != item.clipped(80)

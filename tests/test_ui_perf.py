@@ -32,10 +32,9 @@ here.
 **The frame is not the only clock.** A frame slices a cached list of lines,
 so it is flat for free; the list itself is built by whatever *changes* the
 conversation, and that is the second cost, paid per arriving row rather than
-per keypress. It only became worth a test when the chat started drawing every
-message's text: the cached list went from one line per entry to one per line
-of prose, and a rebuild per arriving row would have put the O(conversation)
-event back after all the work of taking it out. `TestARowArriving` is that
+per keypress. It only became worth a test when a chat row stopped being one
+line, and a rebuild per arriving row would have put the O(conversation) event
+back after all the work of taking it out. `TestARowArriving` is that
 dimension.
 """
 
@@ -198,11 +197,11 @@ class TestARowArriving:
     kept: the flattened line list is added to, so what a row costs is the
     lines that row draws.
 
-    It matters more than it used to. The chat now shows every message's words
-    instead of one truncated line of them, so its line list is as long as the
-    conversation is *wide* — 12,900 lines at 5000 entries against 5000 before
-    — and a rebuild per arriving row would have been an O(conversation) event
-    on the busiest path there is. During a turn these arrive per tool call.
+    It matters more than it used to. A chat row is a label and at least one
+    line of what it holds, so the line list is longer than the conversation is
+    deep — 8,300 lines at 5000 entries against 5000 when a row was one line —
+    and a rebuild per arriving row would have been an O(conversation) event on
+    the busiest path there is. During a turn these arrive per tool call.
     """
 
     def test_it_does_not_grow_with_the_conversation(self):
@@ -222,7 +221,8 @@ class TestARowArriving:
         ui = build(chat=100)
         before = len(ui.chat.flat(WIDTH - 2))
         ui.session.append(ChatEntry(kind="assistant", text="one\ntwo", seq=10**6))
-        assert len(ui.chat.flat(WIDTH - 2)) == before + 3  # a label and two lines
+        # Closed, so: the label and the one line of preview under it.
+        assert len(ui.chat.flat(WIDTH - 2)) == before + 2
 
 
 # ------------------------------------------------- cost tracks area, not n

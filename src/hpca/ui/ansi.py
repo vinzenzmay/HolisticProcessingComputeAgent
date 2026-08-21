@@ -201,6 +201,34 @@ def pad(text: str, width: int) -> str:
     return head + "…" + " " * (width - 1 - cell_width(head))
 
 
+# What a clipped preview says about itself.
+#
+# Deliberately not the "…" `pad` truncates with, though both mean text was
+# cut. That one is an accident of the terminal being this wide; this one is a
+# fact about the row — there is more of this message, and → shows it. Two
+# different things, and only the second has a gesture attached to it, so they
+# are not allowed to look the same.
+CLIP = " [...]"
+
+
+def clip(text: str, cells: int) -> str:
+    """``text`` in at most ``cells`` cells, marked if anything was cut.
+
+    Measured with `fit_index` rather than `cell_width` so the cost is the
+    width of the row and not the length of the string: the text handed to this
+    is a whole chat message, which can be a megabyte, and it is clipped once
+    per frame it is visible in.
+    """
+    if fit_index(text, 0, cells) >= len(text):
+        return text
+    room = cells - cell_width(CLIP)
+    if room < 1:  # a pane too narrow to say both; the words win
+        return cut(text, cells)
+    # `rstrip` so the mark reads as one space after the last word rather than
+    # as two after a cut that happened to land on one.
+    return cut(text, room).rstrip() + CLIP
+
+
 def fold(text: str, width: int) -> list[str]:
     """``text`` broken into lines of at most ``width`` cells.
 
