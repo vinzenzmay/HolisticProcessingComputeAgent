@@ -55,6 +55,13 @@ from hpca.ui.overlays.rewind import (
     RewindOverlay,
     quoted,
 )
+from hpca.ui.overlays.skillnew import (
+    EMPTY_LIST,
+    REMOVE_QUESTION,
+    SkillCreatorOverlay,
+    SkillRemoveOverlay,
+    skill_file,
+)
 from hpca.ui.overlays.skills import SkillsOverlay
 from hpca.ui.overlays.switchllm import SwitchLlmOverlay
 from hpca.ui.overlays.textedit import ARCHIVE, MEMORIES, SKILL, TextEditOverlay
@@ -66,6 +73,7 @@ __all__ = [
     "BACK_KEYS",
     "COPY",
     "DEFAULT_REFUSAL",
+    "EMPTY_LIST",
     "EMPTY_REFUSAL",
     "FORK",
     "KEEP_CHANGES",
@@ -75,6 +83,7 @@ __all__ = [
     "PREVIEW_CHARS",
     "PREVIEW_LINES",
     "PROFILE",
+    "REMOVE_QUESTION",
     "ROLLBACK",
     "SKILL",
     "UNQUEUE",
@@ -94,6 +103,8 @@ __all__ = [
     "QueuedOverlay",
     "RenameOverlay",
     "RewindOverlay",
+    "SkillCreatorOverlay",
+    "SkillRemoveOverlay",
     "SkillsOverlay",
     "SwitchLlmOverlay",
     "TextEditOverlay",
@@ -107,4 +118,5 @@ __all__ = [
     "profile_rows",
     "quoted",
     "row_key",
+    "skill_file",
 ]

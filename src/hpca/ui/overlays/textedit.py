@@ -43,9 +43,15 @@ class TextEditOverlay(EditorOverlay):
     numbers = False
 
     def __init__(
-        self, text: str, *, profile: str = "", name: str = "", kind: str = MEMORIES
+        self,
+        text: str = "",
+        *,
+        profile: str = "",
+        name: str = "",
+        kind: str = MEMORIES,
+        awaiting=None,
     ) -> None:
-        super().__init__(text)
+        super().__init__(text, awaiting=awaiting)
         self.profile = profile
         # The skill's name for a skill file, and empty for the other two: what
         # the parent needs to know where the text goes back to.

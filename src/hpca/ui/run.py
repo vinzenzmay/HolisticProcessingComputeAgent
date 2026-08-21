@@ -133,6 +133,8 @@ class Loop:
         """
         loop = asyncio.get_running_loop()
         loop.add_reader(self.screen.fd, self._readable)
+        with contextlib.suppress(AttributeError):
+            self.ui.suspend = self.suspend
         self._watch_resize(loop)
         if self.conn is not None:
             self._events_task = asyncio.ensure_future(self._events())
@@ -190,6 +192,44 @@ class Loop:
         self.code = code
         self._stop = True
         self._wake.set()
+
+    def suspend(self, run) -> None:
+        """Give the terminal to something else, then take it back (§4.3 item 37).
+
+        Three things have to be undone and redone around the call, and they are
+        three because three different owners have a claim on the terminal:
+
+        1. **The reader.** `add_reader` is still armed, and a callback firing
+           while `$EDITOR` is reading the same fd would eat the user's
+           keystrokes into a frame nobody can see. Removed first, put back
+           last.
+        2. **The modes.** `Screen.suspended` leaves the alternate screen and
+           restores the line discipline. It is a context manager rather than a
+           pair of calls precisely so that an editor which dies badly does not
+           strand the user there.
+        3. **The frame.** Whatever ran owned the screen, so what comes back is
+           painted whole rather than diffed against a description of somebody
+           else's output.
+
+        Synchronous on purpose. The editor is a foreground program the user is
+        looking at, and there is nothing this loop should be doing meanwhile —
+        events pile up in the connection's queue and are applied on the way
+        back, which is the same thing that happens while a frame is painted.
+        """
+        loop = asyncio.get_running_loop()
+        with contextlib.suppress(OSError, ValueError):
+            loop.remove_reader(self.screen.fd)
+        try:
+            with self.screen.suspended():
+                run()
+        finally:
+            # Whatever happened in there, the UI gets its terminal back: a
+            # raised editor must leave a usable app, not a dead one.
+            with contextlib.suppress(OSError, ValueError):
+                loop.add_reader(self.screen.fd, self._readable)
+            self._pending = ""  # anything typed at the editor was the editor's
+            self._full = True
+            self._wake.set()
 
     def _fail(self, exc: BaseException) -> None:
         """A callback raised. End the loop and carry it out through `run`."""
@@ -347,7 +387,40 @@ class Loop:
             self._events_task = None
 
 
-async def drive(ui, *, client=None, conn=None, screen: Screen | None = None) -> int:
+def copier(screen: Screen, settings=None):
+    """`y` on a chat row, as one callable: text in, a sentence out.
+
+    `hpca.clipboard.ClipboardManager` is framework-free already — it takes an
+    injected ``emit`` and has never known what a driver was — so all this does
+    is give it the one thing it cannot have on its own: the terminal to write
+    OSC 52 to. Everything else about copying (the multiplexer wrapping, the
+    tiers, the size limit, the file fallback) is the manager's, and is not
+    reimplemented here. That is also why it lives in `run.py`: this is the
+    module that owns the tty.
+
+    ``settings`` is a `ClipboardSettings`, handed *in* rather than loaded —
+    reading the settings file is `ui/boot.py`'s job, and it is the last thing
+    in `hpca.ui` that would have needed to. None means the defaults, which is
+    the demo's case: no file is read to find out that OSC 52 is the default.
+    """
+    from hpca.clipboard import ClipboardManager
+
+    if settings is None:
+        from hpca.config import ClipboardSettings
+
+        settings = ClipboardSettings()
+    manager = ClipboardManager(settings, emit=screen.write)
+    return lambda text: manager.copy(text).message
+
+
+async def drive(
+    ui,
+    *,
+    client=None,
+    conn=None,
+    screen: Screen | None = None,
+    clipboard=None,
+) -> int:
     """Set the terminal up, run the loop, and put the terminal back.
 
     The `with` is the whole exception-safety story: a traceback out of the loop
@@ -357,6 +430,12 @@ async def drive(ui, *, client=None, conn=None, screen: Screen | None = None) -> 
     would be testing a shutdown path nobody runs.
     """
     with (screen if screen is not None else Screen()) as scr:
+        if getattr(ui, "clipboard", None) is None:
+            # Inside the `with`, because the manager writes OSC 52 to a
+            # terminal that has to exist. A failure to build one leaves `y`
+            # saying so rather than the app failing to start over a clipboard.
+            with contextlib.suppress(Exception):
+                ui.clipboard = copier(scr, clipboard)
         return await Loop(ui, scr, client=client, conn=conn).run()
 
 

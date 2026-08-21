@@ -16,23 +16,29 @@ from __future__ import annotations
 from hpca.ui.overlays.base import ListOverlay
 from hpca.ui.overlays.textedit import SKILL, TextEditOverlay
 from hpca.ui.pane import Item
-from hpca.ui.state import DeleteSkill, ProfileInfo, SaveSkill, SkillInfo
+from hpca.ui.state import (
+    DeleteSkill,
+    FetchSkills,
+    ProfileInfo,
+    SaveSkill,
+    SkillInfo,
+)
 
 EMPTY = "(no skills for this profile)"
 DELETE_QUESTION = "Delete skill “{name}”?"
 
 
 def skill_item(skill: SkillInfo) -> Item:
+    """One row: the name, and what it is for.
+
+    No body: the file is a `skill.get` away and is fetched when the editor
+    opens, so there is nothing to preview here that would not be a second,
+    staler copy of it.
+    """
     head = skill.name
     if skill.description:
         head = f"{skill.name:<24}{skill.description}"
-    return Item(
-        head=head,
-        body=skill.text.split("\n")[:12] if skill.text else [],
-        kind="skill",
-        text=skill.name,
-        key=skill.name,
-    )
+    return Item(head=head, kind="skill", text=skill.name, key=skill.name)
 
 
 class SkillsOverlay(ListOverlay):
@@ -44,6 +50,23 @@ class SkillsOverlay(ListOverlay):
         self.profile = profile
         super().__init__(self._rows())
         self.subject = ""
+
+    def opened(self) -> None:
+        """Ask for the list (`skill.list`) as the screen goes up.
+
+        The list on `ProfileInfo` is whatever the last answer was, which may be
+        nothing at all — a profile nobody has opened has never been asked about
+        — so the screen draws what it has and corrects itself when the rows
+        land.
+        """
+        self.send(FetchSkills(self.profile.name))
+
+    def fill_list(self, key, rows) -> bool:
+        if key != ("skills", self.profile.name):
+            return False
+        self.profile.skills = list(rows)
+        self.replace(self._rows())
+        return True
 
     def _rows(self) -> list[Item]:
         if not self.profile.skills:
@@ -65,13 +88,16 @@ class SkillsOverlay(ListOverlay):
         if item is None or item.kind != "skill":
             return True
         self.subject = item.text
-        skill = self.skill(item.text)
+        # Fetched as the editor opens (`skill.get`), never carried by the row:
+        # `protocol.SkillGet` spells out why — a body shipped with a listing is
+        # stale by the time the editor is over it, and `skill.save` writes
+        # what it is given.
         return self.open(
             TextEditOverlay(
-                skill.text if skill else "",
                 profile=self.profile.name,
                 name=item.text,
                 kind=SKILL,
+                awaiting=("skill", (self.profile.name, item.text)),
             ),
             SKILL,
         )

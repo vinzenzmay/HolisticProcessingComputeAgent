@@ -33,9 +33,13 @@ class ConfigOverlay(EditorOverlay):
     title = "config editor"
 
     def __init__(
-        self, text: str, *, validate: Callable[[str], str] | None = None
+        self,
+        text: str = "",
+        *,
+        validate: Callable[[str], str] | None = None,
+        awaiting=None,
     ) -> None:
-        super().__init__(text)
+        super().__init__(text, awaiting=awaiting)
         self._validate = validate
 
     def keymap(self) -> list[tuple[str, str]]:

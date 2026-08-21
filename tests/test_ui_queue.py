@@ -133,9 +133,13 @@ class TestAMessageSentWhileTheTurnRuns:
         assert "cannot be queued" in wire.ui.note
 
     async def test_and_still_goes_when_nothing_is_running(self, wire):
+        # As a command, which is what M8 made of it: `command.run`, aimed at
+        # the open session, and never a turn.
         wire.ui.focus = INPUT
         await wire.press(*"/compact", "enter")
-        assert wire.peer.last(protocol.TurnSubmit).text == "/compact"
+        assert wire.peer.took(protocol.TurnSubmit) == []
+        ran = wire.peer.last(protocol.CommandRun)
+        assert (ran.name, ran.session_id) == ("compact", "s1")
 
     async def test_a_reply_landing_after_the_wire_closed_stays_quiet(self, wire):
         # The Textual claim was "a reply landing after the screen is gone must

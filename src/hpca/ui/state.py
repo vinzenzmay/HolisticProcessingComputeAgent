@@ -422,9 +422,23 @@ class Context:
 
 @dataclass
 class Toast:
+    """One `notify`, as the thing that draws it needs it (`ui/toasts.py`).
+
+    The text is kept raw: sanitising on the way in would make the state depend
+    on the renderer's rules, and a toast is also the footer's note, which cuts
+    it differently. `toasts.one` is where it is made safe to draw.
+    """
+
     text: str
     severity: str = "information"
     timeout: float | None = None
+    # `protocol.Notify.title`: a heading for the body, or empty. Carried
+    # separately rather than glued onto the front of the text, which is the
+    # whole reason the field exists on the wire — a renderer can no longer
+    # tell a heading from the body it introduces once they are one string.
+    title: str = ""
+    # When it was raised, on `RowUI.clock`. What decides when it goes.
+    at: float = 0.0
 
 
 @dataclass
@@ -508,9 +522,12 @@ class ProfileInfo:
     because the screens ask about *a profile*, and a name that is in three of
     the four dicts is a bug that only shows up on the fourth screen.
 
-    There is no `profile.list` event yet, so these are handed to `RowUI` the
-    way the sidebar's first rows were before `session.rows` existed. Whatever
-    fills them later fills exactly this shape.
+    Filled from `protocol.ProfileRow` and from nothing else. The *bodies* are
+    deliberately not here: `profile.rows` carries a memory count, and each of
+    the two editable files is fetched when its editor opens (`profile.get`,
+    `skill.get`) so that what is edited is what is on disk now rather than
+    what was on disk when the list was drawn — which, with a verbatim save
+    behind it, is how an edit made elsewhere gets silently reverted.
     """
 
     name: str
@@ -522,13 +539,9 @@ class ProfileInfo:
     # the one the core is currently running under — usually another profile.
     default: bool = False
     working: bool = False
-    # The memories file, the RAG archive, and the profile's own skills, as the
-    # editors open them. ``loaded`` is whether they are real: an editor opened
-    # over text nobody fetched would save an empty file over a full one, and
-    # `profile.save` writes what it is given verbatim.
-    loaded: bool = False
-    text: str = ""
-    archive: str = ""
+    # The profile's own skills, name and description, as `skill.rows` sent
+    # them: what the skills screen lists and what the "/" menu offers. Empty
+    # until something asks (`skill.list`), which is not the same as "none".
     skills: list[SkillInfo] = field(default_factory=list)
 
 
@@ -574,6 +587,14 @@ class SessionState:
         # empty for a session that talks to the bootstrap client.
         self.model = model
         self.draft = Editor(wrap=True)
+        # Which row of the "/" menu is highlighted, for as long as this
+        # session's draft is a command being named. Held here and not on the
+        # app because the draft is held here: a parked `/…` draft has to bring
+        # its menu back with it (specs-ui-acceptance.md, "Drafts"), and the
+        # menu's *contents* need no parking at all — they are a function of the
+        # draft, so restoring the draft restores them. Only the cursor is
+        # state, and this is the one place it can belong to the same session.
+        self.menu_at = 0
         self.chat = Pane("chat", [])
         # The folds this UI opened by itself, because their steps were
         # arriving while the user watched. Remembered so that the end of the
@@ -858,10 +879,17 @@ class OpenSession:
 
 @dataclass(frozen=True)
 class Submit:
-    """Send this message."""
+    """Send this message.
+
+    ``forced_skill`` is what makes ``/<skill> …`` an ordinary turn rather than
+    a command: the skill's procedure goes into the *model's* copy of the
+    message and not into the stored transcript, which is the core's job
+    (`protocol.TurnSubmit.forced_skill`), so all this side carries is the name.
+    """
 
     session_id: str
     text: str
+    forced_skill: str = ""
 
 
 @dataclass(frozen=True)
@@ -994,6 +1022,10 @@ class SetBackend:
 
     backend: dict
     session_id: str = ""
+    # The catalog entry's `LLMEntry.label`, which is the form a picker uses:
+    # the catalog carries no api_key, so a rebuilt blob cannot name a
+    # key-locked backend and a label can. A label wins where both are set.
+    label: str = ""
 
 
 @dataclass(frozen=True)
@@ -1079,6 +1111,30 @@ class ResolveMemory:
 
 
 @dataclass(frozen=True)
+class Fetch:
+    """Ask for a body an editor is about to open — and about to overwrite.
+
+    One intent for the three read paths (`profile.get`, `skill.get`,
+    `settings.get`) because the screens do one thing with all three: open
+    empty, wait, and fill. ``what`` names which, ``key`` is whatever that read
+    path is addressed by, and the same ``key`` comes back on the answer so the
+    screen still waiting for it can recognise its own — a `profile.body` that
+    arrived after the user escaped and opened a different profile must fill
+    nothing.
+    """
+
+    what: str  # "profile", "skill" or "settings"
+    key: tuple = ()
+
+
+@dataclass(frozen=True)
+class FetchSkills:
+    """`skill.list`: a profile's own skills, for the list and for the menu."""
+
+    profile: str
+
+
+@dataclass(frozen=True)
 class RunCommand:
     """A slash command: `/compact`, `/thinking`, `/skills-list`, `/<skill>`.
 
@@ -1120,4 +1176,6 @@ Intent = (
     | DeleteSkill
     | ResolveMemory
     | RunCommand
+    | Fetch
+    | FetchSkills
 )

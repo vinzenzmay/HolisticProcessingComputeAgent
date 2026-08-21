@@ -157,6 +157,7 @@ class Core:
         sync_interval: float = 0.0,
         notices: list[str] | None = None,
         profile: str = "default",
+        clipboard=None,
     ) -> None:
         self.service = service
         self.wire = wire
@@ -171,6 +172,9 @@ class Core:
         # tell — a declined local cache, a quarantined corrupt copy. Delivered
         # as `notify` events so they arrive as toasts like everything else.
         self.notices = list(notices or [])
+        # `ClipboardSettings`, handed on to `ui/run.py` so that `y` can copy.
+        # This module reads the settings file; nothing above it does.
+        self.clipboard = clipboard
         self._tasks: list[asyncio.Task] = []
         self._syncing = False
         self._sync_failing = False
@@ -247,6 +251,7 @@ class Core:
             sync_interval=settings.database.sync_interval_s,
             notices=notices,
             profile=profile,
+            clipboard=settings.clipboard,
         )
         return core
 
@@ -511,7 +516,18 @@ async def start(
     try:
         core.run()
         with quiet_terminal():
-            return await drive(ui, client=client, conn=ui_end, screen=screen)
+            return await drive(
+                ui,
+                client=client,
+                conn=ui_end,
+                screen=screen,
+                # The one settings section the UI side needs: which tier the
+                # clipboard uses. Handed over from here because this is the
+                # module that reads the settings file — `ui/run.py` owns the
+                # terminal and `ui/client.py` owns the wire, and neither of
+                # them reads core state any more.
+                clipboard=core.clipboard,
+            )
     finally:
         with contextlib.suppress(Exception):
             await ui_end.close()

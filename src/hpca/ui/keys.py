@@ -8,7 +8,7 @@ tail back at the front of the next read.
 
 from __future__ import annotations
 
-from hpca.ui.ansi import ESC
+from hpca.ui.ansi import ESC, safe
 
 # Bracketed paste: the terminal wraps anything pasted in these two markers, so
 # a pasted newline can be told from a pressed Return. screen.py asks for it
@@ -117,6 +117,7 @@ KEYS = {
     "\x7f": "backspace",
     "\x08": "ctrl-backspace",  # what most terminals send for ctrl+backspace
     "\x17": "ctrl-backspace",  # and ctrl-w, for the terminals that do not
+    "\x05": "ctrl-e",  # the profile in $EDITOR (§4.3 item 37)
     "\x0c": "ctrl-l",  # switch this session's LLM (§5)
     "\x13": "ctrl-s",
     "\x15": "ctrl-u",
@@ -176,8 +177,7 @@ def clean_paste(text: str) -> str:
     something, which is the one combination that corrupts a differential
     repaint.
     """
-    text = text.replace("\r\n", "\n").replace("\r", "\n").expandtabs(4)
-    return "".join(ch for ch in text if ch == "\n" or (ch >= " " and ch != "\x7f"))
+    return safe(text)
 
 
 def decode(data: bytes | str, *, final: bool = False) -> tuple[list[str], str]:

@@ -165,17 +165,23 @@ class ProfilesOverlay(ListOverlay):
         return self._edit(item.text, MEMORIES)
 
     def _edit(self, name: str, kind: str) -> bool:
-        """Open one of a profile's two files, or say why it cannot be."""
+        """Open one of a profile's two files, fetching it as it opens.
+
+        The body is asked for now rather than carried by the row that offered
+        it (`protocol.ProfileGet`): a body shipped with the listing is already
+        stale by the time an editor opens over it, and the save behind that
+        editor writes verbatim. The screen shows "fetching…" until it lands,
+        and shows the reason instead if the core could not read the file —
+        which is `ProfileBody.error`, and is the only thing that separates an
+        empty file from an unreadable one.
+        """
         self.subject = name
-        info = self.info(name)
-        if info is None or not info.loaded:
+        if self.info(name) is None:
             self.note = UNREADABLE
             return True
         return self.open(
             TextEditOverlay(
-                info.text if kind == MEMORIES else info.archive,
-                profile=name,
-                kind=kind,
+                profile=name, kind=kind, awaiting=("profile", (name, kind))
             ),
             kind,
         )
@@ -188,7 +194,7 @@ class ProfilesOverlay(ListOverlay):
         if key == "r":
             return self._edit(item.text, ARCHIVE)
         if key == "s":
-            if info is None or not info.loaded:
+            if info is None:
                 self.note = UNREADABLE
                 return True
             return self.open(SkillsOverlay(info))
@@ -226,14 +232,13 @@ class ProfilesOverlay(ListOverlay):
         if child.tag in (MEMORIES, ARCHIVE) and getattr(child, "saved", False):
             self.send(SaveProfile(self.subject, child.tag, child.text))
             info = self.info(self.subject)
-            if info is not None:
-                if child.tag == MEMORIES:
-                    info.text = child.text
-                    info.memories = sum(
-                        1 for line in child.text.splitlines() if line.strip()
-                    )
-                else:
-                    info.archive = child.text
+            if info is not None and child.tag == MEMORIES:
+                # The count on the row, shown before the core answers, like
+                # every other optimistic row here: the next `profile.rows` is
+                # what makes it true.
+                info.memories = sum(
+                    1 for line in child.text.splitlines() if line.strip()
+                )
                 self.refresh()
             self.note = f"{child.tag} kept"
         elif child.tag == NAME_NEW and getattr(child, "name", ""):

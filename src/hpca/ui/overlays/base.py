@@ -36,6 +36,7 @@ from hpca.ui.ansi import BOLD, CYAN, DIM, RESET, YELLOW, pad, rule
 from hpca.ui.editor import Editor
 from hpca.ui.keys import NEWLINE_KEYS
 from hpca.ui.pane import Item, Pane
+from hpca.ui.state import Fetch
 
 # What closes a screen everywhere. `quit` is here because ctrl+c on a modal
 # means "get me out of this", not "kill the app underneath it".
@@ -44,6 +45,11 @@ BACK_KEYS = ("esc", "quit")
 # The question an editor asks on the way out, in the words the Textual
 # `MemoryEditorScreen` used, so the reflex transfers.
 KEEP_CHANGES = "Keep changes?"
+
+# What an editor draws while the body it is about to open is still on its way
+# (`profile.get`, `skill.get`, `settings.get`). Not an empty box: an empty box
+# is a file this screen could save over.
+FETCHING = "fetching…"
 
 # How a yes/no is answered, on every screen that asks one. Escape is an answer
 # here rather than a way past — the same rule the app's own confirm follows.
@@ -129,6 +135,15 @@ class Overlay:
         self.sent: list = []
         self.send = self.sent.append
 
+    def opened(self) -> None:
+        """The screen is on the stack and its intents now reach the core.
+
+        Not `__init__`: a screen is constructed before `RowUI.push` wires its
+        ``send``, so anything a screen asks for the moment it opens — the body
+        an editor is about to show, the listing a picker is about to draw —
+        would go into ``sent`` and never leave the process.
+        """
+
     def open(self, child: "Overlay", tag: str = "") -> bool:
         """Put a screen over this one. Always returns True — the caller is a
         ``chose``/``other`` answer, and opening a child never closes us."""
@@ -138,6 +153,24 @@ class Overlay:
 
     def child_closed(self, child: "Overlay") -> None:
         """A screen opened over this one has gone. Read what it decided."""
+
+    # ------------------------------------------------ what arrives afterwards
+
+    def fill(self, key, text: str, error: str = "") -> bool:
+        """A body this screen asked for has arrived. False means "not mine".
+
+        Every editable body is now fetched when its editor opens (`profile.get`,
+        `skill.get`, `settings.get`) rather than carried by the listing that
+        offered it, so a screen opens empty and is filled a frame later. The
+        answer is matched on the same ``key`` the request went out under: a
+        `profile.body` that arrives after the user escaped and opened a
+        different profile must fill nothing.
+        """
+        return False
+
+    def fill_list(self, key, rows) -> bool:
+        """A listing this screen asked for has arrived. False: not mine."""
+        return False
 
     # ------------------------------------------------ what a subclass fills in
 
@@ -301,7 +334,9 @@ class EditorOverlay(Overlay):
     numbers = True
     question = KEEP_CHANGES
 
-    def __init__(self, text: str = "", *, title: str = "") -> None:
+    def __init__(
+        self, text: str = "", *, title: str = "", awaiting=None
+    ) -> None:
         super().__init__()
         self.editor = Editor(text)
         self.was = text
@@ -309,20 +344,68 @@ class EditorOverlay(Overlay):
         # keeping an emptied file is a decision and it looks like "".
         self.text = ""
         self.saved = False
+        # The body this screen asked for and has not been given yet, or None
+        # when it was handed its text outright. A screen that is waiting is
+        # not an empty screen: `profile.save` and `skill.save` write what they
+        # are given, so a buffer that could be typed into before the file
+        # arrived is a buffer that can truncate the file it never showed.
+        self.awaiting = awaiting
+        # Why this body may not be edited at all — `ProfileBody.error`, one
+        # line. Empty error is the only permission to edit.
+        self.blocked = ""
         if title:
             self.title = title
 
+    def opened(self) -> None:
+        """Ask for the body this screen was opened over, if it has none yet."""
+        if self.awaiting is not None:
+            self.send(Fetch(self.awaiting[0], self.awaiting[1]))
+
+    @property
+    def pending(self) -> bool:
+        """Waiting for a body it has nothing to show in the meantime.
+
+        Not simply "a fetch is in flight": a screen handed its text outright —
+        the demo, a test, a UI with no wire behind it — has something to draw
+        and something safe to save, and the answer, when one comes, replaces
+        it. What must never be typed into is a box that is empty *because*
+        nothing has arrived, since the save behind it writes verbatim.
+        """
+        return self.awaiting is not None and not self.was
+
     @property
     def dirty(self) -> bool:
-        return self.editor.text() != self.was
+        return not self.pending and self.editor.text() != self.was
+
+    def fill(self, key, text: str, error: str = "") -> bool:
+        if self.awaiting is None or key != self.awaiting:
+            return False
+        self.awaiting = None
+        if error:
+            self.blocked = self.note = error
+            return True
+        if self.dirty:
+            # Typed into while the fetch was out (only possible when the
+            # screen had text to show already). What the user wrote wins; the
+            # answer only tells us what a save would be overwriting.
+            self.was = text
+            return True
+        self.editor.set_text(text)
+        self.was = text
+        return True
 
     def body(self, width: int, height: int) -> list[str]:
+        if self.pending:
+            return [pad(f"  {FETCHING}", width)] + [" " * width] * max(
+                0, height - 1
+            )
+        if self.blocked:
+            return [YELLOW + pad(f"  {self.blocked}", width) + RESET] + [
+                " " * width
+            ] * max(0, height - 1)
         return self.editor.render(
             width, max(1, height), focused=True, numbers=self.numbers
         )
-
-    def paste(self, text: str) -> None:
-        self.editor.insert_text(text)
 
     def keymap(self) -> list[tuple[str, str]]:
         return [
@@ -334,12 +417,20 @@ class EditorOverlay(Overlay):
     def keys(self, key: str, width: int, height: int) -> bool:
         if key in BACK_KEYS:
             return self.close()
+        if self.pending or self.blocked:
+            # Nothing to edit yet, or nothing that would be safe to save.
+            # Escape is the only key either state answers.
+            return True
         if key == "enter" or key in NEWLINE_KEYS:
             self.editor.newline()
         else:
             self.editor.handle(key)
         self.note = ""
         return True
+
+    def paste(self, text: str) -> None:
+        if not (self.pending or self.blocked):
+            self.editor.insert_text(text)
 
     def close(self) -> bool:
         if not self.dirty:

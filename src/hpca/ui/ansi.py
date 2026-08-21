@@ -268,3 +268,26 @@ def footer_line(
         used += extra
     head = f"{style}{note}{RESET}  " if note else ""
     return " " + head + "  ".join(styled) + " " * max(0, width - used)
+
+
+def safe(text: str) -> str:
+    """Arbitrary text as something this UI can draw and measure.
+
+    The one function every unsanitised string goes through — a pasted block, a
+    `notify` carrying LLM output, a skill description off somebody's disk —
+    and the reason it is here rather than next to any one of them: the risk it
+    answers is a property of *drawing*, not of where the text came from.
+
+    Line endings are normalised because a CR is a line break in the source and
+    not a carriage return to obey. Tabs become spaces because how wide a tab is
+    is the terminal's decision, and a row whose width the terminal decides is a
+    row this UI cannot pad exactly. Everything else in the control range goes,
+    escape sequences included: `cell_width` counts a control character as zero
+    cells and the terminal draws it as *something* — moves the cursor, changes
+    the colour, redefines the character set — which is the one combination that
+    corrupts a differential repaint. The Textual UI met the same class of bug
+    from the other end and answered it with ``markup=False``; there is no
+    markup here, so width and control characters are what is left.
+    """
+    text = text.replace("\r\n", "\n").replace("\r", "\n").expandtabs(4)
+    return "".join(ch for ch in text if ch == "\n" or (ch >= " " and ch != "\x7f"))

@@ -1012,70 +1012,67 @@ class TestTheScreenCommands:
 
 
 class TestTheSettingsFile:
-    """There is no `settings.get`/`settings.save` on the wire: the file is the
-    interface and both ends read it (`UIClient.load_settings`)."""
+    """`settings.get` / `settings.save`, and the split the two of them make.
 
-    async def test_loading_prefills_the_editor(self, wire, monkeypatch, tmp_path):
-        monkeypatch.setenv("HPCA_HOME", str(tmp_path))
-        tmp_path.mkdir(exist_ok=True)
-        (tmp_path / "settings.json").write_text('{"llm": {"model": "written"}}')
-        wire.client.load_settings()
-        assert "written" in wire.ui.settings_json
+    The editor checks that the text is JSON, because that is answerable here
+    with the standard library and is what it needs synchronously to refuse to
+    close. Whether it is valid *settings* — and applying the change, which
+    only the core can do — is the core's half, and comes back as
+    `settings.body` with an ``error`` on it.
+    """
 
-    async def test_the_first_c_fills_the_editor(self, wire, monkeypatch, tmp_path):
-        # Lazily, so a UI that is never asked for the editor never reads it.
-        monkeypatch.setenv("HPCA_HOME", str(tmp_path))
-        (tmp_path / "settings.json").write_text('{"llm": {"model": "lazy"}}')
-        assert wire.ui.settings_json == ""
+    async def test_the_first_c_asks_for_the_file(self, wire):
+        # Asked for as the screen opens, not carried from startup: the core
+        # writes this file too, so a copy from last time can be wrong.
         wire.ui.focus = SESSIONS
         await wire.press("c")
+        assert wire.peer.took(protocol.SettingsGet)
+
+    async def test_and_the_answer_fills_the_editor(self, wire):
+        wire.ui.focus = SESSIONS
+        await wire.press("c")
+        await wire.tell(protocol.SettingsBody(text='{"llm": {"model": "lazy"}}'))
         assert "lazy" in wire.ui.overlay.editor.text()
 
-    async def test_a_missing_file_falls_back_to_the_model_s_defaults(
-        self, wire, monkeypatch, tmp_path
-    ):
-        monkeypatch.setenv("HPCA_HOME", str(tmp_path / "nothing-here"))
-        wire.client.load_settings()
-        assert wire.ui.settings_json.startswith("{")
-
-    async def test_saving_writes_it(self, wire, monkeypatch, tmp_path):
-        monkeypatch.setenv("HPCA_HOME", str(tmp_path))
-        wire.client.load_settings()
-        edited = wire.ui.settings_json.replace('"local_cache": true', '"local_cache": false')
-        wire.client.intent(state.SaveSettings(edited))
-        assert '"local_cache": false' in (tmp_path / "settings.json").read_text()
-
-    async def test_and_says_the_llm_changes_wait_for_a_restart(
-        self, wire, monkeypatch, tmp_path
-    ):
-        # The core built its clients from the settings it loaded at startup and
-        # nothing on the wire asks it to build them again.
-        monkeypatch.setenv("HPCA_HOME", str(tmp_path))
-        wire.client.load_settings()
-        wire.client.intent(state.SaveSettings(wire.ui.settings_json))
-        assert "next start" in wire.ui.note
-
-    async def test_a_file_the_model_refuses_is_not_written(
-        self, wire, monkeypatch, tmp_path
-    ):
-        monkeypatch.setenv("HPCA_HOME", str(tmp_path))
-        wire.client.intent(
-            state.SaveSettings('{"database": {"sync_interval_s": "soon"}}')
-        )
-        assert not (tmp_path / "settings.json").exists()
-        assert "invalid" in wire.ui.note
-
-    async def test_the_validator_reaches_the_editor(
-        self, wire, monkeypatch, tmp_path
-    ):
-        monkeypatch.setenv("HPCA_HOME", str(tmp_path))
-        wire.client.load_settings()
+    async def test_until_it_lands_there_is_nothing_to_type_into(self, wire):
+        # An empty box would be a file this screen could save over.
         wire.ui.focus = SESSIONS
         await wire.press("c")
-        wire.ui.overlay.editor.set_text('{"database": {"sync_interval_s": "soon"}}')
+        assert "fetching" in wire.screen()
+        await wire.press("X")
+        assert wire.ui.overlay.editor.text() == ""
+
+    async def test_saving_sends_the_text(self, wire):
+        wire.client.intent(state.SaveSettings('{"llm": {"model": "new"}}'))
+        await wire.client.flush()
+        await settle()
+        sent = wire.peer.last(protocol.SettingsSave)
+        assert sent.text == '{"llm": {"model": "new"}}'
+
+    async def test_and_what_landed_comes_back(self, wire):
+        # Not the bytes that were sent: the core writes the validated model
+        # back out, so the file says more than the editor did.
+        await wire.tell(protocol.SettingsBody(text='{"llm": {"model": "new"}}'))
+        assert "new" in wire.ui.settings_json
+
+    async def test_a_refused_save_says_why_and_keeps_the_file(self, wire):
+        await wire.tell(
+            protocol.SettingsBody(
+                text='{"kept": true}',
+                error="database.sync_interval_s: not a whole number",
+            )
+        )
+        assert "sync_interval_s" in wire.ui.note
+        assert wire.ui.settings_json == '{"kept": true}'
+
+    async def test_the_json_check_reaches_the_editor(self, wire):
+        wire.ui.focus = SESSIONS
+        await wire.press("c")
+        await wire.tell(protocol.SettingsBody(text="{}"))
+        wire.ui.overlay.editor.set_text("{not json")
         await wire.press("esc")
-        assert wire.ui.overlay is not None, "invalid values keep it open"
-        assert "invalid" in wire.screen()
+        assert wire.ui.overlay is not None, "broken json keeps it open"
+        assert "invalid JSON" in wire.screen()
 
 
 class TestThinkingOnTheSidebar:

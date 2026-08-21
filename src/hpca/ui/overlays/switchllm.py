@@ -97,16 +97,12 @@ class SwitchLlmOverlay(ListOverlay):
         picked = self.picked(item.key)
         if picked is None:  # pragma: no cover - the rows are built from the list
             return False
-        if picked.needs_key:
-            self.note = NEEDS_KEY
-            return True
         self.chosen = picked
-        # Named session, so this is the per-session half of `backend.set` and
-        # not the global one — the two are told apart by exactly that. The blob
-        # is rebuilt from what the catalog carries, which for a keyless entry
-        # is everything `config.LLMBackend` needs.
-        blob: dict = {"model": picked.model, "base_url": picked.base_url}
-        if picked.context:
-            blob["max_model_len"] = picked.context
-        self.send(SetBackend(blob, self.session_id))
+        # By *label*, which is what makes a key-locked backend reachable at
+        # all: the catalog deliberately carries no api_key, so a front-end
+        # sending back a rebuilt blob would name an endpoint it was never
+        # given the key for and the core would build a client that 401s
+        # (`protocol.BackendSet`). Naming the entry leaves the key where it
+        # already is. Named session, so this is the per-session half.
+        self.send(SetBackend({}, self.session_id, label=picked.label))
         return False

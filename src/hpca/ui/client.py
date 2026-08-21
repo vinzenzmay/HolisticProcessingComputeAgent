@@ -73,24 +73,23 @@ def _entry(wire: protocol.Entry) -> state.ChatEntry:
 
 
 def _settings_error(text: str) -> str:
-    """Why this text is not a settings file, in one line, or "".
+    """Why this text is not JSON, in one line, or "".
 
-    The config editor refuses to close on a non-empty answer (§4.3 item 26),
-    so it has to fit on a rule: pydantic's own report is several lines and a
-    front-end that pasted all of it would push the editor off screen.
+    Deliberately only half the check, and the split is `protocol.SettingsSave`'s:
+    whether the text is *JSON* is answerable here with the standard library and
+    no idea what a setting is, which is exactly what the editor needs
+    synchronously in order to refuse to close (§4.3 item 26). Whether it is a
+    valid `Settings` — which fields exist, what they may hold — is the core's
+    model to know, and comes back as `SettingsBody.error` after the save is
+    refused. A front-end carrying a copy of the schema in order to be trusted
+    with it is the thing this arrangement avoids.
     """
-    from pydantic import ValidationError
-
-    from hpca.config import Settings
+    import json
 
     try:
-        Settings.model_validate_json(text)
-    except ValidationError as e:
-        first = e.errors()[0]
-        where = ".".join(str(x) for x in first.get("loc", ())) or "settings"
-        return f"invalid: {where} — {first.get('msg', 'not accepted')}"
+        json.loads(text)
     except ValueError as e:
-        return f"invalid: {e}"
+        return f"invalid json: {e}"
     return ""
 
 
@@ -115,52 +114,6 @@ def _panel_item(row: protocol.PanelRow) -> Item:
         key=row.key,
     )
 
-
-def _profile(info: state.ProfileInfo) -> state.ProfileInfo:
-    """Fill in the three bodies the profiles screen's editors open.
-
-    **A stopgap, and it is worth being explicit about which half is which.**
-    Writing a profile is on the wire — `profile.save`, `skill.save`,
-    `skill.delete` — because the write is what has to invalidate the core's
-    loaded copy. *Reading* one is not: `profile.rows` carries a memory count
-    and nothing else, and there is no `profile.get` or `skill.list` to ask.
-
-    So these are read here, out of the app dir, through the same modules the
-    core uses — the same bargain already made for the settings file, and for
-    the same reason: it is a file both ends read, it costs no database, and
-    the alternative is a memory editor that opens over an empty box and whose
-    save would then truncate what it could not show.
-
-    Never raises, and says so through ``loaded``: a profile whose files could
-    not be read is one the screens must refuse to edit rather than edit blind.
-    """
-    from hpca.curator import archive_path
-    from hpca.profiles import Profile
-    from hpca.skills import load_own_skills, skill_path
-
-    try:
-        info.text = Profile.load(info.name).render()
-        archive = archive_path(info.name)
-        info.archive = archive.read_text() if archive.exists() else ""
-        info.skills = [
-            state.SkillInfo(
-                name=skill.name,
-                description=skill.description,
-                text=_read(skill_path(skill.name, info.name)),
-            )
-            for skill in load_own_skills(info.name)
-        ]
-        info.loaded = True
-    except Exception as e:  # pragma: no cover - an unreadable app dir
-        logger.warning("could not read profile %s: %s", info.name, e)
-    return info
-
-
-def _read(path) -> str:
-    try:
-        return path.read_text()
-    except OSError:  # pragma: no cover - a file that went away under us
-        return ""
 
 
 class UIClient:
@@ -190,11 +143,19 @@ class UIClient:
         # and it is still not the conversation the user is looking at until
         # something has asked the core for it.
         self._opened = False
+        # Which profile a ctrl+e is out for, or "": the editor cannot open
+        # until `profile.body` arrives, and there is one terminal to hand over.
+        self._editing = ""
         ui.send = self.intent
-        # Filled on the first `c`, not now: the settings file is read by this
-        # side (there is no `settings.get` on the wire, see `load_settings`),
-        # and a UI that is never asked for the editor should never read it.
-        ui.settings_loader = self.load_settings
+        # Asked for on the first `/`, and answered a frame later by
+        # `skill.rows` — the menu is a function of what has arrived, so it
+        # fills itself the moment it does.
+        ui.skills_loader = self.ask_skills
+        ui.edit_profile = self.edit_profile
+        # Syntax only, and eagerly: it is a pure function of the text, and the
+        # verdict that needs the settings model comes back as
+        # `SettingsBody.error` (see `_settings_error`).
+        ui.validate_settings = _settings_error
 
     # ------------------------------------------------------------- outbound
 
@@ -238,7 +199,14 @@ class UIClient:
             self.command(protocol.SessionFocus(session_id=session))
         elif isinstance(intent, state.Submit):
             self.command(
-                protocol.TurnSubmit(session_id=session, text=intent.text)
+                protocol.TurnSubmit(
+                    session_id=session,
+                    text=intent.text,
+                    # None rather than "" when no skill was named: the wire
+                    # spells "no forced skill" as null, and the core looks the
+                    # name up in the *session's* profile (`_skill_named`).
+                    forced_skill=intent.forced_skill or None,
+                )
             )
         elif isinstance(intent, state.Interrupt):
             self.command(protocol.TurnInterrupt(session_id=session))
@@ -280,7 +248,9 @@ class UIClient:
             # string would name a conversation that does not exist.
             self.command(
                 protocol.BackendSet(
-                    backend=intent.backend, session_id=intent.session_id or None
+                    backend=intent.backend,
+                    label=intent.label,
+                    session_id=intent.session_id or None,
                 )
             )
         elif isinstance(intent, state.SetProfile):
@@ -328,8 +298,30 @@ class UIClient:
                     session_id=intent.session_id or None,
                 )
             )
+        elif isinstance(intent, state.Fetch):
+            # The three read paths, one intent (`state.Fetch`): a screen names
+            # what it wants and the answer comes back addressed by the same
+            # key, so a body that outlived the screen that asked for it fills
+            # nothing (`RowUI.body_arrived`).
+            if intent.what == "profile":
+                name, kind = intent.key
+                self.command(protocol.ProfileGet(name=name, kind=kind))
+            elif intent.what == "skill":
+                profile, name = intent.key
+                self.command(protocol.SkillGet(profile=profile, name=name))
+            elif intent.what == "settings":
+                self.command(protocol.SettingsGet())
+            else:  # pragma: no cover - a screen asking for something new
+                logger.warning("no read path for %r", intent.what)
+        elif isinstance(intent, state.FetchSkills):
+            self.command(protocol.SkillList(profile=intent.profile))
         elif isinstance(intent, state.SaveSettings):
-            self._save_settings(intent.text)
+            # Straight out, with only the JSON check already done on screen.
+            # What is *in* the file is the core's model to judge, and it is the
+            # core that has to rebuild the clients a change affects — which is
+            # the half the old front-end could do nothing about and answered
+            # with "applies on next start".
+            self.command(protocol.SettingsSave(text=intent.text))
         else:  # pragma: no cover - every Intent member is handled above
             logger.warning("no command for %r", intent)
 
@@ -344,56 +336,93 @@ class UIClient:
         """
         self.command(protocol.ProfileList())
 
-    # --------------------------------------------------------- the settings
+    # ------------------------------------------- the skills, and $EDITOR
 
-    def load_settings(self) -> None:
-        """Fill the config editor's text and its validator from `hpca.config`.
+    def ask_skills(self, profile: str) -> None:
+        """`skill.list`: what the "/" menu offers besides the seven built-ins.
 
-        Here rather than in `app.py` for the reason everything is: the app has
-        never heard of a settings model and must not learn about one to draw a
-        box of text (§3.1). Here rather than on the wire because there is no
-        `settings.get`/`settings.save` on it — the file is the interface, both
-        processes read it, and giving it a command belongs to the milestone
-        that actually separates them (M11).
+        **A profile's *own* skills, and only those** — that is what the command
+        answers (`core.service._emit_skills`), and it is a smaller set than the
+        menu wants. HPCA ships skills, and a shared or project one is callable
+        too; none of them appear here, so `/plan` on a fresh install reports
+        itself unknown. That is a gap in the wire and not a decision taken
+        here: closing it wants a scope on `skill.list`, which is a protocol
+        change, and reading the skills directory instead is the rule-2
+        stopgap this milestone exists to remove.
         """
-        from hpca.config import Settings, settings_path
+        self.command(protocol.SkillList(profile=profile))
 
-        self.ui.validate_settings = _settings_error
+    # --------------------------------------------------------------- $EDITOR
+
+    def edit_profile(self, profile: str) -> None:
+        """ctrl+e: this profile's memories in `$EDITOR`, in three steps.
+
+        The steps are `profile.get`, the editor, `profile.save`, and they are
+        in that order for the reason every editor here fetches: the file is
+        also written by the agent, and `profile.save` writes verbatim — an
+        editor opened over a stale copy silently reverts whatever the agent
+        learned in between.
+
+        That makes the whole thing asynchronous, which is why this returns
+        nothing: the request goes out now and `_profile_body` picks it up when
+        the answer lands, hands the terminal over (`RowUI.suspend`, wired by
+        `ui/run.py`) and takes it back. A second ctrl+e while one is out is
+        ignored rather than queued — there is one terminal.
+        """
+        if self._editing:
+            return
+        self._editing = profile
+        self.command(protocol.ProfileGet(name=profile, kind="memories"))
+
+    def _run_editor(self, profile: str, text: str) -> None:
+        """The middle step: a scratch file, the user's editor, and the save.
+
+        A temporary file rather than the profile's own path, because a path is
+        not on the wire and asking for one would be asking the core to hand
+        out filesystem access — the thing this protocol is careful not to be.
+        What comes back out is sent as `profile.save`, which is the same
+        command the memory editor uses and the one that invalidates the core's
+        loaded copy (`core.memory_service.invalidate`).
+
+        Editor resolution is `hpca.editor.resolve_editor` — settings, then
+        `$VISUAL`, then `$EDITOR`, then nano — and is not reimplemented; the
+        settings half comes out of the JSON this UI already holds, so no
+        config module is imported to read one field.
+        """
+        import json
+        import os
+        import subprocess
+        import tempfile
+
+        from hpca.editor import resolve_editor
+
+        chosen = None
         try:
-            self.ui.settings_json = settings_path().read_text()
-        except OSError:
-            # Never written, or unreadable. The model's own defaults are a
-            # truthful starting point and are what `Settings.load` would use.
+            chosen = json.loads(self.ui.settings_json or "{}").get("editor")
+        except ValueError:  # a settings file too broken to parse: still edit
+            pass
+        argv = resolve_editor(chosen if isinstance(chosen, str) else None, os.environ)
+        with tempfile.TemporaryDirectory(prefix="hpca-edit-") as scratch:
+            path = os.path.join(scratch, f"{profile or 'profile'}.md")
             try:
-                self.ui.settings_json = Settings().model_dump_json(indent=2)
-            except Exception:  # pragma: no cover - a broken settings model
-                self.ui.settings_json = "{}"
-
-    def _save_settings(self, text: str) -> None:
-        """Write the edited file, having already been told it is valid.
-
-        Validated again rather than trusted: the check the editor ran is the
-        one that let it close, and between the two the only thing that can
-        have changed is which process is asking.
-        """
-        from hpca.config import Settings
-
-        error = _settings_error(text)
-        if error:
-            self.ui.toast(error, "error")
+                with open(path, "w") as handle:
+                    handle.write(text)
+                code = subprocess.call([*argv, path])
+                edited = open(path).read()
+            except OSError as e:
+                self.ui.toast(f"could not run {argv[0]}: {e}", "error")
+                return
+        if code != 0:
+            self.ui.toast(
+                f"{argv[0]} exited with {code} — nothing was saved", "warning"
+            )
             return
-        try:
-            Settings.model_validate_json(text).save()
-        except Exception as e:  # pragma: no cover - a read-only app dir
-            self.ui.toast(f"could not write the settings: {e}", "error")
+        if edited == text:
+            self.ui.toast(f"“{profile}” unchanged")
             return
-        self.ui.settings_json = text
-        # Said out loud because it is not the whole truth: the core built its
-        # clients and its graph from the settings it loaded at startup, and
-        # nothing on the wire asks it to build them again.
-        self.ui.toast(
-            "settings saved — llm and database changes apply on the next start"
-        )
+        self.command(protocol.ProfileSave(name=profile, kind="memories", text=edited))
+        self._reread_profiles()
+        self.ui.toast(f"saved and reloaded “{profile}”")
 
     def _cycle_mode(self, session_id: str) -> None:
         """The next mode, worked out here and shown before the core answers.
@@ -604,20 +633,22 @@ class UIClient:
     def _profiles(self, msg: protocol.ProfileRows) -> None:
         """The profiles, whole — the answer to `profile.list`.
 
-        The two file bodies the editors open are deliberately absent: the row
-        carries a *count* (`protocol.ProfileRow`), and the text of a profile's
-        memories is a `profile.save` round trip away rather than something
-        shipped to every client on connect.
+        The bodies the editors open are deliberately absent: the row carries a
+        *count* (`protocol.ProfileRow`), and each file is a `profile.get` away,
+        fetched when its editor opens rather than shipped to every client on
+        connect. The skills a profile already listed are kept across the
+        refresh — this event says nothing about them, and dropping them would
+        empty a screen that is open over them.
         """
+        known = {x.name: x.skills for x in self.ui.profiles}
         self.ui.profiles = [
-            _profile(
-                state.ProfileInfo(
-                    name=row.name,
-                    memories=row.memories,
-                    copied_from=row.copied_from,
-                    default=row.is_default,
-                    working=row.working,
-                )
+            state.ProfileInfo(
+                name=row.name,
+                memories=row.memories,
+                copied_from=row.copied_from,
+                default=row.is_default,
+                working=row.working,
+                skills=known.get(row.name, []),
             )
             for row in msg.rows
         ]
@@ -773,8 +804,74 @@ class UIClient:
                 f"“{session.title or msg.session_id}”"
             )
 
+    # ------------------------------------------------------- the read paths
+
+    def _profile_body(self, msg: protocol.ProfileBody) -> None:
+        """`profile.body`: to the editor waiting for it, or into `$EDITOR`.
+
+        Two callers, one event, told apart by whether a ctrl+e is out. The
+        editor suspend happens here rather than at the keypress because this is
+        the moment the text exists: `_run_editor` writes it, runs the program
+        and sends what comes back.
+        """
+        if self._editing == msg.name and msg.kind == "memories":
+            profile, self._editing = self._editing, ""
+            if msg.error:
+                self.ui.toast(msg.error, "error")
+                return
+            suspend = getattr(self.ui, "suspend", None)
+            if suspend is None:
+                self.ui.toast("no terminal to hand over", "warning")
+                return
+            try:
+                suspend(lambda: self._run_editor(profile, msg.text))
+            except Exception as e:
+                self.ui.toast(f"cannot suspend for editing: {e}", "error")
+            return
+        self.ui.body_arrived(
+            ("profile", (msg.name, msg.kind)), msg.text, msg.error
+        )
+
+    def _skill_rows(self, msg: protocol.SkillRows) -> None:
+        """`skill.rows`: the list a screen is drawing and the "/" menu offers."""
+        skills = [
+            state.SkillInfo(name=row.name, description=row.description)
+            for row in msg.skills
+        ]
+        self.ui.skills_listed(msg.profile, skills)
+        self.ui.list_arrived(("skills", msg.profile), skills)
+
+    def _skill_body(self, msg: protocol.SkillBody) -> None:
+        self.ui.body_arrived(
+            ("skill", (msg.profile, msg.name)), msg.text, msg.error
+        )
+
+    def _settings_body(self, msg: protocol.SettingsBody) -> None:
+        """`settings.body`: the file as it is on disk now.
+
+        Sent both in answer to `settings.get` and after every `settings.save`,
+        including a save the core refused — in which case ``error`` says why
+        and ``text`` still describes the file that is still there. So the
+        error is a toast and the body is applied either way, and the editor is
+        never reopened over rejected text: what the user typed is on their
+        screen, not here.
+        """
+        self.ui.settings_json = msg.text
+        self.ui.body_arrived(("settings", ()), msg.text)
+        if msg.error:
+            self.ui.toast(msg.error, "error")
+
     def _notify(self, msg: protocol.Notify) -> None:
-        self.ui.toast(msg.text, msg.severity, msg.timeout)
+        """A toast, heading and all — the whole of §3.2's `notify` row.
+
+        `title` is passed through rather than glued onto the front of the text,
+        which is exactly what the field exists for (`protocol.Notify.title`): a
+        few of the core's answers are a heading plus a block — the skills a
+        profile can see, the summary `/compact` just wrote, the xhigh warning
+        — and a renderer handed one string can no longer tell which half is
+        which.
+        """
+        self.ui.toast(msg.text, msg.severity, msg.timeout, title=msg.title)
 
     def _peeked(self, msg: protocol.WatchPeeked) -> None:
         """The answer to a keypress, drawn where a toast is drawn.
@@ -810,6 +907,10 @@ UIClient._HANDLERS = {
     protocol.ConfirmRequested.__name__: UIClient._confirm,
     protocol.PanelUpdate.__name__: UIClient._panel,
     protocol.MemoryProposals.__name__: UIClient._proposals,
+    protocol.ProfileBody.__name__: UIClient._profile_body,
+    protocol.SkillRows.__name__: UIClient._skill_rows,
+    protocol.SkillBody.__name__: UIClient._skill_body,
+    protocol.SettingsBody.__name__: UIClient._settings_body,
     protocol.Notify.__name__: UIClient._notify,
     protocol.WatchPeeked.__name__: UIClient._peeked,
 }

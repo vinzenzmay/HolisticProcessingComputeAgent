@@ -38,6 +38,8 @@ from hpca.ui.state import (
     CreateProfile,
     DeleteProfile,
     DeleteSkill,
+    Fetch,
+    FetchSkills,
     ProfileInfo,
     Proposal,
     ResolveMemory,
@@ -48,7 +50,14 @@ from hpca.ui.state import (
     SetThinking,
     SkillInfo,
 )
-from tests.ui_harness import frame, on_own_message, plain, recorded, widths
+from tests.ui_harness import (
+    frame,
+    on_own_message,
+    plain,
+    recorded,
+    served,
+    widths,
+)
 
 HELP_MENTIONS = ["m", "a", "c", "→", "←", "^u", "^← ^→", "shift-← →", "^del"]
 WIDTHS = [80, 100, 137]
@@ -80,21 +89,46 @@ def sent(ui: RowUI, kind: type) -> list:
     return [x for x in ui.intents if isinstance(x, kind)]
 
 
+# The bodies the editors fetch when they open (`profile.get`, `skill.get`),
+# as the local `served()` core answers them. A key that is missing is answered
+# with an error, which is how the core says a file could not be read.
+BODIES = {
+    ("profile", ("hpc", "memories")): "scratch is /scratch/proj\n",
+    ("profile", ("hpc", "archive")): "## [rag] old\n",
+    ("profile", ("default", "memories")): "",
+    ("profile", ("writing", "memories")): "x\n",
+    ("skill", ("hpc", "merge-vcfs")): "body\n",
+}
+OWN_SKILLS = {"hpc": [SkillInfo("merge-vcfs", "how to merge shards")]}
+
+
+def with_profiles(rows=None, bodies=None, skills=None) -> RowUI:
+    """A bare `RowUI` on the sessions column, with the read paths answered."""
+    ui = RowUI(profiles=profiles() if rows is None else rows)
+    ui.focus = SESSIONS
+    return served(
+        ui,
+        BODIES if bodies is None else bodies,
+        OWN_SKILLS if skills is None else skills,
+    )
+
+
 def profiles() -> list[ProfileInfo]:
+    """What `profile.rows` fills in — counts and flags, and no bodies.
+
+    The bodies are fetched when an editor opens (`profile.get`, `skill.get`),
+    so a `ProfileInfo` no longer carries any: what a screen shows before its
+    answer arrives is "fetching…", which is the point of it.
+    """
     return [
         ProfileInfo(
             name="hpc",
             memories=12,
-            loaded=True,
             working=True,
-            text="scratch is /scratch/proj\n",
-            archive="## [rag] old\n",
-            skills=[SkillInfo("merge-vcfs", "how to merge shards", "body\n")],
+            skills=[SkillInfo("merge-vcfs", "how to merge shards")],
         ),
-        ProfileInfo(name="default", memories=0, default=True, loaded=True),
-        ProfileInfo(
-            name="writing", memories=5, copied_from="hpc", loaded=True, text="x\n"
-        ),
+        ProfileInfo(name="default", memories=0, default=True),
+        ProfileInfo(name="writing", memories=5, copied_from="hpc"),
     ]
 
 
@@ -317,9 +351,7 @@ class TestProfilesList:
 
 class TestProfileMemories:
     def _open(self):
-        ui = RowUI(profiles=profiles())
-        ui.focus = SESSIONS
-        return press(ui, "a", "enter")
+        return press(with_profiles(), "a", "enter")
 
     def test_enter_opens_a_profiles_memories_in_the_editor(self):
         ui = self._open()
@@ -349,34 +381,39 @@ class TestProfileMemories:
         assert press(ui, "esc").overlay is None
 
     def test_r_opens_the_rag_archive(self):
-        ui = RowUI(profiles=profiles())
-        ui.focus = SESSIONS
-        press(ui, "a", "r")
+        ui = press(with_profiles(), "a", "r")
         assert isinstance(ui.overlay, TextEditOverlay)
         assert ui.overlay.kind == "archive"
 
     def test_and_keeps_its_edits(self):
-        ui = RowUI(profiles=profiles())
-        ui.focus = SESSIONS
-        press(ui, "a", "r")
+        ui = press(with_profiles(), "a", "r")
         type_text(ui, "Z")
         press(ui, "esc", "y")
         assert sent(ui, SaveProfile)[-1].kind == "archive"
 
     def test_r_is_inert_on_the_new_profile_row(self):
-        ui = RowUI(profiles=profiles())
-        ui.focus = SESSIONS
-        press(ui, "a", "end", "r")
+        ui = press(with_profiles(), "a", "end", "r")
         assert isinstance(ui.overlay, ProfilesOverlay)
 
-    def test_an_unreadable_profile_is_not_opened_at_all(self):
-        # `profile.save` writes verbatim, so an editor over text nobody could
-        # fetch would truncate the file it failed to show.
-        ui = RowUI(profiles=[ProfileInfo(name="hpc", loaded=False)])
-        ui.focus = SESSIONS
-        press(ui, "a", "enter")
-        assert isinstance(ui.overlay, ProfilesOverlay)
+    def test_the_body_is_fetched_when_the_editor_opens(self):
+        # Never carried by the row that offered it: `profile.save` writes
+        # verbatim, and a body shipped with a listing is already stale by the
+        # time the editor is over it (`protocol.ProfileGet`).
+        ui = press(with_profiles(), "a", "enter")
+        asked = [x for x in ui.intents if isinstance(x, Fetch)]
+        assert asked[-1] == Fetch("profile", ("hpc", "memories"))
+
+    def test_an_unreadable_profile_cannot_be_edited(self):
+        # `profile.save` writes verbatim, so a box that filled with nothing
+        # would truncate the file it failed to show. `ProfileBody.error` is the
+        # only thing that separates that from an empty file.
+        ui = press(with_profiles(bodies={}), "a", "enter")
+        assert isinstance(ui.overlay, TextEditOverlay)
         assert "could not be read" in screen(ui)
+        type_text(ui, "X")
+        assert ui.overlay.editor.text() == ""
+        press(ui, "esc")
+        assert sent(ui, SaveProfile) == [], "nothing may be written back"
 
 
 class TestProfileLifecycle:
@@ -460,9 +497,7 @@ class TestProfileLifecycle:
 
 class TestProfileSkills:
     def _skills(self):
-        ui = RowUI(profiles=profiles())
-        ui.focus = SESSIONS
-        return press(ui, "a", "s")
+        return press(with_profiles(), "a", "s")
 
     def test_s_lists_a_profiles_skills(self):
         ui = self._skills()
@@ -470,9 +505,7 @@ class TestProfileSkills:
         assert "merge-vcfs" in screen(ui)
 
     def test_s_is_inert_on_the_new_profile_row(self):
-        ui = RowUI(profiles=profiles())
-        ui.focus = SESSIONS
-        press(ui, "a", "end", "s")
+        ui = press(with_profiles(), "a", "end", "s")
         assert isinstance(ui.overlay, ProfilesOverlay)
 
     def test_enter_edits_one(self):
@@ -508,9 +541,14 @@ class TestProfileSkills:
         assert sent(ui, DeleteSkill) == []
 
     def test_a_profile_with_no_skills_says_so(self):
-        ui = RowUI(profiles=[ProfileInfo(name="bare", loaded=True)])
-        ui.focus = SESSIONS
+        ui = with_profiles(rows=[ProfileInfo(name="bare")], skills={})
         assert "(no skills for this profile)" in screen(press(ui, "a", "s"))
+
+    def test_the_list_is_asked_for_when_the_screen_opens(self):
+        # `skill.list`, not a copy carried on the profile row: the screen is
+        # also how a skill is deleted, so what it lists has to be current.
+        ui = press(with_profiles(), "a", "s")
+        assert FetchSkills("hpc") in ui.intents
 
 
 # ------------------------------------------------------ thinking (item 30)
@@ -624,10 +662,13 @@ class TestSwitchLlm:
         assert "★ ● qwen3" in screen(ui)
 
     def test_enter_sets_the_sessions_backend(self):
+        # By label, not by a rebuilt blob: the catalog carries no api key, and
+        # naming the entry the core already holds is what lets a key-locked
+        # backend be switched to at all (`protocol.BackendSet`).
         ui = press(self._open(), "enter")
         picked = sent(ui, SetBackend)[-1]
         assert picked.session_id == ui.active_id
-        assert picked.backend["model"] == "qwen3-27b-fp8"
+        assert picked.label == "qwen3"
 
     def test_and_updates_the_model_line(self):
         ui = press(self._open(), "enter")
@@ -637,13 +678,13 @@ class TestSwitchLlm:
         ui = press(self._open(), "down", "esc")
         assert sent(ui, SetBackend) == []
 
-    def test_a_key_locked_entry_is_refused_rather_than_half_sent(self):
-        # The catalog never carries an api key, so a blob built from it would
-        # make a client the endpoint answers 401 to.
+    def test_a_key_locked_entry_is_reachable_now_that_labels_are(self):
+        # It used to be refused: the catalog carries no api key, so a blob
+        # built from it made a client the endpoint answered 401 to. The label
+        # form leaves the key where the core already has it.
         ui = press(self._open(), "end", "enter")
-        assert sent(ui, SetBackend) == []
-        assert isinstance(ui.overlay, SwitchLlmOverlay)
-        assert "needs an api key" in screen(ui)
+        assert sent(ui, SetBackend)[-1].label == "locked"
+        assert sent(ui, SetBackend)[-1].backend == {}
 
     def test_an_unprobed_entry_is_not_drawn_as_disconnected(self):
         info = BackendInfo(label="a", model="m", base_url="u", reachable=None)

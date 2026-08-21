@@ -11,6 +11,7 @@ pipe with a callback bolted on, so the class collapsed into the one line in
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 import termios
@@ -84,6 +85,36 @@ class Screen:
         if self._saved is not None:
             termios.tcsetattr(self.fd, termios.TCSADRAIN, self._saved)
             self._saved = None
+
+    @contextlib.contextmanager
+    def suspended(self):
+        """Hand the terminal back for the length of the block (§4.3 item 37).
+
+        What Textual spelled `app.suspend()`: out of the alternate screen, out
+        of raw mode, cursor and echo and autowrap restored — because the thing
+        that runs in the block is a full-screen program of its own and a
+        `$EDITOR` started in raw mode is an editor with no line discipline,
+        no visible cursor and a screen it shares with a frame it cannot see.
+
+        The same `try`/`finally` shape as `__enter__`/`__exit__`, and for the
+        same reason: an editor that segfaults, a command that does not exist,
+        a `KeyboardInterrupt` in between — none of them may leave the user in
+        the alternate screen with no echo. Coming back also drops the diff
+        baseline, since whatever ran in here owned the screen and the previous
+        frame describes something that is no longer on it.
+        """
+        self.write(EXIT_MODES)
+        saved, self._saved = self._saved, None
+        try:
+            if saved is not None:
+                termios.tcsetattr(self.fd, termios.TCSADRAIN, saved)
+            yield
+        finally:
+            if saved is not None and os.isatty(self.fd):
+                tty.setraw(self.fd)
+            self._saved = saved
+            self.write(ENTER_MODES)
+            self._prev = []  # nothing on this screen is ours any more
 
     def paint(self, lines: list[str], *, full: bool = False) -> None:
         out = [f"{ESC}[?2026h"]  # begin synchronised update

@@ -11,8 +11,9 @@ from collections import namedtuple
 from collections.abc import Callable
 
 from hpca import __version__ as VERSION
+from hpca.ui import commands, toasts
 from hpca.ui.ansi import BOLD, CYAN, DIM, GREEN, RED, RESET, REVERSE, YELLOW
-from hpca.ui.ansi import cell_width, cut, footer_line, pad, rule
+from hpca.ui.ansi import cell_width, cut, footer_line, pad, rule, safe
 from hpca.ui.approval import decision_height, render_decision
 from hpca.ui.editor import Editor
 from hpca.ui.keys import NEWLINE_KEYS, is_paste, paste_text
@@ -33,6 +34,8 @@ from hpca.ui.overlays import (
     QueuedOverlay,
     RenameOverlay,
     RewindOverlay,
+    SkillCreatorOverlay,
+    SkillRemoveOverlay,
     SwitchLlmOverlay,
     ThinkingOverlay,
     choice,
@@ -58,8 +61,11 @@ from hpca.ui.state import (
     Rename,
     Retitle,
     Rollback,
+    RunCommand,
     SaveSettings,
+    SaveSkill,
     SessionState,
+    SkillInfo,
     SidebarRow,
     Submit,
     Toast,
@@ -92,6 +98,23 @@ INTERRUPT_QUESTION = "Interrupt this turn and re-edit your last message?"
 # 60%`: a decision has to be readable, and the conversation it is about has to
 # stay on screen behind it.
 DECISION_SHARE = 2
+
+# How many commands the "/" menu offers at once. Eight is every built-in plus
+# a skill, which is what an unfiltered menu shows on a fresh install; past that
+# the answer to "I cannot see mine" is to type another letter, not to give the
+# list half the screen.
+MENU_ROWS = 8
+
+# What quitting asks, and what ctrl+q is worth. `q` confirms because it is one
+# letter away from every other key on the sessions column; ctrl+q is not bound
+# at all because it belongs to zellij, which is what a cluster user runs this
+# inside (specs-ui-acceptance.md, "Backends").
+QUIT_QUESTION = "Really quit?"
+
+# What the config editor's fetch is addressed by. There is one settings file,
+# so the key is a constant — it exists so that the answer can be routed the
+# same way a profile's or a skill's is (`RowUI.body_arrived`).
+SETTINGS_KEY = ("settings", ())
 
 
 # The sidebar markers §4.3 item 15 asks for, and the flag strings the core
@@ -184,6 +207,11 @@ class RowUI:
         self.core_profile = ""
         self.confirm: Confirm | None = None
         self.toasts: list[Toast] = []
+        # Whether the answer to the last question was "yes, quit". Read by
+        # `handle`, because ending the loop is something only a return value
+        # can say and a confirmation is answered a keypress later than it is
+        # asked (§4.3 item 38).
+        self.quitting = False
         # The screens over the rows, innermost last. A stack rather than one
         # slot because the profiles screen is genuinely three deep — the list,
         # a profile's skills, one skill's file — and escaping the file has to
@@ -206,13 +234,10 @@ class RowUI:
         # fills these from what it can and the shapes are `state.ProfileInfo`
         # and `state.BackendInfo` — whatever carries them later fills exactly
         # those.
+        # What the config editor shows before the file it asks for arrives —
+        # the last one that did, or whatever a UI with no wire behind it was
+        # handed. The editor fetches on open either way (`settings.get`).
         self.settings_json = settings_json
-        # How the editor's text and its validator arrive. Both are injected,
-        # because what a settings *file* is belongs to `hpca.config` and this
-        # module has never heard of it (§3.1) — and the loader is called on
-        # the first `c` rather than at startup, so a UI that is never asked for
-        # the editor never reads the file at all.
-        self.settings_loader: Callable[[], None] | None = None
         # A validator for the config editor, injected because what a settings
         # *file* means belongs to `hpca.config` and this module has never heard
         # of it (§3.1). None means "JSON syntax is the whole check".
@@ -224,6 +249,30 @@ class RowUI:
         # keep in step. Empty until the first catalog arrives, which is the
         # case the new-session flow answers by skipping the LLM picker.
         self.catalog = list(catalog or [])
+        # The four things M8 needs that are I/O, and are therefore injected —
+        # `RowUI` opens no files, runs no processes and writes to no terminal
+        # (§3.1). Each is None until something that owns the corresponding
+        # resource wires it up, and the key that needs one says so rather than
+        # doing nothing when it is missing.
+        #
+        # Ask for a profile's skills (`skill.list`). Called on the first `/`
+        # rather than at startup, so a UI nobody types a slash into makes no
+        # round trip; the answer comes back through `skills_listed`.
+        self.skills_loader: Callable[[str], None] | None = None
+        self._skills: dict[str, list[tuple[str, str]]] = {}
+        # `y` on a chat row: text in, a sentence about where it went out
+        # (`hpca.clipboard.ClipboardManager.copy(...).message`). A callable and
+        # not the manager itself, because the manager writes OSC 52 straight to
+        # the terminal and this module has never seen one.
+        self.clipboard: Callable[[str], str] | None = None
+        # ctrl+e, in two halves belonging to two different layers. `suspend`
+        # takes the terminal down and puts it back (`ui/run.py`, which owns
+        # it); `edit_profile` fetches the profile, runs the editor over it and
+        # saves it back (`ui/client.py`, which is the side with a wire). Both
+        # ends of it are asynchronous, so it answers in a toast rather than by
+        # returning anything.
+        self.suspend: Callable[[Callable[[], None]], None] | None = None
+        self.edit_profile: Callable[[str], None] | None = None
 
     # ------------------------------------------------------ the open session
 
@@ -255,6 +304,11 @@ class RowUI:
         """
         screen.send = self.send
         self.overlays.append(screen)
+        # Only now, with `send` wired: a screen that asks for something the
+        # moment it opens — the body its editor is about to show, the listing
+        # its list is about to draw — would otherwise be talking to the
+        # throwaway list a screen carries when it is constructed alone.
+        screen.opened()
 
     def _pop(self) -> None:
         """The innermost screen has closed. Whoever opened it hears about it."""
@@ -534,12 +588,161 @@ class RowUI:
         self.open_session(session_id)
 
     def toast(
-        self, text: str, severity: str = "information", timeout: float | None = None
+        self,
+        text: str,
+        severity: str = "information",
+        timeout: float | None = None,
+        title: str = "",
     ) -> None:
-        """Something the core said. The footer says it; M8 makes it a toast."""
-        self.toasts.append(Toast(text, severity, timeout))
-        self._note = text
+        """Something the core said, in the two places it is said (§4.3 item 35).
+
+        Both, and not one or the other. The block over the frame is where a
+        heading, a second line and a severity colour can be read, and it goes
+        on a timer because a notification that stayed would be a modal. The
+        footer note is what is left afterwards — one line, cut to the width —
+        so that a message which expired while the user was reading the chat is
+        still answerable with "what did that say".
+        """
+        self.toasts.append(
+            Toast(text, severity, timeout, title=title, at=self.clock())
+        )
+        # Only what fits on one line, and the heading first where there is one:
+        # the footer is a rule, not a paragraph. Through `safe` for the same
+        # reason the block is — an escape sequence in the footer would move
+        # the cursor just as readily as one in the body, and this is the copy
+        # that outlives the toast.
+        head = f"{title}: " if title else ""
+        self._note = head + " ".join(safe(text).split())
         self.note_style = RED if severity == "error" else YELLOW
+
+    # ------------------------------------------------- the slash commands
+
+    def skills(self) -> list[tuple[str, str]]:
+        """The skills the open profile can call, name and description.
+
+        Whatever the last `skill.rows` for this profile said, and *asked for*
+        the first time the menu wants it — the answer arrives a frame later and
+        the menu, being a function of what has arrived, fills itself when it
+        does. Asked once per profile rather than per keystroke, because the
+        question is asked on every character of a command being typed.
+
+        **Own skills only**, which is what `skill.list` answers. A shipped,
+        shared or project skill is callable and is not listed here, so `/plan`
+        on a fresh install is reported unknown. That is a gap in the wire —
+        see `UIClient.ask_skills`.
+        """
+        profile = self.profile
+        if profile not in self._skills:
+            self._skills[profile] = []
+            if self.skills_loader is not None:
+                self.skills_loader(profile)
+        return self._skills[profile]
+
+    def skills_listed(self, profile: str, skills: list[SkillInfo]) -> None:
+        """`skill.rows` arrived: what this profile can call, and what it owns."""
+        self._skills[profile] = [(x.name, x.description) for x in skills]
+        info = next((x for x in self.profiles if x.name == profile), None)
+        if info is not None:
+            info.skills = list(skills)
+
+    def forget_skills(self, name: str = "") -> None:
+        """A skill was written or removed; the menu's copy is out of date.
+
+        The row goes now and the list is asked for again, which is the same
+        bargain the sidebar's rename makes: what is shown immediately is what
+        the user just did, and the next answer from the core is what makes it
+        true — or takes it back, when the core refused.
+        """
+        info = next((x for x in self.profiles if x.name == self.profile), None)
+        if name:
+            self._skills[self.profile] = [
+                x for x in self._skills.get(self.profile, []) if x[0] != name
+            ]
+            if info is not None:
+                info.skills = [x for x in info.skills if x.name != name]
+        if self.skills_loader is not None:
+            self.skills_loader(self.profile)
+
+    def _remember_skill(self, name: str, description: str) -> None:
+        """A skill the user just wrote, in the two lists that offer skills."""
+        known = self._skills.setdefault(self.profile, [])
+        if not any(x[0] == name for x in known):
+            known.append((name, description))
+        info = next((x for x in self.profiles if x.name == self.profile), None)
+        if info is not None and not any(x.name == name for x in info.skills):
+            info.skills.append(SkillInfo(name=name, description=description))
+
+    def menu(self) -> list[commands.Command]:
+        """The commands the draft is currently naming, best first, or none.
+
+        A function of the draft and nothing else — which is what makes "a
+        parked `/…` draft brings its autocomplete menu back with it" true
+        without anything being parked: switching session swaps the draft, and
+        the menu follows because it was never state of its own. Only the
+        highlighted row is remembered, on the session (`SessionState.menu_at`).
+
+        The order is definition order. The core counts every `command.run` in
+        `command_usage` and nothing serves the counts back, and rule 2 of §4.2
+        says this side does not read the table — so `commands.matching` takes
+        the counts as a parameter and is handed none. Most-used-first is not
+        implemented; see `ui/commands.py`.
+        """
+        typed = commands.typed_name(self.input.text())
+        if typed is None:
+            return []
+        return commands.matching(typed, commands.all_commands(self.skills()))
+
+    def _menu_at(self, matches: list[commands.Command]) -> int:
+        """Which row is highlighted, clamped to a list that has since narrowed."""
+        if not matches:
+            return 0
+        return max(0, min(self.session.menu_at, len(matches) - 1))
+
+    def _menu_h(self, width: int, height: int) -> int:
+        """Rows the menu wants: its rule plus its matches, capped.
+
+        Taken out of the chat's share the way the decision prompt is, rather
+        than drawn over the frame the way a toast is. It belongs to the box
+        being typed into and has to sit next to it, and unlike a toast it is
+        not on a timer: it is up for exactly as long as a command is being
+        named, so pushing the conversation up costs one relayout on the way in
+        and one on the way out.
+        """
+        matches = self.menu()
+        if not matches:
+            return 0
+        room = max(2, (max(8, height - 2) // 3))
+        return min(1 + len(matches), room, 1 + MENU_ROWS)
+
+    def _render_menu(self, width: int, height: int) -> list[str]:
+        matches = self.menu()
+        rows = self._menu_h(width, height)
+        if not matches or rows < 2:
+            return []
+        return [commands.menu_title(matches, width)] + commands.menu_rows(
+            matches, self._menu_at(matches), width, rows - 1
+        )
+
+    # ------------------------------------------------ what arrives afterwards
+
+    def body_arrived(self, key, text: str, error: str = "") -> None:
+        """A `profile.body`, `skill.body` or `settings.body`, to whoever asked.
+
+        Innermost screen first, and the first one that recognises the key takes
+        it: the stack is three deep at its deepest and two editors could in
+        principle be waiting, but only one of them can be waiting for *this*.
+        A body nobody claims is a body whose screen has since closed, and
+        dropping it is the whole point of matching on the key.
+        """
+        for screen in reversed(self.overlays):
+            if screen.fill(key, text, error):
+                return
+
+    def list_arrived(self, key, rows) -> None:
+        """A `skill.rows`, to whoever asked. Same rule as `body_arrived`."""
+        for screen in reversed(self.overlays):
+            if screen.fill_list(key, rows):
+                return
 
     def invalidate(self) -> None:
         """Every pane the UI holds, open or not."""
@@ -579,6 +782,7 @@ class RowUI:
             self._input_h(width)
             + self._status_h()
             + self._decision_h(width, height)
+            + self._menu_h(width, height)
         )
         quarter = max(2, avail // 4)
         inner = max(8, width - 2)
@@ -594,7 +798,12 @@ class RowUI:
         middle = avail - top - bottom - inp
         if middle < 1:  # a terminal too short for the design at all
             top = bottom = 2
-            inp = 2 + self._status_h() + self._decision_h(width, height)
+            inp = (
+                2
+                + self._status_h()
+                + self._decision_h(width, height)
+                + self._menu_h(width, height)
+            )
             middle = max(1, avail - 4 - inp)
         return [top, middle, inp, bottom]
 
@@ -646,8 +855,10 @@ class RowUI:
             while len(out) < height:
                 out.insert(len(out) - 1, " " * width)
             # A confirmation can be asked *about* an overlay — remove this
-            # skill, delete this profile — so it is drawn over that too.
-            return self._over_confirm(out[:height], width)
+            # skill, delete this profile — so it is drawn over that too, and a
+            # toast lands on a screen as readily as on the rows.
+            out = self._over_toasts(out[:height], width)
+            return self._over_confirm(out, width)
         heights = self._heights(height, width)
         order = [
             (SESSIONS, self.panes[0], heights[0]),
@@ -662,9 +873,10 @@ class RowUI:
             if slot == INPUT:
                 prompt = self._render_decision(width, height)
                 status = self._render_status(width)
-                out += prompt + status
+                menu = self._render_menu(width, height)
+                out += prompt + menu + status
                 out += self._render_input(
-                    width, pane_h - len(status) - len(prompt)
+                    width, pane_h - len(status) - len(prompt) - len(menu)
                 )
             else:
                 out += pane.render(width, pane_h, focused=self.focus == slot)
@@ -674,8 +886,31 @@ class RowUI:
         out.append(footer_line(self._keys(), width, note, style))
         while len(out) < height:
             out.insert(len(out) - 1, " " * width)
-        out = out[:height]
+        out = self._over_toasts(out[:height], width)
         return self._over_confirm(out, width)
+
+    def _over_toasts(self, out: list[str], width: int) -> list[str]:
+        """What the core said, over the finished frame (§4.3 item 35).
+
+        Directly under the header, and full-width rows replaced whole. Both
+        halves of that are about the differential repaint. Full rows, because
+        splicing a box into the middle of an already-styled line means cutting
+        SGR sequences, and a cut escape is a colour that never ends. Under the
+        header, because that is the one band of the frame whose height never
+        depends on what is in it — put the block over the chat and a toast
+        arriving mid-turn would cover the rows the user is reading; put it over
+        the message box and it would cover what they are typing.
+        """
+        if not self.toasts:
+            return out
+        rows = toasts.render(self.toasts, self.clock(), width, max(0, len(out) - 2))
+        if not rows:
+            # Nothing live: drop what has expired so the list cannot grow for
+            # the length of a session.
+            self.toasts = []
+            return out
+        out[1 : 1 + len(rows)] = rows
+        return out
 
     def _render_decision(self, width: int, height: int) -> list[str]:
         """The open session's approval, and only the open session's.
@@ -784,9 +1019,19 @@ class RowUI:
         # whole pairs off its end and this is the one that must not be the pair
         # that goes. Leaving the message box is ^↑, not escape: escape has a
         # job now.
-        common = [("^↑^↓", "row"), ("esc esc", "stop"), ("?", "keys"), ("q", "quit")]
+        common = [("^↑^↓", "row"), ("esc esc", "stop"), ("?", "keys")]
         if self.confirm is not None:
             return [("y", "yes"), ("n", "no"), ("esc", "no")]
+        if self.menu():
+            # While a command is being named the menu owns ↑/↓ and the two keys
+            # that fill one in, and saying so is the only way anybody finds tab.
+            return [
+                ("↑↓", "pick"),
+                ("⇥", "complete"),
+                ("enter", "complete / run"),
+                ("esc esc", "stop"),
+                ("?", "keys"),
+            ]
         if self.focus == DECISION:
             decision = self.session.decision
             if decision is not None and not decision.asking:
@@ -815,8 +1060,8 @@ class RowUI:
                 ("⇧←→", "select"),
                 ("^⌫ ^del", "cut word"),
                 ("^u", "clear"),
+                ("^e", "$editor"),
                 ("?", "keys"),
-                ("q", "quit"),
             ]
         rows = [("↑↓", "line"), ("→←", "open"), ("⇧→←", "open all")]
         if self.focus == SESSIONS and self.session_pane.here() == NEW_SESSION_KEY:
@@ -827,14 +1072,24 @@ class RowUI:
         elif self.focus == SESSIONS:
             rows += [("enter", "switch"), ("r", "rename"), ("t", "retitle"), ("d", "delete")]
         elif self.focus == CHAT:
-            rows += [("i", "write"), ("enter", "reuse"), ("⇧tab", "mode")]
+            rows += [
+                ("i", "write"),
+                ("enter", "reuse"),
+                ("y", "copy"),
+                ("⇧tab", "mode"),
+            ]
         else:
             rows += [("enter", "peek"), ("d", "unwatch"), ("alt-↑↓", "move")]
         # Only where they do something. `m` and `a` are the sessions row's, `c`
         # is everywhere but the chat, and ctrl+l is the chat's — a key list
         # that lies is worse than a short one.
         if self.focus == SESSIONS:
-            rows += [("m", "llms"), ("a", "profiles"), ("c", "config")]
+            rows += [
+                ("m", "llms"),
+                ("a", "profiles"),
+                ("c", "config"),
+                ("q", "quit"),
+            ]
         elif self.focus == CHAT:
             rows += [("^l", "switch llm")]
         else:
@@ -923,6 +1178,16 @@ class RowUI:
             session.thinking = overlay.effort
             session.context.effort = overlay.effort
             self.note = f"thinking effort: {overlay.effort}"
+        elif isinstance(overlay, SkillCreatorOverlay) and overlay.saved:
+            self.send(SaveSkill(self.profile, overlay.name, overlay.text))
+            # Shown before the core answers, and remembered locally, because
+            # the menu is what a new skill has to appear in and there is no
+            # event that says a skill file was written.
+            self._remember_skill(overlay.name, overlay.description)
+            self.note = f"saved skill “{overlay.name}”"
+        elif isinstance(overlay, SkillRemoveOverlay) and overlay.removed:
+            self.forget_skills(overlay.removed)
+            self.note = f"removed skill “{overlay.removed}”"
         elif isinstance(overlay, RenameOverlay) and overlay.name:
             self.send(Rename(overlay.session_id, overlay.name))
             # Shown before the core answers, like the mode bar: the next
@@ -966,7 +1231,12 @@ class RowUI:
             # and a gate with a way past it that answers neither is a turn
             # parked on nothing.
             self._answer(False)
-        return True
+        # The one answer that ends the loop rather than changing the frame.
+        return not self.quitting
+
+    def _quit_answer(self, yes: bool) -> None:
+        """"Really quit?", answered. `handle` reads it on the way out."""
+        self.quitting = yes
 
     def _answer(self, confirmed: bool) -> None:
         question, self.confirm = self.confirm, None
@@ -1231,7 +1501,13 @@ class RowUI:
         rather than zero — zero would be a repaint that schedules another
         repaint.
         """
-        waits = [self.session.next_wake(self.wall())]
+        waits = [
+            self.session.next_wake(self.wall()),
+            # The third thing that changes with no keypress behind it: a toast
+            # goes on its own, and a frame drawn with one on it stops being
+            # true the moment it expires.
+            toasts.next_wake(self.toasts, self.clock()),
+        ]
         if self._esc_armed_at is not None:
             left = ESC_STOP_WINDOW - (self.clock() - self._esc_armed_at)
             # A hair past the window rather than exactly on it: `_esc_armed`
@@ -1268,6 +1544,8 @@ class RowUI:
     def _handle_input(self, key: str) -> bool:
         if key == "esc":
             self._escape()
+        elif self._menu_key(key):
+            pass  # the "/" menu had it: see `_menu_key`
         elif key == "enter":
             self._send()
         elif key in NEWLINE_KEYS:
@@ -1288,10 +1566,41 @@ class RowUI:
             # writing the message, like the mode — and ctrl+l is not a
             # printable character, so it cannot be something being typed.
             self._switch_llm()
+        elif key == "ctrl-e":
+            self._edit_profile()
         elif key == "quit":
             return False
         else:
             self.input.handle(key)
+        return True
+
+    def _menu_key(self, key: str) -> bool:
+        """The keys the "/" menu takes while a command is being named.
+
+        ↑/↓ pick, tab fills, and enter fills a partial command and runs a
+        complete one — the same four the Textual entry answered, and the
+        reason the menu closes the moment the token contains whitespace: from
+        there on ↑/↓ belong to the draft, which may be a multi-line message
+        that merely opens with a slash.
+        """
+        matches = self.menu()
+        if not matches:
+            return False
+        at = self._menu_at(matches)
+        if key in ("up", "down"):
+            self.session.menu_at = (at + (1 if key == "down" else -1)) % len(matches)
+            return True
+        if key not in ("tab", "enter"):
+            return False
+        chosen = matches[at]
+        stripped = self.input.text().lstrip()
+        if stripped[1:] == chosen.name:
+            # Already fully typed: tab has nothing to add and enter runs it.
+            return key == "tab"
+        # A space after the name, which is also what closes the menu — so one
+        # enter fills the command in and the next one sends it.
+        self.input.set_text(f"{stripped[0]}{chosen.name} ")
+        self.session.menu_at = 0
         return True
 
     def _send(self) -> None:
@@ -1306,40 +1615,120 @@ class RowUI:
         text = self.input.text().strip()
         if not text:
             return
+        named = commands.split(text)
+        if named is not None:
+            self._command(named[0], named[1], text)
+            return
         if not self.active_id:
             self.note = "no session open"
-            return
-        if self._builtin(text):
-            self.input.clear()
-            return
-        if text.startswith("/") and self.session.turn.busy:
-            # A slash command acts on the UI and runs its own exclusive
-            # worker, so there is nothing sensible to queue it behind — and a
-            # `/compact` that ran an hour later against a thread the turn had
-            # since changed would be worse than one that was refused. An
-            # ordinary message queues; this one waits for the user.
-            self.note = "wait for this turn — a command cannot be queued"
-            self.note_style = DIM
             return
         self.send(Submit(self.active_id, text))
         self.input.clear()
         self.note = "sent"
 
-    # The slash commands are M8's, with one exception: `/thinking` opens a
-    # screen and sends nothing, so it belongs to the milestone that built the
-    # screen. Everything else falls through to the core (`command.run`).
-    BUILTIN_SCREENS = ("/thinking", chr(92) + "thinking")
+    # The three built-ins this side answers by drawing something instead of
+    # sending `command.run`. `/thinking` is a chooser the core expects a
+    # front-end to put up; `/skill-creator` is a form the core says outright it
+    # does not own; a bare `/skill-remove` is a picker, because "the chosen
+    # skill" should be a row you point at rather than a name you retype (the
+    # core still answers `/skill-remove <name>` and that path is left alone).
+    SCREEN_COMMANDS = ("thinking", "skill-creator", "skill-remove")
 
-    def _builtin(self, text: str) -> bool:
-        """A typed command this side answers by drawing something."""
-        if text.split()[0] not in self.BUILTIN_SCREENS:
-            return False
-        self.thinking()
-        return True
+    def _command(self, name: str, args: str, text: str) -> None:
+        """A typed `/name …`: a skill, a built-in, or a typo (§4.3 item 24)."""
+        if self._skill_named(name) is not None:
+            # An ordinary turn carrying a skill, not a command: it queues and
+            # runs concurrently like any message, and what the skill adds goes
+            # into the model's copy rather than the transcript (the core's
+            # job, `protocol.TurnSubmit.forced_skill`).
+            if not self.active_id:
+                self.note = "no session open"
+                return
+            self.send(Submit(self.active_id, text, forced_skill=name))
+            self.input.clear()
+            self.note = f"sent, with the “{name}” skill"
+            return
+        if name not in commands.BUILTIN_NAMES:
+            # Almost always a typo, so the draft stays: the user fixes the
+            # spelling — or reopens the menu to look the name up — instead of
+            # retyping the sentence they attached to it.
+            self.toast(commands.unknown(name), "warning")
+            return
+        if name in self.SCREEN_COMMANDS and self._screen_command(name, args):
+            # Ahead of the busy check on purpose: these three draw a screen
+            # and ask the core for nothing, so there is no worker for a
+            # running turn to collide with. Picking a thinking level while the
+            # model is thinking is the case that makes the point.
+            self.input.clear()
+            return
+        if self.session.turn.busy:
+            # A command that *does* reach the core acts on the UI and runs its
+            # own exclusive worker, so there is nothing sensible to queue it
+            # behind — and a `/compact` that ran an hour later against a thread
+            # the turn had since changed would be worse than one that was
+            # refused. An ordinary message queues; this one waits for the user.
+            self.note = "wait for this turn — a command cannot be queued"
+            self.note_style = DIM
+            return
+        command = next(x for x in commands.BUILTINS if x.name == name)
+        if command.session and not self.active_id:
+            self.note = f"no session open — /{name} works on one conversation"
+            return
+        # The session id goes with every command that has one, the
+        # profile-scoped ones included: it is how the core decides *which*
+        # profile is asking (`core.service._list_skills`), and it is empty —
+        # null on the wire — exactly when there is nothing open.
+        self.send(RunCommand(name, args, self.active_id))
+        self.input.clear()
+        self.note = f"/{name}"
+
+    def _screen_command(self, name: str, args: str) -> bool:
+        """Draw the answer rather than send it. False falls through to the core."""
+        if name == "thinking":
+            self.thinking()
+            return True
+        if name == "skill-creator":
+            self.overlay = SkillCreatorOverlay(
+                self.profile,
+                taken=tuple(x for x, _ in self.skills()),
+                request=args,
+            )
+            return True
+        if name == "skill-remove" and not args:
+            own = self._own_skills()
+            if not own:
+                self.toast(
+                    f"profile “{self.profile}” has no skills of its own to remove",
+                    "warning",
+                )
+                return True
+            self.overlay = SkillRemoveOverlay(self.profile, tuple(own))
+            return True
+        return False
+
+    def _skill_named(self, name: str) -> tuple[str, str] | None:
+        """The visible skill that `/name` names, or None. Built-ins win."""
+        if not name or name in commands.BUILTIN_NAMES:
+            return None
+        return next((x for x in self.skills() if x[0] == name), None)
+
+    def _own_skills(self) -> list[SkillInfo]:
+        """The open profile's own skills — the only ones `skill.delete` can
+        take, and the only ones the picker may therefore offer."""
+        info = next((x for x in self.profiles if x.name == self.profile), None)
+        return list(info.skills) if info is not None else []
 
     def _handle_row(self, key: str, width: int, height: int) -> bool:
-        if key in ("q", "quit"):
-            return False
+        if key == "quit":
+            return False  # ctrl+c and ctrl+d: out, and no question asked
+        if key == "q":
+            # Confirmed, and from the sessions column only (§5). Everywhere
+            # else it is inert: on the watchers column it is a letter with
+            # nothing to do, and in the chat it is a letter somebody is about
+            # to type into the box they just left.
+            if self.focus == SESSIONS:
+                self.ask(QUIT_QUESTION, self._quit_answer)
+            return True
         inner = max(8, width - 2)
         slots = [SESSIONS, CHAT, INPUT, WATCHERS]
         view = max(1, self._heights(height, width)[slots.index(self.focus)] - 1)
@@ -1364,10 +1753,14 @@ class RowUI:
         elif key == "c" and self.focus != CHAT:
             # Anywhere but the chat column (§5), which is the one row where the
             # cursor is on a conversation and `c` reads as a letter.
-            if not self.settings_json and self.settings_loader is not None:
-                self.settings_loader()
+            # Fetched as it opens, like every other editable body: the file is
+            # also written by the core — `settings.save` normalises what lands
+            # on disk — so a copy kept from the last time this screen was open
+            # is a copy that can already be wrong.
             self.overlay = ConfigOverlay(
-                self.settings_json, validate=self.validate_settings
+                self.settings_json,
+                validate=self.validate_settings,
+                awaiting=SETTINGS_KEY,
             )
         elif key == "ctrl-l" and self.focus == CHAT:
             self._switch_llm()
@@ -1382,6 +1775,12 @@ class RowUI:
             self.focus = slots[(slots.index(self.focus) + 1) % len(slots)]
         elif key in ("ctrl-up", "shift-tab"):
             self.focus = slots[(slots.index(self.focus) - 1) % len(slots)]
+        elif key == "ctrl-e":
+            self._edit_profile()
+        elif key == "y" and self.focus == CHAT:
+            # §5: new, and colliding with nothing — the decision prompt owns
+            # `y` only while a decision is pending, and it takes keys first.
+            self._copy_row(inner)
         elif key == "i" and self.focus == CHAT:
             self.focus = INPUT
         elif key == "up":
@@ -1427,6 +1826,57 @@ class RowUI:
             else:
                 self._watch(Drop, "unwatched", inner)
         return True
+
+    # ------------------------------------------------- the clipboard and $EDITOR
+
+    def _copy_row(self, inner: int) -> None:
+        """`y`: the chat row under the cursor, to the clipboard (§4.3 item 36).
+
+        Through `hpca.clipboard.ClipboardManager`, which already knows about
+        OSC 52, the multiplexer wrapping and the file fallback, and which
+        already takes an injected ``emit`` — so nothing about copying is
+        rewritten here and this method only decides *what* is copied. The
+        entry's own text, not the row it is drawn as: `you   ` and the tool
+        markers are decoration, and pasting them back into a shell is a paper
+        cut every time.
+        """
+        if self.clipboard is None:
+            self.toast("no clipboard is wired up here", "warning")
+            return
+        at = self.chat.current(inner)
+        if not (0 <= at < len(self.chat.items)):
+            self.note = "nothing to copy"
+            return
+        item = self.chat.items[at]
+        text = item.text or "\n".join([item.head, *item.body])
+        if not text.strip():
+            self.note = "nothing to copy"
+            return
+        try:
+            self.toast(self.clipboard(text))
+        except Exception as e:  # a tier that raised rather than reporting
+            self.toast(f"copy failed: {e}", "error")
+
+    def _edit_profile(self) -> None:
+        """ctrl+e: this profile's memories in `$EDITOR` (§4.3 item 37).
+
+        Textual spelled this `self.suspend()`; here it means leaving the
+        alternate screen, putting the line discipline back, running the editor
+        on a terminal that behaves like a terminal, and coming back to a full
+        repaint. Both halves are injected — `run.py` owns the terminal and
+        `client.py` owns the wire the file comes down — so this method is the
+        key binding, one guard, and nothing else.
+
+        Nothing is returned and nothing is waited for: the body has to be
+        fetched before there is anything to edit, so the answer arrives as a
+        toast (`UIClient._profile_body`). The guard is what keeps the key
+        honest in a UI with no wire behind it — a key that silently did
+        nothing would look exactly like an editor that opened and closed.
+        """
+        if self.suspend is None or self.edit_profile is None:
+            self.toast("no editor is wired up here", "warning")
+            return
+        self.edit_profile(self.profile)
 
     # ------------------------------------------------------- the session keys
 

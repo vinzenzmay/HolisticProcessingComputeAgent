@@ -21,6 +21,7 @@ from dataclasses import dataclass
 
 from hpca import protocol
 from hpca.transport import InProcessConnection
+from hpca.ui import state
 from hpca.ui.ansi import cell_width
 from hpca.ui.app import CHAT, RowUI
 from hpca.ui.client import UIClient
@@ -84,6 +85,44 @@ def recorded(ui: RowUI) -> RowUI:
         original(intent)
 
     ui.send = record
+    return ui
+
+
+def served(ui: RowUI, bodies=None, skills=None) -> RowUI:
+    """Answer the read paths the screens fetch when they open.
+
+    Every editable body is a round trip now (`profile.get`, `skill.get`,
+    `settings.get`), so a `RowUI` with no core behind it opens its editors on
+    "fetching…" and never fills them. This is the smallest thing that can
+    answer: the intents still land in ``ui.intents``, and each `Fetch` is
+    answered in place — synchronously, which is what lets a test press the key
+    and read the frame in the next line.
+
+    A key with no entry in ``bodies`` is answered with an *error*, which is the
+    core's way of saying a file could not be read and the only thing that
+    stops an editor opening over it.
+    """
+    bodies = {} if bodies is None else bodies
+    skills = {} if skills is None else skills
+    original = ui.send
+    # What `UIClient` wires: the menu asks for a profile's skills the first
+    # time it wants them, and the answer arrives as an intent this handles.
+    ui.skills_loader = lambda profile: ui.send(state.FetchSkills(profile))
+
+    def answer(intent) -> None:
+        original(intent)
+        if isinstance(intent, state.Fetch):
+            key = (intent.what, tuple(intent.key))
+            text = bodies.get(key)
+            ui.body_arrived(
+                key, text or "", "" if text is not None else "could not be read"
+            )
+        elif isinstance(intent, state.FetchSkills):
+            rows = list(skills.get(intent.profile, []))
+            ui.skills_listed(intent.profile, rows)
+            ui.list_arrived(("skills", intent.profile), rows)
+
+    ui.send = answer
     return ui
 
 

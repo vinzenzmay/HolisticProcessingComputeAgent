@@ -242,12 +242,11 @@ def sample_watches(count: int, seed: int = 0) -> list[protocol.PanelRow]:
 
 
 def sample_profiles() -> list[ProfileInfo]:
-    """The profiles screen's rows, with the file bodies its editors open.
+    """The profiles screen's rows, exactly as `profile.rows` carries them.
 
-    Handed to the UI whole rather than answered as `profile.rows`, because
-    that event carries a memory *count* and the bodies are read off disk
-    (`client._profile`) — which a demo must not do. Everything else about
-    these rows is what the real event would say.
+    Counts and flags and no bodies: each of the two editable files is fetched
+    when its editor opens (`profile.get`, `skill.get`), and `DemoCore` answers
+    those from `LEARNINGS`, `ARCHIVE_TEXT` and `SKILL_TEXT` below.
     """
     return [
         ProfileInfo(
@@ -255,29 +254,13 @@ def sample_profiles() -> list[ProfileInfo]:
             memories=12,
             sessions=3,
             working=True,
-            loaded=True,
-            text=LEARNINGS["hpc"],
-            archive=ARCHIVE_TEXT,
             skills=[
-                SkillInfo("merge-vcfs", "how this lab merges shard VCFs", SKILL_TEXT),
-                SkillInfo("submit-gpu", "the partition and the flags that work", ""),
+                SkillInfo("merge-vcfs", "how this lab merges shard VCFs"),
+                SkillInfo("submit-gpu", "the partition and the flags that work"),
             ],
         ),
-        ProfileInfo(
-            name="default",
-            memories=0,
-            sessions=1,
-            default=True,
-            loaded=True,
-            text=LEARNINGS["default"],
-        ),
-        ProfileInfo(
-            name="writing",
-            memories=5,
-            copied_from="hpc",
-            loaded=True,
-            text=LEARNINGS["writing"],
-        ),
+        ProfileInfo(name="default", memories=0, sessions=1, default=True),
+        ProfileInfo(name="writing", memories=5, copied_from="hpc"),
     ]
 
 
@@ -351,6 +334,10 @@ class DemoCore:
         }
         self._entries: dict[str, list[protocol.Entry]] = {}
         self._watches: dict[str, list[protocol.PanelRow]] = {}
+        # What `profile.list` and `skill.list` answer. Held by the core rather
+        # than handed to the UI, which is the whole shape M8 restored: every
+        # list and every body the screens draw comes down the wire.
+        self.profiles = sample_profiles()
         self._forks = 0
         self._made = 0
         # One session is left mid-turn, because a turn in flight is the thing
@@ -652,14 +639,27 @@ class DemoCore:
             self.emit(protocol.LLMCatalog(entries=entries, probed=True))
 
     def _do_ProfileList(self, cmd: protocol.ProfileList) -> None:
-        """Deliberately silent.
+        """`profile.rows`: counts and flags, which is all the event carries.
 
-        `profile.rows` carries a memory count and no file bodies, and the
-        bodies are read off disk by the client — which a demo must not do. So
-        the demo's profiles are handed to `RowUI` whole (`build`), and
-        answering here would replace them with rows whose editors have nothing
-        to open.
+        Answerable now that the bodies come down the wire too — before M8
+        closed the stopgap the client filled them off disk, and answering here
+        would have replaced the demo's profiles with rows whose editors had
+        nothing to open.
         """
+        self.emit(
+            protocol.ProfileRows(
+                rows=[
+                    protocol.ProfileRow(
+                        name=x.name,
+                        memories=x.memories,
+                        copied_from=x.copied_from,
+                        is_default=x.default,
+                        working=x.working,
+                    )
+                    for x in self.profiles
+                ]
+            )
+        )
 
     def _do_ThinkingSet(self, cmd: protocol.ThinkingSet) -> None:
         self.rows[self._index(cmd.session_id)].thinking = cmd.effort
@@ -697,6 +697,59 @@ class DemoCore:
 
     def _do_SkillDelete(self, cmd: protocol.SkillDelete) -> None:
         self.emit(protocol.Notify(text=f"Removed skill {cmd.name}."))
+
+    # ------------------------------------------------------- the read paths
+
+    def _do_ProfileGet(self, cmd: protocol.ProfileGet) -> None:
+        """`profile.get`: one editable body, verbatim.
+
+        The demo's answer to the rule that closed M8's stopgap — the UI reads
+        no files, so every editor's text comes down the wire, here included.
+        """
+        if cmd.kind == "archive":
+            self.emit(
+                protocol.ProfileBody(
+                    name=cmd.name, kind=cmd.kind, text=ARCHIVE_TEXT
+                )
+            )
+            return
+        self.emit(
+            protocol.ProfileBody(
+                name=cmd.name,
+                kind=cmd.kind,
+                text=LEARNINGS.get(cmd.name, ""),
+                error="" if cmd.name in LEARNINGS else "no such profile here",
+            )
+        )
+
+    def _do_SkillList(self, cmd: protocol.SkillList) -> None:
+        info = next((x for x in self.profiles if x.name == cmd.profile), None)
+        self.emit(
+            protocol.SkillRows(
+                profile=cmd.profile,
+                skills=[
+                    protocol.SkillRow(name=x.name, description=x.description)
+                    for x in (info.skills if info else [])
+                ],
+            )
+        )
+
+    def _do_SkillGet(self, cmd: protocol.SkillGet) -> None:
+        self.emit(
+            protocol.SkillBody(
+                profile=cmd.profile, name=cmd.name, text=SKILL_TEXT
+            )
+        )
+
+    def _do_SettingsGet(self, cmd: protocol.SettingsGet) -> None:
+        self.emit(protocol.SettingsBody(text=SETTINGS_JSON))
+
+    def _do_SettingsSave(self, cmd: protocol.SettingsSave) -> None:
+        """Restated on save, which is what the real core does and why: what
+        lands on disk is the validated model written back out, not the bytes
+        that were sent."""
+        self.emit(protocol.SettingsBody(text=cmd.text))
+        self.emit(protocol.Notify(text="Settings saved."))
 
     def _do_MemoryResolve(self, cmd: protocol.MemoryResolve) -> None:
         kept = sum(1 for x in cmd.approved if x)
@@ -832,10 +885,7 @@ def build(chat: int = 400, sessions: int = 14, watchers: int = 5) -> RowUI:
     client's sink; returning the UI keeps all three alive, which is all the
     ownership this needs while the loopback is synchronous.
     """
-    ui = RowUI(
-        settings_json=SETTINGS_JSON,
-        profiles=sample_profiles(),
-    )
+    ui = RowUI()
     core = DemoCore(chat=chat, sessions=sessions, watchers=watchers)
     client = UIClient(ui, send=core.handle)
     core.emit = client.apply
