@@ -1,0 +1,809 @@
+"""The client: events become state, keys become commands.
+
+Driven through a real `InProcessConnection.pair()` — the transport is not
+mocked. A scripted peer sends the events a core would and records the commands
+that come back, and every assertion is either about a frame (a string) or about
+a typed command on the wire.
+
+The three things this file exists to hold on to, from specs-ui-replacement.md
+§3.2 and `protocol.ChatUpdate`:
+
+* the chat is append-only between resets, and a row is named by its `seq`;
+* an update for a row the UI does not have is dropped, never invented;
+* an event for a session that is not on screen changes the sidebar marker and
+  nothing else.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import subprocess
+import sys
+
+import pytest
+
+from hpca import protocol
+from hpca.transport import InProcessConnection
+from hpca.ui.app import CHAT, INPUT, SESSIONS, WATCHERS, RowUI
+from hpca.ui.client import UIClient
+from tests.ui_harness import Peer, Wire, clocked, plain, settle, widths
+
+ROWS = [
+    protocol.SessionRow(
+        session_id="s1", title="the first thing", profile="hpc", mode="agent"
+    ),
+    protocol.SessionRow(
+        session_id="s2", title="the second thing", profile="hpc", mode="plan"
+    ),
+]
+
+
+def entry(seq: int, kind: str = "user", text: str = "", **kw) -> protocol.Entry:
+    return protocol.Entry(kind=kind, text=text or f"row {seq}", seq=seq, **kw)
+
+
+@pytest.fixture
+async def wire():
+    """A UI, a client and a scripted core, over a real pair of connections."""
+    ui = RowUI()
+    ours, theirs = InProcessConnection.pair()
+    client = UIClient(ui, ours)
+    peer = Peer(theirs)
+    tasks = [asyncio.create_task(client.run()), asyncio.create_task(peer.listen())]
+    try:
+        yield Wire(ui, client, peer)
+    finally:
+        await ours.close()
+        await theirs.close()
+        for task in tasks:
+            task.cancel()
+
+
+async def started(wire: Wire, entries: list[protocol.Entry] | None = None) -> Wire:
+    """The opening exchange: hello, the sidebar, and the first transcript."""
+    await wire.tell(protocol.Hello(profile="hpc"))
+    await wire.tell(protocol.SessionRows(rows=list(ROWS)))
+    await wire.tell(
+        protocol.ChatReset(
+            session_id="s1",
+            entries=entries
+            if entries is not None
+            else [entry(1, text="hello there", index=0)],
+        )
+    )
+    wire.peer.clear()
+    return wire
+
+
+# ------------------------------------------------------------- the boundary
+
+
+def test_the_app_does_not_import_the_protocol():
+    """The rule §3.1 puts the whole layering on, checked the way
+    `test_core_headless.py` checks the core's: in a clean interpreter, because
+    an in-process check would pass on an import some other test already made.
+
+    If a `RowUI` method took a `protocol.Entry`, the render tests would need
+    pydantic models to say anything and the property that makes this UI
+    testable — frames are strings, and strings compare — would be gone.
+    """
+    code = (
+        "import sys, hpca.ui.app; "
+        "assert 'hpca.protocol' not in sys.modules, sorted(sys.modules)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True
+    )
+    assert result.returncode == 0, (
+        f"hpca.ui.app drags in the protocol:\n{result.stderr}"
+    )
+
+
+def test_and_neither_does_the_state_layer():
+    code = (
+        "import sys, hpca.ui.state; "
+        "assert 'hpca.protocol' not in sys.modules, sorted(sys.modules)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_the_client_is_the_one_that_does():
+    # The other half of the same claim: the import has to live somewhere, and
+    # a check that only ever says "not here" would pass on a UI wired to
+    # nothing at all.
+    code = "import sys, hpca.ui.client; assert 'hpca.protocol' in sys.modules"
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+
+
+# ------------------------------------------------------------ the handshake
+
+
+class TestHello:
+    async def test_it_asks_for_the_session_list(self, wire):
+        await wire.tell(protocol.Hello(profile="hpc"))
+        assert wire.peer.took(protocol.SessionList)
+
+    async def test_the_profile_reaches_the_header(self, wire):
+        await wire.tell(protocol.Hello(profile="genomics"))
+        assert "genomics" in wire.frame()[0]
+
+    async def test_a_core_of_another_version_says_so(self, wire):
+        await wire.tell(protocol.Hello(version=99))
+        assert [t.severity for t in wire.ui.toasts] == ["error"]
+
+    async def test_and_the_frame_survives_saying_it(self, wire):
+        await wire.tell(protocol.Hello(version=99))
+        assert widths(wire.ui.render(40, 10)) == {40}
+
+
+# -------------------------------------------------------------- the sidebar
+
+
+class TestTheSessionList:
+    async def test_the_rows_are_the_sidebar(self, wire):
+        await wire.tell(
+            protocol.Hello(), protocol.SessionRows(rows=list(ROWS))
+        )
+        assert "the second thing" in wire.screen()
+
+    async def test_the_first_one_is_opened(self, wire):
+        await wire.tell(
+            protocol.Hello(), protocol.SessionRows(rows=list(ROWS))
+        )
+        assert wire.peer.last(protocol.SessionOpen).session_id == "s1"
+
+    async def test_and_the_core_is_told_what_is_on_screen(self, wire):
+        await wire.tell(
+            protocol.Hello(), protocol.SessionRows(rows=list(ROWS))
+        )
+        assert wire.peer.last(protocol.SessionFocus).session_id == "s1"
+
+    async def test_a_second_list_does_not_re_open_it(self, wire):
+        await started(wire)
+        await wire.tell(protocol.SessionRows(rows=list(ROWS)))
+        assert wire.peer.took(protocol.SessionOpen) == []
+
+    async def test_nor_does_it_disturb_the_chat(self, wire):
+        await started(wire)
+        before = wire.screen()
+        await wire.tell(protocol.SessionRows(rows=list(ROWS)))
+        assert wire.screen() == before
+
+    async def test_a_repaint_keeps_the_open_session_open(self, wire):
+        await started(wire)
+        await wire.tell(
+            protocol.SessionRows(
+                rows=[
+                    protocol.SessionRow(session_id="new", title="a fork elsewhere"),
+                    *ROWS,
+                ]
+            )
+        )
+        assert wire.ui.active_id == "s1"
+
+
+class TestTheCursorIsKeptByIdentity:
+    """A row inserted above the cursor must not move the selection (§3.2)."""
+
+    async def positioned(self, wire) -> Wire:
+        await started(wire)
+        wire.ui.focus = SESSIONS
+        wire.ui.session_pane.cursor = 1  # the second row: "the second thing"
+        assert wire.ui.session_pane.items[
+            wire.ui.session_pane.current(wire.inner)
+        ].key == "s2"
+        return wire
+
+    async def test_a_row_inserted_above_does_not_move_it(self, wire):
+        await self.positioned(wire)
+        await wire.tell(
+            protocol.SessionRows(
+                rows=[
+                    protocol.SessionRow(session_id="new", title="made in the background"),
+                    *ROWS,
+                ]
+            )
+        )
+        pane = wire.ui.session_pane
+        assert pane.items[pane.current(wire.inner)].key == "s2"
+
+    async def test_which_is_a_different_line_than_before(self, wire):
+        # The point of keying by id: the line moved, the selection did not.
+        await self.positioned(wire)
+        await wire.tell(
+            protocol.SessionRows(
+                rows=[protocol.SessionRow(session_id="new", title="x"), *ROWS]
+            )
+        )
+        assert wire.ui.session_pane.cursor == 2
+
+    async def test_an_open_row_stays_open_under_the_row_that_arrived(self, wire):
+        await self.positioned(wire)
+        wire.ui.session_pane.expand(wire.inner)
+        await wire.tell(
+            protocol.SessionRows(
+                rows=[protocol.SessionRow(session_id="new", title="x"), *ROWS]
+            )
+        )
+        assert wire.ui.session_pane.expanded == {"s2"}
+
+    async def test_a_row_that_left_takes_its_state_with_it(self, wire):
+        await self.positioned(wire)
+        wire.ui.session_pane.expand(wire.inner)
+        await wire.tell(protocol.SessionRows(rows=[ROWS[0]]))
+        assert wire.ui.session_pane.expanded == set()
+
+
+# ----------------------------------------------------------------- the chat
+
+
+class TestTheChat:
+    async def test_a_reset_fills_it(self, wire):
+        await started(wire, [entry(1, text="the first line"), entry(2, "assistant")])
+        assert "the first line" in wire.screen()
+
+    async def test_an_append_grows_it(self, wire):
+        await started(wire, [entry(1)])
+        await wire.tell(
+            protocol.ChatAppend(
+                session_id="s1", entry=entry(2, "assistant", "and then this")
+            )
+        )
+        assert len(wire.ui.chat.items) == 2
+        assert "and then this" in wire.screen()
+
+    async def test_an_update_revises_a_row_in_place(self, wire):
+        await started(wire, [entry(1), entry(2, "assistant", "still working")])
+        await wire.tell(
+            protocol.ChatUpdate(
+                session_id="s1", entry=entry(2, "assistant", "finished, actually")
+            )
+        )
+        assert len(wire.ui.chat.items) == 2
+        assert "finished, actually" in wire.screen()
+        assert "still working" not in wire.screen()
+
+    async def test_an_update_for_a_row_we_do_not_have_is_dropped(self, wire):
+        await started(wire, [entry(1)])
+        await wire.tell(
+            protocol.ChatUpdate(session_id="s1", entry=entry(97, text="from nowhere"))
+        )
+        assert len(wire.ui.chat.items) == 1
+        assert "from nowhere" not in wire.screen()
+
+    async def test_and_says_that_it_dropped_it(self, wire):
+        await started(wire, [entry(1)])
+        await wire.tell(protocol.ChatUpdate(session_id="s1", entry=entry(97)))
+        assert wire.client.dropped["chat.update"] == 1
+
+    async def test_an_unnumbered_row_can_never_be_updated(self, wire):
+        # seq 0 means "not numbered" (`protocol.Entry.seq`), so an update
+        # carrying 0 must not land on the first unnumbered row it finds.
+        await started(wire, [entry(0, text="unnumbered")])
+        await wire.tell(
+            protocol.ChatUpdate(session_id="s1", entry=entry(0, text="revised"))
+        )
+        assert "revised" not in wire.screen()
+
+    async def test_a_reset_re_bases_the_numbering(self, wire):
+        await started(wire, [entry(1, text="one"), entry(2, text="two")])
+        await wire.tell(
+            protocol.ChatReset(session_id="s1", entries=[entry(1, text="only this")])
+        )
+        assert [x.key for x in wire.ui.chat.items] == ["1"]
+        assert "two" not in wire.screen()
+
+    async def test_and_the_rows_it_dropped_are_no_longer_addressable(self, wire):
+        await started(wire, [entry(1, text="one"), entry(2, text="two")])
+        await wire.tell(
+            protocol.ChatReset(session_id="s1", entries=[entry(1, text="only this")])
+        )
+        await wire.tell(
+            protocol.ChatUpdate(
+                session_id="s1", entry=entry(2, text="back from the dead")
+            )
+        )
+        assert "back from the dead" not in wire.screen()
+        assert wire.client.dropped["chat.update"] == 1
+
+    async def test_the_same_seq_after_a_reset_is_the_new_row(self, wire):
+        await started(wire, [entry(1, text="one"), entry(2, text="two")])
+        await wire.tell(
+            protocol.ChatReset(session_id="s1", entries=[entry(1, text="a new one")])
+        )
+        await wire.tell(
+            protocol.ChatUpdate(session_id="s1", entry=entry(1, text="revised"))
+        )
+        assert [x.text for x in wire.ui.session.entries] == ["revised"]
+
+
+class TestSessionsThatAreNotOnScreen:
+    """Property 1 of §3.2: most events are not for the visible session."""
+
+    async def test_an_append_elsewhere_changes_nothing_on_screen(self, wire):
+        await started(wire)
+        before = wire.screen()
+        await wire.tell(
+            protocol.ChatAppend(session_id="s2", entry=entry(1, text="not for you"))
+        )
+        assert wire.screen() == before
+
+    async def test_but_it_did_land(self, wire):
+        await started(wire)
+        await wire.tell(
+            protocol.ChatAppend(session_id="s2", entry=entry(1, text="kept for later"))
+        )
+        assert wire.ui.session_for("s2").entries[0].text == "kept for later"
+
+    async def test_a_reset_for_another_session_does_not_touch_this_one(self, wire):
+        await started(wire, [entry(1, text="mine")])
+        await wire.tell(protocol.ChatReset(session_id="s2", entries=[entry(1)]))
+        assert "mine" in wire.screen()
+
+    async def test_a_decision_elsewhere_shows_as_a_sidebar_mark(self, wire):
+        await started(wire)
+        await wire.tell(
+            protocol.DecisionRequested(session_id="s2", payload={"tool": "run_bash"})
+        )
+        assert "!" in wire.screen()
+
+    async def test_and_only_the_sidebar_changed(self, wire):
+        await started(wire)
+        before = wire.frame()
+        await wire.tell(protocol.DecisionRequested(session_id="s2", payload={}))
+        changed = [i for i, line in enumerate(wire.frame()) if line != before[i]]
+        rows = wire.ui._heights(wire.height, wire.width)
+        assert changed and all(i <= rows[0] for i in changed)
+
+    async def test_the_mark_goes_when_the_decision_is_cleared(self, wire):
+        await started(wire)
+        await wire.tell(protocol.DecisionRequested(session_id="s2", payload={}))
+        await wire.tell(protocol.DecisionCleared(session_id="s2"))
+        assert "!" not in wire.screen()
+
+    async def test_a_turn_elsewhere_shows_as_the_working_mark(self, wire):
+        await started(wire)
+        await wire.tell(protocol.TurnStarted(session_id="s2"))
+        assert "⟳" in wire.screen()
+
+    async def test_and_goes_when_it_finishes(self, wire):
+        await started(wire)
+        await wire.tell(protocol.TurnStarted(session_id="s2"))
+        await wire.tell(protocol.TurnFinished(session_id="s2"))
+        assert "⟳" not in wire.screen()
+
+
+# ----------------------------------------------------------------- the turn
+
+
+class TestTheTurn:
+    async def test_it_starts_and_stops(self, wire):
+        await started(wire)
+        await wire.tell(protocol.TurnStarted(session_id="s1"))
+        assert wire.ui.session.turn.working
+        await wire.tell(protocol.TurnFinished(session_id="s1"))
+        assert not wire.ui.session.turn.working
+
+    async def test_an_activity_carries_the_cores_own_stamp(self, wire):
+        await started(wire)
+        await wire.tell(
+            protocol.TurnActivity(
+                session_id="s1", activity="reading", started_at="2026-08-21T10:00:00"
+            )
+        )
+        assert wire.ui.session.turn.started_at == "2026-08-21T10:00:00"
+
+    async def test_the_same_activity_again_does_not_restart_the_clock(self, wire):
+        await started(wire)
+        await wire.tell(
+            protocol.TurnActivity(
+                session_id="s1", activity="reading", started_at="2026-08-21T10:00:00"
+            )
+        )
+        await wire.tell(
+            protocol.TurnActivity(
+                session_id="s1", activity="reading", started_at="2026-08-21T10:00:09"
+            )
+        )
+        assert wire.ui.session.turn.started_at == "2026-08-21T10:00:00"
+
+    async def test_but_a_different_one_does(self, wire):
+        await started(wire)
+        await wire.tell(
+            protocol.TurnActivity(
+                session_id="s1", activity="reading", started_at="2026-08-21T10:00:00"
+            )
+        )
+        await wire.tell(
+            protocol.TurnActivity(
+                session_id="s1", activity="writing", started_at="2026-08-21T10:00:09"
+            )
+        )
+        assert wire.ui.session.turn.started_at == "2026-08-21T10:00:09"
+
+    async def test_a_failure_becomes_an_entry_in_the_chat(self, wire):
+        await started(wire, [entry(1)])
+        await wire.tell(
+            protocol.TurnFailed(session_id="s1", error="the backend hung up")
+        )
+        assert "the backend hung up" in wire.screen()
+
+    async def test_the_failure_row_is_not_addressable(self, wire):
+        # The core did not number it, so nothing may revise it later.
+        await started(wire, [entry(1)])
+        await wire.tell(protocol.TurnFailed(session_id="s1", error="boom"))
+        assert wire.ui.session.entries[-1].seq == 0
+
+    async def test_and_the_turn_is_over(self, wire):
+        await started(wire)
+        await wire.tell(protocol.TurnStarted(session_id="s1"))
+        await wire.tell(protocol.TurnFailed(session_id="s1", error="boom"))
+        assert not wire.ui.session.turn.working
+
+
+class TestTheContextMeter:
+    async def test_an_estimate_is_marked_as_one(self, wire):
+        await started(wire)
+        await wire.tell(
+            protocol.ContextEstimate(session_id="s1", used=1000, window=10000)
+        )
+        assert "~10% ctx" in wire.screen()
+
+    async def test_a_measurement_is_not(self, wire):
+        await started(wire)
+        await wire.tell(
+            protocol.TurnUsage(
+                session_id="s1", prompt_tokens=2000, max_model_len=10000
+            )
+        )
+        assert "20% ctx" in wire.screen()
+        assert "~20% ctx" not in wire.screen()
+
+    async def test_a_measurement_beats_an_estimate(self, wire):
+        await started(wire)
+        await wire.tell(
+            protocol.TurnUsage(
+                session_id="s1", prompt_tokens=2000, max_model_len=10000
+            ),
+            protocol.ContextEstimate(session_id="s1", used=9000, window=10000),
+        )
+        assert "20% ctx" in wire.screen()
+
+    async def test_until_the_thread_it_measured_is_gone(self, wire):
+        await started(wire)
+        await wire.tell(
+            protocol.TurnUsage(
+                session_id="s1", prompt_tokens=2000, max_model_len=10000
+            )
+        )
+        await wire.tell(protocol.ChatReset(session_id="s1", entries=[entry(1)]))
+        await wire.tell(
+            protocol.ContextEstimate(session_id="s1", used=500, window=10000)
+        )
+        assert "~5% ctx" in wire.screen()
+
+
+# -------------------------------------------------------------- the panels
+
+
+PANEL = [
+    protocol.PanelRow(
+        key="w7",
+        title="job 4821000",
+        text="RUNNING\n/scratch/run/step0.log\n[12:41] merging shard 3",
+        classes="watch watch-live",
+        kind=protocol.PANEL_WATCH,
+        ref="7",
+    ),
+    protocol.PanelRow(
+        key="w9",
+        title="job 4821001",
+        text="FAILED\n/scratch/run/step1.log",
+        classes="watch watch-dead",
+        kind=protocol.PANEL_WATCH,
+        ref="9",
+    ),
+]
+
+
+class TestTheWatchers:
+    async def test_the_rows_are_the_column(self, wire):
+        await started(wire)
+        await wire.tell(protocol.PanelUpdate(session_id="s1", rows=list(PANEL)))
+        assert "job 4821000" in wire.screen()
+
+    async def test_they_are_keyed_by_the_key_the_core_gave_them(self, wire):
+        await started(wire)
+        await wire.tell(protocol.PanelUpdate(session_id="s1", rows=list(PANEL)))
+        assert [x.key for x in wire.ui.watchers.items] == ["w7", "w9"]
+
+    async def test_a_repaint_keeps_the_cursor_on_its_box(self, wire):
+        await started(wire)
+        await wire.tell(protocol.PanelUpdate(session_id="s1", rows=list(PANEL)))
+        wire.ui.focus = WATCHERS
+        wire.ui.watchers.cursor = 1
+        await wire.tell(
+            protocol.PanelUpdate(
+                session_id="s1",
+                rows=[
+                    protocol.PanelRow(key="w1", title="job 4820000", text="RUNNING"),
+                    *PANEL,
+                ],
+            )
+        )
+        pane = wire.ui.watchers
+        assert pane.items[pane.current(wire.inner)].key == "w9"
+
+    async def test_and_keeps_an_open_box_open(self, wire):
+        await started(wire)
+        await wire.tell(protocol.PanelUpdate(session_id="s1", rows=list(PANEL)))
+        wire.ui.focus = WATCHERS
+        wire.ui.watchers.cursor = 0
+        wire.ui.watchers.expand(wire.inner)
+        await wire.tell(protocol.PanelUpdate(session_id="s1", rows=list(PANEL)))
+        assert wire.ui.watchers.expanded == {"w7"}
+
+    async def test_a_panel_for_another_session_stays_off_screen(self, wire):
+        await started(wire)
+        before = wire.screen()
+        await wire.tell(protocol.PanelUpdate(session_id="s2", rows=list(PANEL)))
+        assert wire.screen() == before
+        assert len(wire.ui.session_for("s2").watchers.items) == 2
+
+
+# ------------------------------------------------------ keys become commands
+
+
+class TestKeysBecomeCommands:
+    async def test_enter_in_the_box_submits_the_turn(self, wire):
+        await started(wire)
+        wire.ui.focus = INPUT
+        wire.ui.input.set_text("which BAMs?")
+        await wire.press("enter")
+        sent = wire.peer.last(protocol.TurnSubmit)
+        assert (sent.session_id, sent.text) == ("s1", "which BAMs?")
+
+    async def test_and_the_chat_does_not_grow_until_the_core_says_so(self, wire):
+        await started(wire, [entry(1)])
+        wire.ui.focus = INPUT
+        wire.ui.input.set_text("which BAMs?")
+        await wire.press("enter")
+        assert len(wire.ui.chat.items) == 1
+
+    async def test_an_empty_box_sends_nothing(self, wire):
+        await started(wire)
+        wire.ui.focus = INPUT
+        await wire.press("enter")
+        assert wire.peer.took(protocol.TurnSubmit) == []
+
+    async def test_esc_esc_interrupts_the_open_session(self, wire):
+        await started(wire)
+        clocked(wire.ui)
+        await wire.press("esc")
+        wire.ui._now += 0.2
+        await wire.press("esc")
+        assert wire.peer.last(protocol.TurnInterrupt).session_id == "s1"
+
+    async def test_one_esc_interrupts_nothing(self, wire):
+        await started(wire)
+        clocked(wire.ui)
+        await wire.press("esc")
+        assert wire.peer.took(protocol.TurnInterrupt) == []
+
+    async def test_enter_on_a_session_opens_it(self, wire):
+        await started(wire)
+        wire.ui.focus = SESSIONS
+        wire.ui.session_pane.cursor = 1
+        await wire.press("enter")
+        assert wire.peer.last(protocol.SessionOpen).session_id == "s2"
+
+    async def test_and_says_which_one_is_on_screen(self, wire):
+        await started(wire)
+        wire.ui.focus = SESSIONS
+        wire.ui.session_pane.cursor = 1
+        await wire.press("enter")
+        assert wire.peer.last(protocol.SessionFocus).session_id == "s2"
+
+    async def test_going_back_does_not_ask_for_the_transcript_twice(self, wire):
+        await started(wire)
+        wire.ui.focus = SESSIONS
+        wire.ui.session_pane.cursor = 1
+        await wire.press("enter")
+        await wire.tell(protocol.ChatReset(session_id="s2", entries=[entry(1)]))
+        wire.peer.clear()
+        wire.ui.focus = SESSIONS
+        wire.ui.session_pane.cursor = 0
+        await wire.press("enter")
+        assert wire.peer.took(protocol.SessionOpen) == []
+        assert wire.peer.last(protocol.SessionFocus).session_id == "s1"
+
+    async def test_a_watcher_peek_names_the_watch(self, wire):
+        await started(wire)
+        await wire.tell(protocol.PanelUpdate(session_id="s1", rows=list(PANEL)))
+        wire.ui.focus = WATCHERS
+        wire.ui.watchers.cursor = 1
+        await wire.press("enter")
+        assert wire.peer.last(protocol.WatchPeek).watch_id == 9
+
+    async def test_and_d_drops_it(self, wire):
+        await started(wire)
+        await wire.tell(protocol.PanelUpdate(session_id="s1", rows=list(PANEL)))
+        wire.ui.focus = WATCHERS
+        wire.ui.watchers.cursor = 0
+        await wire.press("d")
+        assert wire.peer.last(protocol.WatchDrop).watch_id == 7
+
+
+class TestTheRewind:
+    """The one place three different numbers meet, so the one to get wrong."""
+
+    ENTRIES = [
+        entry(1, text="the first ask", index=0),
+        entry(2, "thinking"),
+        entry(3, text="the second ask", index=1),
+    ]
+
+    async def at_the_second_ask(self, wire) -> Wire:
+        await started(wire, list(self.ENTRIES))
+        wire.ui.focus = CHAT
+        wire.ui.chat.cursor = 2
+        await wire.press("enter")
+        assert wire.ui.overlay is not None, "enter on your own message opens the rewind"
+        return wire
+
+    async def test_a_fork_carries_the_message_index(self, wire):
+        # Not the seq (3) and not the row's position in the pane (2): the wire
+        # wants the thread message the cut is made at.
+        await self.at_the_second_ask(wire)
+        await wire.press("f")
+        assert wire.peer.last(protocol.SessionFork).index == 1
+
+    async def test_a_rollback_carries_it_too(self, wire):
+        await self.at_the_second_ask(wire)
+        await wire.press("r")
+        assert wire.peer.last(protocol.SessionRollback).index == 1
+
+    async def test_it_names_the_session_it_was_opened_in(self, wire):
+        await self.at_the_second_ask(wire)
+        await wire.press("f")
+        assert wire.peer.last(protocol.SessionFork).session_id == "s1"
+
+    async def test_copying_it_sends_nothing_at_all(self, wire):
+        await self.at_the_second_ask(wire)
+        await wire.press("c")
+        assert wire.peer.commands == []
+        assert wire.ui.input.text() == "the second ask"
+
+    async def test_a_row_that_is_not_a_message_cannot_be_rewound(self, wire):
+        # A `thinking` row folds several messages and is `index` -1, so there
+        # is nothing to cut at: the answer is to say so, not to send a cut
+        # aimed at whatever -1 resolves to.
+        await started(wire, list(self.ENTRIES))
+        wire.ui.focus = CHAT
+        wire.ui.chat.cursor = 1
+        await wire.press("enter")
+        assert wire.ui.overlay is None
+        assert wire.ui.focus == INPUT
+
+    async def test_and_an_own_message_with_no_index_is_refused(self, wire):
+        await started(wire, [entry(1, text="queued, not sent yet", kind="queued")])
+        wire.ui.focus = CHAT
+        wire.ui.chat.cursor = 0
+        await wire.press("enter", "f")
+        assert wire.peer.took(protocol.SessionFork) == []
+        assert "nothing to rewind to" in wire.ui.note
+
+    async def test_a_fork_is_opened_when_the_core_makes_it(self, wire):
+        await self.at_the_second_ask(wire)
+        await wire.press("f")
+        await wire.tell(
+            protocol.SessionCreated(
+                row=protocol.SessionRow(session_id="f1", title="a fork of it")
+            )
+        )
+        assert wire.ui.active_id == "f1"
+
+    async def test_and_it_is_in_the_sidebar_before_its_row_arrives(self, wire):
+        await self.at_the_second_ask(wire)
+        await wire.press("f")
+        await wire.tell(
+            protocol.SessionCreated(
+                row=protocol.SessionRow(session_id="f1", title="a fork of it")
+            )
+        )
+        assert "a fork of it" in wire.screen()
+
+    async def test_and_its_transcript_is_asked_for(self, wire):
+        await self.at_the_second_ask(wire)
+        await wire.press("f")
+        await wire.tell(
+            protocol.SessionCreated(
+                row=protocol.SessionRow(session_id="f1", title="a fork of it")
+            )
+        )
+        assert wire.peer.last(protocol.SessionOpen).session_id == "f1"
+
+
+# ------------------------------------------------------- what is not drawn
+
+
+class TestWhatTheClientDrops:
+    async def test_an_event_with_no_job_is_dropped_and_counted(self, wire):
+        # `turn.unqueued` is M5's; §3.2's rule is that a client ignores what it
+        # cannot draw, and the count is how that stays a decision rather than
+        # an oversight.
+        await started(wire)
+        await wire.tell(
+            protocol.TurnUnqueued(session_id="s1", seq=4, text="taken back")
+        )
+        assert wire.client.dropped["turn.unqueued"] == 1
+
+    async def test_and_nothing_on_screen_moved(self, wire):
+        await started(wire)
+        before = wire.screen()
+        await wire.tell(protocol.TurnUnqueued(session_id="s1", seq=4, text="x"))
+        assert wire.screen() == before
+
+    async def test_a_frame_that_is_not_a_message_at_all_is_dropped(self, wire):
+        await started(wire)
+        await wire.peer.conn.send(protocol.SessionList())  # a command, from a core
+        await settle()
+        assert wire.client.dropped["session.list"] == 1
+
+    async def test_a_junk_envelope_costs_that_frame_and_no_more(self, wire):
+        await started(wire)
+        wire.client.apply(protocol.Envelope(type="nonsense.event", payload={}))
+        assert wire.client.dropped["unparseable"] == 1
+        await wire.tell(
+            protocol.ChatAppend(session_id="s1", entry=entry(2, text="still here"))
+        )
+        assert "still here" in wire.screen()
+
+
+class TestNotify:
+    async def test_it_reaches_the_footer(self, wire):
+        await started(wire)
+        await wire.tell(protocol.Notify(text="the scratch quota is nearly full"))
+        assert "the scratch quota is nearly full" in plain(wire.frame()[-1])
+
+    async def test_a_toast_longer_than_the_terminal_does_not_break_the_frame(
+        self, wire
+    ):
+        await started(wire)
+        await wire.tell(protocol.Notify(text="verbose " * 60))
+        assert widths(wire.ui.render(80, 24)) == {80}
+
+    async def test_a_peek_answers_where_a_toast_would(self, wire):
+        await started(wire)
+        await wire.tell(
+            protocol.WatchPeeked(watch_id=7, title="job 4821000", text="shard 4 of 8")
+        )
+        assert "shard 4 of 8" in plain(wire.frame()[-1])
+
+
+class TestWithNothingOpenYet:
+    """The UI draws before the first `session.rows`, so it has to survive it."""
+
+    async def test_it_still_renders(self, wire):
+        assert widths(wire.ui.render(80, 24)) == {80}
+
+    async def test_and_a_keypress_sends_nothing(self, wire):
+        wire.ui.focus = INPUT
+        wire.ui.input.set_text("into the void")
+        await wire.press("enter")
+        assert wire.peer.commands == []
+        assert wire.ui.note == "no session open"
+
+    async def test_an_event_for_an_unknown_session_is_still_kept(self, wire):
+        # It arrives before the sidebar that lists it; the state is made on the
+        # spot rather than the frame being lost.
+        await wire.tell(
+            protocol.ChatAppend(session_id="stranger", entry=entry(1, text="early"))
+        )
+        assert wire.ui.session_for("stranger").entries[0].text == "early"

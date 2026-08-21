@@ -7,9 +7,10 @@ what makes the whole UI testable by calling ``render()`` and comparing strings.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 
 from hpca import __version__ as VERSION
-from hpca.ui.ansi import BLUE, BOLD, CYAN, DIM, GREEN, RED, RESET, REVERSE, YELLOW
+from hpca.ui.ansi import BOLD, CYAN, DIM, GREEN, RED, RESET, REVERSE, YELLOW
 from hpca.ui.ansi import cell_width, footer_line, pad, rule
 from hpca.ui.editor import Editor
 from hpca.ui.keys import NEWLINE_KEYS, is_paste, paste_text
@@ -25,6 +26,21 @@ from hpca.ui.overlays import (
     RewindOverlay,
 )
 from hpca.ui.pane import Item, Pane
+from hpca.ui.state import (
+    OWN_MESSAGE_KINDS,
+    Confirm,
+    Drop,
+    Fork,
+    Intent,
+    Interrupt,
+    OpenSession,
+    Peek,
+    Rollback,
+    SessionState,
+    SidebarRow,
+    Submit,
+    Toast,
+)
 
 # How long a first escape stays armed for a second one to complete the stop
 # gesture. The same 1.0s the Textual app uses, and for the same reason a single
@@ -36,77 +52,12 @@ ESC_STOP_WINDOW = 1.0
 SESSIONS, CHAT, INPUT, WATCHERS = range(4)
 
 
-class SessionState:
-    """Everything that belongs to one conversation rather than to the app.
-
-    Switching sessions swaps this and nothing else, which is why the chat's
-    cursor line, its open entries and a half-typed message all survive going
-    away and coming back — the same property each row has, one level up. The
-    Textual app parks drafts per session for the same reason; here it falls out
-    of where the Editor lives instead of needing a store.
-
-    Watchers belong to the session that registered them (WatchStore.list takes
-    a session_id), so they swap too. A session with none simply shows an empty
-    row, which the layout already charges nothing for.
-
-    The chat and the watchers are built on first visit. The real app reads a
-    thread from the checkpointer on switch, and this mirrors that: fourteen
-    sessions of four hundred steps should not all exist because one is open.
-    """
-
-    def __init__(
-        self,
-        *,
-        title: str,
-        profile: str,
-        model: str,
-        started: str,
-        size: int,
-        watch_count: int,
-        index: int,
-    ) -> None:
-        self.title = title
-        self.profile = profile
-        self.model = model
-        self.started = started
-        self.size = size
-        self.watch_count = watch_count
-        self.index = index
-        self.draft = Editor(wrap=True)
-        self._chat: Pane | None = None
-        self._watchers: Pane | None = None
-
-    @property
-    def loaded(self) -> bool:
-        return self._chat is not None
-
-    @property
-    def chat(self) -> Pane:
-        # Imported here rather than at module scope: ``demo`` builds a RowUI,
-        # so the app must not depend on the demo content at import time. Until
-        # a real conversation arrives (specs-ui-replacement.md M3) this is
-        # where it comes from.
-        from hpca.ui.demo import sample_chat
-
-        if self._chat is None:
-            self._chat = Pane("chat", sample_chat(self.size, self.index, self.title))
-            self._chat.cursor = 10**9  # open at the newest, as the app does
-        return self._chat
-
-    @property
-    def watchers(self) -> Pane:
-        from hpca.ui.demo import sample_watchers
-
-        if self._watchers is None:
-            self._watchers = Pane(
-                "watchers", sample_watchers(self.watch_count, self.index)
-            )
-        return self._watchers
-
-    def invalidate(self) -> None:
-        for pane in (self._chat, self._watchers):
-            if pane is not None:
-                pane.invalidate()
+# The sidebar markers §4.3 item 15 asks for, and the flag strings the core
+# uses for the same states. Both are consulted: the flag is what the core
+# knows, and the local turn/decision state is what has arrived since the last
+# `session.rows` — a marker that waited for the next sidebar repaint would lag
+# a whole poll behind the event that caused it.
+DECISION_MARK, WORKING_MARK = "!", "⟳"
 
 
 class RowUI:
@@ -115,35 +66,79 @@ class RowUI:
 
     def __init__(
         self,
-        sessions: list[SessionState],
+        sessions: list[SessionState] | None = None,
         *,
-        learnings: dict[str, str],
-        settings_json: str,
-        llms: tuple[list[Item], list[Item]],
+        learnings: dict[str, str] | None = None,
+        settings_json: str = "",
+        llms: tuple[list[Item], list[Item]] | None = None,
+        profiles: list[Item] | None = None,
+        send: Callable[[Intent], None] | None = None,
     ) -> None:
-        self.sessions = sessions
+        # The sidebar's order, and the store behind it. Two things, because an
+        # event can name a session the sidebar has not been told about yet (a
+        # fork's `session.created` arrives before the `session.rows` that lists
+        # it), and because a session must not lose its chat and its draft
+        # merely by scrolling out of the list.
+        self.sessions = list(sessions or [])
+        self._states = {x.session_id: x for x in self.sessions}
+        # What the rows draw against before the first `session.rows` arrives.
+        # Real, so that nothing below here needs a None check.
+        self._blank = SessionState("")
         self.active = 0
+        # Where a keypress goes when it means something the core has to do.
+        # Recorded rather than dropped when nothing is listening, so a test can
+        # read the intent off the UI without a client at all.
+        self.intents: list[Intent] = []
+        self.send: Callable[[Intent], None] = send or self.intents.append
         self.session_pane = Pane("sessions", [])
-        self._refresh_sessions()
+        self.refresh_sidebar()
         self.focus = CHAT
-        self.mode = "agent"
         self.frame_ms = 0.0
-        self.note = ""
+        self._note = ""
+        self.note_style = YELLOW
+        # Set from `hello`, and what the header falls back to when no session
+        # is open to have a profile of its own.
+        self.core_profile = ""
+        self.confirm: Confirm | None = None
+        self.toasts: list[Toast] = []
         self.overlay: Overlay | None = None
         # When the last escape landed, so the next one can tell whether it is
         # the second half of a stop. Injectable so the headless check can drive
         # the clock instead of sleeping through the window.
         self.clock = time.monotonic
         self._esc_armed_at: float | None = None
-        self._learnings = learnings
+        self._learnings = learnings or {}
         self._settings_json = settings_json
-        self._llms = llms
+        self._llms = llms or ([], [])
+        self._profiles = profiles or []
 
     # ------------------------------------------------------ the open session
 
     @property
     def session(self) -> SessionState:
-        return self.sessions[self.active]
+        """The conversation on screen, or a blank one when there is none.
+
+        A UI drawn before the first `session.rows` has nothing open and still
+        has to render four rows, so "nothing open" is a session with an empty
+        chat rather than a special case in every method below.
+        """
+        if 0 <= self.active < len(self.sessions):
+            return self.sessions[self.active]
+        return self._blank
+
+    @property
+    def active_id(self) -> str:
+        return self.session.session_id
+
+    @property
+    def note(self) -> str:
+        return self._note
+
+    @note.setter
+    def note(self, text: str) -> None:
+        # Anything set as an ordinary note is an ordinary note; a toast that
+        # wants another colour sets both, and the next note takes it back.
+        self._note, self.note_style = text, YELLOW
 
     @property
     def chat(self) -> Pane:
@@ -159,10 +154,21 @@ class RowUI:
 
     @property
     def profile(self) -> str:
-        return self.session.profile
+        return self.session.profile or self.core_profile
+
+    @property
+    def mode(self) -> str:
+        return self.session.mode or "agent"
 
     @property
     def model(self) -> str:
+        """Empty until something puts a model on the wire.
+
+        `protocol.SessionRow` carries the title, the profile, the mode and the
+        render flags, and nothing about the backend a session is pinned to — so
+        the model line (§4.3 item 20) has nothing to read yet, and draws as the
+        absence rather than as a guess.
+        """
         return self.session.model
 
     @property
@@ -170,34 +176,128 @@ class RowUI:
         """The three list rows, top to bottom, for the session on screen."""
         return [self.session_pane, self.chat, self.watchers]
 
-    def _refresh_sessions(self) -> None:
-        """Redraw the session list so the open one is marked.
+    def session_for(self, session_id: str) -> SessionState:
+        """The state for that conversation, made if this is the first word of it.
+
+        Every event handler starts here (§3.2 property 1): an event names a
+        session, and it is answered whether or not that session is the one on
+        screen.
+        """
+        session = self._states.get(session_id)
+        if session is None:
+            session = self._states[session_id] = SessionState(session_id)
+        return session
+
+    def adopt(self, session: SessionState) -> None:
+        """Put a session in the sidebar now, ahead of the core saying so.
+
+        `session.created` names a conversation the user is about to be looking
+        at; waiting for the next `session.rows` to list it would mean opening
+        something the sidebar does not show.
+        """
+        self._states[session.session_id] = session
+        if session in self.sessions:
+            return
+        was = self.active_id
+        self.sessions.insert(0, session)
+        self._select(was)
+        self.refresh_sidebar()
+
+    def sync_sessions(self, rows: list[SidebarRow]) -> None:
+        """The sidebar, as the core last described it.
+
+        The cursor is preserved **by session id** rather than by index: a
+        session created in the background inserts a row, and a selection that
+        moved because of it is a selection the user did not make. So is the
+        open session — `active` is an index into a list that has just been
+        rebuilt, and it is recomputed from the id rather than carried over.
+
+        Nothing else about a session is touched. The chat, the draft, the
+        cursor line and the open entries are the UI's, and a repaint of the
+        sidebar is not an event about any of them.
+        """
+        was = self.active_id
+        self.sessions = []
+        for row in rows:
+            session = self.session_for(row.session_id)
+            session.title = row.title
+            session.profile = row.profile
+            session.mode = row.mode
+            session.flags = list(row.flags)
+            self.sessions.append(session)
+        keep = {x.session_id for x in self.sessions} | {was}
+        self._states = {k: v for k, v in self._states.items() if k in keep}
+        self._select(was)
+        self.refresh_sidebar()
+
+    def _select(self, session_id: str) -> None:
+        """Point `active` at that session, or at the first one if it is gone."""
+        self.active = next(
+            (i for i, x in enumerate(self.sessions) if x.session_id == session_id),
+            0,
+        )
+
+    def _marks(self, session: SessionState) -> str:
+        """The sidebar markers: what this session wants, and what it is doing.
+
+        The one thing a session that is *not* on screen may change about the
+        frame (§3.2 property 1) — so it is read off that session's own state
+        rather than off anything the open conversation knows.
+        """
+        flags = " ".join(session.flags)
+        # `is not None`: an interrupt whose payload happens to be empty is
+        # still a decision waiting for an answer.
+        parked = session.decision is not None or "decision" in flags
+        marks = DECISION_MARK if parked else " "
+        marks += WORKING_MARK if session.turn.working or "working" in flags else " "
+        return marks
+
+    def refresh_sidebar(self) -> None:
+        """Redraw the session list: which one is open, and what each is doing.
 
         Rebuilt rather than patched because it is fourteen rows, not fourteen
         hundred — the cost that matters is the chat's, and that one is never
-        rebuilt at all. The cursor is kept: which session you are *looking at*
-        is not the same as which one is open, and moving the highlight must not
-        follow the switch.
+        rebuilt at all. `Pane.replace` keeps the cursor on the row it was on,
+        by id.
         """
-        cursor = self.session_pane.cursor
-        self.session_pane.items = [
-            Item(
-                head=(
-                    f"{'●' if i == self.active else '○'} "
-                    f"{state.title[:40]:<42}{state.started:>9}   {state.model}"
-                ),
-                body=[
-                    f"session 9f3c{i:04x} · profile {state.profile} · mode agent",
-                    f"{state.size} entries · {(i * 13) % 90}% of context used",
-                    f"{state.watch_count} watches"
-                    + (" · open" if i == self.active else ""),
-                ],
-                accent=GREEN if i == self.active else "",
-            )
-            for i, state in enumerate(self.sessions)
-        ]
-        self.session_pane.invalidate()
-        self.session_pane.cursor = cursor
+        self.session_pane.replace(
+            [
+                Item(
+                    head=(
+                        f"{'●' if i == self.active else '○'} "
+                        f"{self._marks(session)} {session.title[:40]:<42}"
+                        f"{session.profile} · {session.mode or 'agent'}"
+                    ),
+                    body=[
+                        f"session {session.session_id}",
+                        f"{len(session.entries)} entries"
+                        + (
+                            f" · {session.context.label()}"
+                            if session.context.label()
+                            else ""
+                        ),
+                        f"{session.watch_count} watches"
+                        + (" · open" if i == self.active else ""),
+                    ],
+                    accent=GREEN if i == self.active else "",
+                    key=session.session_id,
+                )
+                for i, session in enumerate(self.sessions)
+            ]
+        )
+
+    def open_session(self, session_id: str, *, announce: bool = True) -> None:
+        """Look at this conversation, and tell the core that we are.
+
+        ``announce`` is off for the one the client opens by itself when the
+        first sidebar arrives: the footer note answers a keypress, and there
+        was none.
+        """
+        self._select(session_id)
+        self.refresh_sidebar()
+        if announce:
+            self.note = f"opened “{self.session.title}”"
+        self.send(OpenSession(session_id))
 
     def _switch(self, index: int) -> None:
         if index < 0 or index >= len(self.sessions):
@@ -205,15 +305,21 @@ class RowUI:
         if index == self.active:
             self.note = "already open"
             return
-        self.active = index
-        self._refresh_sessions()
-        self.note = f"opened “{self.session.title}”"
+        self.open_session(self.sessions[index].session_id)
+
+    def toast(
+        self, text: str, severity: str = "information", timeout: float | None = None
+    ) -> None:
+        """Something the core said. The footer says it; M8 makes it a toast."""
+        self.toasts.append(Toast(text, severity, timeout))
+        self._note = text
+        self.note_style = RED if severity == "error" else YELLOW
 
     def invalidate(self) -> None:
-        """Every pane that has been built — a session never visited has none."""
+        """Every pane the UI holds, open or not."""
         self.session_pane.invalidate()
-        for state in self.sessions:
-            state.invalidate()
+        for session in (*self._states.values(), self._blank):
+            session.invalidate()
 
     # ------------------------------------------------------------- geometry
 
@@ -284,7 +390,7 @@ class RowUI:
                 out += self._render_input(width, pane_h)
             else:
                 out += pane.render(width, pane_h, focused=self.focus == slot)
-        note, style = self.note, YELLOW
+        note, style = self.note, self.note_style
         if self._esc_armed():
             note, style = "esc again to stop", RED
         out.append(footer_line(self._keys(), width, note, style))
@@ -294,7 +400,12 @@ class RowUI:
 
     def _render_input(self, width: int, height: int) -> list[str]:
         focused = self.focus == INPUT
-        right = f"{self.mode} · {self.model} · 31% ctx"
+        # Built from what is actually known: the model comes from nothing on
+        # the wire yet, and the context meter is empty until the core has
+        # either measured or estimated one.
+        right = " · ".join(
+            x for x in (self.mode, self.model, self.session.context.label()) if x
+        )
         title = rule("message", width, right)
         out = [(BOLD + CYAN if focused else DIM) + title + RESET]
         rows = max(1, height - 1)
@@ -386,7 +497,7 @@ class RowUI:
     def _closed(self, overlay: Overlay) -> None:
         """A screen that answered with something the rows have to act on."""
         if isinstance(overlay, RewindOverlay) and overlay.choice:
-            self._rewind(overlay.choice, overlay.index, overlay.message)
+            self._rewind(overlay)
 
     # -------------------------------------------------------- the chat rewind
 
@@ -397,20 +508,30 @@ class RowUI:
         moves to the message box, which is what app.py answers an Enter it has
         nothing better to do with.
         """
-        index = self.chat.current(width)
-        item = self.chat.items[index] if index >= 0 else None
-        if item is not None and item.kind == "user":
-            self.overlay = RewindOverlay(item.text, index)
+        entry = self.session.entry_at(self.chat.current(width))
+        if entry is not None and entry.kind in OWN_MESSAGE_KINDS:
+            # The row's own name, not its position: the cut is decided by the
+            # user now and carried out by the core later, and a turn appending
+            # in between moves every position after it.
+            self.overlay = RewindOverlay(entry.text, entry.seq, self.active_id)
         else:
             self.focus = INPUT
 
-    def _rewind(self, choice: str, index: int, message: str) -> None:
-        if choice == COPY:
-            self.reuse_message(message)
-        elif choice == FORK:
-            self._fork_at(index)
-        elif choice == ROLLBACK:
-            self._rollback_to(index)
+    def _rewind(self, overlay: RewindOverlay) -> None:
+        """What the rewind decided, as an intent aimed at the session it was
+        opened in — which is not necessarily the one on screen by the time it
+        closes."""
+        if overlay.choice == COPY:
+            self.reuse_message(overlay.message)
+            return
+        if overlay.choice == FORK:
+            self.send(Fork(overlay.session_id, overlay.seq))
+        elif overlay.choice == ROLLBACK:
+            self.send(Rollback(overlay.session_id, overlay.seq))
+        # Either cut leaves you at the point the conversation now ends, which
+        # is a place to say the next thing from. `reuse_message` above puts the
+        # cursor in the box for itself.
+        self.focus = INPUT
 
     def reuse_message(self, text: str) -> None:
         """Put one of your own past messages back in the box, to send again or
@@ -428,42 +549,6 @@ class RowUI:
         self.input.set_text(draft + text)
         self.focus = INPUT  # cursor behind the reused text, ready to send
         self.note = "copied into the message box"
-
-    def _fork_at(self, index: int) -> None:
-        """A copy of this conversation that stops just before that message.
-
-        The original stays whole — that is the difference from a rollback, and
-        the reason both are offered instead of one being the safe version of
-        the other.
-        """
-        source = self.session
-        fork = SessionState(
-            title=f"{source.title} (fork)",
-            profile=source.profile,
-            model=source.model,
-            started="just now",
-            size=0,
-            watch_count=0,
-            index=source.index,
-        )
-        fork._chat = Pane("chat", list(self.chat.items[:index]))
-        fork._chat.cursor = 10**9
-        self.sessions.insert(0, fork)
-        self.active = 0
-        self._refresh_sessions()
-        self.focus = INPUT
-        self.note = f"forked “{source.title}” — this copy stops before that message"
-
-    def _rollback_to(self, index: int) -> None:
-        """Drop this conversation back to just before that message."""
-        chat = self.chat
-        dropped = len(chat.items) - index
-        del chat.items[index:]
-        chat.expanded = {i for i in chat.expanded if i < index}
-        chat.invalidate()
-        chat.cursor = 10**9
-        self.focus = INPUT
-        self.note = f"rolled back to just before that message ({dropped} entries gone)"
 
     def _esc_armed(self) -> bool:
         """Whether a first escape is still waiting for its second.
@@ -498,6 +583,8 @@ class RowUI:
         if first is None or now - first > ESC_STOP_WINDOW:
             return False
         self._esc_armed_at = None  # spent: a third press opens a fresh pair
+        if self.active_id:
+            self.send(Interrupt(self.active_id))
         self.note = "stopped the turn"
         return True
 
@@ -519,30 +606,25 @@ class RowUI:
         return True
 
     def _send(self) -> None:
+        """Ask for the turn. The row it becomes comes back as a `chat.append`.
+
+        Nothing is written into the chat here, and that is the append-only
+        invariant (§3.2) seen from the writing end: a UI that drew its own copy
+        of the message would have two rows to reconcile the moment the core
+        sent the real one — which is exactly how the queued-message bugs the
+        Textual app carried were made.
+        """
         text = self.input.text().strip()
         if not text:
             return
-        chat = self.chat
-        chat.items.append(
-            Item(head=f"you   {text}", accent=BLUE, kind="user", text=text)
-        )
-        chat.items.append(
-            Item(
-                head="hpca  looking at that now…",
-                body=["(there is no backend yet; this is where a turn would start)"],
-                accent=YELLOW,
-            )
-        )
-        chat.invalidate()
-        chat.cursor = 10**9
+        if not self.active_id:
+            self.note = "no session open"
+            return
+        self.send(Submit(self.active_id, text))
         self.input.clear()
         self.note = "sent"
 
     def _handle_row(self, key: str, width: int, height: int) -> bool:
-        # ``demo`` builds a RowUI, so it is imported here rather than at module
-        # scope; see SessionState.chat.
-        from hpca.ui.demo import sample_profiles
-
         if key in ("q", "quit"):
             return False
         inner = max(8, width - 2)
@@ -561,7 +643,7 @@ class RowUI:
         elif key == "m":
             self.overlay = LlmOverlay(*self._llms)
         elif key == "a":
-            self.overlay = ProfilesOverlay(sample_profiles(), self._learnings)
+            self.overlay = ProfilesOverlay(list(self._profiles), self._learnings)
         elif key == "c":
             self.overlay = ConfigOverlay(self._settings_json)
         elif key in ("ctrl-down", "tab"):
@@ -585,7 +667,7 @@ class RowUI:
         elif key == "right":
             # Open it; on one already open, step into what it opened, the way
             # a file tree does. On an entry with no body, nothing.
-            if not pane.expand(inner) and pane.current(inner) in pane.expanded:
+            if not pane.expand(inner) and pane.is_open(pane.current(inner)):
                 pane.move(1, view, inner)
         elif key == "left":
             pane.collapse(inner)
@@ -605,15 +687,27 @@ class RowUI:
             elif self.focus == CHAT:
                 self._activate_chat(inner)
             elif self.focus == WATCHERS:
-                self.note = "peeking at the log"
+                self._watch(Peek, "peeking at the log", inner)
         elif key == "r" and self.focus == SESSIONS:
             self.note = "rename: a modal in the real app"
         elif key == "t" and self.focus == SESSIONS:
             self.note = "asking the llm for a title"
         elif key == "d":
-            self.note = (
-                "delete session (confirm)"
-                if self.focus == SESSIONS
-                else "unwatched"
-            )
+            if self.focus == SESSIONS:
+                self.note = "delete session (confirm)"
+            else:
+                self._watch(Drop, "unwatched", inner)
         return True
+
+    def _watch(self, intent: type, note: str, inner: int) -> None:
+        """Peek at or drop the watch box under the cursor.
+
+        The row carries the core's own ``PanelRow.ref`` (see
+        `client._panel_item`), so what leaves here names a watch rather than a
+        position in a column that a poll repaints twice a second.
+        """
+        item = self.watchers.current(inner)
+        if item < 0:
+            return
+        self.send(intent(self.watchers.items[item].text))
+        self.note = note

@@ -222,14 +222,18 @@ def switched_to_the_second() -> RowUI:
     return ui
 
 
-def test_nothing_is_loaded_until_it_is_looked_at():
-    assert sum(x.loaded for x in build().sessions) == 0
+def test_exactly_the_open_session_is_loaded():
+    # One `session.open` goes out when the sidebar arrives, and no other:
+    # fourteen sessions of four hundred entries must not all exist because one
+    # of them is on screen.
+    assert sum(x.loaded for x in build().sessions) == 1
 
 
-def test_looking_at_one_loads_exactly_it():
+def test_the_rest_have_no_chat_at_all():
     ui = build()
-    ui.chat  # noqa: B018
-    assert sum(x.loaded for x in ui.sessions) == 1
+    assert [x.chat.items for x in ui.sessions if x is not ui.session] == [
+        [] for _ in range(len(ui.sessions) - 1)
+    ]
 
 
 def test_enter_opens_the_session_under_the_cursor():
@@ -278,13 +282,13 @@ def test_the_profile_follows_the_session():
 
 def test_exactly_one_session_is_marked_open():
     ui = switched_to_the_second()
-    marks = [x for x in frame(ui, 120, 40) if "●" in x and "m ago" in x]
+    marks = [x for x in frame(ui, 120, 40) if "●" in x]
     assert len(marks) == 1
 
 
 def test_the_mark_is_on_the_open_one():
     ui = switched_to_the_second()
-    marks = [x for x in frame(ui, 120, 40) if "●" in x and "m ago" in x]
+    marks = [x for x in frame(ui, 120, 40) if "●" in x]
     assert ui.sessions[1].title[:20] in marks[0]
 
 
@@ -367,10 +371,18 @@ def test_opening_does_not_move_the_session_highlight():
 
 
 def with_an_empty_watcher_row() -> RowUI:
+    """A session the core sent no watch boxes for.
+
+    Opened rather than merely selected: the column is filled by the
+    `panel.update` that answers the open, so a session nobody looked at has an
+    empty watcher row for the uninteresting reason as well as this one.
+    """
     ui = build()
-    ui.active = next(i for i, x in enumerate(ui.sessions) if x.watch_count == 0)
-    ui._refresh_sessions()
-    return ui
+    for session in list(ui.sessions):
+        ui.open_session(session.session_id)
+        if not ui.watchers.items:
+            return ui
+    raise AssertionError("every demo session has watches")
 
 
 def test_an_empty_watcher_row_shrinks_to_its_minimum():
@@ -686,7 +698,7 @@ def rolled_back() -> tuple[RowUI, int, int, int]:
     index = on_own_message(ui)
     total = len(ui.chat.items)
     sessions = len(ui.sessions)
-    ui.chat.expanded = {1, index + 1}
+    ui.chat.expanded = {ui.chat.key_at(1), ui.chat.key_at(index + 1)}
     ui.handle("enter", 120, 40)
     ui.handle("r", 120, 40)
     return ui, index, total, sessions
@@ -713,9 +725,13 @@ def test_it_says_how_much_went():
     assert f"({total - index} entries gone)" in ui.note
 
 
-def test_open_entries_past_the_cut_are_forgotten():
+def test_a_reset_forgets_every_open_entry():
+    # A rollback comes back as `chat.reset`, and a reset re-bases the row
+    # numbering — so a `seq` still held as open afterwards would be naming a
+    # row the core has renumbered, which is the one thing keying by identity
+    # must not be allowed to get wrong.
     ui, _, _, _ = rolled_back()
-    assert ui.chat.expanded == {1}
+    assert ui.chat.expanded == set()
 
 
 def test_the_frame_is_still_exact_after_a_rollback():

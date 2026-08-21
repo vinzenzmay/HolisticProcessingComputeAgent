@@ -34,7 +34,7 @@ class TestArrowsOpenAndCloseEntries:
         ui = chat_ui()
         pane, item = on_an_entry_with_a_body(ui)
         ui.handle("right", 120, 40)
-        assert item in pane.expanded
+        assert pane.is_open(item)
 
     def test_the_row_got_longer(self):
         ui = chat_ui()
@@ -62,7 +62,7 @@ class TestArrowsOpenAndCloseEntries:
         pane, item = on_an_entry_with_a_body(ui)
         ui.handle("right", 120, 40)
         ui.handle("right", 120, 40)
-        assert item in pane.expanded
+        assert pane.is_open(item)
 
     def test_left_closes_it_from_inside_the_body(self):
         ui = chat_ui()
@@ -70,7 +70,7 @@ class TestArrowsOpenAndCloseEntries:
         ui.handle("right", 120, 40)
         ui.handle("right", 120, 40)
         ui.handle("left", 120, 40)
-        assert item not in pane.expanded
+        assert not pane.is_open(item)
 
     def test_and_puts_you_back_on_its_head_line(self):
         ui = chat_ui()
@@ -169,8 +169,8 @@ class TestReorderingWatchers:
         ui.watchers.cursor = 0
         ui.handle("right", 120, 40)
         ui.handle("alt-down", 120, 40)
-        assert 1 in ui.watchers.expanded
-        assert 0 not in ui.watchers.expanded
+        assert ui.watchers.is_open(1)
+        assert not ui.watchers.is_open(0)
 
     def test_and_it_is_still_the_same_entry(self):
         ui = build()
@@ -225,3 +225,73 @@ class TestFlattening:
         pane = Pane("x", [Item(head="one", body=["a"])])
         pane.expand(40)
         assert "1 open" in pane.render(40, 4, focused=True)[0]
+
+
+class TestRowsAreKeyedByIdentity:
+    """`expanded` used to be keyed by position, which is only right while
+    entries are appended at the end. The chat's rows are named by the core
+    (`Entry.seq`) and the sidebar's by session id, so both are keyed by that
+    instead — and a row arriving above another cannot take over what was open.
+    """
+
+    def keyed(self) -> Pane:
+        return Pane(
+            "x",
+            [
+                Item(head="first", body=["a"], key="k1"),
+                Item(head="second", body=["b"], key="k2"),
+            ],
+        )
+
+    def test_a_row_with_no_key_of_its_own_falls_back_to_its_position(self):
+        pane = Pane("x", [Item(head="one"), Item(head="two")])
+        assert [pane.key_at(0), pane.key_at(1)] == ["#0", "#1"]
+
+    def test_a_row_with_one_is_addressed_by_it(self):
+        assert self.keyed().key_at(1) == "k2"
+
+    def test_off_the_end_is_nothing_rather_than_an_error(self):
+        assert self.keyed().key_at(9) == ""
+
+    def test_opening_a_row_remembers_the_row_and_not_the_line(self):
+        pane = self.keyed()
+        pane.cursor = 1
+        pane.expand(40)
+        assert pane.expanded == {"k2"}
+
+    def test_a_row_inserted_above_does_not_steal_what_was_open(self):
+        pane = self.keyed()
+        pane.cursor = 1
+        pane.expand(40)
+        pane.replace([Item(head="new", body=["c"], key="k0"), *pane.items], 40)
+        assert pane.is_open(2) and not pane.is_open(0)
+
+    def test_and_the_cursor_stays_on_the_row_it_was_on(self):
+        pane = self.keyed()
+        pane.cursor = 1
+        pane.replace([Item(head="new", key="k0"), *pane.items], 40)
+        assert pane.items[pane.current(40)].key == "k2"
+
+    def test_a_row_that_left_takes_its_open_state_with_it(self):
+        pane = self.keyed()
+        pane.cursor = 1
+        pane.expand(40)
+        pane.replace([pane.items[0]], 40)
+        assert pane.expanded == set()
+
+    def test_a_reorder_carries_it_along(self):
+        pane = self.keyed()
+        pane.cursor = 0
+        pane.expand(40)
+        pane.reorder(1, 10, 40)
+        assert pane.expanded == {"k1"}
+        assert pane.items[1].key == "k1"
+
+    def test_and_still_does_for_rows_with_no_key(self):
+        # The old hand-patch, which is still what a keyless list needs.
+        pane = Pane("x", [Item(head="one", body=["a"]), Item(head="two", body=["b"])])
+        pane.cursor = 0
+        pane.expand(40)
+        pane.reorder(1, 10, 40)
+        assert pane.expanded == {"#1"}
+        assert pane.items[1].head == "one"

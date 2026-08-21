@@ -252,6 +252,11 @@ def footer_line(
     styled: list[str] = []
     used = 1
     if note:
+        # Cut rather than allowed to run past the edge: every row is padded to
+        # an exact number of cells, so one over-long `notify` would otherwise
+        # shift the differential repaint by however far it overflowed. Three
+        # cells go to the leading space and the two after the note.
+        note = cut(note, max(0, width - 3))
         used += cell_width(note) + 2
     for key, label in pairs:
         piece = f"{key} {label}"

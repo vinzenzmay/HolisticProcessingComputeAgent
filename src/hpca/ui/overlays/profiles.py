@@ -71,9 +71,8 @@ class ProfilesOverlay(Overlay):
         elif key == "down":
             self.pane.move(1, view, inner)
         elif key == "right":
-            if (
-                not self.pane.expand(inner)
-                and self.pane.current(inner) in self.pane.expanded
+            if not self.pane.expand(inner) and self.pane.is_open(
+                self.pane.current(inner)
             ):
                 self.pane.move(1, view, inner)
         elif key == "left":

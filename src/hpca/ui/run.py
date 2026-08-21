@@ -45,8 +45,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if not args.demo:
-        # Nothing but the demo is wired up yet; the real client arrives with
-        # specs-ui-replacement.md M2/M3. Saying so beats drawing an empty UI.
+        # The client and the state layer are real (M2); what is not wired up
+        # yet is an `AgentService` to put on the other end of the connection
+        # (M3). Saying so beats drawing an empty UI.
         print("hpca.ui.run only knows --demo so far.", file=sys.stderr)
         return 2
 

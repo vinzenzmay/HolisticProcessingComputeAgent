@@ -15,6 +15,12 @@ class Item:
     which rows are the user's own words, and to hand back the words themselves
     rather than the decorated line they are drawn as (app.py keeps the same two
     on Entry, see OWN_MESSAGE_KINDS).
+
+    ``key`` is what the row *is*, for the lists whose rows have an identity
+    that outlives their position — a chat entry's core-assigned ``seq``, a
+    sidebar row's session id, a watch box's ``PanelRow.key``. Everything a pane
+    remembers per row is remembered against it, so a row arriving above another
+    cannot silently take over what was open.
     """
 
     head: str
@@ -22,6 +28,7 @@ class Item:
     accent: str = ""
     kind: str = ""
     text: str = ""
+    key: str = ""
 
 
 class Pane:
@@ -35,7 +42,8 @@ class Pane:
     def __init__(self, name: str, items: list[Item]) -> None:
         self.name = name
         self.items = items
-        self.expanded: set[int] = set()
+        # Keys, not positions: see `key_at`.
+        self.expanded: set[str] = set()
         self.cursor = 0  # index into the flattened line list
         self.offset = 0  # first visible flattened line
         self._flat: list[tuple[int, str, bool]] | None = None
@@ -54,9 +62,10 @@ class Pane:
             return self._flat
         lines: list[tuple[int, str, bool]] = []
         for index, item in enumerate(self.items):
-            marker = ("▾" if index in self.expanded else "▸") if item.body else " "
+            opened = self.key_at(index) in self.expanded
+            marker = ("▾" if opened else "▸") if item.body else " "
             lines.append((index, f"{marker} {item.head}", True))
-            if index in self.expanded:
+            if opened:
                 for raw in item.body:
                     # Folded by cells rather than by characters: a body line of
                     # CJK holds half as many characters in the same row, and
@@ -70,6 +79,46 @@ class Pane:
 
     def invalidate(self) -> None:
         self._flat = None
+
+    def key_at(self, item: int) -> str:
+        """What the row at that position is called.
+
+        A row that carries a ``key`` is addressed by it; one that does not
+        falls back to its position, which is what this pane used to do for
+        every row and is still right for a list that is only ever appended to
+        or reordered whole. The ``#`` keeps the two namespaces apart, since a
+        real key is a session id or a number the core assigned.
+        """
+        if 0 <= item < len(self.items):
+            return self.items[item].key or f"#{item}"
+        return ""
+
+    def is_open(self, item: int) -> bool:
+        """Whether the entry at that position is showing its body."""
+        return self.key_at(item) in self.expanded
+
+    def replace(self, items: list[Item], width: int | None = None) -> None:
+        """Take a new list of rows, keeping what the user had done to the old.
+
+        The cursor stays on the row it was on — by key, so a row inserted above
+        it does not move the selection — and rows that are still here stay
+        open. Rows that are gone take their state with them rather than leaving
+        a key behind for a later row to inherit.
+
+        Only for the panes the core repaints whole (the sidebar, the watchers).
+        The chat is never rebuilt; it appends (specs-ui-replacement.md §3.2).
+        """
+        # The client repaints a column without knowing the terminal size; the
+        # width only decides which flattened line the cursor lands on, and the
+        # last one this pane was drawn at is the right answer for that.
+        width = self._flat_width if width is None else width
+        was = self.key_at(self.current(width))
+        self.items = items
+        keys = [self.key_at(i) for i in range(len(items))]
+        self.expanded &= set(keys)
+        self.invalidate()
+        if was in keys:
+            self._go_to(keys.index(was), width)
 
     def current(self, width: int) -> int:
         lines = self.flat(width)
@@ -104,9 +153,9 @@ class Pane:
     def expand(self, width: int) -> bool:
         """Open the entry under the cursor. False if there was nothing to open."""
         item = self.current(width)
-        if item < 0 or not self.items[item].body or item in self.expanded:
+        if item < 0 or not self.items[item].body or self.is_open(item):
             return False
-        self.expanded.add(item)
+        self.expanded.add(self.key_at(item))
         self.invalidate()
         # Land back on the entry's own first line: opening one twelve lines
         # long and being left in the middle of it reads as a jump.
@@ -116,16 +165,18 @@ class Pane:
     def collapse(self, width: int) -> bool:
         """Close the entry the cursor is anywhere inside. False if it was shut."""
         item = self.current(width)
-        if item < 0 or item not in self.expanded:
+        if item < 0 or not self.is_open(item):
             return False
-        self.expanded.discard(item)
+        self.expanded.discard(self.key_at(item))
         self.invalidate()
         self._go_to(item, width)
         return True
 
     def expand_all(self, width: int) -> None:
         item = self.current(width)
-        self.expanded = {i for i, entry in enumerate(self.items) if entry.body}
+        self.expanded = {
+            self.key_at(i) for i, entry in enumerate(self.items) if entry.body
+        }
         self.invalidate()
         if item >= 0:
             self._go_to(item, width)
@@ -142,20 +193,25 @@ class Pane:
 
         The cursor travels with the entry rather than staying on the line,
         which is what makes holding alt+↓ walk one watcher down the list
-        instead of shuffling a different one each press. ``expanded`` is keyed
-        by position, so the two entries trade that flag along with their slot.
+        instead of shuffling a different one each press.
+
+        A row that carries a key takes what was open with it for free. One that
+        does not is keyed by position, so the two slots have just traded flags
+        and the flags are put back by hand — the same patch this always needed,
+        written once against ``key_at`` rather than against bare ints.
         """
         item = self.current(width)
         target = item + delta
         if item < 0 or not 0 <= target < len(self.items):
             return False
+        was = (self.is_open(item), self.is_open(target))
+        self.expanded.difference_update({self.key_at(item), self.key_at(target)})
         self.items[item], self.items[target] = self.items[target], self.items[item]
-        was = (item in self.expanded, target in self.expanded)
-        self.expanded.difference_update({item, target})
-        if was[1]:
-            self.expanded.add(item)
+        self.expanded.difference_update({self.key_at(item), self.key_at(target)})
         if was[0]:
-            self.expanded.add(target)
+            self.expanded.add(self.key_at(target))
+        if was[1]:
+            self.expanded.add(self.key_at(item))
         self.invalidate()
         self._go_to(target, width)
         self._scroll_into_view(view_h, len(self.flat(width)))

@@ -35,10 +35,13 @@ sequence the key table did not know used to be read as the esc key followed by
 its letters, so reaching for shift+arrow threw you out of the box and into the
 chat. Escapes are now measured by shape and unknown ones are dropped whole.
 
-What is deliberately still missing here: real data, mouse support, selecting
-text out of the *chat*, and approval prompts. Those are arguments *against*
-leaving Textual, so none of them is pretended solved — specs-ui-replacement.md
-§4 is the full list of what is absent and the order it arrives in.
+The content is real from M2 on: ``client`` fills ``state`` in from protocol
+events and the rows render that, so the only thing standing between this and a
+live conversation is the core on the other end of the connection (M3). What is
+deliberately still missing: mouse support, selecting text out of the *chat*,
+the turn display and approval prompts. Those are arguments *against* leaving
+Textual, so none of them is pretended solved — specs-ui-replacement.md §4 is
+the full list of what is absent and the order it arrives in.
 
 The modules, per specs-ui-replacement.md §3:
 
@@ -47,9 +50,14 @@ The modules, per specs-ui-replacement.md §3:
 * ``screen`` — the raw terminal: alternate screen, differential repaint;
 * ``keys`` — one read off the wire into key names;
 * ``editor`` — the shared multi-line buffer;
-* ``pane`` — one navigable list of entries;
+* ``pane`` — one navigable list of entries, each named by its own key;
+* ``state`` — the plain dataclasses the rows are drawn from: sessions, chat,
+  turn, context, and the intents a keypress becomes;
+* ``client`` — the one module that knows the protocol: events become state,
+  intents become commands;
 * ``overlays`` — the screens that draw over the rows, one module each;
 * ``app`` — layout, focus and key dispatch, with no I/O of its own;
-* ``demo`` — the sample content;
+* ``demo`` — the sample content, served by a loopback core that speaks the
+  same protocol a real one does;
 * ``run`` — argument parsing and the read/render loop.
 """

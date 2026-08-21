@@ -80,7 +80,7 @@ class LlmOverlay(Overlay):
         elif key == "pgdn":
             pane.move(view, view, inner)
         elif key == "right":
-            if not pane.expand(inner) and pane.current(inner) in pane.expanded:
+            if not pane.expand(inner) and pane.is_open(pane.current(inner)):
                 pane.move(1, view, inner)
         elif key == "left":
             pane.collapse(inner)

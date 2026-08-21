@@ -38,9 +38,15 @@ class RewindOverlay(Overlay):
         ("esc", "cancel"),
     ]
 
-    def __init__(self, message: str, index: int) -> None:
+    def __init__(self, message: str, seq: int = 0, session_id: str = "") -> None:
         self.message = message
-        self.index = index
+        # The row's core-assigned name (`protocol.Entry.seq`), not its position
+        # in the log: the cut is decided here and carried out later, and a turn
+        # appending in between moves every position after this one.
+        self.seq = seq
+        # And the conversation it was decided in, since a rewind that closes
+        # after the user has switched sessions must not cut the new one.
+        self.session_id = session_id
         self.choice = ""
 
     def render(self, width: int, height: int) -> list[str]:
