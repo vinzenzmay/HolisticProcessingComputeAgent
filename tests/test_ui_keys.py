@@ -140,6 +140,42 @@ def test_what_came_before_the_split_is_still_delivered():
     assert tail == "\x1b["
 
 
+# ------------------------------------------ alt+arrow, in all three spellings
+
+
+@pytest.mark.parametrize(
+    ("data", "name"),
+    [
+        (b"\x1b[1;3A", "alt-up"),  # the modifier byte xterm documents
+        (b"\x1b[1;3B", "alt-down"),
+        (b"\x1b[1;9A", "alt-up"),  # alt reported as the meta bit instead
+        (b"\x1b[1;9B", "alt-down"),
+        (b"\x1b\x1b[A", "alt-up"),  # an ESC in front of the plain arrow
+        (b"\x1b\x1b[B", "alt-down"),
+        (b"\x1b\x1bOA", "alt-up"),  # the same, in application cursor mode
+        (b"\x1b\x1b[D", "ctrl-left"),  # alt+←/→ is word motion, on purpose
+        (b"\x1b\x1b[C", "ctrl-right"),
+    ],
+)
+def test_alt_arrow_decodes_however_the_terminal_spells_it(data: bytes, name: str):
+    # The defect: reordering a watcher with alt+↑ did nothing in most
+    # terminals, because ESC ESC [ A read as the escape key followed by ↑ —
+    # which moved the cursor and armed half the stop gesture instead.
+    assert keys(data) == [name]
+
+
+def test_two_escapes_and_nothing_else_are_still_the_stop_gesture():
+    # What the meta prefix must not eat. Only a *sequence* behind the second
+    # escape is a modifier; a bare pair is somebody stopping the turn.
+    assert keys(b"\x1b\x1b") == ["esc", "esc"]
+
+
+def test_a_meta_prefixed_arrow_split_across_two_reads_arrives_whole():
+    named, tail = decode(b"\x1b\x1b[")
+    assert named == []  # neither escape is named while the rest could arrive
+    assert decode(tail.encode() + b"A") == (["alt-up"], "")
+
+
 # ------------------------------------------------------- bracketed paste
 
 
