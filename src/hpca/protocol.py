@@ -1523,7 +1523,14 @@ class TurnUnqueued(Event):
 
 
 class TurnInterrupted(Event):
-    """A running turn was stopped: here is the message it was working on.
+    """A stopped turn left nothing behind: here is the message back.
+
+    Sent for the *exception*, not the rule. Stopping a turn keeps its work —
+    the message and everything the agent got through stay in the conversation
+    (`TurnScheduler.interrupt`), so handing the text back as well would have
+    the user send it twice, and no such event is sent. The one case that still
+    needs it is a stop that lands before the message reached the thread: there
+    is then no exchange to keep and the sentence would simply be lost.
 
     The sibling of `turn.unqueued`, and deliberately not the same event. Both
     hand a message back to be edited and re-sent, and both are addressed so it
@@ -1533,13 +1540,14 @@ class TurnInterrupted(Event):
 
     * `turn.unqueued` names a row and means "that row is gone"; everything
       else stands, the turn ahead is still running and its spinner with it.
-      This one names no row: the rows the abandoned attempt drew describe
-      messages that have just left the thread, and a delta cannot take a row
-      off the screen. A `chat.reset` — an open of what is left — precedes this
-      event and is what un-draws them (`AgentService`'s `turn.interrupt`).
-    * After this one the turn is over: the spinner goes and the session is
-      free. A ``seq`` field here would be a number every client had to know to
-      ignore.
+      This one names no row. A `chat.reset` — an open of what the session
+      holds now — precedes it and is what settles the screen, on this path and
+      on the ordinary one where no text comes back at all (`AgentService`'s
+      `turn.interrupt`).
+    * A `turn.finished` says the turn is over, on both stop paths and on the
+      ordinary end of a turn. This event never means it: it is about a
+      message, and a ``seq`` field here would be a number every client had to
+      know to ignore.
 
     The shape is otherwise the queue's on purpose, so parking the text as that
     session's draft is one routine on the UI side rather than two.

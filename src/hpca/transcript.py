@@ -67,10 +67,20 @@ ARGUMENTS_CHARS = 2000
 # Separates the two halves of one exchange. Written rather than drawn, because
 # the same string goes into the session log, which is a text file.
 RESULT_RULE = "── result ──"
-# Background work reporting in on its own (§5.4). Rides the user role like
-# tool results do, and is marked so the transcript does not attribute a
-# process crash to the human sitting there.
-EVENT_PREFIXES = ("[process ", "[job ")
+# Background work reporting in on its own (§5.4), and the note a stopped turn
+# leaves behind it (`hpca.agent.graph.STOPPED_NOTE`). Both ride the user role
+# like tool results do, and are marked so the transcript does not attribute a
+# process crash — or the user's own stop gesture — to the human as something
+# they said. An `event` row is the right one for the stop: it is the only kind
+# that means "this happened", which is exactly what the reader scrolling back
+# needs to see at the point the work breaks off.
+EVENT_PREFIXES = ("[process ", "[job ", "[stopped]")
+# The stop note is written for the model and reads like it — four lines
+# telling it not to pick the work back up. The user does not need to be told
+# that; they are the one who stopped it. Same cut as the tool-result hints
+# below: the news is kept, the prompt is not.
+STOPPED_PREFIX = "[stopped]"
+STOPPED_TEXT = "stopped by the user"
 
 USER = "user"
 ASSISTANT = "assistant"
@@ -197,6 +207,18 @@ def is_tool_message(message: Message) -> bool:
     return message["role"] == USER and str(message["content"]).startswith(
         TOOL_PREFIXES
     )
+
+
+def event_text(content: str) -> str:
+    """An event as the user reads it.
+
+    Only the stop note is rewritten, and only because it is the one event
+    written for the model rather than about the world: a process reporting in
+    says the same thing to both readers, and is passed through.
+    """
+    if content.startswith(STOPPED_PREFIX):
+        return STOPPED_TEXT
+    return content
 
 
 def is_event_message(message: Message) -> bool:
@@ -481,7 +503,9 @@ def build_entries(
             steps += 1
         elif is_event_message(message):
             flush()
-            entries.append(Entry(kind=EVENT, text=content, index=index, at=at))
+            entries.append(
+                Entry(kind=EVENT, text=event_text(content), index=index, at=at)
+            )
         else:
             flush()
             entries.append(Entry(kind=USER, text=content, index=index, at=at))

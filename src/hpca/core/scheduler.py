@@ -82,8 +82,8 @@ from langgraph.types import Command
 
 from hpca.agent.graph import (
     deliver_event,
-    rollback_thread,
     run_turn,
+    stop_thread,
     thread_message_count,
 )
 from hpca.core.deps import CoreDeps
@@ -229,6 +229,23 @@ class PendingWork:
 
 
 @dataclass
+class Stopped:
+    """What :meth:`TurnScheduler.interrupt` did, for the caller to answer to.
+
+    A bare ``str | None`` return said both "a turn was stopped" and "here is
+    its message"; those came apart the moment a stop stopped withdrawing the
+    message, since the usual stop now has a chat to re-state and no text to
+    give back. Distinguishing them is the whole reason this exists: ``None``
+    from ``interrupt`` still means nothing was running.
+    """
+
+    # The message to put back in the entry box, and only when the exchange
+    # left no trace to keep — otherwise it is in the conversation, where
+    # handing it back too would get it sent twice.
+    text: str | None = None
+
+
+@dataclass
 class TurnState:
     """Everything one in-flight turn owns, kept per session so turns on
     different sessions never read each other's client, context, memory,
@@ -240,14 +257,22 @@ class TurnState:
     session: Any
     plan: TurnPlan
     task: asyncio.Task | None = None
-    interrupt_keep: int | None = None
+    # Where the *exchange* this turn belongs to begins in the thread, measured
+    # before its message was appended. It was the rollback point back when
+    # stopping a turn withdrew it; a stop now keeps the work, and what the
+    # number answers is "did any of this reach the thread at all" — which is
+    # what decides whether the message is the conversation's or is handed back
+    # (see :meth:`TurnScheduler.interrupt`). Shared by every turn of one
+    # exchange, so the half after an approval measures nothing of its own.
+    exchange_start: int | None = None
     # Where this turn's own messages begin in the thread — what `TurnResult`
     # calls ``first_new``, measured before the turn ran so a turn that never
-    # produces a result still knows which tail is its own. Read only by the
-    # failure hook; a turn that finishes carries the same number back itself.
+    # produces a result still knows which tail is its own. The same number as
+    # ``exchange_start`` for a turn that brings its own message, and not for
+    # the resumed half of one. Read by the failure and the stop hooks; a turn
+    # that finishes carries the same number back itself.
     first_new: int | None = None
     # The user message this turn is running (None for a resume or an event).
-    # The interrupt hands it back to the entry for editing.
     user_text: str | None = None
     activity: str = "working"
     # When this turn began. Held here rather than on any renderer, because a
@@ -273,6 +298,9 @@ class TurnScheduler:
         on_turn_error: (
             Callable[[Any, TurnPlan, Exception, int | None], Awaitable[None]] | None
         ) = None,
+        on_turn_stopped: (
+            Callable[[Any, TurnPlan, int | None], Awaitable[None]] | None
+        ) = None,
     ) -> None:
         self._deps = deps
         self._graph = graph
@@ -291,6 +319,15 @@ class TurnScheduler:
         # messages start in the thread, so the same tail can be read back out
         # of the checkpoint; None when it could not be measured.
         self._on_turn_error = on_turn_error
+        # And the third ending: (session, plan, first_new) for a turn the user
+        # stopped. It gets a door of its own rather than borrowing the failure
+        # one because a stop is not a failure — there is no error to write
+        # under it — and rather than borrowing the result one because there is
+        # no result. What it has in common with both is that it happened, and
+        # what happened belongs in the log and the index: the work stays in
+        # the thread now, and a conversation the user can still read but
+        # `session_search` cannot find would be a record with a hole in it.
+        self._on_turn_stopped = on_turn_stopped
         self._turns: dict[str, TurnState] = {}
         self._pending: list[PendingWork] = []
         self._awaiting_approval: set[str] = set()
@@ -301,8 +338,11 @@ class TurnScheduler:
         # message) — kept per session for as long as the *exchange* lasts and
         # not just for one turn. An approval ends the turn it parked; the
         # resume starts a fresh one carrying no user message of its own, and
-        # without this it would be a turn nobody could stop and nothing could
-        # roll back (`tui/app.py:_interrupt_anchor`).
+        # without this it would be a turn nobody could stop
+        # (`tui/app.py:_interrupt_anchor`). It outlived the rollback it was
+        # first written for: the length still says whether the exchange ever
+        # reached the thread, and the message is still what a stop with
+        # nothing to keep gives back.
         self._anchors: dict[str, tuple[int, str]] = {}
         self._shutting_down = False
         # session_id -> the last chat row name handed out for it. See
@@ -739,7 +779,7 @@ class TurnScheduler:
             user_text=user_text if anchor is None else anchor[1],
             # Filled once the pre-turn count is read — already known here for
             # a resume, since the message it belongs to ran before it.
-            interrupt_keep=None if anchor is None else anchor[0],
+            exchange_start=None if anchor is None else anchor[0],
         )
         self._turns[session.session_id] = ts
         if user_text is not None:
@@ -1041,36 +1081,37 @@ class TurnScheduler:
     async def _run(self, session: Any, ts: TurnState, *, resume: Command | None) -> None:
         session_id = session.session_id
         if resume is None and ts.user_text is not None:
-            # Where to roll back to if this turn is interrupted: captured
-            # before run_turn appends the user message. It is also the index
-            # that message is about to take, which is what tells a `chat.reset`
+            # Where this exchange begins: captured before run_turn appends the
+            # user message, so a stop can tell an exchange that reached the
+            # thread from one that never did. It is also the index that
+            # message is about to take, which is what tells a `chat.reset`
             # which of its entries belong to this turn (`rebase_rows`) and
             # where the reconcile starts folding.
             #
             # Read only for a turn that brings its own message: a resume was
             # handed both by the anchor, and re-reading the count here would
-            # measure a thread that already holds the message and roll the
-            # exchange back to halfway through itself.
+            # measure a thread that already holds the message and put the
+            # start of the exchange halfway through itself.
             try:
-                ts.interrupt_keep = await thread_message_count(
+                ts.exchange_start = await thread_message_count(
                     self._graph, session_id=session_id
                 )
             except Exception:
-                ts.interrupt_keep = None
-            ts.first_new = ts.interrupt_keep
+                ts.exchange_start = None
+            ts.first_new = ts.exchange_start
             live = self._live.get(session_id)
             if live is not None:
-                live.start = ts.interrupt_keep
-            if ts.interrupt_keep is not None:
+                live.start = ts.exchange_start
+            if ts.exchange_start is not None:
                 # Outlives this turn: an approval splits one exchange into
                 # several, and each of them has to stay stoppable.
-                self._anchors[session_id] = (ts.interrupt_keep, ts.user_text)
+                self._anchors[session_id] = (ts.exchange_start, ts.user_text)
         elif resume is not None:
             # Measured, not inherited: the anchor points at the message that
             # opened the whole exchange, whose half has already been logged.
             # What this half adds starts where the parked thread stopped. The
-            # count is safe to read here precisely because it is not the
-            # rollback point — see the anchor above.
+            # count is safe to read here precisely because it is not the start
+            # of the exchange — see the anchor above.
             try:
                 ts.first_new = await thread_message_count(
                     self._graph, session_id=session_id
@@ -1088,12 +1129,12 @@ class TurnScheduler:
                 api_content=ts.plan.api_content,
             )
         except asyncio.CancelledError:
-            raise  # an interrupt; _interrupt owns the cleanup
+            raise  # a stop; `interrupt` owns the cleanup
         except Exception as e:
             logger.exception("turn failed")
             await self._reconcile_failed(session_id)
             self._close_turn(session_id)
-            # Nothing survives of this attempt to roll back to or hand back:
+            # Nothing of this attempt is stoppable or continuable any more:
             # the exchange ended where it broke.
             self._anchors.pop(session_id, None)
             if self._on_turn_error is not None:
@@ -1136,8 +1177,8 @@ class TurnScheduler:
             )
             return
         self._close_turn(session_id)
-        # Answered for good: nothing left of this exchange to roll back to,
-        # and the next turn must not inherit this one's message.
+        # Answered for good: there is no exchange left to stop, and the next
+        # turn must not inherit this one's message.
         self._anchors.pop(session_id, None)
         self._deps.emit(TurnFinished(session_id=session_id, reply=result.reply))
 
@@ -1186,54 +1227,114 @@ class TurnScheduler:
         turn's — until it exits. The abort ends the *turn*, not the work
         already in flight.
 
-        The two conditions that remain are what the abort needs: a message of
-        the user's own to hand back, and the point in the thread to roll back
-        to. A turn a fraction of a second old has only the first, and is
-        stoppable a moment later.
+        The two conditions that remain are what a stop needs to leave the
+        session in a state someone can carry on from: a message of the user's
+        own, and the point in the thread the exchange began at — which is what
+        tells the stop whether any of it got as far as being written down
+        (:meth:`interrupt`). A turn a fraction of a second old has only the
+        first, and is stoppable a moment later.
         """
         ts = self._turns.get(session_id)
         return (
             ts is not None
             and ts.user_text is not None
-            and ts.interrupt_keep is not None
+            and ts.exchange_start is not None
         )
 
-    async def interrupt(self, session_id: str) -> str | None:
-        """Abort the in-flight request and drop the aborted turn from the
-        thread. Returns the message to hand back for editing, or None.
+    async def interrupt(self, session_id: str) -> Stopped | None:
+        """Stop the agent and keep what it has already done. None if there was
+        no turn to stop.
 
-        The rollback is what makes the re-edited prompt start from a clean
-        history: the interrupted user message and any partial tool traffic
-        must leave the thread, or the model sees the abandoned attempt twice.
+        This used to throw the turn away: the message and every tool exchange
+        under it were rolled out of the thread and the text handed back to be
+        re-typed, on the reasoning that the model must not meet an abandoned
+        attempt twice. The user who asked for the change put it better than
+        the reasoning did — *"not the whole turn should be thrown away, the
+        agent should just be stopped"*. The steps cost real cluster time, and
+        half a turn is very often exactly the half they wanted to read.
+
+        So the thread keeps its work and ``stop_thread`` writes the one thing
+        that makes it safe to keep: a note saying a person stopped this, which
+        is what stands between the next turn and a model that reads an
+        unfinished history as an instruction to finish it.
+
+        **The message is not handed back** when the exchange survives — it is
+        in the conversation now, and putting it into the entry box as well
+        would have the user send it twice without meaning to. The hand-back
+        remains for the one case where there is nothing to keep: a stop that
+        lands in the window between the turn being announced and its message
+        reaching the thread. Nothing of that turn was ever written down, so
+        the sentence would be lost outright, and it goes back to the box.
+        Taking a message back on purpose is what the chat rewind is for.
+
+        It ends with a `turn.finished` because a stopped turn is a turn that
+        is over, and `turn.finished`/`turn.failed` is the only thing any
+        front-end reads as one ending. Without it the spinner ran on forever:
+        `chat.reset` restates rows and `turn.interrupted` hands a message
+        back, and neither says the turn is done, so the working row kept
+        drawing — spinning on a turn that no longer existed and offering to
+        stop it. Not `turn.failed`: nothing broke, and that event puts an
+        error row in the transcript.
         """
         ts = self._turns.get(session_id)
-        if ts is None or ts.interrupt_keep is None or ts.user_text is None:
+        if ts is None or ts.exchange_start is None or ts.user_text is None:
             return None
-        text, keep, task = ts.user_text, ts.interrupt_keep, ts.task
+        text, start, task = ts.user_text, ts.exchange_start, ts.task
         if task is not None:
             task.cancel()
             try:
-                await task  # let the cancellation unwind before editing
+                await task  # let the cancellation unwind before anything reads
             except (Exception, asyncio.CancelledError):
                 pass
         self._turns.pop(session_id, None)
-        # The exchange is over, however many turns it took: this rollback is
-        # the anchor being spent.
+        # The exchange is over, however many turns it took: nothing after this
+        # continues it, so the next turn must not inherit its message.
         self._anchors.pop(session_id, None)
-        # The rows this turn drew describe messages that are about to leave
-        # the thread. Nothing may revise them again; what replaces them is the
-        # `chat.reset` the caller sends once the rollback has landed, which is
-        # the only frame that can take a row off the screen.
+        # The rows this turn drew include a call still waiting for a result
+        # that is never coming. Nothing may revise them again; what re-states
+        # them is the `chat.reset` the caller sends once the thread has
+        # settled, which is the only frame that can take a row off the screen.
         self._close_turn(session_id)
         self._deps.emit(TurnActivity(session_id=session_id, activity=""))
+        kept = await self._keep_stopped_work(session_id, start)
+        if kept and self._on_turn_stopped is not None:
+            try:
+                await self._on_turn_stopped(ts.session, ts.plan, ts.first_new)
+            except Exception:  # a log is never worth a second failure
+                logger.exception("post-turn handling of a stop failed")
+        # Last, as on both the finished and the failed paths: what a client is
+        # told about is what has already been written down.
+        self._deps.emit(TurnFinished(session_id=session_id))
+        asyncio.ensure_future(self.drain())
+        return Stopped(text=None if kept else text)
+
+    async def _keep_stopped_work(self, session_id: str, start: int) -> bool:
+        """Close off a stopped turn's work in the thread, and say whether
+        there was any to close off.
+
+        The one question that cannot be answered from the scheduler's own
+        bookkeeping: a turn is announced before the graph has written
+        anything, so between ``start`` and the thread's length now is the
+        difference between an exchange that happened and one that never got
+        off the ground. An empty one is left completely alone — a lone
+        "[stopped]" note under nothing at all would be the only trace of a
+        turn nobody can see.
+        """
         try:
-            await rollback_thread(self._graph, session_id=session_id, keep=keep)
+            count = await thread_message_count(self._graph, session_id=session_id)
+            if count <= start:
+                return False
+            await stop_thread(self._graph, session_id=session_id)
         except Exception as e:
+            # The turn is stopped either way; what failed is the tidying. Said
+            # rather than logged, because the next turn runs on this thread.
+            # Falling through to "kept" is the answer that cannot do damage:
+            # handing a message back that is in fact in the thread would have
+            # the user send it twice, and the reset shows them either way.
             self._deps.emit(
                 Notify(severity="error", text=f"Interrupt cleanup failed: {e}")
             )
-        asyncio.ensure_future(self.drain())
-        return text
+        return True
 
     # -------------------------------------------------------------- shutdown
 

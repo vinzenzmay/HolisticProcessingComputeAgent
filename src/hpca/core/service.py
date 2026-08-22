@@ -450,22 +450,27 @@ class AgentService:
             await self._scheduler.drain()
             return
         if isinstance(command, TurnInterrupt):
-            text = await self._scheduler.interrupt(command.session_id)
-            if text is None:
-                return
-            # The interrupt rolls the abandoned attempt out of the thread, so
-            # the rows drawn for it now describe messages that are gone. A
-            # delta cannot take a row off the screen; a reset can, and this is
-            # the same case `session.rollback` is — an open of what is left.
+            stopped = await self._scheduler.interrupt(command.session_id)
+            if stopped is None:
+                return  # nothing was running: a gesture that arrived too late
+            # A stopped turn keeps its work, but not all of what was drawn for
+            # it is work: the call it died inside was never written to the
+            # thread, and its row is on screen waiting for a result that is
+            # not coming. A delta cannot take a row off the screen; a reset
+            # can, and this is the same case `session.rollback` is — an open
+            # of what is left, which is now most of it.
             await self._reset_chat(command.session_id)
-            # And the message itself comes back to be edited and re-sent —
-            # after the reset, because the chat it was in has just been
-            # re-stated, and addressed, because it belongs to the session it
-            # was typed in and not to whichever one is on screen when this
-            # lands (`protocol.TurnInterrupted`).
-            self._deps.emit(
-                TurnInterrupted(session_id=command.session_id, text=text)
-            )
+            if stopped.text is not None:
+                # The one stop with nothing to keep — it landed before the
+                # message reached the thread — hands the sentence back rather
+                # than losing it (`TurnScheduler.interrupt`). After the reset,
+                # because the chat it was in has just been re-stated, and
+                # addressed, because it belongs to the session it was typed in
+                # and not to whichever one is on screen when this lands
+                # (`protocol.TurnInterrupted`).
+                self._deps.emit(
+                    TurnInterrupted(session_id=command.session_id, text=stopped.text)
+                )
             return
         if isinstance(command, TurnUnqueue):
             text = self._scheduler.unqueue(command.session_id, command.seq)
@@ -922,31 +927,59 @@ class AgentService:
         """A turn that broke instead of finishing, written down anyway.
 
         Wired to `on_turn_error`. There is no result to read, so the tail is
-        read back out of the checkpoint instead — a failure does not roll the
-        thread back (an interrupt does; see `TurnScheduler.interrupt`), so
-        whatever the turn got through is still there, and it is the same fold
-        the reconcile has just put on screen. The error goes under it as its
-        own entry, which is what turns a log that stops mid-conversation into
-        one that says why.
+        read back out of the checkpoint instead — whatever the turn got
+        through is still there, and it is the same fold the reconcile has just
+        put on screen. The error goes under it as its own entry, which is what
+        turns a log that stops mid-conversation into one that says why.
 
         `tui/app.py` logged the error alone, which left the question that
         provoked it out of the file entirely.
         """
-        entries = []
-        if first_new is not None:
-            try:
-                values = await self._thread_values(session.session_id)
-            except Exception:  # a backend that died may have taken more with it
-                logger.exception("could not read a failed turn's messages")
-                values = {}
-            entries = build_entries(
-                list(values.get("messages", [])),
-                list(values.get("thinking", []) or []),
-                list(values.get("calls", []) or []),
-                start=int(first_new),
-            )
+        entries = await self._tail_from_thread(session, first_new)
         entries.append(Entry(kind=ERROR, text=str(error)))
         await self._record_turn_tail(session, entries, getattr(plan, "log", None))
+
+    async def after_stopped_turn(self, session, plan, first_new) -> None:
+        """A turn the user stopped, written down as far as it got.
+
+        Wired to `on_turn_stopped`, and read back out of the checkpoint for
+        the same reason the failure is: there is no result. What makes it
+        worth its own hook is that a stop is not a failure and nothing goes
+        *under* it — the "[stopped]" note is already the last message of the
+        tail, so the fold ends on it and the log says where the work broke off
+        without a line of error text pretending something went wrong.
+
+        This exists at all because the stop stopped throwing the turn away.
+        While it rolled the exchange out of the thread there was nothing to
+        record; now the user can scroll back to a conversation that would
+        otherwise be in no log and findable by no search.
+        """
+        entries = await self._tail_from_thread(session, first_new)
+        if not entries:
+            return
+        await self._record_turn_tail(session, entries, getattr(plan, "log", None))
+
+    async def _tail_from_thread(self, session, first_new) -> list[Entry]:
+        """One turn's entries, read back out of the checkpoint.
+
+        For the two endings that produce no result to fold. ``first_new`` is
+        where this turn's own messages begin; None when the scheduler never
+        managed to measure it, and then there is no tail this can safely name
+        — logging from zero would write the whole conversation out again.
+        """
+        if first_new is None:
+            return []
+        try:
+            values = await self._thread_values(session.session_id)
+        except Exception:  # a backend that died may have taken more with it
+            logger.exception("could not read an unfinished turn's messages")
+            return []
+        return build_entries(
+            list(values.get("messages", [])),
+            list(values.get("thinking", []) or []),
+            list(values.get("calls", []) or []),
+            start=int(first_new),
+        )
 
     @staticmethod
     def _entries_of(result, *, start) -> list[Entry]:
@@ -2936,6 +2969,12 @@ def build_service(
         if holder is not None:
             await holder.after_failed_turn(session, plan, error, first_new)
 
+    async def after_stopped_turn(session, plan, first_new) -> None:
+        """The same again, for a turn the user stopped part-way through."""
+        holder = service_ref.get("service")
+        if holder is not None:
+            await holder.after_stopped_turn(session, plan, first_new)
+
     scheduler = TurnScheduler(
         deps,
         graph=graph,
@@ -2943,6 +2982,7 @@ def build_service(
         session_for=sessions.get,
         on_turn_result=after_turn,
         on_turn_error=after_failed_turn,
+        on_turn_stopped=after_stopped_turn,
     )
     scheduler_ref["scheduler"] = scheduler
 

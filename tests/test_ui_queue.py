@@ -307,10 +307,18 @@ class TestATakenBackMessageGoesToItsOwnSession:
 
 
 class TestTheInterruptHandsTheMessageBack:
+    """What the UI does with `turn.interrupted` when one arrives.
+
+    Rarely, now: a stopped turn keeps its work, so its message stays in the
+    conversation and the core sends this only when nothing of the turn ever
+    reached the thread (`protocol.TurnInterrupted`). The half asserted here is
+    unchanged either way — where a message that does come back lands.
+    """
+
     async def test_into_the_session_it_was_typed_in(self, wire):
-        # Not into whichever entry is on screen when the rollback finishes:
-        # the message belongs to the conversation it was typed in, and this is
-        # the kind of thing that looks right in a single-session test.
+        # Not into whichever entry is on screen when the answer arrives: the
+        # message belongs to the conversation it was typed in, and this is the
+        # kind of thing that looks right in a single-session test.
         await working(wire, "s2")
         await wire.tell(
             protocol.TurnInterrupted(
@@ -337,9 +345,9 @@ class TestTheInterruptHandsTheMessageBack:
         assert wire.ui.input.text() == "why did the merge stall"
         assert wire.ui.focus == INPUT
 
-    async def test_it_names_no_row_because_the_reset_took_them(self, wire):
+    async def test_it_names_no_row_because_the_reset_settled_them(self, wire):
         # `turn.unqueued` names the row it removes; this one cannot, and the
-        # `chat.reset` before it is what un-draws the abandoned attempt.
+        # `chat.reset` before it is what settles the screen.
         await working(wire)
         await wire.tell(
             protocol.ChatReset(

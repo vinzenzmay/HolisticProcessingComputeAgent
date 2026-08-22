@@ -409,8 +409,106 @@ class TestPerSessionLLM:
         assert r2.reply == "from B"
 
 
+class TestStop:
+    """`stop_thread`: what a turn the user stopped leaves behind.
+
+    Stopping keeps the work now (`TurnScheduler.interrupt`), which puts the
+    weight on the state the cancel left: the thread has to be one the next
+    turn can be run against, and the model has to be told that a person
+    stopped this rather than left to read an unfinished history as an
+    instruction to finish it.
+    """
+
+    async def stopped_mid_tool(self, tools):
+        """A turn that ran one tool and was cancelled inside the next."""
+        import asyncio
+
+        entered, held = asyncio.Event(), asyncio.Event()
+
+        async def slow(args, ctx):
+            entered.set()
+            await held.wait()
+            return "never arrives"
+
+        tools.register(
+            Tool(name="slow", description="Slow", params=EchoParams, handler=slow)
+        )
+        llm = FakeLLM([
+            tool_json("echo", text="first"),
+            tool_json("slow", text="second"),
+            respond_json("never said"),
+        ])
+        graph = make_graph(llm, tools)
+        task = asyncio.ensure_future(
+            run_turn(graph, session_id="s1", user_text="do both")
+        )
+        await asyncio.wait_for(entered.wait(), timeout=5)  # inside the slow one
+        task.cancel()
+        try:
+            await task
+        except (Exception, asyncio.CancelledError):
+            pass
+        held.set()
+        return graph, llm
+
+    async def contents(self, graph):
+        values = (
+            await graph.aget_state({"configurable": {"thread_id": "s1"}})
+        ).values or {}
+        return values
+
+    async def test_a_cancelled_turn_leaves_no_call_without_its_result(
+        self, tools
+    ):
+        # The reason `stop_thread` writes no synthetic tool result: it has
+        # nothing to answer. A call and its result are appended in one state
+        # update, so a cancel lands before both or after both — asserted here
+        # because keeping the work is only safe while it stays true.
+        graph, _ = await self.stopped_mid_tool(tools)
+        messages = (await self.contents(graph))["messages"]
+        for position, message in enumerate(messages):
+            if is_tool_call_message(message):
+                assert position + 1 < len(messages)
+                assert str(messages[position + 1]["content"]).startswith("[tool")
+
+    async def test_stopping_writes_the_note_and_clears_the_pending_call(
+        self, tools
+    ):
+        from hpca.agent.graph import STOPPED_NOTE, stop_thread
+
+        graph, _ = await self.stopped_mid_tool(tools)
+        # What the cancel left: parked one step short of the call it never ran.
+        assert (await self.contents(graph))["pending_tool"]["tool"] == "slow"
+
+        await stop_thread(graph, session_id="s1")
+        values = await self.contents(graph)
+        assert values["messages"][-1]["content"] == STOPPED_NOTE
+        assert values["pending_tool"] is None
+        # And nothing is left poised to run: a thread still aimed at the call
+        # the user stopped is not a thing to leave lying about.
+        state = await graph.aget_state({"configurable": {"thread_id": "s1"}})
+        assert state.next == ()
+
+    async def test_and_the_next_turn_reads_it_and_does_not_redo_the_call(
+        self, tools
+    ):
+        from hpca.agent.graph import STOPPED_NOTE, stop_thread
+
+        graph, llm = await self.stopped_mid_tool(tools)
+        await stop_thread(graph, session_id="s1")
+        llm._outputs = [respond_json("understood")]
+        result = await run_turn(graph, session_id="s1", user_text="never mind")
+        assert result.reply == "understood"
+        sent = [str(m["content"]) for m in llm.calls[-1]["messages"]]
+        # The work it got through, the note, and the new question — and the
+        # call it was stopped inside is in none of them.
+        assert "echo: first" in " ".join(sent)
+        assert STOPPED_NOTE in sent
+        assert "never arrives" not in " ".join(sent)
+
+
 class TestRollback:
-    """Interrupt support: drop an aborted turn's messages from the thread."""
+    """Rewind support: drop the tail of a thread the user cut back."""
 
     async def test_rollback_truncates_to_keep(self, tools):
         from hpca.agent.graph import (

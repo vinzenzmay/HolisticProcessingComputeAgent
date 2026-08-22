@@ -586,8 +586,8 @@ class TestTheMessageAnInterruptRecovers:
         assert parse(decode(encode(handed_back.to_envelope()))) == handed_back
 
     def test_it_names_no_row(self):
-        # A `chat.reset` has already taken the abandoned attempt's rows off the
-        # screen; a seq here would be a field every client had to ignore.
+        # A `chat.reset` has already settled the screen by the time this
+        # lands; a seq here would be a field every client had to ignore.
         assert set(TurnInterrupted.model_fields) == {
             "session_id",
             "text",

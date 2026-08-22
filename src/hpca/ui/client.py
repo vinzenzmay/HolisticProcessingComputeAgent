@@ -906,11 +906,14 @@ class UIClient:
     def _interrupted(self, msg: protocol.TurnInterrupted) -> None:
         """A stopped turn's message, back to the session it was typed in.
 
-        `turn.unqueued`'s sibling and deliberately not the same event: this one
-        names no row, because the `chat.reset` that precedes it has already
-        un-drawn the abandoned attempt (`protocol.TurnInterrupted`). All that
-        is left to do with it is the half both share — park the text as that
-        session's draft, which is why they share the routine.
+        Rare, and the core decides when: a stop keeps its work, so the message
+        is normally part of the conversation and no such event is sent
+        (`protocol.TurnInterrupted`). When one does arrive, nothing of that
+        turn survived to draw. `turn.unqueued`'s sibling and deliberately not
+        the same event: this one names no row, because the `chat.reset` before
+        it has already settled the screen. All that is left is the half both
+        share — park the text as that session's draft, which is why they share
+        the routine.
         """
         self.ui.hand_back(msg.session_id, msg.text)
 
