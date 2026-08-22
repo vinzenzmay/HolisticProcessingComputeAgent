@@ -194,7 +194,7 @@ class TestNotifyReachesIt:
 
 
 class TestTheClipboard:
-    """§4.3 item 36: `y` on the chat row, through `ClipboardManager`."""
+    """§4.3 item 36: `c` on the chat row, through `ClipboardManager`."""
 
     def _ready(self):
         copied: list[str] = []
@@ -203,21 +203,21 @@ class TestTheClipboard:
         ui.focus = CHAT
         return ui, copied
 
-    def test_y_copies_the_row_under_the_cursor(self):
+    def test_c_copies_the_row_under_the_cursor(self):
         ui, copied = self._ready()
-        press(ui, "home", "y")
+        press(ui, "home", "c")
         assert copied, "nothing was handed to the clipboard"
 
     def test_it_copies_the_message_and_not_the_row_it_is_drawn_as(self):
         # `you   ` and the tool markers are decoration; pasting them into a
         # shell is a paper cut every time.
         ui, copied = self._ready()
-        press(ui, "home", "y")
+        press(ui, "home", "c")
         assert not copied[-1].startswith("you   ")
 
     def test_and_says_where_it_went(self):
         ui, _ = self._ready()
-        press(ui, "home", "y")
+        press(ui, "home", "c")
         assert "Copied via osc52" in ui.note
 
     def test_a_tier_that_raises_is_reported_rather_than_fatal(self):
@@ -228,28 +228,37 @@ class TestTheClipboard:
 
         ui.clipboard = boom
         ui.focus = CHAT
-        press(ui, "home", "y")
+        press(ui, "home", "c")
         assert "copy failed" in ui.note
 
     def test_with_no_clipboard_wired_up_it_says_so(self):
         ui = clocked(build())
         ui.clipboard = None
         ui.focus = CHAT
-        press(ui, "home", "y")
+        press(ui, "home", "c")
         assert "no clipboard" in ui.note
 
-    def test_y_is_the_chat_column_s_key_and_no_one_else_s(self):
+    def test_c_copies_from_the_chat_column_and_nowhere_else(self):
+        # Everywhere else `c` is the config editor, which is the one screen
+        # that had to give the key up for this — and did, on one row only.
         ui, copied = self._ready()
         ui.focus = SESSIONS
-        press(ui, "y")
+        press(ui, "c")
         ui.focus = WATCHERS
-        press(ui, "y")
+        press(ui, "c")
+        assert copied == []
+
+    def test_and_y_no_longer_copies_anywhere(self):
+        ui, copied = self._ready()
+        for row in (CHAT, SESSIONS, WATCHERS):
+            ui.focus = row
+            press(ui, "home", "y")
         assert copied == []
 
     def test_the_footer_offers_it_in_the_chat(self):
         ui = clocked(build())
         ui.focus = CHAT
-        assert "y copy" in plain(ui.render(160, 40)[-1])
+        assert "c copy" in plain(ui.render(160, 40)[-1])
 
     def test_it_goes_through_the_tiered_manager_and_the_screen_emits(self):
         # `hpca.clipboard` is framework-free already: it takes an injected

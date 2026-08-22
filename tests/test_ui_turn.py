@@ -809,19 +809,27 @@ class TestTheModeBar:
 
 
 class TestShiftTabCycles:
+    """The dial is the message box's key and no other row's.
+
+    Deciding the agent may act unasked is a thought you have *while typing*,
+    not one you leave the box to act on — which is why the Textual app bound
+    this `priority=True` so it fired from the entry. Everywhere else shift+tab
+    is the way back up the ring, as tab is the way down.
+    """
+
     async def test_it_moves_to_the_next_mode(self, wire):
-        wire.ui.focus = CHAT
+        wire.ui.focus = INPUT
         await wire.press("shift-tab")
         assert "mode: full auto" in wire.screen()
 
     async def test_and_persists_the_choice(self, wire):
-        wire.ui.focus = CHAT
+        wire.ui.focus = INPUT
         await wire.press("shift-tab")
         sent = wire.peer.last(protocol.ModeSet)
         assert (sent.session_id, sent.mode) == ("s1", "full-auto")
 
     async def test_it_is_a_cycle(self, wire):
-        wire.ui.focus = CHAT
+        wire.ui.focus = INPUT
         await wire.press("shift-tab", "shift-tab", "shift-tab")
         assert [x.mode for x in wire.peer.took(protocol.ModeSet)] == [
             "full-auto",
@@ -830,36 +838,36 @@ class TestShiftTabCycles:
         ]
 
     async def test_the_core_still_has_the_last_word(self, wire):
-        wire.ui.focus = CHAT
+        wire.ui.focus = INPUT
         await wire.press("shift-tab")
         await wire.tell(protocol.SessionRows(rows=list(ROWS)))
         assert "mode: auto" in wire.screen()
 
-    @pytest.mark.parametrize("row", [SESSIONS, WATCHERS])
+    @pytest.mark.parametrize("row", [SESSIONS, CHAT, WATCHERS])
     async def test_the_other_columns_leave_the_mode_alone(self, wire, row):
         wire.ui.focus = row
         await wire.press("shift-tab")
         assert wire.peer.took(protocol.ModeSet) == []
 
-    @pytest.mark.parametrize("row", [SESSIONS, WATCHERS])
+    @pytest.mark.parametrize("row", [SESSIONS, CHAT, WATCHERS])
     async def test_and_move_between_rows_instead(self, wire, row):
         wire.ui.focus = row
         await wire.press("shift-tab")
         assert wire.ui.focus != row
 
-    async def test_the_mode_a_session_is_in_belongs_to_that_session(self, wire):
+    async def test_the_chat_row_moves_the_way_the_other_lists_do(self, wire):
+        # It used to be the second place the dial could be turned, which is
+        # what made shift+tab mean one thing in three rows and another in the
+        # fourth. Now it is the ring's step back, everywhere but the box.
         wire.ui.focus = CHAT
+        await wire.press("shift-tab")
+        assert wire.ui.focus == SESSIONS
+
+    async def test_the_mode_a_session_is_in_belongs_to_that_session(self, wire):
+        wire.ui.focus = INPUT
         await wire.press("shift-tab")
         wire.ui.open_session("s2")
         assert "mode: manual" in wire.screen()
-
-    async def test_it_works_while_writing_the_message(self, wire):
-        # Deciding the agent may act unasked is a thought you have *while
-        # typing*, not one you leave the box to act on — which is why the
-        # Textual app bound this `priority=True` so it fired from the entry.
-        wire.ui.focus = INPUT
-        await wire.press("shift-tab")
-        assert wire.peer.last(protocol.ModeSet).mode == "full-auto"
 
     async def test_and_does_not_take_the_focus_out_of_the_box(self, wire):
         wire.ui.focus = INPUT

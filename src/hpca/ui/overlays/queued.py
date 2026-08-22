@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from hpca.ui.overlays.rewind import COPY, ChoiceDialog
+from hpca.ui.overlays.rewind import ChoiceDialog
 
 UNQUEUE = "unqueue"
+# The rewind dialog dropped its copy — `c` on the chat row does that now — so
+# the choice lives here, with the one screen that still offers it.
+COPY = "copy"
 
 
 class QueuedOverlay(ChoiceDialog):
@@ -16,9 +19,11 @@ class QueuedOverlay(ChoiceDialog):
     sent message only offers a rewind. Cancelling lands where the interrupt
     lands, with the text back in the entry to edit and send again.
 
-    Escape leaves it queued, and Enter still copies, so activating a message
-    twice does here what it does on the rewind dialog. Same keys and same
-    copy as `tui/rewind_screen.py`'s QueuedScreen, which this replaces.
+    Escape leaves it queued, and Enter still copies it into the entry: a
+    queued message has no cut to offer — there is nothing behind it to roll
+    back to — so copy is the only thing the reflex of activating a message
+    twice can mean here. Same keys and same copy as `tui/rewind_screen.py`'s
+    QueuedScreen, which this replaces.
 
     What leaves here is the row's ``seq`` and the session it was queued in,
     never its position: the turn ahead can finish while this dialog sits open,

@@ -176,7 +176,7 @@ class Core:
         # tell — a declined local cache, a quarantined corrupt copy. Delivered
         # as `notify` events so they arrive as toasts like everything else.
         self.notices = list(notices or [])
-        # `ClipboardSettings`, handed on to `ui/run.py` so that `y` can copy.
+        # `ClipboardSettings`, handed on to `ui/run.py` so that `c` can copy.
         # This module reads the settings file; nothing above it does.
         self.clipboard = clipboard
         # What to do when startup ends with nothing answering. The core makes

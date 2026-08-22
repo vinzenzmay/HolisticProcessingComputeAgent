@@ -19,7 +19,6 @@ from hpca.ui.approval import decision_height, render_decision
 from hpca.ui.editor import Editor
 from hpca.ui.keys import NEWLINE_KEYS, is_paste, paste_text
 from hpca.ui.overlays import (
-    COPY,
     FORK,
     NO_SESSION,
     ROLLBACK,
@@ -325,7 +324,7 @@ class RowUI:
         # definition order — the same order an install nobody has typed into
         # yet would produce anyway.
         self.command_counts: dict[str, int] = {}
-        # `y` on a chat row: text in, a sentence about where it went out
+        # `c` on a chat row: text in, a sentence about where it went out
         # (`hpca.clipboard.ClipboardManager.copy(...).message`). A callable and
         # not the manager itself, because the manager writes OSC 52 straight to
         # the terminal and this module has never seen one.
@@ -1402,7 +1401,7 @@ class RowUI:
         # whole pairs off its end and this is the one that must not be the pair
         # that goes. Leaving the message box is ^↑, not escape: escape has a
         # job now.
-        common = [("^↑^↓", "row"), ("esc esc", "stop"), ("?", "keys")]
+        common = [("^↑^↓", "panel"), ("esc esc", "stop"), ("?", "keys")]
         if self.confirm is not None:
             return [("y", "yes"), ("n", "no"), ("esc", "no")]
         if self.menu():
@@ -1425,13 +1424,13 @@ class RowUI:
                     # Offered here too, because they work here too: the box
                     # keeps what is in it while the cursor is away, and the
                     # ring always comes back to this row (`_ring`).
-                    ("^↑^↓", "row"),
+                    ("^↑^↓", "panel"),
                 ]
             return [
                 ("y", "approve"),
                 ("n", "deny"),
                 ("esc", "deny, no reason"),
-                ("^↑^↓", "row"),
+                ("^↑^↓", "panel"),
             ]
         if self.focus == INPUT:
             # Spelled out rather than built from ``common`` so that send and
@@ -1440,8 +1439,9 @@ class RowUI:
             return [
                 ("enter", "send"),
                 ("esc esc", "stop"),
-                ("^↑^↓", "row"),
+                ("^↑^↓", "panel"),
                 ("⇧enter", "new line"),
+                ("⇧tab", "mode"),
                 ("^←→", "word"),
                 ("^l", "switch llm"),
                 ("⇧←→", "select"),
@@ -1459,17 +1459,14 @@ class RowUI:
         elif self.focus == SESSIONS:
             rows += [("enter", "switch"), ("r", "rename"), ("t", "retitle"), ("d", "delete")]
         elif self.focus == CHAT:
-            rows += [
-                ("i", "write"),
-                ("enter", "reuse"),
-                ("y", "copy"),
-                ("⇧tab", "mode"),
-            ]
+            rows += [("enter", "rollback/fork"), ("c", "copy")]
         else:
             rows += [("enter", "peek"), ("d", "unwatch"), ("alt-↑↓", "move")]
-        # Only where they do something. `m` and `a` are the sessions row's, `c`
-        # is everywhere but the chat, and ctrl+l is the chat's — a key list
-        # that lies is worse than a short one.
+        # Only where they do something. `m` and `a` are the sessions row's and
+        # ctrl+l is the chat's; `c` is live everywhere, but it is the config
+        # editor outside the chat and the row copy inside it (`_copy_row`), so
+        # it is offered once per row with the label that is true there — a key
+        # list that lies is worse than a short one.
         if self.focus == SESSIONS:
             rows += [
                 ("m", "llms"),
@@ -1509,7 +1506,7 @@ class RowUI:
         the prompt with no decision left behind it, and the message box while
         a decision is standing in front of it. Both are one line away from
         every path that sets INPUT — a paste, a rollback handing a message
-        back, `i` in the chat, a decision arriving while the box has the
+        back, ctrl+↓ out of the chat, a decision arriving while the box has the
         cursor — and the one that forgot would leave the cursor on a row that
         is not drawn, or walk a key into `_handle_row`'s pane lookup with a
         focus it has no entry for. Asked once, here, rather than remembered
@@ -1738,9 +1735,9 @@ class RowUI:
         ctrl+↑ and ctrl+↓ leave the way they leave any row, because this is a
         row of the ring now (`_ring`): up to the chat the question is about,
         down to the watchers. What they do *not* do any more is drop into the
-        message box — it is not on screen while this is, and `i` and tab used
-        to aim at it. Nothing here can strand the prompt: every step of the
-        ring comes back to it.
+        message box — it is not on screen while this is, and tab used to aim
+        at it. Nothing here can strand the prompt: every step of the ring
+        comes back to it.
         """
         if key == "quit":
             return False
@@ -1914,38 +1911,13 @@ class RowUI:
         """What the rewind decided, as an intent aimed at the session it was
         opened in — which is not necessarily the one on screen by the time it
         closes."""
-        if overlay.choice == COPY:
-            self.reuse_message(overlay.message, overlay.session_id)
-            return
         if overlay.choice == FORK:
             self.send(Fork(overlay.session_id, overlay.seq))
         elif overlay.choice == ROLLBACK:
             self.send(Rollback(overlay.session_id, overlay.seq))
         # Either cut leaves you at the point the conversation now ends, which
-        # is a place to say the next thing from. `reuse_message` above puts the
-        # cursor in the box for itself.
+        # is a place to say the next thing from.
         self.focus = INPUT
-
-    def reuse_message(self, text: str, session_id: str = "") -> None:
-        """Put one of your own past messages back in the box, to send again or
-        edit into the next one — usually a command that needs a word changed,
-        which is otherwise retyped off the screen.
-
-        Into the draft of the session it was *taken from*, which is what the
-        rewind promises ("an intent aimed at the session it was opened in —
-        which is not necessarily the one on screen by the time it closes").
-        That is the whole of `hand_back`'s errand already, so this goes
-        through it rather than keeping a second copy of the rule that once
-        disagreed with it.
-
-        Added to whatever is already being written rather than replacing it, so
-        activating a message can never lose a draft. It starts its own line,
-        except after a draft left ending in whitespace — that space is how you
-        say "continue here" (``rerun this: `` + the old command).
-        """
-        self.hand_back(
-            session_id or self.active_id, text, note="copied into the message box"
-        )
 
     def _esc_armed(self) -> bool:
         """Whether a first escape is still waiting for its second.
@@ -2076,11 +2048,12 @@ class RowUI:
         elif key in NEWLINE_KEYS:
             self.input.newline()
         elif key == "shift-tab":
-            # Cycling the mode is the one thing shift+tab does, and it has to
-            # work from here: deciding the agent may act unasked is a thought
-            # you have *while writing the message*, not one you leave the box
-            # to act on. The Textual app bound it `priority=True` for exactly
-            # that reason. ctrl+↑ is how you leave the box.
+            # The message box is the one place the mode can be changed from,
+            # and the right one: deciding the agent may act unasked is a
+            # thought you have *while writing the message*, not one you leave
+            # the box to act on. The Textual app bound it `priority=True` for
+            # exactly that reason. Everywhere else shift+tab is the way back
+            # up the ring, as tab is the way down; ctrl+↑ leaves the box.
             self._cycle_mode()
         elif key == "ctrl-up":
             self.focus = CHAT
@@ -2356,9 +2329,14 @@ class RowUI:
             self.overlay = LlmOverlay(self.catalog)
         elif key == "a" and self.focus == SESSIONS:
             self.overlay = ProfilesOverlay(self.profiles)
-        elif key == "c" and self.focus != CHAT:
-            # Anywhere but the chat column (§5), which is the one row where the
-            # cursor is on a conversation and `c` reads as a letter.
+        elif key == "c" and self.focus == CHAT:
+            # The chat column's `c` copies the row under the cursor (§4.3 item
+            # 36). It is the one row where `c` is about a conversation rather
+            # than about the app, which is why the config editor gives it up
+            # here and keeps every other row.
+            self._copy_row(inner)
+        elif key == "c":
+            # Anywhere but the chat column (§5), where `c` is the row copy.
             # Fetched as it opens, like every other editable body: the file is
             # also written by the core — `settings.save` normalises what lands
             # on disk — so a copy kept from the last time this screen was open
@@ -2370,29 +2348,12 @@ class RowUI:
             )
         elif key == "ctrl-l" and self.focus == CHAT:
             self._switch_llm()
-        elif key == "shift-tab" and self.focus == CHAT:
-            # The mode is a per-session dial, so the key means something only
-            # where a session's conversation is: here and in the message box
-            # (see `_handle_input`). From the sessions and watchers rows
-            # shift+tab keeps moving between rows, which is what the Textual
-            # app's `check_action` decided for the same reason.
-            self._cycle_mode()
         elif key in ("ctrl-down", "tab"):
             self.focus = slots[(slots.index(self.focus) + 1) % len(slots)]
         elif key in ("ctrl-up", "shift-tab"):
             self.focus = slots[(slots.index(self.focus) - 1) % len(slots)]
         elif key == "ctrl-e":
             self._edit_profile()
-        elif key == "y" and self.focus == CHAT:
-            # §5: new, and colliding with nothing — the decision prompt owns
-            # `y` only while a decision is pending, and it takes keys first.
-            self._copy_row(inner)
-        elif key == "i" and self.focus == CHAT:
-            # Whatever is in that slot: the box, or the prompt standing in it
-            # (`_ring`). "write" is what the footer offers here, and while a
-            # decision is up there is nothing to write into — the answer to
-            # the question is the next thing this session takes.
-            self.focus = slots[2]
         elif key == "up":
             pane.move(-1, view, inner)
         elif key == "down":
@@ -2443,7 +2404,7 @@ class RowUI:
     # ------------------------------------------------- the clipboard and $EDITOR
 
     def _copy_row(self, inner: int) -> None:
-        """`y`: the chat row under the cursor, to the clipboard (§4.3 item 36).
+        """`c`: the chat row under the cursor, to the clipboard (§4.3 item 36).
 
         Through `hpca.clipboard.ClipboardManager`, which already knows about
         OSC 52, the multiplexer wrapping and the file fallback, and which

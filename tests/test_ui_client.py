@@ -862,11 +862,21 @@ class TestTheRewind:
         await wire.press("f")
         assert wire.peer.last(protocol.SessionFork).session_id == "s1"
 
-    async def test_copying_it_sends_nothing_at_all(self, wire):
+    async def test_enter_is_the_fork_and_carries_the_same_index(self, wire):
+        # The dialog opens on Enter and answers Enter with the choice that
+        # keeps the conversation whole.
+        await self.at_the_second_ask(wire)
+        await wire.press("enter")
+        assert wire.peer.last(protocol.SessionFork).index == 1
+
+    async def test_and_c_is_not_one_of_its_answers(self, wire):
+        # It is the chat row's copy key, and the dialog in front of the row
+        # neither takes it nor closes on it.
         await self.at_the_second_ask(wire)
         await wire.press("c")
         assert wire.peer.commands == []
-        assert wire.ui.input.text() == "the second ask"
+        assert wire.ui.overlay is not None
+        assert wire.ui.input.text() == ""
 
     async def test_a_row_that_is_not_a_message_cannot_be_rewound(self, wire):
         # A `thinking` row folds several messages and is `index` -1, so there

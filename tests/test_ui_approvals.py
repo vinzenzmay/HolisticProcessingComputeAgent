@@ -399,7 +399,7 @@ class TestTheDecisionCannotBeLeftUnanswerable:
 
     async def test_the_cursor_is_never_left_in_a_box_that_is_not_drawn(self, wire):
         # As any unguarded path that aims at the message box would leave it —
-        # a paste, a message handed back, `i` in the chat.
+        # a paste, a message handed back, ctrl+↓ out of the chat.
         await parked(wire, BASH_GATE)
         wire.ui.focus = INPUT
         assert "── message ─" not in wire.screen()
@@ -407,12 +407,12 @@ class TestTheDecisionCannotBeLeftUnanswerable:
         await wire.press("y")
         assert wire.peer.last(protocol.DecisionResolve).approved is True
 
-    async def test_i_in_the_chat_lands_on_the_question_and_not_on_the_box(
+    async def test_the_ring_lands_on_the_question_and_not_on_the_box(
         self, wire
     ):
         await parked(wire, BASH_GATE)
         await wire.press("ctrl-up")  # to the chat
-        await wire.press("i")
+        await wire.press("ctrl-down")  # and back down, into the prompt's slot
         assert wire.ui.focus == DECISION
         await wire.press("y")
         assert wire.peer.last(protocol.DecisionResolve).approved is True

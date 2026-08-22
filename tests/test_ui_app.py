@@ -79,8 +79,39 @@ def test_the_rows_are_drawn_top_to_bottom():
 # ------------------------------------------------------- the context footer
 
 
-def test_chat_offers_write():
-    assert "i write" in footer_of(CHAT)
+def test_chat_offers_the_row_copy():
+    assert "c copy" in footer_of(CHAT)
+
+
+def test_chat_offers_the_cuts_under_enter():
+    assert "enter rollback/fork" in footer_of(CHAT)
+
+
+def test_chat_no_longer_offers_a_key_to_write():
+    # `i` is gone: ctrl+↑/↓ already walk to the message box, and a second key
+    # for the same move is one more thing the footer has to be honest about.
+    assert "i write" not in footer_of(CHAT)
+
+
+def test_the_chat_no_longer_offers_the_old_copy_key():
+    assert "y copy" not in footer_of(CHAT)
+
+
+def test_the_mode_is_offered_in_the_message_box():
+    assert "⇧tab mode" in footer_of(INPUT)
+
+
+@pytest.mark.parametrize("row", [CHAT, SESSIONS, WATCHERS])
+def test_and_nowhere_else(row):
+    # The dial belongs to the row you are typing into (§3.5), so it is offered
+    # from exactly one row — the one it works from.
+    assert "mode" not in footer_of(row)
+
+
+@pytest.mark.parametrize("row", [SESSIONS, CHAT, INPUT, WATCHERS])
+def test_the_ring_hint_calls_them_panels(row):
+    assert "^↑^↓ panel" in footer_of(row)
+    assert "^↑^↓ row" not in footer_of(row)
 
 
 def test_sessions_offers_rename():
@@ -191,10 +222,17 @@ def test_a_note_is_the_bottom_line_once_the_footer_wraps():
 # ------------------------------------------------------------ the message row
 
 
-def test_i_focuses_the_message_row():
+def test_i_in_the_chat_moves_nothing():
     ui = build()
     ui.focus = CHAT
     ui.handle("i", 120, 40)
+    assert ui.focus == CHAT
+
+
+def test_ctrl_down_is_how_the_chat_reaches_the_message_row():
+    ui = build()
+    ui.focus = CHAT
+    ui.handle("ctrl-down", 120, 40)
     assert ui.focus == INPUT
 
 
@@ -793,7 +831,7 @@ def test_it_still_says_which_session_opened():
     assert "opened" in switched_to_the_second().note
 
 
-# --------------------------- enter on your own message: fork, roll back, copy
+# ------------------------- enter on your own message: fork or roll back to it
 
 
 def at_the_rewind() -> tuple[RowUI, int, str]:
@@ -815,58 +853,37 @@ def test_enter_elsewhere_in_the_log_goes_to_the_box():
     assert ui.overlay is None
 
 
-def test_c_copies_it_in():
-    ui, _, said = at_the_rewind()
-    ui.handle("c", 120, 40)
-    assert ui.input.text() == said
-
-
-def test_and_focuses_the_box():
+def test_c_is_not_one_of_its_answers_any_more():
+    # The copy left the dialog for the chat row's own `c`, and a modal leaves
+    # a key it has no answer for alone rather than closing on it.
     ui, _, _ = at_the_rewind()
     ui.handle("c", 120, 40)
-    assert ui.focus == INPUT
+    assert ui.overlay is not None
+    assert ui.input.text() == ""
 
 
-def test_the_cursor_is_behind_the_reused_text():
-    ui, _, _ = at_the_rewind()
-    ui.handle("c", 120, 40)
-    assert (ui.input.row, ui.input.col) == (
-        len(ui.input.lines) - 1,
-        len(ui.input.lines[-1]),
-    )
-
-
-def test_enter_is_copy_too():
+def entered_twice() -> tuple[RowUI, list, int]:
+    """Enter on your own message, and Enter again on the dialog it opened."""
     ui = build()
     on_own_message(ui)
-    ui.focus = INPUT
-    typed(ui, "already typing")
-    ui.focus = CHAT
+    before = list(ui.chat.items)
+    sessions = len(ui.sessions)
     ui.handle("enter", 120, 40)
     ui.handle("enter", 120, 40)
+    return ui, before, sessions
+
+
+def test_a_second_enter_takes_the_fork():
+    ui, _, sessions = entered_twice()
     assert ui.overlay is None
+    assert len(ui.sessions) == sessions + 1
 
 
-def test_a_draft_is_never_lost():
-    ui = build()
-    index = on_own_message(ui)
-    said = ui.chat.items[index].text
-    ui.focus = INPUT
-    typed(ui, "already typing")
-    ui.focus = CHAT
-    ui.handle("enter", 120, 40)
-    ui.handle("enter", 120, 40)
-    assert ui.input.text() == f"already typing\n{said}"
-
-
-def test_a_draft_ending_in_a_space_continues_on_that_line():
-    ui = build()
-    index = on_own_message(ui)
-    said = ui.chat.items[index].text
-    ui.input.set_text("rerun this: ")
-    ui.handle("enter", 120, 40)
-    ui.handle("c", 120, 40)
-    assert ui.input.text() == f"rerun this: {said}"
+def test_and_leaves_the_conversation_it_was_pressed_in_whole():
+    # Which is why Enter is the fork and not the rollback: the key that can be
+    # hit by reflex is the one choice that cannot lose anything.
+    ui, before, _ = entered_twice()
+    assert ui.sessions[1].chat.items == before
 
 
 def forked() -> tuple[RowUI, int, list, str, int]:

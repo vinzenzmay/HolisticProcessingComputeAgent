@@ -110,7 +110,11 @@ off file by file.
 
 - Enter on one of your own sent messages opens the rewind dialog.
 - Escape from the dialog changes nothing.
-- Activating a message twice still copies its text into the entry.
+- Activating a sent message twice forks the session — the reflex key is
+  the choice that cannot lose anything. On a queued message it still
+  copies the text into the entry, which is all that dialog has to offer.
+- `c` on the chat row copies the row under the cursor to the clipboard;
+  the rewind dialog no longer offers a copy of its own.
 - Rollback trims the conversation to before that message.
 - Rollback to the first message empties the thread.
 - The next turn runs on the trimmed thread: the model does not see the cut messages.

@@ -197,21 +197,32 @@ class TestRewindOverlay:
         press(ui, "enter")
         assert isinstance(ui.overlay, RewindOverlay)
 
-    def test_it_offers_all_three(self):
+    def test_it_offers_both_cuts(self):
         ui = build()
         on_own_message(ui)
         seen = screen(press(ui, "enter"))
         assert "fork the session from here" in seen
         assert "roll this conversation back to here" in seen
-        assert "copy it into the message box" in seen
 
-    def test_the_footer_names_all_three(self):
+    def test_and_no_longer_the_copy(self):
+        # It is `c` on the chat row now, which needs no dialog in front of it.
+        ui = build()
+        on_own_message(ui)
+        assert "copy it into the message box" not in screen(press(ui, "enter"))
+
+    def test_the_footer_names_them_both(self):
         ui = build()
         on_own_message(ui)
         press(ui, "enter")
         foot = plain(ui.render(160, 40)[-1])
-        for pair in ("f fork", "r roll back", "c / enter copy", "esc cancel"):
+        for pair in ("f / enter fork", "r roll back", "esc cancel"):
             assert pair in foot
+
+    def test_and_offers_no_key_it_will_not_answer(self):
+        ui = build()
+        on_own_message(ui)
+        press(ui, "enter")
+        assert "copy" not in plain(ui.render(160, 40)[-1])
 
     def test_a_key_it_has_no_answer_for_leaves_it_open(self):
         ui = build()
@@ -572,7 +583,7 @@ class TestThinking:
     def test_the_command_opens_the_chooser(self):
         ui = recorded(build())
         ui.focus = CHAT
-        press(ui, "i")
+        press(ui, "ctrl-down")
         type_text(ui, "/thinking")
         press(ui, "enter")
         assert isinstance(ui.overlay, ThinkingOverlay)

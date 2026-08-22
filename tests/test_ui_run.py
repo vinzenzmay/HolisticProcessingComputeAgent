@@ -403,8 +403,9 @@ class TestEvents:
         await h.settle(1)
         await _until(lambda: peer.took(protocol.SessionOpen))
         peer.clear()
-        # `i` from the chat row moves into the message box; then type and send.
-        await h.press(b"ihi\r")
+        # ctrl+↓ from the chat row moves into the message box (the ring); then
+        # type and send.
+        await h.press(b"\x1b[1;5Bhi\r")
         await _until(lambda: peer.took(protocol.TurnSubmit))
         assert peer.last(protocol.TurnSubmit).text == "hi"
 
