@@ -2093,17 +2093,25 @@ class AgentService:
 
     # ---------------------------------------------------------- confirmations
 
-    def ask(self, question: str, on_yes) -> None:
-        """Put a yes/no to whoever is listening; run ``on_yes`` if they accept.
+    def ask(self, session_id: str, question: str, on_yes) -> None:
+        """Put a yes/no about one session; run ``on_yes`` if they accept.
 
         Returns immediately — this is called from a poll, and a poll that
         waited for a person would stop being a poll. The continuation is held
         here rather than sent, see :attr:`_confirmations`.
+
+        ``session_id`` says which conversation's work is being asked about,
+        which is the whole difference between a question a user can place and
+        one that arrives out of nowhere: what raises this is a background job
+        finishing, and the user is by then as likely as not reading something
+        else.
         """
         self._confirm_seq += 1
         key = f"q{self._confirm_seq}"
         self._confirmations[key] = on_yes
-        self._deps.emit(ConfirmRequested(id=key, question=question))
+        self._deps.emit(
+            ConfirmRequested(id=key, session_id=session_id, question=question)
+        )
 
     async def _resolve_confirmation(self, key: str, confirmed: bool) -> None:
         on_yes = self._confirmations.pop(key, None)
@@ -3049,7 +3057,7 @@ def build_service(
     # Triage's "shall I learn this signature?" offer needs somewhere to ask.
     # Wired after construction because the service is what holds the pending
     # question, and the poller is built before it.
-    pollers._confirm = lambda question, on_yes: service.ask(question, on_yes)
+    pollers._confirm = service.ask
     for event in events:
         service._fan_out(event)
     return service

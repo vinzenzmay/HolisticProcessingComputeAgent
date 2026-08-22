@@ -38,7 +38,7 @@ from hpca.ui.ansi import (
     WHITE,
     YELLOW,
 )
-from hpca.ui.app import CHAT, DECISION, INPUT, SESSIONS, WATCHERS, RowUI
+from hpca.ui.app import CHAT, DECISION, INPUT, OFFER, SESSIONS, WATCHERS, RowUI
 from hpca.ui.approval import approval_details
 from hpca.ui.keys import PASTE
 from hpca.ui.state import Confirm, Display
@@ -1008,32 +1008,141 @@ class TestTheGenericConfirm:
 class TestConfirmRequested:
     """§4.3 item 23 — the separate channel triage offers a learned log
     signature on. Never wired into the Textual UI at all, so this is new
-    behaviour arriving with the port."""
+    behaviour arriving with the port.
 
-    async def test_the_question_reaches_the_screen(self, wire):
-        await wire.tell(
+    It is raised by a poll rather than by a keypress, which is what makes it
+    unlike every other question here: whoever started the job that failed is
+    as likely as not reading a different conversation by the time it lands. So
+    it waits in the session it is about, standing in that session's message
+    box (`app.OFFER`), and a session that is not on screen says so with a mark
+    and nothing else.
+    """
+
+    async def offered(self, w, session_id="s1", question="Learn it?", offer_id="sig-1"):
+        await w.tell(
             protocol.ConfirmRequested(
-                id="sig-1", question="Remember “OOM killed” as a failure?"
+                id=offer_id, session_id=session_id, question=question
             )
         )
+        return w
+
+    async def test_the_question_reaches_the_session_it_is_about(self, wire):
+        await self.offered(wire, question="Remember “OOM killed” as a failure?")
         assert "Remember “OOM killed” as a failure?" in wire.screen()
 
+    async def test_it_stands_where_the_message_box_was(self, wire):
+        # In the box's slot and not over the frame: the conversation the
+        # question is about has to stay readable behind it (`_entry_h`).
+        assert "── message" in wire.screen()
+        await self.offered(wire)
+        screen = wire.screen()
+        assert "── offer" in screen
+        assert "── message" not in screen
+        assert "edit run.sh" in screen, "the chat is still there to read"
+        assert "the second thing" in screen, "and so is the sidebar"
+
+    async def test_the_layout_budgets_for_the_rows_it_draws(self, wire):
+        """Rows drawn that no band asked for come off the bottom of the frame.
+
+        Which is a silent failure and the reason this is asserted rather than
+        eyeballed: the frame is always exactly as tall as the terminal, so an
+        entry band that draws four rows where two were planned does not
+        overflow — it pushes the watchers column down and two of its rows are
+        cut, with nothing anywhere saying they are missing.
+        """
+        await self.offered(wire, question="a question long enough to wrap " * 6)
+        ui, w, h = wire.ui, wire.width, wire.height
+        assert ui._entry_h(w, h) == len(ui._render_offer(w, h))
+        assert sum(ui._heights(h, w)) == ui._avail(w, h)
+
+    async def test_the_cursor_lands_on_it_so_the_keys_work(self, wire):
+        await self.offered(wire)
+        assert wire.ui.focus == OFFER
+
     async def test_yes_answers_it_by_id(self, wire):
-        await wire.tell(protocol.ConfirmRequested(id="sig-1", question="Learn it?"))
+        await self.offered(wire)
         await wire.press("y")
         answer = wire.peer.last(protocol.ConfirmResolve)
         assert (answer.id, answer.confirmed) == ("sig-1", True)
 
     async def test_and_no_answers_it_too(self, wire):
-        await wire.tell(protocol.ConfirmRequested(id="sig-1", question="Learn it?"))
+        await self.offered(wire)
         await wire.press("n")
         answer = wire.peer.last(protocol.ConfirmResolve)
         assert (answer.id, answer.confirmed) == ("sig-1", False)
 
-    async def test_it_names_no_session_because_it_belongs_to_none(self, wire):
-        # A triage offer comes from a poll, not from a conversation
-        # (`protocol.ConfirmResolve`).
-        assert not hasattr(Confirm(id="x", question="?"), "session_id")
-        await wire.tell(protocol.ConfirmRequested(id="sig-1", question="Learn it?"))
+    async def test_escape_is_no_here_too(self, wire):
+        await self.offered(wire)
+        await wire.press("esc")
+        assert wire.peer.last(protocol.ConfirmResolve).confirmed is False
+
+    async def test_answering_gives_the_message_box_back(self, wire):
+        await self.offered(wire)
         await wire.press("y")
-        assert not hasattr(wire.peer.last(protocol.ConfirmResolve), "session_id")
+        assert wire.ui.focus == INPUT
+        assert "── message" in wire.screen()
+
+    async def test_a_question_about_another_session_does_not_take_this_one(self, wire):
+        # §3.2 property 1: a session that is not on screen may change the
+        # sidebar and nothing else.
+        await self.offered(wire, session_id="s2", question="Learn the other one?")
+        assert "Learn the other one?" not in wire.screen()
+        assert "── message" in wire.screen()
+        assert wire.ui.focus != OFFER
+
+    async def test_but_the_sidebar_says_it_is_waiting(self, wire):
+        await self.offered(wire, session_id="s2")
+        row = next(
+            line for line in wire.frame() if "the second thing" in plain(line)
+        )
+        assert "?" in plain(row)
+
+    async def test_and_switching_to_it_is_what_asks(self, wire):
+        await wire.tell(protocol.ChatReset(session_id="s2", entries=[entry(1)]))
+        await self.offered(wire, session_id="s2", question="Learn the other one?")
+        wire.ui.focus = SESSIONS
+        wire.ui.session_pane.cursor = 2  # the second session's row
+        await wire.press("enter")
+        assert "Learn the other one?" in wire.screen()
+
+    async def test_a_decision_outranks_it_and_it_waits(self, wire):
+        # Both want the same slot, and of the two the decision is the one
+        # holding a turn.
+        await self.offered(wire)
+        await parked(wire, BASH_GATE)
+        screen = wire.screen()
+        assert "── decision" in screen
+        assert "Learn it?" not in screen
+        await wire.press("y")  # answer the decision
+        assert "Learn it?" in wire.screen(), "the offer was waiting, not lost"
+
+    async def test_two_questions_are_asked_one_at_a_time(self, wire):
+        # The core is holding a continuation per id: a second offer landing on
+        # the first would strand it with nothing able to answer it.
+        await self.offered(wire, offer_id="sig-1", question="Learn the first?")
+        await self.offered(wire, offer_id="sig-2", question="Learn the second?")
+        assert "Learn the first?" in wire.screen()
+        assert "Learn the second?" not in wire.screen()
+        await wire.press("y")
+        assert wire.peer.last(protocol.ConfirmResolve).id == "sig-1"
+        assert "Learn the second?" in wire.screen()
+        await wire.press("n")
+        assert wire.peer.last(protocol.ConfirmResolve).id == "sig-2"
+        assert "── message" in wire.screen()
+
+    async def test_the_same_question_twice_is_one_question(self, wire):
+        # A re-emit on subscribe must not ask twice: the second copy would be
+        # unanswerable, the core having freed the continuation on the first.
+        await self.offered(wire)
+        await self.offered(wire)
+        await wire.press("y")
+        assert wire.ui.session.offers == []
+        assert "── message" in wire.screen()
+
+    async def test_walking_away_does_not_answer_it(self, wire):
+        await self.offered(wire)
+        await wire.press("ctrl-up")
+        assert wire.ui.focus == CHAT
+        assert wire.peer.took(protocol.ConfirmResolve) == []
+        await wire.press("ctrl-down")
+        assert wire.ui.focus == OFFER, "the ring comes back to it"

@@ -628,17 +628,35 @@ class Toast:
 
 
 @dataclass
-class Confirm:
-    """A yes/no question, from the core or from the UI itself.
+class Offer:
+    """A `confirm.requested`, waiting in the session it was raised about.
 
-    ``id`` is `confirm.requested`'s: the core holds the continuation (today,
-    the coroutine that writes a learned log signature) and only the yes/no
-    crosses back. It is empty for the eleven local questions — really quit,
-    delete this session, interrupt this turn — which have no core state
-    waiting on them and are answered by ``on_answer`` alone.
+    The core holds the continuation under ``id`` — today, the coroutine that
+    writes a learned log signature — and only the yes/no crosses back.
+
+    Held on the `SessionState` and not on the app, which is the whole point of
+    it: this is raised by a poll rather than by a keypress, so it belongs to
+    the conversation whose job failed rather than to whatever happens to be on
+    screen when it lands. Switching session carries it, exactly as the parked
+    decision and the half-typed draft are carried (§4.4).
     """
 
     id: str = ""
+    question: str = ""
+
+
+@dataclass
+class Confirm:
+    """A yes/no the UI asks itself, over everything else.
+
+    Really quit, interrupt this turn, delete this session: local questions
+    with no core state waiting on them, answered by ``on_answer`` alone. What
+    the *core* asks is an `Offer` above, which is a different thing in every
+    way that matters — it is about one session, it can arrive while the user
+    is elsewhere, and so it waits in that session rather than taking the
+    screen.
+    """
+
     question: str = ""
     # What to do with the answer here, when the answer is this side's business.
     # A callable rather than a verdict flag because the eleven call sites do
@@ -829,6 +847,12 @@ class SessionState:
         # Per session and held here rather than in one shared bar, which is
         # what parks the half-typed refusal across a switch (§4.4).
         self.decision: Decision | None = None
+        # Questions the core raised about this conversation's own work, oldest
+        # first (`Offer`). A list rather than one slot: two background jobs can
+        # fail before either question is answered, and the core is holding a
+        # continuation per id — a second offer overwriting the first would
+        # strand that one with nothing left on any screen able to answer it.
+        self.offers: list[Offer] = []
         self.proposals: list[Proposal] = []
         # A reply landed here while the user was looking at another
         # conversation (§4.3 item 15). Local, because the core has no flag for
@@ -1064,6 +1088,31 @@ class SessionState:
         # re-binds the anchor and the turn is a turn again, and where there is
         # no turn `working` is already False.
         self.turn.parked = False
+
+    # ---------------------------------------------------------- the offers
+
+    @property
+    def offer(self) -> Offer | None:
+        """The one being asked, which is the oldest one still unanswered."""
+        return self.offers[0] if self.offers else None
+
+    def add_offer(self, offer_id: str, question: str) -> Offer:
+        """`confirm.requested` for this conversation.
+
+        The same id twice is the same question — a re-emit on subscribe would
+        otherwise ask it twice and leave the second copy unanswerable, since
+        the core frees the continuation on the first answer.
+        """
+        for existing in self.offers:
+            if existing.id == offer_id:
+                return existing
+        offer = Offer(id=offer_id, question=question)
+        self.offers.append(offer)
+        return offer
+
+    def drop_offer(self, offer_id: str) -> None:
+        """Answered. Nothing about the turn changes — this never held one."""
+        self.offers = [o for o in self.offers if o.id != offer_id]
 
     # -------------------------------------------------------------- the turn
 

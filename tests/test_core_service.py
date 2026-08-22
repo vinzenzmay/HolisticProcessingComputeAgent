@@ -2930,16 +2930,19 @@ class TestConfirmations:
         async def on_yes():
             ran.append(True)
 
-        service.ask("Learn this signature?", on_yes)
+        service.ask("s1", "Learn this signature?", on_yes)
         events = await drain(queue)
         assert kinds(events) == ["ConfirmRequested"]
+        # Which conversation is being asked about, so a client can put the
+        # question in it rather than over whatever the user is reading.
+        assert events[0].session_id == "s1"
         await service.handle(ConfirmResolve(id=events[0].id, confirmed=True))
         assert ran == [True]
 
     async def test_a_no_runs_nothing(self, service):
         queue = subscribe(service)
         ran = []
-        service.ask("Learn this?", lambda: _record(ran))
+        service.ask("s1", "Learn this?", lambda: _record(ran))
         events = await drain(queue)
         await service.handle(ConfirmResolve(id=events[0].id, confirmed=False))
         assert ran == []
@@ -2950,7 +2953,7 @@ class TestConfirmations:
     async def test_the_same_answer_twice_runs_once(self, service):
         queue = subscribe(service)
         ran = []
-        service.ask("Learn this?", lambda: _record(ran))
+        service.ask("s1", "Learn this?", lambda: _record(ran))
         key = (await drain(queue))[0].id
         await service.handle(ConfirmResolve(id=key, confirmed=True))
         await service.handle(ConfirmResolve(id=key, confirmed=True))
@@ -2962,7 +2965,7 @@ class TestConfirmations:
         async def boom():
             raise RuntimeError("the signature file is read-only")
 
-        service.ask("Learn this?", boom)
+        service.ask("s1", "Learn this?", boom)
         key = (await drain(queue))[0].id
         await service.handle(ConfirmResolve(id=key, confirmed=True))
         assert any(

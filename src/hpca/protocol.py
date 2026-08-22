@@ -1667,17 +1667,26 @@ class MemoryProposals(Event):
 
 
 class ConfirmRequested(Event):
-    """A yes/no question that is not a tool approval.
+    """A yes/no question about one conversation that is not a tool approval.
 
     One case today: triage proposing a log signature it just learned (§5.5
     tier 3). It is deliberately not `decision.requested` — that one parks a
     graph thread and its answer resumes a turn, whereas this one comes from a
     poll and nothing is waiting on it. Conflating them would let an unanswered
     triage offer look like a stalled session.
+
+    ``session_id`` is the conversation whose work raised it — the session the
+    failed job was started from — and it is not decoration: this arrives from
+    a poll rather than from a keypress, so without it the question reaches a
+    user who is somewhere else entirely, about work they cannot see, with
+    nothing on screen saying which of their conversations it came out of. It
+    is what lets a client hold the question *in* that session instead
+    (§3.2 property 1).
     """
 
     TYPE: ClassVar[str] = "confirm.requested"
     id: str
+    session_id: str
     question: str
 
 

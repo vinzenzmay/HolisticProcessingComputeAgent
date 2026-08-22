@@ -631,7 +631,7 @@ class TestTierThree:
         self, deps, recorder
     ):
         """The library is the user's; one model call is thin evidence."""
-        asked: list[str] = []
+        asked: list[tuple[str, str]] = []
         llm = FakeLLM(
             explanation(
                 proposed_signature={
@@ -644,11 +644,18 @@ class TestTierThree:
         )
         poller = pollers(
             deps, recorder, llm=lambda: llm,
-            confirm=lambda question, on_yes: asked.append(question),
+            confirm=lambda session_id, question, on_yes: asked.append(
+                (session_id, question)
+            ),
         )
         await poller._explain_candidates(_change(), tier_two(), "head\n\nbody")
         assert len(asked) == 1
-        assert "missing_contig" in asked[0]
+        session_id, question = asked[0]
+        assert "missing_contig" in question
+        # The two things whoever answers needs and a poll is the only one
+        # holding: which conversation this came out of, and which job failed.
+        assert session_id == "s1"
+        assert "sniffles_run" in question
 
     async def test_with_nothing_to_ask_with_the_proposal_is_dropped(
         self, deps, recorder
@@ -674,10 +681,11 @@ class TestTierThree:
         accepted: list = []
         poller = pollers(
             deps, recorder,
-            confirm=lambda question, on_yes: accepted.append(on_yes),
+            confirm=lambda session_id, question, on_yes: accepted.append(on_yes),
         )
         poller._offer_signature(
-            _proposed(id="missing_contig", patterns=["contig .* not in reference"])
+            _change(),
+            _proposed(id="missing_contig", patterns=["contig .* not in reference"]),
         )
         await accepted[0]()
         assert any("Saved error signature" in t for t in recorder.toasts)
@@ -692,9 +700,11 @@ class TestTierThree:
         accepted: list = []
         poller = pollers(
             deps, recorder,
-            confirm=lambda question, on_yes: accepted.append(on_yes),
+            confirm=lambda session_id, question, on_yes: accepted.append(on_yes),
         )
-        poller._offer_signature(_proposed(id="broken", patterns=["(unclosed"]))
+        poller._offer_signature(
+            _change(), _proposed(id="broken", patterns=["(unclosed"])
+        )
         assert accepted == []
         assert any("Ignored a proposed error signature" in t for t in recorder.toasts)
         assert not (tmp_path / "error_signatures.yaml").exists()

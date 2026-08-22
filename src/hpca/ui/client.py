@@ -1073,7 +1073,14 @@ class UIClient:
         self.ui.decision_cleared(msg.session_id)
 
     def _confirm(self, msg: protocol.ConfirmRequested) -> None:
-        self.ui.confirm_requested(msg.id, msg.question)
+        """A question about one session, which is where it is put.
+
+        Not on the app: what raises this is a job finishing, and the user is
+        by then as likely as not reading another conversation. Handing it to
+        the session makes "when you are in there" the moment it is asked.
+        """
+        self._session(msg.session_id).add_offer(msg.id, msg.question)
+        self.ui.confirm_requested(msg.session_id)
 
     def _unqueued(self, msg: protocol.TurnUnqueued) -> None:
         """A typed-ahead message taken back: its row goes, its text stays.

@@ -14,7 +14,8 @@ from hpca import __version__ as VERSION
 from hpca.ui import commands, toasts
 from hpca.ui.ansi import BOLD, CYAN, DIM, GREEN, RED, RESET, REVERSE, YELLOW
 from hpca.ui.ansi import PULSE_INTERVAL
-from hpca.ui.ansi import cell_width, cut, footer_lines, footer_wrap, pad, rule, safe
+from hpca.ui.ansi import cell_width, cut, fold, footer_lines, footer_wrap, pad
+from hpca.ui.ansi import rule, safe
 from hpca.ui.approval import decision_height, render_decision
 from hpca.ui.editor import Editor
 from hpca.ui.keys import NEWLINE_KEYS, is_paste, paste_text
@@ -58,6 +59,7 @@ from hpca.ui.state import (
     Interrupt,
     MoveSession,
     MoveWatch,
+    Offer,
     NewSession,
     OpenSession,
     Peek,
@@ -93,7 +95,15 @@ ESC_STOP_WINDOW = 1.0
 # was outside the ring once, and that was a lockout: its own keys moved the
 # focus away and nothing could move it back, so the turn stayed parked on a
 # question that could no longer be answered.
-SESSIONS, CHAT, INPUT, WATCHERS, DECISION = range(5)
+SESSIONS, CHAT, INPUT, WATCHERS, DECISION, OFFER = range(6)
+
+# The other thing that can stand in the message box's slot: a question the
+# core raised about this conversation — today, triage offering to remember a
+# failed job's error signature (`state.Offer`). It is in the ring for the same
+# reason DECISION is, and it is a slot rather than a modal for a reason of its
+# own: it arrives from a poll, so the user is as likely as not reading another
+# session when it lands, and a question that takes the screen from work it has
+# nothing to do with is a question asked in the wrong place.
 
 # The question the aimed half of the stop gesture asks first. Enter on the
 # working row is a key that can be hit while steering through a log the agent
@@ -168,6 +178,11 @@ SETTINGS_KEY = ("settings", ())
 # `session.rows` — a marker that waited for the next sidebar repaint would lag
 # a whole poll behind the event that caused it.
 DECISION_MARK, WORKING_MARK = "!", "⟳"
+# And what a session with an unanswered question from the core wants. Its
+# own glyph rather than the "!": one is a turn parked mid-flight and the
+# other is an offer about work that has already finished, and a user who
+# crosses the screen for the second expecting the first has been lied to.
+OFFER_MARK = "?"
 
 # And the third state §4.3 item 15 asks for, which the core has no flag for
 # and could not have one: a reply landed in this conversation while the user
@@ -619,7 +634,15 @@ class RowUI:
         # `is not None`: an interrupt whose payload happens to be empty is
         # still a decision waiting for an answer.
         parked = session.decision is not None or "decision" in flags
-        marks = DECISION_MARK if parked else " "
+        # The offer is second to the decision and not beside it: one column,
+        # and of the two the parked turn is the one that stops work.
+        marks = (
+            DECISION_MARK
+            if parked
+            else OFFER_MARK
+            if session.offer is not None
+            else " "
+        )
         # `busy`, not `working`: a silent backend call — a compaction, the
         # titler, a `/conclude` — is something in flight in that conversation
         # and the row has to say so, even though there is no turn to stop
@@ -1135,10 +1158,11 @@ class RowUI:
             # rows, which is the difference between them on a screen with no
             # room: a message can be typed a line at a time, and a question
             # nobody can read is a question nobody can answer.
+            standing = (
+                self.session.decision is not None or self.session.offer is not None
+            )
             inp = self._status_h() + (
-                self._decision_h(width, height)
-                if self.session.decision is not None
-                else 2
+                self._entry_h(width, height) if standing else 2
             )
             middle = max(1, avail - 4 - inp)
         return [top, middle, inp, bottom]
@@ -1161,6 +1185,8 @@ class RowUI:
         """
         if self.session.decision is not None:
             return self._decision_h(width, height)
+        if self.session.offer is not None:
+            return self._offer_h(width, height)
         return self._input_h(width) + self._menu_h(width, height)
 
     def _decision_h(self, width: int, height: int) -> int:
@@ -1178,6 +1204,29 @@ class RowUI:
         return decision_height(
             decision, width, max(3, self._avail(width, height) // DECISION_SHARE)
         )
+
+    def _offer_rows(self, offer: Offer, width: int) -> list[tuple[str, str]]:
+        """The core's question, as ``(style, text)`` rows.
+
+        Deliberately plainer than the decision above it. That one is a turn
+        parked mid-flight and says so in red or yellow; this one is an offer
+        about work that has already finished, and painting the two alike would
+        say they are equally urgent — which would be a lie in the direction
+        that costs most, since the decision is the one holding a turn.
+        """
+        rows = [("", rule("offer", width))]
+        for line in fold(offer.question, max(8, width - 4)):
+            rows.append((BOLD, f"  {line}"))
+        rows.append((DIM, "  (y) yes · (n) no"))
+        return rows
+
+    def _offer_h(self, width: int, height: int) -> int:
+        """Rows the offer wants, under the same cap the decision has."""
+        offer = self.session.offer
+        if offer is None:
+            return 0
+        cap = max(3, self._avail(width, height) // DECISION_SHARE)
+        return max(3, min(cap, len(self._offer_rows(offer, width))))
 
     def _status_h(self) -> int:
         """Whether the mode/meter row is on screen at all.
@@ -1237,7 +1286,9 @@ class RowUI:
         for slot, pane, pane_h in order:
             if slot == INPUT:
                 status = self._render_status(width)
-                prompt = self._render_decision(width, height)
+                prompt = self._render_decision(width, height) or self._render_offer(
+                    width, height
+                )
                 if prompt:  # standing where the box would be (`_entry_h`)
                     out += prompt + status
                     continue
@@ -1368,6 +1419,27 @@ class RowUI:
         blank[at : at + len(rows)] = rows
         return blank
 
+    def _render_offer(self, width: int, height: int) -> list[str]:
+        """The offer, in exactly ``_offer_h`` rows — or none, if none is up.
+
+        The rule says focus the way every other region's does, and the last
+        row is the one kept when there is no room: a question with no visible
+        way to answer it is worse than a question with no visible middle.
+        """
+        offer = self.session.offer
+        if offer is None:
+            return []
+        focused = self.focus == OFFER
+        rows = self._offer_rows(offer, width)
+        rows[0] = (BOLD + CYAN if focused else DIM, rows[0][1])
+        out = [f"{style}{pad(text, width)}{RESET}" for style, text in rows]
+        room = self._offer_h(width, height)
+        if len(out) > room:
+            out = out[: max(0, room - 1)] + out[-1:]
+        while len(out) < room:
+            out.append(" " * width)
+        return out[:room]
+
     def _render_status(self, width: int) -> list[str]:
         """The mode bar and the context meter, sharing one row.
 
@@ -1449,6 +1521,8 @@ class RowUI:
                 ("esc esc", "stop"),
                 ("?", "keys"),
             ]
+        if self.focus == OFFER:
+            return [("y", "yes"), ("n", "no"), ("^↑^↓", "panel"), ("?", "keys")]
         if self.focus == DECISION:
             decision = self.session.decision
             if decision is not None and not decision.asking:
@@ -1531,7 +1605,12 @@ class RowUI:
         sequence could reach again — re-opening the session was the only way
         back, and nothing on screen said so.
         """
-        middle = DECISION if self.session.decision is not None else INPUT
+        if self.session.decision is not None:
+            middle = DECISION
+        elif self.session.offer is not None:
+            middle = OFFER
+        else:
+            middle = INPUT
         return [SESSIONS, CHAT, middle, WATCHERS]
 
     def _settle_focus(self) -> None:
@@ -1547,11 +1626,9 @@ class RowUI:
         focus it has no entry for. Asked once, here, rather than remembered
         eleven times.
         """
-        if self.session.decision is None:
-            if self.focus == DECISION:
-                self.focus = INPUT
-        elif self.focus == INPUT:
-            self.focus = DECISION
+        middle = self._ring()[2]
+        if self.focus in (INPUT, DECISION, OFFER) and self.focus != middle:
+            self.focus = middle
 
     def handle(self, key: str, width: int, height: int) -> bool:
         self._settle_focus()
@@ -1580,6 +1657,8 @@ class RowUI:
             # prompt — which is underneath it, not over it — has them the
             # moment it does.
             return self._handle_decision(key)
+        if self.focus == OFFER:
+            return self._handle_offer(key)
         if self.focus == INPUT:
             return self._handle_input(key)
         return self._handle_row(key, width, height)
@@ -1678,21 +1757,16 @@ class RowUI:
         self,
         question: str,
         on_answer: Callable[[bool], None] | None = None,
-        *,
-        confirm_id: str = "",
     ) -> None:
-        """Put a yes/no on screen. The answer goes wherever it belongs.
+        """Put a yes/no over everything. The answer runs ``on_answer``.
 
-        Two kinds of caller, one dialog. The UI's own questions pass
-        ``on_answer`` and nothing is waiting on the other side of a socket for
-        them. `confirm.requested` passes ``confirm_id``: the core is holding a
-        continuation under that id and only the verdict crosses back
-        (`protocol.ConfirmResolve`), which is why the question need not name a
-        session — a triage offer comes from a poll, not a conversation.
+        The UI's own questions only — really quit, interrupt this turn, delete
+        this session — which is why taking the whole screen is fair: each of
+        them answers a key that was just pressed, so there is nothing else the
+        user was in the middle of. What the *core* asks does not come through
+        here; it waits in the session it is about (`confirm_requested`).
         """
-        self.confirm = Confirm(
-            id=confirm_id, question=question, on_answer=on_answer
-        )
+        self.confirm = Confirm(question=question, on_answer=on_answer)
 
     def _handle_confirm(self, key: str) -> bool:
         """y, n, escape. Anything else is ignored rather than passed on: a
@@ -1717,14 +1791,27 @@ class RowUI:
         question, self.confirm = self.confirm, None
         if question is None:  # pragma: no cover - guarded by the caller
             return
-        if question.id:
-            self.send(Answer(question.id, confirmed))
         if callable(question.on_answer):
             question.on_answer(confirmed)
 
-    def confirm_requested(self, confirm_id: str, question: str) -> None:
-        """`confirm.requested`, which the Textual UI never drew at all."""
-        self.ask(question, confirm_id=confirm_id)
+    def confirm_requested(self, session_id: str) -> None:
+        """`confirm.requested`, which the Textual UI never drew at all.
+
+        The question itself is already on its session (`client._confirm`);
+        what is left is the two things the *frame* has to say about it. A
+        session that is not on screen says it with the "?" in the sidebar and
+        nothing else (§3.2 property 1) — this arrives from a poll, and a poll
+        may not reach across and take the row somebody is working in.
+
+        For the open session the cursor moves onto it, from the chat or the
+        box only, which is the same bargain `decision_arrived` makes and for
+        the same reason: the offer stands in the box's slot (`_entry_h`), so
+        a cursor left in the box would be a cursor on a row that is no longer
+        drawn. The draft is untouched and comes back with the box.
+        """
+        self.refresh_sidebar()
+        if session_id == self.active_id and self.focus in (CHAT, INPUT):
+            self.focus = OFFER
 
     # ------------------------------------------------------ the decision
 
@@ -1807,6 +1894,46 @@ class RowUI:
         else:
             decision.reason.handle(key)
         return True
+
+    def _handle_offer(self, key: str) -> bool:
+        """Two answers and the ring, which is all this row has.
+
+        No third key, and in particular no "later": the core is holding a
+        continuation under this id and a question that can be walked past
+        without answering is a continuation nothing ever frees. Walking off
+        with ctrl+↑/↓ is not walking past it — the offer is still here, the
+        sidebar still says so, and the ring comes back.
+        """
+        if key == "quit":
+            return False
+        offer = self.session.offer
+        if offer is None:  # answered elsewhere, or its session went away
+            self.focus = INPUT
+            return True
+        if key == "y":
+            self._answer_offer(offer, True)
+        elif key in ("n", "esc"):
+            self._answer_offer(offer, False)
+        elif key in ("ctrl-up", "shift-tab"):
+            self.focus = CHAT
+        elif key in ("ctrl-down", "tab"):
+            self.focus = WATCHERS
+        return True
+
+    def _answer_offer(self, offer: Offer, accepted: bool) -> None:
+        """Answer it and give the slot back — to the box, or to the next one.
+
+        Taken off here rather than when the core agrees, the same as a
+        decision: a question that stays up until an answer comes back is a
+        question that can be answered twice, and this one's continuation is
+        freed by the first answer.
+        """
+        session = self.session
+        session.drop_offer(offer.id)
+        self.refresh_sidebar()
+        self.focus = self._ring()[2]
+        self.send(Answer(offer.id, accepted))
+        self.note = "accepted" if accepted else "declined"
 
     def _resolve(self, approved: bool, reason: str = "") -> None:
         """Answer the open session's decision and let the turn go on.

@@ -105,16 +105,24 @@ def panel_profile(
 
 
 class Confirm(Protocol):
-    """Put a yes/no question to the user and run ``on_yes`` if they accept.
+    """Put a yes/no question about one session and run ``on_yes`` if accepted.
 
     Returns immediately: the poll that raised the question must not wait for a
     human to answer it. ``on_yes`` is the coroutine *function*, not a started
     coroutine, so a hook that decides to drop the question leaves nothing
     un-awaited behind.
+
+    ``session_id`` is which conversation the question is about. A poll knows
+    it and a person does not — by the time a background job fails, whoever
+    started it is as likely as not reading another session — so it is asked
+    for here rather than left to whoever draws the question to guess.
     """
 
     def __call__(
-        self, question: str, on_yes: Callable[[], Awaitable[None]]
+        self,
+        session_id: str,
+        question: str,
+        on_yes: Callable[[], Awaitable[None]],
     ) -> None: ...
 
 
@@ -435,11 +443,13 @@ class Pollers:
         if not explanation.conclusive:
             return fallback  # it said it could not tell; do not dress that up
         if explanation.proposed_signature is not None:
-            self._offer_signature(explanation.proposed_signature)
+            self._offer_signature(change, explanation.proposed_signature)
         head = fallback.split("\n\n", 1)[0]
         return f"{head}\n\n{explanation.render()}\n\nlog:\n{finding.excerpt}"
 
-    def _offer_signature(self, proposed: ProposedSignature) -> None:
+    def _offer_signature(
+        self, change: ProcessChange, proposed: ProposedSignature
+    ) -> None:
         """A tier-3 diagnosis means a signature was missing; offer to keep it.
 
         Offered and not simply written: the library is the user's, one model
@@ -447,6 +457,13 @@ class Pollers:
         widens into every later triage. With nothing wired to ask with, the
         proposal is dropped — the diagnosis still reaches the agent, and only
         the learning is skipped, which is the safe half to lose.
+
+        ``change`` is here for the question rather than for the saving: what
+        goes in the library is global, but *why it is being offered* is one
+        job in one session, and both belong in front of whoever answers. The
+        diagnosis this came out of has already gone to that session's chat
+        (`_submit_event`), so the question and its evidence end up in the same
+        conversation.
         """
         if self._confirm is None:
             return
@@ -492,7 +509,8 @@ class Pollers:
             )
 
         self._confirm(
-            f"Remember this failure as {signature.id!r} "
+            change.session_id,
+            f"{change.name} failed. Remember this as {signature.id!r} "
             f"({signature.title}) so it is recognised next time?",
             save,
         )
