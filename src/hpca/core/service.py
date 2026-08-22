@@ -3137,12 +3137,16 @@ def _make_tool_ctx(
         skills=skills,
         # Bound to this session, because the queue `/conclude` drains is
         # per-session: a fact flagged in one conversation must not be offered
-        # for approval at the end of another.
+        # for approval at the end of another. Its profile goes with it for the
+        # same reason: the addresses are resolved when they are queued, and a
+        # background turn running under a different profile than the working
+        # one would otherwise be told about entries from a file it is not
+        # writing to.
         queue_memory_edits=(
             None
             if memory is None
             else lambda operations: memory.queue_edits(
-                session.session_id, operations
+                session.session_id, operations, profile=session.profile
             )
         ),
     )
