@@ -770,7 +770,8 @@ class UIClient:
         """
         return state.Display(
             chat_stamps=msg.chat_stamps,
-            confirm_rain=msg.confirm_rain,
+            quit_rain=msg.quit_rain,
+            quit_rain_fps=msg.quit_rain_fps,
             decision_pulse_seconds=msg.decision_pulse_seconds,
         )
 

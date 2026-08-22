@@ -281,14 +281,35 @@ class DisplaySettings(_Section):
     # what. Off is for the narrow terminal, and for the reader who wants the
     # conversation and not the clock.
     chat_stamps: bool = True
-    # Whether the screen behind a confirmation rains (`ui.rain`). A yes/no
-    # clears the frame it was asked over, and this fills the black it leaves.
-    # On, because a terminal that goes blank is a terminal that might have
-    # died and an animating one is unmistakably alive — and off, because that
-    # animation is a repaint every 80ms of a screen made mostly of escape
-    # sequences, which is a real cost down a slow link and a fair thing to
-    # decline.
-    confirm_rain: bool = True
+    # Whether the screen behind "Really quit?" rains (`ui.rain`). That one
+    # question clears the frame it was asked over, and this fills the black it
+    # leaves. On, because it costs nothing anybody is waiting on — and off,
+    # because it is a repaint ten times a second of a screen made mostly of
+    # escape sequences, which is a real thing to spend down a slow link and a
+    # fair thing to decline.
+    #
+    # Named for the one dialog it appears on. The other questions here — stop
+    # this turn, delete this session — clear the screen just the same and stay
+    # black, so a key called `confirm_rain` would promise three screens it
+    # does not paint.
+    quit_rain: bool = True
+    # How often that screen is repainted while it falls. Frames a second.
+    #
+    # Sixty by default, because falling is the whole of what it does and ten a
+    # second reads as stepping. It is a setting and not a constant because
+    # what it costs is a property of the *link*, not of the effect: the
+    # painter sends only changed rows, so 60 is about 313 KiB/s against 88 at
+    # 10 — nothing on a local terminal, enough to feel down a slow tunnel to a
+    # login node. `ui.rain.FPS` has the measured table.
+    #
+    # Bounded at both ends. Below 1 there is no frame to book and the field
+    # would hang mid-drop; above 120 the frames are closer together than the
+    # glyphs change, so it is bytes bought for nothing at all.
+    #
+    # The literal rather than `ui.rain.FPS`, the way the pulse period
+    # below carries its own: this module is read by a core that may be
+    # running with no front-end in the process at all.
+    quit_rain_fps: int = Field(default=60, ge=1, le=120)
     # How long one breath of the decision prompt's answer line takes
     # (`ui.ansi.pulse`). Seconds, fractional.
     #

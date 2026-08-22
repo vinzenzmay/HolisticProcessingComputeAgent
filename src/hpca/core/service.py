@@ -3098,7 +3098,8 @@ def _display_settings(settings) -> DisplaySettings:
         return DisplaySettings()
     return DisplaySettings(
         chat_stamps=section.chat_stamps,
-        confirm_rain=section.confirm_rain,
+        quit_rain=section.quit_rain,
+        quit_rain_fps=section.quit_rain_fps,
         decision_pulse_seconds=section.decision_pulse_seconds,
     )
 

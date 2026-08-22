@@ -28,6 +28,7 @@ from hpca.ui.approval import Decision
 from hpca.ui.editor import Editor
 from hpca.ui.meter import render_bar, severity
 from hpca.ui.pane import Fold, Item, Pane
+from hpca.ui.rain import FPS as RAIN_FPS
 
 # The kinds of chat entry that are the user's own words, and so the ones Enter
 # offers the rewind on. `queued` counts: it is a message the user wrote, drawn
@@ -94,8 +95,11 @@ class Display:
 
     # Whether a chat row's label carries the instant it was said.
     chat_stamps: bool = True
-    # Whether the screen a confirmation cleared rains behind it (`ui.rain`).
-    confirm_rain: bool = True
+    # Whether the screen the quit question cleared rains (`ui.rain`), and
+    # how many frames a second it falls at. The module default stands in until
+    # `hello` lands, which is long before there is a quit dialog to draw.
+    quit_rain: bool = True
+    quit_rain_fps: int = RAIN_FPS
     # One breath of the decision prompt's answer line, in seconds. The module
     # default stands in until `hello` lands, which is before there is a
     # decision on screen to pulse (`client._hello` is the first frame).
@@ -660,6 +664,13 @@ class Confirm:
     """
 
     question: str = ""
+    # Whether the screen this one cleared falls (`ui.rain`). Per question and
+    # not per confirmation: leaving is the one of these you are not coming
+    # back from, so it is the one that gets a send-off. Stopping a turn or
+    # deleting a session are things you do in the middle of working, and an
+    # animation over the top of them would be a flourish charged to somebody
+    # who is busy.
+    rain: bool = False
     # What to do with the answer here, when the answer is this side's business.
     # A callable rather than a verdict flag because the eleven call sites do
     # eleven different things, and the alternative is the UI holding a little

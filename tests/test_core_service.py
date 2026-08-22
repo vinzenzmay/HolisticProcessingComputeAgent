@@ -321,8 +321,9 @@ class TestHandshake:
         first = service.subscribe().get_nowait()
         assert set(type(first.display).model_fields) == {
             "chat_stamps",
-            "confirm_rain",
             "decision_pulse_seconds",
+            "quit_rain",
+            "quit_rain_fps",
         }
 
     async def test_the_digest_follows_the_settings(self, home, conn, llm):

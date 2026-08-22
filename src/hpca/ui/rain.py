@@ -34,8 +34,9 @@ GLYPHS = tuple(
 # Rows a second. The spread is the whole illusion — one speed reads as a
 # curtain being lowered rather than as rain — and the range is bounded below
 # by "does it look stopped" and above by how far a drop moves between two
-# repaints: at RAIN_INTERVAL and 30 rows a second a drop jumps three rows at a
-# time, which reads as a dotted line rather than a streak.
+# repaints: at the lowest frame rate the settings allow, 30 rows a second is a
+# drop jumping three rows at a time, which reads as a dotted line rather than
+# as a streak.
 MIN_SPEED, MAX_SPEED = 4.0, 18.0
 
 # How long a drop's tail is, in rows.
@@ -57,15 +58,29 @@ DARK = 2.6
 # it look like the code from the film rather than like snow.
 CHURN = 9.0
 
-# Seconds between repaints while this is on screen. The same order as
-# `ansi.PULSE_INTERVAL`, and for the same reason: the loop repaints when
-# something happens, so anything that moves by the clock alone has to book its
-# own frame (`app.RowUI.next_wake`).
+# Frames a second, and the default for `config.DisplaySettings.quit_rain_fps`.
+# The loop repaints when something happens, so anything that moves by the
+# clock alone has to book its own frame (`app.RowUI.next_wake`) — this is how
+# often that one asks.
 #
-# Ten a second, which is where the two costs cross: slower and the drops step
-# visibly rather than fall, faster and it is a full screen of escape sequences
-# being sent more often than a terminal over ssh is glad to receive one.
-INTERVAL = 0.1
+# Sixty, because falling is the one thing this draws and ten a second reads as
+# stepping. What that costs is worth writing down, since it is not the linear
+# thing it looks like: `screen.paint` sends only the rows that *changed*, and
+# what changes per second is set by how fast the drops fall and how fast the
+# glyphs churn, not by how often the field is sampled. Measured over a 120x40
+# screen, one second of it:
+#
+#     fps      wire     rows/s     cpu
+#      10   88 KiB/s      399    3.9 ms/s
+#      30  223 KiB/s      990    9.4 ms/s
+#      60  313 KiB/s     1379   18.9 ms/s
+#     120  379 KiB/s     1662   37.7 ms/s
+#
+# So six times the frame rate is three and a half times the bytes, and the cpu
+# never matters. Locally 313 KiB/s is nothing; down a tunnel to a login node
+# it is enough to be felt, which is what the setting is for — and why the
+# lower end of it is genuinely usable rather than a token.
+FPS = 60
 
 # The head is the bright one, then a few full-strength rows, then the tail
 # fades. Three tiers rather than a gradient because a 256-colour ramp of green

@@ -42,7 +42,6 @@ from hpca.ui.overlays import (
     choice,
 )
 from hpca.ui.pane import Item, Pane
-from hpca.ui.rain import INTERVAL as RAIN_INTERVAL
 from hpca.ui.rain import rain
 from hpca.ui.state import (
     MODE_COLOURS,
@@ -1417,13 +1416,14 @@ class RowUI:
         # is decoration on a screen that has nothing left on it to divide.
         rows = [rows[i] for i in sorted([1, 2, 0][: len(out)])]
         at = max(0, (len(out) - len(rows)) // 2)
-        # What the cleared screen is made of. Rain rather than blanks by
-        # default (`ui.rain` says why), and the question is spliced over it
-        # whole — its rows are padded to the width, so nothing of the field
-        # shows through the three lines that matter.
+        # What the cleared screen is made of. Black, unless this is the
+        # question you do not come back from (`ui.rain` says why that one is
+        # different). The question is spliced over it whole either way — its
+        # rows are padded to the width, so nothing of the field shows through
+        # the three lines that matter.
         under = (
             rain(width, len(out), self.clock())
-            if self.display.confirm_rain
+            if self._raining()
             else [" " * width] * len(out)
         )
         under[at : at + len(rows)] = rows
@@ -1767,6 +1767,8 @@ class RowUI:
         self,
         question: str,
         on_answer: Callable[[bool], None] | None = None,
+        *,
+        rain: bool = False,
     ) -> None:
         """Put a yes/no over everything. The answer runs ``on_answer``.
 
@@ -1776,7 +1778,30 @@ class RowUI:
         user was in the middle of. What the *core* asks does not come through
         here; it waits in the session it is about (`confirm_requested`).
         """
-        self.confirm = Confirm(question=question, on_answer=on_answer)
+        self.confirm = Confirm(question=question, on_answer=on_answer, rain=rain)
+
+    def _raining(self) -> bool:
+        """Whether the cleared screen behind the open question is falling.
+
+        Asked in the two places that must agree — what is drawn, and whether a
+        frame is booked to draw it again — because a field painted once and
+        never repainted hangs mid-drop, and a repaint booked for a screen that
+        is black is a wakeup with nothing to do.
+        """
+        return (
+            self.confirm is not None
+            and self.confirm.rain
+            and self.display.quit_rain
+        )
+
+    def _rain_interval(self) -> float:
+        """Seconds between two frames of the field, from the settings.
+
+        Clamped here rather than trusted: the value crossed a wire, this is a
+        repaint loop, and a zero would divide by zero somewhere with the
+        terminal in raw mode. The bounds are the ones `config` documents.
+        """
+        return 1.0 / min(120, max(1, self.display.quit_rain_fps))
 
     def _handle_confirm(self, key: str) -> bool:
         """y, n, escape. Anything else is ignored rather than passed on: a
@@ -2168,9 +2193,7 @@ class RowUI:
             # And the fifth: the field behind an open confirmation falls by
             # the clock and by nothing else, so without a frame booked here it
             # would be painted once and hang there mid-drop.
-            RAIN_INTERVAL
-            if self.confirm is not None and self.display.confirm_rain
-            else None,
+            self._rain_interval() if self._raining() else None,
         ]
         if self._esc_armed_at is not None:
             left = ESC_STOP_WINDOW - (self.clock() - self._esc_armed_at)
@@ -2484,7 +2507,7 @@ class RowUI:
             # nothing to do, and in the chat it is a letter somebody is about
             # to type into the box they just left.
             if self.focus == SESSIONS:
-                self.ask(QUIT_QUESTION, self._quit_answer)
+                self.ask(QUIT_QUESTION, self._quit_answer, rain=True)
             return True
         inner = max(8, width - 2)
         slots = self._ring()
