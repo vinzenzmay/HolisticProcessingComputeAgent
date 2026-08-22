@@ -223,12 +223,82 @@ class TestReorderingWatchers:
         assert len(drawn) == 40
         assert widths(drawn) == {120}
 
-    def test_sessions_do_not_reorder(self):
+class TestReorderingSessions:
+    """The sidebar's own `alt+↑/↓`, alongside the watchers' (§ above): asked
+    for so the two reorderable rows answer to the same keys. Cursor row 0 is
+    always "(new session)"; row 1 is the first real one, `self.sessions[0]`.
+    """
+
+    def test_the_entry_moved_down(self):
+        ui = build()
+        ui.focus = SESSIONS
+        names = [x.head for x in ui.session_pane.items]
+        ui.session_pane.cursor = 1
+        ui.handle("alt-down", 120, 40)
+        assert [x.head for x in ui.session_pane.items][1:3] == [names[2], names[1]]
+
+    def test_the_cursor_followed_it(self):
+        ui = build()
+        ui.focus = SESSIONS
+        ui.session_pane.cursor = 1
+        ui.handle("alt-down", 120, 40)
+        assert ui.session_pane.current(INNER) == 2
+
+    def test_and_it_says_so(self):
+        ui = build()
+        ui.focus = SESSIONS
+        ui.session_pane.cursor = 1
+        ui.handle("alt-down", 120, 40)
+        assert ui.note == "moved"
+
+    def test_alt_up_puts_it_back(self):
+        ui = build()
+        ui.focus = SESSIONS
+        names = [x.head for x in ui.session_pane.items]
+        ui.session_pane.cursor = 1
+        ui.handle("alt-down", 120, 40)
+        ui.handle("alt-up", 120, 40)
+        assert [x.head for x in ui.session_pane.items] == names
+
+    def test_cursor_followed_back(self):
+        ui = build()
+        ui.focus = SESSIONS
+        ui.session_pane.cursor = 1
+        ui.handle("alt-down", 120, 40)
+        ui.handle("alt-up", 120, 40)
+        assert ui.session_pane.current(INNER) == 1
+
+    def test_alt_up_at_the_top_is_a_no_op(self):
+        ui = build()
+        ui.focus = SESSIONS
+        names = [x.head for x in ui.session_pane.items]
+        ui.session_pane.cursor = 1
+        ui.handle("alt-up", 120, 40)
+        assert [x.head for x in ui.session_pane.items] == names
+        assert ui.note == ""
+
+    def test_the_new_session_row_never_moves(self):
         ui = build()
         ui.focus = SESSIONS
         first = ui.session_pane.items[0].head
+        ui.session_pane.cursor = 0
         ui.handle("alt-down", 120, 40)
         assert ui.session_pane.items[0].head == first
+        assert ui.note == ""
+
+    def test_the_active_marker_follows_the_active_session(self):
+        # `active` is a position in `self.sessions`; the swap moves the
+        # session out from under it and `_reorder_session` has to carry it
+        # along, or the ● lands on whatever session happens to sit at the
+        # old index instead of the one actually open.
+        ui = build()
+        ui.focus = SESSIONS
+        assert ui.active == 0
+        ui.session_pane.cursor = 1
+        ui.handle("alt-down", 120, 40)
+        assert ui.active == 1
+        assert ui.session_pane.items[1].head.startswith("○")
+        assert ui.session_pane.items[2].head.startswith("●")
 
 
 class TestFlattening:

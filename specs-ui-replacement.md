@@ -420,6 +420,7 @@ what §4 requires, and resolves one collision.
 | global | `?` | help |
 | sessions | `enter` | open (and focus the message box), or start a new session |
 | sessions | `r` `t` `d` | rename, retitle, delete |
+| sessions | `alt+↑` `alt+↓` | reorder |
 | chat | `→` `←` | expand / collapse an entry |
 | chat | `enter` | rewind on your own message; interrupt on the working row |
 | chat | `y` | copy the row under the cursor to the clipboard |

@@ -45,6 +45,7 @@ class HelpOverlay(Overlay):
                 ("r", "rename"),
                 ("t", "ask the llm for a title"),
                 ("d", "delete (asks first; the log on disk is kept)"),
+                ("alt-↑ alt-↓", "reorder"),
             ],
         ),
         (

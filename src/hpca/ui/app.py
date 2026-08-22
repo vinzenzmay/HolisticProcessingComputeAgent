@@ -644,6 +644,45 @@ class RowUI:
             ]
         )
 
+    def _reorder_session(self, delta: int, view_h: int, width: int) -> bool:
+        """Swap the session under the cursor with its neighbour.
+
+        `alt+↑/↓`, the same gesture the watchers row already answers to
+        (`Pane.reorder`) — asked for so the two reorderable rows behave alike.
+        The truth here is `self.sessions`, not `session_pane.items`: unlike
+        the watchers pane, which owns its rows outright, `refresh_sidebar`
+        rebuilds the sidebar from `self.sessions` on almost every keystroke,
+        so a swap made only on the pane would be undone by the next one. The
+        swap is scoped to that list instead, and `refresh_sidebar` is what
+        turns it into a repaint. `Pane.replace` already keeps the cursor on
+        the session it was on, by id, so the row travels with the entry the
+        way `reorder`'s docstring promises; `move(0, ...)` after it only
+        exists to pull the offset along when the swap carried the row past
+        the edge of what is on screen.
+
+        The one row this never touches is "+ new session": it sits above
+        every real session and is not a member of `self.sessions`, so index 0
+        in the pane is index -1 here and refuses to move, same as the top of
+        the list refusing to move further up.
+        """
+        index = self.session_pane.current(width) - 1
+        target = index + delta
+        if index < 0 or not 0 <= target < len(self.sessions):
+            return False
+        was = self.active_id
+        self.sessions[index], self.sessions[target] = (
+            self.sessions[target],
+            self.sessions[index],
+        )
+        # `active` is a position in `self.sessions`, not an id — the swap just
+        # moved out from under it, and it is what `refresh_sidebar` reads to
+        # draw ● and the open row's green, so it has to be recomputed before
+        # that read rather than after.
+        self._select(was)
+        self.refresh_sidebar()
+        self.session_pane.move(0, view_h, width)
+        return True
+
     def _tag(self, session: SessionState) -> str:
         """The profile a row is tagged with, and nothing for the default one.
 
@@ -2135,6 +2174,9 @@ class RowUI:
             pane.collapse_all(inner)
         elif key in ("alt-up", "alt-down") and self.focus == WATCHERS:
             moved = pane.reorder(-1 if key == "alt-up" else 1, view, inner)
+            self.note = "moved" if moved else ""
+        elif key in ("alt-up", "alt-down") and self.focus == SESSIONS:
+            moved = self._reorder_session(-1 if key == "alt-up" else 1, view, inner)
             self.note = "moved" if moved else ""
         elif key == "enter":
             if self.focus == SESSIONS:
