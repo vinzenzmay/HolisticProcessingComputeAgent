@@ -28,6 +28,7 @@ it. So this is a correctness property of the repaint, not a cosmetic one.
 
 from __future__ import annotations
 
+import math
 import unicodedata
 from functools import lru_cache
 
@@ -44,12 +45,84 @@ BLUE = f"{ESC}[38;5;68m"
 # The two the conversation itself is drawn in, and the only colours chosen for
 # a *reading* job rather than a signalling one: everything above marks
 # something (a state, a rule, a warning), while these two carry paragraphs of
-# text that somebody is going to sit and read. So they are bright — near-white
-# for the user's own words, and a clear amber for the agent's — where the
+# text that somebody is going to sit and read. So they are bright — where the
 # muted 179 the agent used to be drawn in read as grey against a dark
 # terminal, which is the one thing a wall of prose must not do.
+#
+# Which way round they go is a separate decision from how bright they are, and
+# it went the other way in the end: the amber marks the user's own words and
+# the near-white carries the agent's. The agent writes most of what is on the
+# screen, so the calmer colour is the one that has to hold a page of prose,
+# and the handful of lines the user typed are what a scrollback is searched
+# for — a conversation is scanned for one's own questions, not for the
+# answers, and the colour is what finds them.
 WHITE = f"{ESC}[38;5;255m"
 AMBER = f"{ESC}[38;5;215m"
+
+# ------------------------------------------------------------- the pulse
+
+# The one colour on the screen that is a function of the clock rather than of
+# what is on the row. The decision prompt's answer line breathes between WHITE
+# and CYAN, because a parked turn is a turn nobody is driving: the "!" in the
+# sidebar says a *background* session is waiting, and this says the session in
+# front of you is — a thing a static dim line failed to say, since it looks
+# exactly like the key hints under every other row.
+#
+# The ramp is walked rather than the two ends being swapped, because a hard
+# switch between two colours is a blink, and a blinking line is read as broken
+# rather than as waiting. Seven steps is what the 256-colour palette actually
+# has between these two: the cube is 6x6x6, white-to-teal moves along one axis
+# of it, and asking for more steps than that only repeats colours. They are
+# interpolated in *level* space (the cube's 0-5 per channel) rather than in
+# RGB — the levels are unevenly spaced (0, 95, 135, 175, 215, 255), so
+# quantising an even RGB walk rounds the three channels at different points
+# and puts a grey step in the middle of a walk that should never leave the
+# cyans.
+PULSE_ENDS = ((5, 5, 5), (0, 4, 4))  # near-white, and the levels CYAN is
+PULSE_STEPS = 6
+
+# How long one breath takes, and how often the frame it is on has to be drawn
+# again. 2.4s is slow enough to read as breathing rather than as flicker, and
+# the interval is the spinner's 0.1 for the spinner's reason (`ui/state.py`):
+# it is the idle cost of having a decision on screen, and this is the cheapest
+# rate that still moves. The sine is fastest through the middle of its sweep,
+# where ten frames a second skips a step of the seven — which is the part of a
+# gradient nobody can follow anyway; the ends, where it lingers, get every one.
+PULSE_PERIOD = 2.4
+PULSE_INTERVAL = 0.1
+
+
+def _pulse_ramp() -> tuple[str, ...]:
+    """The colours the answer line takes, palest first.
+
+    Built once at import: it is seven strings and it never depends on anything
+    the UI knows, so computing it per frame would be arithmetic in the
+    repaint's way for no answer that could ever differ.
+    """
+    start, end = PULSE_ENDS
+    ramp = [WHITE]
+    for step in range(PULSE_STEPS):
+        share = step / (PULSE_STEPS - 1)
+        r, g, b = (round(a + (z - a) * share) for a, z in zip(start, end))
+        ramp.append(f"{ESC}[38;5;{16 + 36 * r + 6 * g + b}m")
+    return tuple(ramp)
+
+
+PULSE_RAMP = _pulse_ramp()
+
+
+def pulse(now: float) -> str:
+    """The answer line's colour at this instant, and at no other.
+
+    A pure function of the clock, exactly as the spinner's glyph is
+    (`Turn.frame`), and for the same two reasons: a UI that repaints only when
+    something changed can work out when this one next will (`PULSE_INTERVAL`),
+    and a test can pin the clock and get the colour back rather than watching
+    for a change it has no way to time.
+    """
+    phase = (math.sin(now * math.tau / PULSE_PERIOD) + 1) / 2
+    return PULSE_RAMP[min(len(PULSE_RAMP) - 1, int(phase * len(PULSE_RAMP)))]
+
 
 # Joiners ask for the glyph after them, so a slice must never end on one.
 JOINERS = "‍‌"

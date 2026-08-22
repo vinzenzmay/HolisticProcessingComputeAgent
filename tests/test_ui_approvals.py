@@ -27,8 +27,10 @@ from hpca.config import Settings
 from hpca.db import connect, init_db
 from hpca.runner import ProcessRunner
 from hpca.trash import TrashManager
+from hpca.ui.ansi import CYAN, PULSE_INTERVAL, PULSE_PERIOD, PULSE_RAMP, WHITE
 from hpca.ui.app import CHAT, DECISION, INPUT, SESSIONS, WATCHERS, RowUI
 from hpca.ui.approval import approval_details
+from hpca.ui.keys import PASTE
 from hpca.ui.state import Confirm
 from tests.ui_harness import connected, plain, widths
 
@@ -246,6 +248,193 @@ class TestAnsweringIt:
         assert wire.ui.focus == INPUT
 
 
+
+class TestThePromptStandsInForTheMessageBox:
+    """§4.3 item 21 in the layout: the prompt is inline at the foot of the
+    chat column, and what it is inline *in place of* is the message box.
+
+    Both on screen at once was the arrangement before, and it cost twice: the
+    ring pointed one cursor at a slot that held two things, and the box offered
+    to take a message in a session whose turn cannot move until the question
+    above it is answered.
+    """
+
+    async def test_the_message_box_is_not_drawn_while_one_is_pending(self, wire):
+        await parked(wire, BASH_GATE)
+        assert "── decision ─" in wire.screen()
+        assert "── message ─" not in wire.screen()
+
+    async def test_and_it_is_back_the_moment_it_is_answered(self, wire):
+        await parked(wire, BASH_GATE)
+        await wire.press("y")
+        assert "── message ─" in wire.screen()
+
+    async def test_the_prompt_takes_the_box_s_slot_and_not_a_row_of_its_own(
+        self, wire
+    ):
+        before = wire.ui._heights(40, 100)
+        await parked(wire, BASH_GATE)
+        after = wire.ui._heights(40, 100)
+        assert sum(after) == sum(before), "the screen is still the screen"
+        assert after[2] == wire.ui._decision_h(100, 40) + wire.ui._status_h()
+        assert after[2] > before[2], "and the prompt has the room the box had"
+
+    async def test_the_half_typed_message_waits_behind_it(self, wire):
+        # The draft lives on the `SessionState` and never depended on being
+        # drawn (§4.4) — which is what makes hiding the box safe.
+        wire.ui.focus = INPUT
+        await wire.press(*"the shards are still open")
+        await parked(wire, BASH_GATE)
+        assert "the shards are still open" not in wire.screen()
+        await wire.press("y")
+        assert "the shards are still open" in wire.screen()
+        assert wire.ui.focus == INPUT
+
+    async def test_the_command_menu_goes_with_the_box_it_belongs_to(self, wire):
+        # It is the box's own autocomplete: a list of commands offered next to
+        # a field that is not on screen is a list nothing can run.
+        wire.ui.focus = INPUT
+        await wire.press("/")
+        assert "── commands" in wire.screen()
+        await parked(wire, BASH_GATE)
+        assert "── commands" not in wire.screen()
+        assert wire.ui.input.text() == "/", "and the draft that named them is intact"
+
+    @pytest.mark.parametrize("width,height", [(80, 24), (120, 40), (60, 14), (100, 8)])
+    async def test_the_slot_is_filled_to_exactly_the_rows_it_was_given(
+        self, wire, width, height
+    ):
+        # The frame pads and truncates at the end, so a band that rendered
+        # short or long would show up as another row moving rather than as an
+        # exception — hence the count, and not just the frame's height.
+        await parked(wire, LONG_SCRIPT)
+        heights = wire.ui._heights(height, width)
+        assert len(wire.ui.render(width, height)) == height
+        assert (
+            len(wire.ui._render_decision(width, height))
+            + len(wire.ui._render_status(width))
+            == heights[2]
+        )
+
+
+class TestTheDecisionCannotBeLeftUnanswerable:
+    """The lockout, which was real: DECISION was not in the ctrl+↑/ctrl+↓ ring
+    while its own keys still moved the cursor out of it, so one ctrl+↑ off an
+    unanswered prompt left a turn parked on a question no key sequence could
+    reach again. Re-opening the session was the only way back, and nothing on
+    screen said so.
+
+    The prompt is in the ring now, in the slot the box would have had, so
+    every step of it comes back to the question.
+    """
+
+    async def test_the_ring_holds_the_prompt_while_one_is_pending(self, wire):
+        assert wire.ui._ring() == [SESSIONS, CHAT, INPUT, WATCHERS]
+        await parked(wire, BASH_GATE)
+        assert wire.ui._ring() == [SESSIONS, CHAT, DECISION, WATCHERS]
+
+    @pytest.mark.parametrize("key", ["ctrl-up", "ctrl-down", "tab"])
+    async def test_the_decision_cannot_be_left_unanswerable(self, wire, key):
+        await parked(wire, BASH_GATE)
+        seen = []
+        for _ in range(4):  # one whole turn of the ring
+            await wire.press(key)
+            seen.append(wire.ui.focus)
+        assert set(seen) == {SESSIONS, CHAT, DECISION, WATCHERS}, "every row"
+        assert wire.ui.focus == DECISION, "and back to the one that is waiting"
+        assert "Run this — run_bash?" in wire.screen()
+        await wire.press("y")
+        assert wire.peer.last(protocol.DecisionResolve).approved is True
+
+    @pytest.mark.parametrize("key", ["ctrl-up", "ctrl-down", "tab"])
+    async def test_and_not_from_the_reason_box_either(self, wire, key):
+        # The second stage is a text field, and walking off it must not lose
+        # the half-written refusal or the way back to it.
+        await parked(wire, BASH_GATE)
+        await wire.press("n", *"keep the shards")
+        for _ in range(4):
+            await wire.press(key)
+        assert wire.ui.focus == DECISION
+        assert "keep the shards" in wire.screen()
+        await wire.press("enter")
+        assert wire.peer.last(protocol.DecisionResolve).reason == "keep the shards"
+
+    async def test_walking_the_ring_never_asks_a_row_for_a_pane_it_has_none_of(
+        self, wire
+    ):
+        # `_handle_row` looks its pane up in a dict with three entries, so a
+        # ring that could route a key there with the prompt or the box under
+        # the cursor would raise rather than misdraw.
+        await parked(wire, BASH_GATE)
+        for _ in range(9):
+            await wire.press("ctrl-down")
+            await wire.press("down")
+
+    async def test_the_cursor_is_never_left_in_a_box_that_is_not_drawn(self, wire):
+        # As any unguarded path that aims at the message box would leave it —
+        # a paste, a message handed back, `i` in the chat.
+        await parked(wire, BASH_GATE)
+        wire.ui.focus = INPUT
+        assert "── message ─" not in wire.screen()
+        assert wire.ui.focus == DECISION
+        await wire.press("y")
+        assert wire.peer.last(protocol.DecisionResolve).approved is True
+
+    async def test_i_in_the_chat_lands_on_the_question_and_not_on_the_box(
+        self, wire
+    ):
+        await parked(wire, BASH_GATE)
+        await wire.press("ctrl-up")  # to the chat
+        await wire.press("i")
+        assert wire.ui.focus == DECISION
+        await wire.press("y")
+        assert wire.peer.last(protocol.DecisionResolve).approved is True
+
+    async def test_a_decision_arriving_takes_the_cursor_out_of_the_box(self, wire):
+        # It has to: the box is what the prompt is standing in front of.
+        wire.ui.focus = INPUT
+        await parked(wire, BASH_GATE)
+        assert wire.ui.focus == DECISION
+
+    async def test_and_the_prompt_being_cleared_hands_it_back(self, wire):
+        await parked(wire, BASH_GATE)
+        await wire.tell(protocol.DecisionCleared(session_id="s1"))
+        assert wire.ui.focus == INPUT
+        assert wire.ui._ring() == [SESSIONS, CHAT, INPUT, WATCHERS]
+
+    async def test_but_not_from_a_row_the_user_walked_off_to(self, wire):
+        await parked(wire, BASH_GATE)
+        await wire.press("ctrl-up")  # the chat, deliberately
+        await wire.tell(protocol.DecisionCleared(session_id="s1"))
+        assert wire.ui.focus == CHAT
+
+    async def test_a_pasted_block_is_not_dropped_and_does_not_move_the_cursor(
+        self, wire
+    ):
+        # A paste is an unambiguous "I am entering text" and is never dropped,
+        # but the box it is aimed at is not on screen: it waits in the draft
+        # with whatever was already there.
+        wire.ui.focus = INPUT
+        await wire.press(*"before ")
+        await parked(wire, BASH_GATE)
+        await wire.press(PASTE + "pasted while parked")
+        assert wire.ui.focus == DECISION
+        assert "pasted while parked" not in wire.screen()
+        await wire.press("y")
+        assert "before pasted while parked" in wire.screen()
+
+    async def test_and_at_the_reason_stage_it_lands_in_the_box_that_is_open(
+        self, wire
+    ):
+        await parked(wire, BASH_GATE)
+        await wire.press("n")
+        await wire.press(PASTE + "two shards were still open")
+        assert "two shards were still open" in wire.screen()
+        await wire.press("enter")
+        answer = wire.peer.last(protocol.DecisionResolve)
+        assert answer.reason == "two shards were still open"
+
+
 class TestADecisionInAnotherSession:
     async def test_it_flags_the_sidebar_row(self, wire):
         await parked(wire, BASH_GATE, session_id="s2")
@@ -453,6 +642,90 @@ class TestTheHalfWrittenReasonIsADraft:
         await self.at_the_box(wire)
         await parked(wire, BASH_GATE, session_id="s1")
         assert "the shards are still open" in wire.screen()
+
+
+
+class TestTheAnswerLinePulses:
+    """The one line on the screen that is drawn in a different colour every
+    tenth of a second, and the reason it is: a turn parked on a question is a
+    turn nobody is driving, and a dim key hint under a block of script looks
+    exactly like the dim key hint under every other row.
+
+    The clock is pinned in every test here, because that is the whole design:
+    the colour is a pure function of `RowUI.clock()` (`ansi.pulse`), so a
+    frame at a given instant is one answer and not a race.
+    """
+
+    @staticmethod
+    def hint(wire, when: float) -> str:
+        """The styled answer line at that instant — styled, because the style
+        is what is under test."""
+        wire.ui.clock = lambda: when
+        rows = [x for x in wire.ui.render(120, 40) if "(y) run script" in x]
+        assert len(rows) == 1, "the answer line is drawn once"
+        return rows[0]
+
+    async def test_the_colour_moves_with_the_clock(self, wire):
+        await parked(wire, BASH_GATE)
+        assert self.hint(wire, 0.0) != self.hint(wire, PULSE_PERIOD / 4)
+
+    async def test_and_the_words_do_not(self, wire):
+        await parked(wire, BASH_GATE)
+        moment = (self.hint(wire, x) for x in (0.0, PULSE_PERIOD / 4))
+        assert len({plain(x) for x in moment}) == 1
+
+    async def test_it_never_leaves_the_two_colours_it_was_given(self, wire):
+        await parked(wire, BASH_GATE)
+        # A whole cycle at the frame rate the repaint is booked at, which is
+        # every colour the line can ever be drawn in.
+        steps = int(PULSE_PERIOD / PULSE_INTERVAL) + 1
+        drawn = {self.hint(wire, x * PULSE_INTERVAL) for x in range(steps)}
+        assert {x.split("m", 1)[0] + "m" for x in drawn} <= set(PULSE_RAMP)
+        assert len(drawn) > 2, "a ramp, and not a two-colour blink"
+
+    async def test_and_reaches_both_ends_of_the_sweep(self, wire):
+        await parked(wire, BASH_GATE)
+        assert self.hint(wire, PULSE_PERIOD / 4).startswith(CYAN)
+        assert self.hint(wire, PULSE_PERIOD * 3 / 4).startswith(WHITE)
+
+    async def test_the_frame_books_the_repaint_that_animates_it(self, wire):
+        # Without this the colour would be whichever one the keypress that
+        # drew the frame landed on, and it would sit there: nothing else wakes
+        # an idle UI (`RowUI.next_wake`).
+        assert wire.ui.next_wake() is None
+        await parked(wire, BASH_GATE)
+        assert 0 < wire.ui.next_wake() <= PULSE_INTERVAL
+
+    async def test_and_stops_booking_them_when_it_is_answered(self, wire):
+        await parked(wire, BASH_GATE)
+        await wire.press("y")
+        assert wire.ui.next_wake() is None
+
+    async def test_a_prompt_in_another_session_asks_for_no_frames(self, wire):
+        # It is not drawn here — it is a "!" in the sidebar — so nothing about
+        # this screen changes with the clock (`_render_decision`).
+        await parked(wire, BASH_GATE, session_id="s2")
+        assert wire.ui.next_wake() is None
+
+    async def test_the_reason_box_does_not_pulse_behind_its_own_cursor(self, wire):
+        await parked(wire, BASH_GATE)
+        await wire.press("n")
+        wire.ui.clock = lambda: 0.0
+        first = [x for x in wire.ui.render(120, 40) if "(enter) send" in x]
+        wire.ui.clock = lambda: PULSE_PERIOD / 4
+        assert [x for x in wire.ui.render(120, 40) if "(enter) send" in x] == first
+
+    async def test_how_tall_the_prompt_is_does_not_depend_on_what_time_it_is(
+        self, wire
+    ):
+        # `decision_height` is asked before the frame is laid out, and a
+        # layout that moved with the clock would relay the whole screen out
+        # ten times a second.
+        await parked(wire, LONG_SCRIPT)
+        wire.ui.clock = lambda: 0.0
+        first = wire.ui._heights(40, 120)
+        wire.ui.clock = lambda: PULSE_PERIOD / 4
+        assert wire.ui._heights(40, 120) == first
 
 
 # --------------------------------------------------- the generic yes/no

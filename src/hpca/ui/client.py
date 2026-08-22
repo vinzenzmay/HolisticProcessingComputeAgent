@@ -1020,13 +1020,38 @@ class UIClient:
         self.ui.toast(msg.text, msg.severity, msg.timeout, title=msg.title)
 
     def _peeked(self, msg: protocol.WatchPeeked) -> None:
-        """The answer to a keypress, drawn where a toast is drawn.
+        """The answer to a keypress, in a window rather than over the frame.
 
         Not in §3.2's table because that table is about state; this one is a
         reply, and the alternative to showing it is a key that does nothing.
+
+        A toast was the first answer and it was wrong twice over. It expires,
+        so a tail worth reading is gone before it has been read and cannot be
+        selected out of the terminal on the way past; and the single line it
+        can carry meant the text was flattened with `" ".join(split())`, which
+        throws away the line breaks that are most of what a log means — a
+        traceback run into one paragraph is not a traceback. `RowUI.window` is
+        the read-only screen `/skills-list` and the tunnel recipe already land
+        in: it folds to the width, it scrolls, it waits for escape rather than
+        for a timer, and it leaves the mouse released so the terminal's own
+        selection can copy the failing line out of it (§4.1 item 6).
+
+        Through `window` and not `RowUI.inspect` because this is a *reply*: a
+        job peek costs an squeue call and a stat that may cross NFS, and in
+        those seconds the user is free to have opened the config editor and
+        typed half a settings file into it. `inspect` assigns `overlay`, which
+        starts a fresh stack and would drop that on the floor; `window` parks
+        until it can land without taking a screen away.
+
+        An empty answer stays a toast. `watches.peek` already answers "(empty)"
+        in words for a log with nothing in it, so a blank body here is the odd
+        case — a job that has not written yet — and a full screen with nothing
+        on it costs an escape to say what the footer says for free.
         """
-        head = f"{msg.title}: " if msg.title else ""
-        self.ui.toast(head + " ".join(msg.text.split()))
+        if not msg.text.strip():
+            self.ui.toast("nothing there yet", title=msg.title)
+            return
+        self.ui.window(msg.title or "peek", msg.text)
 
     _HANDLERS: dict[str, Callable[[UIClient, protocol.Message], None]] = {}
 

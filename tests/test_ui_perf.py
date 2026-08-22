@@ -219,10 +219,13 @@ class TestARowArriving:
         # The measurement above is worthless if `extend` quietly dropped what
         # it was given, so the same path is checked for the row itself.
         ui = build(chat=100)
-        before = len(ui.chat.flat(WIDTH - 2))
         ui.session.append(ChatEntry(kind="assistant", text="one\ntwo", seq=10**6))
-        # Closed, so: the label and the one line of preview under it.
-        assert len(ui.chat.flat(WIDTH - 2)) == before + 2
+        # Open, because it is the newest row: its label and both of its lines,
+        # at the bottom of the list and in that order.
+        last = len(ui.chat.items) - 1
+        lines = [text.strip() for owner, text, _ in ui.chat.flat(WIDTH - 2)
+                 if owner == last]
+        assert lines == ["▾ hpca", "one", "two"]
 
 
 # ------------------------------------------------- cost tracks area, not n

@@ -433,6 +433,7 @@ what §4 requires, and resolves one collision.
 | message box | `ctrl+←/→`, `ctrl+bksp/del`, `shift+`motion | word motion, word delete, selection |
 | message box | `ctrl+↑` | leave the box |
 | decision | `y` `n` `esc` | approve, refuse with a reason, refuse without |
+| decision | `ctrl+↑` `ctrl+↓` | leave — the prompt stands in the message box's slot in the ring while it is pending, and the box is not drawn |
 
 `y` on the chat row is new and collides with nothing: the decision prompt owns
 `y` only while a decision is pending, and it takes the key first.

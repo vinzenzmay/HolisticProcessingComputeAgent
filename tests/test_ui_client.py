@@ -27,6 +27,7 @@ from hpca.transport import InProcessConnection
 from hpca.ui.app import CHAT, INPUT, SESSIONS, WATCHERS, RowUI
 from hpca.ui import state
 from hpca.ui.client import UIClient
+from hpca.ui.overlays import HelpOverlay, InspectOverlay
 from tests.ui_harness import Peer, Wire, clocked, on_entry, plain, settle, widths
 
 ROWS = [
@@ -867,12 +868,60 @@ class TestNotify:
         await wire.tell(protocol.Notify(text="verbose " * 60))
         assert widths(wire.ui.render(80, 24)) == {80}
 
-    async def test_a_peek_answers_where_a_toast_would(self, wire):
+    async def test_a_peek_answers_in_a_window_and_not_on_a_timer(self, wire):
+        # It used to answer where a toast answers, which expired before a log
+        # could be read and could not be selected out of on the way past.
         await started(wire)
         await wire.tell(
             protocol.WatchPeeked(watch_id=7, title="job 4821000", text="shard 4 of 8")
         )
-        assert "shard 4 of 8" in plain(wire.frame()[-1])
+        assert isinstance(wire.ui.overlay, InspectOverlay)
+        assert "shard 4 of 8" in wire.screen()
+
+    async def test_a_peeked_log_keeps_its_lines(self, wire):
+        # The regression: the tail was flattened with `" ".join(split())`, and
+        # a traceback run into one paragraph is not a traceback.
+        await started(wire)
+        await wire.tell(
+            protocol.WatchPeeked(
+                watch_id=7,
+                title="job 4821000",
+                text="[12:41:07] merging shard 3\n[12:41:44] merging shard 4",
+            )
+        )
+        body = [x.strip() for x in wire.frame()]
+        assert "[12:41:07] merging shard 3" in body
+        assert "[12:41:44] merging shard 4" in body
+
+    async def test_the_window_is_titled_after_the_watch(self, wire):
+        await started(wire)
+        await wire.tell(
+            protocol.WatchPeeked(watch_id=7, title="job 4821000", text="running")
+        )
+        assert wire.ui.overlay.title == "job 4821000"
+
+    async def test_an_empty_peek_stays_a_toast(self, wire):
+        # A job that has not written yet. A blank full screen costs an escape
+        # to say what the footer says for free.
+        await started(wire)
+        await wire.tell(
+            protocol.WatchPeeked(watch_id=7, title="job 4821000", text="   \n")
+        )
+        assert wire.ui.overlay is None
+        assert "nothing there yet" in plain(wire.frame()[-1])
+
+    async def test_a_peek_does_not_take_away_a_screen_the_user_opened(self, wire):
+        # The reply arrives after a round trip, and a peek is pressed from the
+        # rows: `RowUI.window` parks rather than clearing the stack.
+        await started(wire)
+        wire.ui.focus = SESSIONS
+        await wire.press("?")
+        await wire.tell(
+            protocol.WatchPeeked(watch_id=7, title="job 4821000", text="running")
+        )
+        assert isinstance(wire.ui.overlay, HelpOverlay)
+        await wire.press("esc")
+        assert isinstance(wire.ui.overlay, InspectOverlay)
 
 
 class TestWithNothingOpenYet:

@@ -34,7 +34,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from hpca.transcript import call_arguments
-from hpca.ui.ansi import BOLD, DIM, RED, RESET, YELLOW, fold, pad, rule
+from hpca.ui.ansi import BOLD, DIM, RED, RESET, YELLOW, fold, pad, pulse, rule
 from hpca.ui.editor import Editor
 
 # The two halves of the prompt. "ask" is the y/n question; "reason" keeps the
@@ -191,7 +191,9 @@ def _wrapped(text: str, width: int, cap: int) -> list[str]:
     return lines[: max(1, cap - 1)] + [_more(len(lines) - max(1, cap - 1))]
 
 
-def prompt_rows(decision: Decision, width: int) -> list[tuple[str, str]]:
+def prompt_rows(
+    decision: Decision, width: int, now: float | None = None
+) -> list[tuple[str, str]]:
     """The prompt above the box, as ``(style, text)`` rows.
 
     Styled rather than plain because the border carries a fact: an execution
@@ -199,6 +201,12 @@ def prompt_rows(decision: Decision, width: int) -> list[tuple[str, str]]:
     be lost, and those are not the same warning. The Textual bar said it with
     `border: heavy $error` / `$warning`; this says it with the rule and the
     heading, which is the same two colours in the space a row UI has.
+
+    ``now`` is the clock the answer line pulses on, and None is "do not" —
+    which is what `decision_height` passes, because how tall this is must not
+    depend on what time it is. Only the y/n line breathes: at the reason stage
+    the hint is describing a box that already has the cursor in it, and two
+    things asking for the eye at once is neither of them getting it.
     """
     payload = decision.payload
     accent = YELLOW if approval_kind(payload) == "execution" else RED
@@ -218,17 +226,10 @@ def prompt_rows(decision: Decision, width: int) -> list[tuple[str, str]]:
         # above it at a glance.
         for line in _wrapped(script, width - 6, SCRIPT_LINES):
             rows.append((DIM, f"  │ {line}"))
-    rows.append(
-        (
-            DIM,
-            "  "
-            + (
-                approval_hint(payload)
-                if decision.asking
-                else approval_reason_hint()
-            ),
-        )
-    )
+    asking = decision.asking
+    hint = approval_hint(payload) if asking else approval_reason_hint()
+    style = pulse(now) if asking and now is not None else DIM
+    rows.append((style, f"  {hint}"))
     return rows
 
 
@@ -246,7 +247,12 @@ def decision_height(decision: Decision, width: int, cap: int) -> int:
 
 
 def render_decision(
-    decision: Decision, width: int, height: int, *, focused: bool
+    decision: Decision,
+    width: int,
+    height: int,
+    *,
+    focused: bool,
+    now: float | None = None,
 ) -> list[str]:
     """The prompt, in exactly ``height`` rows of exactly ``width`` cells.
 
@@ -256,7 +262,7 @@ def render_decision(
     while clipping the hint would leave a question with no visible way to
     answer it.
     """
-    rows = prompt_rows(decision, width)
+    rows = prompt_rows(decision, width, now)
     box = min(reason_height(decision, width), max(0, height - 3))
     room = max(0, height - box)
     if len(rows) > room:
