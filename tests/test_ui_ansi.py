@@ -5,19 +5,25 @@ same one — a line is exactly `width` visible cells, whatever styling was
 wrapped around it afterwards.
 """
 
+import re
+
 from hpca.ui.ansi import (
     CLIP,
     CYAN,
     DIM,
     ONE_CELL_GLYPHS,
+    PULSE_PERIOD,
+    PULSE_RAMP,
     RESET,
     REVERSE,
+    WHITE,
     cell_width,
     char_width,
     clip,
     fold,
     footer_line,
     pad,
+    pulse,
     reverse,
     rule,
 )
@@ -263,3 +269,42 @@ class TestReverseKeepsGlyphsWhole:
     def test_a_mark_that_ends_before_a_combining_mark_takes_it_along(self):
         drawn = reverse(COMBINED, [(0, 1)])
         assert f"{REVERSE}{COMBINED}{RESET}" in drawn
+
+
+class TestThePulse:
+    """The decision prompt's answer line, whose colour is a function of the
+    clock and of nothing else (`ui/approval.py` says why it breathes)."""
+
+    def test_it_starts_white_and_ends_teal(self):
+        assert PULSE_RAMP[0] == WHITE
+        assert PULSE_RAMP[-1] == CYAN
+
+    def test_every_step_between_them_is_a_256_colour_escape(self):
+        # The whole UI addresses colour as `38;5;N`, and a 24-bit sequence
+        # here would be the one row of the frame a 256-colour terminal drew
+        # in something else entirely.
+        assert all(re.fullmatch(r"\x1b\[38;5;\d+m", x) for x in PULSE_RAMP)
+
+    def test_and_no_step_repeats_the_one_before_it(self):
+        # A ramp with a repeat in it is a pulse that stalls for a frame.
+        assert len(set(PULSE_RAMP)) == len(PULSE_RAMP)
+
+    def test_the_ends_of_the_sweep_are_the_two_it_was_asked_for(self):
+        assert pulse(PULSE_PERIOD / 4) == CYAN
+        assert pulse(PULSE_PERIOD * 3 / 4) == WHITE
+
+    def test_it_is_the_same_colour_one_period_later(self):
+        assert pulse(0.3) == pulse(0.3 + PULSE_PERIOD)
+
+    def test_and_a_different_one_a_quarter_of_the_way_round(self):
+        assert pulse(0.0) != pulse(PULSE_PERIOD / 4)
+
+    def test_it_never_answers_with_a_colour_that_is_not_on_the_ramp(self):
+        walk = [pulse(x / 97 * PULSE_PERIOD) for x in range(97)]
+        assert set(walk) <= set(PULSE_RAMP)
+        assert set(walk) == set(PULSE_RAMP), "and every one of them is reachable"
+
+    def test_a_pinned_clock_pins_the_colour(self):
+        # Which is what makes it testable at all: the frame asks the clock,
+        # the clock is injectable, and nothing else is consulted.
+        assert pulse(1.234) == pulse(1.234)

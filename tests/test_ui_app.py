@@ -584,11 +584,16 @@ def parked_on_an_approval() -> RowUI:
     The scheduler has already popped its `TurnState` and returned without a
     `turn.finished` (specs-ui-coverage.md §4), so nothing clears `working` and
     an `Interrupt` sent now reaches a core that has no turn to stop.
+
+    Aimed from the chat and not from the message box, which is not on screen
+    while a prompt is up (`RowUI._entry_h`) — and not from the prompt either,
+    where escape is the refusal and never the gesture. The chat is where the
+    stop keys are asked from while a turn is parked.
     """
     ui = half_a_message()
     ui.session.turn.working = True
     ui.session.request_decision({"tool": "run_bash", "command": "rm -rf ~/data"})
-    ui.focus = INPUT
+    ui.focus = CHAT
     return ui
 
 

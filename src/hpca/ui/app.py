@@ -13,6 +13,7 @@ from collections.abc import Callable
 from hpca import __version__ as VERSION
 from hpca.ui import commands, toasts
 from hpca.ui.ansi import BOLD, CYAN, DIM, GREEN, RED, RESET, REVERSE, YELLOW
+from hpca.ui.ansi import PULSE_INTERVAL
 from hpca.ui.ansi import cell_width, cut, footer_line, pad, rule, safe
 from hpca.ui.approval import decision_height, render_decision
 from hpca.ui.editor import Editor
@@ -82,11 +83,14 @@ from hpca.ui.state import (
 # is not evidence that the user wants the turn dead. Two in a second are.
 ESC_STOP_WINDOW = 1.0
 
-# The four rows, and the prompt that is not a row. DECISION is a focus target
-# without a pane: the inline approval sits at the foot of the chat column
-# (§4.3 item 21), it takes keys while it is unanswered, and it is deliberately
-# not in the ↑/↓ ring — you arrive at it because a decision arrived, and you
-# leave it by answering.
+# The four rows, and the prompt that stands in for one of them. DECISION is a
+# focus target without a pane: the inline approval sits at the foot of the chat
+# column (§4.3 item 21) and takes keys while it is unanswered. It is in the
+# ctrl+↑/ctrl+↓ ring — in the message box's slot, because while a decision is
+# pending the box is not drawn and the prompt is what is there (`_ring`). It
+# was outside the ring once, and that was a lockout: its own keys moved the
+# focus away and nothing could move it back, so the turn stayed parked on a
+# question that could no longer be answered.
 SESSIONS, CHAT, INPUT, WATCHERS, DECISION = range(5)
 
 # The question the aimed half of the stop gesture asks first. Enter on the
@@ -1005,12 +1009,7 @@ class RowUI:
         can use it.
         """
         avail = max(8, height - 2)  # header and footer
-        inp = (
-            self._input_h(width)
-            + self._status_h()
-            + self._decision_h(width, height)
-            + self._menu_h(width, height)
-        )
+        inp = self._entry_h(width, height) + self._status_h()
         quarter = max(2, avail // 4)
         inner = max(8, width - 2)
         top = max(2, min(1 + len(self.panes[0].flat(inner)), quarter))
@@ -1025,14 +1024,37 @@ class RowUI:
         middle = avail - top - bottom - inp
         if middle < 1:  # a terminal too short for the design at all
             top = bottom = 2
-            inp = (
-                2
-                + self._status_h()
-                + self._decision_h(width, height)
-                + self._menu_h(width, height)
+            # The prompt keeps its full share here and the box is cut to two
+            # rows, which is the difference between them on a screen with no
+            # room: a message can be typed a line at a time, and a question
+            # nobody can read is a question nobody can answer.
+            inp = self._status_h() + (
+                self._decision_h(width, height)
+                if self.session.decision is not None
+                else 2
             )
             middle = max(1, avail - 4 - inp)
         return [top, middle, inp, bottom]
+
+    def _entry_h(self, width: int, height: int) -> int:
+        """Rows the third band wants — the message box, or the prompt instead.
+
+        Instead, and not as well. Both were on screen once, the prompt pushed
+        in above the box, and it cost twice: the two of them shared the slot
+        the ring pointed one cursor at, and the box sat there offering to take
+        a message in a session whose turn is stopped dead until the question
+        above it is answered. So the prompt takes the slot whole while it is
+        up, and the box comes back — with the half-typed draft still in it,
+        which lives on the `SessionState` and never depended on being drawn —
+        the moment it is answered.
+
+        The "/" menu goes with the box for the same reason: it is the box's
+        own autocomplete, and a menu for a field that is not on screen is a
+        list of commands nothing can run.
+        """
+        if self.session.decision is not None:
+            return self._decision_h(width, height)
+        return self._input_h(width) + self._menu_h(width, height)
 
     def _decision_h(self, width: int, height: int) -> int:
         """Rows the inline approval wants, or none because there is none.
@@ -1075,6 +1097,10 @@ class RowUI:
     # -------------------------------------------------------------- drawing
 
     def render(self, width: int, height: int) -> list[str]:
+        # Before anything is measured: a decision that arrived between two
+        # keypresses changes which row the middle slot is, and a frame drawn
+        # with the cursor on the row it used to be would draw nothing focused.
+        self._settle_focus()
         out = [self._header(width)]
         if self.overlay is not None:
             out += self.overlay.render(width, height - 2)
@@ -1098,13 +1124,14 @@ class RowUI:
         self.session.tick(self.wall())
         for slot, pane, pane_h in order:
             if slot == INPUT:
-                prompt = self._render_decision(width, height)
                 status = self._render_status(width)
+                prompt = self._render_decision(width, height)
+                if prompt:  # standing where the box would be (`_entry_h`)
+                    out += prompt + status
+                    continue
                 menu = self._render_menu(width, height)
-                out += prompt + menu + status
-                out += self._render_input(
-                    width, pane_h - len(status) - len(prompt) - len(menu)
-                )
+                out += menu + status
+                out += self._render_input(width, pane_h - len(status) - len(menu))
             else:
                 out += pane.render(width, pane_h, focused=self.focus == slot)
         note, style = self.note, self.note_style
@@ -1155,6 +1182,10 @@ class RowUI:
             width,
             self._decision_h(width, height),
             focused=self.focus == DECISION,
+            # The answer line breathes, and the clock is what it breathes on
+            # — the same arrangement the spinner has, and the reason
+            # `next_wake` books a frame while this is up.
+            now=self.clock(),
         )
 
     def _over_confirm(self, out: list[str], width: int) -> list[str]:
@@ -1266,12 +1297,16 @@ class RowUI:
                     ("enter", "send the reason"),
                     ("esc", "no reason"),
                     ("⇧enter", "new line"),
+                    # Offered here too, because they work here too: the box
+                    # keeps what is in it while the cursor is away, and the
+                    # ring always comes back to this row (`_ring`).
+                    ("^↑^↓", "row"),
                 ]
             return [
                 ("y", "approve"),
                 ("n", "deny"),
                 ("esc", "deny, no reason"),
-                ("^↑", "row"),
+                ("^↑^↓", "row"),
             ]
         if self.focus == INPUT:
             # Spelled out rather than built from ``common`` so that send and
@@ -1325,7 +1360,44 @@ class RowUI:
 
     # --------------------------------------------------------------- input
 
+    def _ring(self) -> list[int]:
+        """The rows ctrl+↑ and ctrl+↓ walk, in the order they are drawn.
+
+        The third one is the message box, or the decision prompt standing in
+        its place while one is pending: the prompt is *in* that slot rather
+        than beside it (`_entry_h`), so the ring says what the layout says and
+        the two cannot disagree about how many rows there are.
+
+        Which is also the fix for a hard lockout. DECISION used to be outside
+        the ring while its own keys still moved the focus out of it, so one
+        ctrl+↑ off an unanswered prompt left a parked turn that no key
+        sequence could reach again — re-opening the session was the only way
+        back, and nothing on screen said so.
+        """
+        middle = DECISION if self.session.decision is not None else INPUT
+        return [SESSIONS, CHAT, middle, WATCHERS]
+
+    def _settle_focus(self) -> None:
+        """Put the cursor on a row that exists, before anything reads it.
+
+        Two states are not allowed, and they are the two the ring cannot name:
+        the prompt with no decision left behind it, and the message box while
+        a decision is standing in front of it. Both are one line away from
+        every path that sets INPUT — a paste, a rollback handing a message
+        back, `i` in the chat, a decision arriving while the box has the
+        cursor — and the one that forgot would leave the cursor on a row that
+        is not drawn, or walk a key into `_handle_row`'s pane lookup with a
+        focus it has no entry for. Asked once, here, rather than remembered
+        eleven times.
+        """
+        if self.session.decision is None:
+            if self.focus == DECISION:
+                self.focus = INPUT
+        elif self.focus == INPUT:
+            self.focus = DECISION
+
     def handle(self, key: str, width: int, height: int) -> bool:
+        self._settle_focus()
         if is_paste(key):
             self._paste(paste_text(key))
             return True
@@ -1369,6 +1441,19 @@ class RowUI:
         """
         if self.overlay is not None:
             self.overlay.paste(text)
+            return
+        decision = self.session.decision
+        if decision is not None:
+            # The box this would land in is not on screen — the prompt is in
+            # its slot — so the focus cannot follow the text. At the reason
+            # stage there *is* a visible editor and it takes it; at the
+            # question there is not, and the text goes into the draft it was
+            # aimed at and waits there with it. Dropping a payload because a
+            # gate happened to be open is the worse of the two answers.
+            if decision.asking:
+                self.input.insert_text(text)
+            else:
+                decision.reason.insert_text(text)
             return
         self.focus = INPUT
         self.input.insert_text(text)
@@ -1494,13 +1579,25 @@ class RowUI:
         so its keys work at once — but only from the chat column, because a
         decision must never pull the cursor out of the sessions or watchers
         row the user is working in.
+
+        From the message box it is not a courtesy but the only answer: the
+        prompt takes the box's slot (`_entry_h`), so leaving the cursor there
+        would leave it on a row that is no longer drawn. What was being typed
+        is not lost — it is the session's draft, and the box comes back with
+        it once this is answered.
         """
         self.refresh_sidebar()
         if session_id == self.active_id and self.focus in (CHAT, INPUT):
             self.focus = DECISION
 
     def decision_cleared(self, session_id: str) -> None:
-        """The core says that decision is gone (answered, or its turn died)."""
+        """The core says that decision is gone (answered, or its turn died).
+
+        The cursor goes back to the box the prompt was standing in front of,
+        which is where it came from and where the draft has been waiting.
+        Only from the prompt: a user who had walked off to the sessions column
+        meanwhile is left where they are.
+        """
         self.refresh_sidebar()
         if session_id == self.active_id and self.focus == DECISION:
             self.focus = INPUT
@@ -1512,6 +1609,13 @@ class RowUI:
         text field, and "n" in the middle of "not this path" is not a verdict
         — which is why the stage gates the keys rather than both being live at
         once (`DecisionBar.check_action` did the same with `check_action`).
+
+        ctrl+↑ and ctrl+↓ leave the way they leave any row, because this is a
+        row of the ring now (`_ring`): up to the chat the question is about,
+        down to the watchers. What they do *not* do any more is drop into the
+        message box — it is not on screen while this is, and `i` and tab used
+        to aim at it. Nothing here can strand the prompt: every step of the
+        ring comes back to it.
         """
         if key == "quit":
             return False
@@ -1528,10 +1632,10 @@ class RowUI:
                 decision.decline()
             elif key == "esc":
                 self._resolve(False)
-            elif key == "ctrl-up":
+            elif key in ("ctrl-up", "shift-tab"):
                 self.focus = CHAT
-            elif key in ("ctrl-down", "tab", "i"):
-                self.focus = INPUT
+            elif key in ("ctrl-down", "tab"):
+                self.focus = WATCHERS
             return True
         if key == "enter":
             self._resolve(False, decision.reason_text())
@@ -1542,7 +1646,7 @@ class RowUI:
         elif key == "ctrl-up":
             self.focus = CHAT  # the half-written reason stays where it is
         elif key == "ctrl-down":
-            self.focus = INPUT
+            self.focus = WATCHERS
         else:
             decision.reason.handle(key)
         return True
@@ -1759,10 +1863,11 @@ class RowUI:
 
         The loop repaints because something happened — a key, an event, a
         resize — and not on a timer, so anything that changes by the clock
-        alone has to say when it will. Two things do, and the answer is the
+        alone has to say when it will. Four things do, and the answer is the
         sooner of them: the armed escape, which is only true for
-        ``ESC_STOP_WINDOW`` and has no keypress coming to wipe it, and the
-        spinner, which turns.
+        ``ESC_STOP_WINDOW`` and has no keypress coming to wipe it; the
+        spinner, which turns; the toast, which expires; and the answer line of
+        an open decision, which breathes.
 
         The spinner deliberately goes through here rather than being given a
         timer of its own. A widget that repaints itself is a poll by another
@@ -1781,6 +1886,16 @@ class RowUI:
             # goes on its own, and a frame drawn with one on it stops being
             # true the moment it expires.
             toasts.next_wake(self.toasts, self.clock()),
+            # And the fourth: the prompt's answer line is a function of the
+            # clock (`ansi.pulse`), so without a frame booked here it would be
+            # painted once in whatever colour the keypress that drew it landed
+            # on and sit there. A fixed interval rather than "when the ramp
+            # next steps", because the ramp has seven colours and working out
+            # which second of the sweep is the slow one costs more than the
+            # frame it would save. Only while a decision is on *this* screen:
+            # a background session's prompt is not drawn, so nothing about it
+            # changes with the clock.
+            PULSE_INTERVAL if self.session.decision is not None else None,
         ]
         if self._esc_armed_at is not None:
             left = ESC_STOP_WINDOW - (self.clock() - self._esc_armed_at)
@@ -2096,7 +2211,7 @@ class RowUI:
                 self.ask(QUIT_QUESTION, self._quit_answer)
             return True
         inner = max(8, width - 2)
-        slots = [SESSIONS, CHAT, INPUT, WATCHERS]
+        slots = self._ring()
         view = max(1, self._heights(height, width)[slots.index(self.focus)] - 1)
         pane = {
             SESSIONS: self.session_pane,
@@ -2148,7 +2263,11 @@ class RowUI:
             # `y` only while a decision is pending, and it takes keys first.
             self._copy_row(inner)
         elif key == "i" and self.focus == CHAT:
-            self.focus = INPUT
+            # Whatever is in that slot: the box, or the prompt standing in it
+            # (`_ring`). "write" is what the footer offers here, and while a
+            # decision is up there is nothing to write into — the answer to
+            # the question is the next thing this session takes.
+            self.focus = slots[2]
         elif key == "up":
             pane.move(-1, view, inner)
         elif key == "down":
