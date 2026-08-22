@@ -1064,6 +1064,47 @@ class DemoCore:
             protocol.Notify(severity="warning", text="no such watch any more")
         )
 
+    def _do_SessionMove(self, cmd: protocol.SessionMove) -> None:
+        """`session.move`: swap with a neighbour, then re-state the sidebar.
+
+        The list goes out whether or not anything moved, which is what the
+        real core does and why (`service._move_session`): the sidebar on
+        screen is the answer to the keypress, and a front-end that is entitled
+        to have shuffled its own rows needs the store's order to land on top
+        of it. A row at either end has no neighbour to trade with, which is
+        what holding the key down looks like and is not worth a message.
+        """
+        index = next(
+            (i for i, r in enumerate(self.rows) if r.session_id == cmd.session_id),
+            -1,
+        )
+        target = index + cmd.delta
+        if index >= 0 and 0 <= target < len(self.rows):
+            self.rows[index], self.rows[target] = (
+                self.rows[target],
+                self.rows[index],
+            )
+        self.emit(protocol.SessionRows(rows=list(self.rows)))
+
+    def _do_WatchMove(self, cmd: protocol.WatchMove) -> None:
+        """`watch.move`: the same, scoped to the column the box is in.
+
+        Scoped by the real core to the session that registered the watch, so a
+        swap never puts a box next to one belonging to a conversation the user
+        is not looking at; here that is simply the list the ref is found in.
+        """
+        for session_id, rows in self._watches.items():
+            index = next(
+                (i for i, r in enumerate(rows) if r.ref == str(cmd.watch_id)), -1
+            )
+            if index < 0:
+                continue
+            target = index + cmd.delta
+            if 0 <= target < len(rows):
+                rows[index], rows[target] = rows[target], rows[index]
+            self._panel(session_id)
+            return
+
     def _do_WatchDrop(self, cmd: protocol.WatchDrop) -> None:
         for session_id, rows in self._watches.items():
             kept = [row for row in rows if row.ref != str(cmd.watch_id)]

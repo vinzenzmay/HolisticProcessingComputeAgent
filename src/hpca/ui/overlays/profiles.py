@@ -27,6 +27,7 @@ from hpca.ui.state import (
     CopyProfile,
     CreateProfile,
     DeleteProfile,
+    EditProfile,
     ProfileInfo,
     SaveProfile,
 )
@@ -106,13 +107,28 @@ class ProfilesOverlay(ListOverlay):
     copies it under a new name, `d` deletes it. On the `(new profile)` row
     Enter names and creates one and the other four are inert — a key list that
     lies is worse than a short one.
+
+    ``external`` decides where the two files open. With a terminal to hand
+    over they go to the user's own editor — asked for in those words: the
+    profile you *selected*, in `$EDITOR`, rather than the one the core happens
+    to be working under — and this screen stays up behind it, so the next one
+    is one keypress away. Without one (a test, the demo, a `RowUI` driven
+    headless) they open in the editor overlay this screen has always used,
+    because a key that answers "no editor is wired up here" and leaves no way
+    to edit a profile at all is the worse of the two.
     """
 
     title = "profiles & learnings"
     name = "profiles"
 
-    def __init__(self, profiles: Iterable[ProfileInfo] | None = None) -> None:
+    def __init__(
+        self,
+        profiles: Iterable[ProfileInfo] | None = None,
+        *,
+        external: bool = False,
+    ) -> None:
         self.profiles = list(profiles or [])
+        self.external = external
         super().__init__(profile_rows(self.profiles))
         # The name the last child screen was opened about, since the child
         # itself is content-agnostic and a `d` in between could have moved the
@@ -174,10 +190,20 @@ class ProfilesOverlay(ListOverlay):
         and shows the reason instead if the core could not read the file —
         which is `ProfileBody.error`, and is the only thing that separates an
         empty file from an unreadable one.
+
+        `$EDITOR` fetches for the same reason and says the same things, one
+        layer down (`UIClient.edit_profile`), so the branch here is only about
+        which editor gets the text: the intent leaves and this screen stays
+        where it is, and nothing comes back through `child_closed` because
+        there is no child — the save is sent by the side that ran the editor.
         """
         self.subject = name
         if self.info(name) is None:
             self.note = UNREADABLE
+            return True
+        if self.external:
+            self.send(EditProfile(name, kind))
+            self.note = f"“{name}” is in your editor"
             return True
         return self.open(
             TextEditOverlay(

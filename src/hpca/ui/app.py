@@ -56,6 +56,8 @@ from hpca.ui.state import (
     Fork,
     Intent,
     Interrupt,
+    MoveSession,
+    MoveWatch,
     NewSession,
     OpenSession,
     Peek,
@@ -329,14 +331,24 @@ class RowUI:
         # not the manager itself, because the manager writes OSC 52 straight to
         # the terminal and this module has never seen one.
         self.clipboard: Callable[[str], str] | None = None
-        # ctrl+e, in two halves belonging to two different layers. `suspend`
-        # takes the terminal down and puts it back (`ui/run.py`, which owns
-        # it); `edit_profile` fetches the profile, runs the editor over it and
-        # saves it back (`ui/client.py`, which is the side with a wire). Both
-        # ends of it are asynchronous, so it answers in a toast rather than by
-        # returning anything.
+        # The external editor, in two halves belonging to two different
+        # layers. `suspend` takes the terminal down and puts it back
+        # (`ui/run.py`, which owns it); the three hooks under it fetch a body,
+        # run the editor over it and send what comes back (`ui/client.py`,
+        # which is the side with a wire). All of them are asynchronous — the
+        # text has to arrive before there is anything to edit — so they answer
+        # in a toast rather than by returning anything.
+        #
+        # Three hooks and not one because the three things `$EDITOR` is opened
+        # on are three different round trips: a draft is already here and goes
+        # nowhere near the core (`edit_text`), a profile is `profile.get` /
+        # `profile.save`, and the settings file is `settings.get` /
+        # `settings.save`. They are wired together by one constructor
+        # (`UIClient.__init__`), which is what `external_editor` reads.
         self.suspend: Callable[[Callable[[], None]], None] | None = None
-        self.edit_profile: Callable[[str], None] | None = None
+        self.edit_text: Callable[[str, Callable[[str], None]], None] | None = None
+        self.edit_profile: Callable[[str, str], None] | None = None
+        self.edit_settings: Callable[[], None] | None = None
         # A window that arrived while a screen was open, waiting for the
         # screen to close (`window`). One slot: two of these queued at once
         # would be a stack of modals nobody asked for, and the newer answer is
@@ -690,43 +702,54 @@ class RowUI:
             ]
         )
 
-    def _reorder_session(self, delta: int, view_h: int, width: int) -> bool:
-        """Swap the session under the cursor with its neighbour.
+    def _move_session(self, delta: int, width: int) -> bool:
+        """Ask the core to shift the session under the cursor one place.
 
-        `alt+↑/↓`, the same gesture the watchers row already answers to
-        (`Pane.reorder`) — asked for so the two reorderable rows behave alike.
-        The truth here is `self.sessions`, not `session_pane.items`: unlike
-        the watchers pane, which owns its rows outright, `refresh_sidebar`
-        rebuilds the sidebar from `self.sessions` on almost every keystroke,
-        so a swap made only on the pane would be undone by the next one. The
-        swap is scoped to that list instead, and `refresh_sidebar` is what
-        turns it into a repaint. `Pane.replace` already keeps the cursor on
-        the session it was on, by id, so the row travels with the entry the
-        way `reorder`'s docstring promises; `move(0, ...)` after it only
-        exists to pull the offset along when the swap carried the row past
-        the edge of what is on screen.
+        `alt+↑/↓`, the same gesture the watchers column answers — asked for so
+        the two reorderable rows behave alike, and now sent rather than
+        performed. The order is a fact about the database, which rule 2 of
+        §4.2 puts out of a front-end's reach; the answer is a whole new
+        `session.rows` in the order the store now holds, and a sidebar that
+        swapped its own rows first would be overwritten by it a frame later.
+        That was the bug: the list moved, and the next frame put it back.
 
-        The one row this never touches is "+ new session": it sits above
-        every real session and is not a member of `self.sessions`, so index 0
-        in the pane is index -1 here and refuses to move, same as the top of
-        the list refusing to move further up.
+        Nothing is optimistic here for a second reason, which is what makes
+        holding the key down work. `MoveSession` names a row by id and carries
+        an offset, so the core swaps it with whichever row is its neighbour
+        when the command *arrives*: two presses walk one session past two
+        others whether or not the first answer has landed. A local swap would
+        be aiming the second press at a list the core has not agreed to yet.
+
+        What is decided here is only whether there is a move to ask for. The
+        row above every real session is "+ new session", which is not a member
+        of `self.sessions` at all — index 0 in the pane is index -1 here — so
+        it refuses to move, the same way the top of the list refuses to move
+        further up. Out of range at the far end is a silent no-op in the core
+        too; answering it here as well is what keeps the footer's "moved" from
+        being said about a row that did not.
         """
         index = self.session_pane.current(width) - 1
         target = index + delta
         if index < 0 or not 0 <= target < len(self.sessions):
             return False
-        was = self.active_id
-        self.sessions[index], self.sessions[target] = (
-            self.sessions[target],
-            self.sessions[index],
-        )
-        # `active` is a position in `self.sessions`, not an id — the swap just
-        # moved out from under it, and it is what `refresh_sidebar` reads to
-        # draw ● and the open row's green, so it has to be recomputed before
-        # that read rather than after.
-        self._select(was)
-        self.refresh_sidebar()
-        self.session_pane.move(0, view_h, width)
+        self.send(MoveSession(self.sessions[index].session_id, delta))
+        return True
+
+    def _move_watch(self, delta: int, width: int) -> bool:
+        """The same, for the watch box under the cursor.
+
+        The row carries the core's own ``PanelRow.ref`` (see
+        `client._panel_item`), so what leaves here names a watch rather than a
+        position in a column that a poll repaints twice a second — which is
+        the other reason not to reorder locally: this column is rewritten by
+        `panel.update` on a timer, and a swap made here would survive only
+        until the next poll.
+        """
+        index = self.watchers.current(width)
+        target = index + delta
+        if index < 0 or not 0 <= target < len(self.watchers.items):
+            return False
+        self.send(MoveWatch(self.watchers.items[index].text, delta))
         return True
 
     def _tag(self, session: SessionState) -> str:
@@ -2065,7 +2088,7 @@ class RowUI:
             # printable character, so it cannot be something being typed.
             self._switch_llm()
         elif key == "ctrl-e":
-            self._edit_profile()
+            self._edit_draft()
         elif key == "quit":
             return False
         else:
@@ -2328,7 +2351,13 @@ class RowUI:
             # may be about to type into the box they just left.
             self.overlay = LlmOverlay(self.catalog)
         elif key == "a" and self.focus == SESSIONS:
-            self.overlay = ProfilesOverlay(self.profiles)
+            # Told whether `$EDITOR` can be reached, because that is what
+            # decides where the profile under the cursor opens: the user's own
+            # editor, or the in-app one that stands in when there is no
+            # terminal to hand over (`external_editor`).
+            self.overlay = ProfilesOverlay(
+                self.profiles, external=self.external_editor
+            )
         elif key == "c" and self.focus == CHAT:
             # The chat column's `c` copies the row under the cursor (§4.3 item
             # 36). It is the one row where `c` is about a conversation rather
@@ -2337,15 +2366,7 @@ class RowUI:
             self._copy_row(inner)
         elif key == "c":
             # Anywhere but the chat column (§5), where `c` is the row copy.
-            # Fetched as it opens, like every other editable body: the file is
-            # also written by the core — `settings.save` normalises what lands
-            # on disk — so a copy kept from the last time this screen was open
-            # is a copy that can already be wrong.
-            self.overlay = ConfigOverlay(
-                self.settings_json,
-                validate=self.validate_settings,
-                awaiting=SETTINGS_KEY,
-            )
+            self._edit_config()
         elif key == "ctrl-l" and self.focus == CHAT:
             self._switch_llm()
         elif key in ("ctrl-down", "tab"):
@@ -2353,7 +2374,9 @@ class RowUI:
         elif key in ("ctrl-up", "shift-tab"):
             self.focus = slots[(slots.index(self.focus) - 1) % len(slots)]
         elif key == "ctrl-e":
-            self._edit_profile()
+            # The draft, from here too — and the focus goes with it, the way a
+            # paste does (`_edit_draft`, `_paste`).
+            self._edit_draft()
         elif key == "up":
             pane.move(-1, view, inner)
         elif key == "down":
@@ -2378,10 +2401,14 @@ class RowUI:
         elif key == "shift-left":
             pane.collapse_all(inner)
         elif key in ("alt-up", "alt-down") and self.focus == WATCHERS:
-            moved = pane.reorder(-1 if key == "alt-up" else 1, view, inner)
+            moved = self._move_watch(-1 if key == "alt-up" else 1, inner)
             self.note = "moved" if moved else ""
         elif key in ("alt-up", "alt-down") and self.focus == SESSIONS:
-            moved = self._reorder_session(-1 if key == "alt-up" else 1, view, inner)
+            # Said before the core has answered, like the mode bar: the
+            # keypress needs feedback, the frame that arrives is what makes it
+            # true, and the one case the core would refuse — no neighbour to
+            # trade with — has already been ruled out above.
+            moved = self._move_session(-1 if key == "alt-up" else 1, inner)
             self.note = "moved" if moved else ""
         elif key == "enter":
             if self.focus == SESSIONS:
@@ -2436,26 +2463,124 @@ class RowUI:
         except Exception as e:  # a tier that raised rather than reporting
             self.toast(f"copy failed: {e}", "error")
 
-    def _edit_profile(self) -> None:
-        """ctrl+e: this profile's memories in `$EDITOR` (§4.3 item 37).
+    @property
+    def external_editor(self) -> bool:
+        """Whether `$EDITOR` can be reached from here at all.
+
+        Read by the keys that now have two ways to do the same job — the
+        config editor, and a profile's files off the profiles screen — so
+        that a UI with no terminal to hand over (a test, the demo, anything
+        driving `RowUI` headless) keeps the in-app form rather than being
+        told there is no editor and left with no way in.
+
+        One question for three hooks and a terminal, because they are wired
+        by one constructor (`UIClient.__init__`) against the one terminal
+        `run.py` owns: a UI holding some of them and not the others would be
+        a UI somebody had taken apart by hand.
+        """
+        return self.suspend is not None and self.edit_text is not None
+
+    def _edit_draft(self) -> None:
+        """ctrl+e: the message being written, in `$EDITOR` (§4.3 item 37).
 
         Textual spelled this `self.suspend()`; here it means leaving the
         alternate screen, putting the line discipline back, running the editor
         on a terminal that behaves like a terminal, and coming back to a full
         repaint. Both halves are injected — `run.py` owns the terminal and
-        `client.py` owns the wire the file comes down — so this method is the
-        key binding, one guard, and nothing else.
+        `client.py` owns the process — so this method is the key binding, one
+        guard, and where the text lands when it comes back.
 
-        Nothing is returned and nothing is waited for: the body has to be
-        fetched before there is anything to edit, so the answer arrives as a
-        toast (`UIClient._profile_body`). The guard is what keeps the key
-        honest in a UI with no wire behind it — a key that silently did
-        nothing would look exactly like an editor that opened and closed.
+        The draft and not the profile, which is what this key used to open:
+        the footer offers it in the message box and nowhere else, and a key
+        advertised next to "send" and "new line" that opened a *memories* file
+        was the one hint in the footer that named the wrong thing entirely.
+        A profile is edited where a profile is chosen (`a`, then the row), and
+        the settings file where the settings are (`c`).
+
+        It works from the rows too, and takes the focus back to the box with
+        it, for the reason `_paste` does the same: editing the message is an
+        unambiguous "I am writing", the rows have no draft of their own, and
+        coming back from the editor to a cursor parked on a chat row would
+        hide the very text that was just edited.
+
+        The editor is captured rather than looked up again when the text comes
+        back, so what was edited is what is written to — the answer arrives
+        from `client.py` and is not obliged to arrive before the next key.
         """
-        if self.suspend is None or self.edit_profile is None:
+        if self.suspend is None or self.edit_text is None:
             self.toast("no editor is wired up here", "warning")
             return
-        self.edit_profile(self.profile)
+        draft = self.input
+        self.edit_text(draft.text(), lambda text: self._draft_edited(draft, text))
+
+    def _draft_edited(self, draft: Editor, text: str) -> None:
+        """What `$EDITOR` left in the file, as the draft it was opened on.
+
+        Said out loud only when it comes back empty: everything else about
+        this is visible — the box is the feedback, and it now holds what the
+        editor holds. An empty buffer is applied rather than refused, because
+        deleting the message and saving is a thing a person does on purpose
+        and the alternative is a key that silently ignores it; but the draft
+        it replaced is gone, so the one case that can lose work says so.
+        """
+        draft.set_text(text)
+        self.focus = INPUT
+        if not text.strip():
+            self.toast("the editor left the message empty", "warning")
+
+    def _edit_config(self) -> None:
+        """`c`: the settings file, in `$EDITOR` — or in the screen, failing that.
+
+        The file is the interface either way (`overlays/config.py` says why at
+        length: the settings model grows a field whenever anything does, and a
+        hand-built form is the copy of it that falls behind). All that changes
+        here is which editor holds the text, and `$EDITOR` is the better one
+        for a file: it has the user's keys, their search, their JSON mode.
+
+        The in-app screen is kept as the way in when there is no terminal to
+        hand over, and as the place a refusal lands: text the settings model
+        would not accept is opened in it with the reason on its rule
+        (`fix_settings`), rather than dropped after a minute of typing. Nothing malformed reaches disk in either case: the core
+        validates `settings.save` again and refuses it (`_save_settings`),
+        which is what keeps a hand-edited file from being one the next start
+        cannot read.
+        """
+        if self.external_editor and self.edit_settings is not None:
+            self.edit_settings()
+            return
+        # Fetched as it opens, like every other editable body: the file is
+        # also written by the core — `settings.save` normalises what lands on
+        # disk — so a copy kept from the last time this screen was open is a
+        # copy that can already be wrong.
+        self.overlay = ConfigOverlay(
+            self.settings_json,
+            validate=self.validate_settings,
+            awaiting=SETTINGS_KEY,
+        )
+
+    def fix_settings(self, text: str, reason: str) -> None:
+        """Put rejected settings back on screen, in the editor that refuses to
+        lose them.
+
+        Called by `client.py` when a file that came back out of `$EDITOR`
+        cannot be saved — either it is not JSON, or the core would not take it
+        — and it is the whole of the answer to "what happens when they save
+        something malformed": the text is not on disk, not on the wire, and
+        not thrown away either.
+
+        ``was`` is set to the file that is still there rather than to the text
+        the screen opens with, and that is the load-bearing line. It is what
+        `EditorOverlay` measures "changed" against, so the rejected text reads
+        as an unsaved edit: escape asks to keep it, and `ConfigOverlay.refuse`
+        will not let the screen close at all while it is still not JSON.
+        Opened over itself, one escape would drop the minute of typing this
+        exists to preserve.
+        """
+        screen = ConfigOverlay(text, validate=self.validate_settings)
+        screen.was = self.settings_json
+        screen.note = reason
+        self.overlay = screen
+        self.toast(reason, "error")
 
     # ------------------------------------------------------- the session keys
 

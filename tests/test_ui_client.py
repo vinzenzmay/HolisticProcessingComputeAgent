@@ -733,6 +733,129 @@ class TestTheWatchers:
         assert len(wire.ui.session_for("s2").watchers.items) == 2
 
 
+class TestReorderingSurvivesTheNextFrame:
+    """alt+↑/↓ asks the core, and the core's answer is the order.
+
+    The bug this is the test for: both keys reordered the front-end's own
+    copy and sent nothing, so the arrangement lasted exactly until the next
+    frame — the column is repainted by a poll twice a second, and the sidebar
+    on almost every command — and then snapped back. Nothing was wrong with
+    the swap; there was no one to tell.
+    """
+
+    async def _column(self, wire) -> Wire:
+        await started(wire)
+        await wire.tell(protocol.PanelUpdate(session_id="s1", rows=list(PANEL)))
+        wire.ui.focus = WATCHERS
+        wire.ui.watchers.cursor = 0
+        wire.peer.clear()
+        return wire
+
+    async def test_alt_down_on_a_box_asks_the_core(self, wire):
+        await self._column(wire)
+        await wire.press("alt-down")
+        asked = wire.peer.last(protocol.WatchMove)
+        assert (asked.watch_id, asked.delta) == (7, +1)
+
+    async def test_alt_up_is_the_other_direction(self, wire):
+        await self._column(wire)
+        wire.ui.watchers.cursor = 1
+        await wire.press("alt-up")
+        asked = wire.peer.last(protocol.WatchMove)
+        assert (asked.watch_id, asked.delta) == (9, -1)
+
+    async def test_the_ref_is_an_int_by_the_time_it_is_a_command(self, wire):
+        # `PanelRow.ref` is a string for every kind of row and a watch id is
+        # an int; the conversion is the sender's errand (`protocol.PanelRow`),
+        # which is `client.py`'s side of the line and not `app.py`'s.
+        await self._column(wire)
+        await wire.press("alt-down")
+        assert isinstance(wire.peer.last(protocol.WatchMove).watch_id, int)
+
+    async def test_the_column_is_not_reordered_before_the_answer(self, wire):
+        # Nothing optimistic: the order is the store's, the answer is the
+        # column whole, and a swap made here would only be overwritten by it.
+        await self._column(wire)
+        await wire.press("alt-down")
+        assert [x.key for x in wire.ui.watchers.items] == ["w7", "w9"]
+
+    async def test_and_the_frame_that_answers_is_the_new_order(self, wire):
+        # The whole point, and the exact thing that used to fail: the order
+        # the core sends after the move is the order that stays.
+        await self._column(wire)
+        await wire.press("alt-down")
+        await wire.tell(
+            protocol.PanelUpdate(session_id="s1", rows=[PANEL[1], PANEL[0]])
+        )
+        assert [x.key for x in wire.ui.watchers.items] == ["w9", "w7"]
+
+    async def test_the_cursor_rides_the_box_it_moved(self, wire):
+        # Which is what makes holding the key down walk one box past several:
+        # the second press has to be aimed at the same watch as the first.
+        await self._column(wire)
+        await wire.press("alt-down")
+        await wire.tell(
+            protocol.PanelUpdate(session_id="s1", rows=[PANEL[1], PANEL[0]])
+        )
+        pane = wire.ui.watchers
+        assert pane.items[pane.current(wire.inner)].key == "w7"
+        await wire.press("alt-down")
+        asked = wire.peer.last(protocol.WatchMove)
+        assert (asked.watch_id, asked.delta) == (7, +1), "the same box again"
+
+    async def test_two_presses_ahead_of_the_answer_still_name_one_box(self, wire):
+        # An offset and not a slot: the core swaps with whichever row is the
+        # neighbour when the command arrives, so a second press that went out
+        # before the first was answered still walks the same box one further.
+        await self._column(wire)
+        await wire.press("alt-down", "alt-down")
+        asked = wire.peer.took(protocol.WatchMove)
+        assert [(x.watch_id, x.delta) for x in asked] == [(7, +1), (7, +1)]
+
+    async def test_the_bottom_box_asks_for_nothing(self, wire):
+        await self._column(wire)
+        wire.ui.watchers.cursor = 1
+        await wire.press("alt-down")
+        assert wire.peer.took(protocol.WatchMove) == []
+        assert wire.ui.note == ""
+
+    async def test_a_sidebar_row_asks_the_core_too(self, wire):
+        await started(wire)
+        wire.ui.focus = SESSIONS
+        wire.ui.session_pane.cursor = 1  # row 0 is "+ new session"
+        await wire.press("alt-down")
+        asked = wire.peer.last(protocol.SessionMove)
+        assert (asked.session_id, asked.delta) == ("s1", +1)
+
+    async def test_and_the_sidebar_the_core_sends_back_is_the_order(self, wire):
+        await started(wire)
+        wire.ui.focus = SESSIONS
+        wire.ui.session_pane.cursor = 1
+        await wire.press("alt-down")
+        assert [x.session_id for x in wire.ui.sessions] == ["s1", "s2"], "not yet"
+        await wire.tell(protocol.SessionRows(rows=[ROWS[1], ROWS[0]]))
+        assert [x.session_id for x in wire.ui.sessions] == ["s2", "s1"]
+
+    async def test_the_open_session_is_still_the_open_one(self, wire):
+        # `active` is a position in `self.sessions`, and the frame that
+        # reorders them moves it out from under it.
+        await started(wire)
+        wire.ui.focus = SESSIONS
+        wire.ui.session_pane.cursor = 1
+        await wire.press("alt-down")
+        await wire.tell(protocol.SessionRows(rows=[ROWS[1], ROWS[0]]))
+        assert wire.ui.active_id == "s1"
+        assert wire.ui.active == 1
+
+    async def test_the_new_session_row_never_moves(self, wire):
+        await started(wire)
+        wire.ui.focus = SESSIONS
+        wire.ui.session_pane.cursor = 0
+        await wire.press("alt-down")
+        assert wire.peer.took(protocol.SessionMove) == []
+        assert wire.ui.note == ""
+
+
 # ------------------------------------------------------ keys become commands
 
 

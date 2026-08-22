@@ -574,9 +574,15 @@ class Pane:
     def reorder(self, delta: int, view_h: int, width: int) -> bool:
         """Move the entry under the cursor up or down past its neighbour.
 
-        The cursor travels with the entry rather than staying on the line,
-        which is what makes holding alt+↓ walk one watcher down the list
-        instead of shuffling a different one each press.
+        The cursor travels with the entry rather than staying on the line, so
+        holding the key walks one row down the list instead of shuffling a
+        different one each press.
+
+        Not what alt+↑/↓ does any more, and worth saying because this is
+        where it used to live: the two reorderable columns are the core's to
+        arrange (`session.move`, `watch.move`), and their new order arrives as
+        a repaint that goes through `replace`. What is left here is the pane's
+        own primitive, for a list this side genuinely owns.
 
         A row that carries a key takes what was open with it for free. One that
         does not is keyed by position, so the two slots have just traded flags

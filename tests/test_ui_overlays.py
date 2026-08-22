@@ -44,6 +44,7 @@ from hpca.ui.state import (
     CreateProfile,
     DeleteProfile,
     DeleteSkill,
+    EditProfile,
     Fetch,
     FetchSkills,
     ProfileInfo,
@@ -431,6 +432,58 @@ class TestProfileMemories:
         assert ui.overlay.editor.text() == ""
         press(ui, "esc")
         assert sent(ui, SaveProfile) == [], "nothing may be written back"
+
+
+class TestProfilesInTheUsersEditor:
+    """With a terminal to hand over, the profile under the cursor opens in
+    `$EDITOR` — asked for in those words.
+
+    The screen stays up behind it, because the point of editing from a list is
+    that the next one is one keypress away. Nothing comes back through
+    `child_closed`: there is no child, and the save is sent by the side that
+    ran the editor (`UIClient._run_editor`).
+    """
+
+    def _external(self, **kw) -> RowUI:
+        ui = with_profiles(**kw)
+        ui.suspend = lambda run: run()
+        ui.edit_text = lambda text, done: None
+        return ui
+
+    def test_enter_sends_the_row_the_cursor_is_on(self):
+        ui = press(self._external(), "a", "down", "enter")
+        assert sent(ui, EditProfile)[-1] == EditProfile("default", "memories")
+
+    def test_and_not_the_profile_the_core_is_working_under(self):
+        # The whole of the complaint: the old key edited `ui.profile`, from a
+        # screen where a *different* row was selected.
+        ui = self._external()
+        ui.core_profile = "hpc"
+        press(ui, "a", "down", "enter")
+        assert ui.profile == "hpc"
+        assert sent(ui, EditProfile)[-1].name == "default"
+
+    def test_no_in_app_editor_opens_over_it(self):
+        ui = press(self._external(), "a", "enter")
+        assert isinstance(ui.overlay, ProfilesOverlay), "the list stays up"
+        assert "your editor" in ui.overlay.note
+
+    def test_r_sends_the_archive_of_that_row(self):
+        ui = press(self._external(), "a", "down", "r")
+        assert sent(ui, EditProfile)[-1] == EditProfile("default", "archive")
+
+    def test_the_new_profile_row_still_names_one_instead(self):
+        ui = press(self._external(), "a", "end", "enter")
+        assert isinstance(ui.overlay, PromptOverlay)
+        assert sent(ui, EditProfile) == []
+
+    def test_without_a_terminal_the_in_app_editor_is_what_opens(self):
+        # A UI with nothing to hand the terminal over to keeps the screen it
+        # has always had, rather than being told there is no editor and left
+        # with no way to edit a profile at all.
+        ui = press(with_profiles(), "a", "enter")
+        assert isinstance(ui.overlay, TextEditOverlay)
+        assert sent(ui, EditProfile) == []
 
 
 class TestProfileLifecycle:

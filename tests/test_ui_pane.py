@@ -149,6 +149,16 @@ class TestArrowsOpenAndCloseEntries:
 
 
 class TestReorderingWatchers:
+    """alt+↑/↓ on the watchers column, through the demo core and back.
+
+    Nothing here is done locally any more: the key sends `watch.move` and the
+    order on screen is the `panel.update` that answers it (`app._move_watch`,
+    and `TestReorderingSurvivesTheNextFrame` in test_ui_client.py for the
+    round trip in slow motion). The demo's loopback is synchronous, so the
+    answer has landed by the time `handle` returns and these read the same as
+    they did when the swap was made here.
+    """
+
     def test_the_entry_moved_down(self):
         ui = build()
         ui.focus = WATCHERS
@@ -215,6 +225,21 @@ class TestReorderingWatchers:
         ui.handle("alt-down", 120, 40)
         assert ui.watchers.items[1].head == opened_head
 
+    def test_holding_it_down_walks_the_box_past_two(self):
+        # The reason the core swaps with a neighbour rather than assigning a
+        # slot: the second press is aimed at the same box, one row further on.
+        ui = build()
+        ui.focus = WATCHERS
+        names = [x.head for x in ui.watchers.items]
+        ui.watchers.cursor = 0
+        ui.handle("alt-down", 120, 40)
+        ui.handle("alt-down", 120, 40)
+        assert [x.head for x in ui.watchers.items][:3] == [
+            names[1],
+            names[2],
+            names[0],
+        ]
+
     def test_frame_still_exact_after_a_reorder(self):
         ui = build()
         ui.focus = WATCHERS
@@ -228,7 +253,25 @@ class TestReorderingSessions:
     """The sidebar's own `alt+↑/↓`, alongside the watchers' (§ above): asked
     for so the two reorderable rows answer to the same keys. Cursor row 0 is
     always "(new session)"; row 1 is the first real one, `self.sessions[0]`.
+
+    Sent rather than done, like the watchers': `session.move` goes out and the
+    `session.rows` that answers it is the order — the arrangement is a fact
+    about the store, and the sidebar is rebuilt from `self.sessions` on almost
+    every keystroke, so a swap made only here lasted until the next one.
     """
+
+    def test_holding_it_down_walks_the_session_past_two(self):
+        ui = build()
+        ui.focus = SESSIONS
+        names = [x.head for x in ui.session_pane.items]
+        ui.session_pane.cursor = 1
+        ui.handle("alt-down", 120, 40)
+        ui.handle("alt-down", 120, 40)
+        assert [x.head for x in ui.session_pane.items][1:4] == [
+            names[2],
+            names[3],
+            names[1],
+        ]
 
     def test_the_entry_moved_down(self):
         ui = build()
@@ -288,10 +331,10 @@ class TestReorderingSessions:
         assert ui.note == ""
 
     def test_the_active_marker_follows_the_active_session(self):
-        # `active` is a position in `self.sessions`; the swap moves the
-        # session out from under it and `_reorder_session` has to carry it
-        # along, or the ● lands on whatever session happens to sit at the
-        # old index instead of the one actually open.
+        # `active` is a position in `self.sessions`; the sidebar the core
+        # sends back moves the session out from under it, and `sync_sessions`
+        # recomputes it from the id — or the ● lands on whatever session
+        # happens to sit at the old index instead of the one actually open.
         ui = build()
         ui.focus = SESSIONS
         assert ui.active == 0

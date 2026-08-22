@@ -1325,6 +1325,41 @@ class Drop:
 
 
 @dataclass(frozen=True)
+class MoveSession:
+    """alt+↑ / alt+↓ on a sidebar row: shift it one place, for good.
+
+    An offset and not a slot, and a row named by id rather than by position,
+    because that is the whole gesture the user has and because both halves of
+    that survive the round trip: the core swaps with whichever row is the
+    neighbour *when it arrives*, so two presses in quick succession walk one
+    session past two others even though the second was sent before the first
+    was answered.
+
+    Which is also why nothing is reordered here. The arrangement is a fact
+    about the database (rule 2 of §4.2), the answer is a whole new
+    `session.rows`, and a sidebar that shuffled itself first would only be
+    overwritten by it — which is exactly the bug this replaced: the list moved,
+    and the next frame from the core put it straight back.
+    """
+
+    session_id: str
+    delta: int
+
+
+@dataclass(frozen=True)
+class MoveWatch:
+    """alt+↑ / alt+↓ on a watch box: the right column's half of `MoveSession`.
+
+    Same shape and same reasons — see there. ``ref`` is the string every panel
+    row carries; a watch id is an int, and that conversion is the sender's
+    errand (`protocol.PanelRow`), which is `client.py`'s side of the line.
+    """
+
+    ref: str
+    delta: int
+
+
+@dataclass(frozen=True)
 class SaveSettings:
     """The whole settings file, as the config editor left it (§4.3 item 26).
 
@@ -1387,6 +1422,26 @@ class SaveProfile:
     name: str
     kind: str  # "memories" or "archive"
     text: str
+
+
+@dataclass(frozen=True)
+class EditProfile:
+    """Open one of a profile's two files in `$EDITOR`, and save what comes back.
+
+    The counterpart of `SaveProfile` for the profiles screen's other editor:
+    the same two kinds, the same profile named by name, and no text — because
+    the whole point of this one is that the text is fetched, edited outside
+    the app and written back by the side holding the wire
+    (`UIClient.edit_profile`).
+
+    The profile is named rather than assumed. A screen sends this about the
+    row under the cursor, which is not usually the profile the core is
+    working under, and a command that meant "the active one" is what made the
+    old ctrl+e edit a file nobody had selected.
+    """
+
+    name: str
+    kind: str  # "memories" or "archive"
 
 
 @dataclass(frozen=True)
@@ -1577,11 +1632,14 @@ Intent = (
     | Answer
     | Peek
     | Drop
+    | MoveSession
+    | MoveWatch
     | SaveSettings
     | SetThinking
     | SetBackend
     | SetProfile
     | SaveProfile
+    | EditProfile
     | CreateProfile
     | CopyProfile
     | DeleteProfile
