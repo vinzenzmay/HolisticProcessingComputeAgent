@@ -697,12 +697,17 @@ class TestWorkingProfile:
 
 
 class TestHeadless:
-    def test_the_service_does_not_import_textual(self):
+    def test_the_service_does_not_import_the_front_end(self):
         """The rule `hpca.core` exists to enforce (see its __init__): a runtime
-        that can reach for a widget is a runtime that only runs in the UI."""
+        that can reach for a widget is a runtime that only runs in the UI.
+
+        `textual` is checked alongside `hpca.ui` because the dependency is gone
+        as of M9 and this is one of the places that would notice it returning.
+        """
         code = (
             "import sys, hpca.core.memory_service; "
-            "assert not [m for m in sys.modules if m.startswith('textual')], "
-            "sorted(m for m in sys.modules if m.startswith('textual'))"
+            "leaked = sorted(m for m in sys.modules "
+            "if m.startswith('textual') or m.startswith('hpca.ui')); "
+            "assert not leaked, leaked"
         )
         subprocess.run([sys.executable, "-c", code], check=True)

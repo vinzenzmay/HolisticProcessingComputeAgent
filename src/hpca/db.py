@@ -53,7 +53,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     backend TEXT NOT NULL DEFAULT '',
     -- Thinking effort (hpca.thinking): off | low | medium | xhigh. Empty means
     -- "use agent.default_thinking", same convention as mode above.
-    thinking TEXT NOT NULL DEFAULT ''
+    thinking TEXT NOT NULL DEFAULT '',
+    -- When something last happened in this conversation, ISO-8601 UTC: a turn
+    -- submitted, or one recorded. What the sidebar shows next to the title, so
+    -- a column of thirty sessions says which ones are alive. Empty means never
+    -- touched since the column arrived; the backfill below seeds it.
+    last_active TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS symbols (
     name TEXT NOT NULL,
@@ -140,6 +145,7 @@ ADDED_COLUMNS = [
     ("sessions", "mode", "TEXT NOT NULL DEFAULT ''"),
     ("sessions", "backend", "TEXT NOT NULL DEFAULT ''"),
     ("sessions", "thinking", "TEXT NOT NULL DEFAULT ''"),
+    ("sessions", "last_active", "TEXT NOT NULL DEFAULT ''"),
     ("watches", "position", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
@@ -152,8 +158,14 @@ ADDED_COLUMNS = [
 # ``id`` is the autoincrement they were already sorted by, so copying it across
 # preserves exactly the order the user last saw, and leaves every position at or
 # above 1 — which is what makes "position = 0" mean "not backfilled yet".
+#
+# A session that existed before `last_active` did has no record of when it was
+# last worked in — the messages have stamps only from the same release. Its
+# creation is the one honest thing left to say about it, and it is at least the
+# right order of magnitude for a sidebar people read as "old / recent".
 BACKFILLS = [
     "UPDATE watches SET position = id WHERE position = 0",
+    "UPDATE sessions SET last_active = created_at WHERE last_active = ''",
 ]
 
 # Indexes an older database may still carry under an old definition.

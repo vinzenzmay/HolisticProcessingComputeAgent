@@ -67,10 +67,12 @@ from hpca.runner import running_session_ids
 from hpca.sessions import Session, SessionStore
 from hpca.skills import (
     Skill,
+    SkillLevel,
     copy_profile_skills,
     delete_own_skill,
     delete_profile_skills,
     load_own_skills,
+    load_project_skills,
     load_skills,
     patched_body,
     skill_path,
@@ -202,6 +204,14 @@ class MemoryService:
 
     def _cap(self) -> int:
         return self._settings().system_prompt_token_cap
+
+    @property
+    def project_root(self) -> Path | None:
+        """Where project-level skills are read from, or None for the working
+        directory. Public because the slash commands that list and remove
+        skills have to look in the same place this service writes them, and
+        two answers to "which project" would silently disagree in a test."""
+        return self._project_root
 
     # ------------------------------------------------------------ snapshots
 
@@ -725,6 +735,88 @@ class MemoryService:
 
     # ----------------------------------------------------- profile / skills
 
+    def profile_body(self, name: str, kind: str) -> tuple[str, str]:
+        """One editable profile file as text, and why it could not be read.
+
+        The read half of :meth:`save_profile_memories` /
+        :meth:`save_profile_archive`, and it belongs beside them because they
+        are the pair that has to agree about *which bytes*: the save writes
+        verbatim, so a read that returned anything but the file itself would
+        turn every edit into a silent rewrite of what it failed to show.
+
+        Hence the raw file rather than ``Profile.load(name).render()``, which
+        is what a front-end was doing. A memory file the parser choked on is
+        exactly the one someone opens an editor to fix, and rendering the
+        parsed subset back would delete the lines it could not read — with the
+        user believing they had just saved them.
+
+        Returns ``(text, error)``. A file that is not there is "", not an
+        error: a fresh profile has no archive yet, and refusing to open an
+        editor over it would leave no way to write the first line. An error is
+        for a name nothing answers to, or a file that exists and would not be
+        read — both cases where an editor must refuse rather than edit blind.
+        """
+        if name not in Profile.list_profiles():
+            return "", f"There is no profile called “{name}”."
+        if kind == "archive":
+            path = curator.archive_path(name)
+        elif kind == "memories":
+            path = Profile.path_for(name)
+        else:  # pragma: no cover - the protocol only admits the two kinds
+            return "", f"There is no “{kind}” to edit."
+        return self._read(path)
+
+    def skill_body(self, profile: str, name: str) -> tuple[str, str]:
+        """One skill file the user owns, verbatim, and why not.
+
+        The same two levels :meth:`delete_profile_skill` removes — this
+        profile's and this project's — because they are the two a front-end
+        draws as removable and offers to open (`SkillInfo.removable`). A
+        shared or shipped skill is still refused: it is not this profile's to
+        edit, and handing its body to an editor whose save would land in the
+        profile's own directory would silently fork it.
+
+        It was own-only for a milestone while the screens had already widened,
+        so a skill created at the project level appeared on the profile's
+        skills screen and answered Enter with "has no skill of its own"
+        (specs-ui-coverage.md §9.9).
+        """
+        # Project before profile on a name clash, matching load precedence and
+        # `delete_profile_skill`: the file the user can see is the one they
+        # mean to open.
+        for skill in load_project_skills(project_root=self._project_root):
+            if skill.name == name:
+                return self._read(
+                    skill_path(
+                        name,
+                        profile,
+                        level="project",
+                        project_root=self._project_root,
+                    )
+                )
+        for skill in load_own_skills(profile):
+            if skill.name == name:
+                return self._read(skill_path(name, profile))
+        return "", f"Profile “{profile}” has no skill “{name}” of its own."
+
+    def own_skills(self, profile: str) -> list[Skill]:
+        """The skills a profile may edit and delete — its own, never shared."""
+        return load_own_skills(profile)
+
+    @staticmethod
+    def _read(path: Path) -> tuple[str, str]:
+        """``(text, error)`` for one file. Missing is empty, not an error."""
+        try:
+            return path.read_text(), ""
+        except FileNotFoundError:
+            return "", ""
+        except OSError as e:
+            return "", f"Could not read {path.name}: {e.strerror or e}"
+        except UnicodeDecodeError:
+            # A file an editor cannot show is a file a verbatim save would
+            # destroy; better to refuse than to hand back a lossy decode.
+            return "", f"{path.name} is not text."
+
     def save_profile_memories(self, name: str, text: str) -> None:
         """Persist the raw memory text a user edited; report parse trouble but
         never lose their edits — the file is theirs to fix by hand (§6.4)."""
@@ -751,10 +843,20 @@ class MemoryService:
             path.unlink()
             self._notify(f"Cleared archive for “{name}”.")
 
-    def save_skill_file(self, profile: str, name: str, text: str) -> None:
+    def save_skill_file(
+        self, profile: str, name: str, text: str, *, level: SkillLevel = "profile"
+    ) -> None:
         """Persist a hand-edited skill file verbatim (front matter and body).
-        The user owns the file; a parse problem is reported, never fatal."""
-        path = skill_path(name, profile)
+        The user owns the file; a parse problem is reported, never fatal.
+
+        ``level`` is where it lands — the profile's own directory, the shared
+        one every profile sees, or this project's. It defaults to the
+        profile's, which is where an edited file came from and where a
+        self-review patch goes, so the editor paths need no opinion about it.
+        """
+        path = skill_path(
+            name, profile, level=level, project_root=self._project_root
+        )
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text if text.endswith("\n") else text + "\n")
         if profile == self._deps.profile:
@@ -762,11 +864,27 @@ class MemoryService:
         self._notify(f"Saved skill “{name}”.")
 
     def delete_profile_skill(self, profile: str, name: str) -> None:
-        """Delete one of a profile's own skills (never shared/project)."""
-        skill = next(
-            (s for s in load_own_skills(profile) if s.name == name), None
+        """Delete one skill the user owns: this profile's, or this project's.
+
+        The two removable levels, and only those — `delete_own_skill` will not
+        touch `_shared/` or the shipped files, because removing one would
+        silently change every other profile that sees it. The project's are
+        here because a project skill is written from the creator like any
+        other and would otherwise be listed as removable and refuse to go.
+        """
+        by_name = {s.name: s for s in load_own_skills(profile)}
+        # Project shadows profile on a name clash, matching load precedence:
+        # the file the user can see is the one they mean to remove.
+        by_name.update(
+            {
+                s.name: s
+                for s in load_project_skills(project_root=self._project_root)
+            }
         )
-        if skill is None or not delete_own_skill(skill, profile):
+        skill = by_name.get(name)
+        if skill is None or not delete_own_skill(
+            skill, profile, project_root=self._project_root
+        ):
             self._notify(f"No skill “{name}” to delete.", "warning")
             return
         if profile == self._deps.profile:

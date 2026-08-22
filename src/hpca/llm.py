@@ -33,6 +33,18 @@ Message = dict[str, Any]
 # encoding below substitutes it for the content.
 API_CONTENT_KEY = "api_content"
 
+# When a message was added to the thread, ISO-8601 UTC. Stamped once, by the
+# reducer that appends it (`hpca.agent.graph`), so the chat can say when each
+# turn happened and a session can say when it was last worked in.
+#
+# On the message rather than in a record anchored to its index — the way
+# reasoning and tool calls are kept — because a stamp is *of* the message
+# rather than about the turn around it, and because an anchored record would
+# have to be trimmed in step with every rollback and fork that moves a message.
+# Safe there because `wire_messages` below whitelists what a backend sees: an
+# extra key on a stored message cannot reach a model.
+STAMP_KEY = "at"
+
 
 # Keys the native tool-calling protocol needs on the wire: the assistant's
 # calls, and the id + name that tie a tool-role result back to one of them.

@@ -51,12 +51,32 @@ sessions, and supervise running sub-processes and cluster jobs.
 
 ### 3.1 Framework
 
-**Textual** (Python, async-first). Reasons: proper layout system for the three-column
-design, CSS-like styling, native `Header`/`Footer` widgets (the footer renders
-keybindings exactly like the required bottom hotkey bar), modal screens for
-interactive resolution, runs in any terminal incl. over SSH, and — critically for an
-agent — an async event loop so streaming LLM output and tool execution never freeze
-the UI. `App.suspend()` is used to drop into external editors (see §6.4).
+**None.** The UI is a few thousand lines that turn state into a list of strings and
+write the ones that changed, over asyncio and the standard library.
+
+It was built on **Textual** until v0.26.0, for reasons that were good at the time: a
+real layout system for the three-column design, CSS-like styling, `Header`/`Footer`
+widgets that render the hotkey bar for free, modal screens, and an async event loop
+so streaming output never freezes the UI. What replaced it keeps every one of those
+properties except the styling, and the styling was never load-bearing.
+
+The reason for the move is measured, and written up in
+[specs-ui-baseline.md](specs-ui-baseline.md): Textual's *repaint* is flat and
+perfectly fine, but its *arrange* pass is O(conversation) — 2.9 ms at 100 chat
+entries, 126 ms at 5000, and 994 ms at the 95th percentile, which is a second of
+frozen terminal on a keypress. A scroll invalidates layout, so a long session pays
+it on every arrow key. Cold-opening a 5000-entry session took 15 seconds, because it
+mounts one widget per entry. The replacement is flat at ~0.19 ms from 100 entries to
+20,000, because only the visible slice is ever turned into lines.
+
+Two consequences worth stating plainly, because they are the cost side: there is no
+style cascade and no arrange pass, so anything the layout does it does explicitly;
+and cell widths, escape decoding and the alternate screen are ours to get right
+rather than a dependency's. §3.2 onward is that layout; `ui/ansi.py` is the width
+and escape handling.
+
+Dropping into an external editor no longer needs `App.suspend()` — the UI restores
+the terminal, runs the editor, and takes it back (see §6.4).
 
 ### 3.2 Layout
 
@@ -289,9 +309,10 @@ Notes:
 * Terminals cap OSC 52 payloads (commonly ~100 KB base64). Above
   `clipboard.osc52_limit_kb`, skip OSC 52 and go straight to the file fallback with a
   notice.
-* Textual's built-in `copy_to_clipboard` emits plain OSC 52 without multiplexer
-  wrapping — do **not** use it; write raw sequences through the Textual driver
-  (~150 lines total).
+* OSC 52 is written as raw sequences, with the multiplexer wrapping tmux and screen
+  need — a plain unwrapped OSC 52 is silently swallowed inside either. (This was
+  originally a warning not to use Textual's `copy_to_clipboard`, which emitted
+  exactly that unwrapped form.)
 * README must state: tmux users need `set -g set-clipboard on` (or
   `allow-passthrough on`) for the system-clipboard path; the tmux buffer fallback
   works regardless.
@@ -1123,10 +1144,10 @@ backend `/tokenize` call in the shipped code). When a write would exceed the cap
 is blocked with a notification prompting the user to condense; the `rag` scope is
 not metered. Cleanup paths:
 
-* **Edit externally** — via Textual's `App.suspend()`: restore the terminal, open
-  `$VISUAL`/`$EDITOR`/`nano` on the profile file, reinstate the TUI on exit. On
-  return the file is re-parsed and validated; the user can move a memory between
-  scopes simply by moving its block between the two headings.
+* **Edit externally** — the UI restores the terminal, opens
+  `$VISUAL`/`$EDITOR`/`nano` on the profile file, and takes the terminal back on
+  exit. On return the file is re-parsed and validated; the user can move a memory
+  between scopes simply by moving its block between the two headings.
 * **Condense with the LLM** — the model drafts a shorter version for approval,
   never auto-applied.
 * **Demote** — an op that moves a `system-prompt` entry into `rag` to free the
@@ -1176,7 +1197,6 @@ editor (`c`) and by hand. Sketch:
 Constraints: no root, no daemons, installable into a venv/conda env on the cluster.
 
 * `python3` (≥ 3.11)
-* `textual` — TUI
 * `langgraph`, `langchain-core` — agent graph, checkpointing, interrupts
 * `httpx` + OpenAI-compatible client (or `langchain-openai`) — any backend behind an
   SSH tunnel

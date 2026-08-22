@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 
 from hpca.agent.hints import MODEL_HINTS
 from hpca.agent.history import is_tool_call_message
-from hpca.llm import Message
+from hpca.llm import STAMP_KEY, Message
 
 TOOL_PREFIXES = ("[tool result]", "[tool error]")
 # The lines themselves — a script's, or the two sides of an edit — rendered as
@@ -174,6 +174,13 @@ class Entry:
     # rides its user message, live rows predate the graph copy). What the chat
     # rewind (fork / roll back) uses to name its cut point.
     index: int = -1
+    # When the message this entry reads was added, ISO-8601 UTC, straight off
+    # `llm.STAMP_KEY`. Empty for the entries that are not one message: a
+    # thinking box folds several and a live row predates the graph copy, and
+    # neither can honestly name an instant. Empty too for a thread written
+    # before there were stamps, which is what makes "" mean "not known"
+    # rather than "the epoch".
+    at: str = ""
 
     def summary(self) -> str:
         """One-line gist, for the collapsed box: only what is actually there."""
@@ -348,6 +355,32 @@ def live_step(payload: dict) -> Step:
     return result_step(str(payload.get("text", "")))
 
 
+def thinking_entry(parts: list[Step]) -> Entry:
+    """The one entry a turn's working folds into.
+
+    Public, and the only place that fold is written, because two callers have
+    to agree about it exactly: :func:`build_entries` closing the box at the end
+    of a turn, and the core drawing the same box *while* the turn runs (see
+    ``hpca.core.scheduler``). If those two disagreed by a field, a re-opened
+    session would visibly rearrange itself against what the user watched
+    happen — which is the bug the old chat rebuild paid for.
+
+    The counters are derived from the parts rather than passed in: a result
+    lands by filling in the call it answers (:meth:`Step.attach`), so "how many
+    steps" is exactly "how many parts have their answer", and asking the parts
+    is the only version of that count which cannot drift from what is shown.
+    """
+    return Entry(
+        kind=THINKING,
+        text=_block(parts),
+        steps=sum(1 for part in parts if part.kind != "reasoning" and part.done),
+        reasoning_chars=sum(
+            len(part.text) for part in parts if part.kind == "reasoning"
+        ),
+        parts=list(parts),
+    )
+
+
 def clip(text: str) -> str:
     if len(text) <= ARGUMENTS_CHARS:
         return text
@@ -399,15 +432,7 @@ def build_entries(
     def flush() -> None:
         nonlocal pending, steps, reasoning_chars
         if pending:
-            entries.append(
-                Entry(
-                    kind=THINKING,
-                    text=_block(pending),
-                    steps=steps,
-                    reasoning_chars=reasoning_chars,
-                    parts=list(pending),
-                )
-            )
+            entries.append(thinking_entry(pending))
         pending, steps, reasoning_chars = [], 0, 0
 
     def open_calls(index: int) -> None:
@@ -440,9 +465,10 @@ def build_entries(
             # record instead — same call, arguments unfolded — which
             # ``open_calls`` has already put in the open thinking box.
             continue
+        at = str(message.get(STAMP_KEY) or "")
         if role == ASSISTANT:
             flush()  # the answer closes the box that produced it
-            entries.append(Entry(kind=ASSISTANT, text=content, index=index))
+            entries.append(Entry(kind=ASSISTANT, text=content, index=index, at=at))
         elif is_tool_message(message):
             # Onto the call it answers, so the exchange is one part. A tail
             # that begins between a call and its result has no call to land
@@ -455,12 +481,15 @@ def build_entries(
             steps += 1
         elif is_event_message(message):
             flush()
-            entries.append(Entry(kind=EVENT, text=content, index=index))
+            entries.append(Entry(kind=EVENT, text=content, index=index, at=at))
         else:
             flush()
-            entries.append(Entry(kind=USER, text=content, index=index))
+            entries.append(Entry(kind=USER, text=content, index=index, at=at))
             recalled = recalled_text(message)
             if recalled:
-                entries.append(Entry(kind=RECALL, text=recalled))
+                # The recall rides its user message, so it happened when that
+                # message did — the one entry with no index of its own that
+                # can still name an instant.
+                entries.append(Entry(kind=RECALL, text=recalled, at=at))
     flush()  # a turn interrupted for approval leaves its box open
     return entries

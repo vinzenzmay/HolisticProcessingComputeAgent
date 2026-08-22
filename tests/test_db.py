@@ -56,6 +56,48 @@ class TestInitDb:
         conn.close()
 
 
+class TestTheLastActiveBackfill:
+    """A session made before the column existed still has to say something.
+
+    Its messages have no stamps either — those arrived in the same release —
+    so its creation is the one honest thing left, and it is at least the right
+    order of magnitude for a sidebar people read as "old / recent".
+    """
+
+    def old_database(self, tmp_path):
+        """A sessions table exactly as it was before `last_active`."""
+        conn = connect(tmp_path / "hpca.db")
+        conn.execute(
+            "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, profile TEXT "
+            "NOT NULL, title TEXT, created_at TEXT, checkpoint_ref TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s1', 'default', 'old one', "
+            "'2026-01-02T03:04:05+00:00', 's1')"
+        )
+        conn.commit()
+        return conn
+
+    def test_an_old_row_is_seeded_from_its_creation(self, tmp_path):
+        conn = self.old_database(tmp_path)
+        init_db(conn)
+        row = conn.execute("SELECT last_active FROM sessions").fetchone()
+        assert row["last_active"] == "2026-01-02T03:04:05+00:00"
+        conn.close()
+
+    def test_and_a_second_start_does_not_undo_a_touch(self, tmp_path):
+        # The backfill runs on every start, not once, so it has to be written
+        # to only touch rows that have never been touched.
+        conn = self.old_database(tmp_path)
+        init_db(conn)
+        conn.execute("UPDATE sessions SET last_active = '2030-01-01T00:00:00+00:00'")
+        conn.commit()
+        init_db(conn)
+        row = conn.execute("SELECT last_active FROM sessions").fetchone()
+        assert row["last_active"] == "2030-01-01T00:00:00+00:00"
+        conn.close()
+
+
 class TestWatchUniqueness:
     """Watches are session-scoped; the index that enforced profile-scoping has
     to actually go, or an existing database keeps applying the old rule."""

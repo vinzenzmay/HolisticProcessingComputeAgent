@@ -2,6 +2,7 @@
 
 from hpca.agent.hints import MODEL_HINTS
 from hpca.agent.history import tool_call_message
+from hpca.llm import STAMP_KEY
 from hpca.transcript import (
     RESULT_RULE,
     Entry,
@@ -522,3 +523,57 @@ class TestModelFacingFramingIsNotShown:
         table = "a     1\nbb    2"
         text, _ = result_text(f"[tool result] run_bash: ran (exit 0).\n\n{table}")
         assert table in text
+
+
+class TestEntriesCarryTheirInstant:
+    """`Entry.at`: when the message this entry reads was added.
+
+    Straight off `llm.STAMP_KEY`, which `graph._append_messages` puts on every
+    message as it arrives. Read here rather than stamped here, because a
+    transcript is a *reading* of stored messages — one built twice must come
+    out the same, and a clock read at render time would not.
+    """
+
+    AT = "2026-08-21T12:34:56+00:00"
+
+    def said(self, **extra):
+        return {"role": "user", "content": "what is the coverage?", STAMP_KEY: self.AT}
+
+    def test_a_message_gives_its_entry_the_stamp(self):
+        [entry] = build_entries([self.said()])
+        assert entry.at == self.AT
+
+    def test_and_so_does_an_answer(self):
+        entries = build_entries(
+            [self.said(), {"role": "assistant", "content": "31x", STAMP_KEY: self.AT}]
+        )
+        assert entries[-1].at == self.AT
+
+    def test_a_message_with_no_stamp_says_nothing(self):
+        # A thread written before there were stamps. "" means "not known",
+        # where a zero would mean the epoch.
+        [entry] = build_entries([{"role": "user", "content": "hi"}])
+        assert entry.at == ""
+
+    def test_a_recall_rides_the_message_it_came_with(self):
+        # The one entry with no index of its own that can still name an
+        # instant: it happened when the message carrying it did.
+        message = self.said()
+        message["api_content"] = (
+            "what is the coverage?\n\n<memory-context>\n"
+            "Past struggle (2026-06-02): dry-runs fail here.\n</memory-context>"
+        )
+        entries = build_entries([message])
+        assert [e.kind for e in entries] == ["user", "recall"]
+        assert [e.at for e in entries] == [self.AT, self.AT]
+
+    def test_a_thinking_box_names_no_instant(self):
+        # It folds several messages, so there is no one moment it happened at.
+        entries = build_entries(
+            [
+                self.said(),
+                {"role": "assistant", "content": "31x", STAMP_KEY: self.AT},
+            ],
+            calls=[{"after": 1, "tool": "read_file", "arguments": {}}],
+        )
+        assert [e.at for e in entries if e.kind == "thinking"] == [""]

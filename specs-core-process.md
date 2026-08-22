@@ -170,9 +170,12 @@ One envelope in both directions:
 | `session.rename` | `session_id`, `title` |
 | `session.retitle` | `session_id` |
 | `session.delete` | `session_id` |
+| `session.fork` | `session_id`, `index` — branch the conversation into a new session, cut before that entry; answered by `session.created`. The *entry index* crosses, not the `keep` count `fork_thread` takes: the core issued the index and is the only side that can still say whether it means what the user saw once a turn has appended. Deliberately allowed while the source is busy (see `session.rollback`) |
+| `session.rollback` | `session_id`, `index` — trim the conversation to before that entry, in place. Refused with a warning `notify` while a turn is running, a decision is unanswered or a message is queued (`TurnScheduler.rewind_blocker`). Gated where the fork is not because the consequences differ: a fork at a stale cut point leaves a session the user deletes, a rollback at one destroys messages that cannot come back |
 | `session.focus` | `session_id \| null` — which session the user is looking at (§4.4) |
 | `turn.submit` | `session_id`, `text`, `forced_skill?` |
 | `turn.interrupt` | `session_id` |
+| `turn.unqueue` | `session_id`, `seq` — take a typed-ahead message back out of the queue, named by the `Entry.seq` of the `queued` row the core drew for it. Not a queue position: the turn ahead can finish while the user is deciding, and a position would then quietly name the neighbour |
 | `decision.resolve` | `session_id`, `approved: bool`, `reason: str` |
 | `command.run` | `name`, `args`, `session_id?` — `/compact`, `/memorize`, `/conclude`, `/skill-*`. Session-scoped commands carry the id explicitly rather than letting the core infer it from the last `session.focus`, which may have moved on between the keystroke and the frame arriving |
 | `confirm.resolve` | `id`, `confirmed` — answers a `confirm.requested`; the core holds the continuation, only the yes/no crosses |
@@ -186,6 +189,7 @@ One envelope in both directions:
 | `skill.save` / `skill.delete` | `profile`, `name`, `text?` |
 | `process.kill` | `pid` |
 | `job.cancel` | `job_id` |
+| `watch.peek` | `watch_id` — the tail of a watched log, or a job's state; answered by `watch.peeked`. The only read-only command here, and still a command: the file is on a node the UI may not share (§4.2 rule 2) |
 | `watch.drop` | `watch_id` |
 | `shutdown` | — |
 
@@ -194,17 +198,21 @@ One envelope in both directions:
 | type | payload |
 |---|---|
 | `hello` | `version`, `profile`, `settings_digest` — first frame on connect |
-| `session.rows` | `rows: [{session_id, title, profile, mode, flags}]` — deliberately **not** `session.list`: `parse()` sees a frame without knowing which direction it travelled, so one type string cannot carry two payload shapes |
-| `chat.reset` | `session_id`, `entries: [Entry]` — on open only |
+| `session.rows` | `rows: [{session_id, title, profile, mode, last_active, flags}]` — `last_active` is when something last happened in that conversation, ISO-8601 **UTC**: the core and the front-end need not share a machine, so the wire carries the instant and the UI decides whose clock to write it in (`ui.state.when`). Stored on the session rather than read off the thread, because the sidebar draws every row at once and answering it from the transcript would mean opening every conversation to paint a list — deliberately **not** `session.list`: `parse()` sees a frame without knowing which direction it travelled, so one type string cannot carry two payload shapes |
+| `session.created` | `row: SessionRow` — a session the core just made and the UI is expected to open: the reply to `session.fork`, and what `session.new` needs too. The whole row, so one frame both opens it and fills the sidebar; `session.rows` re-states the sidebar but cannot say which line is new |
+| `chat.reset` | `session_id`, `entries: [Entry]` — on open only; also re-bases the row numbering (see `chat.update`). Each `Entry` carries `at`: when the message it reads was added, ISO-8601 UTC, stamped once by the reducer that appends it (`agent.graph._append_messages`) and read back by `transcript.build_entries`. Empty for the entries that are not one message — a `thinking` box folds several and cannot honestly name an instant |
 | `chat.append` | `session_id`, `entry: Entry` |
+| `chat.update` | `session_id`, `entry: Entry` — a row already on screen, revised in place; `Entry.seq` says which. Without it the chat is not append-only: a tool call that gains its result, and a `queued` entry becoming a `user` one, could only be expressed by resending the transcript — the per-turn rebuild this protocol exists to delete |
 | `turn.started` | `session_id` |
 | `turn.activity` | `session_id`, `activity`, `started_at` |
 | `turn.usage` | `session_id`, `prompt_tokens`, `max_model_len?` |
 | `turn.finished` | `session_id`, `reply?` |
 | `turn.failed` | `session_id`, `error` |
+| `turn.unqueued` | `session_id`, `seq`, `text` — a queued message was taken back: drop that row, and the text returns to the entry box, where an interrupt would also have left it |
 | `decision.requested` | `session_id`, `payload` (the graph interrupt value) |
 | `decision.cleared` | `session_id` |
 | `panel.update` | `profile`, `session_id?`, `rows: [PanelRow]` |
+| `watch.peeked` | `watch_id`, `title`, `text` — the answer to a `watch.peek`. Deliberately not a `notify`: it answers a keypress (so it echoes `reply_to`), two peeks can cross so the answer must name its box, and how long a tail stays on screen is the renderer's decision, not a timeout the core sets |
 | `memory.proposals` | `session_id`, `proposals` |
 | `confirm.requested` | `id`, `question` — a yes/no that is not a tool approval (triage offering a learned log signature). Deliberately not `decision.requested`: nothing is parked on it, and conflating them would make an unanswered offer look like a stalled session |
 | `context.estimate` | `session_id`, `used`, `window` |
@@ -213,7 +221,8 @@ One envelope in both directions:
 Three properties do the real work:
 
 1. **Snapshot then delta.** `session.open` yields one `chat.reset` with the
-   full entry list, then `chat.append` per new entry. This is where the
+   full entry list, then `chat.append` per new entry and `chat.update` per
+   revised one, each row addressed by the `Entry.seq` the core gave it. This is where the
    rebuild-the-whole-chat-per-turn cost at `tui/app.py:4095` dies. If it is not
    in the protocol from the start, the whole history crosses the socket every
    turn and the result is slower than today.
@@ -226,7 +235,11 @@ Three properties do the real work:
 ### 4.3 Entry and PanelRow
 
 `Entry` is the existing `transcript.Entry` (kind, text, parts) serialised as a
-dict. `PanelRow` is the existing `tui/app.py:242` dataclass minus its widget
+dict, plus one wire-only field: `seq`, the core-assigned per-session row name
+that `chat.update` addresses. It has no transcript twin because the transcript
+has no notion of a row being revised — it is rebuilt, which is the cost this
+protocol removes. `seq` is not `index`: `index` says which thread *message* an
+entry is (−1 for the many that are none), `seq` names the row on screen. `PanelRow` is the existing `tui/app.py:242` dataclass minus its widget
 payloads: `{key, text, classes, title, kind, ref}` where `ref` is the pid, job
 id or watch id the UI needs for `process.kill` / `job.cancel` / `watch.drop`.
 

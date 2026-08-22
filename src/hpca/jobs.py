@@ -1,9 +1,13 @@
-"""Job DB layer and polling cycle (§5.4).
+"""Job DB layer and the store half of the polling cycle (§5.4).
 
-``JobStore`` wraps the ``jobs``/``job_logs`` tables; ``poll_active`` is one
-poll iteration — query sacct for every non-terminal job, persist updates, and
-return the state changes so the TUI can notify. Jobs sacct does not know yet
-(accounting lag right after submission) simply stay in SUBMITTED.
+``JobStore`` wraps the ``jobs``/``job_logs`` tables; ``apply_statuses`` folds
+a batch of fresh sacct statuses into it and returns the state changes, so the
+caller can tell someone. Jobs sacct does not know yet (accounting lag right
+after submission) simply stay in SUBMITTED.
+
+The sacct call itself is the caller's — `core.pollers.poll_jobs` awaits it on
+the loop and runs the two store halves on the DB thread, which is why nothing
+here is async.
 """
 
 from __future__ import annotations
@@ -12,7 +16,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from hpca.slurm import JobStatus, SlurmClient, TERMINAL_STATES
+from hpca.slurm import JobStatus, TERMINAL_STATES
 
 
 def _now() -> str:
@@ -170,22 +174,16 @@ class JobStore:
         return JobRow(**{key: row[key] for key in JobRow.__dataclass_fields__})
 
 
-async def poll_active(slurm: SlurmClient, store: JobStore) -> list[StateChange]:
-    """One poll iteration; returns state changes for TUI notification."""
-    active = store.active()
-    if not active:
-        return []
-    statuses = await slurm.status([j.job_id for j in active])
-    return apply_statuses(store, active, statuses)
-
-
 def apply_statuses(
     store: JobStore, active: list[JobRow], statuses: dict[str, JobStatus]
 ) -> list[StateChange]:
     """Fold fresh sacct statuses into the store; returns the state changes.
 
-    Split from poll_active so the TUI can run the store halves on its DB
-    thread while awaiting sacct on the loop.
+    The store half of one poll iteration, on its own so that the caller can
+    run it on the DB thread while awaiting sacct on the loop —
+    `core.pollers.poll_jobs` is that caller and does exactly this. It was once
+    reached through a `poll_active` wrapper that made the sacct call itself;
+    nothing called that any more, so it is gone.
     """
     changes: list[StateChange] = []
     for job in active:

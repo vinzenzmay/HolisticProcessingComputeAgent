@@ -15,6 +15,7 @@ import pytest
 from hpca.config import LLMSettings
 from hpca.llm import (
     PROBE_SCHEMA,
+    STAMP_KEY,
     ChatResponse,
     LLMClient,
     LLMError,
@@ -377,6 +378,16 @@ class TestNativeTools:
 class TestWireMessages:
     def test_only_role_and_content_by_default(self):
         wired = wire_messages([{"role": "user", "content": "hi", "extra": "drop me"}])
+        assert wired == [{"role": "user", "content": "hi"}]
+
+    def test_the_stamp_never_reaches_a_backend(self):
+        # `graph._append_messages` puts one on every stored message, so this
+        # whitelist is the only thing keeping it off the wire — and a backend
+        # that validates strictly rejects the whole request over one unknown
+        # key, which would be every request rather than an odd one.
+        wired = wire_messages(
+            [{"role": "user", "content": "hi", STAMP_KEY: "2026-08-21T12:00:00+00:00"}]
+        )
         assert wired == [{"role": "user", "content": "hi"}]
 
     def test_tool_protocol_keys_survive(self):

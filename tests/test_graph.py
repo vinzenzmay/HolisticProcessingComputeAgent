@@ -1,6 +1,7 @@
 """Tests for hpca.agent.graph: the checkpointed orchestrator loop (§4.1, §4.2)."""
 
 import json
+from datetime import datetime
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
@@ -164,7 +165,18 @@ class TestDirectResponse:
         result = await run_turn(graph, session_id="s1", user_text="hi")
         assert result.reply == "hello there"
         assert result.interrupt is None
-        assert result.messages[-1] == {"role": "assistant", "content": "hello there"}
+        assert result.messages[-1]["role"] == "assistant"
+        assert result.messages[-1]["content"] == "hello there"
+
+    async def test_and_stamped_with_when_it_was_added(self, tools):
+        # By the reducer, so every door into a thread stamps: a node returning
+        # messages, `run_turn`'s opening payload, `push_event`'s update.
+        llm = FakeLLM([respond_json("hello there")])
+        graph = make_graph(llm, tools)
+        result = await run_turn(graph, session_id="s1", user_text="hi")
+        stamps = [m.get("at") for m in result.messages if m["role"] != "system"]
+        assert all(stamps), f"an unstamped message got in: {result.messages}"
+        assert all(datetime.fromisoformat(x).tzinfo for x in stamps), "UTC on the wire"
 
     async def test_system_prompt_first(self, tools):
         llm = FakeLLM([respond_json()])
@@ -529,6 +541,24 @@ class TestFork:
         # the source is untouched (q2's turn is four messages: the question,
         # the call the model made, its result, the answer)
         assert await thread_message_count(graph, session_id="src") == 6
+
+    async def test_a_fork_does_not_redate_what_it_copies(self, tools):
+        from hpca.agent.graph import fork_thread
+
+        graph, _ = await self._two_turns(tools)
+        before = [
+            m["at"]
+            for m in (
+                await graph.aget_state({"configurable": {"thread_id": "src"}})
+            ).values["messages"][:2]
+        ]
+        copied = await fork_thread(
+            graph, source_session_id="src", target_session_id="dst", keep=2
+        )
+        # The reducer stamps what arrives *unstamped*, and these arrive with
+        # theirs — otherwise a fork of a week-old conversation would read as
+        # having all been said in the moment it was forked.
+        assert [m["at"] for m in copied] == before
 
     async def test_fork_trims_thinking_and_calls_to_the_cut(self, tools):
         from hpca.agent.graph import fork_thread

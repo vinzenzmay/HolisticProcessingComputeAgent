@@ -1,11 +1,20 @@
-"""Tests for the context meter (rendering and thresholds)."""
+"""The context meter's two pure functions: the bar and the thresholds.
 
-from hpca.tui.context_bar import (
-    BAR_CELLS,
-    ContextBar,
-    render_bar,
-    severity,
-)
+Written against `hpca/tui/context_bar.py` and repointed at `hpca/ui/meter.py`,
+which is where `render_bar` and `severity` now live — they were *copied* out of
+the Textual module rather than shared with it (see `meter`'s docstring), so
+this file would have become a collection error the day `tui/` went.
+
+What went with the widget is the widget's own state — measured versus
+estimated, the speed, the thinking level. That is `state.Context` now, and it
+is asserted claim for claim in
+`tests/test_ui_turn.py::TestTheContextMeterState`. The two assertions with no
+successor there — an overflowing bar staying inside its cells, and a small
+window reaching danger where a large one does not — are why the rest of this
+file stayed.
+"""
+
+from hpca.ui.meter import BAR_CELLS, render_bar, severity
 
 
 class TestRenderBar:
@@ -59,118 +68,3 @@ class TestSeverity:
         assert severity(29_500, 32_768) == "danger"
         # the same prompt is unremarkable on a large model
         assert severity(29_500, 192_000) == "ok"
-
-
-class TestWidgetState:
-    def test_no_reply_yet(self):
-        bar = ContextBar()
-        bar.set_window(32_000)
-        assert "no reply yet" in bar.text
-        assert "32,000" in bar.text
-
-    def test_measured_value_replaces_the_placeholder(self):
-        bar = ContextBar()
-        bar.set_window(32_000)
-        bar.set_used(8_000)
-        assert "8,000 / 32,000" in bar.text
-
-    def test_measured_supersedes_an_estimate(self):
-        bar = ContextBar()
-        bar.set_window(32_000)
-        bar.set_estimate(9_000)
-        assert "~9,000" in bar.text
-        bar.set_used(8_123)
-        rendered = bar.text
-        assert "8,123" in rendered
-        assert "~" not in rendered
-
-    def test_reset_clears_to_no_reply(self):
-        bar = ContextBar()
-        bar.set_window(32_000)
-        bar.set_used(8_000)
-        bar.reset()
-        assert "no reply yet" in bar.text
-
-    def test_window_can_arrive_after_the_usage(self):
-        """Discovery is async: a reply can land before the probe answers."""
-        bar = ContextBar()
-        bar.set_used(8_000)
-        assert "window unknown" in bar.text
-        bar.set_window(32_000)
-        assert "8,000 / 32,000" in bar.text
-
-
-class TestSpeed:
-    def test_appended_to_the_measured_line(self):
-        bar = ContextBar()
-        bar.set_window(32_000)
-        bar.set_used(8_000)
-        bar.set_speed(28.07)
-        assert "· 28 tok/s" in bar.text
-
-    def test_slow_turns_keep_a_decimal(self):
-        # Sub-10 rates (a big model, a loaded backend) round to uselessness
-        # as integers; that is exactly where the decimal carries information.
-        bar = ContextBar()
-        bar.set_used(8_000)
-        bar.set_speed(3.14)
-        assert "3.1 tok/s" in bar.text
-
-    def test_waits_for_a_measured_fill(self):
-        # Before the first reply the line says so; a speed with no fill to
-        # hang off would imply a turn that never happened.
-        bar = ContextBar()
-        bar.set_window(32_000)
-        bar.set_speed(28.0)
-        assert "no reply yet" in bar.text
-        assert "tok/s" not in bar.text
-
-    def test_none_and_reset_both_clear_it(self):
-        bar = ContextBar()
-        bar.set_used(8_000)
-        bar.set_speed(28.0)
-        bar.set_speed(None)
-        assert "tok/s" not in bar.text
-        bar.set_speed(28.0)
-        bar.reset()
-        bar.set_used(8_000)
-        assert "tok/s" not in bar.text
-
-
-class TestThinkingEffort:
-    """The session's thinking level, shown alongside the fill and the speed."""
-
-    def test_shown_before_the_first_reply(self):
-        # Unlike the fill, the level is known the moment a session is open —
-        # and "is this session about to think for two minutes?" is a question
-        # whose answer must not wait for the reply that proves it.
-        bar = ContextBar()
-        bar.set_window(32_000)
-        bar.set_effort("xhigh")
-        assert "no reply yet" in bar.text
-        assert "think xhigh" in bar.text
-
-    def test_appended_after_the_fill_and_the_speed(self):
-        bar = ContextBar()
-        bar.set_window(32_000)
-        bar.set_used(8_000)
-        bar.set_speed(28.0)
-        bar.set_effort("low")
-        assert bar.text.endswith("· think low")
-        assert bar.text.index("8,000") < bar.text.index("28 tok/s")
-        assert bar.text.index("28 tok/s") < bar.text.index("think low")
-
-    def test_off_is_shown_too(self):
-        # "off" is a state of the dial, not an absence of one: a user who has
-        # just turned thinking off needs to see that it took.
-        bar = ContextBar()
-        bar.set_used(8_000)
-        bar.set_effort("off")
-        assert "think off" in bar.text
-
-    def test_none_clears_it(self):
-        bar = ContextBar()
-        bar.set_used(8_000)
-        bar.set_effort("medium")
-        bar.set_effort(None)
-        assert "think" not in bar.text

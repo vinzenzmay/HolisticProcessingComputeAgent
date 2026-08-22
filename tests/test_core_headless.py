@@ -38,16 +38,22 @@ def test_the_walk_actually_found_the_services():
 
 @pytest.mark.parametrize("module", CORE_MODULES)
 def test_a_core_module_pulls_in_no_front_end(module: str):
+    # Both names, and neither is redundant. `hpca.ui` is the live rule: it is
+    # the front-end that exists, and a core module reaching into it is the
+    # coupling this whole package boundary is here to prevent. `textual` is a
+    # ratchet: the dependency is gone as of M9 and this is what would notice
+    # it coming back in through a core module rather than a UI one.
     code = (
         f"import sys, {module}; "
-        "leaked = sorted(m for m in sys.modules if m.split('.')[0] == 'textual'); "
+        "leaked = sorted(m for m in sys.modules "
+        "if m.split('.')[0] == 'textual' or m.startswith('hpca.ui')); "
         "assert not leaked, leaked"
     )
     result = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True
     )
     assert result.returncode == 0, (
-        f"{module} drags in Textual:\n{result.stderr}"
+        f"{module} drags in a front-end:\n{result.stderr}"
     )
 
 

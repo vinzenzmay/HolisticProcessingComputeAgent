@@ -52,6 +52,45 @@ class TestSessionStore:
         assert session.checkpoint_ref == session.session_id
 
 
+class TestLastActive:
+    """When something last happened here — the sidebar's right-hand column.
+
+    Stored on the session rather than read back off the thread, because the
+    sidebar draws every row at once and answering this from the transcript
+    would mean opening every conversation to paint a list.
+    """
+
+    def test_a_new_session_is_active_now(self, store):
+        # Being made is the first thing that happens in a conversation, so a
+        # session with no turns yet reads as new rather than as never having
+        # happened at all.
+        session = store.create(profile="default")
+        assert session.last_active == session.created_at
+
+    def test_and_it_survives_the_round_trip(self, store):
+        session = store.create(profile="default")
+        assert store.get(session.session_id).last_active == session.last_active
+
+    def test_touching_moves_it(self, store):
+        session = store.create(profile="default")
+        store.touch(session.session_id, "2030-01-01T00:00:00+00:00")
+        assert store.get(session.session_id).last_active == (
+            "2030-01-01T00:00:00+00:00"
+        )
+
+    def test_and_a_bare_touch_is_now(self, store):
+        session = store.create(profile="default")
+        store.touch(session.session_id, "2000-01-01T00:00:00+00:00")
+        store.touch(session.session_id)
+        assert store.get(session.session_id).last_active > session.created_at
+
+    def test_touching_one_leaves_the_others_alone(self, store):
+        a = store.create(profile="default")
+        b = store.create(profile="default")
+        store.touch(a.session_id, "2030-01-01T00:00:00+00:00")
+        assert store.get(b.session_id).last_active == b.last_active
+
+
 class TestDelete:
     def test_delete_removes_only_that_session(self, store):
         keep = store.create(profile="default", title="keep me")

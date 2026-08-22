@@ -24,31 +24,111 @@ blob the choice is stored as, are here.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import TYPE_CHECKING, Any, Callable
 
 import httpx
 
 from hpca.agent import compact
-from hpca.autoconnect import AutoConnectPlan, plan_auto_connect
+from hpca.autoconnect import AutoConnectPlan, offcluster_help, plan_auto_connect
 from hpca.cluster_endpoints import discover_cluster_endpoints
 from hpca.config import LLMBackend, LLMSettings, llm_settings_for
 from hpca.core.deps import CoreDeps
-from hpca.discover import DiscoveredBackend
+from hpca.discover import (
+    KEY_REQUIRED,
+    DiscoveredBackend,
+    is_reachable,
+    ordered_ports,
+    probe_endpoint,
+    scan_local_ports,
+)
 from hpca.embeddings import EmbeddingClient
 from hpca.llm import LLMClient
 from hpca.logs import LoggedLLM
-from hpca.protocol import ContextEstimate, Notify
+from hpca.protocol import (
+    BackendProbed,
+    ContextEstimate,
+    LLMEntry,
+    Notify,
+    TurnUsage,
+)
 from hpca.sessions import SessionStore
 
 if TYPE_CHECKING:
     from hpca.logs import SessionLog
 
+# Said once, at the end of startup, when nothing is listening where the
+# settings say a backend is. The parenthesis is the way back: the front-end
+# opens the manage-LLMs screen on this answer, and a user who closes it needs
+# to know which key reopens it.
+NO_BACKEND_MESSAGE = (
+    "No LLM backend is answering — pick or configure one here (m reopens this)."
+)
+
 # How a client is built from the settings that describe it. A seam rather than
 # a bare `LLMClient(...)` call so a test can count constructions and closes
 # without a socket ever being opened.
 ClientFactory = Callable[[LLMSettings], Any]
+
+# The localhost sweep, as a seam. Injected rather than called directly so a
+# test can drive `scan` without opening 64k sockets — and so the thread hop
+# around it (see `BackendRegistry._scan_local`) is exercised either way.
+PortScanner = Callable[..., Any]
+
+
+@dataclass
+class ScanResult:
+    """What one `backend.scan` turned up, and the state it has to be read
+    against.
+
+    Three fields because "the scan found nothing" is not one outcome. A
+    localhost sweep that finds nothing while the cluster's manifests declare a
+    live endpoint is a normal day on a compute node; the same empty sweep with
+    every configured backend also unreachable is the off-cluster case, and the
+    user needs the tunnel recipe. Only something holding all three can tell
+    those apart, which is why the verdict is minted here (`verdict`) rather
+    than left to whoever draws the panel.
+    """
+
+    local: list[DiscoveredBackend] = field(default_factory=list)
+    cluster: list[DiscoveredBackend] = field(default_factory=list)
+    reachable: dict[str, bool] = field(default_factory=dict)
+
+    @property
+    def found(self) -> int:
+        return len(self.local) + len(self.cluster)
+
+    def verdict(self, settings) -> tuple[str, str]:
+        """What this scan's emptiness means: ``(notice, help)``, both often "".
+
+        Minted here because it is the one reading that needs all three fields
+        at once, and a front-end holding only the rows would have to guess.
+
+        The localhost sweep is what is being explained — a manifest hit is a
+        cluster endpoint the sweep structurally cannot see, so finding one
+        means nothing is wrong and there is nothing to say. With neither, the
+        configured catalog decides which of two different things happened: a
+        backend that still answers makes this a scan that simply turned up
+        nothing *new* (a passing remark), and none answering is the
+        off-cluster case, where the user needs the tunnel recipe — several
+        lines to retype into a shell, so it wants a window that holds a
+        selection rather than a toast that dismisses itself.
+        """
+        if self.local or self.cluster:
+            return "", ""
+        if any(self.reachable.values()):
+            return (
+                "Nothing new on localhost — the backends you already have "
+                "still answer.",
+                "",
+            )
+        return "", offcluster_help(
+            settings.endpoints.login_target(), settings.endpoints.endpoints_dir
+        )
 
 
 def autoconnect_logger(app_dir: Path) -> logging.Logger:
@@ -109,6 +189,7 @@ class BackendRegistry:
         client_factory: ClientFactory = LLMClient,
         on_reload: Callable[[], None] | None = None,
         probe_transport: httpx.AsyncBaseTransport | None = None,
+        port_scanner: PortScanner = scan_local_ports,
         logger: logging.Logger | None = None,
     ) -> None:
         self._deps = deps
@@ -142,12 +223,25 @@ class BackendRegistry:
         # the app, which is what this used to be.
         self._on_reload = on_reload
         self._probe_transport = probe_transport
+        self._port_scanner = port_scanner
         self._logger = logger
+        # Endpoints a scan turned up that nobody has configured. Kept here
+        # rather than in the front-end because they are catalog rows with a
+        # flag on them (`protocol.LLMEntry.discovered`) — the same list, so a
+        # screen showing two panels is splitting one answer rather than
+        # keeping two in step. They outlive the scan so a second `llm.list`
+        # still draws them; only a rescan replaces them.
+        self._discovered: list[DiscoveredBackend] = []
         # The window the bootstrap backend reports when asked, and the last
         # measured prompt size per session — a different thread is a different
         # context, so this can never be one number.
         self._discovered_window: int | None = None
         self._context_used: dict[str, int] = {}
+        # The last generation each session paid for: (completion tokens, wall
+        # clock). Kept beside the prompt size rather than divided into a rate
+        # here, because the protocol carries both (`protocol.TurnUsage`) and
+        # this is the only place that has them.
+        self._last_generation: dict[str, tuple[int, float]] = {}
         self._closed = False
 
     # ------------------------------------------------------------- clients
@@ -244,35 +338,441 @@ class BackendRegistry:
 
     # ------------------------------------------------------------- catalog
 
-    def choices(self) -> list[LLMBackend]:
-        """The configured catalog, for whoever puts the picker up.
+    # The configured catalog with the api keys still on it was once offered
+    # here as `choices()`, "for callers inside the core". It had none: the two
+    # questions the core actually asks are `labels()` — what a command may pin
+    # an entry with — and `catalog()`, the drawable form that is the only one
+    # a front-end ever sees. `settings.backends` is where the list itself
+    # lives, and it is one attribute away for anyone who needs it whole.
 
-        Choosing is a front-end job — it was a modal — but the list being
-        chosen from belongs to the core, and so does what the choice is
-        stored as (`backend_for_new_session`).
+    def labels(self) -> dict[str, LLMBackend]:
+        """The catalog by the name a command may pin an entry with.
+
+        One place mints these, because two would eventually disagree and the
+        disagreement would look like "the backend I picked was ignored": the
+        same function fills `LLMEntry.label` for the front-end and resolves
+        what comes back in `session.new`.
+
+        The model name where it is unique, ``model @ host:port`` where it is
+        not — two vLLMs serving one model on two nodes are two entries a user
+        has to be able to tell apart, and a bare index would not survive the
+        catalog being reordered, which is the property the stored blob has and
+        a label must not lose. A catalog holding the very same model at the
+        very same endpoint twice is a duplicated settings entry rather than a
+        choice; the second copy is numbered so that every entry still has a
+        name, and neither name is silently unreachable.
         """
-        return list(self._deps.settings.backends)
+        counts: dict[str, int] = {}
+        for entry in self._deps.settings.backends:
+            counts[entry.model] = counts.get(entry.model, 0) + 1
+        out: dict[str, LLMBackend] = {}
+        for entry in self._deps.settings.backends:
+            label = entry.model
+            if counts.get(entry.model, 0) > 1:
+                label = f"{entry.model} @ {urlparse(entry.base_url).netloc}"
+            if label in out:
+                seq = 2
+                while f"{label} #{seq}" in out:
+                    seq += 1
+                label = f"{label} #{seq}"
+            out[label] = entry
+        return out
+
+    def catalog(self, *, reachable: dict[str, bool] | None = None) -> list[LLMEntry]:
+        """The catalog as a front-end draws it (`protocol.LLMCatalog`).
+
+        Never the `LLMBackend` objects themselves: they hold api keys, and a
+        picker only needs the name, the endpoint, the window and whether a key
+        is required — which is exactly what the manage-LLMs line has always
+        shown (`discover.DiscoveredBackend.details`).
+
+        ``reachable`` is the probe results by label when there are any. Absent
+        means "not asked", which is a third state and not a synonym for
+        disconnected: see `probe_catalog`.
+        """
+        settings = self._deps.settings
+        results = reachable or {}
+        rows = [
+            LLMEntry(
+                label=label,
+                model=entry.model,
+                base_url=entry.base_url,
+                max_model_len=entry.max_model_len,
+                # Whether there is a key, never the key. The line says "key:
+                # yes"; nothing on a screen ever needed more than that.
+                needs_key=entry.api_key is not None,
+                active=settings.is_active(entry),
+                reachable=results.get(label),
+            )
+            for label, entry in self.labels().items()
+        ]
+        # And what a scan turned up, in the same list with a flag on it. The
+        # manage-LLMs screen draws two panels out of this; they are two views
+        # of one answer rather than two lists that have to be kept in step,
+        # which is what made the old screen's dedup a screen-side problem.
+        rows += [
+            LLMEntry(
+                label=label,
+                model=found.model,
+                base_url=found.base_url,
+                max_model_len=found.max_model_len,
+                needs_key=found.needs_key,
+                active=(
+                    settings.llm.base_url == found.base_url
+                    and settings.llm.model == found.model
+                ),
+                # It answered a probe moments ago — a 401 included, which is
+                # an endpoint that is up and wants a key.
+                reachable=True,
+                discovered=True,
+            )
+            for label, found in self.discovered_labels().items()
+        ]
+        return rows
+
+    def discovered_labels(self) -> dict[str, DiscoveredBackend]:
+        """What a scan turned up, by the name a command may pin one with.
+
+        Minted against the configured labels as well as against each other,
+        because the two travel as one catalog: a discovered row reusing a
+        configured row's name would make `backend.set` ambiguous in the one
+        direction the user cannot see — the row they pointed at is not the
+        entry the core would resolve.
+        """
+        out: dict[str, DiscoveredBackend] = {}
+        taken = set(self.labels())
+        for found in self._discovered:
+            label = found.model
+            if label in taken:
+                label = f"{found.model} @ {urlparse(found.base_url).netloc}"
+            base, seq = label, 2
+            while label in taken:
+                label = f"{base} #{seq}"
+                seq += 1
+            taken.add(label)
+            out[label] = found
+        return out
+
+    def resolve_label(self, label: str) -> tuple[LLMBackend | None, str]:
+        """The backend a command's label names, or why it names none.
+
+        Configured entries first, then what a scan turned up — because the
+        screen's "add this to the list" is a `backend.set` on a discovered row
+        (`specs-ui-replacement.md` §4.2), and because a label is the only way
+        to name a key-locked backend without putting its key on the wire.
+
+        A key-locked scan hit resolves to nothing on purpose: `KEY_REQUIRED`
+        is a sentinel, not a model id, so an entry built from it would be a
+        catalog row nothing can serve. That needs the key form, which is a
+        different gesture, so it gets its own sentence rather than the generic
+        "no such backend".
+        """
+        entry = self.labels().get(label)
+        if entry is not None:
+            return entry, ""
+        found = self.discovered_labels().get(label)
+        if found is None:
+            return None, f"There is no backend called \u201c{label}\u201d."
+        if found.model == KEY_REQUIRED:
+            return None, (
+                f"{urlparse(found.base_url).netloc} needs an api key — check "
+                "it with one first, and its model name comes back with it."
+            )
+        return (
+            LLMBackend(
+                model=found.model,
+                base_url=found.base_url,
+                api_key=found.api_key,
+                max_model_len=found.max_model_len,
+            ),
+            "",
+        )
+
+    def remove(self, label: str) -> LLMBackend | None:
+        """Drop a catalog entry, named the way a picker knows it.
+
+        The other half of the `backend.set` that adds one. Configured entries
+        only: a discovered row is not in the file, so "removing" one would
+        remove something nobody wrote — which is exactly why the old screen's
+        `r` was inert on that panel.
+
+        The active backend is not exempt. Dropping it leaves `settings.llm`
+        describing an endpoint the catalog no longer lists, which is the state
+        a fresh install is already in and which both the picker and
+        auto-connect handle; refusing would make the entry a user most wants
+        to replace the one entry they cannot remove.
+        """
+        entry = self.labels().get(label)
+        if entry is None:
+            return None
+        settings = self._deps.settings
+        settings.backends = [
+            backend
+            for backend in settings.backends
+            if not (
+                backend.base_url == entry.base_url
+                and backend.model == entry.model
+            )
+        ]
+        settings.save()
+        return entry
+
+    async def probe_catalog(self) -> dict[str, bool]:
+        """Ask every configured endpoint whether it answers, all at once.
+
+        Concurrent because the endpoints are independent and a probe of a node
+        that has gone away costs the full timeout; serialised, a catalog of
+        five dead entries would take five timeouts before the first ● could be
+        drawn.
+
+        Authenticated where the entry has a key, because `is_reachable` counts
+        a 401 as reachable only when it was not given one — a stored key that
+        no longer works is a backend the user cannot use, and it should read
+        as disconnected rather than as connected.
+
+        Never raises: a probe is a nicety, and an endpoint that fails in a way
+        `is_reachable` does not catch must not cost the client its catalog.
+        """
+        entries = list(self.labels().items())
+        if not entries:
+            return {}
+
+        async def ask(entry: LLMBackend) -> bool:
+            try:
+                return await is_reachable(
+                    entry.base_url,
+                    api_key=entry.api_key,
+                    transport=self._probe_transport,
+                )
+            except Exception:
+                return False
+
+        answers = await asyncio.gather(*(ask(entry) for _, entry in entries))
+        return {label: bool(ok) for (label, _), ok in zip(entries, answers)}
+
+    # ---------------------------------------------------- probe and discover
+
+    def key_pool(self) -> list[str]:
+        """Every key that could unlock a locked endpoint, order-stable.
+
+        The remembered pool plus the keys already sitting on configured
+        backends: a key typed once for one backend is a key worth trying
+        against the next 401, which is what turns a "(api key required)" row
+        into a named model without another form.
+        """
+        settings = self._deps.settings
+        keys = list(settings.llm_api_keys)
+        for backend in settings.backends:
+            if backend.api_key and backend.api_key not in keys:
+                keys.append(backend.api_key)
+        return keys
+
+    async def probe(
+        self, base_url: str, api_key: str | None = None
+    ) -> BackendProbed:
+        """Ask one endpoint what it serves (`backend.probe`).
+
+        Three answers in two fields, as `protocol.BackendProbed` describes:
+        rows are the models it serves (one auto-fills a form, several are a
+        picker), no rows with ``needs_key`` is an endpoint that is there and
+        refused us, and neither is nothing OpenAI-shaped answering at all.
+
+        The key pool is offered only when the caller typed no key of its own,
+        which is the split the two old call sites had: a form validating a
+        typed key must report *that* key rejected rather than quietly succeed
+        on a stored one, while a bare check should try everything we have. A
+        typed key that works is remembered, so the next scan resolves locked
+        ports inline instead of listing sentinels.
+        """
+        try:
+            rows = await probe_endpoint(
+                base_url,
+                api_key=api_key or None,
+                api_keys=() if api_key else self.key_pool(),
+                transport=self._probe_transport,
+            )
+        except Exception:
+            # A probe is a question, not a turn: an endpoint that fails in a
+            # way `probe_endpoint` does not catch reads as "nothing answered".
+            rows = []
+        locked = [row for row in rows if row.model == KEY_REQUIRED]
+        rows = [row for row in rows if row.model != KEY_REQUIRED]
+        if rows and api_key:
+            settings = self._deps.settings
+            if settings.remember_llm_key(api_key):
+                settings.save()
+        return BackendProbed(
+            base_url=base_url,
+            models=[
+                LLMEntry(
+                    # The model id: this entry is in no catalog yet, so there
+                    # is nothing for a label to disambiguate it from.
+                    label=row.model,
+                    model=row.model,
+                    base_url=row.base_url,
+                    max_model_len=row.max_model_len,
+                    needs_key=row.needs_key,
+                    reachable=True,
+                    discovered=True,
+                )
+                for row in rows
+            ],
+            needs_key=bool(locked) and not rows,
+        )
+
+    async def scan(
+        self, on_found: Callable[[DiscoveredBackend], None] | None = None
+    ) -> ScanResult:
+        """Look for endpoints nobody has configured yet (`backend.scan`).
+
+        Two searches, run together because neither finds the other's hits: the
+        localhost sweep finds SSH-tunnelled backends, and the cluster's
+        manifest dir declares the ones living on a compute node's own IP,
+        which no localhost scan can see.
+
+        ``on_found`` fires per hit, on this loop, so the catalog can be
+        restated while the sweep is still running — the sweep is tens of
+        thousands of ports and a screen that filled only at the end would look
+        hung for the whole of it.
+
+        The result carries the reachability of the *configured* catalog too,
+        because that is half of what an empty scan means (`ScanResult`).
+        """
+        self.forget_discovered()
+        settings = self._deps.settings
+        cluster, local, reachable = await asyncio.gather(
+            self._scan_cluster(on_found),
+            self._scan_local(on_found),
+            self.probe_catalog(),
+        )
+        # Cluster first, deduped on (base_url, model): on a login node with a
+        # tunnel to the very server a manifest names, both passes report the
+        # same endpoint, and the manifest is the one that knows its name.
+        seen: set[tuple[str, str]] = set()
+        ordered: list[DiscoveredBackend] = []
+        for backend in [*cluster, *local]:
+            key = (backend.base_url, backend.model)
+            if key not in seen:
+                seen.add(key)
+                ordered.append(backend)
+        self._discovered = ordered
+        if settings.remember_llm_ports(b.base_url for b in local):
+            settings.save()  # the next scan starts with these ports
+        return ScanResult(local=local, cluster=cluster, reachable=reachable)
+
+    def forget_discovered(self) -> None:
+        """Drop what the last scan turned up.
+
+        A rescan replaces rather than adds: an endpoint that has since gone
+        away must stop being offered. Separate from `scan` so the caller can
+        say so *before* the sweep starts — those rows are stale from the
+        moment a rescan is asked for, and leaving them up for the length of a
+        64k-port sweep is the same lie the old panel told.
+        """
+        self._discovered = []
+
+    async def _scan_cluster(self, on_found) -> list[DiscoveredBackend]:
+        """The manifest pass. Off-cluster there is no Slurm and no manifests,
+        and this contributes nothing rather than failing."""
+        if self._deps.slurm is None:
+            return []
+        settings = self._deps.settings
+        try:
+            endpoints = await discover_cluster_endpoints(
+                settings.endpoints.dir_path(),
+                self._deps.slurm,
+                api_keys=self.key_pool(),
+                transport=self._probe_transport,
+            )
+        except Exception:
+            # Never in silence: an empty panel on a node with servers running
+            # is exactly the outcome that needs explaining, and the reason each
+            # manifest was dropped is already written there.
+            self.logger.exception("scan: cluster discovery failed")
+            return []
+        # Only the LLM role: the embeddings server is auto-wired to RAG and is
+        # not a backend anyone picks.
+        for backend in endpoints.llms:
+            self._note_discovered(backend, on_found)
+        return list(endpoints.llms)
+
+    async def _scan_local(self, on_found) -> list[DiscoveredBackend]:
+        """The localhost sweep, in a thread with its own loop.
+
+        Tens of thousands of connect attempts on the core's loop would starve
+        every session's turn for the length of the sweep — the Textual screen
+        had the same problem and solved it the same way. Hits come back
+        through `call_soon_threadsafe` because `deps.emit` puts events on
+        asyncio queues, and those are not thread-safe.
+        """
+        loop = asyncio.get_running_loop()
+        keys = self.key_pool()
+        ports = ordered_ports(self._priority_ports())
+
+        def hit(backend: DiscoveredBackend) -> None:
+            loop.call_soon_threadsafe(self._note_discovered, backend, on_found)
+
+        def sweep():
+            return asyncio.run(
+                self._port_scanner(ports, on_found=hit, api_keys=keys)
+            )
+
+        try:
+            return list(await asyncio.to_thread(sweep))
+        except Exception:
+            self.logger.exception("scan: localhost sweep failed")
+            return []
+
+    def _note_discovered(self, backend: DiscoveredBackend, on_found) -> None:
+        """One hit, on this loop: remembered, then announced.
+
+        Remembered first so that whatever `on_found` restates already contains
+        the row — the catalog is rebuilt from `_discovered`, not handed the
+        backend.
+        """
+        key = (backend.base_url, backend.model)
+        if any((b.base_url, b.model) == key for b in self._discovered):
+            return
+        self._discovered.append(backend)
+        if on_found is not None:
+            on_found(backend)
+
+    def _priority_ports(self) -> list[int]:
+        """Ports worth trying first: ones that have served an LLM before, then
+        the configured backends' own."""
+        settings = self._deps.settings
+        configured = (urlparse(b.base_url).port for b in settings.backends)
+        return [
+            *settings.known_llm_ports,
+            *(port for port in configured if port is not None),
+        ]
 
     def backend_for_new_session(
         self, requested: LLMBackend | str | None = None
-    ) -> str:
-        """The backend blob to store on a session about to be created.
+    ) -> str | None:
+        """The backend blob to store on a session about to be created, or None
+        when the label names nothing.
 
-        JSON rather than a catalog index, so the choice survives that entry
-        being dropped from the catalog later (`sessions.Session.backend`). An
-        empty string means the bootstrap client — what a run with no configured
-        backends gets, since then there is nothing to pick from.
+        Stored as JSON rather than as the label itself, so the choice survives
+        that entry being dropped from the catalog later
+        (`sessions.Session.backend`) — the label is how a *command* names a
+        backend, not how a session remembers one.
+
+        What crosses the wire is a label (`protocol.SessionNew`). It used to be
+        the blob, while the protocol documented a label, and the mismatch was
+        silent in the worst way: an unrecognised value returned "" and the
+        session was created against the bootstrap client as though nothing had
+        been asked for. So an empty request still means the bootstrap — that is
+        a real answer, and what a run with no configured backends gets — but a
+        label nothing in the catalog answers to comes back as None, for the
+        caller to report rather than absorb.
         """
         if requested is None or requested == "":
             return ""
         if isinstance(requested, LLMBackend):
             return requested.model_dump_json()
-        try:
-            return LLMBackend.model_validate_json(requested).model_dump_json()
-        except Exception:
-            # An unparseable blob would pin the session to nothing at all;
-            # the bootstrap client is at least something that answers.
-            return ""
+        entry = self.labels().get(requested)
+        return entry.model_dump_json() if entry is not None else None
 
     def marks_session_backend(
         self, backend: LLMBackend, *, session_id: str | None
@@ -320,9 +820,52 @@ class BackendRegistry:
         if self.sessions is not None:
             self.sessions.set_backend(session_id, blob)
         self._deps.emit(Notify(text=f"This session now uses {backend.model}"))
+        # A rate measured on the old model says nothing about the new one, and
+        # leaving it beside a restated fill would attribute one backend's speed
+        # to another. The prompt size survives: it counts the same thread.
+        self._last_generation.pop(session_id, None)
         # A different backend is a different window, so the fill this session
         # was showing describes the wrong denominator until it is restated.
         self._emit_estimate(session_id)
+        return True
+
+    async def set_default(
+        self, backend: LLMBackend, *, busy: bool = False
+    ) -> bool:
+        """Make one backend the default — what every un-pinned session uses.
+
+        The other half of `backend.set` (`switch_backend` is the per-session
+        one), and a different operation rather than the same one with a wider
+        blast radius: this writes the *settings*, so it outlives the run and
+        decides what the next session is created against, while a session
+        switch only rewrites one row.
+
+        Added to the catalog if it is not in it, for the same reason
+        `ensure_catalog` does it on the auto-connect path: a backend that is
+        active but unlisted is one the picker cannot show the user as chosen.
+        Its port and key are remembered too, so a later scan finds it first.
+
+        ``busy`` is whether ANY turn is in flight, because the client this
+        replaces is the one every un-pinned session is talking through.
+        Announced regardless of whether the rebuild happened: what was said is
+        that this endpoint is now the default, and a rebuild deferred by a
+        running turn (or skipped for an injected client) leaves that true — it
+        only delays which client speaks it, exactly as `auto_activate` argues.
+        """
+        settings = self._deps.settings
+        if not any(
+            entry.base_url == backend.base_url and entry.model == backend.model
+            for entry in settings.backends
+        ):
+            settings.backends.append(backend)
+        settings.activate_backend(backend)
+        settings.remember_llm_ports([backend.base_url])
+        settings.remember_llm_key(backend.api_key)
+        settings.save()
+        await self.reload(busy=busy)
+        self._deps.emit(
+            Notify(text=f"Sessions without a backend of their own now use {backend.model}")
+        )
         return True
 
     def model_for(self, session_id: str | None) -> str:
@@ -383,11 +926,35 @@ class BackendRegistry:
         # session's measurement so each re-measures on its next turn.
         self._discovered_window = None
         self._context_used.clear()
+        self._last_generation.clear()
         if self._on_reload is not None:
             self._on_reload()
         if old is not None:
             await _close_quietly(old)
         await self.discover_context_window()
+        return True
+
+    async def reload_embedder(self) -> bool:
+        """Rebuild RAG's client from the settings as they now stand.
+
+        The sibling of :meth:`reload` for the other client this registry owns,
+        and a different entry point from :meth:`wire_embedding` on purpose:
+        that one is *told* an endpoint by auto-connect and writes it into the
+        settings, while this one reads settings that have already changed —
+        which is what a hand-edited file is (`settings.save`).
+
+        Unconditional, because the caller is the one holding the before and
+        after and has already decided the section moved; and unlike the
+        bootstrap client there is no injected-by-the-host case to respect (see
+        the constructor: the embedder is owned either way).
+        """
+        rag = self._deps.settings.rag
+        old = self.embedder
+        self.embedder = EmbeddingClient(
+            base_url=rag.embedding_base_url, model=rag.embedding
+        )
+        if old is not None:
+            await _close_quietly(old)
         return True
 
     # --------------------------------------------------- context accounting
@@ -417,12 +984,56 @@ class BackendRegistry:
         its own number, so switching to it later shows its current fill instead
         of a stale zero or another session's count. Whether the update reaches
         a screen is the renderer's call now: the event names its session.
+
+        The same report carries the turn's speed — the completion count over
+        the wall clock our own client measured around the request (`llm.py`
+        puts ``request_seconds`` in this dict, since an OpenAI-style body has
+        no timing in it). Recorded before the early return, because a decision
+        that generated tokens took time whether or not the backend bothered to
+        say what the prompt cost.
         """
+        completion = usage.get("completion_tokens")
+        seconds = usage.get("request_seconds")
+        if completion and seconds:
+            self._last_generation[session_id] = (int(completion), float(seconds))
         prompt_tokens = usage.get("prompt_tokens")
         if not prompt_tokens:
             return
         self._context_used[session_id] = int(prompt_tokens)
-        self._emit_estimate(session_id)
+        self._emit_measured(session_id)
+
+    def _emit_measured(self, session_id: str) -> None:
+        """The backend's own count for one session (`turn.usage`).
+
+        A separate event from `context.estimate` because the two are different
+        claims about the same number: this one was reported by the model
+        server, the other is arithmetic over the stored history. The protocol
+        carries no measured/estimated flag, so the distinction has to be the
+        event type — and a client that draws them the same way is free to,
+        while one that marks an estimate with a "~" can.
+
+        Every path that restates a *known* fill goes through here rather than
+        through `_emit_estimate`, including a backend switch: a client that has
+        already seen a measured count ignores a later estimate for the same
+        session (it is a guess about a number it knows), so restating a new
+        window as an estimate would silently fail to move the meter.
+        """
+        completion, seconds = self._last_generation.get(session_id, (0, None))
+        self._deps.emit(
+            TurnUsage(
+                session_id=session_id,
+                prompt_tokens=self._context_used.get(session_id, 0),
+                max_model_len=self.max_model_len_for(session_id),
+                # Restated on every measurement rather than sent once, so the
+                # pair always travels with the fill it was measured beside and
+                # a client never has to remember which earlier frame the speed
+                # arrived in. Zero and None where there is nothing to report:
+                # see `switch_backend`, which drops a rate the new model did
+                # not earn.
+                completion_tokens=completion,
+                request_seconds=seconds,
+            )
+        )
 
     def estimate_context(self, session_id: str, values: dict) -> None:
         """How full a reopened session's context already is.
@@ -434,7 +1045,7 @@ class BackendRegistry:
         one — always supersedes the estimate.
         """
         if self._context_used.get(session_id):
-            self._emit_estimate(session_id)
+            self._emit_measured(session_id)
             return
         messages = list(values.get("messages", []))
         compacted = values.get("compacted")
@@ -449,21 +1060,32 @@ class BackendRegistry:
         Reopening then re-derives the fill from the stored history, which
         reflects compaction and any growth since; a running turn re-stores its
         count the next time it reports.
+
+        The speed goes with it, and for a sharper reason: it describes one
+        request made by one backend, so carrying it across a close would put a
+        rate from the old model beside a fill measured against the new one.
         """
         self._context_used.pop(session_id, None)
+        self._last_generation.pop(session_id, None)
 
     def _emit_estimate(self, session_id: str, *, used: int | None = None) -> None:
-        """Say how full one session's window is.
+        """Say how full one session's window is, as far as anyone can tell.
 
-        `ContextEstimate` carries no measured/estimated flag, so the number is
-        all that crosses and the precedence rule — a measured count always
-        beats an estimate — is applied here rather than left to whoever draws
-        it. A window of 0 means "not known yet": the protocol field is not
+        The precedence rule — a measured count always beats an estimate — is
+        applied here rather than left to whoever draws it: asked to restate a
+        session that has already reported real usage, this says so on the
+        measured channel instead (see `_emit_measured`).
+
+        A window of 0 means "not known yet": the protocol field is not
         optional, and an unknown window is exactly what the probe below exists
         to fix.
         """
         if used is None:
-            used = self._context_used.get(session_id, 0)
+            measured = self._context_used.get(session_id)
+            if measured:
+                self._emit_measured(session_id)
+                return
+            used = 0
         self._deps.emit(
             ContextEstimate(
                 session_id=session_id,
@@ -548,6 +1170,50 @@ class BackendRegistry:
         elif plan.notice:
             self._deps.emit(Notify(text=plan.notice))
         return plan
+
+    async def ensure_connected(self) -> bool:
+        """Whether the active backend answers — the last step of startup.
+
+        Without a live backend the app cannot do the one thing it is for, and
+        that used to show up only as a failed first turn: the settings say a
+        backend is configured, so nothing on screen looks wrong. This is the
+        moment to say otherwise. Auto-connect has already had its say, so if
+        the active backend still does not answer there is either nothing
+        configured yet (first run) or the tunnel to the cluster is down — and
+        both are fixed on the same screen, which the front-end opens on a
+        `False` here (`ui/boot.py`).
+
+        Only the *active* backend is probed: it is what a new session talks
+        to. Another catalog entry may well be up, and the screen shows it as
+        ● connected, one keypress away.
+
+        "Answers" means a usable answer — model rows we can actually reach
+        with the key this backend carries. A server that 401s the key we have
+        (or that we have no key for) is up, but not for us, and the first turn
+        would fail exactly as if it were down. Hence `probe_endpoint` rather
+        than `is_reachable`, which counts an unauthenticated 401 as reachable,
+        and hence no pool keys: a key that unlocks the endpoint but is not the
+        one on this backend does not make this backend usable.
+        """
+        llm = self._deps.settings.llm
+        if llm.base_url and llm.model:
+            try:
+                rows = await probe_endpoint(
+                    llm.base_url,
+                    api_key=llm.api_key,
+                    transport=self._probe_transport,
+                )
+            except Exception:
+                # A check must never be the thing that interrupts a working
+                # startup: what it cannot answer, it does not answer for.
+                self.logger.exception(
+                    "startup check: probing %s failed", llm.base_url
+                )
+                return True
+            if any(row.model != KEY_REQUIRED for row in rows):
+                return True
+        self._deps.emit(Notify(severity="warning", text=NO_BACKEND_MESSAGE))
+        return False
 
     def ensure_catalog(self, discovered: DiscoveredBackend) -> LLMBackend:
         """The catalog entry for a discovered endpoint, adding it if new."""
