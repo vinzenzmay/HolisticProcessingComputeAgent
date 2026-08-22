@@ -225,7 +225,7 @@ class TestARowArriving:
         last = len(ui.chat.items) - 1
         lines = [text.strip() for owner, text, _ in ui.chat.flat(WIDTH - 2)
                  if owner == last]
-        assert lines == ["▾ hpca", "one", "two"]
+        assert lines == ["▾    hpca", "one", "two"]
 
 
 # ------------------------------------------------- cost tracks area, not n

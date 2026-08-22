@@ -459,7 +459,7 @@ class TestTheChatSelectsClean:
         # who spoke and not a word of what was said.
         ui = self.a_chat_with(self.said(), opened=False)
         drawn = [x.rstrip() for x in frame(ui, 120, 40)]
-        assert "▸ you" in drawn
+        assert "▸    you" in drawn
         assert " ".join(self.SAID) in drawn  # short enough to survive whole
 
     def test_and_says_so_when_there_is_more(self):
@@ -482,7 +482,7 @@ class TestTheChatSelectsClean:
         # Its head is already the summary, so a preview would repeat it.
         ui = self.a_chat_with(ChatEntry(kind="thinking", seq=1, steps=3), opened=False)
         drawn = [x.rstrip() for x in frame(ui, 120, 40)]
-        assert "  3 steps" in drawn
+        assert "     3 steps" in drawn  # nothing to open, so a blank marker
         assert sum(1 for x in drawn if "steps" in x) == 1
 
     def test_the_label_is_a_line_of_its_own(self):
@@ -490,7 +490,7 @@ class TestTheChatSelectsClean:
         # message's own lines to have to select around.
         ui = self.a_chat_with(self.said())
         drawn = [x.rstrip() for x in frame(ui, 120, 40)]
-        assert "  you" in drawn or "▾ you" in drawn or "▸ you" in drawn
+        assert any(x in drawn for x in ("     you", "▾    you", "▸    you"))
         assert not any(x.endswith("you " + self.SAID[0]) for x in drawn)
 
     def test_a_row_the_ui_wrote_keeps_its_furniture(self):
@@ -655,7 +655,7 @@ class TestTheChatFillsFromTheBottom:
         drawn = [plain(x).rstrip() for x in chat_of(SAID, REPLIED).render(
             60, 12, focused=True
         )]
-        assert drawn[-2:] == ["▾ hpca", "done"]
+        assert drawn[-2:] == ["▾    hpca", "done"]
 
     def test_and_the_room_it_does_not_need_is_above_it(self):
         drawn = [plain(x).rstrip() for x in chat_of(SAID, REPLIED).render(
@@ -699,6 +699,95 @@ class TestTheChatFillsFromTheBottom:
             assert pane.current(58) == owner
 
 
+def head_lines(pane: Pane, width: int = 58) -> list[str]:
+    """The lines a pane draws as heads, marker and all."""
+    return [text for _, text, is_head in pane.flat(width) if is_head]
+
+
+def head_column(line: str) -> int:
+    """Which column a head line's words start in, whatever is in front."""
+    return len(line) - len(line.lstrip(" ▸▾"))
+
+
+class TestTheHeadRowsStandOffTheProse:
+    """`▸    you`, not `▸ you`: four spaces between the marker and the head.
+
+    On the chat and nowhere else. A message's own lines are drawn at column 0
+    so that a drag-select picks up prose and nothing else, which leaves the
+    head rows with a single marker to say they are the UI talking about the
+    conversation rather than more of it — and a row with nothing to open has
+    not even that. The wider gap is what says it now.
+    """
+
+    def test_the_head_sits_four_spaces_off_its_marker(self):
+        drawn = [plain(x).rstrip() for x in chat_of(SAID, REPLIED).render(
+            60, 12, focused=True
+        )]
+        assert "▸    you" in drawn
+        assert "▾    hpca" in drawn
+
+    def test_and_the_words_under_it_are_still_flush(self):
+        # The gap is the head's, not the row's: widening it must not push the
+        # message itself off column 0, which is the whole point of this pane.
+        drawn = [plain(x).rstrip() for x in chat_of(SAID, REPLIED).render(
+            60, 12, focused=True
+        )]
+        assert "run it again" in drawn
+
+    def test_opening_a_row_does_not_move_its_head(self):
+        # ▸ and ▾ are one cell each and the gap is on both, so the column
+        # cannot shift as rows open and close — one that did would read as the
+        # pane twitching rather than as a fold.
+        pane = chat_of(SAID, WORKED, REPLIED)
+        pane.collapse_all(58)
+        closed = head_lines(pane)
+        pane.expand_all(58)
+        assert {head_column(x) for x in closed} == {5}
+        tops = [x for x in head_lines(pane) if not x.startswith("  ")]
+        assert {head_column(x) for x in tops} == {5}
+
+    def test_a_row_with_nothing_to_open_lines_up_with_one_that_has(self):
+        # It carries a blank where the marker would be, and the gap goes on
+        # the blank too, or the column goes ragged down the log.
+        pane = chat_of(SAID, ChatEntry(kind="event", text="session resumed", seq=9))
+        assert {head_column(x) for x in head_lines(pane)} == {5}
+
+    def test_the_steps_of_a_turn_get_it_as_well(self):
+        # A step's head sits over its output, and that output is flush too —
+        # the same ambiguity one level in, so the same answer. Indented from
+        # the turn that holds it, which is what says which it belongs to.
+        pane = chat_of(SAID, WORKED)
+        steps = [x for x in head_lines(pane) if x.startswith("  ")]
+        assert steps, "the turn drew no steps to check"
+        assert {head_column(x) for x in steps} == {7}
+
+    def test_the_live_row_lands_in_the_head_column(self):
+        # The spinner is a head line with nothing to open, and it is read
+        # together with the rows above it: half a gutter to the left of them
+        # is exactly how it would look wrong.
+        pane = chat_of(SAID, REPLIED)
+        pane.set_tail(Item(head="working"))
+        assert pane.flat(58)[-1][1] == "     working"
+
+    def test_a_list_keeps_its_single_space(self):
+        # Nothing to fix there: a sidebar indents its bodies four columns
+        # under the head already, so the wider gap would only push the heads
+        # out of line with them.
+        pane = Pane("sessions", [Item(head="one", body=["a"])])
+        pane.expand_all(58)
+        assert [x[1] for x in pane.flat(58)] == ["▾ one", "    a"]
+
+    def test_and_the_rows_are_still_exactly_the_width(self):
+        # Three cells came off the head's text budget, so the narrow case is
+        # the one that matters: `pad` has to cut the head rather than let the
+        # row run over, or the differential repaint leaves the screen wrong.
+        pane = chat_of(SAID, WORKED, REPLIED)
+        pane.expand_all(28)
+        assert widths(pane.render(30, 16, focused=True)) == {30}
+        pane.collapse_all(28)
+        assert widths(pane.render(30, 16, focused=True)) == {30}
+
+
 class TestTheLabelLinesAreDrawnHeavier:
     """`you 22-08-2026 13:04:47` and `hpca …` are bold; the words are not.
 
@@ -710,12 +799,12 @@ class TestTheLabelLinesAreDrawnHeavier:
     def test_your_own_label_is_bold(self):
         pane = chat_of(SAID, REPLIED)
         pane.cursor = 0  # off the reply, so the highlight is not what shows
-        assert BOLD in styled(pane, "▸ you")
+        assert BOLD in styled(pane, "▸    you")
 
     def test_and_so_is_the_agents(self):
         pane = chat_of(SAID, REPLIED)
         pane.cursor = 0
-        assert BOLD in styled(pane, "▾ hpca")
+        assert BOLD in styled(pane, "▾    hpca")
 
     def test_but_the_words_under_it_are_not(self):
         # A paragraph in bold is not an indication, it is a shout.
@@ -726,7 +815,7 @@ class TestTheLabelLinesAreDrawnHeavier:
     def test_and_neither_is_a_line_that_names_no_speaker(self):
         pane = chat_of(SAID, WORKED)
         pane.cursor = 0
-        assert BOLD not in styled(pane, "▾ 2 steps · read_file → reasoning")
+        assert BOLD not in styled(pane, "▾    2 steps · read_file → reasoning")
 
 
 class TestATurnIsGreyThroughout:
@@ -743,7 +832,7 @@ class TestATurnIsGreyThroughout:
         pane = chat_of(SAID, WORKED)
         pane.collapse_all(58)
         pane.cursor = 0
-        assert DIM in styled(pane, "▸ 2 steps · read_file → reasoning")
+        assert DIM in styled(pane, "▸    2 steps · read_file → reasoning")
 
     def test_and_so_is_every_step_it_opens_into(self):
         # The head and both of the rows under it: the whole of what an opened
@@ -752,9 +841,9 @@ class TestATurnIsGreyThroughout:
         pane = chat_of(SAID, WORKED)
         pane.cursor = 0
         for text in (
-            "▾ 2 steps · read_file → reasoning",
-            "  ▸ read_file     /scratch/run.log",
-            "    reasoning     two shards, one temp path",
+            "▾    2 steps · read_file → reasoning",
+            "  ▸    read_file     /scratch/run.log",
+            "       reasoning     two shards, one temp path",
         ):
             assert DIM in styled(pane, text), text
 

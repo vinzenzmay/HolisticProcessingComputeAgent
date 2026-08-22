@@ -6,6 +6,23 @@ from dataclasses import dataclass, field
 
 from hpca.ui.ansi import BOLD, CYAN, DIM, RESET, REVERSE, clip, fold, pad, rule
 
+# How far a row's head sits from its fold marker, on the two kinds of pane.
+#
+# One space is all a marker needs to stand off the word after it, and on the
+# lists that is the whole job: their bodies are indented four columns under
+# the head, so which lines are the pane talking *about* a row and which are
+# the row itself is never in question there. The chat has no such indent — a
+# message's words start at column 0 so that a drag-select picks up prose and
+# nothing else, see `Pane.flush` — and there the head line's only claim to
+# being furniture was the marker, which a row with nothing to open does not
+# even carry. So on that pane the gap is four spaces: the column of `you` /
+# `hpca` / `12 steps` heads stands off the prose under it at a glance. It is
+# conditional rather than global because on a list it would buy nothing and
+# cost something — the heads would sit four columns right of the bodies that
+# currently line up under them.
+FLUSH_HEAD_GAP = "    "
+LIST_HEAD_GAP = " "
+
 
 class Wrapped:
     """A row that remembers its ``body`` wrapped, so nothing wraps it twice.
@@ -208,10 +225,14 @@ class Pane:
         the head lines that carry a marker keep theirs, because those are the
         pane talking *about* the row rather than the row itself, and the two
         are meant to be told apart at a glance. Anything at column 0 is
-        verbatim and selects as-is; anything indented is furniture.
+        verbatim and selects as-is; anything indented is furniture — which is
+        also why the gap between marker and head is wider there
+        (`FLUSH_HEAD_GAP`): with the body flush, the head's indent is the only
+        thing left saying it is not part of the text.
         """
         body_pad = "" if self.flush else "    "
         step_pad = "" if self.flush else "      "
+        gap = self.head_gap
         lines: list[tuple[int, str, bool]] = []
         keys: list[str] = []
         openable: set[str] = set()
@@ -219,8 +240,13 @@ class Pane:
         if item.openable:
             openable.add(key)
         opened = key in self.expanded
+        # The gap goes on whatever occupies the marker slot — the open
+        # marker, the closed one, or the blank a row with nothing behind it
+        # gets. The heads are a column, and a column that shifted as its rows
+        # opened and closed would read as the pane twitching rather than as a
+        # fold.
         marker = ("▾" if opened else "▸") if item.openable else " "
-        lines.append((index, f"{marker} {item.head}", True))
+        lines.append((index, f"{marker}{gap}{item.head}", True))
         keys.append(key)
         if not opened:
             # Closed: neither its words nor its steps — both hang off the same
@@ -244,7 +270,7 @@ class Pane:
                 openable.add(sub)
             sub_open = sub in self.expanded
             mark = ("▾" if sub_open else "▸") if part.body else " "
-            lines.append((index, f"  {mark} {part.head}", True))
+            lines.append((index, f"  {mark}{gap}{part.head}", True))
             keys.append(sub)
             if not sub_open:
                 continue
@@ -317,8 +343,22 @@ class Pane:
             self._flat.append(self._tail_line())
             self._keys.append(self.key_at(len(self.items)))
 
+    @property
+    def head_gap(self) -> str:
+        """The space between a row's fold marker and its head on this pane.
+
+        A property rather than a literal at each place that draws one, because
+        the live row below is a head line too and has to land in the same
+        column as the rows above it — one of them reading the gap off `flush`
+        and the other keeping a hardcoded space is how a spinner ends up three
+        columns left of the conversation it belongs to.
+        """
+        return FLUSH_HEAD_GAP if self.flush else LIST_HEAD_GAP
+
     def _tail_line(self) -> tuple[int, str, bool]:
-        return (len(self.items), f"  {self.tail.head}", True)
+        # A blank where the marker would be: there is nothing to open on a
+        # spinner, and it still belongs in the head column.
+        return (len(self.items), f" {self.head_gap}{self.tail.head}", True)
 
     def set_tail(self, item: Item | None) -> None:
         """Pin (or take away) the live row after the last entry.
