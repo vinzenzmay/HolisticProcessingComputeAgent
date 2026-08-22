@@ -14,7 +14,7 @@ from hpca import __version__ as VERSION
 from hpca.ui import commands, toasts
 from hpca.ui.ansi import BOLD, CYAN, DIM, GREEN, RED, RESET, REVERSE, YELLOW
 from hpca.ui.ansi import PULSE_INTERVAL
-from hpca.ui.ansi import cell_width, cut, footer_line, pad, rule, safe
+from hpca.ui.ansi import cell_width, cut, footer_lines, footer_wrap, pad, rule, safe
 from hpca.ui.approval import decision_height, render_decision
 from hpca.ui.editor import Editor
 from hpca.ui.keys import NEWLINE_KEYS, is_paste, paste_text
@@ -105,6 +105,24 @@ INTERRUPT_QUESTION = "Interrupt this turn and re-edit your last message?"
 # 60%`: a decision has to be readable, and the conversation it is about has to
 # stay on screen behind it.
 DECISION_SHARE = 2
+
+# What the footer may take of the screen once its hints stop fitting on one
+# row. They wrap rather than falling off the right-hand end (`ansi.footer_wrap`),
+# and something has to stop a 20-column terminal from turning the message box's
+# eleven hints into eleven rows of footer with the conversation squeezed out
+# above them.
+#
+# A quarter of the screen, and never more than five rows. A quarter because
+# that is already what the sessions and the watcher columns are each allowed,
+# so the footer is not claiming more of the layout than a band of it does. Five
+# because that is what the longest key set actually costs at the narrowest
+# width anybody drives this at: the message box offers eleven pairs, ~136 cells
+# of them, which is one row at 160 columns, two at 100, three at 60 and five at
+# 30. Under the ceiling the hints that still do not fit are dropped from the
+# end as they always were — a UI with no room left in it is worse than a hint
+# `?` will still list in full.
+FOOTER_ROWS = 5
+FOOTER_SHARE = 4
 
 # How many commands the "/" menu offers at once. Eight is every built-in plus
 # a skill, which is what an unfiltered menu shows on a fresh install; past that
@@ -967,7 +985,7 @@ class RowUI:
         matches = self.menu()
         if not matches:
             return 0
-        room = max(2, (max(8, height - 2) // 3))
+        room = max(2, self._avail(width, height) // 3)
         return min(1 + len(matches), room, 1 + MENU_ROWS)
 
     def _render_menu(self, width: int, height: int) -> list[str]:
@@ -1023,7 +1041,49 @@ class RowUI:
         two, and the editor is handed the rest."""
         return max(4, width - 2)
 
-    def _heights(self, height: int, width: int) -> list[int]:
+    def _footer_cap(self, height: int) -> int:
+        """The most rows the footer may have on a screen this tall
+        (`FOOTER_ROWS`)."""
+        return max(1, min(FOOTER_ROWS, height // FOOTER_SHARE))
+
+    def _footer_note(self) -> tuple[str, str]:
+        """What the footer says beside the keys, and in which colour.
+
+        Read here rather than in `render` because the note is part of what
+        decides how tall the footer is — it shares the row while there is one
+        and takes the bottom line once the hints wrap (`ansi.footer_lines`) —
+        so the measurement and the drawing ask the same question of it.
+        """
+        if self._esc_armed():
+            return "esc again to stop", RED
+        return self.note, self.note_style
+
+    def _footer_h(self, width: int, height: int) -> int:
+        """How many rows the footer needs for the keys this row offers."""
+        note, _ = self._footer_note()
+        return len(
+            footer_wrap(self._keys(), width, note, self._footer_cap(height))
+        )
+
+    def _avail(self, width: int, height: int, footer_h: int | None = None) -> int:
+        """Rows the four bands share: the screen, less the header and however
+        many rows the footer wants at this width.
+
+        The footer used to be one row by definition and every band's share was
+        measured from ``height - 2``. It can be several now, so the number is
+        asked for in one place and every share is measured from that — a frame
+        where the layout and the footer disagreed about the footer's height
+        would be a frame with a clipped bottom. ``footer_h`` is for the caller
+        that has already built the rows and can hand over the count instead of
+        having it worked out again.
+        """
+        if footer_h is None:
+            footer_h = self._footer_h(width, height)
+        return max(8, height - 1 - footer_h)
+
+    def _heights(
+        self, height: int, width: int, footer_h: int | None = None
+    ) -> list[int]:
         """How the rows split the screen.
 
         A quarter each for sessions and watchers and the rest to the chat — but
@@ -1033,7 +1093,7 @@ class RowUI:
         six lines. Everything left over goes to the chat, which is the row that
         can use it.
         """
-        avail = max(8, height - 2)  # header and footer
+        avail = self._avail(width, height, footer_h)
         inp = self._entry_h(width, height) + self._status_h()
         quarter = max(2, avail // 4)
         inner = max(8, width - 2)
@@ -1094,7 +1154,7 @@ class RowUI:
         if decision is None:
             return 0
         return decision_height(
-            decision, width, max(3, max(8, height - 2) // DECISION_SHARE)
+            decision, width, max(3, self._avail(width, height) // DECISION_SHARE)
         )
 
     def _status_h(self) -> int:
@@ -1128,16 +1188,21 @@ class RowUI:
         self._settle_focus()
         out = [self._header(width)]
         if self.overlay is not None:
-            out += self.overlay.render(width, height - 2)
-            out.append(footer_line(self.overlay.footer(), width))
-            while len(out) < height:
-                out.insert(len(out) - 1, " " * width)
+            footer = self._screen_footer(self.overlay, width, height)
+            body = self._screen_h(self.overlay, width, height)
+            out += self.overlay.render(width, body)
+            out = self._frame(out, footer, width, height)
             # A confirmation can be asked *about* an overlay — remove this
             # skill, delete this profile — so it is drawn over that too, and a
             # toast lands on a screen as readily as on the rows.
-            out = self._over_toasts(out[:height], width)
+            out = self._over_toasts(out, width, len(footer))
             return self._over_confirm(out, width)
-        heights = self._heights(height, width)
+        # Built once and its height handed to the layout, because how many rows
+        # the hints need is a function of the width *and* of which keys this row
+        # offers: two answers worked out separately are two answers that can
+        # differ, and the difference would come off the bottom of the frame.
+        footer = self._footer(width, height)
+        heights = self._heights(height, width, len(footer))
         order = [
             (SESSIONS, self.panes[0], heights[0]),
             (CHAT, self.panes[1], heights[1]),
@@ -1159,16 +1224,48 @@ class RowUI:
                 out += self._render_input(width, pane_h - len(status) - len(menu))
             else:
                 out += pane.render(width, pane_h, focused=self.focus == slot)
-        note, style = self.note, self.note_style
-        if self._esc_armed():
-            note, style = "esc again to stop", RED
-        out.append(footer_line(self._keys(), width, note, style))
-        while len(out) < height:
-            out.insert(len(out) - 1, " " * width)
-        out = self._over_toasts(out[:height], width)
+        out = self._frame(out, footer, width, height)
+        out = self._over_toasts(out, width, len(footer))
         return self._over_confirm(out, width)
 
-    def _over_toasts(self, out: list[str], width: int) -> list[str]:
+    def _footer(self, width: int, height: int) -> list[str]:
+        """The key hints for this row, as the rows they will be drawn on."""
+        note, style = self._footer_note()
+        return footer_lines(
+            self._keys(), width, note, style, self._footer_cap(height)
+        )
+
+    def _screen_footer(self, screen: Overlay, width: int, height: int) -> list[str]:
+        """The same for an open screen, which has its own keys and no note."""
+        return footer_lines(
+            screen.footer(), width, max_rows=self._footer_cap(height)
+        )
+
+    def _screen_h(self, screen: Overlay, width: int, height: int) -> int:
+        """Rows a screen's body gets, the header and its footer taken off.
+
+        Asked for by the drawing and by the keys alike (`handle`): what a page
+        key scrolls by has to be what was drawn, or page-down moves by a
+        different amount than the screen showed.
+        """
+        return max(1, height - 1 - len(self._screen_footer(screen, width, height)))
+
+    def _frame(
+        self, out: list[str], footer: list[str], width: int, height: int
+    ) -> list[str]:
+        """The bands and the footer as exactly ``height`` rows.
+
+        The frame's one hard invariant is settled in this one place: whatever
+        the bands came to, the rows above the footer are padded out or cut
+        down to what is left, and the footer goes on last. That order is the
+        point — a band that asked for more rows than the screen has costs a
+        clipped pane, never the key hints the footer was widened to show.
+        """
+        footer = footer[:height]
+        rows = max(0, height - len(footer))
+        return (out + [" " * width] * rows)[:rows] + footer
+
+    def _over_toasts(self, out: list[str], width: int, footer_h: int) -> list[str]:
         """What the core said, over the finished frame (§4.3 item 35).
 
         Directly under the header, and full-width rows replaced whole. Both
@@ -1182,7 +1279,9 @@ class RowUI:
         """
         if not self.toasts:
             return out
-        rows = toasts.render(self.toasts, self.clock(), width, max(0, len(out) - 2))
+        rows = toasts.render(
+            self.toasts, self.clock(), width, max(0, len(out) - 1 - footer_h)
+        )
         if not rows:
             # Nothing live: drop what has expired so the list cannot grow for
             # the length of a session.
@@ -1434,7 +1533,7 @@ class RowUI:
             return self._handle_confirm(key)
         if self.overlays:
             overlay = self.overlays[-1]
-            alive = overlay.handle(key, width, height - 2)
+            alive = overlay.handle(key, width, self._screen_h(overlay, width, height))
             # A screen that opened a screen has not closed, and one that closed
             # cannot also have opened one — so the two are exclusive and the
             # order only decides which is checked first.

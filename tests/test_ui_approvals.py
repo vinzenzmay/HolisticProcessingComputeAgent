@@ -293,9 +293,16 @@ class TestThePromptStandsInForTheMessageBox:
         self, wire
     ):
         before = wire.ui._heights(40, 100)
+        was = wire.ui._footer_h(100, 40)
         await parked(wire, BASH_GATE)
         after = wire.ui._heights(40, 100)
-        assert sum(after) == sum(before), "the screen is still the screen"
+        # The footer is part of the sum: it is as many rows as this row's keys
+        # need (`FOOTER_ROWS`), and the prompt offers four where the message
+        # box offers eleven — so at 100 columns it hands a row back, and the
+        # screen is still the screen once that row is counted.
+        assert sum(after) + wire.ui._footer_h(100, 40) == sum(before) + was, (
+            "the screen is still the screen"
+        )
         assert after[2] == wire.ui._decision_h(100, 40) + wire.ui._status_h()
         assert after[2] > before[2], "and the prompt has the room the box had"
 

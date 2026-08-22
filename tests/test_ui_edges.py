@@ -21,7 +21,15 @@ from hpca.ui.overlays import HelpOverlay
 from hpca.ui.run import Loop, copier
 from hpca.ui.screen import ENTER_MODES, EXIT_MODES, Screen
 from hpca.ui.state import Toast
-from tests.ui_harness import clocked, connected, frame, plain, settle, widths
+from tests.ui_harness import (
+    clocked,
+    connected,
+    footer,
+    frame,
+    plain,
+    settle,
+    widths,
+)
 
 WIDTHS = [80, 100, 137]
 
@@ -118,7 +126,7 @@ class TestWhatAToastSays:
         # expired while the user was reading the chat is still answerable.
         ui = clocked(build())
         ui.toast("line one\nline two")
-        assert "line one line two" in plain(ui.render(120, 24)[-1])
+        assert "line one line two" in footer(ui, 120, 24)
 
 
 class TestAToastGoesOnItsOwn:

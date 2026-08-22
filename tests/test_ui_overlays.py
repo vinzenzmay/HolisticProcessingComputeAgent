@@ -1404,3 +1404,43 @@ def test_the_catalog_reaches_the_new_session_picker():
     # The second stage exists because the demo core answered `llm.list`.
     assert "which llm" in screen(ui)
     assert sample_catalog()[0].label in screen(ui)
+
+
+# ------------------------------------------- a screen's footer wraps as well
+
+
+class TestAScreenFooterWraps:
+    """A screen has its own keys and the same narrow terminal to draw them in,
+    so the wrapping is the frame's, not the rows'."""
+
+    def test_no_hint_falls_off_the_end_of_a_narrow_screen_footer(self):
+        ui = build()
+        ui.overlay = LlmOverlay()
+        rows = ui._screen_footer(ui.overlay, 60, 40)
+        assert len(rows) > 1, "the case is only interesting once it wraps"
+        shown = "  ".join(plain(row) for row in rows)
+        for key, label in ui.overlay.footer():
+            assert f"{key} {label}" in shown
+
+    def test_the_body_gives_up_what_the_footer_takes(self):
+        ui = build()
+        ui.overlay = LlmOverlay()
+        for width in (200, 120, 90, 60, 40, 24):
+            rows = len(ui._screen_footer(ui.overlay, width, 40))
+            assert ui._screen_h(ui.overlay, width, 40) == 40 - 1 - rows, width
+
+    def test_the_frame_is_exact_at_every_width_the_footer_wraps_at(self):
+        ui = build()
+        ui.overlay = LlmOverlay()
+        for width in range(200, 19, -1):
+            drawn = ui.render(width, 40)
+            assert len(drawn) == 40
+            assert widths(drawn) == {width}, width
+
+    def test_what_a_page_key_scrolls_is_what_was_drawn(self):
+        # `handle` and `render` ask the same question, or page-down moves by a
+        # different amount than the screen showed.
+        ui = build()
+        ui.overlay = LlmOverlay()
+        drawn = len(ui._screen_footer(ui.overlay, 50, 40))
+        assert ui._screen_h(ui.overlay, 50, 40) == 40 - 1 - drawn
