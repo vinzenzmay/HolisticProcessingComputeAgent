@@ -233,6 +233,68 @@ class DatabaseSettings(_Section):
     sync_interval_s: int = Field(default=60, ge=0)
 
 
+class WatchSettings(_Section):
+    """The watch boxes' own dials — the boxes, and not the cluster in them.
+
+    Filed apart from `cluster` deliberately. That section says where the
+    cluster *is* (``submit_host``) and how often squeue is asked; a peek is
+    just as often a plain log file on this machine as a job's stdout, and a
+    key that trims a tail read off any path has no business living under a
+    heading about Slurm. One key is a small section, but the file's shape is
+    already a section per feature — rag, logging, endpoints, database — and a
+    reader looking for the watch panel's settings looks for the watch panel.
+    """
+
+    # How much of a log's tail the Enter peek ships (`watches.peek`).
+    #
+    # 300 was the right figure while the answer was a toast: it expired on a
+    # timer and had to stay small enough to be read in the seconds it lasted.
+    # The tail now lands in a scrollable window instead (`client._peeked`), so
+    # the constraint the 300 was chosen against is gone — and what was left
+    # was a cap that cut a traceback off above the line naming the exception.
+    # 2000 is a couple of screenfuls: enough for the end of a stack trace or
+    # the last few progress lines, still nowhere near the gigabyte of progress
+    # bars the read window is sized to avoid.
+    #
+    # ``gt=0``: zero would ship an empty peek for every box, which reads as
+    # the log being empty — a different fact from one nobody asked to see.
+    peek_chars: int = Field(default=2000, gt=0)
+
+
+class DisplaySettings(_Section):
+    """What the front-end draws *with*, as opposed to what the core does.
+
+    The odd section out, because nothing in this process reads it: rule 2 of
+    §4.2 keeps the settings file out of a front-end's reach, so these travel
+    over the wire instead — `protocol.DisplaySettings`, carried on `hello` and
+    restated after a save (`core.service._apply_settings`). They are gathered
+    into one section for exactly that reason: the payload that crosses *is*
+    this section, so adding a display key here is the whole of adding one, and
+    no other part of the tree can reach the wire by being renamed into it.
+    """
+
+    # Whether a chat row's label carries the date and time it was said —
+    # ``▸ you 22-08-2026 13:04:47`` against a bare ``▸ you``. On, because the
+    # stamp is what tells a turn's question from its answer when both landed
+    # in the same minute (`ui.state.STAMP_FORMAT` says why the seconds are
+    # there), and a log read back the next day is read for when as much as for
+    # what. Off is for the narrow terminal, and for the reader who wants the
+    # conversation and not the clock.
+    chat_stamps: bool = True
+    # How long one breath of the decision prompt's answer line takes
+    # (`ui.ansi.pulse`). Seconds, fractional.
+    #
+    # ``gt=0`` and nothing else. Zero divides by zero in the sweep and a
+    # negative runs it backwards, so both are refused here — where a refusal
+    # is one line beside the editor that named the field, rather than an
+    # exception out of a repaint loop with the terminal in raw mode. The upper
+    # end is left open: a very long period is a line that barely moves, which
+    # is a legitimate thing to ask for. The lower end is not clamped either,
+    # but the repaint is only booked every `ui.ansi.PULSE_INTERVAL` (0.1s), so
+    # a period under about 0.2s aliases into a flicker rather than a breath.
+    decision_pulse_seconds: float = Field(default=1.0, gt=0)
+
+
 class LLMBackend(_Section):
     """One entry of the configured backend catalog (manage-LLMs screen).
 
@@ -285,6 +347,8 @@ class Settings(_Section):
     logging: LoggingSettings = LoggingSettings()
     endpoints: EndpointsSettings = EndpointsSettings()
     database: DatabaseSettings = DatabaseSettings()
+    watches: WatchSettings = WatchSettings()
+    display: DisplaySettings = DisplaySettings()
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Settings":

@@ -44,6 +44,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from hpca.config import WatchSettings
 from hpca.slurm import JobDetail, JobStatus, TERMINAL_STATES
 
 KIND_LOG = "log"
@@ -67,9 +68,13 @@ LOG_GONE = "gone"
 # A job squeue no longer lists and sacct cannot account for either.
 JOB_GONE = "GONE"
 
-# The Enter peek: enough tail to carry a traceback's last line or a "Done.",
-# short enough to stay a toast rather than a wall of text.
-PEEK_CHARS = 300
+# The Enter peek's fallback size, for a caller with no settings in hand — the
+# tests, and anything that peeks at a file outside a running core. Taken off
+# the settings model rather than written out again, because two copies of one
+# number are two numbers as soon as one of them is edited; what the app
+# actually uses is `settings.watches.peek_chars`, which the core passes in
+# (`core.service._peek_watch`).
+PEEK_CHARS = WatchSettings().peek_chars
 
 
 def _now() -> datetime:
@@ -588,10 +593,13 @@ def apply_job_details(
 
 
 def peek(path: str | Path, chars: int = PEEK_CHARS) -> str:
-    """The tail of a file, for the flash-up notice bound to Enter.
+    """The tail of a file, for the window Enter opens over a watch box.
 
     Reads only the last few KB: these are job logs, and one of them being a
-    gigabyte of progress bars is entirely normal.
+    gigabyte of progress bars is entirely normal. The read window is a
+    multiple of ``chars`` rather than ``chars`` itself because the decode is
+    lossy at the front — a seek lands mid-character and mid-line — so there
+    has to be more read than kept.
     """
     path = Path(path)
     window = max(chars * 8, 4096)

@@ -51,6 +51,7 @@ from hpca.ui.state import (
     CycleMode,
     Decide,
     DeleteSession,
+    Display,
     DraftSkill,
     Drop,
     Fork,
@@ -208,6 +209,7 @@ class RowUI:
         sessions: list[SessionState] | None = None,
         *,
         settings_json: str = "",
+        display: Display | None = None,
         profiles: list[ProfileInfo] | None = None,
         catalog: list[BackendInfo] | None = None,
         send: Callable[[Intent], None] | None = None,
@@ -217,11 +219,19 @@ class RowUI:
         # fork's `session.created` arrives before the `session.rows` that lists
         # it), and because a session must not lose its chat and its draft
         # merely by scrolling out of the list.
+        # The settings this UI *draws* with, and the only ones it ever sees:
+        # the file is out of a front-end's reach (§4.2 rule 2), so these come
+        # down the wire on `hello` and again after a save (`client._display`).
+        # A default here rather than a None check everywhere below, and it is
+        # the same default `config.DisplaySettings` carries — so a UI built
+        # with no core behind it (a test, the demo's first frame) draws what a
+        # fresh install would.
+        self.display = display or Display()
         self.sessions = list(sessions or [])
         self._states = {x.session_id: x for x in self.sessions}
         # What the rows draw against before the first `session.rows` arrives.
         # Real, so that nothing below here needs a None check.
-        self._blank = SessionState("")
+        self._blank = SessionState("", display=self.display)
         self.active = 0
         # Where a keypress goes when it means something the core has to do.
         # Recorded rather than dropped when nothing is listening, so a test can
@@ -487,8 +497,23 @@ class RowUI:
         """
         session = self._states.get(session_id)
         if session is None:
-            session = self._states[session_id] = SessionState(session_id)
+            session = self._states[session_id] = SessionState(
+                session_id, display=self.display
+            )
         return session
+
+    def set_display(self, display: Display) -> None:
+        """Adopt display settings that have just arrived, and redraw for them.
+
+        Every session, not only the one on screen: the others are not being
+        looked at *yet*, and a chat that restyled itself on the way back into
+        view would be doing the work at the one moment the user is watching.
+        `restyle` is cheap — it rebuilds `Item`s from entries already held —
+        and it keeps what is open open, which `reset` would not.
+        """
+        self.display = display
+        for session in [self._blank, *self._states.values()]:
+            session.restyle(display)
 
     def adopt(self, session: SessionState) -> None:
         """Put a session in the sidebar now, ahead of the core saying so.
@@ -1186,6 +1211,7 @@ class RowUI:
             # — the same arrangement the spinner has, and the reason
             # `next_wake` books a frame while this is up.
             now=self.clock(),
+            period=self.display.decision_pulse_seconds,
         )
 
     def _over_confirm(self, out: list[str], width: int) -> list[str]:

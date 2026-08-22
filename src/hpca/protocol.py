@@ -1068,6 +1068,37 @@ class Shutdown(Command):
 # ---------------------------------------------------------------------- events
 
 
+class DisplaySettings(_Model):
+    """The settings a front-end *renders with*, and nothing else.
+
+    The counterpart to `Hello.settings_digest`, and the reason that field is
+    phrased the way it is: a UI cannot read the settings file (§4.2 rule 2),
+    but two or three of the keys in it are about nothing except what a frame
+    looks like, and a digest cannot answer "draw this how". So those keys —
+    and strictly those — cross as a payload of their own.
+
+    Not the whole tree, which is the point the digest was making: the tree
+    holds api keys and endpoint addresses, and a process that only needs to
+    know whether to print a timestamp has no business being handed them. Nor
+    is it `settings.body`, which is the *file as text* and exists for one
+    thing, the config editor opening over it. That is a read path answering a
+    keypress; this is state, delivered without being asked for, on the one
+    frame that is guaranteed to arrive before anything is drawn.
+
+    `config.DisplaySettings` is the twin, field for field. Two models rather
+    than an import for the reason `Part` and `Entry` are copies: this module
+    is the only thing both processes agree on and it imports nothing of
+    hpca's own.
+    """
+
+    # `▸ you 22-08-2026 13:04:47` against a bare `▸ you` (`ui.state._label`).
+    chat_stamps: bool = True
+    # One breath of the decision prompt's answer line, in seconds
+    # (`ui.ansi.pulse`). The receiving side treats a value it cannot divide by
+    # as "use the built-in", because a repaint loop is not a place to raise.
+    decision_pulse_seconds: float = 1.0
+
+
 class Hello(Event):
     """First frame on connect: who the core is and what it is configured as."""
 
@@ -1077,6 +1108,37 @@ class Hello(Event):
     # Lets the UI notice that settings changed under a reconnect without
     # shipping the whole settings tree to a process that cannot use it.
     settings_digest: str = ""
+    # The exception the digest carves out: the handful of keys that decide
+    # what a frame looks like, which a front-end cannot render without and
+    # cannot read for itself. Here rather than in a frame of its own because
+    # the first frame is the one that arrives before anything is drawn — a UI
+    # that had to ask would draw one frame in whatever it assumed, and a
+    # timestamp appearing on the second frame is a redraw the user sees.
+    display: DisplaySettings = DisplaySettings()
+
+
+class DisplayChanged(Event):
+    """The display settings again, because they have just been edited.
+
+    `hello` alone would have made these restart-only, which is the very toast
+    `settings.save` exists to stop printing: the config editor is *in* the
+    app, and a key whose whole subject is what the screen looks like must
+    take effect on the frame after the save.
+
+    Its own event and not a re-sent `hello`: that one is a handshake, sent to
+    one subscriber at the moment it attaches (`Core.subscribe`), and sending
+    it again would have every attached front-end re-run its version check and
+    re-ask for the sidebar, the catalog and the profiles. This is news, so it
+    fans out to everyone — a second front-end on the same core is looking at
+    the same settings file.
+
+    Sent only when the section actually changed, for the same reason the
+    clients are only rebuilt when the llm section did: a repaint of every
+    conversation's chat rows is not the price of an edited log level.
+    """
+
+    TYPE: ClassVar[str] = "display.settings"
+    display: DisplaySettings = DisplaySettings()
 
 
 class SessionRows(Event):
@@ -1538,8 +1600,12 @@ class WatchPeeked(Event):
     TYPE: ClassVar[str] = "watch.peeked"
     watch_id: int
     title: str = ""  # the box's border title — what this is the tail *of*
-    # Already trimmed to a glance by the core (`watches.PEEK_CHARS`): the
-    # whole point of peeking is not to ship a gigabyte of progress bars.
+    # Already trimmed by the core to what the user asked a peek to be worth
+    # (`config.WatchSettings.peek_chars`): the whole point of peeking is not
+    # to ship a gigabyte of progress bars. How much is a setting and not a
+    # constant because the two ends of the range are both real — a tail read
+    # over a tunnel wants to stay small, and a traceback wants to arrive
+    # whole.
     text: str = ""
 
 

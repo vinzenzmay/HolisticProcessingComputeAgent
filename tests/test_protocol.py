@@ -136,6 +136,7 @@ SPEC_COMMANDS = {
 
 SPEC_EVENTS = {
     "hello",
+    "display.settings",
     "session.rows",
     "session.created",
     "llm.catalog",

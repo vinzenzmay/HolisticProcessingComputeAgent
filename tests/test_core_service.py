@@ -281,6 +281,28 @@ class TestHandshake:
         # able to notice they changed without being handed the api keys.
         assert first.settings_digest
 
+    async def test_hello_carries_the_settings_the_ui_draws_with(self, service):
+        # The carve-out the digest implies: a front-end may not read the file,
+        # and a digest cannot answer "draw this how". On `hello` because that
+        # is the frame that lands before anything has been drawn — a setting
+        # arriving later would be a redraw the user sees.
+        service._deps.settings.display.chat_stamps = False
+        service._deps.settings.display.decision_pulse_seconds = 4.0
+        first = service.subscribe().get_nowait()
+        assert first.display.chat_stamps is False
+        assert first.display.decision_pulse_seconds == 4.0
+
+    async def test_and_carries_nothing_else_of_the_settings(self, service):
+        # Not the tree: it holds api keys and endpoint addresses, and a
+        # process that only needs to know whether to print a timestamp has no
+        # business being handed them. Adding a display key is a deliberate
+        # edit here, exactly as dropping one would be.
+        first = service.subscribe().get_nowait()
+        assert set(type(first.display).model_fields) == {
+            "chat_stamps",
+            "decision_pulse_seconds",
+        }
+
     async def test_the_digest_follows_the_settings(self, home, conn, llm):
         async def db(fn):
             return fn(conn)
@@ -3506,6 +3528,34 @@ class TestSettingsFile:
         await service.handle(SettingsSave(text='{"editor": "hx"}'))
         assert rebuilt == []
 
+    async def test_a_display_change_takes_effect_without_a_restart(
+        self, service
+    ):
+        # The config editor is *in* the app, and a key whose whole subject is
+        # what the screen looks like must apply on the frame after the save.
+        queue = subscribe(service)
+        await drain(queue)
+        await service.handle(
+            SettingsSave(
+                text=json.dumps(
+                    {"display": {"chat_stamps": False, "decision_pulse_seconds": 4}}
+                )
+            )
+        )
+        changed = only(await drain(queue), "DisplayChanged")
+        assert changed.display.chat_stamps is False
+        assert changed.display.decision_pulse_seconds == 4
+
+    async def test_a_save_that_leaves_the_display_alone_restates_nothing(
+        self, service
+    ):
+        # Restating it repaints every conversation's chat rows, which is not
+        # the price of an edited log level.
+        queue = subscribe(service)
+        await drain(queue)
+        await service.handle(SettingsSave(text='{"editor": "hx"}'))
+        assert "DisplayChanged" not in kinds(await drain(queue))
+
     async def test_database_settings_are_said_to_wait_for_a_restart(
         self, service
     ):
@@ -3767,6 +3817,64 @@ class TestWatchBoxes:
         await service.handle(WatchPeek(watch_id=watch.id))
         text = only(await drain(queue), "WatchPeeked").text
         assert "RUNNING" in text and "step 1 done" in text
+
+    async def test_the_peek_ships_as_much_tail_as_the_settings_say(
+        self, service, session, conn, home
+    ):
+        # The size is `watches.peek_chars` and the core is what applies it:
+        # the file is on a node the front-end may not share, so trimming it
+        # afterwards is not something the UI could do (§4.2 rule 2).
+        log = home / "train.log"
+        log.write_text("\n".join(f"epoch {i}" for i in range(500)))
+        watch = WatchStore(conn).add(
+            kind=KIND_LOG, target=str(log), session_id=session.session_id,
+        )
+        service._deps.settings.watches.peek_chars = 40
+        queue = subscribe(service)
+        await service.handle(WatchPeek(watch_id=watch.id))
+        text = only(await drain(queue), "WatchPeeked").text
+        assert len(text) <= 41  # the tail, plus the "…" that says it is one
+        assert text.endswith("epoch 499")
+
+    async def test_and_a_bigger_setting_ships_more_of_it(
+        self, service, session, conn, home
+    ):
+        # The whole point of raising the default: a traceback whose last line
+        # names the exception must not be cut off above it.
+        log = home / "train.log"
+        log.write_text("boom\n" * 200 + "ValueError: the cohort is empty")
+        watch = WatchStore(conn).add(
+            kind=KIND_LOG, target=str(log), session_id=session.session_id,
+        )
+        service._deps.settings.watches.peek_chars = 300
+        queue = subscribe(service)
+        await service.handle(WatchPeek(watch_id=watch.id))
+        short = only(await drain(queue), "WatchPeeked").text
+        service._deps.settings.watches.peek_chars = 2000
+        queue = subscribe(service)
+        await service.handle(WatchPeek(watch_id=watch.id))
+        long = only(await drain(queue), "WatchPeeked").text
+        assert len(long) > len(short)
+        # Both keep the end; what the bigger figure buys is what led up to it.
+        assert short.endswith("the cohort is empty")
+        assert long.endswith("the cohort is empty")
+
+    async def test_a_configured_peek_survives_a_settings_save(
+        self, service, session, conn, home
+    ):
+        # Read per peek rather than captured at startup, because `settings.save`
+        # swaps the running section in place.
+        log = home / "train.log"
+        log.write_text("\n".join(f"epoch {i}" for i in range(500)))
+        watch = WatchStore(conn).add(
+            kind=KIND_LOG, target=str(log), session_id=session.session_id,
+        )
+        await service.handle(
+            SettingsSave(text=json.dumps({"watches": {"peek_chars": 30}}))
+        )
+        queue = subscribe(service)
+        await service.handle(WatchPeek(watch_id=watch.id))
+        assert len(only(await drain(queue), "WatchPeeked").text) <= 31
 
     async def test_peeking_a_box_that_is_gone_says_so(self, service):
         queue = subscribe(service)

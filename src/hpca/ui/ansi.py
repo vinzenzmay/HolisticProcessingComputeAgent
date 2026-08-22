@@ -82,13 +82,20 @@ PULSE_ENDS = ((5, 5, 5), (0, 4, 4))  # near-white, and the levels CYAN is
 PULSE_STEPS = 6
 
 # How long one breath takes, and how often the frame it is on has to be drawn
-# again. 2.4s is slow enough to read as breathing rather than as flicker, and
-# the interval is the spinner's 0.1 for the spinner's reason (`ui/state.py`):
+# again. The period is a setting now (`config.DisplaySettings`, arriving as
+# `protocol.DisplaySettings.decision_pulse_seconds`) and this is what a caller
+# that was handed none uses; it is also the floor of what the interval below
+# can resolve, so the two are read together. It was 2.4s, on the argument that
+# a slow breath is not a flicker — 1.0 because in use the line is read as a
+# *prompt* waiting for an answer, and a two-and-a-half-second cycle is slow
+# enough that a glance at the screen catches it standing still.
+#
+# The interval is the spinner's 0.1 for the spinner's reason (`ui/state.py`):
 # it is the idle cost of having a decision on screen, and this is the cheapest
 # rate that still moves. The sine is fastest through the middle of its sweep,
 # where ten frames a second skips a step of the seven — which is the part of a
 # gradient nobody can follow anyway; the ends, where it lingers, get every one.
-PULSE_PERIOD = 2.4
+PULSE_PERIOD = 1.0
 PULSE_INTERVAL = 0.1
 
 
@@ -111,7 +118,7 @@ def _pulse_ramp() -> tuple[str, ...]:
 PULSE_RAMP = _pulse_ramp()
 
 
-def pulse(now: float) -> str:
+def pulse(now: float, period: float = PULSE_PERIOD) -> str:
     """The answer line's colour at this instant, and at no other.
 
     A pure function of the clock, exactly as the spinner's glyph is
@@ -119,8 +126,18 @@ def pulse(now: float) -> str:
     something changed can work out when this one next will (`PULSE_INTERVAL`),
     and a test can pin the clock and get the colour back rather than watching
     for a change it has no way to time.
+
+    ``period`` is how long one breath takes. A value that cannot be divided by
+    falls back to the module's own rather than raising: the settings model is
+    what refuses a period of zero (`config.DisplaySettings` — ``gt=0``, one
+    line beside the editor that typed it), and by the time a number has
+    crossed the wire it is being divided by inside a repaint, where the only
+    thing an exception can do is take the frame down with the terminal in raw
+    mode. Belt and braces, and the braces are the ones the user can read.
     """
-    phase = (math.sin(now * math.tau / PULSE_PERIOD) + 1) / 2
+    if period <= 0:
+        period = PULSE_PERIOD
+    phase = (math.sin(now * math.tau / period) + 1) / 2
     return PULSE_RAMP[min(len(PULSE_RAMP) - 1, int(phase * len(PULSE_RAMP)))]
 
 

@@ -40,6 +40,14 @@ ROWS = [
 ]
 
 
+# A fixed instant, so a frame can be searched for the stamp rather than for
+# whatever the clock says while the test runs. Read back through `state.when`,
+# which is what turns the core's UTC into the local wall-clock the label
+# carries — writing the expected text out here would make the assertion
+# depend on the timezone the suite runs in.
+AT = "2026-08-22T11:04:47+00:00"
+
+
 def entry(seq: int, kind: str = "user", text: str = "", **kw) -> protocol.Entry:
     return protocol.Entry(kind=kind, text=text or f"row {seq}", seq=seq, **kw)
 
@@ -148,6 +156,105 @@ class TestHello:
     async def test_and_the_frame_survives_saying_it(self, wire):
         await wire.tell(protocol.Hello(version=99))
         assert widths(wire.ui.render(40, 10)) == {40}
+
+
+class TestTheSettingsTheUiDrawsWith:
+    """`hello.display` and `display.settings` — the one part of the settings
+    file a front-end is handed, and the path it is handed it down.
+
+    The rule is unchanged: the UI reads no settings file (§4.2 rule 2). What
+    is new is that a couple of keys are about nothing except what a frame
+    looks like, and a `settings_digest` cannot answer "draw this how". So
+    those keys, and strictly those, arrive as state — on the frame that lands
+    before anything is drawn, and again whenever a save changes them.
+
+    Deliberately not `settings.body`: that is the file as *text*, fetched
+    because the config editor is opening over it. Hanging a chat label off a
+    read path would leave the setting inert until somebody pressed `c`.
+    """
+
+    async def test_they_arrive_on_the_first_frame(self, wire):
+        await wire.tell(
+            protocol.Hello(
+                profile="hpc",
+                display=protocol.DisplaySettings(
+                    chat_stamps=False, decision_pulse_seconds=4.0
+                ),
+            )
+        )
+        assert wire.ui.display == state.Display(
+            chat_stamps=False, decision_pulse_seconds=4.0
+        )
+
+    async def test_and_before_the_first_chat_that_uses_them(self, wire):
+        # The ordering that matters: `hello` is the first frame, and the
+        # transcript can only arrive as the answer to a command `hello` itself
+        # sends — so no row is ever built against the wrong setting.
+        await wire.tell(
+            protocol.Hello(display=protocol.DisplaySettings(chat_stamps=False)),
+            protocol.SessionRows(rows=list(ROWS)),
+            protocol.ChatReset(
+                session_id="s1", entries=[entry(1, text="run it", at=AT)]
+            ),
+        )
+        assert any(x.rstrip().endswith(" you") for x in wire.frame())
+        assert state.when(AT) not in wire.screen()
+
+    async def test_a_ui_with_no_core_behind_it_draws_the_defaults(self):
+        # What a fresh install would say, so nothing below needs a None check.
+        assert RowUI().display == state.Display()
+
+    async def test_a_change_lands_without_a_restart(self, wire):
+        await started(wire, [entry(1, text="run it", at=AT)])
+        assert state.when(AT) in wire.screen()
+        await wire.tell(
+            protocol.DisplayChanged(
+                display=protocol.DisplaySettings(chat_stamps=False)
+            )
+        )
+        assert state.when(AT) not in wire.screen()
+        assert any(x.rstrip().endswith(" you") for x in wire.frame())
+
+    async def test_and_the_conversation_survives_it(self, wire):
+        # `restyle`, not `reset`: nothing about what was *said* changed, so
+        # the rows keep their text, their numbering and what is open in them.
+        await started(wire, [entry(1, text="run it", at=AT)])
+        await wire.tell(
+            protocol.DisplayChanged(
+                display=protocol.DisplaySettings(chat_stamps=False)
+            )
+        )
+        assert "run it" in wire.screen()
+        assert [x.key for x in wire.ui.chat.items] == ["1"]
+
+    async def test_a_session_nobody_has_looked_at_yet_gets_them_too(self, wire):
+        # Restyling on the way back into view would do the work at the one
+        # moment the user is watching.
+        await started(wire)
+        await wire.tell(
+            protocol.ChatReset(
+                session_id="s2", entries=[entry(2, text="later", at=AT)]
+            ),
+            protocol.DisplayChanged(
+                display=protocol.DisplaySettings(chat_stamps=False)
+            ),
+        )
+        assert wire.ui.session_for("s2").display.chat_stamps is False
+        assert state.when(AT) not in " ".join(
+            x.head for x in wire.ui.session_for("s2").chat.items
+        )
+
+    async def test_a_session_opened_after_the_change_is_drawn_with_it(self, wire):
+        await started(wire)
+        await wire.tell(
+            protocol.DisplayChanged(
+                display=protocol.DisplaySettings(chat_stamps=False)
+            ),
+            protocol.ChatReset(
+                session_id="s3", entries=[entry(9, text="new one", at=AT)]
+            ),
+        )
+        assert wire.ui.session_for("s3").chat.items[0].head == "you"
 
 
 # -------------------------------------------------------------- the sidebar

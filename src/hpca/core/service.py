@@ -91,6 +91,8 @@ from hpca.protocol import (
     ConfirmResolve,
     DecisionRequested,
     DecisionResolve,
+    DisplayChanged,
+    DisplaySettings,
     Hello,
     JobCancel,
     LLMCatalog,
@@ -342,6 +344,7 @@ class AgentService:
                 version=PROTOCOL_VERSION,
                 profile=self._deps.profile,
                 settings_digest=_settings_digest(self._deps.settings),
+                display=_display_settings(self._deps.settings),
             )
         )
         for session_id, payload in self._scheduler.pending_decisions().items():
@@ -1847,6 +1850,14 @@ class AgentService:
             self._emit_catalog()
         if settings.rag != before.rag:
             await self._backends.reload_embedder()
+        if settings.display != before.display:
+            # The one section whose whole subject is what a frame looks like,
+            # and so the one an editor must not make the user restart for.
+            # Fanned out rather than sent back to whoever saved: a second
+            # front-end on this core is drawing the same file's settings.
+            self._deps.emit(
+                DisplayChanged(display=_display_settings(settings))
+            )
         if settings.database != before.database:
             self._deps.emit(
                 Notify(
@@ -1877,29 +1888,35 @@ class AgentService:
                 Notify(severity="warning", text="That box is gone.")
             )
             return
+        chars = self._deps.settings.watches.peek_chars
         if watch.kind == KIND_LOG:
-            text = await self._tail(watch.target)
+            text = await self._tail(watch.target, chars)
         else:
             text = " · ".join(part for part in watch_lines(watch) if part)
             row = await self._deps.db(
                 lambda conn: JobStore(conn).get(watch.target)
             )
             if row is not None and row.sbatch_stdout_path:
-                text += "\n" + await self._tail(row.sbatch_stdout_path)
+                text += "\n" + await self._tail(row.sbatch_stdout_path, chars)
         self._deps.emit(
             WatchPeeked(watch_id=watch_id, title=watch.title, text=text)
         )
 
     @staticmethod
-    async def _tail(path: str) -> str:
+    async def _tail(path: str, chars: int) -> str:
         """`watches.peek`, off the dispatch loop.
 
         The read is small by construction but the file is a job log on a
         cluster filesystem, where a stat can cost a network round trip — and
         this loop has one socket and every other session's commands behind it.
         The same reason `deps.db` exists, for a file rather than a database.
+
+        ``chars`` is read from the settings on every peek rather than captured
+        once at startup, because `settings.save` swaps the running section in
+        place: a figure bound at boot would leave the config editor's own
+        display of the key describing a peek that no longer honours it.
         """
-        return await asyncio.to_thread(peek, path)
+        return await asyncio.to_thread(peek, path, chars)
 
     async def _drop_watch(self, watch_id: int) -> None:
         """`watch.drop`: stop watching, and repaint the column.
@@ -2972,6 +2989,26 @@ def _settings_problem(error: ValueError) -> str:
         where = ".".join(str(x) for x in first.get("loc", ())) or "settings"
         return f"invalid: {where} — {first.get('msg', 'not accepted')}"
     return f"invalid: {str(error).splitlines()[0]}"
+
+
+def _display_settings(settings) -> DisplaySettings:
+    """The display section, as the wire's twin of it (`protocol.DisplaySettings`).
+
+    Field by field rather than by dumping the section, so that a key added to
+    `config.DisplaySettings` and not to the protocol is a name error here and
+    not a payload that silently forbids an extra key at the far end.
+
+    A settings object that has no display section at all still has to greet a
+    client — the same allowance `_settings_digest` makes, and for the same
+    reason: a core that cannot say hello is a UI that never starts.
+    """
+    section = getattr(settings, "display", None)
+    if section is None:  # pragma: no cover - a settings object that is a fake
+        return DisplaySettings()
+    return DisplaySettings(
+        chat_stamps=section.chat_stamps,
+        decision_pulse_seconds=section.decision_pulse_seconds,
+    )
 
 
 def _settings_digest(settings) -> str:

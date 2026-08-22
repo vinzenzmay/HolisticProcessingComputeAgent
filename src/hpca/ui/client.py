@@ -574,8 +574,38 @@ class UIClient:
     def _session(self, session_id: str) -> state.SessionState:
         return self.ui.session_for(session_id)
 
+    @staticmethod
+    def _display(msg: protocol.DisplaySettings) -> state.Display:
+        """The wire's display settings as the renderer's own shape.
+
+        Field by field, which is this module's whole job: `app.py` and
+        `state.py` have never heard of the protocol (§3.1), so the two models
+        are twins that only this line knows are twins.
+        """
+        return state.Display(
+            chat_stamps=msg.chat_stamps,
+            decision_pulse_seconds=msg.decision_pulse_seconds,
+        )
+
+    def _display_changed(self, msg: protocol.DisplayChanged) -> None:
+        """`display.settings`: the config editor changed how a frame looks.
+
+        The reason these are a state feed and not read off `settings.body`:
+        that one is the *file as text*, fetched because an editor is opening
+        over it, and hanging the chat's labels on a body that arrives only
+        when somebody presses `c` would leave the setting inert until they
+        did. This arrives unasked, on connect and after every save that
+        touched the section.
+        """
+        self.ui.set_display(self._display(msg.display))
+
     def _hello(self, msg: protocol.Hello) -> None:
         self.hello = msg
+        # Before the commands below, and so before any of their answers can
+        # draw a row: `hello` is the first frame on the wire (§4.2) and this
+        # is the first thing done with it, which is what makes "the labels are
+        # right on the first chat that arrives" true rather than lucky.
+        self.ui.set_display(self._display(msg.display))
         if msg.version != protocol.PROTOCOL_VERSION:
             # Not fatal here: the handshake in `coreproc` is what refuses a
             # stale core. On this side it is something to say out loud.
@@ -1057,6 +1087,7 @@ class UIClient:
 
 
 UIClient._HANDLERS = {
+    protocol.DisplayChanged.__name__: UIClient._display_changed,
     protocol.Hello.__name__: UIClient._hello,
     protocol.SessionRows.__name__: UIClient._rows,
     protocol.SessionCreated.__name__: UIClient._created,

@@ -27,11 +27,21 @@ from hpca.config import Settings
 from hpca.db import connect, init_db
 from hpca.runner import ProcessRunner
 from hpca.trash import TrashManager
-from hpca.ui.ansi import CYAN, PULSE_INTERVAL, PULSE_PERIOD, PULSE_RAMP, WHITE
+from hpca.ui.ansi import (
+    BOLD,
+    CYAN,
+    DIM,
+    PULSE_INTERVAL,
+    PULSE_PERIOD,
+    PULSE_RAMP,
+    RED,
+    WHITE,
+    YELLOW,
+)
 from hpca.ui.app import CHAT, DECISION, INPUT, SESSIONS, WATCHERS, RowUI
 from hpca.ui.approval import approval_details
 from hpca.ui.keys import PASTE
-from hpca.ui.state import Confirm
+from hpca.ui.state import Confirm, Display
 from tests.ui_harness import connected, plain, widths
 
 ROWS = [
@@ -62,6 +72,16 @@ LONG_SCRIPT = {
         f"--reference /scratch/proj/refs/GRCh38_full_analysis_set.fa"
         for i in range(60)
     ),
+}
+
+
+# The other gate: not a script about to run but something about to be lost.
+# Hand-written because what is under test here is the *colour* the two kinds
+# are drawn in, and a real payload would only add fields nothing reads.
+DELETE_GATE = {
+    "tool": "delete_file",
+    "kind": "destructive",
+    "details": "delete /scratch/proj/cohort.bam",
 }
 
 
@@ -643,6 +663,166 @@ class TestTheHalfWrittenReasonIsADraft:
         await parked(wire, BASH_GATE, session_id="s1")
         assert "the shards are still open" in wire.screen()
 
+
+
+class TestTheRuleSaysWhereTheKeysAre:
+    """The decision's rule follows the focus convention, and the severity it
+    used to carry moves one line down onto the heading.
+
+    Two facts were fighting over one row. Focus is teal-and-bold in every
+    other region — sessions, chat, watchers, all drawn by `Pane.render` — and
+    the prompt stands in the message box's slot of the same ring, so a rule
+    that could not say "the keys are here" left the one region whose keys
+    silently do nothing as the one region unable to say so.
+
+    The severity is not dropped for it. An execution gate and a destructive
+    one are different warnings and the prompt still says which, in the same
+    two colours, on the bold heading line directly under the rule — which is
+    larger type than the rule ever was. What is lost is the dashes it was
+    painted on.
+    """
+
+    @staticmethod
+    def rule_row(wire) -> str:
+        rows = [x for x in wire.ui.render(120, 40) if "── decision ─" in x]
+        assert len(rows) == 1, "the rule is drawn once"
+        return rows[0]
+
+    @staticmethod
+    def heading(wire, text: str) -> str:
+        rows = [x for x in wire.ui.render(120, 40) if text in x]
+        assert len(rows) == 1, f"{text!r} is drawn once"
+        return rows[0]
+
+    async def test_the_rule_is_teal_when_the_prompt_is_focused(self, wire):
+        await parked(wire, BASH_GATE)
+        assert wire.ui.focus == DECISION
+        assert self.rule_row(wire).startswith(BOLD + CYAN)
+
+    async def test_and_dim_when_it_is_not(self, wire):
+        await parked(wire, BASH_GATE)
+        wire.ui.focus = CHAT
+        assert self.rule_row(wire).startswith(DIM)
+
+    async def test_it_is_the_same_sentence_the_panes_write(self, wire):
+        # Not merely "teal": the exact styles `Pane.render` puts on its own
+        # title, so the four regions cannot drift into two conventions.
+        await parked(wire, BASH_GATE)
+        focused = self.rule_row(wire)
+        wire.ui.focus = CHAT
+        unfocused = self.rule_row(wire)
+        chat = [x for x in wire.ui.render(120, 40) if "── chat ─" in x][0]
+        wire.ui.focus = CHAT
+        assert focused.startswith(BOLD + CYAN) and chat.startswith(BOLD + CYAN)
+        assert unfocused.startswith(DIM)
+
+    async def test_a_destructive_gate_still_says_so_in_red(self, wire):
+        await parked(wire, DELETE_GATE)
+        assert self.heading(wire, "Destructive operation").startswith(RED + BOLD)
+
+    async def test_and_an_execution_gate_in_yellow(self, wire):
+        # The distinction the docstring of `ui/approval.py` insists on: a
+        # script about to run is not the same warning as something about to be
+        # lost, and one colour for both would be a warning that says nothing.
+        await parked(wire, BASH_GATE)
+        assert self.heading(wire, "Run this —").startswith(YELLOW + BOLD)
+
+    async def test_the_two_kinds_are_still_told_apart_while_focused(self, wire):
+        # The thing the naive fix would have broken: the prompt is focused
+        # almost all the time, so a severity that only showed when it was not
+        # would be a severity nobody ever sees.
+        await parked(wire, BASH_GATE)
+        assert wire.ui.focus == DECISION
+        execution = self.heading(wire, "Run this —")
+        await parked(wire, DELETE_GATE)
+        assert wire.ui.focus == DECISION
+        destructive = self.heading(wire, "Destructive operation")
+        assert execution.split("m", 1)[0] != destructive.split("m", 1)[0]
+
+    async def test_the_refusal_box_keeps_the_severity_too(self, wire):
+        # The second stage replaces the question but not the warning: what is
+        # being refused is still the same class of thing.
+        await parked(wire, DELETE_GATE)
+        await wire.press("n")
+        assert self.heading(wire, "Denied —").startswith(RED + BOLD)
+
+    async def test_the_rule_costs_no_rows_either_way(self, wire):
+        # Focus is a colour and never a layout: a prompt that grew a row when
+        # the keys arrived would move the conversation behind it.
+        await parked(wire, LONG_SCRIPT)
+        focused = wire.ui._heights(40, 120)
+        wire.ui.focus = CHAT
+        assert wire.ui._heights(40, 120) == focused
+
+
+class TestHowFastTheAnswerLineBreathes:
+    """`Display.decision_pulse_seconds` — the period, in seconds, as it
+    arrived over the wire. The colour is still a pure function of the clock;
+    what the setting changes is how far round the sweep a given instant is."""
+
+    @staticmethod
+    def hint(wire, when: float) -> str:
+        wire.ui.clock = lambda: when
+        rows = [x for x in wire.ui.render(120, 40) if "(y) run script" in x]
+        assert len(rows) == 1
+        return rows[0]
+
+    async def test_the_period_arrives_with_the_rest_of_the_display_settings(
+        self, wire
+    ):
+        await wire.tell(
+            protocol.DisplayChanged(
+                display=protocol.DisplaySettings(decision_pulse_seconds=8.0)
+            )
+        )
+        assert wire.ui.display.decision_pulse_seconds == 8.0
+
+    async def test_a_configured_period_is_what_the_sweep_runs_on(self, wire):
+        # A quarter of the way round is the far end of the ramp, wherever the
+        # user put the quarter mark.
+        await wire.tell(
+            protocol.DisplayChanged(
+                display=protocol.DisplaySettings(decision_pulse_seconds=8.0)
+            )
+        )
+        await parked(wire, BASH_GATE)
+        assert self.hint(wire, 2.0).startswith(CYAN)
+        assert self.hint(wire, 6.0).startswith(WHITE)
+
+    async def test_and_a_slower_one_is_visibly_slower(self, wire):
+        # The same instant, two periods, two colours — which is the whole of
+        # what the setting does.
+        await parked(wire, BASH_GATE)
+        fast = self.hint(wire, PULSE_PERIOD / 4)
+        await wire.tell(
+            protocol.DisplayChanged(
+                display=protocol.DisplaySettings(decision_pulse_seconds=100.0)
+            )
+        )
+        assert self.hint(wire, PULSE_PERIOD / 4) != fast
+
+    async def test_a_period_nothing_can_be_divided_by_does_not_kill_the_frame(
+        self, wire
+    ):
+        # The settings model refuses zero (`config.DisplaySettings`), which is
+        # where a user finds out. This is the other half: by the time a number
+        # has crossed the wire it is being divided by inside a repaint, and an
+        # exception there takes the terminal down with it.
+        await wire.tell(
+            protocol.DisplayChanged(
+                display=protocol.DisplaySettings(decision_pulse_seconds=0.0)
+            )
+        )
+        await parked(wire, BASH_GATE)
+        assert widths(wire.ui.render(120, 40)) == {120}
+        assert self.hint(wire, PULSE_PERIOD / 4).startswith(CYAN)
+
+    async def test_the_default_is_one_second(self, wire):
+        # Changed from 2.4: the line reads as a prompt waiting for an answer,
+        # and a two-and-a-half-second cycle is slow enough that a glance
+        # catches it standing still.
+        assert PULSE_PERIOD == 1.0
+        assert wire.ui.display == Display()
 
 
 class TestTheAnswerLinePulses:

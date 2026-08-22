@@ -23,7 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from hpca.ui.ansi import AMBER, DIM, GREEN, RED, WHITE, YELLOW
+from hpca.ui.ansi import AMBER, DIM, GREEN, PULSE_PERIOD, RED, WHITE, YELLOW
 from hpca.ui.approval import Decision
 from hpca.ui.editor import Editor
 from hpca.ui.meter import render_bar, severity
@@ -65,10 +65,40 @@ def when(stamp: str) -> str:
         return ""
 
 
-def _label(who: str, at: str) -> str:
-    """`you 21-08-2026 19:04:11` — who said it, and when."""
-    stamp = when(at)
+def _label(who: str, at: str, stamps: bool = True) -> str:
+    """`you 21-08-2026 19:04:11` — who said it, and when.
+
+    ``stamps`` is `Display.chat_stamps` and turning it off leaves the bare
+    `you`, which is the same shape a row with no ``at`` already draws — so the
+    two answers to "no time on this row" produce one label rather than a
+    second layout nothing else in the pane has to line up against.
+    """
+    stamp = when(at) if stamps else ""
     return f"{who} {stamp}" if stamp else who
+
+
+@dataclass(frozen=True)
+class Display:
+    """What this front-end draws with, as the core last said (§4.2 rule 2).
+
+    The plain twin of `protocol.DisplaySettings` — `client.py` is the only
+    module that has seen the wire one, so this is the shape the renderer takes
+    it in. One object rather than loose attributes because the two arrive
+    together, twice: on `hello`, and again whenever the config editor saves.
+
+    Frozen, and replaced rather than edited. A `SessionState` holds the same
+    instance the `RowUI` does, so a mutable one would let a session's chat be
+    rebuilt against a value the app no longer believes — the divergence would
+    be invisible, since both copies stay individually consistent.
+    """
+
+    # Whether a chat row's label carries the instant it was said.
+    chat_stamps: bool = True
+    # One breath of the decision prompt's answer line, in seconds. The module
+    # default stands in until `hello` lands, which is before there is a
+    # decision on screen to pulse (`client._hello` is the first frame).
+    decision_pulse_seconds: float = PULSE_PERIOD
+
 
 # The mode line's copy, lifted from `tui/mode_bar.py` — the hint is the whole
 # value of the row: "auto" and "full-auto" differ by whether a destructive
@@ -180,8 +210,13 @@ def part_fold(part: ChatPart) -> Fold:
     return Fold(head=head, body=part.result.split("\n") if part.result else [])
 
 
-def entry_item(entry: ChatEntry) -> Item:
+def entry_item(entry: ChatEntry, *, stamps: bool = True) -> Item:
     """The row an entry draws as: who said it, and underneath, what they said.
+
+    ``stamps`` is `Display.chat_stamps`, passed in by the session rather than
+    read from anywhere: this is a pure function of an entry and a setting, and
+    a module-level flag would make two sessions' rows depend on the order they
+    were built in.
 
     The one place a `ChatEntry` becomes something with colours in it, so that
     every path into the chat — reset, append, update — produces the same row
@@ -219,7 +254,7 @@ def entry_item(entry: ChatEntry) -> Item:
     row = dict(kind=entry.kind, text=entry.text, key=str(entry.seq))
     if entry.kind == "user":
         return Item(
-            head=_label("you", entry.at),
+            head=_label("you", entry.at, stamps),
             body=body,
             preview=said,
             accent=AMBER,
@@ -230,7 +265,7 @@ def entry_item(entry: ChatEntry) -> Item:
         # Still the user's own words, and still copyable as such — the label
         # is what says they have not been sent yet.
         return Item(
-            head=f"{_label('you', entry.at)} · queued",
+            head=f"{_label('you', entry.at, stamps)} · queued",
             body=body,
             preview=said,
             accent=DIM,
@@ -239,7 +274,7 @@ def entry_item(entry: ChatEntry) -> Item:
         )
     if entry.kind == "error":
         return Item(
-            head=_label("error", entry.at),
+            head=_label("error", entry.at, stamps),
             body=body,
             preview=said,
             accent=RED,
@@ -275,7 +310,7 @@ def entry_item(entry: ChatEntry) -> Item:
     # renderer has never heard of: the text is what matters and dropping the
     # row would lose it.
     return Item(
-        head=_label("hpca", entry.at),
+        head=_label("hpca", entry.at, stamps),
         body=body,
         preview=said,
         accent=WHITE,
@@ -741,8 +776,15 @@ class SessionState:
         flags: tuple[str, ...] = (),
         model: str = "",
         thinking: str = "",
+        display: Display | None = None,
     ) -> None:
         self.session_id = session_id
+        # What this conversation's rows are drawn with (`RowUI.set_display`
+        # hands the same object to every session, and swaps them all at once).
+        # Defaulted rather than required so that a `SessionState` built by a
+        # test or by the blank stand-in draws what the settings' own defaults
+        # would have said.
+        self.display = display or Display()
         self.title = title
         self.profile = profile
         self.mode = mode
@@ -810,6 +852,29 @@ class SessionState:
 
     # -------------------------------------------------------------- the chat
 
+    def _item(self, entry: ChatEntry) -> Item:
+        """One row, drawn with this session's display settings.
+
+        The single place `entry_item` is called from, which is what keeps the
+        three paths into the chat — reset, append, update — producing the same
+        row for the same entry after a setting changes under them.
+        """
+        return entry_item(entry, stamps=self.display.chat_stamps)
+
+    def restyle(self, display: Display) -> None:
+        """Redraw every row, because what a row looks like has changed.
+
+        Not `reset`: nothing about the *conversation* changed, so the rows
+        that are open stay open, the cursor stays on the line it was on and
+        the numbering is untouched — this rebuilds the `Item`s the entries
+        already produced and nothing else. Which is why it is here rather than
+        in `RowUI`: `entries` and `chat.items` are parallel and this is the
+        only side that knows it.
+        """
+        self.display = display
+        self.chat.items = [self._item(entry) for entry in self.entries]
+        self.chat.invalidate()
+
     def reset(self, entries: list[ChatEntry]) -> None:
         """Replace the transcript — the snapshot the deltas build on.
 
@@ -826,7 +891,7 @@ class SessionState:
         # is not this conversation's any more.
         self.context.reset()
         self._live.clear()
-        self.chat.items = [entry_item(entry) for entry in self.entries]
+        self.chat.items = [self._item(entry) for entry in self.entries]
         self._rows = {
             entry.seq: i for i, entry in enumerate(self.entries) if entry.seq
         }
@@ -905,7 +970,7 @@ class SessionState:
         # added to the cache rather than the whole conversation re-flattened
         # on the next frame. This is the append-only invariant (§3.2) being
         # spent rather than merely kept.
-        self.chat.extend(entry_item(entry))
+        self.chat.extend(self._item(entry))
         self._open_last()
         self.chat.cursor = 10**9
         self.loaded = True
@@ -922,7 +987,7 @@ class SessionState:
         if row is None:
             return False
         self.entries[row] = entry
-        self.chat.items[row] = entry_item(entry)
+        self.chat.items[row] = self._item(entry)
         self.chat.invalidate()
         # A row that had nothing to open when it arrived and has something now
         # — an assistant row is appended empty and filled token by token — is
