@@ -44,6 +44,7 @@ from hpca.ui.state import (
     CreateProfile,
     DeleteProfile,
     DeleteSkill,
+    EditProfile,
     Fetch,
     FetchSkills,
     ProfileInfo,
@@ -197,21 +198,32 @@ class TestRewindOverlay:
         press(ui, "enter")
         assert isinstance(ui.overlay, RewindOverlay)
 
-    def test_it_offers_all_three(self):
+    def test_it_offers_both_cuts(self):
         ui = build()
         on_own_message(ui)
         seen = screen(press(ui, "enter"))
         assert "fork the session from here" in seen
         assert "roll this conversation back to here" in seen
-        assert "copy it into the message box" in seen
 
-    def test_the_footer_names_all_three(self):
+    def test_and_no_longer_the_copy(self):
+        # It is `c` on the chat row now, which needs no dialog in front of it.
+        ui = build()
+        on_own_message(ui)
+        assert "copy it into the message box" not in screen(press(ui, "enter"))
+
+    def test_the_footer_names_them_both(self):
         ui = build()
         on_own_message(ui)
         press(ui, "enter")
         foot = plain(ui.render(160, 40)[-1])
-        for pair in ("f fork", "r roll back", "c / enter copy", "esc cancel"):
+        for pair in ("f / enter fork", "r roll back", "esc cancel"):
             assert pair in foot
+
+    def test_and_offers_no_key_it_will_not_answer(self):
+        ui = build()
+        on_own_message(ui)
+        press(ui, "enter")
+        assert "copy" not in plain(ui.render(160, 40)[-1])
 
     def test_a_key_it_has_no_answer_for_leaves_it_open(self):
         ui = build()
@@ -422,6 +434,58 @@ class TestProfileMemories:
         assert sent(ui, SaveProfile) == [], "nothing may be written back"
 
 
+class TestProfilesInTheUsersEditor:
+    """With a terminal to hand over, the profile under the cursor opens in
+    `$EDITOR` — asked for in those words.
+
+    The screen stays up behind it, because the point of editing from a list is
+    that the next one is one keypress away. Nothing comes back through
+    `child_closed`: there is no child, and the save is sent by the side that
+    ran the editor (`UIClient._run_editor`).
+    """
+
+    def _external(self, **kw) -> RowUI:
+        ui = with_profiles(**kw)
+        ui.suspend = lambda run: run()
+        ui.edit_text = lambda text, done: None
+        return ui
+
+    def test_enter_sends_the_row_the_cursor_is_on(self):
+        ui = press(self._external(), "a", "down", "enter")
+        assert sent(ui, EditProfile)[-1] == EditProfile("default", "memories")
+
+    def test_and_not_the_profile_the_core_is_working_under(self):
+        # The whole of the complaint: the old key edited `ui.profile`, from a
+        # screen where a *different* row was selected.
+        ui = self._external()
+        ui.core_profile = "hpc"
+        press(ui, "a", "down", "enter")
+        assert ui.profile == "hpc"
+        assert sent(ui, EditProfile)[-1].name == "default"
+
+    def test_no_in_app_editor_opens_over_it(self):
+        ui = press(self._external(), "a", "enter")
+        assert isinstance(ui.overlay, ProfilesOverlay), "the list stays up"
+        assert "your editor" in ui.overlay.note
+
+    def test_r_sends_the_archive_of_that_row(self):
+        ui = press(self._external(), "a", "down", "r")
+        assert sent(ui, EditProfile)[-1] == EditProfile("default", "archive")
+
+    def test_the_new_profile_row_still_names_one_instead(self):
+        ui = press(self._external(), "a", "end", "enter")
+        assert isinstance(ui.overlay, PromptOverlay)
+        assert sent(ui, EditProfile) == []
+
+    def test_without_a_terminal_the_in_app_editor_is_what_opens(self):
+        # A UI with nothing to hand the terminal over to keeps the screen it
+        # has always had, rather than being told there is no editor and left
+        # with no way to edit a profile at all.
+        ui = press(with_profiles(), "a", "enter")
+        assert isinstance(ui.overlay, TextEditOverlay)
+        assert sent(ui, EditProfile) == []
+
+
 class TestProfileLifecycle:
     def _list(self):
         ui = RowUI(profiles=profiles())
@@ -572,7 +636,7 @@ class TestThinking:
     def test_the_command_opens_the_chooser(self):
         ui = recorded(build())
         ui.focus = CHAT
-        press(ui, "i")
+        press(ui, "ctrl-down")
         type_text(ui, "/thinking")
         press(ui, "enter")
         assert isinstance(ui.overlay, ThinkingOverlay)
@@ -1404,3 +1468,43 @@ def test_the_catalog_reaches_the_new_session_picker():
     # The second stage exists because the demo core answered `llm.list`.
     assert "which llm" in screen(ui)
     assert sample_catalog()[0].label in screen(ui)
+
+
+# ------------------------------------------- a screen's footer wraps as well
+
+
+class TestAScreenFooterWraps:
+    """A screen has its own keys and the same narrow terminal to draw them in,
+    so the wrapping is the frame's, not the rows'."""
+
+    def test_no_hint_falls_off_the_end_of_a_narrow_screen_footer(self):
+        ui = build()
+        ui.overlay = LlmOverlay()
+        rows = ui._screen_footer(ui.overlay, 60, 40)
+        assert len(rows) > 1, "the case is only interesting once it wraps"
+        shown = "  ".join(plain(row) for row in rows)
+        for key, label in ui.overlay.footer():
+            assert f"{key} {label}" in shown
+
+    def test_the_body_gives_up_what_the_footer_takes(self):
+        ui = build()
+        ui.overlay = LlmOverlay()
+        for width in (200, 120, 90, 60, 40, 24):
+            rows = len(ui._screen_footer(ui.overlay, width, 40))
+            assert ui._screen_h(ui.overlay, width, 40) == 40 - 1 - rows, width
+
+    def test_the_frame_is_exact_at_every_width_the_footer_wraps_at(self):
+        ui = build()
+        ui.overlay = LlmOverlay()
+        for width in range(200, 19, -1):
+            drawn = ui.render(width, 40)
+            assert len(drawn) == 40
+            assert widths(drawn) == {width}, width
+
+    def test_what_a_page_key_scrolls_is_what_was_drawn(self):
+        # `handle` and `render` ask the same question, or page-down moves by a
+        # different amount than the screen showed.
+        ui = build()
+        ui.overlay = LlmOverlay()
+        drawn = len(ui._screen_footer(ui.overlay, 50, 40))
+        assert ui._screen_h(ui.overlay, 50, 40) == 40 - 1 - drawn

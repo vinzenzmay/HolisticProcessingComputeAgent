@@ -24,6 +24,15 @@ it queues (:meth:`queue_edits`), and the queue is reviewed at `/conclude`. A
 small model with write access to its own memory is the failure mode this whole
 design avoids, so every path here ends at a human.
 
+**A deferred write still has to answer.** Because nothing is applied, the model
+never sees the effect of what it just did, so the *result string* is the only
+feedback there is — and for a while it was a constant. A `demote` addressing
+text that existed nowhere read exactly like a successful `add`, and the model,
+having no way to tell, kept shortening its substring and trying again. So
+:meth:`queue_edits` resolves every address at queue time and reports the state
+it leaves behind: success and failure must be distinguishable, or a tool call
+has no terminating condition.
+
 **Approval is a round trip, not a call.** `HpcaApp._review_proposals` pushed a
 modal and awaited the user inside the write path. Across a socket that is not
 available: the proposals are *emitted* (`memory.proposals`) and the answer
@@ -92,6 +101,55 @@ Severity = Literal["information", "warning", "error"]
 KIND_MEMORIZE = "memorize"
 KIND_REFLECTION = "reflection"
 KIND_FLAGGED = "flagged"
+
+# How many changes one session may leave waiting for review. A refusal in
+# :meth:`MemoryService.queue_edits` is normally something the model can act on
+# and reissue, which is exactly what a runaway needs; this one it cannot retry
+# its way out of, so it is the last stop before an unbounded queue. It is also
+# a review limit: the user approves the batch whole, in one dialog, and past a
+# couple of dozen entries that dialog stops being read.
+MEMORY_QUEUE_LIMIT = 25
+
+# How many times one operation may be refused, unchanged, before the tool
+# stops for the rest of the session. Three, because the ladder needs a rung
+# between "here is what is wrong" and "stop": the first refusal names the
+# entries that do exist, the second says the model has already been told, and
+# a model that reissues the same bytes a third time is not reading the answer
+# at all — which is the runaway this whole path exists to end.
+MEMORY_REPEAT_LIMIT = 3
+
+# How many operations may be refused *since the last one that made it into the
+# queue* before the tool stops for the session. Twelve: four operations run to
+# the end of their three-strike ladder, or twelve distinct misses in a row.
+# Since every refusal now comes back with the scope's actual entries, one miss
+# should be enough for a model that reads it; twelve in a row with nothing at
+# all landing in between is not a model that is going to arrive. The count is
+# deliberately of *wasted* calls — ones that leave nothing for the user to
+# review — which is why it is much tighter than the queue limit above.
+MEMORY_REJECT_LIMIT = 12
+
+# Said the second time an operation is refused unchanged. The point is less
+# the content than that the string *moved*: an answer that never changes is
+# the only thing a looping model is actually reacting to, so the second
+# refusal must not read like the first, and must say what happens next.
+REPEATED = (
+    "You were told this once already in this session; reissuing it unchanged "
+    "will not change the answer. Correct it from the entries listed above or "
+    "drop it — one more identical attempt stops this tool for the session."
+)
+
+
+def _brief(text: str, limit: int = 70) -> str:
+    """One change on one line. The full text is in the review dialog; here it
+    only has to be recognizable enough to not be flagged twice."""
+    flat = " ".join(text.split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
+def _listing(operations: list[MemoryOp], shown: int = 6) -> str:
+    items = "; ".join(_brief(operation.describe()) for operation in operations[:shown])
+    rest = len(operations) - shown
+    return items + (f"; … and {rest} more" if rest > 0 else "")
 
 
 @dataclass
@@ -171,6 +229,18 @@ class MemoryService:
         # session. Nothing is written until the user runs /conclude, which
         # reviews these together with the self-review proposals.
         self._pending_edits: dict[str, list[MemoryOp]] = {}
+        # The other half of that ledger: what `memory` was *refused*, per
+        # session. Refusals leave no trace anywhere else — that is the whole
+        # problem with them — so a repeat is invisible unless it is counted
+        # here. Keyed by operation identity, and never cleared, so an
+        # operation refused twice an hour apart is still on its third strike.
+        self._rejected_ops: dict[str, dict[tuple[str, ...], int]] = {}
+        # Refusals since the last change that actually made it into the queue,
+        # per session. Reset by progress, on purpose: see `queue_edits`.
+        self._rejected_run: dict[str, int] = {}
+        # Sessions where `memory` has stopped answering, and the answer it
+        # gives instead. Set only by a terminal refusal.
+        self._edits_closed: dict[str, str] = {}
         # Emitted proposal sets awaiting an answer, per session.
         self._pending_proposals: dict[str, ProposalSet] = {}
         self.skills: list[Skill] = load_skills(
@@ -399,16 +469,257 @@ class MemoryService:
 
     # ------------------------------------------------------- flagged edits
 
-    def queue_edits(self, session_id: str, operations: list[MemoryOp]) -> str:
+    def queue_edits(
+        self,
+        session_id: str,
+        operations: list[MemoryOp],
+        *,
+        profile: str | None = None,
+    ) -> str:
         """The `memory` tool's path: queue a flagged batch for review at the
         next /conclude. Nothing is written now — the agent flags, the user
-        decides. Returns the tool result so the model knows it was noted."""
+        decides. Returns the tool result the model reads.
+
+        That result used to be one constant string, and the constant was the
+        bug. `match` was resolved only at /conclude, so a `demote` addressing
+        a substring that existed nowhere got the same "Noted 1 memory
+        change(s)" as a successful `add`. A model that cannot tell a hit from
+        a miss has no basis to stop, and one did not: it loosened the
+        substring and reissued the call until the user killed the turn. So the
+        addresses are resolved *here*, and the answer says which operations
+        landed, which did not and why, and what is now waiting.
+
+        They are resolved against the profile as this queue would leave it,
+        not as it is on disk. Nothing is applied until /conclude, so an entry
+        the model added two calls ago exists in no file to be matched — and
+        adding a fact and then correcting it in the same conversation is the
+        commonest shape this tool is used in.
+
+        ``profile`` says which profile the addresses resolve against and
+        defaults to the working one, which is the session's own except for a
+        background turn running under another. Wrong there only in what this
+        message *says*: the apply path loads the session's profile itself and
+        the batch is all-or-nothing, so nothing can land in the wrong file.
+
+        **Refusals are counted too, or the loop survives the fix.** Naming the
+        miss makes a model correct itself; it does not make an incorrigible
+        one stop. Neither guard above bites on a refused operation: it never
+        enters the queue, so the queue limit is never approached and it is
+        never a duplicate *of* anything queued. A model can therefore reissue
+        one invalid `demote` forever and get a byte-identical answer every
+        time — the same "tool result that does not move" that caused the
+        original runaway, only with a better sentence in it. So refusals get
+        their own ledger, and the answer to a repeat escalates: the second
+        says it has been said before, the third stops the tool for the
+        session. Every shape of the loop now ends somewhere — the same
+        operation at :data:`MEMORY_REPEAT_LIMIT`, different bad operations at
+        :data:`MEMORY_REJECT_LIMIT`, and good ones at
+        :data:`MEMORY_QUEUE_LIMIT`.
+        """
         if not operations:
             return "Nothing to flag."
-        self._pending_edits.setdefault(session_id, []).extend(operations)
+        queued = self._pending_edits.setdefault(session_id, [])
+        closed = self._edits_closed.get(session_id)
+        if closed:
+            # The queue line is rebuilt rather than replayed: /conclude can
+            # empty the queue after the tool has stopped, and a stored answer
+            # would go on naming entries the user has already reviewed.
+            return f"{closed}\n{self._waiting_line(queued)}"
+        if len(queued) >= MEMORY_QUEUE_LIMIT:
+            return (
+                f"Refused: {len(queued)} memory changes are already waiting "
+                f"for review, which is the limit ({MEMORY_QUEUE_LIMIT}). Do "
+                "not call this tool again in this session — tell the user to "
+                "run /conclude to review what is queued."
+            )
+        projected = self._projected(
+            Profile.load(profile or self._deps.profile), queued
+        )
+        accepted: list[MemoryOp] = []
+        refused: list[str] = []
+        for operation in operations:
+            problem, projected = self._admit(
+                operation, projected, queued + accepted
+            )
+            if not problem:
+                accepted.append(operation)
+                continue
+            strikes, run = self._record_rejection(session_id, operation)
+            if strikes >= MEMORY_REPEAT_LIMIT or run >= MEMORY_REJECT_LIMIT:
+                queued.extend(accepted)
+                return self._close_edits(
+                    session_id, operation, strikes, run, queued
+                )
+            refused.append(problem if strikes == 1 else f"{problem} {REPEATED}")
+        queued.extend(accepted)
+        if accepted:
+            # Progress resets the run: a session that is landing changes is
+            # using the tool, not looping in it, and should not be shut down
+            # hours later for misses it recovered from. Safe to reset because
+            # it is not the only bound — the repeat ledger below is never
+            # reset, so alternating a good change with the *same* bad one
+            # still hits the third strike, and alternating it with distinct
+            # good ones fills the queue to its own limit instead.
+            self._rejected_run[session_id] = 0
+        return self._queue_report(len(operations), accepted, refused, queued)
+
+    def _record_rejection(
+        self, session_id: str, operation: MemoryOp
+    ) -> tuple[int, int]:
+        """Book one refusal: how often *this* operation has been refused this
+        session, and how many refusals have gone by without one landing.
+
+        Identity is the operation's four fields, compared exactly. The loop
+        this bounds reissues the same bytes, and an exact key cannot punish a
+        model for a genuinely new attempt — a shortened substring is a
+        different operation and starts its own count, which is what the run
+        limit is for.
+        """
+        key = (
+            operation.op,
+            operation.scope.value,
+            operation.match,
+            operation.text,
+        )
+        seen = self._rejected_ops.setdefault(session_id, {})
+        seen[key] = seen.get(key, 0) + 1
+        run = self._rejected_run.get(session_id, 0) + 1
+        self._rejected_run[session_id] = run
+        return seen[key], run
+
+    def _close_edits(
+        self,
+        session_id: str,
+        operation: MemoryOp,
+        strikes: int,
+        run: int,
+        queued: list[MemoryOp],
+    ) -> str:
+        """Stop answering `memory` for this session, and say so once and for
+        all.
+
+        Deliberately not undone by /conclude: what ran out is the model's
+        ability to address memory correctly, and reviewing the queue does not
+        change that. The message is careful, for the same reason, not to
+        promise that /conclude reopens the tool — it asks the model to hand
+        the remaining work to the user, which is the one move that still
+        works. Whatever *was* queued is listed, so nothing looks lost.
+        """
+        if strikes >= MEMORY_REPEAT_LIMIT:
+            why = (
+                f"Refused: the same operation has now been refused {strikes} "
+                f"times in this session, unchanged — {_brief(operation.describe())}. "
+                "Reissuing it cannot make it work."
+            )
+        else:
+            why = (
+                f"Refused: {run} memory operations have been refused in this "
+                f"session without one being queued, which is the limit "
+                f"({MEMORY_REJECT_LIMIT})."
+            )
+        message = (
+            f"{why} Do not call this tool again in this session — tell the "
+            "user in plain words what you wanted to save and leave it to them "
+            "to run /conclude."
+        )
+        self._edits_closed[session_id] = message
+        return f"{message}\n{self._waiting_line(queued)}"
+
+    def _admit(
+        self, operation: MemoryOp, projected: Profile, queued: list[MemoryOp]
+    ) -> tuple[str, Profile]:
+        """Why this operation cannot join the queue, or "" and the profile it
+        would leave behind.
+
+        The duplicate check comes first and is exact rather than semantic: a
+        model reissuing byte-identical operations is the tightest form of the
+        loop, and it is the one case where "you already did this" is both true
+        and enough to stop. Everything else is delegated to `apply_batch`
+        against the projection, so queue-time addressing and /conclude-time
+        addressing cannot drift apart — and `resolve`'s refusal already names
+        the scope's current entries, which is what lets the model correct
+        itself in one step instead of bisecting its way to a shorter
+        substring.
+        """
+        if len(queued) >= MEMORY_QUEUE_LIMIT:
+            return (
+                f"{_brief(operation.describe())} — the queue is full "
+                f"({MEMORY_QUEUE_LIMIT}); ask the user to run /conclude."
+            ), projected
+        if operation in queued:
+            return (
+                f"{_brief(operation.describe())} — identical to a change "
+                "already queued this session."
+            ), projected
+        try:
+            # No cap here: the budget is a property of the final batch, and
+            # `propose_flagged_edits` checks it against the profile the write
+            # will actually land in. Refusing an add now because the batch
+            # that frees room has not been issued yet would be a wall the
+            # model could only retry against.
+            result = apply_batch(projected, [operation])
+        except MemoryOpError as e:
+            return f"{_brief(operation.describe())} — {e}", projected
+        if not result.applied:
+            reason = result.skipped[0] if result.skipped else "no change"
+            return f"{_brief(operation.describe())} — {reason}", projected
+        return "", result.profile
+
+    @staticmethod
+    def _projected(loaded: Profile, operations: list[MemoryOp]) -> Profile:
+        """The profile as the queue standing so far would leave it.
+
+        Every queued operation resolved cleanly when it was queued, so this
+        normally cannot raise; it still can if the user hand-edited the file
+        in between, and then the file as it is now is the honest answer — the
+        queue is re-checked whole at /conclude anyway, where a batch that no
+        longer applies is dropped with a warning the user can see.
+        """
+        if not operations:
+            return loaded
+        try:
+            return apply_batch(loaded, operations).profile
+        except MemoryOpError:
+            return loaded
+
+    @staticmethod
+    def _queue_report(
+        asked: int,
+        accepted: list[MemoryOp],
+        refused: list[str],
+        queued: list[MemoryOp],
+    ) -> str:
+        """What the model is told: what landed, what did not and why, and what
+        is now waiting.
+
+        The last part is what makes the call observable at all. Without it two
+        calls that leave entirely different queues can read identically, and a
+        tool whose result does not move when the state does is a tool the
+        model can only guess about. It is kept to one summarized line per
+        change, and truncated, because this text is paid for on every call.
+        """
+        if accepted and refused:
+            lines = [f"Queued {len(accepted)} of {asked} memory change(s)."]
+        elif accepted:
+            lines = [f"Queued {len(accepted)} memory change(s)."]
+        else:
+            lines = [f"Queued none of the {asked} memory change(s) asked for."]
+        lines += [f"NOT queued — {reason}" for reason in refused[:3]]
+        if len(refused) > 3:
+            lines.append(f"… and {len(refused) - 3} more not queued.")
+        lines.append(MemoryService._waiting_line(queued))
+        return "\n".join(lines)
+
+    @staticmethod
+    def _waiting_line(queued: list[MemoryOp]) -> str:
+        """The one line that makes the call observable: what the queue holds
+        now. Shared with the terminal refusals so that stopping the tool never
+        also hides what the session already banked."""
+        if not queued:
+            return "Nothing is waiting for review."
         return (
-            f"Noted {len(operations)} memory change(s) — they will be reviewed "
-            "together when the user runs /conclude. Nothing is saved yet."
+            f"Waiting for the user's review at /conclude ({len(queued)}, "
+            f"nothing saved yet): {_listing(queued)}"
         )
 
     def pending_edits(self, session_id: str) -> list[MemoryOp]:

@@ -23,11 +23,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from hpca.ui.ansi import AMBER, DIM, GREEN, RED, WHITE, YELLOW
+from hpca.ui.ansi import AMBER, DIM, GREEN, PULSE_PERIOD, RED, WHITE, YELLOW
 from hpca.ui.approval import Decision
 from hpca.ui.editor import Editor
 from hpca.ui.meter import render_bar, severity
 from hpca.ui.pane import Fold, Item, Pane
+from hpca.ui.rain import FPS as RAIN_FPS
 
 # The kinds of chat entry that are the user's own words, and so the ones Enter
 # offers the rewind on. `queued` counts: it is a message the user wrote, drawn
@@ -65,10 +66,45 @@ def when(stamp: str) -> str:
         return ""
 
 
-def _label(who: str, at: str) -> str:
-    """`you 21-08-2026 19:04:11` — who said it, and when."""
-    stamp = when(at)
+def _label(who: str, at: str, stamps: bool = True) -> str:
+    """`you 21-08-2026 19:04:11` — who said it, and when.
+
+    ``stamps`` is `Display.chat_stamps` and turning it off leaves the bare
+    `you`, which is the same shape a row with no ``at`` already draws — so the
+    two answers to "no time on this row" produce one label rather than a
+    second layout nothing else in the pane has to line up against.
+    """
+    stamp = when(at) if stamps else ""
     return f"{who} {stamp}" if stamp else who
+
+
+@dataclass(frozen=True)
+class Display:
+    """What this front-end draws with, as the core last said (§4.2 rule 2).
+
+    The plain twin of `protocol.DisplaySettings` — `client.py` is the only
+    module that has seen the wire one, so this is the shape the renderer takes
+    it in. One object rather than loose attributes because the two arrive
+    together, twice: on `hello`, and again whenever the config editor saves.
+
+    Frozen, and replaced rather than edited. A `SessionState` holds the same
+    instance the `RowUI` does, so a mutable one would let a session's chat be
+    rebuilt against a value the app no longer believes — the divergence would
+    be invisible, since both copies stay individually consistent.
+    """
+
+    # Whether a chat row's label carries the instant it was said.
+    chat_stamps: bool = True
+    # Whether the screen the quit question cleared rains (`ui.rain`), and
+    # how many frames a second it falls at. The module default stands in until
+    # `hello` lands, which is long before there is a quit dialog to draw.
+    quit_rain: bool = True
+    quit_rain_fps: int = RAIN_FPS
+    # One breath of the decision prompt's answer line, in seconds. The module
+    # default stands in until `hello` lands, which is before there is a
+    # decision on screen to pulse (`client._hello` is the first frame).
+    decision_pulse_seconds: float = PULSE_PERIOD
+
 
 # The mode line's copy, lifted from `tui/mode_bar.py` — the hint is the whole
 # value of the row: "auto" and "full-auto" differ by whether a destructive
@@ -180,8 +216,13 @@ def part_fold(part: ChatPart) -> Fold:
     return Fold(head=head, body=part.result.split("\n") if part.result else [])
 
 
-def entry_item(entry: ChatEntry) -> Item:
+def entry_item(entry: ChatEntry, *, stamps: bool = True) -> Item:
     """The row an entry draws as: who said it, and underneath, what they said.
+
+    ``stamps`` is `Display.chat_stamps`, passed in by the session rather than
+    read from anywhere: this is a pure function of an entry and a setting, and
+    a module-level flag would make two sessions' rows depend on the order they
+    were built in.
 
     The one place a `ChatEntry` becomes something with colours in it, so that
     every path into the chat — reset, append, update — produces the same row
@@ -219,7 +260,7 @@ def entry_item(entry: ChatEntry) -> Item:
     row = dict(kind=entry.kind, text=entry.text, key=str(entry.seq))
     if entry.kind == "user":
         return Item(
-            head=_label("you", entry.at),
+            head=_label("you", entry.at, stamps),
             body=body,
             preview=said,
             accent=AMBER,
@@ -230,7 +271,7 @@ def entry_item(entry: ChatEntry) -> Item:
         # Still the user's own words, and still copyable as such — the label
         # is what says they have not been sent yet.
         return Item(
-            head=f"{_label('you', entry.at)} · queued",
+            head=f"{_label('you', entry.at, stamps)} · queued",
             body=body,
             preview=said,
             accent=DIM,
@@ -239,7 +280,7 @@ def entry_item(entry: ChatEntry) -> Item:
         )
     if entry.kind == "error":
         return Item(
-            head=_label("error", entry.at),
+            head=_label("error", entry.at, stamps),
             body=body,
             preview=said,
             accent=RED,
@@ -275,7 +316,7 @@ def entry_item(entry: ChatEntry) -> Item:
     # renderer has never heard of: the text is what matters and dropping the
     # row would lose it.
     return Item(
-        head=_label("hpca", entry.at),
+        head=_label("hpca", entry.at, stamps),
         body=body,
         preview=said,
         accent=WHITE,
@@ -593,18 +634,43 @@ class Toast:
 
 
 @dataclass
-class Confirm:
-    """A yes/no question, from the core or from the UI itself.
+class Offer:
+    """A `confirm.requested`, waiting in the session it was raised about.
 
-    ``id`` is `confirm.requested`'s: the core holds the continuation (today,
-    the coroutine that writes a learned log signature) and only the yes/no
-    crosses back. It is empty for the eleven local questions — really quit,
-    delete this session, interrupt this turn — which have no core state
-    waiting on them and are answered by ``on_answer`` alone.
+    The core holds the continuation under ``id`` — today, the coroutine that
+    writes a learned log signature — and only the yes/no crosses back.
+
+    Held on the `SessionState` and not on the app, which is the whole point of
+    it: this is raised by a poll rather than by a keypress, so it belongs to
+    the conversation whose job failed rather than to whatever happens to be on
+    screen when it lands. Switching session carries it, exactly as the parked
+    decision and the half-typed draft are carried (§4.4).
     """
 
     id: str = ""
     question: str = ""
+
+
+@dataclass
+class Confirm:
+    """A yes/no the UI asks itself, over everything else.
+
+    Really quit, interrupt this turn, delete this session: local questions
+    with no core state waiting on them, answered by ``on_answer`` alone. What
+    the *core* asks is an `Offer` above, which is a different thing in every
+    way that matters — it is about one session, it can arrive while the user
+    is elsewhere, and so it waits in that session rather than taking the
+    screen.
+    """
+
+    question: str = ""
+    # Whether the screen this one cleared falls (`ui.rain`). Per question and
+    # not per confirmation: leaving is the one of these you are not coming
+    # back from, so it is the one that gets a send-off. Stopping a turn or
+    # deleting a session are things you do in the middle of working, and an
+    # animation over the top of them would be a flourish charged to somebody
+    # who is busy.
+    rain: bool = False
     # What to do with the answer here, when the answer is this side's business.
     # A callable rather than a verdict flag because the eleven call sites do
     # eleven different things, and the alternative is the UI holding a little
@@ -741,8 +807,15 @@ class SessionState:
         flags: tuple[str, ...] = (),
         model: str = "",
         thinking: str = "",
+        display: Display | None = None,
     ) -> None:
         self.session_id = session_id
+        # What this conversation's rows are drawn with (`RowUI.set_display`
+        # hands the same object to every session, and swaps them all at once).
+        # Defaulted rather than required so that a `SessionState` built by a
+        # test or by the blank stand-in draws what the settings' own defaults
+        # would have said.
+        self.display = display or Display()
         self.title = title
         self.profile = profile
         self.mode = mode
@@ -787,6 +860,12 @@ class SessionState:
         # Per session and held here rather than in one shared bar, which is
         # what parks the half-typed refusal across a switch (§4.4).
         self.decision: Decision | None = None
+        # Questions the core raised about this conversation's own work, oldest
+        # first (`Offer`). A list rather than one slot: two background jobs can
+        # fail before either question is answered, and the core is holding a
+        # continuation per id — a second offer overwriting the first would
+        # strand that one with nothing left on any screen able to answer it.
+        self.offers: list[Offer] = []
         self.proposals: list[Proposal] = []
         # A reply landed here while the user was looking at another
         # conversation (§4.3 item 15). Local, because the core has no flag for
@@ -810,6 +889,29 @@ class SessionState:
 
     # -------------------------------------------------------------- the chat
 
+    def _item(self, entry: ChatEntry) -> Item:
+        """One row, drawn with this session's display settings.
+
+        The single place `entry_item` is called from, which is what keeps the
+        three paths into the chat — reset, append, update — producing the same
+        row for the same entry after a setting changes under them.
+        """
+        return entry_item(entry, stamps=self.display.chat_stamps)
+
+    def restyle(self, display: Display) -> None:
+        """Redraw every row, because what a row looks like has changed.
+
+        Not `reset`: nothing about the *conversation* changed, so the rows
+        that are open stay open, the cursor stays on the line it was on and
+        the numbering is untouched — this rebuilds the `Item`s the entries
+        already produced and nothing else. Which is why it is here rather than
+        in `RowUI`: `entries` and `chat.items` are parallel and this is the
+        only side that knows it.
+        """
+        self.display = display
+        self.chat.items = [self._item(entry) for entry in self.entries]
+        self.chat.invalidate()
+
     def reset(self, entries: list[ChatEntry]) -> None:
         """Replace the transcript — the snapshot the deltas build on.
 
@@ -826,7 +928,7 @@ class SessionState:
         # is not this conversation's any more.
         self.context.reset()
         self._live.clear()
-        self.chat.items = [entry_item(entry) for entry in self.entries]
+        self.chat.items = [self._item(entry) for entry in self.entries]
         self._rows = {
             entry.seq: i for i, entry in enumerate(self.entries) if entry.seq
         }
@@ -905,7 +1007,7 @@ class SessionState:
         # added to the cache rather than the whole conversation re-flattened
         # on the next frame. This is the append-only invariant (§3.2) being
         # spent rather than merely kept.
-        self.chat.extend(entry_item(entry))
+        self.chat.extend(self._item(entry))
         self._open_last()
         self.chat.cursor = 10**9
         self.loaded = True
@@ -922,7 +1024,7 @@ class SessionState:
         if row is None:
             return False
         self.entries[row] = entry
-        self.chat.items[row] = entry_item(entry)
+        self.chat.items[row] = self._item(entry)
         self.chat.invalidate()
         # A row that had nothing to open when it arrived and has something now
         # — an assistant row is appended empty and filled token by token — is
@@ -999,6 +1101,31 @@ class SessionState:
         # re-binds the anchor and the turn is a turn again, and where there is
         # no turn `working` is already False.
         self.turn.parked = False
+
+    # ---------------------------------------------------------- the offers
+
+    @property
+    def offer(self) -> Offer | None:
+        """The one being asked, which is the oldest one still unanswered."""
+        return self.offers[0] if self.offers else None
+
+    def add_offer(self, offer_id: str, question: str) -> Offer:
+        """`confirm.requested` for this conversation.
+
+        The same id twice is the same question — a re-emit on subscribe would
+        otherwise ask it twice and leave the second copy unanswerable, since
+        the core frees the continuation on the first answer.
+        """
+        for existing in self.offers:
+            if existing.id == offer_id:
+                return existing
+        offer = Offer(id=offer_id, question=question)
+        self.offers.append(offer)
+        return offer
+
+    def drop_offer(self, offer_id: str) -> None:
+        """Answered. Nothing about the turn changes — this never held one."""
+        self.offers = [o for o in self.offers if o.id != offer_id]
 
     # -------------------------------------------------------------- the turn
 
@@ -1260,6 +1387,41 @@ class Drop:
 
 
 @dataclass(frozen=True)
+class MoveSession:
+    """alt+↑ / alt+↓ on a sidebar row: shift it one place, for good.
+
+    An offset and not a slot, and a row named by id rather than by position,
+    because that is the whole gesture the user has and because both halves of
+    that survive the round trip: the core swaps with whichever row is the
+    neighbour *when it arrives*, so two presses in quick succession walk one
+    session past two others even though the second was sent before the first
+    was answered.
+
+    Which is also why nothing is reordered here. The arrangement is a fact
+    about the database (rule 2 of §4.2), the answer is a whole new
+    `session.rows`, and a sidebar that shuffled itself first would only be
+    overwritten by it — which is exactly the bug this replaced: the list moved,
+    and the next frame from the core put it straight back.
+    """
+
+    session_id: str
+    delta: int
+
+
+@dataclass(frozen=True)
+class MoveWatch:
+    """alt+↑ / alt+↓ on a watch box: the right column's half of `MoveSession`.
+
+    Same shape and same reasons — see there. ``ref`` is the string every panel
+    row carries; a watch id is an int, and that conversion is the sender's
+    errand (`protocol.PanelRow`), which is `client.py`'s side of the line.
+    """
+
+    ref: str
+    delta: int
+
+
+@dataclass(frozen=True)
 class SaveSettings:
     """The whole settings file, as the config editor left it (§4.3 item 26).
 
@@ -1322,6 +1484,26 @@ class SaveProfile:
     name: str
     kind: str  # "memories" or "archive"
     text: str
+
+
+@dataclass(frozen=True)
+class EditProfile:
+    """Open one of a profile's two files in `$EDITOR`, and save what comes back.
+
+    The counterpart of `SaveProfile` for the profiles screen's other editor:
+    the same two kinds, the same profile named by name, and no text — because
+    the whole point of this one is that the text is fetched, edited outside
+    the app and written back by the side holding the wire
+    (`UIClient.edit_profile`).
+
+    The profile is named rather than assumed. A screen sends this about the
+    row under the cursor, which is not usually the profile the core is
+    working under, and a command that meant "the active one" is what made the
+    old ctrl+e edit a file nobody had selected.
+    """
+
+    name: str
+    kind: str  # "memories" or "archive"
 
 
 @dataclass(frozen=True)
@@ -1512,11 +1694,14 @@ Intent = (
     | Answer
     | Peek
     | Drop
+    | MoveSession
+    | MoveWatch
     | SaveSettings
     | SetThinking
     | SetBackend
     | SetProfile
     | SaveProfile
+    | EditProfile
     | CreateProfile
     | CopyProfile
     | DeleteProfile

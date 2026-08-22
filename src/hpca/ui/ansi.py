@@ -82,13 +82,20 @@ PULSE_ENDS = ((5, 5, 5), (0, 4, 4))  # near-white, and the levels CYAN is
 PULSE_STEPS = 6
 
 # How long one breath takes, and how often the frame it is on has to be drawn
-# again. 2.4s is slow enough to read as breathing rather than as flicker, and
-# the interval is the spinner's 0.1 for the spinner's reason (`ui/state.py`):
+# again. The period is a setting now (`config.DisplaySettings`, arriving as
+# `protocol.DisplaySettings.decision_pulse_seconds`) and this is what a caller
+# that was handed none uses; it is also the floor of what the interval below
+# can resolve, so the two are read together. It was 2.4s, on the argument that
+# a slow breath is not a flicker — 1.0 because in use the line is read as a
+# *prompt* waiting for an answer, and a two-and-a-half-second cycle is slow
+# enough that a glance at the screen catches it standing still.
+#
+# The interval is the spinner's 0.1 for the spinner's reason (`ui/state.py`):
 # it is the idle cost of having a decision on screen, and this is the cheapest
 # rate that still moves. The sine is fastest through the middle of its sweep,
 # where ten frames a second skips a step of the seven — which is the part of a
 # gradient nobody can follow anyway; the ends, where it lingers, get every one.
-PULSE_PERIOD = 2.4
+PULSE_PERIOD = 1.0
 PULSE_INTERVAL = 0.1
 
 
@@ -111,7 +118,7 @@ def _pulse_ramp() -> tuple[str, ...]:
 PULSE_RAMP = _pulse_ramp()
 
 
-def pulse(now: float) -> str:
+def pulse(now: float, period: float = PULSE_PERIOD) -> str:
     """The answer line's colour at this instant, and at no other.
 
     A pure function of the clock, exactly as the spinner's glyph is
@@ -119,8 +126,18 @@ def pulse(now: float) -> str:
     something changed can work out when this one next will (`PULSE_INTERVAL`),
     and a test can pin the clock and get the colour back rather than watching
     for a change it has no way to time.
+
+    ``period`` is how long one breath takes. A value that cannot be divided by
+    falls back to the module's own rather than raising: the settings model is
+    what refuses a period of zero (`config.DisplaySettings` — ``gt=0``, one
+    line beside the editor that typed it), and by the time a number has
+    crossed the wire it is being divided by inside a repaint, where the only
+    thing an exception can do is take the frame down with the terminal in raw
+    mode. Belt and braces, and the braces are the ones the user can read.
     """
-    phase = (math.sin(now * math.tau / PULSE_PERIOD) + 1) / 2
+    if period <= 0:
+        period = PULSE_PERIOD
+    phase = (math.sin(now * math.tau / period) + 1) / 2
     return PULSE_RAMP[min(len(PULSE_RAMP) - 1, int(phase * len(PULSE_RAMP)))]
 
 
@@ -394,35 +411,102 @@ def reverse(text: str, ranges: list[tuple[int, int]]) -> str:
     return "".join(out)
 
 
-def footer_line(
-    pairs: list[tuple[str, str]], width: int, note: str = "", style: str = YELLOW
-) -> str:
-    """As many ``key label`` pairs as fit, keys bright and labels dim.
+def _footer_note(note: str, width: int) -> str:
+    """The note as it will be drawn, cut to what a row can hold.
 
-    Truncation is by whole pairs rather than by characters: half a hint is
-    worse than one hint fewer, and ``?`` opens the full list anyway — which is
-    the honest answer to "show *all* the hotkeys" on an 80-column terminal.
+    Cut rather than allowed to run past the edge: every row is padded to an
+    exact number of cells, so one over-long `notify` would otherwise shift the
+    differential repaint by however far it overflowed. Three cells go to the
+    leading space and the two after the note.
     """
-    plain: list[str] = []
-    styled: list[str] = []
-    used = 1
-    if note:
-        # Cut rather than allowed to run past the edge: every row is padded to
-        # an exact number of cells, so one over-long `notify` would otherwise
-        # shift the differential repaint by however far it overflowed. Three
-        # cells go to the leading space and the two after the note.
-        note = cut(note, max(0, width - 3))
-        used += cell_width(note) + 2
-    for key, label in pairs:
-        piece = f"{key} {label}"
-        extra = cell_width(piece) + (2 if plain else 0)
-        if used + extra > width - 1:
-            break
-        plain.append(piece)
-        styled.append(f"{CYAN}{key}{RESET} {DIM}{label}{RESET}")
-        used += extra
-    head = f"{style}{note}{RESET}  " if note else ""
-    return " " + head + "  ".join(styled) + " " * max(0, width - used)
+    return cut(note, max(0, width - 3)) if note else ""
+
+
+def _footer_fill(
+    pairs: list[tuple[str, str]], width: int, used: int, max_rows: int
+) -> list[list[tuple[str, str]]]:
+    """``pairs`` dealt into rows of ``width``, the first row starting ``used``
+    cells in. The loop `footer_wrap` is two calls to."""
+    rows: list[list[tuple[str, str]]] = [[]]
+    for pair in pairs:
+        piece = cell_width(pair[0]) + 1 + cell_width(pair[1])
+        extra = piece + (2 if rows[-1] else 0)
+        if used + extra <= width - 1:
+            rows[-1].append(pair)
+            used += extra
+        elif len(rows) >= max_rows:
+            break  # no rows left to give: the rest fall off the end
+        elif 1 + piece <= width - 1:
+            rows.append([pair])
+            used = 1 + piece
+    return rows
+
+
+def footer_wrap(
+    pairs: list[tuple[str, str]], width: int, note: str = "", max_rows: int = 1
+) -> list[list[tuple[str, str]]]:
+    """Which ``key label`` pairs land on which footer row at this width.
+
+    Split out of `footer_lines` because the frame has to know how tall the
+    footer is *before* it can decide how many rows are left for the panes, and
+    asking that must not mean building the styled strings a second time from a
+    second set of inputs — one function answers both questions, and they cannot
+    disagree (`RowUI._avail`).
+
+    A pair is never broken across rows: it is a key and the word for what the
+    key does, and half of that is not a hint. One so wide that no row could
+    hold it whole is dropped on its own and the rest carry on, rather than
+    everything after it going with it.
+
+    An empty last row is the note's: see `footer_lines` for why it gets one.
+    """
+    note = _footer_note(note, width)
+    used = 1 + (cell_width(note) + 2 if note else 0)
+    rows = _footer_fill(pairs, width, used, max_rows)
+    if not note or len(rows) == 1:
+        return rows
+    return _footer_fill(pairs, width, 1, max_rows - 1) + [[]]
+
+
+def footer_lines(
+    pairs: list[tuple[str, str]],
+    width: int,
+    note: str = "",
+    style: str = YELLOW,
+    max_rows: int = 1,
+) -> list[str]:
+    """The ``key label`` pairs, keys bright and labels dim, over as many rows
+    as they need — up to ``max_rows``.
+
+    Wrapping rather than truncating, because a hint that is not on the screen
+    is a hint nobody has: on a narrow terminal the pairs that used to fall off
+    the right-hand end were exactly the ones a user was least likely to know
+    already. So the row fills, the next one starts, and the caller takes the
+    rows off the panes' share (`RowUI._avail`) — which is why ``max_rows``
+    exists at all. Under that cap the old policy is what is left: whole pairs
+    fall off the end, since a footer that has eaten the conversation is worse
+    than a hint ``?`` will still list in full.
+
+    The note shares the row while there is only one, exactly as it always has.
+    Once the hints need more than one, it takes the bottom line for itself: a
+    note is a sentence rather than a hint, it arrives and expires while the
+    keys sit still, and the bottom line of the screen is where a reader already
+    looks for one — under a stack of key rows is not where the eye would find
+    it. Costing a row is the price of that, and only while a note is up.
+    """
+    note = _footer_note(note, width)
+    rows = footer_wrap(pairs, width, note, max_rows)
+    at = len(rows) - 1 if note and len(rows) > 1 else 0
+    out: list[str] = []
+    for index, row in enumerate(rows):
+        head = f"{style}{note}{RESET}  " if note and index == at else ""
+        used = 1 + (cell_width(note) + 2 if head else 0)
+        styled: list[str] = []
+        for key, label in row:
+            used += cell_width(key) + 1 + cell_width(label) + (2 if styled else 0)
+            styled.append(f"{CYAN}{key}{RESET} {DIM}{label}{RESET}")
+        out.append(" " + head + "  ".join(styled) + " " * max(0, width - used))
+    return out
 
 
 def safe(text: str) -> str:

@@ -131,11 +131,18 @@ SPEC_COMMANDS = {
     "job.cancel",
     "watch.peek",
     "watch.drop",
+    # Nor these two, and they are the same command twice: the arrangement of
+    # the sidebar and of the watch column belongs to the user, and it lives in
+    # the database, which §4.2 rule 2 puts out of a front-end's reach. A UI
+    # that shuffled its own rows would have them put back by the next frame.
+    "session.move",
+    "watch.move",
     "shutdown",
 }
 
 SPEC_EVENTS = {
     "hello",
+    "display.settings",
     "session.rows",
     "session.created",
     "llm.catalog",
@@ -585,8 +592,8 @@ class TestTheMessageAnInterruptRecovers:
         assert parse(decode(encode(handed_back.to_envelope()))) == handed_back
 
     def test_it_names_no_row(self):
-        # A `chat.reset` has already taken the abandoned attempt's rows off the
-        # screen; a seq here would be a field every client had to ignore.
+        # A `chat.reset` has already settled the screen by the time this
+        # lands; a seq here would be a field every client had to ignore.
         assert set(TurnInterrupted.model_fields) == {
             "session_id",
             "text",

@@ -453,3 +453,85 @@ class TestDatabaseSettings:
         path.write_text(json.dumps({"database": {"sync_interval_s": -1}}))
         with pytest.raises(SettingsError):
             Settings.load(path)
+
+
+class TestWatchSettings:
+    """`watches.peek_chars` — how much tail the Enter peek is worth.
+
+    A setting rather than a constant because both ends of the range are real:
+    a tail read over a tunnel wants to stay small, and a traceback wants to
+    arrive with the line that names the exception still on it.
+    """
+
+    def test_the_peek_ships_a_couple_of_screenfuls_by_default(self):
+        assert Settings().watches.peek_chars == 2000
+
+    def test_the_module_default_is_the_settings_default(self):
+        # One number, not two: `watches.PEEK_CHARS` is the fallback for a
+        # caller with no settings in hand, and it is taken off the model so
+        # that editing one of them cannot leave the other behind.
+        from hpca.watches import PEEK_CHARS
+
+        assert PEEK_CHARS == Settings().watches.peek_chars
+
+    def test_a_configured_size_is_what_the_file_says(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"watches": {"peek_chars": 40}}))
+        assert Settings.load(path).watches.peek_chars == 40
+
+    def test_a_missing_section_falls_back_to_the_default(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"llm": {"model": "m"}}))
+        assert Settings.load(path).watches.peek_chars == 2000
+
+    def test_a_peek_of_nothing_is_refused(self, tmp_path):
+        # Zero would answer every box with an empty string, which reads as the
+        # log being empty — a different fact from one nobody asked to see.
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"watches": {"peek_chars": 0}}))
+        with pytest.raises(SettingsError):
+            Settings.load(path)
+
+
+class TestDisplaySettings:
+    """The section nothing in the core reads: it is what the *front-end* draws
+    with, and it reaches the UI over the wire (`protocol.DisplaySettings`)
+    because rule 2 of §4.2 keeps the settings file out of its reach."""
+
+    def test_the_stamp_is_on_by_default(self):
+        assert Settings().display.chat_stamps is True
+
+    def test_the_decision_breathes_once_a_second_by_default(self):
+        assert Settings().display.decision_pulse_seconds == 1.0
+
+    def test_the_section_roundtrips(self, tmp_path):
+        s = Settings()
+        s.display.chat_stamps = False
+        s.display.decision_pulse_seconds = 3.5
+        s.save(tmp_path / "settings.json")
+        loaded = Settings.load(tmp_path / "settings.json")
+        assert loaded.display.chat_stamps is False
+        assert loaded.display.decision_pulse_seconds == 3.5
+
+    def test_a_missing_section_falls_back_to_the_defaults(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"llm": {"model": "m"}}))
+        loaded = Settings.load(path)
+        assert loaded.display.chat_stamps is True
+        assert loaded.display.decision_pulse_seconds == 1.0
+
+    def test_a_period_of_zero_is_refused(self, tmp_path):
+        # It divides by zero in the sweep. Refused here, where the answer is
+        # one line beside the editor that typed it, rather than in a repaint
+        # loop with the terminal in raw mode.
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"display": {"decision_pulse_seconds": 0}}))
+        with pytest.raises(SettingsError):
+            Settings.load(path)
+
+    def test_a_negative_period_is_refused_too(self, tmp_path):
+        # It would run the sweep backwards, which is not a thing anyone means.
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"display": {"decision_pulse_seconds": -2}}))
+        with pytest.raises(SettingsError):
+            Settings.load(path)

@@ -122,3 +122,125 @@ class TestDelete:
         store.delete(session.session_id)
         # the cluster job runs on; its record must not vanish with the chat
         assert jobs.get("27744534") is not None
+
+
+class TestReordering:
+    """alt+↑/alt+↓ in the sidebar, at the store level.
+
+    The same gesture the watch column has, on the list the user spends the
+    day in: newest-first is a good default and a bad permanent arrangement,
+    because the conversation somebody works in all week sinks under every
+    throwaway one. What is asserted here is the resulting order and not the
+    numbers behind it.
+    """
+
+    def three(self, store):
+        for title in ("first", "second", "third"):
+            store.create(profile="default", title=title)
+        # Newest first, so the list reads back the other way round.
+        return store.list_all()
+
+    def order(self, store):
+        return [s.title for s in store.list_all()]
+
+    def test_the_sidebar_starts_newest_first(self, store):
+        self.three(store)
+        assert self.order(store) == ["third", "second", "first"]
+
+    def test_moving_up_trades_places_with_the_row_above(self, store):
+        _, middle, _ = self.three(store)
+        assert store.move(middle.session_id, -1) is True
+        assert self.order(store) == ["second", "third", "first"]
+
+    def test_moving_down_trades_places_with_the_row_below(self, store):
+        _, middle, _ = self.three(store)
+        assert store.move(middle.session_id, +1) is True
+        assert self.order(store) == ["third", "first", "second"]
+
+    def test_the_arrangement_survives_a_restart(self, store, tmp_path):
+        """The reason this is a column and not a front-end's memory: an order
+        arranged today has to be the order tomorrow opens with."""
+        _, _, oldest = self.three(store)
+        store.move(oldest.session_id, -1)
+        store.move(oldest.session_id, -1)
+        store._conn.close()
+
+        reopened = connect(tmp_path / "hpca.db")
+        init_db(reopened)  # the migrations run on every start; none may undo it
+        assert self.order(SessionStore(reopened)) == ["first", "third", "second"]
+        reopened.close()
+
+    def test_the_top_row_cannot_go_further_up(self, store):
+        newest, _, _ = self.three(store)
+        assert store.move(newest.session_id, -1) is False
+        assert self.order(store) == ["third", "second", "first"]
+
+    def test_the_bottom_row_cannot_go_further_down(self, store):
+        _, _, oldest = self.three(store)
+        assert store.move(oldest.session_id, +1) is False
+        assert self.order(store) == ["third", "second", "first"]
+
+    def test_a_sidebar_of_one_has_nowhere_to_go(self, store):
+        alone = store.create(profile="default", title="only")
+        assert store.move(alone.session_id, -1) is False
+        assert store.move(alone.session_id, +1) is False
+        assert self.order(store) == ["only"]
+
+    def test_moving_a_session_that_is_gone_is_not_an_error(self, store):
+        """The sidebar can lose a row between the keypress and the write — a
+        deletion from another front-end, or the one the user just pressed."""
+        _, _, oldest = self.three(store)
+        store.delete(oldest.session_id)
+        assert store.move(oldest.session_id, -1) is False
+        assert self.order(store) == ["third", "second"]
+
+    def test_a_deleted_row_leaves_the_rest_arranged(self, store):
+        """Deleting punches a hole in the numbers and nothing else: the order
+        of what is left is untouched, and the next move closes the gaps."""
+        newest, middle, oldest = self.three(store)
+        store.move(oldest.session_id, -1)  # third, first, second
+        store.delete(newest.session_id)
+        assert self.order(store) == ["first", "second"]
+        assert store.move(middle.session_id, -1) is True
+        assert self.order(store) == ["second", "first"]
+
+    def test_a_new_session_lands_at_the_top_of_a_rearranged_sidebar(self, store):
+        """Where newest-first always put it, and where the front-end that
+        opens it expects to find it — the opposite end from a new watch box,
+        because the two lists are read in opposite directions."""
+        _, _, oldest = self.three(store)
+        store.move(oldest.session_id, -1)
+        store.create(profile="default", title="fourth")
+        assert self.order(store) == ["fourth", "third", "first", "second"]
+
+    def test_a_profile_listing_shows_the_arrangement_too(self, store):
+        """One sidebar, one order: `list` is `list_all` with rows hidden, so
+        it must not fall back to an order of its own."""
+        store.create(profile="p1", title="mine")
+        store.create(profile="p2", title="theirs")
+        store.create(profile="p1", title="mine too")
+        arranged = store.list_all()[0]  # "mine too", at the top
+        store.move(arranged.session_id, +1)
+        store.move(arranged.session_id, +1)
+        assert [s.title for s in store.list(profile="p1")] == ["mine", "mine too"]
+
+    def test_a_move_reaches_across_profiles(self, store):
+        """The sidebar draws every profile's sessions interleaved, so a swap
+        that skipped the differently-profiled row between two rows would land
+        somewhere the user did not aim."""
+        store.create(profile="p1", title="mine")
+        store.create(profile="p2", title="theirs")
+        bottom = store.list_all()[1].session_id  # "mine", under "theirs"
+        assert store.move(bottom, -1) is True
+        assert self.order(store) == ["mine", "theirs"]
+
+    def test_a_session_from_before_the_column_existed_keeps_its_place(self, store):
+        """Rows written by an older hpca all carry position 0. The ordering
+        has to fall back to newest-first, or every one of them would pile up
+        above the rows the user has arranged."""
+        self.three(store)
+        store._conn.execute("UPDATE sessions SET position = 0")
+        store._conn.commit()
+        assert self.order(store) == ["third", "second", "first"]
+        assert store.move(store.list_all()[2].session_id, -1) is True
+        assert self.order(store) == ["third", "first", "second"]

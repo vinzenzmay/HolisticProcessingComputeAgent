@@ -21,7 +21,8 @@ from hpca.ui.ansi import (
     char_width,
     clip,
     fold,
-    footer_line,
+    footer_lines,
+    footer_wrap,
     pad,
     pulse,
     reverse,
@@ -73,7 +74,7 @@ class TestFooterLine:
     def test_narrow_footer_still_exactly_width(self):
         ui = build()
         ui.focus = INPUT
-        assert len(plain(ui.render(60, 40)[-1])) == 60
+        assert all(len(plain(row)) == 60 for row in ui.render(60, 40))
 
     def test_narrow_footer_drops_whole_pairs(self):
         ui = build()
@@ -81,21 +82,62 @@ class TestFooterLine:
         narrow = plain(ui.render(60, 40)[-1])
         assert not narrow.rstrip().endswith("…")
 
-    def test_a_pair_that_does_not_fit_is_left_out_entirely(self):
-        wide = plain(footer_line(PAIRS, 200))
-        narrow = plain(footer_line(PAIRS, 24))
-        assert "q quit" in wide
+    def test_one_row_is_all_a_footer_gets_unless_it_is_offered_more(self):
+        assert len(footer_lines(PAIRS, 24)) == 1
+
+    def test_a_pair_that_does_not_fit_moves_to_the_next_row_whole(self):
+        rows = [plain(row) for row in footer_lines(PAIRS, 24, max_rows=4)]
+        assert len(rows) == 3
+        assert rows[0].strip() == "enter send"
+        assert rows[-1].strip() == "q quit"
+
+    def test_a_pair_that_does_not_fit_is_dropped_rather_than_halved(self):
+        narrow = plain(footer_lines(PAIRS, 24)[0])
         assert "q quit" not in narrow
         assert "enter send" in narrow
 
+    def test_every_row_of_a_wrapped_footer_is_exactly_the_width(self):
+        for width in range(20, 120):
+            for row in footer_lines(PAIRS, width, "sent", CYAN, max_rows=5):
+                assert len(plain(row)) == width, (width, plain(row))
+
+    def test_the_rows_stop_at_the_cap_and_the_rest_fall_off_the_end(self):
+        rows = footer_lines(PAIRS, 20, max_rows=2)
+        assert len(rows) == 2
+        assert "q quit" not in plain("".join(rows))
+
+    def test_a_pair_too_wide_for_any_row_does_not_take_the_rest_with_it(self):
+        pairs = [("k", "a hint far too long for this"), ("q", "quit")]
+        rows = footer_wrap(pairs, 20, max_rows=4)
+        assert rows == [[("q", "quit")]]
+
     def test_keys_are_bright_and_labels_dim(self):
-        drawn = footer_line([("q", "quit")], 40)
+        drawn = footer_lines([("q", "quit")], 40)[0]
         assert f"{CYAN}q{RESET} {DIM}quit{RESET}" in drawn
 
     def test_a_note_is_drawn_in_the_style_it_was_given(self):
-        drawn = footer_line(PAIRS, 120, "sent", CYAN)
+        drawn = footer_lines(PAIRS, 120, "sent", CYAN)[0]
         assert f"{CYAN}sent{RESET}" in drawn
         assert len(plain(drawn)) == 120
+
+    def test_a_note_shares_the_row_while_there_is_only_one(self):
+        row = plain(footer_lines(PAIRS, 120, "sent")[0])
+        assert row.startswith(" sent  enter send")
+
+    def test_a_note_takes_the_bottom_line_once_the_hints_wrap(self):
+        rows = [plain(row) for row in footer_lines(PAIRS, 30, "sent", max_rows=4)]
+        assert rows[-1].strip() == "sent"
+        assert "sent" not in "".join(rows[:-1])
+
+    def test_the_note_costs_a_row_and_no_hints(self):
+        pairs = [("a", "one"), ("b", "two")]
+        assert footer_wrap(pairs, 20, max_rows=4) == [pairs]
+        assert footer_wrap(pairs, 20, "a note", 4) == [pairs, []]
+
+    def test_the_notes_row_counts_against_the_cap_like_any_other(self):
+        rows = footer_lines(PAIRS, 24, "sent", max_rows=2)
+        assert len(rows) == 2
+        assert plain(rows[-1]).strip() == "sent"
 
 
 # ------------------------------------------------------------ cell widths
@@ -203,7 +245,12 @@ class TestRuleCountsCells:
 
 class TestFooterCountsCells:
     def test_a_wide_note_still_leaves_the_footer_exact(self):
-        assert cell_width(plain(footer_line(PAIRS, 120, "送信しました"))) == 120
+        assert cell_width(plain(footer_lines(PAIRS, 120, "送信しました")[0])) == 120
+
+    def test_wide_labels_wrap_on_cells_and_not_on_characters(self):
+        pairs = [("a", "送信"), ("b", "送信"), ("c", "送信")]
+        for row in footer_lines(pairs, 20, max_rows=4):
+            assert cell_width(plain(row)) == 20
 
 
 class TestFold:

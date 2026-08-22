@@ -580,6 +580,32 @@ class SessionRollback(_Rewind):
     TYPE: ClassVar[str] = "session.rollback"
 
 
+class SessionMove(Command):
+    """alt+↑ / alt+↓ on a sidebar row: shift it one place, for good.
+
+    ``delta`` is an offset and not a slot — ``-1`` for up, ``+1`` for down —
+    because that is the whole gesture the user has. Two presses walk a row
+    past two others; nothing in a keypress can say "third from the top", so
+    nothing in the command tries to.
+
+    The core answers with `session.rows` (and `watch.move` with
+    `panel.update`), which is the point of routing a keypress through the
+    socket at all rather than letting the front-end shuffle its own list. The
+    arrangement is a fact about the database, which §4.2 rule 2 puts out of a
+    front-end's reach, so the only order that survives a restart is the one
+    the core sends back — and a UI that reordered locally would be overwritten
+    by the very next frame anyway.
+
+    A move at the end of the list changes nothing and is answered the same
+    way, with the unchanged list. That is not a refusal worth a message: it is
+    what holding the key down looks like once the row has arrived.
+    """
+
+    TYPE: ClassVar[str] = "session.move"
+    session_id: str
+    delta: int
+
+
 class SessionFocus(Command):
     """Which session the user is looking at; null when none is (§4.4).
 
@@ -1061,11 +1087,64 @@ class WatchDrop(Command):
     watch_id: int
 
 
+class WatchMove(Command):
+    """alt+↑ / alt+↓ on a watch box: shift it one place in the column.
+
+    The right column's half of `session.move`, in the same shape and for the
+    same reasons — see there. Answered with `panel.update`, the column whole,
+    in the order the store now holds.
+
+    Scoped by the core to the column the box is in, which is the session that
+    registered it: a store-wide swap would put it next to a box belonging to a
+    conversation the user is not even looking at.
+    """
+
+    TYPE: ClassVar[str] = "watch.move"
+    watch_id: int
+    delta: int
+
+
 class Shutdown(Command):
     TYPE: ClassVar[str] = "shutdown"
 
 
 # ---------------------------------------------------------------------- events
+
+
+class DisplaySettings(_Model):
+    """The settings a front-end *renders with*, and nothing else.
+
+    The counterpart to `Hello.settings_digest`, and the reason that field is
+    phrased the way it is: a UI cannot read the settings file (§4.2 rule 2),
+    but two or three of the keys in it are about nothing except what a frame
+    looks like, and a digest cannot answer "draw this how". So those keys —
+    and strictly those — cross as a payload of their own.
+
+    Not the whole tree, which is the point the digest was making: the tree
+    holds api keys and endpoint addresses, and a process that only needs to
+    know whether to print a timestamp has no business being handed them. Nor
+    is it `settings.body`, which is the *file as text* and exists for one
+    thing, the config editor opening over it. That is a read path answering a
+    keypress; this is state, delivered without being asked for, on the one
+    frame that is guaranteed to arrive before anything is drawn.
+
+    `config.DisplaySettings` is the twin, field for field. Two models rather
+    than an import for the reason `Part` and `Entry` are copies: this module
+    is the only thing both processes agree on and it imports nothing of
+    hpca's own.
+    """
+
+    # `▸ you 22-08-2026 13:04:47` against a bare `▸ you` (`ui.state._label`).
+    chat_stamps: bool = True
+    # Whether the cleared screen behind "Really quit?" rains (`ui.rain`).
+    quit_rain: bool = True
+    # And how many frames a second it falls at. The receiving side clamps
+    # rather than trusts: a repaint loop is not a place to divide by zero.
+    quit_rain_fps: int = 60
+    # One breath of the decision prompt's answer line, in seconds
+    # (`ui.ansi.pulse`). The receiving side treats a value it cannot divide by
+    # as "use the built-in", because a repaint loop is not a place to raise.
+    decision_pulse_seconds: float = 1.0
 
 
 class Hello(Event):
@@ -1077,6 +1156,37 @@ class Hello(Event):
     # Lets the UI notice that settings changed under a reconnect without
     # shipping the whole settings tree to a process that cannot use it.
     settings_digest: str = ""
+    # The exception the digest carves out: the handful of keys that decide
+    # what a frame looks like, which a front-end cannot render without and
+    # cannot read for itself. Here rather than in a frame of its own because
+    # the first frame is the one that arrives before anything is drawn — a UI
+    # that had to ask would draw one frame in whatever it assumed, and a
+    # timestamp appearing on the second frame is a redraw the user sees.
+    display: DisplaySettings = DisplaySettings()
+
+
+class DisplayChanged(Event):
+    """The display settings again, because they have just been edited.
+
+    `hello` alone would have made these restart-only, which is the very toast
+    `settings.save` exists to stop printing: the config editor is *in* the
+    app, and a key whose whole subject is what the screen looks like must
+    take effect on the frame after the save.
+
+    Its own event and not a re-sent `hello`: that one is a handshake, sent to
+    one subscriber at the moment it attaches (`Core.subscribe`), and sending
+    it again would have every attached front-end re-run its version check and
+    re-ask for the sidebar, the catalog and the profiles. This is news, so it
+    fans out to everyone — a second front-end on the same core is looking at
+    the same settings file.
+
+    Sent only when the section actually changed, for the same reason the
+    clients are only rebuilt when the llm section did: a repaint of every
+    conversation's chat rows is not the price of an edited log level.
+    """
+
+    TYPE: ClassVar[str] = "display.settings"
+    display: DisplaySettings = DisplaySettings()
 
 
 class SessionRows(Event):
@@ -1461,7 +1571,14 @@ class TurnUnqueued(Event):
 
 
 class TurnInterrupted(Event):
-    """A running turn was stopped: here is the message it was working on.
+    """A stopped turn left nothing behind: here is the message back.
+
+    Sent for the *exception*, not the rule. Stopping a turn keeps its work —
+    the message and everything the agent got through stay in the conversation
+    (`TurnScheduler.interrupt`), so handing the text back as well would have
+    the user send it twice, and no such event is sent. The one case that still
+    needs it is a stop that lands before the message reached the thread: there
+    is then no exchange to keep and the sentence would simply be lost.
 
     The sibling of `turn.unqueued`, and deliberately not the same event. Both
     hand a message back to be edited and re-sent, and both are addressed so it
@@ -1471,13 +1588,14 @@ class TurnInterrupted(Event):
 
     * `turn.unqueued` names a row and means "that row is gone"; everything
       else stands, the turn ahead is still running and its spinner with it.
-      This one names no row: the rows the abandoned attempt drew describe
-      messages that have just left the thread, and a delta cannot take a row
-      off the screen. A `chat.reset` — an open of what is left — precedes this
-      event and is what un-draws them (`AgentService`'s `turn.interrupt`).
-    * After this one the turn is over: the spinner goes and the session is
-      free. A ``seq`` field here would be a number every client had to know to
-      ignore.
+      This one names no row. A `chat.reset` — an open of what the session
+      holds now — precedes it and is what settles the screen, on this path and
+      on the ordinary one where no text comes back at all (`AgentService`'s
+      `turn.interrupt`).
+    * A `turn.finished` says the turn is over, on both stop paths and on the
+      ordinary end of a turn. This event never means it: it is about a
+      message, and a ``seq`` field here would be a number every client had to
+      know to ignore.
 
     The shape is otherwise the queue's on purpose, so parking the text as that
     session's draft is one routine on the UI side rather than two.
@@ -1538,8 +1656,12 @@ class WatchPeeked(Event):
     TYPE: ClassVar[str] = "watch.peeked"
     watch_id: int
     title: str = ""  # the box's border title — what this is the tail *of*
-    # Already trimmed to a glance by the core (`watches.PEEK_CHARS`): the
-    # whole point of peeking is not to ship a gigabyte of progress bars.
+    # Already trimmed by the core to what the user asked a peek to be worth
+    # (`config.WatchSettings.peek_chars`): the whole point of peeking is not
+    # to ship a gigabyte of progress bars. How much is a setting and not a
+    # constant because the two ends of the range are both real — a tail read
+    # over a tunnel wants to stay small, and a traceback wants to arrive
+    # whole.
     text: str = ""
 
 
@@ -1550,17 +1672,26 @@ class MemoryProposals(Event):
 
 
 class ConfirmRequested(Event):
-    """A yes/no question that is not a tool approval.
+    """A yes/no question about one conversation that is not a tool approval.
 
     One case today: triage proposing a log signature it just learned (§5.5
     tier 3). It is deliberately not `decision.requested` — that one parks a
     graph thread and its answer resumes a turn, whereas this one comes from a
     poll and nothing is waiting on it. Conflating them would let an unanswered
     triage offer look like a stalled session.
+
+    ``session_id`` is the conversation whose work raised it — the session the
+    failed job was started from — and it is not decoration: this arrives from
+    a poll rather than from a keypress, so without it the question reaches a
+    user who is somewhere else entirely, about work they cannot see, with
+    nothing on screen saying which of their conversations it came out of. It
+    is what lets a client hold the question *in* that session instead
+    (§3.2 property 1).
     """
 
     TYPE: ClassVar[str] = "confirm.requested"
     id: str
+    session_id: str
     question: str
 
 

@@ -34,7 +34,19 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from hpca.transcript import call_arguments
-from hpca.ui.ansi import BOLD, DIM, RED, RESET, YELLOW, fold, pad, pulse, rule
+from hpca.ui.ansi import (
+    BOLD,
+    CYAN,
+    DIM,
+    PULSE_PERIOD,
+    RED,
+    RESET,
+    YELLOW,
+    fold,
+    pad,
+    pulse,
+    rule,
+)
 from hpca.ui.editor import Editor
 
 # The two halves of the prompt. "ask" is the y/n question; "reason" keeps the
@@ -192,25 +204,47 @@ def _wrapped(text: str, width: int, cap: int) -> list[str]:
 
 
 def prompt_rows(
-    decision: Decision, width: int, now: float | None = None
+    decision: Decision,
+    width: int,
+    now: float | None = None,
+    *,
+    focused: bool = False,
+    period: float = PULSE_PERIOD,
 ) -> list[tuple[str, str]]:
     """The prompt above the box, as ``(style, text)`` rows.
 
-    Styled rather than plain because the border carries a fact: an execution
-    gate is a script about to run and a destructive one is something about to
-    be lost, and those are not the same warning. The Textual bar said it with
-    `border: heavy $error` / `$warning`; this says it with the rule and the
-    heading, which is the same two colours in the space a row UI has.
+    Styled rather than plain because two different facts are being said at
+    once, and this is where they were fighting over one row.
+
+    **The rule says focus.** Teal-and-bold when the keys are aimed here, dim
+    when they are not — the same sentence `Pane.render` writes over the
+    sessions, the chat and the watchers, and this prompt stands in the message
+    box's slot in the focus ring (`app.SESSIONS…DECISION`). It carried the
+    *severity* until now, which read well right up until you asked what an
+    unfocused decision looks like: the answer was "identical", so the one
+    region whose keys silently do nothing was the one region that could not
+    say so. Focus is a four-region convention or it is not a convention.
+
+    **The heading says severity.** An execution gate is a script about to run
+    and a destructive one is something about to be lost, and those are not the
+    same warning — the Textual bar said it with `border: heavy $error` /
+    `$warning`, and dropping it to buy the rule back would be trading a real
+    signal for a cosmetic one. It moves down one line instead, onto the bold
+    line that already carried the same colour: `Run this — run_bash?` in
+    yellow, `Destructive operation — delete_file?` in red, directly under the
+    rule and in larger type than the rule ever was. Nothing is lost but the
+    dashes it was painted on.
 
     ``now`` is the clock the answer line pulses on, and None is "do not" —
     which is what `decision_height` passes, because how tall this is must not
     depend on what time it is. Only the y/n line breathes: at the reason stage
     the hint is describing a box that already has the cursor in it, and two
-    things asking for the eye at once is neither of them getting it.
+    things asking for the eye at once is neither of them getting it. ``period``
+    is how long one breath takes (`Display.decision_pulse_seconds`).
     """
     payload = decision.payload
     accent = YELLOW if approval_kind(payload) == "execution" else RED
-    rows = [(accent, rule("decision", width))]
+    rows = [(BOLD + CYAN if focused else DIM, rule("decision", width))]
     title = (
         approval_title(payload)
         if decision.asking
@@ -228,7 +262,7 @@ def prompt_rows(
             rows.append((DIM, f"  │ {line}"))
     asking = decision.asking
     hint = approval_hint(payload) if asking else approval_reason_hint()
-    style = pulse(now) if asking and now is not None else DIM
+    style = pulse(now, period) if asking and now is not None else DIM
     rows.append((style, f"  {hint}"))
     return rows
 
@@ -253,6 +287,7 @@ def render_decision(
     *,
     focused: bool,
     now: float | None = None,
+    period: float = PULSE_PERIOD,
 ) -> list[str]:
     """The prompt, in exactly ``height`` rows of exactly ``width`` cells.
 
@@ -262,7 +297,7 @@ def render_decision(
     while clipping the hint would leave a question with no visible way to
     answer it.
     """
-    rows = prompt_rows(decision, width, now)
+    rows = prompt_rows(decision, width, now, focused=focused, period=period)
     box = min(reason_height(decision, width), max(0, height - 3))
     room = max(0, height - box)
     if len(rows) > room:

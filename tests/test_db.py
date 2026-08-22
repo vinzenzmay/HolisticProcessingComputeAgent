@@ -1,6 +1,7 @@
 """Tests for hpca.db: schema init and connection settings (§5.4)."""
 
 from hpca.db import connect, init_db
+from hpca.sessions import SessionStore
 from hpca.watches import KIND_LOG, WatchStore
 
 EXPECTED_TABLES = {"jobs", "job_logs", "sessions", "processes"}
@@ -95,6 +96,81 @@ class TestTheLastActiveBackfill:
         init_db(conn)
         row = conn.execute("SELECT last_active FROM sessions").fetchone()
         assert row["last_active"] == "2030-01-01T00:00:00+00:00"
+        conn.close()
+
+
+class TestTheSessionOrderBackfill:
+    """A sidebar that predates `position` has to open in the order it closed.
+
+    Every row carries 0 until the migration runs, and 0 is not an order: the
+    seed has to reproduce newest-first, which is the only arrangement those
+    rows ever had, and it has to leave every one of them at or above 1 so that
+    "position = 0" goes on meaning "never assigned".
+    """
+
+    def old_database(self, tmp_path):
+        """A sessions table exactly as it was before `position`, three rows
+        deep so an order is something the assertions can actually see."""
+        conn = connect(tmp_path / "hpca.db")
+        conn.execute(
+            "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, profile TEXT "
+            "NOT NULL, title TEXT, created_at TEXT, checkpoint_ref TEXT)"
+        )
+        for made, title in (
+            ("2026-01-01T00:00:00+00:00", "oldest"),
+            ("2026-02-01T00:00:00+00:00", "middle"),
+            ("2026-03-01T00:00:00+00:00", "newest"),
+        ):
+            conn.execute(
+                "INSERT INTO sessions VALUES (?, 'default', ?, ?, ?)",
+                (title, title, made, title),
+            )
+        conn.commit()
+        return conn
+
+    def test_the_rows_survive_and_keep_the_order_they_had(self, tmp_path):
+        conn = self.old_database(tmp_path)
+        init_db(conn)
+        store = SessionStore(conn)
+        assert [s.title for s in store.list_all()] == [
+            "newest",
+            "middle",
+            "oldest",
+        ]
+        # Numbered densely from the top, not left at 0: an unnumbered row
+        # would sort above every row the user goes on to arrange.
+        assert [s.position for s in store.list_all()] == [1, 2, 3]
+        conn.close()
+
+    def test_and_a_second_start_does_not_undo_an_arrangement(self, tmp_path):
+        # The backfill runs on every start, not once, so it has to be written
+        # to only touch rows that have never been placed.
+        conn = self.old_database(tmp_path)
+        init_db(conn)
+        store = SessionStore(conn)
+        store.move("oldest", -1)
+        init_db(conn)
+        assert [s.title for s in store.list_all()] == [
+            "newest",
+            "oldest",
+            "middle",
+        ]
+        conn.close()
+
+    def test_an_old_row_can_be_moved_at_all(self, tmp_path):
+        # Swapping two zeroes changes nothing, which is why the move
+        # renumbers the whole list instead — the case that motivated it.
+        conn = self.old_database(tmp_path)
+        init_db(conn)
+        conn.execute("UPDATE sessions SET position = 0")  # as if never seeded
+        conn.commit()
+        store = SessionStore(conn)
+        assert store.move("middle", -1) is True
+        assert [s.title for s in store.list_all()] == [
+            "middle",
+            "newest",
+            "oldest",
+        ]
         conn.close()
 
 

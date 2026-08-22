@@ -1,11 +1,11 @@
-"""The rewind screen: fork, roll back, or copy one of your own messages."""
+"""The rewind screen: fork or roll back from one of your own messages."""
 
 from __future__ import annotations
 
 from hpca.ui.ansi import DIM, RESET, fold, pad
 from hpca.ui.overlays.base import BACK_KEYS, Overlay, options
 
-FORK, ROLLBACK, COPY = "fork", "rollback", "copy"
+FORK, ROLLBACK = "fork", "rollback"
 
 # The dialog quotes the message being rewound from so you can check you grabbed
 # the right one — a preview, not the transcript; the log has the rest. Same
@@ -72,12 +72,16 @@ class ChoiceDialog(Overlay):
 class RewindOverlay(ChoiceDialog):
     """Enter on one of your own messages in the log (§ chat rewind).
 
-    Three ways to pick the conversation up from it, the same three
-    RewindScreen offers and on the same keys: fork the session from just
-    before it (the original stays whole), roll this conversation back to just
-    before it (everything after is dropped), or copy the text into the message
-    box — the old behaviour, still on Enter, so the reflex of activating a
-    message twice keeps doing what it always did.
+    Two ways to pick the conversation up from it: fork the session from just
+    before it (the original stays whole), or roll this conversation back to
+    just before it (everything after is dropped). Copying the text used to be
+    the third, and is now `c` on the chat row itself (`_copy_row`) — one key,
+    without a dialog in front of it, on every row rather than only your own.
+
+    Enter is the fork, because Enter is what opened this screen and the reflex
+    of activating a message twice must not land on the cut that drops rows: a
+    fork loses nothing, so it is the only one of the two that is safe under a
+    key pressed by habit. Escape is still how you leave without either.
 
     The choice is read back by the caller rather than acted on here, for the
     reason app.py captures the session before pushing the screen: what happens
@@ -87,17 +91,15 @@ class RewindOverlay(ChoiceDialog):
     title = "this message again"
 
     OPTIONS = [
-        ("f", "fork the session from here — the original stays whole"),
+        ("f / enter", "fork the session from here — the original stays whole"),
         ("r", "roll this conversation back to here"),
-        ("c / enter", "copy it into the message box"),
         ("esc", "cancel"),
     ]
-    PICKS = {"f": FORK, "r": ROLLBACK, "c": COPY, "enter": COPY}
+    PICKS = {"f": FORK, "enter": FORK, "r": ROLLBACK}
 
     def keymap(self) -> list[tuple[str, str]]:
         return [
-            ("f", "fork"),
+            ("f / enter", "fork"),
             ("r", "roll back"),
-            ("c / enter", "copy"),
             ("esc", "cancel"),
         ]

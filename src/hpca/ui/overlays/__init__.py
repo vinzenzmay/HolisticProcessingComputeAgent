@@ -46,10 +46,9 @@ from hpca.ui.overlays.profiles import (
     ProfilesOverlay,
     profile_rows,
 )
-from hpca.ui.overlays.queued import UNQUEUE, QueuedOverlay
+from hpca.ui.overlays.queued import COPY, UNQUEUE, QueuedOverlay
 from hpca.ui.overlays.rename import EMPTY_REFUSAL, RenameOverlay
 from hpca.ui.overlays.rewind import (
-    COPY,
     FORK,
     PREVIEW_CHARS,
     PREVIEW_LINES,

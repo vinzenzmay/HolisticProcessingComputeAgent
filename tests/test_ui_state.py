@@ -15,6 +15,7 @@ from hpca.ui.state import (
     ChatEntry,
     ChatPart,
     Context,
+    Display,
     SessionState,
     Turn,
     entry_item,
@@ -459,3 +460,125 @@ class TestRowsSayWhenTheyHappened:
         # name (`transcript.Entry.at`).
         item = entry_item(ChatEntry(kind="thinking", seq=3, steps=4))
         assert item.head == "4 steps"
+
+
+class TestTheStampCanBeTurnedOff:
+    """`Display.chat_stamps` — the setting for a reader who wants the
+    conversation and not the clock, and for a terminal narrow enough that
+    nineteen characters of date in front of every message costs a column.
+
+    Which setting is on is not something this layer can look up: the settings
+    file is out of a front-end's reach (§4.2 rule 2), so it is handed in — by
+    `SessionState`, which was handed it by `RowUI.set_display`, which was told
+    by the core.
+    """
+
+    AT = "2026-08-21T12:34:56+00:00"
+
+    def test_the_stamp_can_be_turned_off(self):
+        item = entry_item(entry(1, text="run it", at=self.AT), stamps=False)
+        assert item.head == "you"
+
+    def test_and_the_agents_too(self):
+        item = entry_item(entry(1, "assistant", "done", at=self.AT), stamps=False)
+        assert item.head == "hpca"
+
+    def test_a_queued_row_keeps_the_half_that_is_not_a_time(self):
+        # The " · queued" is what says it has not been sent yet, which is a
+        # fact about the message and not about the clock.
+        item = entry_item(entry(2, "queued", "next", at=self.AT), stamps=False)
+        assert item.head == "you · queued"
+
+    def test_an_error_row_too(self):
+        item = entry_item(entry(1, "error", "fell over", at=self.AT), stamps=False)
+        assert item.head == "error"
+
+    def test_it_is_the_same_label_a_row_with_no_stamp_draws(self):
+        # One shape for "no time on this row", however it came about — a
+        # second layout would have nothing else in the pane to line up with.
+        off = entry_item(entry(1, text="run it", at=self.AT), stamps=False)
+        assert off.head == entry_item(entry(1, text="run it")).head
+
+    def test_nothing_else_about_the_row_moves(self):
+        with_stamp = entry_item(entry(1, text="run it", at=self.AT))
+        without = entry_item(entry(1, text="run it", at=self.AT), stamps=False)
+        assert (without.accent, without.body, without.key, without.label) == (
+            with_stamp.accent,
+            with_stamp.body,
+            with_stamp.key,
+            with_stamp.label,
+        )
+
+    def test_the_stamp_is_on_unless_something_says_otherwise(self):
+        # The default is the one `config.DisplaySettings` carries, so a
+        # `SessionState` built by a test draws what a fresh install would.
+        assert Display().chat_stamps is True
+        assert SessionState("s1").display.chat_stamps is True
+
+    def test_a_session_draws_its_rows_with_what_it_was_given(self):
+        session = SessionState("s1", display=Display(chat_stamps=False))
+        session.reset([entry(1, text="run it", at=self.AT)])
+        assert session.chat.items[0].head == "you"
+
+    def test_and_a_row_arriving_later_is_drawn_the_same_way(self):
+        session = SessionState("s1", display=Display(chat_stamps=False))
+        session.reset([entry(1, text="run it", at=self.AT)])
+        session.append(entry(2, "assistant", "done", at=self.AT))
+        assert [x.head for x in session.chat.items] == ["you", "hpca"]
+
+    def test_and_so_is_one_revised_in_place(self):
+        session = SessionState("s1", display=Display(chat_stamps=False))
+        session.reset([entry(1, "assistant", "", at=self.AT)])
+        session.update(entry(1, "assistant", "done", at=self.AT))
+        assert session.chat.items[0].head == "hpca"
+
+
+class TestRestylingAChatThatIsAlreadyOnScreen:
+    """What `restyle` is for: the setting changed under a conversation that is
+    already drawn, and every row has to be rebuilt without the conversation
+    itself being disturbed. `reset` would do the rebuilding and throw away the
+    rest — it re-bases the numbering and clears what is open, because it is
+    the path a *different transcript* arrives by."""
+
+    AT = "2026-08-21T12:34:56+00:00"
+
+    def rows(self) -> list[ChatEntry]:
+        return [
+            entry(1, text="run it", at=self.AT),
+            entry(2, "assistant", "done\nand dusted", at=self.AT),
+        ]
+
+    def test_every_row_is_redrawn(self):
+        session = SessionState("s1")
+        session.reset(self.rows())
+        assert session.chat.items[0].head.startswith("you 21-08-2026")
+        session.restyle(Display(chat_stamps=False))
+        assert [x.head for x in session.chat.items] == ["you", "hpca"]
+
+    def test_and_the_setting_sticks_for_what_arrives_next(self):
+        session = SessionState("s1")
+        session.reset(self.rows())
+        session.restyle(Display(chat_stamps=False))
+        session.append(entry(3, text="again", at=self.AT))
+        assert session.chat.items[-1].head == "you"
+
+    def test_the_numbering_is_untouched(self):
+        # A reset re-bases it, which would make every open row's key name a
+        # different row. Nothing about the conversation changed here.
+        session = SessionState("s1")
+        session.reset(self.rows())
+        session.restyle(Display(chat_stamps=False))
+        assert [x.key for x in session.chat.items] == ["1", "2"]
+
+    def test_and_what_was_open_stays_open(self):
+        session = SessionState("s1")
+        session.reset(self.rows())
+        session.chat.expanded.add("1")
+        session.restyle(Display(chat_stamps=False))
+        assert "1" in session.chat.expanded
+
+    def test_and_what_was_said_is_still_there(self):
+        session = SessionState("s1")
+        session.reset(self.rows())
+        session.restyle(Display(chat_stamps=False))
+        assert session.chat.items[1].body == ["done", "and dusted"]

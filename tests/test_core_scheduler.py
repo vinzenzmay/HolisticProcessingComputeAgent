@@ -74,7 +74,7 @@ def graph_calls(monkeypatch):
     calls = {
         "run_turn": [],
         "delivered": [],
-        "rolled_back": [],
+        "stopped": [],
         "results": {},
         "gates": {},
         "counts": {},
@@ -89,6 +89,13 @@ def graph_calls(monkeypatch):
             {"session_id": session_id, "user_text": user_text, "resume": resume,
              "api_content": api_content}
         )
+        if user_text is not None:
+            # The message reaches the thread the moment the turn starts, and
+            # the scheduler asks the thread how long it is to find out whether
+            # a stopped turn left anything behind. A count that never moved
+            # would make every stop here look like one that landed before its
+            # message did (`TurnScheduler._keep_stopped_work`).
+            calls["counts"][session_id] = calls["counts"].get(session_id, 3) + 1
         gate = calls["gates"].get(session_id)
         if gate is not None:
             await gate.wait()
@@ -100,9 +107,8 @@ def graph_calls(monkeypatch):
     async def fake_thread_message_count(graph, *, session_id):
         return calls["counts"].get(session_id, 3)
 
-    async def fake_rollback_thread(graph, *, session_id, keep):
-        calls["rolled_back"].append((session_id, keep))
-        return []
+    async def fake_stop_thread(graph, *, session_id):
+        calls["stopped"].append(session_id)
 
     async def fake_deliver_event(graph, *, session_id, text):
         calls["delivered"].append((session_id, text))
@@ -111,7 +117,7 @@ def graph_calls(monkeypatch):
     monkeypatch.setattr(
         scheduler_module, "thread_message_count", fake_thread_message_count
     )
-    monkeypatch.setattr(scheduler_module, "rollback_thread", fake_rollback_thread)
+    monkeypatch.setattr(scheduler_module, "stop_thread", fake_stop_thread)
     monkeypatch.setattr(scheduler_module, "deliver_event", fake_deliver_event)
     return calls
 
@@ -1101,14 +1107,17 @@ class TestInterrupt:
     async def test_never_for_a_session_with_no_turn(self, sched):
         assert sched.can_interrupt("s1") is False
 
-    async def test_not_before_the_rollback_point_is_known(self, sched, graph_calls):
-        # The two things an abort needs are a message of the user's own to
-        # hand back and the point in the thread to roll back to. A turn a
+    async def test_not_before_the_start_of_the_exchange_is_known(
+        self, sched, graph_calls
+    ):
+        # The two things a stop needs are a message of the user's own and the
+        # point in the thread the exchange began at — the number that says
+        # whether any of it ever got as far as being written down. A turn a
         # fraction of a second old has only the first.
         graph_calls["gates"]["s1"] = asyncio.Event()
         sched.submit_user("s1", "x")
         await sched.drain()
-        sched._turns["s1"].interrupt_keep = None
+        sched._turns["s1"].exchange_start = None
         assert sched.can_interrupt("s1") is False
         graph_calls["gates"]["s1"].set()
         await settle()
@@ -1134,23 +1143,67 @@ class TestInterrupt:
         await sched.drain()
         await settle()
         try:
-            assert await sched.interrupt("s1") == "start the long thing"
+            assert await sched.interrupt("s1") is not None
             await settle()
             assert not started["task"].done()
         finally:
             started["task"].cancel()
 
-    async def test_it_hands_the_message_back_and_rolls_the_thread_back(
+    async def test_a_stopped_turn_keeps_what_it_already_did(
         self, sched, graph_calls
     ):
+        # The change the user asked for: "not the whole turn should be thrown
+        # away, the agent should just be stopped". Nothing is rolled out of
+        # the thread; what is written is the note that closes it off, so the
+        # next turn does not read an unfinished history as an instruction to
+        # finish it.
         graph_calls["counts"]["s1"] = 7
         await self._park_on_the_model(sched, graph_calls)
-        text = await sched.interrupt("s1")
-        assert text == "a long question"
-        # Everything the aborted turn appended leaves the thread, or the model
-        # meets the abandoned attempt again on the retry.
-        assert graph_calls["rolled_back"] == [("s1", 7)]
+        stopped = await sched.interrupt("s1")
+        assert stopped is not None
+        assert graph_calls["stopped"] == ["s1"]
         assert not sched.is_busy("s1")
+
+    async def test_and_does_not_hand_the_message_back(self, sched, graph_calls):
+        # It is in the conversation now. Handing it to the entry box as well
+        # would have the user send the same sentence twice without meaning to.
+        await self._park_on_the_model(sched, graph_calls)
+        assert (await sched.interrupt("s1")).text is None
+
+    async def test_but_a_turn_that_never_reached_the_thread_gives_it_back(
+        self, sched, graph_calls, monkeypatch
+    ):
+        # The window between announcing a turn and its message landing in the
+        # thread. There is no exchange to keep, so the alternative to handing
+        # the sentence back is losing it — and nothing is written under a turn
+        # nobody can see.
+        async def never_gets_there(graph, *, session_id, **kwargs):
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(scheduler_module, "run_turn", never_gets_there)
+        sched.submit_user("s1", "a question that never landed")
+        await sched.drain()
+        await settle()
+        stopped = await sched.interrupt("s1")
+        assert stopped.text == "a question that never landed"
+        assert graph_calls["stopped"] == []
+
+    async def test_stopping_a_turn_ends_it_for_the_screen(
+        self, sched, graph_calls, events
+    ):
+        # `turn.finished` is the only thing a front-end reads as a turn
+        # ending. Without one the working row spins forever on a turn that no
+        # longer exists — and goes on offering to stop it.
+        await self._park_on_the_model(sched, graph_calls)
+        events.clear()
+        await sched.interrupt("s1")
+        assert "TurnFinished" in kinds(events)
+        # The spinner is cleared before the turn is called over, the order the
+        # finished path uses: a client reading the empty activity on its own
+        # would otherwise end a turn that is about to be ended again.
+        assert kinds(events).index("TurnActivity") < kinds(events).index(
+            "TurnFinished"
+        )
 
     async def test_interrupting_nothing_returns_nothing(self, sched):
         assert await sched.interrupt("s1") is None
@@ -1162,9 +1215,9 @@ class TestStoppableAcrossAnApproval:
 
     The resume carries no user message of its own — it is a `Command(resume=)`
     on a thread that already holds the message — so without the anchor the
-    second half of every approved turn is a spinner nothing can answer, and
-    the rollback point it would need has been thrown away with the first
-    turn's state (`tui/app.py:_interrupt_anchor`).
+    second half of every approved turn is a spinner nothing can answer, the
+    start of the exchange having been thrown away with the first turn's state
+    (`tui/app.py:_interrupt_anchor`).
     """
 
     async def _park_on_a_decision(self, sched, graph_calls):
@@ -1186,12 +1239,12 @@ class TestStoppableAcrossAnApproval:
         ts = sched._turns["s1"]
         # The message that started the exchange, and the point in the thread
         # it started from — borrowed, not invented.
-        assert (ts.user_text, ts.interrupt_keep) == ("clear the scratch dir", 4)
+        assert (ts.user_text, ts.exchange_start) == ("clear the scratch dir", 4)
         assert sched.can_interrupt("s1") is True
         graph_calls["gates"]["s1"].set()
         await settle()
 
-    async def test_stopping_the_resume_rolls_back_the_whole_exchange(
+    async def test_stopping_the_resume_keeps_the_whole_exchange(
         self, sched, graph_calls
     ):
         await self._park_on_a_decision(sched, graph_calls)
@@ -1199,10 +1252,13 @@ class TestStoppableAcrossAnApproval:
         sched.resolve_decision("s1", approved=True)
         await settle()
 
-        assert await sched.interrupt("s1") == "clear the scratch dir"
-        # Back to before the message, not to before the resume: the tool call
-        # the user approved is part of the attempt being abandoned.
-        assert graph_calls["rolled_back"] == [("s1", 4)]
+        stopped = await sched.interrupt("s1")
+        # The exchange began before the resume did, and all of it stays: the
+        # call the user approved and answered for is exactly the work they
+        # would be most annoyed to lose. Nothing comes back to the entry box —
+        # the message that opened it is in the conversation.
+        assert stopped.text is None
+        assert graph_calls["stopped"] == ["s1"]
         assert not sched.is_busy("s1")
 
     async def test_the_anchor_is_dropped_once_the_exchange_ends(
@@ -1213,8 +1269,8 @@ class TestStoppableAcrossAnApproval:
         graph_calls["results"]["s1"] = TurnResult(reply="done", interrupt=None)
         sched.resolve_decision("s1", approved=True)
         await settle()
-        # Answered for good: nothing left of this exchange to roll back to,
-        # and the next turn must not be handed the last one's message.
+        # Answered for good: there is no exchange left to stop, and the next
+        # turn must not be handed the last one's message.
         assert sched._anchors == {}
         assert sched.can_interrupt("s1") is False
 

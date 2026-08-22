@@ -416,6 +416,7 @@ what §4 requires, and resolves one collision.
 | global | `←` `→` | previous / next column |
 | global | `esc esc` | stop the turn (1.0s window; one escape means nothing) |
 | global | `c` | config, anywhere but the chat column |
+| chat | `c` | copy the row under the cursor to the clipboard |
 | global | `m` / `a` | manage LLMs / profiles, sessions row only |
 | global | `?` | help |
 | sessions | `enter` | open (and focus the message box), or start a new session |
@@ -423,20 +424,21 @@ what §4 requires, and resolves one collision.
 | sessions | `alt+↑` `alt+↓` | reorder |
 | chat | `→` `←` | expand / collapse an entry |
 | chat | `enter` | rewind on your own message; interrupt on the working row |
-| chat | `y` | copy the row under the cursor to the clipboard |
 | chat | `ctrl+l` | switch this session's LLM |
-| chat | `shift+tab` | cycle mode |
 | watchers | `enter` `d` | peek, drop |
 | watchers | `alt+↑` `alt+↓` | reorder |
 | message box | `enter` | send |
 | message box | `shift+enter` `alt+enter` `ctrl+j` | newline |
 | message box | `ctrl+←/→`, `ctrl+bksp/del`, `shift+`motion | word motion, word delete, selection |
+| message box | `shift+tab` | cycle mode — the one place it is offered |
 | message box | `ctrl+↑` | leave the box |
 | decision | `y` `n` `esc` | approve, refuse with a reason, refuse without |
 | decision | `ctrl+↑` `ctrl+↓` | leave — the prompt stands in the message box's slot in the ring while it is pending, and the box is not drawn |
 
-`y` on the chat row is new and collides with nothing: the decision prompt owns
-`y` only while a decision is pending, and it takes the key first.
+`c` on the chat row collides with nothing: it is the one column the config
+editor gives `c` up on, the decision prompt takes keys before the rows do, and
+every overlay answers its own. The mode is the message box's alone — from the
+chat row shift+tab moves up the ring like it does everywhere else.
 
 ---
 

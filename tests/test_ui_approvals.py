@@ -27,11 +27,23 @@ from hpca.config import Settings
 from hpca.db import connect, init_db
 from hpca.runner import ProcessRunner
 from hpca.trash import TrashManager
-from hpca.ui.ansi import CYAN, PULSE_INTERVAL, PULSE_PERIOD, PULSE_RAMP, WHITE
-from hpca.ui.app import CHAT, DECISION, INPUT, SESSIONS, WATCHERS, RowUI
+from hpca.ui.ansi import (
+    BOLD,
+    CYAN,
+    DIM,
+    PULSE_INTERVAL,
+    PULSE_PERIOD,
+    PULSE_RAMP,
+    RED,
+    WHITE,
+    YELLOW,
+)
+from hpca.ui.app import CHAT, DECISION, INPUT, OFFER, SESSIONS, WATCHERS, RowUI
 from hpca.ui.approval import approval_details
 from hpca.ui.keys import PASTE
-from hpca.ui.state import Confirm
+from hpca.ui.rain import FPS as RAIN_FPS
+from hpca.ui.rain import GLYPHS
+from hpca.ui.state import Confirm, Display
 from tests.ui_harness import connected, plain, widths
 
 ROWS = [
@@ -62,6 +74,16 @@ LONG_SCRIPT = {
         f"--reference /scratch/proj/refs/GRCh38_full_analysis_set.fa"
         for i in range(60)
     ),
+}
+
+
+# The other gate: not a script about to run but something about to be lost.
+# Hand-written because what is under test here is the *colour* the two kinds
+# are drawn in, and a real payload would only add fields nothing reads.
+DELETE_GATE = {
+    "tool": "delete_file",
+    "kind": "destructive",
+    "details": "delete /scratch/proj/cohort.bam",
 }
 
 
@@ -273,9 +295,16 @@ class TestThePromptStandsInForTheMessageBox:
         self, wire
     ):
         before = wire.ui._heights(40, 100)
+        was = wire.ui._footer_h(100, 40)
         await parked(wire, BASH_GATE)
         after = wire.ui._heights(40, 100)
-        assert sum(after) == sum(before), "the screen is still the screen"
+        # The footer is part of the sum: it is as many rows as this row's keys
+        # need (`FOOTER_ROWS`), and the prompt offers four where the message
+        # box offers eleven — so at 100 columns it hands a row back, and the
+        # screen is still the screen once that row is counted.
+        assert sum(after) + wire.ui._footer_h(100, 40) == sum(before) + was, (
+            "the screen is still the screen"
+        )
         assert after[2] == wire.ui._decision_h(100, 40) + wire.ui._status_h()
         assert after[2] > before[2], "and the prompt has the room the box had"
 
@@ -372,7 +401,7 @@ class TestTheDecisionCannotBeLeftUnanswerable:
 
     async def test_the_cursor_is_never_left_in_a_box_that_is_not_drawn(self, wire):
         # As any unguarded path that aims at the message box would leave it —
-        # a paste, a message handed back, `i` in the chat.
+        # a paste, a message handed back, ctrl+↓ out of the chat.
         await parked(wire, BASH_GATE)
         wire.ui.focus = INPUT
         assert "── message ─" not in wire.screen()
@@ -380,12 +409,12 @@ class TestTheDecisionCannotBeLeftUnanswerable:
         await wire.press("y")
         assert wire.peer.last(protocol.DecisionResolve).approved is True
 
-    async def test_i_in_the_chat_lands_on_the_question_and_not_on_the_box(
+    async def test_the_ring_lands_on_the_question_and_not_on_the_box(
         self, wire
     ):
         await parked(wire, BASH_GATE)
         await wire.press("ctrl-up")  # to the chat
-        await wire.press("i")
+        await wire.press("ctrl-down")  # and back down, into the prompt's slot
         assert wire.ui.focus == DECISION
         await wire.press("y")
         assert wire.peer.last(protocol.DecisionResolve).approved is True
@@ -645,6 +674,166 @@ class TestTheHalfWrittenReasonIsADraft:
 
 
 
+class TestTheRuleSaysWhereTheKeysAre:
+    """The decision's rule follows the focus convention, and the severity it
+    used to carry moves one line down onto the heading.
+
+    Two facts were fighting over one row. Focus is teal-and-bold in every
+    other region — sessions, chat, watchers, all drawn by `Pane.render` — and
+    the prompt stands in the message box's slot of the same ring, so a rule
+    that could not say "the keys are here" left the one region whose keys
+    silently do nothing as the one region unable to say so.
+
+    The severity is not dropped for it. An execution gate and a destructive
+    one are different warnings and the prompt still says which, in the same
+    two colours, on the bold heading line directly under the rule — which is
+    larger type than the rule ever was. What is lost is the dashes it was
+    painted on.
+    """
+
+    @staticmethod
+    def rule_row(wire) -> str:
+        rows = [x for x in wire.ui.render(120, 40) if "── decision ─" in x]
+        assert len(rows) == 1, "the rule is drawn once"
+        return rows[0]
+
+    @staticmethod
+    def heading(wire, text: str) -> str:
+        rows = [x for x in wire.ui.render(120, 40) if text in x]
+        assert len(rows) == 1, f"{text!r} is drawn once"
+        return rows[0]
+
+    async def test_the_rule_is_teal_when_the_prompt_is_focused(self, wire):
+        await parked(wire, BASH_GATE)
+        assert wire.ui.focus == DECISION
+        assert self.rule_row(wire).startswith(BOLD + CYAN)
+
+    async def test_and_dim_when_it_is_not(self, wire):
+        await parked(wire, BASH_GATE)
+        wire.ui.focus = CHAT
+        assert self.rule_row(wire).startswith(DIM)
+
+    async def test_it_is_the_same_sentence_the_panes_write(self, wire):
+        # Not merely "teal": the exact styles `Pane.render` puts on its own
+        # title, so the four regions cannot drift into two conventions.
+        await parked(wire, BASH_GATE)
+        focused = self.rule_row(wire)
+        wire.ui.focus = CHAT
+        unfocused = self.rule_row(wire)
+        chat = [x for x in wire.ui.render(120, 40) if "── chat ─" in x][0]
+        wire.ui.focus = CHAT
+        assert focused.startswith(BOLD + CYAN) and chat.startswith(BOLD + CYAN)
+        assert unfocused.startswith(DIM)
+
+    async def test_a_destructive_gate_still_says_so_in_red(self, wire):
+        await parked(wire, DELETE_GATE)
+        assert self.heading(wire, "Destructive operation").startswith(RED + BOLD)
+
+    async def test_and_an_execution_gate_in_yellow(self, wire):
+        # The distinction the docstring of `ui/approval.py` insists on: a
+        # script about to run is not the same warning as something about to be
+        # lost, and one colour for both would be a warning that says nothing.
+        await parked(wire, BASH_GATE)
+        assert self.heading(wire, "Run this —").startswith(YELLOW + BOLD)
+
+    async def test_the_two_kinds_are_still_told_apart_while_focused(self, wire):
+        # The thing the naive fix would have broken: the prompt is focused
+        # almost all the time, so a severity that only showed when it was not
+        # would be a severity nobody ever sees.
+        await parked(wire, BASH_GATE)
+        assert wire.ui.focus == DECISION
+        execution = self.heading(wire, "Run this —")
+        await parked(wire, DELETE_GATE)
+        assert wire.ui.focus == DECISION
+        destructive = self.heading(wire, "Destructive operation")
+        assert execution.split("m", 1)[0] != destructive.split("m", 1)[0]
+
+    async def test_the_refusal_box_keeps_the_severity_too(self, wire):
+        # The second stage replaces the question but not the warning: what is
+        # being refused is still the same class of thing.
+        await parked(wire, DELETE_GATE)
+        await wire.press("n")
+        assert self.heading(wire, "Denied —").startswith(RED + BOLD)
+
+    async def test_the_rule_costs_no_rows_either_way(self, wire):
+        # Focus is a colour and never a layout: a prompt that grew a row when
+        # the keys arrived would move the conversation behind it.
+        await parked(wire, LONG_SCRIPT)
+        focused = wire.ui._heights(40, 120)
+        wire.ui.focus = CHAT
+        assert wire.ui._heights(40, 120) == focused
+
+
+class TestHowFastTheAnswerLineBreathes:
+    """`Display.decision_pulse_seconds` — the period, in seconds, as it
+    arrived over the wire. The colour is still a pure function of the clock;
+    what the setting changes is how far round the sweep a given instant is."""
+
+    @staticmethod
+    def hint(wire, when: float) -> str:
+        wire.ui.clock = lambda: when
+        rows = [x for x in wire.ui.render(120, 40) if "(y) run script" in x]
+        assert len(rows) == 1
+        return rows[0]
+
+    async def test_the_period_arrives_with_the_rest_of_the_display_settings(
+        self, wire
+    ):
+        await wire.tell(
+            protocol.DisplayChanged(
+                display=protocol.DisplaySettings(decision_pulse_seconds=8.0)
+            )
+        )
+        assert wire.ui.display.decision_pulse_seconds == 8.0
+
+    async def test_a_configured_period_is_what_the_sweep_runs_on(self, wire):
+        # A quarter of the way round is the far end of the ramp, wherever the
+        # user put the quarter mark.
+        await wire.tell(
+            protocol.DisplayChanged(
+                display=protocol.DisplaySettings(decision_pulse_seconds=8.0)
+            )
+        )
+        await parked(wire, BASH_GATE)
+        assert self.hint(wire, 2.0).startswith(CYAN)
+        assert self.hint(wire, 6.0).startswith(WHITE)
+
+    async def test_and_a_slower_one_is_visibly_slower(self, wire):
+        # The same instant, two periods, two colours — which is the whole of
+        # what the setting does.
+        await parked(wire, BASH_GATE)
+        fast = self.hint(wire, PULSE_PERIOD / 4)
+        await wire.tell(
+            protocol.DisplayChanged(
+                display=protocol.DisplaySettings(decision_pulse_seconds=100.0)
+            )
+        )
+        assert self.hint(wire, PULSE_PERIOD / 4) != fast
+
+    async def test_a_period_nothing_can_be_divided_by_does_not_kill_the_frame(
+        self, wire
+    ):
+        # The settings model refuses zero (`config.DisplaySettings`), which is
+        # where a user finds out. This is the other half: by the time a number
+        # has crossed the wire it is being divided by inside a repaint, and an
+        # exception there takes the terminal down with it.
+        await wire.tell(
+            protocol.DisplayChanged(
+                display=protocol.DisplaySettings(decision_pulse_seconds=0.0)
+            )
+        )
+        await parked(wire, BASH_GATE)
+        assert widths(wire.ui.render(120, 40)) == {120}
+        assert self.hint(wire, PULSE_PERIOD / 4).startswith(CYAN)
+
+    async def test_the_default_is_one_second(self, wire):
+        # Changed from 2.4: the line reads as a prompt waiting for an answer,
+        # and a two-and-a-half-second cycle is slow enough that a glance
+        # catches it standing still.
+        assert PULSE_PERIOD == 1.0
+        assert wire.ui.display == Display()
+
+
 class TestTheAnswerLinePulses:
     """The one line on the screen that is drawn in a different colour every
     tenth of a second, and the reason it is: a turn parked on a question is a
@@ -737,10 +926,172 @@ class TestTheGenericConfirm:
     quit and the skill screens are M8), and the one live caller today is the
     interrupt (see `test_ui_turn.py`)."""
 
-    async def test_it_draws_over_whatever_is_on_screen(self, wire):
+    async def test_it_draws_instead_of_whatever_is_on_screen(self, wire):
         wire.ui.ask("Really quit?")
         assert "Really quit?" in wire.screen()
         assert "(y) yes · (n) no" in wire.screen()
+
+    async def test_and_it_is_the_only_thing_left_to_read(self, wire):
+        # Three rows spliced into a full screen read as another band of it.
+        # The question is a gate, so the screen it gates is cleared.
+        await wire.tell(protocol.SessionRows(rows=list(ROWS)))
+        busy = [plain(row) for row in wire.frame() if plain(row).strip()]
+        assert len(busy) > 3, "the frame under the question was already empty"
+
+        wire.ui.ask("Really quit?")
+        rows = [plain(row) for row in wire.frame() if plain(row).strip()]
+        assert [row.strip() for row in rows] == [
+            "── confirm " + "─" * (wire.width - 11),
+            "Really quit?",
+            "(y) yes · (n) no · (esc) no",
+        ]
+
+    async def test_and_no_puts_back_the_frame_it_hid(self, wire):
+        # Which is what makes the question cheap to answer wrongly: the frame
+        # underneath is built the same way while it is up, so the panes keep
+        # the heights and the scroll they had.
+        await wire.tell(protocol.SessionRows(rows=list(ROWS)))
+        before = wire.frame()
+        wire.ui.ask("Really quit?")
+        await wire.press("n")
+        assert wire.frame() == before
+
+    @pytest.mark.parametrize(
+        "height,rows",
+        [
+            (1, ["Really quit?"]),
+            (2, ["Really quit?", "(y) yes · (n) no · (esc) no"]),
+        ],
+    )
+    async def test_a_terminal_too_short_keeps_the_question(self, wire, height, rows):
+        # The rule is the decoration, and it is decorating nothing now.
+        wire.ui.ask("Really quit?")
+        drawn = [plain(row) for row in wire.ui.render(wire.width, height)]
+        assert [row.strip() for row in drawn] == rows
+        assert widths(drawn) == {wire.width}
+
+
+class TestTheFieldBehindIt:
+    """The falling glyphs on the screen a confirmation cleared (`ui.rain`).
+
+    Fun, and not only fun: the cleared screen is the one frame this UI draws
+    that has nothing on it, and a terminal that goes blank is a terminal that
+    might have died. A field that is visibly moving says the opposite.
+
+    The clock is pinned wherever a frame is compared to another frame, because
+    that is the design — the field is a pure function of `RowUI.clock()`, so
+    an instant is one answer and not a race.
+    """
+
+    @staticmethod
+    async def quitting(wire):
+        """The real gesture, since it is the only one that raises this."""
+        wire.ui.focus = SESSIONS
+        await wire.press("q")
+        return wire
+
+    @staticmethod
+    def at(wire, when: float, height: int = 40) -> list[str]:
+        wire.ui.clock = lambda: when
+        return wire.ui.render(wire.width, height)
+
+    async def test_it_fills_the_screen_the_question_cleared(self, wire):
+        await self.quitting(wire)
+        rows = [plain(r) for r in self.at(wire, 20.0)]
+        painted = [r for r in rows if r.strip() and "quit" not in r and "─" not in r]
+        assert painted, "the cleared screen is bare"
+        assert any(ch in GLYPHS for r in painted for ch in r)
+
+    async def test_and_spares_the_lines_of_the_question(self, wire):
+        await self.quitting(wire)
+        rows = [plain(r).rstrip() for r in self.at(wire, 20.0)]
+        assert "  Really quit?" in rows
+        assert "  (y) yes · (n) no · (esc) no" in rows
+        assert any(r.startswith("── confirm") for r in rows)
+
+    async def test_the_frame_is_still_the_terminal(self, wire):
+        # The one rule a frame may never break, and the reason the glyphs are
+        # halfwidth katakana rather than the full-width block.
+        await self.quitting(wire)
+        for when in (0.0, 3.7, 20.0, 91.25):
+            assert widths([plain(r) for r in self.at(wire, when)]) == {wire.width}
+
+    async def test_nothing_of_the_frame_underneath_survives_it(self, wire):
+        await wire.tell(protocol.SessionRows(rows=list(ROWS)))
+        await self.quitting(wire)
+        screen = "\n".join(plain(r) for r in self.at(wire, 20.0))
+        assert "the second thing" not in screen
+        assert "edit run.sh" not in screen
+        assert "HPCA" not in screen
+
+    async def test_one_instant_is_one_answer(self, wire):
+        # `render` is called more than once for the same instant, and the
+        # repaint is differential: a field that differed between two frames of
+        # the same moment would flicker for no reason.
+        await self.quitting(wire)
+        assert self.at(wire, 20.0) == self.at(wire, 20.0)
+
+    async def test_but_it_moves_with_the_clock(self, wire):
+        await self.quitting(wire)
+        assert self.at(wire, 20.0) != self.at(wire, 20.5)
+
+    async def test_it_books_the_repaint_that_animates_it(self, wire):
+        # Nothing else wakes the loop: without this the field would be painted
+        # once, mid-drop, and hang there.
+        assert wire.ui.next_wake() is None
+        await self.quitting(wire)
+        assert wire.ui.next_wake() == pytest.approx(1 / RAIN_FPS)
+
+    @pytest.mark.parametrize("fps,wake", [(10, 0.1), (30, 1 / 30), (60, 1 / 60)])
+    async def test_and_at_the_rate_the_settings_asked_for(self, wire, fps, wake):
+        await wire.tell(
+            protocol.Hello(display=protocol.DisplaySettings(quit_rain_fps=fps))
+        )
+        await self.quitting(wire)
+        assert wire.ui.next_wake() == pytest.approx(wake)
+
+    @pytest.mark.parametrize("fps", [0, -5, 10_000])
+    async def test_a_rate_it_cannot_use_is_clamped_not_raised_on(self, wire, fps):
+        # It crossed a wire and this is a repaint loop with the terminal in
+        # raw mode; a zero here would divide by zero somewhere unhelpful.
+        await wire.tell(
+            protocol.Hello(display=protocol.DisplaySettings(quit_rain_fps=fps))
+        )
+        await self.quitting(wire)
+        assert 1 / 120 <= wire.ui.next_wake() <= 1.0
+        assert widths([plain(r) for r in self.at(wire, 20.0)]) == {wire.width}
+
+    async def test_and_books_nothing_when_it_is_turned_off(self, wire):
+        await wire.tell(
+            protocol.Hello(display=protocol.DisplaySettings(quit_rain=False))
+        )
+        await self.quitting(wire)
+        assert wire.ui.next_wake() is None
+
+    async def test_off_is_a_black_screen_and_the_question(self, wire):
+        await wire.tell(
+            protocol.Hello(display=protocol.DisplaySettings(quit_rain=False))
+        )
+        await self.quitting(wire)
+        rows = [plain(r) for r in self.at(wire, 20.0)]
+        assert len([r for r in rows if r.strip()]) == 3
+
+    @pytest.mark.parametrize(
+        "raise_it",
+        [
+            lambda w: w.ui.ask("Really delete “the first thing”?"),
+            lambda w: w.ui.ask("Interrupt this turn?"),
+        ],
+    )
+    async def test_and_the_other_questions_stay_black(self, wire, raise_it):
+        # Leaving is the one you are not coming back from. Stopping a turn or
+        # deleting a session are things done in the middle of working, and an
+        # animation over the top of one is a flourish charged to somebody who
+        # is busy.
+        raise_it(wire)
+        rows = [plain(r) for r in self.at(wire, 20.0)]
+        assert len([r for r in rows if r.strip()]) == 3
+        assert wire.ui.next_wake() is None
 
     @pytest.mark.parametrize("width", [80, 100, 137])
     async def test_and_the_frame_is_still_the_terminal(self, wire, width):
@@ -782,32 +1133,141 @@ class TestTheGenericConfirm:
 class TestConfirmRequested:
     """§4.3 item 23 — the separate channel triage offers a learned log
     signature on. Never wired into the Textual UI at all, so this is new
-    behaviour arriving with the port."""
+    behaviour arriving with the port.
 
-    async def test_the_question_reaches_the_screen(self, wire):
-        await wire.tell(
+    It is raised by a poll rather than by a keypress, which is what makes it
+    unlike every other question here: whoever started the job that failed is
+    as likely as not reading a different conversation by the time it lands. So
+    it waits in the session it is about, standing in that session's message
+    box (`app.OFFER`), and a session that is not on screen says so with a mark
+    and nothing else.
+    """
+
+    async def offered(self, w, session_id="s1", question="Learn it?", offer_id="sig-1"):
+        await w.tell(
             protocol.ConfirmRequested(
-                id="sig-1", question="Remember “OOM killed” as a failure?"
+                id=offer_id, session_id=session_id, question=question
             )
         )
+        return w
+
+    async def test_the_question_reaches_the_session_it_is_about(self, wire):
+        await self.offered(wire, question="Remember “OOM killed” as a failure?")
         assert "Remember “OOM killed” as a failure?" in wire.screen()
 
+    async def test_it_stands_where_the_message_box_was(self, wire):
+        # In the box's slot and not over the frame: the conversation the
+        # question is about has to stay readable behind it (`_entry_h`).
+        assert "── message" in wire.screen()
+        await self.offered(wire)
+        screen = wire.screen()
+        assert "── offer" in screen
+        assert "── message" not in screen
+        assert "edit run.sh" in screen, "the chat is still there to read"
+        assert "the second thing" in screen, "and so is the sidebar"
+
+    async def test_the_layout_budgets_for_the_rows_it_draws(self, wire):
+        """Rows drawn that no band asked for come off the bottom of the frame.
+
+        Which is a silent failure and the reason this is asserted rather than
+        eyeballed: the frame is always exactly as tall as the terminal, so an
+        entry band that draws four rows where two were planned does not
+        overflow — it pushes the watchers column down and two of its rows are
+        cut, with nothing anywhere saying they are missing.
+        """
+        await self.offered(wire, question="a question long enough to wrap " * 6)
+        ui, w, h = wire.ui, wire.width, wire.height
+        assert ui._entry_h(w, h) == len(ui._render_offer(w, h))
+        assert sum(ui._heights(h, w)) == ui._avail(w, h)
+
+    async def test_the_cursor_lands_on_it_so_the_keys_work(self, wire):
+        await self.offered(wire)
+        assert wire.ui.focus == OFFER
+
     async def test_yes_answers_it_by_id(self, wire):
-        await wire.tell(protocol.ConfirmRequested(id="sig-1", question="Learn it?"))
+        await self.offered(wire)
         await wire.press("y")
         answer = wire.peer.last(protocol.ConfirmResolve)
         assert (answer.id, answer.confirmed) == ("sig-1", True)
 
     async def test_and_no_answers_it_too(self, wire):
-        await wire.tell(protocol.ConfirmRequested(id="sig-1", question="Learn it?"))
+        await self.offered(wire)
         await wire.press("n")
         answer = wire.peer.last(protocol.ConfirmResolve)
         assert (answer.id, answer.confirmed) == ("sig-1", False)
 
-    async def test_it_names_no_session_because_it_belongs_to_none(self, wire):
-        # A triage offer comes from a poll, not from a conversation
-        # (`protocol.ConfirmResolve`).
-        assert not hasattr(Confirm(id="x", question="?"), "session_id")
-        await wire.tell(protocol.ConfirmRequested(id="sig-1", question="Learn it?"))
+    async def test_escape_is_no_here_too(self, wire):
+        await self.offered(wire)
+        await wire.press("esc")
+        assert wire.peer.last(protocol.ConfirmResolve).confirmed is False
+
+    async def test_answering_gives_the_message_box_back(self, wire):
+        await self.offered(wire)
         await wire.press("y")
-        assert not hasattr(wire.peer.last(protocol.ConfirmResolve), "session_id")
+        assert wire.ui.focus == INPUT
+        assert "── message" in wire.screen()
+
+    async def test_a_question_about_another_session_does_not_take_this_one(self, wire):
+        # §3.2 property 1: a session that is not on screen may change the
+        # sidebar and nothing else.
+        await self.offered(wire, session_id="s2", question="Learn the other one?")
+        assert "Learn the other one?" not in wire.screen()
+        assert "── message" in wire.screen()
+        assert wire.ui.focus != OFFER
+
+    async def test_but_the_sidebar_says_it_is_waiting(self, wire):
+        await self.offered(wire, session_id="s2")
+        row = next(
+            line for line in wire.frame() if "the second thing" in plain(line)
+        )
+        assert "?" in plain(row)
+
+    async def test_and_switching_to_it_is_what_asks(self, wire):
+        await wire.tell(protocol.ChatReset(session_id="s2", entries=[entry(1)]))
+        await self.offered(wire, session_id="s2", question="Learn the other one?")
+        wire.ui.focus = SESSIONS
+        wire.ui.session_pane.cursor = 2  # the second session's row
+        await wire.press("enter")
+        assert "Learn the other one?" in wire.screen()
+
+    async def test_a_decision_outranks_it_and_it_waits(self, wire):
+        # Both want the same slot, and of the two the decision is the one
+        # holding a turn.
+        await self.offered(wire)
+        await parked(wire, BASH_GATE)
+        screen = wire.screen()
+        assert "── decision" in screen
+        assert "Learn it?" not in screen
+        await wire.press("y")  # answer the decision
+        assert "Learn it?" in wire.screen(), "the offer was waiting, not lost"
+
+    async def test_two_questions_are_asked_one_at_a_time(self, wire):
+        # The core is holding a continuation per id: a second offer landing on
+        # the first would strand it with nothing able to answer it.
+        await self.offered(wire, offer_id="sig-1", question="Learn the first?")
+        await self.offered(wire, offer_id="sig-2", question="Learn the second?")
+        assert "Learn the first?" in wire.screen()
+        assert "Learn the second?" not in wire.screen()
+        await wire.press("y")
+        assert wire.peer.last(protocol.ConfirmResolve).id == "sig-1"
+        assert "Learn the second?" in wire.screen()
+        await wire.press("n")
+        assert wire.peer.last(protocol.ConfirmResolve).id == "sig-2"
+        assert "── message" in wire.screen()
+
+    async def test_the_same_question_twice_is_one_question(self, wire):
+        # A re-emit on subscribe must not ask twice: the second copy would be
+        # unanswerable, the core having freed the continuation on the first.
+        await self.offered(wire)
+        await self.offered(wire)
+        await wire.press("y")
+        assert wire.ui.session.offers == []
+        assert "── message" in wire.screen()
+
+    async def test_walking_away_does_not_answer_it(self, wire):
+        await self.offered(wire)
+        await wire.press("ctrl-up")
+        assert wire.ui.focus == CHAT
+        assert wire.peer.took(protocol.ConfirmResolve) == []
+        await wire.press("ctrl-down")
+        assert wire.ui.focus == OFFER, "the ring comes back to it"

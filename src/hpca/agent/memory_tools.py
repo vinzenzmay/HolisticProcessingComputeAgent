@@ -109,8 +109,13 @@ MEMORY_DESCRIPTION = (
     "correction) — kept small, so reserve it for what is always relevant; "
     "'rag' for a situational, one-topic learning recalled only when a later "
     "request resembles it. Put ALL changes in ONE call via the operations "
-    "array. Address an existing entry by a short unique substring of its text; "
-    "use 'demote' to move a system-prompt entry to rag."
+    "array. Address an existing entry by a short unique substring of its text "
+    "— including one you flagged earlier in this conversation; use 'demote' "
+    "to move a system-prompt entry to rag. The result says what was queued "
+    "and what was refused: a substring that addresses nothing comes back with "
+    "the entries that DO exist, so correct it from that list rather than "
+    "retrying with a shorter substring. Reissuing a refused operation "
+    "unchanged is counted and stops the tool for the session."
 )
 
 
@@ -143,7 +148,14 @@ def _scope_of(raw: str) -> MemoryScope:
 
 async def memory(args: MemoryParams, ctx: ToolContext) -> str:
     """Flag a memory batch for review at the next /conclude. The tool never
-    writes: it queues the proposal and reports that it was noted."""
+    writes: it queues the proposal and reports what the queue now holds.
+
+    All the judgement is on the other side of ``queue_memory_edits`` — this
+    end only normalizes strings into ops. It matters that it reports *that*
+    side's answer verbatim rather than a friendly summary of it: the answer is
+    where a substring that addressed nothing is named, and swallowing it here
+    would put back exactly the constant acknowledgement that once let this
+    tool be called forever."""
     if ctx.queue_memory_edits is None:
         return "Memory flagging is not available in this context."
     operations = [

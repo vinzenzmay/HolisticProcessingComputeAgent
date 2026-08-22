@@ -144,15 +144,33 @@ class UIClient:
         # and it is still not the conversation the user is looking at until
         # something has asked the core for it.
         self._opened = False
-        # Which profile a ctrl+e is out for, or "": the editor cannot open
-        # until `profile.body` arrives, and there is one terminal to hand over.
-        self._editing = ""
+        # Which profile file an editor is out for, as (name, kind), or
+        # ("", ""): the editor cannot open until `profile.body` arrives, and
+        # there is one terminal to hand over.
+        self._editing: tuple[str, str] = ("", "")
+        # And the same for the settings file, which is a different fetch
+        # (`settings.get`) and cannot be told apart from the config screen's
+        # own by the event that answers it.
+        self._editing_settings = False
+        # What was last sent as `settings.save` from `$EDITOR`, until the core
+        # says whether it took it. Kept because a refusal has to land
+        # somewhere the user can still fix it, and by then their editor has
+        # closed — see `_settings_body`.
+        self._saving_settings = ""
+        # The program `resolve_editor` picked, for the sentence a bad exit
+        # gets. Set by `_in_editor` on the way in.
+        self._editor_name = "the editor"
         ui.send = self.intent
         # Asked for on the first `/`, and answered a frame later by
         # `skill.rows` — the menu is a function of what has arrived, so it
         # fills itself the moment it does.
         ui.skills_loader = self.ask_skills
+        # The three ways into `$EDITOR`, wired together because they are one
+        # terminal and one resolution order (`RowUI.external_editor` reads
+        # them as one fact).
         ui.edit_profile = self.edit_profile
+        ui.edit_text = self.edit_text
+        ui.edit_settings = self.edit_settings
         # Syntax only, and eagerly: it is a pure function of the text, and the
         # verdict that needs the settings model comes back as
         # `SettingsBody.error` (see `_settings_error`).
@@ -235,7 +253,11 @@ class UIClient:
             self._cycle_mode(session)
         elif isinstance(intent, state.Fork | state.Rollback):
             self._rewind(intent)
-        elif isinstance(intent, state.Peek | state.Drop):
+        elif isinstance(intent, state.MoveSession):
+            self.command(
+                protocol.SessionMove(session_id=session, delta=intent.delta)
+            )
+        elif isinstance(intent, state.Peek | state.Drop | state.MoveWatch):
             self._watch(intent)
         elif isinstance(intent, state.SetThinking):
             self.command(
@@ -279,6 +301,11 @@ class UIClient:
                     name=intent.name, kind=intent.kind, text=intent.text
                 )
             )
+        elif isinstance(intent, state.EditProfile):
+            # Not a command of its own: three of them in a row, the middle one
+            # a program the user is looking at (`edit_profile`). The screen
+            # that sent this stays open behind it.
+            self.edit_profile(intent.name, intent.kind)
         elif isinstance(intent, state.CreateProfile):
             self.command(protocol.ProfileCreate(name=intent.name))
             self._reread_profiles()
@@ -392,8 +419,8 @@ class UIClient:
 
     # --------------------------------------------------------------- $EDITOR
 
-    def edit_profile(self, profile: str) -> None:
-        """ctrl+e: this profile's memories in `$EDITOR`, in three steps.
+    def edit_profile(self, profile: str, kind: str = "memories") -> None:
+        """A profile's memories or its archive in `$EDITOR`, in three steps.
 
         The steps are `profile.get`, the editor, `profile.save`, and they are
         in that order for the reason every editor here fetches: the file is
@@ -404,28 +431,90 @@ class UIClient:
         That makes the whole thing asynchronous, which is why this returns
         nothing: the request goes out now and `_profile_body` picks it up when
         the answer lands, hands the terminal over (`RowUI.suspend`, wired by
-        `ui/run.py`) and takes it back. A second ctrl+e while one is out is
+        `ui/run.py`) and takes it back. A second one while one is out is
         ignored rather than queued — there is one terminal.
+
+        The profile is named by the caller and never assumed. It arrives from
+        the row the user put the cursor on (`ProfilesOverlay._edit`), which is
+        the whole of the fix: the key this used to hang off edited whichever
+        profile the core was working under, from a screen where nothing had
+        been selected at all.
         """
-        if self._editing:
+        if self._editing != ("", ""):
+            return  # one terminal, and one editor out over it
+        self._editing = (profile, kind)
+        self.command(protocol.ProfileGet(name=profile, kind=kind))
+
+    def edit_text(self, text: str, done: Callable[[str], None]) -> None:
+        """Text the UI already holds, in `$EDITOR`, and back where it came from.
+
+        The one editor here with no wire in it: the message being written is
+        the front-end's own state until it is sent, so there is nothing to
+        fetch and nothing to save — which is why this suspends immediately
+        instead of waiting for a body, and why what comes back is handed to a
+        callback the caller chose rather than to a command.
+        """
+        self._suspend_for(lambda: self._run_text_editor(text, done))
+
+    def edit_settings(self) -> None:
+        """The settings file in `$EDITOR`: `settings.get`, the editor, `settings.save`.
+
+        Fetched first for the same reason a profile is, and a sharper one: the
+        core rewrites the file on every save (`_save_settings` writes the
+        validated model back out), so the copy this UI is holding can already
+        differ from the file in ways nobody typed.
+        """
+        if self._editing_settings:
             return
-        self._editing = profile
-        self.command(protocol.ProfileGet(name=profile, kind="memories"))
+        self._editing_settings = True
+        self.command(protocol.SettingsGet())
 
-    def _run_editor(self, profile: str, text: str) -> None:
-        """The middle step: a scratch file, the user's editor, and the save.
+    # ---------------------------------------------------- running the editor
 
-        A temporary file rather than the profile's own path, because a path is
-        not on the wire and asking for one would be asking the core to hand
-        out filesystem access — the thing this protocol is careful not to be.
-        What comes back out is sent as `profile.save`, which is the same
-        command the memory editor uses and the one that invalidates the core's
-        loaded copy (`core.memory_service.invalidate`).
+    def _suspend_for(self, run: Callable[[], None]) -> None:
+        """Hand the terminal over and take it back, or say why it cannot be.
+
+        One place for it because the three editors reach it by three routes —
+        a draft suspends at the keypress, a profile and the settings file when
+        their body arrives — and what "there is no terminal" means is the same
+        answer in all three. `RowUI.suspend` is wired by `ui/run.py`, which is
+        the layer that owns the fd; a UI that has no loop behind it has none,
+        and an editor that could not be started must leave the app usable.
+        """
+        suspend = getattr(self.ui, "suspend", None)
+        if suspend is None:
+            self.ui.toast("no terminal to hand over", "warning")
+            return
+        try:
+            suspend(run)
+        except Exception as e:
+            self.ui.toast(f"cannot suspend for editing: {e}", "error")
+
+    def _in_editor(self, text: str, name: str) -> tuple[int, str] | None:
+        """A scratch file, the user's editor, and what it left behind.
+
+        A temporary file rather than the real one, because a path is not on
+        the wire and asking for one would be asking the core to hand out
+        filesystem access — the thing this protocol is careful not to be. The
+        draft has no path at all, which is the same answer for a different
+        reason.
+
+        ``name`` is the file's name, and it is not decoration: it is the only
+        thing an editor has to go on when it decides how to treat the buffer.
+        A profile and a draft message are `.md` — both are prose, and the
+        suffix is what turns on highlighting, spell-checking and soft wrap
+        without the user configuring anything — and the settings file is
+        `.json`, which is what puts an editor in a mode that matches the
+        brackets it is about to be asked to balance.
 
         Editor resolution is `hpca.editor.resolve_editor` — settings, then
         `$VISUAL`, then `$EDITOR`, then nano — and is not reimplemented; the
         settings half comes out of the JSON this UI already holds, so no
         config module is imported to read one field.
+
+        Returns the exit code and the text, or None when the editor could not
+        be run at all — which is said here, because the caller's next question
+        ("did it change?") has no answer in that case.
         """
         import json
         import os
@@ -440,8 +529,9 @@ class UIClient:
         except ValueError:  # a settings file too broken to parse: still edit
             pass
         argv = resolve_editor(chosen if isinstance(chosen, str) else None, os.environ)
+        self._editor_name = argv[0]
         with tempfile.TemporaryDirectory(prefix="hpca-edit-") as scratch:
-            path = os.path.join(scratch, f"{profile or 'profile'}.md")
+            path = os.path.join(scratch, name)
             try:
                 with open(path, "w") as handle:
                     handle.write(text)
@@ -449,18 +539,104 @@ class UIClient:
                 edited = open(path).read()
             except OSError as e:
                 self.ui.toast(f"could not run {argv[0]}: {e}", "error")
-                return
-        if code != 0:
-            self.ui.toast(
-                f"{argv[0]} exited with {code} — nothing was saved", "warning"
-            )
+                return None
+        return code, edited
+
+    def _quit_badly(self, code: int, kept: str) -> bool:
+        """Whether the editor refused the edit, said in one place.
+
+        A non-zero exit is how every editor spells "I did not mean that" —
+        `:cq` in vim, a signal, a crash — and the one thing it must never do
+        is write anything back. ``kept`` names what survives instead, because
+        "nothing was saved" is not the same sentence for a file and a draft.
+        """
+        if code == 0:
+            return False
+        self.ui.toast(
+            f"{self._editor_name} exited with {code} — {kept}", "warning"
+        )
+        return True
+
+    def _run_editor(self, profile: str, kind: str, text: str) -> None:
+        """The middle step for a profile file: edit it, then save it back.
+
+        What comes back out is sent as `profile.save`, which is the same
+        command the in-app editor uses and the one that invalidates the core's
+        loaded copy (`core.memory_service.invalidate`).
+        """
+        got = self._in_editor(text, f"{profile or 'profile'}-{kind}.md")
+        if got is None:
+            return
+        code, edited = got
+        if self._quit_badly(code, "nothing was saved"):
             return
         if edited == text:
             self.ui.toast(f"“{profile}” unchanged")
             return
-        self.command(protocol.ProfileSave(name=profile, kind="memories", text=edited))
+        self.command(protocol.ProfileSave(name=profile, kind=kind, text=edited))
         self._reread_profiles()
         self.ui.toast(f"saved and reloaded “{profile}”")
+
+    def _run_text_editor(self, text: str, done: Callable[[str], None]) -> None:
+        """The middle step for a draft: edit it, and hand it back.
+
+        Two things are done to the text on the way through, and both are about
+        the difference between a *file* and a message. It is given a trailing
+        newline going in, because a file without one is a file editors warn
+        about; and every trailing newline is taken off coming back, because
+        the editor's own convention would otherwise arrive as blank lines at
+        the end of the box and as trailing whitespace in what is sent.
+
+        Nothing is said when it worked. The draft is on screen — the box *is*
+        the feedback, unlike a profile file, which is saved somewhere the user
+        cannot see and therefore has to be told about.
+        """
+        seeded = text if not text or text.endswith("\n") else text + "\n"
+        got = self._in_editor(seeded, "message.md")
+        if got is None:
+            return
+        code, edited = got
+        if self._quit_badly(code, "the draft is unchanged"):
+            return
+        edited = edited.rstrip("\n")
+        if edited == text.rstrip("\n"):
+            self.ui.toast("the draft is unchanged")
+            return
+        done(edited)
+
+    def _run_settings_editor(self, text: str) -> None:
+        """The middle step for the settings file: edit it, check it, save it.
+
+        The check is `_settings_error`, the same one the in-app editor refuses
+        to close on, and it is asked here for the same reason: text that is
+        not JSON is not worth a round trip, and the answer to it must not be
+        to throw the edit away. So a file that fails goes back on screen in
+        the editor overlay, which will not close while it is still broken
+        (`RowUI.fix_settings`) — the user's minute of typing is still there,
+        in the app, with the reason on the rule.
+
+        The half this cannot answer is whether valid JSON is valid *settings*.
+        That is the core's model to know, it is asked again on the other side
+        (`service._save_settings` refuses and writes nothing), and its verdict
+        comes back as `SettingsBody.error` — which `_settings_body` lands in
+        the same place, because by then the text is no longer on anybody's
+        screen to correct.
+        """
+        got = self._in_editor(text, "settings.json")
+        if got is None:
+            return
+        code, edited = got
+        if self._quit_badly(code, "the settings were not touched"):
+            return
+        if edited == text:
+            self.ui.toast("settings unchanged")
+            return
+        reason = _settings_error(edited)
+        if reason:
+            self.ui.fix_settings(edited, reason)
+            return
+        self._saving_settings = edited
+        self.command(protocol.SettingsSave(text=edited))
 
     def _cycle_mode(self, session_id: str) -> None:
         """The next mode, worked out here and shown before the core answers.
@@ -505,16 +681,26 @@ class UIClient:
                 )
             )
 
-    def _watch(self, intent: state.Peek | state.Drop) -> None:
+    def _watch(self, intent: state.Peek | state.Drop | state.MoveWatch) -> None:
         """`PanelRow.ref` is a string for every kind of row; a watch is an int.
 
         The conversion has to happen somewhere, and `protocol.PanelRow` says
-        explicitly that it is the sender's errand.
+        explicitly that it is the sender's errand. All three of the column's
+        keys come through here so that there is one of it.
         """
         try:
             watch_id = int(intent.ref)
         except ValueError:
             self.ui.toast(f"that row is not a watch ({intent.ref!r})", "warning")
+            return
+        if isinstance(intent, state.MoveWatch):
+            # Answered with the column whole, in the order the store now holds
+            # — and answered even when nothing moved (`protocol.WatchMove`),
+            # which is what lets the UI wait for the frame instead of
+            # shuffling its own rows and being corrected by it.
+            self.command(
+                protocol.WatchMove(watch_id=watch_id, delta=intent.delta)
+            )
             return
         if isinstance(intent, state.Peek):
             self.command(protocol.WatchPeek(watch_id=watch_id))
@@ -574,8 +760,40 @@ class UIClient:
     def _session(self, session_id: str) -> state.SessionState:
         return self.ui.session_for(session_id)
 
+    @staticmethod
+    def _display(msg: protocol.DisplaySettings) -> state.Display:
+        """The wire's display settings as the renderer's own shape.
+
+        Field by field, which is this module's whole job: `app.py` and
+        `state.py` have never heard of the protocol (§3.1), so the two models
+        are twins that only this line knows are twins.
+        """
+        return state.Display(
+            chat_stamps=msg.chat_stamps,
+            quit_rain=msg.quit_rain,
+            quit_rain_fps=msg.quit_rain_fps,
+            decision_pulse_seconds=msg.decision_pulse_seconds,
+        )
+
+    def _display_changed(self, msg: protocol.DisplayChanged) -> None:
+        """`display.settings`: the config editor changed how a frame looks.
+
+        The reason these are a state feed and not read off `settings.body`:
+        that one is the *file as text*, fetched because an editor is opening
+        over it, and hanging the chat's labels on a body that arrives only
+        when somebody presses `c` would leave the setting inert until they
+        did. This arrives unasked, on connect and after every save that
+        touched the section.
+        """
+        self.ui.set_display(self._display(msg.display))
+
     def _hello(self, msg: protocol.Hello) -> None:
         self.hello = msg
+        # Before the commands below, and so before any of their answers can
+        # draw a row: `hello` is the first frame on the wire (§4.2) and this
+        # is the first thing done with it, which is what makes "the labels are
+        # right on the first chat that arrives" true rather than lucky.
+        self.ui.set_display(self._display(msg.display))
         if msg.version != protocol.PROTOCOL_VERSION:
             # Not fatal here: the handshake in `coreproc` is what refuses a
             # stale core. On this side it is something to say out loud.
@@ -857,7 +1075,14 @@ class UIClient:
         self.ui.decision_cleared(msg.session_id)
 
     def _confirm(self, msg: protocol.ConfirmRequested) -> None:
-        self.ui.confirm_requested(msg.id, msg.question)
+        """A question about one session, which is where it is put.
+
+        Not on the app: what raises this is a job finishing, and the user is
+        by then as likely as not reading another conversation. Handing it to
+        the session makes "when you are in there" the moment it is asked.
+        """
+        self._session(msg.session_id).add_offer(msg.id, msg.question)
+        self.ui.confirm_requested(msg.session_id)
 
     def _unqueued(self, msg: protocol.TurnUnqueued) -> None:
         """A typed-ahead message taken back: its row goes, its text stays.
@@ -876,11 +1101,14 @@ class UIClient:
     def _interrupted(self, msg: protocol.TurnInterrupted) -> None:
         """A stopped turn's message, back to the session it was typed in.
 
-        `turn.unqueued`'s sibling and deliberately not the same event: this one
-        names no row, because the `chat.reset` that precedes it has already
-        un-drawn the abandoned attempt (`protocol.TurnInterrupted`). All that
-        is left to do with it is the half both share — park the text as that
-        session's draft, which is why they share the routine.
+        Rare, and the core decides when: a stop keeps its work, so the message
+        is normally part of the conversation and no such event is sent
+        (`protocol.TurnInterrupted`). When one does arrive, nothing of that
+        turn survived to draw. `turn.unqueued`'s sibling and deliberately not
+        the same event: this one names no row, because the `chat.reset` before
+        it has already settled the screen. All that is left is the half both
+        share — park the text as that session's draft, which is why they share
+        the routine.
         """
         self.ui.hand_back(msg.session_id, msg.text)
 
@@ -923,24 +1151,19 @@ class UIClient:
     def _profile_body(self, msg: protocol.ProfileBody) -> None:
         """`profile.body`: to the editor waiting for it, or into `$EDITOR`.
 
-        Two callers, one event, told apart by whether a ctrl+e is out. The
-        editor suspend happens here rather than at the keypress because this is
-        the moment the text exists: `_run_editor` writes it, runs the program
-        and sends what comes back.
+        Two callers, one event, told apart by whether an external edit is out
+        — and by *which* one, name and kind both, because the answer to a
+        memories fetch must not be opened as the archive. The suspend happens
+        here rather than at the keypress because this is the moment the text
+        exists: `_run_editor` writes it, runs the program and sends what comes
+        back.
         """
-        if self._editing == msg.name and msg.kind == "memories":
-            profile, self._editing = self._editing, ""
+        if self._editing == (msg.name, msg.kind):
+            (profile, kind), self._editing = self._editing, ("", "")
             if msg.error:
                 self.ui.toast(msg.error, "error")
                 return
-            suspend = getattr(self.ui, "suspend", None)
-            if suspend is None:
-                self.ui.toast("no terminal to hand over", "warning")
-                return
-            try:
-                suspend(lambda: self._run_editor(profile, msg.text))
-            except Exception as e:
-                self.ui.toast(f"cannot suspend for editing: {e}", "error")
+            self._suspend_for(lambda: self._run_editor(profile, kind, msg.text))
             return
         self.ui.body_arrived(
             ("profile", (msg.name, msg.kind)), msg.text, msg.error
@@ -997,15 +1220,31 @@ class UIClient:
 
         Sent both in answer to `settings.get` and after every `settings.save`,
         including a save the core refused — in which case ``error`` says why
-        and ``text`` still describes the file that is still there. So the
-        error is a toast and the body is applied either way, and the editor is
-        never reopened over rejected text: what the user typed is on their
-        screen, not here.
+        and ``text`` still describes the file that is still there. So the body
+        is applied either way, and the fetch this UI made for `$EDITOR` is
+        picked out of the same event the config screen's fetch arrives on.
+
+        A refusal used to be only a toast, and could be: the text the core
+        would not take was still in the editor on the user's screen. It is not
+        any more — `$EDITOR` has closed by the time the answer comes back — so
+        a refusal of *our* save reopens the in-app editor over exactly what
+        was sent, with the reason on its rule. The rejected text is on screen,
+        it is not on disk, and nothing about the file the core still has
+        changed.
         """
         self.ui.settings_json = msg.text
         self.ui.body_arrived(("settings", ()), msg.text)
         if msg.error:
+            rejected, self._saving_settings = self._saving_settings, ""
+            if rejected:
+                self.ui.fix_settings(rejected, msg.error)
+                return
             self.ui.toast(msg.error, "error")
+            return
+        self._saving_settings = ""
+        if self._editing_settings:
+            self._editing_settings = False
+            self._suspend_for(lambda: self._run_settings_editor(msg.text))
 
     def _notify(self, msg: protocol.Notify) -> None:
         """A toast, heading and all — the whole of §3.2's `notify` row.
@@ -1057,6 +1296,7 @@ class UIClient:
 
 
 UIClient._HANDLERS = {
+    protocol.DisplayChanged.__name__: UIClient._display_changed,
     protocol.Hello.__name__: UIClient._hello,
     protocol.SessionRows.__name__: UIClient._rows,
     protocol.SessionCreated.__name__: UIClient._created,

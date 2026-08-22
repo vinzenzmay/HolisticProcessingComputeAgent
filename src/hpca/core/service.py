@@ -91,6 +91,8 @@ from hpca.protocol import (
     ConfirmResolve,
     DecisionRequested,
     DecisionResolve,
+    DisplayChanged,
+    DisplaySettings,
     Hello,
     JobCancel,
     LLMCatalog,
@@ -116,6 +118,7 @@ from hpca.protocol import (
     SessionFocus,
     SessionFork,
     SessionList,
+    SessionMove,
     SessionNew,
     SessionOpen,
     SessionRename,
@@ -144,6 +147,7 @@ from hpca.protocol import (
     TurnUnqueue,
     TurnUnqueued,
     WatchDrop,
+    WatchMove,
     WatchPeek,
     WatchPeeked,
 )
@@ -342,6 +346,7 @@ class AgentService:
                 version=PROTOCOL_VERSION,
                 profile=self._deps.profile,
                 settings_digest=_settings_digest(self._deps.settings),
+                display=_display_settings(self._deps.settings),
             )
         )
         for session_id, payload in self._scheduler.pending_decisions().items():
@@ -406,6 +411,9 @@ class AgentService:
         if isinstance(command, SessionRollback):
             await self._rollback_session(command.session_id, command.index)
             return
+        if isinstance(command, SessionMove):
+            self._move_session(command.session_id, command.delta)
+            return
         if isinstance(command, SessionFocus):
             # The one sanctioned answer to "what is the user looking at".
             self._deps.focused_session_id = command.session_id
@@ -447,22 +455,27 @@ class AgentService:
             await self._scheduler.drain()
             return
         if isinstance(command, TurnInterrupt):
-            text = await self._scheduler.interrupt(command.session_id)
-            if text is None:
-                return
-            # The interrupt rolls the abandoned attempt out of the thread, so
-            # the rows drawn for it now describe messages that are gone. A
-            # delta cannot take a row off the screen; a reset can, and this is
-            # the same case `session.rollback` is — an open of what is left.
+            stopped = await self._scheduler.interrupt(command.session_id)
+            if stopped is None:
+                return  # nothing was running: a gesture that arrived too late
+            # A stopped turn keeps its work, but not all of what was drawn for
+            # it is work: the call it died inside was never written to the
+            # thread, and its row is on screen waiting for a result that is
+            # not coming. A delta cannot take a row off the screen; a reset
+            # can, and this is the same case `session.rollback` is — an open
+            # of what is left, which is now most of it.
             await self._reset_chat(command.session_id)
-            # And the message itself comes back to be edited and re-sent —
-            # after the reset, because the chat it was in has just been
-            # re-stated, and addressed, because it belongs to the session it
-            # was typed in and not to whichever one is on screen when this
-            # lands (`protocol.TurnInterrupted`).
-            self._deps.emit(
-                TurnInterrupted(session_id=command.session_id, text=text)
-            )
+            if stopped.text is not None:
+                # The one stop with nothing to keep — it landed before the
+                # message reached the thread — hands the sentence back rather
+                # than losing it (`TurnScheduler.interrupt`). After the reset,
+                # because the chat it was in has just been re-stated, and
+                # addressed, because it belongs to the session it was typed in
+                # and not to whichever one is on screen when this lands
+                # (`protocol.TurnInterrupted`).
+                self._deps.emit(
+                    TurnInterrupted(session_id=command.session_id, text=stopped.text)
+                )
             return
         if isinstance(command, TurnUnqueue):
             text = self._scheduler.unqueue(command.session_id, command.seq)
@@ -579,6 +592,9 @@ class AgentService:
             return
         if isinstance(command, WatchDrop):
             await self._drop_watch(command.watch_id)
+            return
+        if isinstance(command, WatchMove):
+            await self._move_watch(command.watch_id, command.delta)
             return
         if isinstance(command, ProcessKill):
             await self._kill_process(command.pid)
@@ -832,6 +848,22 @@ class AgentService:
         self._store_title(session, title, by="user")
         self._emit_rows()
 
+    def _move_session(self, session_id: str, delta: int) -> None:
+        """`session.move`: rearrange the sidebar, and re-state it.
+
+        The sidebar goes out again whether or not the row actually moved, for
+        the reason `_move_watch` gives at more length: the list on screen is
+        the answer to the keypress, and a front-end that shuffled its own rows
+        ahead of the reply needs the core's order to land on top of it.
+
+        Silent when the row is gone, unlike every other session command
+        (`_known` warns): those change a conversation, and this changes the
+        order two of them are drawn in. A keypress against a sidebar that has
+        just lost a row is worth redrawing the sidebar, not interrupting for.
+        """
+        self._sessions.move(session_id, delta)
+        self._emit_rows()
+
     def _store_title(self, session, title: str, *, by: str, log=None) -> None:
         """Write a session's name, record who wrote it, and stop the model
         from writing over it.
@@ -919,31 +951,59 @@ class AgentService:
         """A turn that broke instead of finishing, written down anyway.
 
         Wired to `on_turn_error`. There is no result to read, so the tail is
-        read back out of the checkpoint instead — a failure does not roll the
-        thread back (an interrupt does; see `TurnScheduler.interrupt`), so
-        whatever the turn got through is still there, and it is the same fold
-        the reconcile has just put on screen. The error goes under it as its
-        own entry, which is what turns a log that stops mid-conversation into
-        one that says why.
+        read back out of the checkpoint instead — whatever the turn got
+        through is still there, and it is the same fold the reconcile has just
+        put on screen. The error goes under it as its own entry, which is what
+        turns a log that stops mid-conversation into one that says why.
 
         `tui/app.py` logged the error alone, which left the question that
         provoked it out of the file entirely.
         """
-        entries = []
-        if first_new is not None:
-            try:
-                values = await self._thread_values(session.session_id)
-            except Exception:  # a backend that died may have taken more with it
-                logger.exception("could not read a failed turn's messages")
-                values = {}
-            entries = build_entries(
-                list(values.get("messages", [])),
-                list(values.get("thinking", []) or []),
-                list(values.get("calls", []) or []),
-                start=int(first_new),
-            )
+        entries = await self._tail_from_thread(session, first_new)
         entries.append(Entry(kind=ERROR, text=str(error)))
         await self._record_turn_tail(session, entries, getattr(plan, "log", None))
+
+    async def after_stopped_turn(self, session, plan, first_new) -> None:
+        """A turn the user stopped, written down as far as it got.
+
+        Wired to `on_turn_stopped`, and read back out of the checkpoint for
+        the same reason the failure is: there is no result. What makes it
+        worth its own hook is that a stop is not a failure and nothing goes
+        *under* it — the "[stopped]" note is already the last message of the
+        tail, so the fold ends on it and the log says where the work broke off
+        without a line of error text pretending something went wrong.
+
+        This exists at all because the stop stopped throwing the turn away.
+        While it rolled the exchange out of the thread there was nothing to
+        record; now the user can scroll back to a conversation that would
+        otherwise be in no log and findable by no search.
+        """
+        entries = await self._tail_from_thread(session, first_new)
+        if not entries:
+            return
+        await self._record_turn_tail(session, entries, getattr(plan, "log", None))
+
+    async def _tail_from_thread(self, session, first_new) -> list[Entry]:
+        """One turn's entries, read back out of the checkpoint.
+
+        For the two endings that produce no result to fold. ``first_new`` is
+        where this turn's own messages begin; None when the scheduler never
+        managed to measure it, and then there is no tail this can safely name
+        — logging from zero would write the whole conversation out again.
+        """
+        if first_new is None:
+            return []
+        try:
+            values = await self._thread_values(session.session_id)
+        except Exception:  # a backend that died may have taken more with it
+            logger.exception("could not read an unfinished turn's messages")
+            return []
+        return build_entries(
+            list(values.get("messages", [])),
+            list(values.get("thinking", []) or []),
+            list(values.get("calls", []) or []),
+            start=int(first_new),
+        )
 
     @staticmethod
     def _entries_of(result, *, start) -> list[Entry]:
@@ -1847,6 +1907,14 @@ class AgentService:
             self._emit_catalog()
         if settings.rag != before.rag:
             await self._backends.reload_embedder()
+        if settings.display != before.display:
+            # The one section whose whole subject is what a frame looks like,
+            # and so the one an editor must not make the user restart for.
+            # Fanned out rather than sent back to whoever saved: a second
+            # front-end on this core is drawing the same file's settings.
+            self._deps.emit(
+                DisplayChanged(display=_display_settings(settings))
+            )
         if settings.database != before.database:
             self._deps.emit(
                 Notify(
@@ -1877,29 +1945,35 @@ class AgentService:
                 Notify(severity="warning", text="That box is gone.")
             )
             return
+        chars = self._deps.settings.watches.peek_chars
         if watch.kind == KIND_LOG:
-            text = await self._tail(watch.target)
+            text = await self._tail(watch.target, chars)
         else:
             text = " · ".join(part for part in watch_lines(watch) if part)
             row = await self._deps.db(
                 lambda conn: JobStore(conn).get(watch.target)
             )
             if row is not None and row.sbatch_stdout_path:
-                text += "\n" + await self._tail(row.sbatch_stdout_path)
+                text += "\n" + await self._tail(row.sbatch_stdout_path, chars)
         self._deps.emit(
             WatchPeeked(watch_id=watch_id, title=watch.title, text=text)
         )
 
     @staticmethod
-    async def _tail(path: str) -> str:
+    async def _tail(path: str, chars: int) -> str:
         """`watches.peek`, off the dispatch loop.
 
         The read is small by construction but the file is a job log on a
         cluster filesystem, where a stat can cost a network round trip — and
         this loop has one socket and every other session's commands behind it.
         The same reason `deps.db` exists, for a file rather than a database.
+
+        ``chars`` is read from the settings on every peek rather than captured
+        once at startup, because `settings.save` swaps the running section in
+        place: a figure bound at boot would leave the config editor's own
+        display of the key describing a peek that no longer honours it.
         """
-        return await asyncio.to_thread(peek, path)
+        return await asyncio.to_thread(peek, path, chars)
 
     async def _drop_watch(self, watch_id: int) -> None:
         """`watch.drop`: stop watching, and repaint the column.
@@ -1919,6 +1993,25 @@ class AgentService:
             )
             return
         self._deps.emit(Notify(text=f"Stopped watching {watch.title}"))
+        await self._pollers.refresh_panel(force=True)
+
+    async def _move_watch(self, watch_id: int, delta: int) -> None:
+        """`watch.move`: rearrange the column, and say what it now looks like.
+
+        The repaint is forced and unconditional — sent even when nothing
+        moved, and even though `refresh_panel` would otherwise skip a column
+        that has not changed. The column on screen is the answer to a
+        keypress, and the front-end is entitled to have moved the box itself
+        while it waited (`ui.pane.Pane.reorder` does). A frame per press is
+        cheap; a box left one row from where the store thinks it is, until
+        some unrelated poll happens to change the column, is not.
+
+        Nothing is said when the move does not happen. At the top or the
+        bottom there is no neighbour to trade with, which is what holding the
+        key down looks like, and a box dropped between the keypress and the
+        write is the same stale-cursor case `watch.drop` already tolerates.
+        """
+        await self._deps.db(lambda conn: WatchStore(conn).move(watch_id, delta))
         await self._pollers.refresh_panel(force=True)
 
     # ------------------------------------------------------- running work
@@ -2000,17 +2093,25 @@ class AgentService:
 
     # ---------------------------------------------------------- confirmations
 
-    def ask(self, question: str, on_yes) -> None:
-        """Put a yes/no to whoever is listening; run ``on_yes`` if they accept.
+    def ask(self, session_id: str, question: str, on_yes) -> None:
+        """Put a yes/no about one session; run ``on_yes`` if they accept.
 
         Returns immediately — this is called from a poll, and a poll that
         waited for a person would stop being a poll. The continuation is held
         here rather than sent, see :attr:`_confirmations`.
+
+        ``session_id`` says which conversation's work is being asked about,
+        which is the whole difference between a question a user can place and
+        one that arrives out of nowhere: what raises this is a background job
+        finishing, and the user is by then as likely as not reading something
+        else.
         """
         self._confirm_seq += 1
         key = f"q{self._confirm_seq}"
         self._confirmations[key] = on_yes
-        self._deps.emit(ConfirmRequested(id=key, question=question))
+        self._deps.emit(
+            ConfirmRequested(id=key, session_id=session_id, question=question)
+        )
 
     async def _resolve_confirmation(self, key: str, confirmed: bool) -> None:
         on_yes = self._confirmations.pop(key, None)
@@ -2919,6 +3020,12 @@ def build_service(
         if holder is not None:
             await holder.after_failed_turn(session, plan, error, first_new)
 
+    async def after_stopped_turn(session, plan, first_new) -> None:
+        """The same again, for a turn the user stopped part-way through."""
+        holder = service_ref.get("service")
+        if holder is not None:
+            await holder.after_stopped_turn(session, plan, first_new)
+
     scheduler = TurnScheduler(
         deps,
         graph=graph,
@@ -2926,6 +3033,7 @@ def build_service(
         session_for=sessions.get,
         on_turn_result=after_turn,
         on_turn_error=after_failed_turn,
+        on_turn_stopped=after_stopped_turn,
     )
     scheduler_ref["scheduler"] = scheduler
 
@@ -2949,7 +3057,7 @@ def build_service(
     # Triage's "shall I learn this signature?" offer needs somewhere to ask.
     # Wired after construction because the service is what holds the pending
     # question, and the poller is built before it.
-    pollers._confirm = lambda question, on_yes: service.ask(question, on_yes)
+    pollers._confirm = service.ask
     for event in events:
         service._fan_out(event)
     return service
@@ -2972,6 +3080,28 @@ def _settings_problem(error: ValueError) -> str:
         where = ".".join(str(x) for x in first.get("loc", ())) or "settings"
         return f"invalid: {where} — {first.get('msg', 'not accepted')}"
     return f"invalid: {str(error).splitlines()[0]}"
+
+
+def _display_settings(settings) -> DisplaySettings:
+    """The display section, as the wire's twin of it (`protocol.DisplaySettings`).
+
+    Field by field rather than by dumping the section, so that a key added to
+    `config.DisplaySettings` and not to the protocol is a name error here and
+    not a payload that silently forbids an extra key at the far end.
+
+    A settings object that has no display section at all still has to greet a
+    client — the same allowance `_settings_digest` makes, and for the same
+    reason: a core that cannot say hello is a UI that never starts.
+    """
+    section = getattr(settings, "display", None)
+    if section is None:  # pragma: no cover - a settings object that is a fake
+        return DisplaySettings()
+    return DisplaySettings(
+        chat_stamps=section.chat_stamps,
+        quit_rain=section.quit_rain,
+        quit_rain_fps=section.quit_rain_fps,
+        decision_pulse_seconds=section.decision_pulse_seconds,
+    )
 
 
 def _settings_digest(settings) -> str:
@@ -3060,12 +3190,16 @@ def _make_tool_ctx(
         skills=skills,
         # Bound to this session, because the queue `/conclude` drains is
         # per-session: a fact flagged in one conversation must not be offered
-        # for approval at the end of another.
+        # for approval at the end of another. Its profile goes with it for the
+        # same reason: the addresses are resolved when they are queued, and a
+        # background turn running under a different profile than the working
+        # one would otherwise be told about entries from a file it is not
+        # writing to.
         queue_memory_edits=(
             None
             if memory is None
             else lambda operations: memory.queue_edits(
-                session.session_id, operations
+                session.session_id, operations, profile=session.profile
             )
         ),
     )

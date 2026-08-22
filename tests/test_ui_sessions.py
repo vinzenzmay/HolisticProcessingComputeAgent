@@ -866,11 +866,19 @@ class TestTheRewindIsConnected:
         screen = wire.screen()
         assert "the first thing" in screen and "a fork of it" in screen
 
-    async def test_a_copy_still_only_copies(self, wire):
+    async def test_enter_forks_from_the_message_it_was_opened_on(self, wire):
+        # Enter opened the dialog, so Enter answers it with the one choice
+        # that cannot lose anything — the reflex key is not the cut.
+        await self.at_q2(wire)
+        await wire.press("enter")
+        sent = wire.peer.last(protocol.SessionFork)
+        assert (sent.session_id, sent.index) == ("s1", 2)
+
+    async def test_and_c_is_left_to_the_chat_row(self, wire):
         await self.at_q2(wire)
         await wire.press("c")
         assert wire.peer.commands == []
-        assert wire.ui.input.text() == "q2"
+        assert wire.ui.overlay is not None
 
 
 # ---------------------------------------------------------------------- drafts
@@ -973,42 +981,30 @@ class TestDrafts:
         # session with nothing typed in it.
         assert wire.ui.session_for("s2").draft.text() == ""
 
-    async def test_a_reused_message_becomes_that_sessions_draft(self, wire):
-        await self.two_sessions(wire)
-        wire.ui.focus = CHAT
-        on_entry(wire.ui.chat, 2)
-        await wire.press("enter", "c")
-        await self.switch_to(wire, SECOND)
-        await self.switch_to(wire, FIRST)
-        assert wire.ui.input.text() == "q2"
-
     async def rewind_answered_elsewhere(self, w: Wire) -> Wire:
-        """Open the rewind in s1, land on s2, and take the copy.
+        """Open the rewind in s1, land on s2, and take the fork.
 
         The switch is `open_session` rather than a keypress because the dialog
         owns the keyboard while it is up — which is exactly the situation
         `_rewind`'s docstring is about: "the session it was opened in … is not
-        necessarily the one on screen by the time it closes".
+        necessarily the one on screen by the time it closes". The copy that
+        used to make this point left the dialog for the chat row's `c`; the
+        two cuts carry the same promise and are what asserts it now.
         """
         await self.two_sessions(w)
         w.ui.focus = CHAT
         on_entry(w.ui.chat, 2)
         await w.press("enter")  # the rewind, opened in s1
         w.ui.open_session("s2")
-        await w.press("c")  # …and answered while s2 is on screen
+        await w.press("f")  # …and answered while s2 is on screen
         return w
 
-    async def test_and_it_belongs_to_the_session_it_was_taken_from(self, wire):
-        # §4: the copy went into whatever was on screen when the dialog
-        # closed, contradicting `_rewind`'s own docstring — and the test above
-        # could not catch it, because it only ever copies into the open one.
+    async def test_a_cut_belongs_to_the_session_it_was_opened_in(self, wire):
+        # §4: the answer used to land on whatever was on screen when the
+        # dialog closed, contradicting `_rewind`'s own docstring — and a test
+        # that never switches sessions cannot catch it.
         await self.rewind_answered_elsewhere(wire)
-        assert wire.ui.input.text() == "", "s2's box is untouched"
-        assert wire.ui.session_for("s1").draft.text() == "q2"
-
-    async def test_and_says_where_it_went(self, wire):
-        await self.rewind_answered_elsewhere(wire)
-        assert "the first thing" in wire.ui.note
+        assert wire.peer.last(protocol.SessionFork).session_id == "s1"
 
     async def test_a_parked_slash_draft_does_not_bring_its_menu_back(self, wire):
         # Half of "a parked `/…` draft brings its autocomplete menu back with

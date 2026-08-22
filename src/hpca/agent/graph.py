@@ -57,10 +57,22 @@ MAX_TOOL_ROUNDS = 30
 MAX_CONTINUE_NUDGES = 2
 
 
-# Sentinel for rolling an interrupted turn out of the thread: the messages
+# Sentinel for rolling a turn out of the thread (the chat rewind): the messages
 # reducer is append-only, so an update cannot otherwise shrink the history.
 # ``aupdate_state(config, {"messages": {TRUNCATE_TO: n}})`` keeps the first n.
 TRUNCATE_TO = "__truncate_to__"
+
+# What a stopped turn leaves behind in the thread (``stop_thread``). Addressed
+# to the model, which reads it at the top of the next turn: it has to say that
+# a person stopped this on purpose — otherwise the history simply looks
+# unfinished and the model resumes it — without reading as an instruction to
+# try the same thing again more carefully.
+STOPPED_NOTE = (
+    "[stopped] The user stopped this turn before it finished. Whatever was "
+    "running when they stopped it did not complete, and no result for it "
+    "reached this conversation. Do not pick that work back up on your own: "
+    "what they say next is where they want you to go instead."
+)
 
 
 def _append(left: list, right) -> list:
@@ -702,6 +714,54 @@ async def rollback_thread(graph, *, session_id: str, keep: int) -> list[Message]
     await graph.aupdate_state(config, update)
     snapshot = await graph.aget_state(config)
     return list((snapshot.values or {}).get("messages", []))
+
+
+async def stop_thread(graph, *, session_id: str) -> None:
+    """Close off a turn the user stopped, leaving the thread fit to run again.
+
+    The other half of ``rollback_thread``, for the stop that keeps its work
+    (`TurnScheduler.interrupt`): the messages stay where they are and what
+    gets written is the fact that they stop there.
+
+    **The note.** The exchange now ends in mid-air — a question with no
+    answer, or a round of tool results with nothing said about them — and a
+    model reading that back draws the obvious conclusion: something cut it
+    off, so pick it up. Saying plainly what happened costs one message and
+    settles it; a prompt rule about "history that looks unfinished" would have
+    to be true of every turn to catch the one it is about. It rides the user
+    role because that is how every machine-generated message reaches this
+    model, tool results included (see ``deliver_event``).
+
+    **The cleared ``pending_tool``.** A turn cancelled inside a tool leaves
+    the checkpoint parked one step short of ``execute_tool``, still holding
+    the call that never ran. Nothing replays it today — the next turn arrives
+    as fresh input at START — but a thread left poised to run the very call
+    the user stopped is not a thing to leave lying about. Clearing it is also
+    what drops the pending task, in the case that matters: the write is
+    attributed to whichever node wrote last, and for a stop inside a tool that
+    is the orchestrator, whose branch is re-read against an empty
+    ``pending_tool`` and routes to END. (A stop during the model call leaves
+    the thread pointed at the orchestrator instead, which the next turn's
+    input re-triggers anyway.) Naming START explicitly — the convention for an
+    out-of-band write, see ``compact_now`` — would point *every* stopped
+    thread back at the model, which is strictly worse.
+
+    What is deliberately NOT here is a synthetic tool result closing a
+    dangling call, and the reason is worth writing down because it is the
+    first thing this function looks like it should do. ``execute_tool``
+    appends the call and its result in ONE state update, so a cancel lands
+    either before both or after both: at every point a stop can happen the
+    history is already balanced, and a manufactured result would be answering
+    a call that is not in the thread.
+    """
+    config = {"configurable": {"thread_id": session_id}}
+    await graph.aupdate_state(
+        config,
+        {
+            "messages": [{"role": "user", "content": STOPPED_NOTE}],
+            "pending_tool": None,
+        },
+    )
 
 
 async def fork_thread(

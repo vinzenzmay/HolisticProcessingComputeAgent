@@ -53,6 +53,7 @@ from hpca.protocol import (
     SessionFocus,
     SessionFork,
     SessionList,
+    SessionMove,
     SessionNew,
     SessionOpen,
     SessionRename,
@@ -71,6 +72,7 @@ from hpca.protocol import (
     TurnSubmit,
     TurnUnqueue,
     WatchDrop,
+    WatchMove,
     WatchPeek,
 )
 from hpca.sessions import SessionStore
@@ -82,7 +84,9 @@ from hpca.skills import (
     write_skill,
 )
 from hpca.transcript import RESULT_RULE
+from hpca.ui.state import SPINNER_FRAMES
 from hpca.watches import KIND_JOB, KIND_LOG, WatchStore
+from tests.ui_harness import connected
 
 
 def respond(text="done"):
@@ -239,6 +243,23 @@ def kinds(events):
     return [type(e).__name__ for e in events]
 
 
+async def relay(queue, wire):
+    """Everything the core has said so far, played into a real front-end.
+
+    The one test vehicle in this file that is not an assertion about events:
+    the core's frames go over a real connection to a real `UIClient`, in the
+    order the core emitted them, so what is asserted afterwards is the screen
+    a user would be looking at.
+    """
+    while not queue.empty():
+        await wire.tell(queue.get_nowait())
+
+
+def spinner_lines(wire) -> list[str]:
+    """The working rows on screen — one while a turn runs, none after."""
+    return [line for line in wire.frame() if any(f in line for f in SPINNER_FRAMES)]
+
+
 class TestAssembly:
     def test_it_builds_without_a_terminal(self, service):
         assert service is not None
@@ -280,6 +301,30 @@ class TestHandshake:
         # A digest rather than the settings themselves: a front-end must be
         # able to notice they changed without being handed the api keys.
         assert first.settings_digest
+
+    async def test_hello_carries_the_settings_the_ui_draws_with(self, service):
+        # The carve-out the digest implies: a front-end may not read the file,
+        # and a digest cannot answer "draw this how". On `hello` because that
+        # is the frame that lands before anything has been drawn — a setting
+        # arriving later would be a redraw the user sees.
+        service._deps.settings.display.chat_stamps = False
+        service._deps.settings.display.decision_pulse_seconds = 4.0
+        first = service.subscribe().get_nowait()
+        assert first.display.chat_stamps is False
+        assert first.display.decision_pulse_seconds == 4.0
+
+    async def test_and_carries_nothing_else_of_the_settings(self, service):
+        # Not the tree: it holds api keys and endpoint addresses, and a
+        # process that only needs to know whether to print a timestamp has no
+        # business being handed them. Adding a display key is a deliberate
+        # edit here, exactly as dropping one would be.
+        first = service.subscribe().get_nowait()
+        assert set(type(first.display).model_fields) == {
+            "chat_stamps",
+            "decision_pulse_seconds",
+            "quit_rain",
+            "quit_rain_fps",
+        }
 
     async def test_the_digest_follows_the_settings(self, home, conn, llm):
         async def db(fn):
@@ -436,31 +481,68 @@ class TestTurns:
     async def test_interrupting_nothing_is_harmless(self, service, session):
         await service.handle(TurnInterrupt(session_id=session.session_id))
 
-    async def test_interrupting_takes_the_abandoned_rows_off_the_screen(
+    async def test_stopping_a_turn_re_states_the_chat_it_leaves_behind(
         self, service, session, llm
     ):
-        # The interrupt rolls the abandoned attempt out of the thread, so the
-        # rows drawn for it describe messages that no longer exist. A delta
-        # cannot un-draw a row; the reset that follows is the same case a
-        # rollback is — an open of what is left.
+        # A stopped turn keeps its work, but the row for the call it died
+        # inside is on screen waiting for a result that is never coming, and a
+        # delta cannot un-draw a row. The reset that follows is the same case
+        # a rollback is — an open of what the session holds now, which after
+        # this change is the message and everything under it.
         release = await park_turn(service, llm, session.session_id)
         queue = subscribe(service)
         await service.handle(TurnInterrupt(session_id=session.session_id))
-        assert only(await drain(queue), "ChatReset").entries == []
+        entries = only(await drain(queue), "ChatReset").entries
+        assert [e.kind for e in entries] == ["user", "event"]
+        assert entries[0].text == "running"
+        # And the marker saying where it stopped, so the reader scrolling back
+        # can tell a turn that was stopped from one that answered nothing —
+        # in the short form, not the paragraph the model is handed.
+        assert entries[1].text == "stopped by the user"
         release.set()
         await service.stop()
 
-    async def test_the_message_comes_back_to_be_edited(
+    async def test_and_the_message_is_not_handed_back(
         self, service, session, llm
     ):
-        # The whole point of the abort: the user meant something slightly
-        # different, and gets their sentence back rather than retyping it.
+        # It used to be: the turn was rolled out of the thread and the
+        # sentence came back to be edited. Now the sentence is in the
+        # conversation — see the reset above — and handing it to the entry box
+        # as well would have the user send it twice.
         release = await park_turn(service, llm, session.session_id)
         queue = subscribe(service)
         await service.handle(TurnInterrupt(session_id=session.session_id))
+        assert "TurnInterrupted" not in kinds(await drain(queue))
+        release.set()
+        await service.stop()
+
+    async def test_unless_the_stop_beat_the_message_into_the_thread(
+        self, service, session, monkeypatch
+    ):
+        # The window a turn is announced in before the graph has written
+        # anything. There is no exchange to keep, so the sentence goes back to
+        # the box it was typed in rather than being lost — the one case left
+        # for `turn.interrupted`.
+        import asyncio
+
+        from hpca.core import scheduler as scheduler_module
+
+        async def never_gets_there(graph, **kwargs):
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(scheduler_module, "run_turn", never_gets_there)
+        queue = subscribe(service)
+        await service.handle(
+            TurnSubmit(session_id=session.session_id, text="a lost sentence")
+        )
+        # As far as a turn gets here: it knows where the thread stood, and
+        # nothing has been added to it.
+        while not service._scheduler.can_interrupt(session.session_id):
+            await asyncio.sleep(0)
+        await service.handle(TurnInterrupt(session_id=session.session_id))
         events = await drain(queue)
         handed_back = only(events, "TurnInterrupted")
-        assert handed_back.text == "running"
+        assert handed_back.text == "a lost sentence"
         # Addressed: the user may be looking at another session by now, and
         # the message waits in the one it was typed in, as a draft.
         assert handed_back.session_id == session.session_id
@@ -468,7 +550,6 @@ class TestTurns:
         assert kinds(events).index("ChatReset") < kinds(events).index(
             "TurnInterrupted"
         )
-        release.set()
         await service.stop()
 
     async def test_nothing_is_handed_back_when_nothing_was_stopped(
@@ -551,8 +632,11 @@ class TestStoppingATurnInEveryPhase:
 
         await service.handle(TurnInterrupt(session_id=session.session_id))
         events = await drain(queue)
-        assert only(events, "TurnInterrupted").text == "run the thing"
-        assert only(events, "ChatReset").entries == []
+        assert "TurnFinished" in kinds(events)
+        assert not service._scheduler.is_busy(session.session_id)
+        # And the message it was working on stays where it was said.
+        entries = only(events, "ChatReset").entries
+        assert [e.text for e in entries if e.kind == "user"] == ["run the thing"]
         release.set()
         await service.stop()
 
@@ -585,13 +669,202 @@ class TestStoppingATurnInEveryPhase:
         await asyncio.wait_for(entered.wait(), timeout=5)
 
         await service.handle(TurnInterrupt(session_id=session.session_id))
-        assert only(await drain(queue), "TurnInterrupted").text == (
-            "do the impossible"
-        )
+        assert "TurnFinished" in kinds(await drain(queue))
         assert rounds["n"] == 2  # the loop stopped where it stood
         assert not release.is_set()
         assert not service._scheduler.is_busy(session.session_id)
         await service.stop()
+
+
+class TestAStoppedTurnKeepsItsWork:
+    """The stop that stops the agent instead of throwing the turn away.
+
+    Driven through a real graph and a real checkpointer, because the whole
+    question is what the *thread* looks like afterwards. A turn stopped
+    mid-tool is stopped between a decision and the result that answers it,
+    and the next turn runs on whatever that left: keeping the work is only
+    worth anything if the conversation it leaves behind is one a model can
+    still be handed.
+    """
+
+    def tools(self):
+        """One tool that answers at once, and one that never comes back."""
+        import asyncio
+
+        from pydantic import BaseModel
+
+        from hpca.agent.tools import Tool, ToolRegistry
+
+        class Params(BaseModel):
+            text: str = ""
+
+        ran = {"counted": 0, "slow": 0}
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def counter(args, ctx):
+            ran["counted"] += 1
+            return "42 files"
+
+        async def slow(args, ctx):
+            ran["slow"] += 1
+            entered.set()
+            await release.wait()
+            return "finished at last"
+
+        registry = ToolRegistry()
+        registry.register(
+            Tool(name="count_files", description="Counts", params=Params,
+                 handler=counter)
+        )
+        registry.register(
+            Tool(name="slow_tool", description="Takes its time", params=Params,
+                 handler=slow)
+        )
+        return registry, ran, entered, release
+
+    async def stopped_mid_tool(self, home, conn, session):
+        """A turn that ran one tool, then was stopped inside the next."""
+        import asyncio
+
+        registry, ran, entered, release = self.tools()
+        llm = FakeLLM([
+            calling("count_files"),
+            calling("slow_tool"),
+            respond("never said"),
+        ])
+
+        async def db(fn):
+            return fn(conn)
+
+        service = build_service(
+            settings=Settings.load(),
+            app_dir=home,
+            db=db,
+            conn=conn,
+            checkpointer=InMemorySaver(),
+            llm=llm,
+            tools=registry,
+        )
+        queue = subscribe(service)
+        await service.handle(
+            TurnSubmit(session_id=session.session_id, text="count the files")
+        )
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        await service.handle(TurnInterrupt(session_id=session.session_id))
+        release.set()
+        return service, queue, llm, ran
+
+    async def messages_of(self, service, session):
+        state = await service._graph.aget_state(
+            {"configurable": {"thread_id": session.session_id}}
+        )
+        return list((state.values or {}).get("messages", []))
+
+    async def test_the_steps_it_got_through_are_still_there(
+        self, home, conn, session
+    ):
+        # What the user asked for: the tool round that finished cost real
+        # cluster time and is very often the half they wanted to read.
+        service, queue, _, _ = await self.stopped_mid_tool(home, conn, session)
+        entries = only(await drain(queue), "ChatReset").entries
+        assert [e.kind for e in entries] == ["user", "thinking", "event"]
+        assert [(p.tool, p.done) for p in entries[1].parts] == [
+            ("count_files", True)
+        ]
+        # The call it was stopped inside is not among them: it never reached
+        # the thread, so nothing about it survives to draw.
+        assert "slow_tool" not in entries[1].text
+        await service.stop()
+
+    async def test_and_the_thread_it_leaves_is_one_a_model_can_read(
+        self, home, conn, session
+    ):
+        # The hazard of keeping the work: a history whose last word is a call
+        # nobody answered is malformed for most backends, and the model that
+        # is handed one either errors or issues the call again. It cannot
+        # happen here — the call and its result are appended in one state
+        # update — and this is what says so out loud.
+        from hpca.agent.history import is_tool_call_message
+
+        service, _, _, _ = await self.stopped_mid_tool(home, conn, session)
+        messages = await self.messages_of(service, session)
+        for position, message in enumerate(messages):
+            if is_tool_call_message(message):
+                assert position + 1 < len(messages), "a call with no result"
+                assert messages[position + 1]["content"].startswith("[tool")
+        # And it ends on the note, so the model is told what happened rather
+        # than left to infer it from a conversation that stops in mid-air.
+        assert messages[-1]["content"].startswith("[stopped]")
+        await service.stop()
+
+    async def test_and_the_next_turn_runs_without_repeating_the_stopped_call(
+        self, home, conn, session
+    ):
+        # The proof the change is safe: without it this could corrupt every
+        # following turn on the session. The tool the user stopped is the one
+        # thing that must not quietly happen anyway.
+        service, queue, llm, ran = await self.stopped_mid_tool(home, conn, session)
+        await drain(queue)  # the stop's own frames, `turn.finished` included
+        llm._outputs = [respond("understood, stopping there")]
+        await service.handle(
+            TurnSubmit(session_id=session.session_id, text="never mind, thanks")
+        )
+        events = await wait_for(queue, "TurnFinished")
+        assert only(events, "TurnFinished").reply == "understood, stopping there"
+        assert ran == {"counted": 1, "slow": 1}
+        # And the turn was answered against the whole conversation, note and
+        # all — the history is the one the stop left, not a rolled-back one.
+        assert [m["role"] for m in llm.prompts[-1]] == [
+            "system", "user", "assistant", "user", "user", "user"
+        ]
+        await service.stop()
+
+
+class TestAStoppedTurnLeavesTheScreen:
+    """The core's own frames, played into the real UI on the other end.
+
+    Everywhere else in this file the assertion is about the events; here it
+    has to be about the screen, because the bug this holds down was invisible
+    in them. Every frame the interrupt sent was correct and none of them said
+    the turn was *over*, so the working row went on spinning "LLM processing…
+    (enter or esc esc to interrupt)" for a turn that no longer existed — and
+    offering to stop it again. Nothing but a real client applying the real
+    stream in order can catch that.
+    """
+
+    async def stopped(self, service, session, llm, wire):
+        """A turn parked inside the model, then stopped. Returns the gate."""
+        queue = service.subscribe()
+        await service.handle(SessionList())
+        await service.handle(SessionOpen(session_id=session.session_id))
+        release = await park_turn(service, llm, session.session_id)
+        await relay(queue, wire)
+        assert spinner_lines(wire), "the turn should be on screen to begin with"
+        await service.handle(TurnInterrupt(session_id=session.session_id))
+        await relay(queue, wire)
+        return release
+
+    async def test_the_working_row_goes_when_the_turn_is_stopped(
+        self, service, session, llm
+    ):
+        async with connected() as wire:
+            release = await self.stopped(service, session, llm, wire)
+            assert not spinner_lines(wire)
+            release.set()
+            await service.stop()
+
+    async def test_and_the_session_is_no_longer_busy(
+        self, service, session, llm
+    ):
+        # `Turn.busy` is what draws the row and `Turn.interruptible` is what
+        # offers to stop it; both stayed true forever, so the sidebar kept the
+        # session's "⟳" and the gesture claimed a stop it could not make.
+        async with connected() as wire:
+            release = await self.stopped(service, session, llm, wire)
+            turn = wire.ui.session_for(session.session_id).turn
+            assert (turn.busy, turn.interruptible) == (False, False)
+            release.set()
+            await service.stop()
 
 
 class TestTypeAhead:
@@ -888,6 +1161,66 @@ class TestSessionList:
         queue = subscribe(service)
         await service.handle(SessionList())
         assert only(await drain(queue), "SessionRows").rows[0].flags == ["decision"]
+
+
+class TestReorderingTheSidebar:
+    """`session.move` — alt+↑/alt+↓ on a sidebar row.
+
+    The order is a fact about the database, which a front-end may not read
+    (§4.2 rule 2), so the arrangement is made here and comes back as the
+    sidebar. That is what makes it survive a restart, and what stops the next
+    frame putting a locally-shuffled row back where it was.
+    """
+
+    def two(self, conn):
+        """`session` fixture aside, a second row to trade places with. Newer,
+        so it starts above it."""
+        return SessionStore(conn).create(profile="default", title="the other one")
+
+    async def test_a_move_rearranges_the_store_and_re_states_the_sidebar(
+        self, service, session, conn
+    ):
+        self.two(conn)
+        queue = subscribe(service)
+        await service.handle(SessionMove(session_id=session.session_id, delta=-1))
+        rows = only(await drain(queue), "SessionRows").rows
+        assert [r.title for r in rows] == ["a session", "the other one"]
+        # And the store agrees, which is the half that outlives the process.
+        assert [s.title for s in SessionStore(conn).list_all()] == [
+            "a session",
+            "the other one",
+        ]
+
+    async def test_and_down_again_puts_it_back(self, service, session, conn):
+        self.two(conn)
+        await service.handle(SessionMove(session_id=session.session_id, delta=-1))
+        queue = subscribe(service)
+        await service.handle(SessionMove(session_id=session.session_id, delta=+1))
+        rows = only(await drain(queue), "SessionRows").rows
+        assert [r.title for r in rows] == ["the other one", "a session"]
+
+    async def test_a_row_at_the_end_still_gets_the_sidebar_back(
+        self, service, session, conn
+    ):
+        # Nothing moved, and the list is sent anyway: the front-end is
+        # entitled to have moved the row itself while it waited, and this
+        # frame is what puts it back.
+        other = self.two(conn)
+        queue = subscribe(service)
+        await service.handle(SessionMove(session_id=other.session_id, delta=-1))
+        rows = only(await drain(queue), "SessionRows").rows
+        assert [r.title for r in rows] == ["the other one", "a session"]
+
+    async def test_moving_a_row_that_is_gone_says_nothing(self, service, session):
+        # Unlike every other session command, which warns through `_known`:
+        # this one changes the order two rows are drawn in, and a keypress
+        # against a sidebar that has just lost a row is worth a repaint rather
+        # than an interruption.
+        queue = subscribe(service)
+        await service.handle(SessionMove(session_id="no-such-session", delta=-1))
+        events = await drain(queue)
+        assert "Notify" not in kinds(events)
+        assert [r.title for r in only(events, "SessionRows").rows] == ["a session"]
 
 
 class TestSessionNew:
@@ -1477,10 +1810,13 @@ class TestAParkedApproval:
 
         await service.handle(TurnInterrupt(session_id=session.session_id))
         events = await drain(queue)
-        # The message that started the exchange, and the whole exchange gone
-        # from the thread — the refused call included.
-        assert only(events, "TurnInterrupted").text == "clear the scratch dir"
-        assert only(events, "ChatReset").entries == []
+        assert "TurnFinished" in kinds(events)
+        # And the whole exchange stays, the refused call included: the half
+        # the user answered for is the last thing to throw away.
+        entries = only(events, "ChatReset").entries
+        assert [e.kind for e in entries] == ["user", "thinking", "event"]
+        assert entries[0].text == "clear the scratch dir"
+        assert [(p.tool, p.done) for p in entries[1].parts] == [("run_bash", True)]
         release.set()
         await service.stop()
 
@@ -2217,19 +2553,29 @@ class TestTheEpisodicIndex:
             "seven reads",
         ]
 
-    async def test_an_interrupted_turn_leaves_nothing_behind(
+    async def test_a_stopped_turn_is_indexed_as_far_as_it_got(
         self, service, session, conn, llm
     ):
+        # It used to leave nothing behind, because stopping a turn rolled its
+        # messages out of the thread and indexing them would have described a
+        # conversation that no longer existed. The work stays now, so the
+        # opposite is what would be wrong: a conversation the user can scroll
+        # back to and `session_search` cannot find.
         release = await park_turn(service, llm, session.session_id)
         await service.handle(TurnInterrupt(session_id=session.session_id))
         release.set()
         await _settle()
-        # The interrupt rolled its messages out of the thread; indexing them
-        # would leave search describing a conversation that never happened.
-        assert conn.execute(
-            "SELECT COUNT(*) AS n FROM messages WHERE session_id = ?",
+        rows = conn.execute(
+            "SELECT role, content FROM messages WHERE session_id = ? "
+            "ORDER BY turn_no",
             (session.session_id,),
-        ).fetchone()["n"] == 0
+        ).fetchall()
+        # The question, and only the question: it was never answered, and the
+        # "[stopped]" marker is an event rather than something either side
+        # said (`_record_turn`).
+        assert [(row["role"], row["content"]) for row in rows] == [
+            ("user", "running")
+        ]
         await service.stop()
 
     async def test_a_deleted_session_is_never_indexed_behind_its_deletion(
@@ -2586,16 +2932,19 @@ class TestConfirmations:
         async def on_yes():
             ran.append(True)
 
-        service.ask("Learn this signature?", on_yes)
+        service.ask("s1", "Learn this signature?", on_yes)
         events = await drain(queue)
         assert kinds(events) == ["ConfirmRequested"]
+        # Which conversation is being asked about, so a client can put the
+        # question in it rather than over whatever the user is reading.
+        assert events[0].session_id == "s1"
         await service.handle(ConfirmResolve(id=events[0].id, confirmed=True))
         assert ran == [True]
 
     async def test_a_no_runs_nothing(self, service):
         queue = subscribe(service)
         ran = []
-        service.ask("Learn this?", lambda: _record(ran))
+        service.ask("s1", "Learn this?", lambda: _record(ran))
         events = await drain(queue)
         await service.handle(ConfirmResolve(id=events[0].id, confirmed=False))
         assert ran == []
@@ -2606,7 +2955,7 @@ class TestConfirmations:
     async def test_the_same_answer_twice_runs_once(self, service):
         queue = subscribe(service)
         ran = []
-        service.ask("Learn this?", lambda: _record(ran))
+        service.ask("s1", "Learn this?", lambda: _record(ran))
         key = (await drain(queue))[0].id
         await service.handle(ConfirmResolve(id=key, confirmed=True))
         await service.handle(ConfirmResolve(id=key, confirmed=True))
@@ -2618,7 +2967,7 @@ class TestConfirmations:
         async def boom():
             raise RuntimeError("the signature file is read-only")
 
-        service.ask("Learn this?", boom)
+        service.ask("s1", "Learn this?", boom)
         key = (await drain(queue))[0].id
         await service.handle(ConfirmResolve(id=key, confirmed=True))
         assert any(
@@ -3506,6 +3855,34 @@ class TestSettingsFile:
         await service.handle(SettingsSave(text='{"editor": "hx"}'))
         assert rebuilt == []
 
+    async def test_a_display_change_takes_effect_without_a_restart(
+        self, service
+    ):
+        # The config editor is *in* the app, and a key whose whole subject is
+        # what the screen looks like must apply on the frame after the save.
+        queue = subscribe(service)
+        await drain(queue)
+        await service.handle(
+            SettingsSave(
+                text=json.dumps(
+                    {"display": {"chat_stamps": False, "decision_pulse_seconds": 4}}
+                )
+            )
+        )
+        changed = only(await drain(queue), "DisplayChanged")
+        assert changed.display.chat_stamps is False
+        assert changed.display.decision_pulse_seconds == 4
+
+    async def test_a_save_that_leaves_the_display_alone_restates_nothing(
+        self, service
+    ):
+        # Restating it repaints every conversation's chat rows, which is not
+        # the price of an edited log level.
+        queue = subscribe(service)
+        await drain(queue)
+        await service.handle(SettingsSave(text='{"editor": "hx"}'))
+        assert "DisplayChanged" not in kinds(await drain(queue))
+
     async def test_database_settings_are_said_to_wait_for_a_restart(
         self, service
     ):
@@ -3768,6 +4145,64 @@ class TestWatchBoxes:
         text = only(await drain(queue), "WatchPeeked").text
         assert "RUNNING" in text and "step 1 done" in text
 
+    async def test_the_peek_ships_as_much_tail_as_the_settings_say(
+        self, service, session, conn, home
+    ):
+        # The size is `watches.peek_chars` and the core is what applies it:
+        # the file is on a node the front-end may not share, so trimming it
+        # afterwards is not something the UI could do (§4.2 rule 2).
+        log = home / "train.log"
+        log.write_text("\n".join(f"epoch {i}" for i in range(500)))
+        watch = WatchStore(conn).add(
+            kind=KIND_LOG, target=str(log), session_id=session.session_id,
+        )
+        service._deps.settings.watches.peek_chars = 40
+        queue = subscribe(service)
+        await service.handle(WatchPeek(watch_id=watch.id))
+        text = only(await drain(queue), "WatchPeeked").text
+        assert len(text) <= 41  # the tail, plus the "…" that says it is one
+        assert text.endswith("epoch 499")
+
+    async def test_and_a_bigger_setting_ships_more_of_it(
+        self, service, session, conn, home
+    ):
+        # The whole point of raising the default: a traceback whose last line
+        # names the exception must not be cut off above it.
+        log = home / "train.log"
+        log.write_text("boom\n" * 200 + "ValueError: the cohort is empty")
+        watch = WatchStore(conn).add(
+            kind=KIND_LOG, target=str(log), session_id=session.session_id,
+        )
+        service._deps.settings.watches.peek_chars = 300
+        queue = subscribe(service)
+        await service.handle(WatchPeek(watch_id=watch.id))
+        short = only(await drain(queue), "WatchPeeked").text
+        service._deps.settings.watches.peek_chars = 2000
+        queue = subscribe(service)
+        await service.handle(WatchPeek(watch_id=watch.id))
+        long = only(await drain(queue), "WatchPeeked").text
+        assert len(long) > len(short)
+        # Both keep the end; what the bigger figure buys is what led up to it.
+        assert short.endswith("the cohort is empty")
+        assert long.endswith("the cohort is empty")
+
+    async def test_a_configured_peek_survives_a_settings_save(
+        self, service, session, conn, home
+    ):
+        # Read per peek rather than captured at startup, because `settings.save`
+        # swaps the running section in place.
+        log = home / "train.log"
+        log.write_text("\n".join(f"epoch {i}" for i in range(500)))
+        watch = WatchStore(conn).add(
+            kind=KIND_LOG, target=str(log), session_id=session.session_id,
+        )
+        await service.handle(
+            SettingsSave(text=json.dumps({"watches": {"peek_chars": 30}}))
+        )
+        queue = subscribe(service)
+        await service.handle(WatchPeek(watch_id=watch.id))
+        assert len(only(await drain(queue), "WatchPeeked").text) <= 31
+
     async def test_peeking_a_box_that_is_gone_says_so(self, service):
         queue = subscribe(service)
         await service.handle(WatchPeek(watch_id=404))
@@ -3791,6 +4226,86 @@ class TestWatchBoxes:
         queue = subscribe(service)
         await service.handle(WatchDrop(watch_id=404))
         assert only(await drain(queue), "Notify").severity == "warning"
+
+    def column(self, service, session, conn, home, *names):
+        """A column of watch boxes, top to bottom, on the focused session."""
+        service._deps.focused_session_id = session.session_id
+        store = WatchStore(conn)
+        return [
+            store.add(
+                kind=KIND_LOG,
+                target=str(home / f"{name}.log"),
+                label=name,
+                session_id=session.session_id,
+            )
+            for name in names
+        ]
+
+    async def test_moving_a_box_rearranges_the_column_and_repaints_it(
+        self, service, session, conn, home
+    ):
+        _, b, _ = self.column(service, session, conn, home, "a", "b", "c")
+        queue = subscribe(service)
+        await service.handle(WatchMove(watch_id=b.id, delta=-1))
+        rows = only(await drain(queue), "PanelUpdate").rows
+        assert [r.title for r in rows] == ["b", "a", "c"]
+        # The store is where it has to have landed: the panel is repainted
+        # from that every two seconds, and read back from it after a restart.
+        assert [
+            w.label for w in WatchStore(conn).list(session_id=session.session_id)
+        ] == ["b", "a", "c"]
+
+    async def test_a_box_at_the_end_still_gets_the_column_back(
+        self, service, session, conn, home
+    ):
+        # Nothing moved, and the frame is sent anyway — the front-end may have
+        # moved the box itself while it waited (`ui.pane.Pane.reorder` does),
+        # and this is what puts it back.
+        a, _ = self.column(service, session, conn, home, "a", "b")
+        queue = subscribe(service)
+        await service.handle(WatchMove(watch_id=a.id, delta=-1))
+        rows = only(await drain(queue), "PanelUpdate").rows
+        assert [r.title for r in rows] == ["a", "b"]
+
+    async def test_moving_a_box_that_is_gone_says_nothing(
+        self, service, session, conn, home
+    ):
+        # The column repaints on a timer, so the box under the cursor can be
+        # dropped between the keypress and the write. Not worth a warning: the
+        # repaint that comes back already tells the user what is there.
+        self.column(service, session, conn, home, "a")
+        queue = subscribe(service)
+        await service.handle(WatchMove(watch_id=404, delta=-1))
+        events = await drain(queue)
+        assert "Notify" not in kinds(events)
+        assert [r.title for r in only(events, "PanelUpdate").rows] == ["a"]
+
+    async def test_one_sessions_column_cannot_disturb_anothers(
+        self, service, session, conn, home
+    ):
+        # Each session has its own column and only one is ever on screen; a
+        # store-wide swap could put a box next to one from a conversation the
+        # user is not even looking at.
+        other = SessionStore(conn).create(profile="default", title="elsewhere")
+        self.column(service, session, conn, home, "a", "b")
+        store = WatchStore(conn)
+        for name in ("x", "y"):
+            store.add(
+                kind=KIND_LOG,
+                target=str(home / f"{name}.log"),
+                label=name,
+                session_id=other.session_id,
+            )
+        mine = store.list(session_id=session.session_id)[1]
+        await service.handle(WatchMove(watch_id=mine.id, delta=-1))
+        assert [w.label for w in store.list(session_id=session.session_id)] == [
+            "b",
+            "a",
+        ]
+        assert [w.label for w in store.list(session_id=other.session_id)] == [
+            "x",
+            "y",
+        ]
 
 
 class TestRunningWork:
@@ -4057,7 +4572,7 @@ class TestMemoryReview:
             for part in entry.parts
             if part.tool == "memory" and part.done
         ]
-        assert results and all("Noted 1 memory change" in r for r in results)
+        assert results and all("Queued 1 memory change" in r for r in results)
 
         # And the fact is there to be offered when the user asks for it.
         llm._outputs = [json.dumps({"proposals": []})]

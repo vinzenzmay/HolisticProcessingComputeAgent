@@ -304,6 +304,21 @@ class TestIndex:
         entries = build_entries([USER_MSG, ANSWER, event], [])
         assert (entries[2].kind, entries[2].index) == ("event", 2)
 
+    def test_the_note_a_stopped_turn_leaves_is_an_event_and_not_a_message(self):
+        # It rides the user role, like every machine-written message this
+        # model is handed, and reading it as something the user *said* would
+        # put the machinery's own words in their mouth — and index them as
+        # theirs. What the reader scrolling back needs is the fact that the
+        # work stops here, which is what an `event` row says.
+        from hpca.agent.graph import STOPPED_NOTE
+
+        stopped = {"role": "user", "content": STOPPED_NOTE}
+        entries = build_entries([USER_MSG, stopped], [])
+        assert [e.kind for e in entries] == ["user", "event"]
+        # And it is shown as the news it is, not as the four lines of prompt
+        # the model needs: the user is the one who stopped it.
+        assert entries[1].text == "stopped by the user"
+
     def test_synthetic_entries_carry_no_index(self):
         # The thinking box folds several messages; recall rides its user
         # message. Neither is one message, so neither names a cut point.

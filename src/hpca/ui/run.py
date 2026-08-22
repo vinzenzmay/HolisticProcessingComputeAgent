@@ -407,7 +407,7 @@ class Loop:
 
 
 def copier(screen: Screen, settings=None):
-    """`y` on a chat row, as one callable: text in, a sentence out.
+    """`c` on a chat row, as one callable: text in, a sentence out.
 
     `hpca.clipboard.ClipboardManager` is framework-free already — it takes an
     injected ``emit`` and has never known what a driver was — so all this does
@@ -452,7 +452,7 @@ async def drive(
     with (screen if screen is not None else Screen()) as scr:
         if getattr(ui, "clipboard", None) is None:
             # Inside the `with`, because the manager writes OSC 52 to a
-            # terminal that has to exist. A failure to build one leaves `y`
+            # terminal that has to exist. A failure to build one leaves `c`
             # saying so rather than the app failing to start over a clipboard.
             with contextlib.suppress(Exception):
                 ui.clipboard = copier(scr, clipboard)

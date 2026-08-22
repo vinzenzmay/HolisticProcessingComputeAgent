@@ -40,6 +40,18 @@ def frame(ui: RowUI, width: int, height: int) -> list[str]:
     return [plain(x) for x in ui.render(width, height)]
 
 
+def footer(ui: RowUI, width: int = 160, height: int = 40) -> str:
+    """Every row of the footer as one searchable line.
+
+    The footer is one row until the hints stop fitting on one and then as many
+    as it needs (`ansi.footer_lines`), so "is this hint offered here" is a
+    question about the whole band rather than about the last row of the frame.
+    A pair is never split across rows, so joining them cannot invent one.
+    """
+    rows = len(ui._footer(width, height))
+    return "  ".join(plain(x).strip() for x in ui.render(width, height)[-rows:])
+
+
 def widths(lines: list[str]) -> set[int]:
     """The distinct visible widths in a frame — `{width}` if it is well formed.
 

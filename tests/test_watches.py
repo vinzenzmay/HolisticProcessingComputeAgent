@@ -148,6 +148,37 @@ class TestReordering:
         store.update(a.id, state=LOG_PRESENT)  # a poll must not undo it
         assert self.order(store) == ["/c.log", "/a.log", "/b.log"]
 
+    def test_the_arrangement_survives_a_restart(self, store, tmp_path):
+        """What the column is *for*: an order put right yesterday has to still
+        be right tomorrow, which is the whole reason it is a database column
+        and not something the panel remembers."""
+        _, _, c = self.three(store)
+        store.move(c.id, -1)
+        store._conn.close()
+
+        reopened = connect(tmp_path / "hpca.db")
+        init_db(reopened)  # every start runs the migrations; none may undo it
+        assert self.order(WatchStore(reopened)) == ["/a.log", "/c.log", "/b.log"]
+        reopened.close()
+
+    def test_a_column_of_one_has_nowhere_to_go(self, store):
+        alone = store.add(
+            kind=KIND_LOG, target="/only.log", profile="p", session_id="s1"
+        )
+        assert store.move(alone.id, -1) is False
+        assert store.move(alone.id, +1) is False
+        assert self.order(store) == ["/only.log"]
+
+    def test_a_dropped_box_leaves_the_rest_in_order(self, store):
+        """Removal punches a hole in the numbers and nothing else: what is
+        left keeps the arrangement, and the next move closes the gaps."""
+        a, b, c = self.three(store)
+        store.move(c.id, -1)  # a, c, b
+        store.remove(a.id)
+        assert self.order(store) == ["/c.log", "/b.log"]
+        assert store.move(b.id, -1) is True
+        assert self.order(store) == ["/b.log", "/c.log"]
+
     def test_the_top_box_cannot_go_further_up(self, store):
         a, _, _ = self.three(store)
         assert store.move(a.id, -1) is False

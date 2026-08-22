@@ -14,12 +14,12 @@ from hpca import __version__ as VERSION
 from hpca.ui import commands, toasts
 from hpca.ui.ansi import BOLD, CYAN, DIM, GREEN, RED, RESET, REVERSE, YELLOW
 from hpca.ui.ansi import PULSE_INTERVAL
-from hpca.ui.ansi import cell_width, cut, footer_line, pad, rule, safe
+from hpca.ui.ansi import cell_width, cut, fold, footer_lines, footer_wrap, pad
+from hpca.ui.ansi import rule, safe
 from hpca.ui.approval import decision_height, render_decision
 from hpca.ui.editor import Editor
 from hpca.ui.keys import NEWLINE_KEYS, is_paste, paste_text
 from hpca.ui.overlays import (
-    COPY,
     FORK,
     NO_SESSION,
     ROLLBACK,
@@ -42,6 +42,7 @@ from hpca.ui.overlays import (
     choice,
 )
 from hpca.ui.pane import Item, Pane
+from hpca.ui.rain import rain
 from hpca.ui.state import (
     MODE_COLOURS,
     OWN_MESSAGE_KINDS,
@@ -51,11 +52,15 @@ from hpca.ui.state import (
     CycleMode,
     Decide,
     DeleteSession,
+    Display,
     DraftSkill,
     Drop,
     Fork,
     Intent,
     Interrupt,
+    MoveSession,
+    MoveWatch,
+    Offer,
     NewSession,
     OpenSession,
     Peek,
@@ -91,7 +96,15 @@ ESC_STOP_WINDOW = 1.0
 # was outside the ring once, and that was a lockout: its own keys moved the
 # focus away and nothing could move it back, so the turn stayed parked on a
 # question that could no longer be answered.
-SESSIONS, CHAT, INPUT, WATCHERS, DECISION = range(5)
+SESSIONS, CHAT, INPUT, WATCHERS, DECISION, OFFER = range(6)
+
+# The other thing that can stand in the message box's slot: a question the
+# core raised about this conversation — today, triage offering to remember a
+# failed job's error signature (`state.Offer`). It is in the ring for the same
+# reason DECISION is, and it is a slot rather than a modal for a reason of its
+# own: it arrives from a poll, so the user is as likely as not reading another
+# session when it lands, and a question that takes the screen from work it has
+# nothing to do with is a question asked in the wrong place.
 
 # The question the aimed half of the stop gesture asks first. Enter on the
 # working row is a key that can be hit while steering through a log the agent
@@ -104,6 +117,24 @@ INTERRUPT_QUESTION = "Interrupt this turn and re-edit your last message?"
 # 60%`: a decision has to be readable, and the conversation it is about has to
 # stay on screen behind it.
 DECISION_SHARE = 2
+
+# What the footer may take of the screen once its hints stop fitting on one
+# row. They wrap rather than falling off the right-hand end (`ansi.footer_wrap`),
+# and something has to stop a 20-column terminal from turning the message box's
+# eleven hints into eleven rows of footer with the conversation squeezed out
+# above them.
+#
+# A quarter of the screen, and never more than five rows. A quarter because
+# that is already what the sessions and the watcher columns are each allowed,
+# so the footer is not claiming more of the layout than a band of it does. Five
+# because that is what the longest key set actually costs at the narrowest
+# width anybody drives this at: the message box offers eleven pairs, ~136 cells
+# of them, which is one row at 160 columns, two at 100, three at 60 and five at
+# 30. Under the ceiling the hints that still do not fit are dropped from the
+# end as they always were — a UI with no room left in it is worse than a hint
+# `?` will still list in full.
+FOOTER_ROWS = 5
+FOOTER_SHARE = 4
 
 # How many commands the "/" menu offers at once. Eight is every built-in plus
 # a skill, which is what an unfiltered menu shows on a fresh install; past that
@@ -148,6 +179,11 @@ SETTINGS_KEY = ("settings", ())
 # `session.rows` — a marker that waited for the next sidebar repaint would lag
 # a whole poll behind the event that caused it.
 DECISION_MARK, WORKING_MARK = "!", "⟳"
+# And what a session with an unanswered question from the core wants. Its
+# own glyph rather than the "!": one is a turn parked mid-flight and the
+# other is an offer about work that has already finished, and a user who
+# crosses the screen for the second expecting the first has been lied to.
+OFFER_MARK = "?"
 
 # And the third state §4.3 item 15 asks for, which the core has no flag for
 # and could not have one: a reply landed in this conversation while the user
@@ -208,6 +244,7 @@ class RowUI:
         sessions: list[SessionState] | None = None,
         *,
         settings_json: str = "",
+        display: Display | None = None,
         profiles: list[ProfileInfo] | None = None,
         catalog: list[BackendInfo] | None = None,
         send: Callable[[Intent], None] | None = None,
@@ -217,11 +254,19 @@ class RowUI:
         # fork's `session.created` arrives before the `session.rows` that lists
         # it), and because a session must not lose its chat and its draft
         # merely by scrolling out of the list.
+        # The settings this UI *draws* with, and the only ones it ever sees:
+        # the file is out of a front-end's reach (§4.2 rule 2), so these come
+        # down the wire on `hello` and again after a save (`client._display`).
+        # A default here rather than a None check everywhere below, and it is
+        # the same default `config.DisplaySettings` carries — so a UI built
+        # with no core behind it (a test, the demo's first frame) draws what a
+        # fresh install would.
+        self.display = display or Display()
         self.sessions = list(sessions or [])
         self._states = {x.session_id: x for x in self.sessions}
         # What the rows draw against before the first `session.rows` arrives.
         # Real, so that nothing below here needs a None check.
-        self._blank = SessionState("")
+        self._blank = SessionState("", display=self.display)
         self.active = 0
         # Where a keypress goes when it means something the core has to do.
         # Recorded rather than dropped when nothing is listening, so a test can
@@ -297,19 +342,29 @@ class RowUI:
         # definition order — the same order an install nobody has typed into
         # yet would produce anyway.
         self.command_counts: dict[str, int] = {}
-        # `y` on a chat row: text in, a sentence about where it went out
+        # `c` on a chat row: text in, a sentence about where it went out
         # (`hpca.clipboard.ClipboardManager.copy(...).message`). A callable and
         # not the manager itself, because the manager writes OSC 52 straight to
         # the terminal and this module has never seen one.
         self.clipboard: Callable[[str], str] | None = None
-        # ctrl+e, in two halves belonging to two different layers. `suspend`
-        # takes the terminal down and puts it back (`ui/run.py`, which owns
-        # it); `edit_profile` fetches the profile, runs the editor over it and
-        # saves it back (`ui/client.py`, which is the side with a wire). Both
-        # ends of it are asynchronous, so it answers in a toast rather than by
-        # returning anything.
+        # The external editor, in two halves belonging to two different
+        # layers. `suspend` takes the terminal down and puts it back
+        # (`ui/run.py`, which owns it); the three hooks under it fetch a body,
+        # run the editor over it and send what comes back (`ui/client.py`,
+        # which is the side with a wire). All of them are asynchronous — the
+        # text has to arrive before there is anything to edit — so they answer
+        # in a toast rather than by returning anything.
+        #
+        # Three hooks and not one because the three things `$EDITOR` is opened
+        # on are three different round trips: a draft is already here and goes
+        # nowhere near the core (`edit_text`), a profile is `profile.get` /
+        # `profile.save`, and the settings file is `settings.get` /
+        # `settings.save`. They are wired together by one constructor
+        # (`UIClient.__init__`), which is what `external_editor` reads.
         self.suspend: Callable[[Callable[[], None]], None] | None = None
-        self.edit_profile: Callable[[str], None] | None = None
+        self.edit_text: Callable[[str, Callable[[str], None]], None] | None = None
+        self.edit_profile: Callable[[str, str], None] | None = None
+        self.edit_settings: Callable[[], None] | None = None
         # A window that arrived while a screen was open, waiting for the
         # screen to close (`window`). One slot: two of these queued at once
         # would be a stack of modals nobody asked for, and the newer answer is
@@ -487,8 +542,23 @@ class RowUI:
         """
         session = self._states.get(session_id)
         if session is None:
-            session = self._states[session_id] = SessionState(session_id)
+            session = self._states[session_id] = SessionState(
+                session_id, display=self.display
+            )
         return session
+
+    def set_display(self, display: Display) -> None:
+        """Adopt display settings that have just arrived, and redraw for them.
+
+        Every session, not only the one on screen: the others are not being
+        looked at *yet*, and a chat that restyled itself on the way back into
+        view would be doing the work at the one moment the user is watching.
+        `restyle` is cheap — it rebuilds `Item`s from entries already held —
+        and it keeps what is open open, which `reset` would not.
+        """
+        self.display = display
+        for session in [self._blank, *self._states.values()]:
+            session.restyle(display)
 
     def adopt(self, session: SessionState) -> None:
         """Put a session in the sidebar now, ahead of the core saying so.
@@ -565,7 +635,15 @@ class RowUI:
         # `is not None`: an interrupt whose payload happens to be empty is
         # still a decision waiting for an answer.
         parked = session.decision is not None or "decision" in flags
-        marks = DECISION_MARK if parked else " "
+        # The offer is second to the decision and not beside it: one column,
+        # and of the two the parked turn is the one that stops work.
+        marks = (
+            DECISION_MARK
+            if parked
+            else OFFER_MARK
+            if session.offer is not None
+            else " "
+        )
         # `busy`, not `working`: a silent backend call — a compaction, the
         # titler, a `/conclude` — is something in flight in that conversation
         # and the row has to say so, even though there is no turn to stop
@@ -648,43 +726,54 @@ class RowUI:
             ]
         )
 
-    def _reorder_session(self, delta: int, view_h: int, width: int) -> bool:
-        """Swap the session under the cursor with its neighbour.
+    def _move_session(self, delta: int, width: int) -> bool:
+        """Ask the core to shift the session under the cursor one place.
 
-        `alt+↑/↓`, the same gesture the watchers row already answers to
-        (`Pane.reorder`) — asked for so the two reorderable rows behave alike.
-        The truth here is `self.sessions`, not `session_pane.items`: unlike
-        the watchers pane, which owns its rows outright, `refresh_sidebar`
-        rebuilds the sidebar from `self.sessions` on almost every keystroke,
-        so a swap made only on the pane would be undone by the next one. The
-        swap is scoped to that list instead, and `refresh_sidebar` is what
-        turns it into a repaint. `Pane.replace` already keeps the cursor on
-        the session it was on, by id, so the row travels with the entry the
-        way `reorder`'s docstring promises; `move(0, ...)` after it only
-        exists to pull the offset along when the swap carried the row past
-        the edge of what is on screen.
+        `alt+↑/↓`, the same gesture the watchers column answers — asked for so
+        the two reorderable rows behave alike, and now sent rather than
+        performed. The order is a fact about the database, which rule 2 of
+        §4.2 puts out of a front-end's reach; the answer is a whole new
+        `session.rows` in the order the store now holds, and a sidebar that
+        swapped its own rows first would be overwritten by it a frame later.
+        That was the bug: the list moved, and the next frame put it back.
 
-        The one row this never touches is "+ new session": it sits above
-        every real session and is not a member of `self.sessions`, so index 0
-        in the pane is index -1 here and refuses to move, same as the top of
-        the list refusing to move further up.
+        Nothing is optimistic here for a second reason, which is what makes
+        holding the key down work. `MoveSession` names a row by id and carries
+        an offset, so the core swaps it with whichever row is its neighbour
+        when the command *arrives*: two presses walk one session past two
+        others whether or not the first answer has landed. A local swap would
+        be aiming the second press at a list the core has not agreed to yet.
+
+        What is decided here is only whether there is a move to ask for. The
+        row above every real session is "+ new session", which is not a member
+        of `self.sessions` at all — index 0 in the pane is index -1 here — so
+        it refuses to move, the same way the top of the list refuses to move
+        further up. Out of range at the far end is a silent no-op in the core
+        too; answering it here as well is what keeps the footer's "moved" from
+        being said about a row that did not.
         """
         index = self.session_pane.current(width) - 1
         target = index + delta
         if index < 0 or not 0 <= target < len(self.sessions):
             return False
-        was = self.active_id
-        self.sessions[index], self.sessions[target] = (
-            self.sessions[target],
-            self.sessions[index],
-        )
-        # `active` is a position in `self.sessions`, not an id — the swap just
-        # moved out from under it, and it is what `refresh_sidebar` reads to
-        # draw ● and the open row's green, so it has to be recomputed before
-        # that read rather than after.
-        self._select(was)
-        self.refresh_sidebar()
-        self.session_pane.move(0, view_h, width)
+        self.send(MoveSession(self.sessions[index].session_id, delta))
+        return True
+
+    def _move_watch(self, delta: int, width: int) -> bool:
+        """The same, for the watch box under the cursor.
+
+        The row carries the core's own ``PanelRow.ref`` (see
+        `client._panel_item`), so what leaves here names a watch rather than a
+        position in a column that a poll repaints twice a second — which is
+        the other reason not to reorder locally: this column is rewritten by
+        `panel.update` on a timer, and a swap made here would survive only
+        until the next poll.
+        """
+        index = self.watchers.current(width)
+        target = index + delta
+        if index < 0 or not 0 <= target < len(self.watchers.items):
+            return False
+        self.send(MoveWatch(self.watchers.items[index].text, delta))
         return True
 
     def _tag(self, session: SessionState) -> str:
@@ -942,7 +1031,7 @@ class RowUI:
         matches = self.menu()
         if not matches:
             return 0
-        room = max(2, (max(8, height - 2) // 3))
+        room = max(2, self._avail(width, height) // 3)
         return min(1 + len(matches), room, 1 + MENU_ROWS)
 
     def _render_menu(self, width: int, height: int) -> list[str]:
@@ -998,7 +1087,49 @@ class RowUI:
         two, and the editor is handed the rest."""
         return max(4, width - 2)
 
-    def _heights(self, height: int, width: int) -> list[int]:
+    def _footer_cap(self, height: int) -> int:
+        """The most rows the footer may have on a screen this tall
+        (`FOOTER_ROWS`)."""
+        return max(1, min(FOOTER_ROWS, height // FOOTER_SHARE))
+
+    def _footer_note(self) -> tuple[str, str]:
+        """What the footer says beside the keys, and in which colour.
+
+        Read here rather than in `render` because the note is part of what
+        decides how tall the footer is — it shares the row while there is one
+        and takes the bottom line once the hints wrap (`ansi.footer_lines`) —
+        so the measurement and the drawing ask the same question of it.
+        """
+        if self._esc_armed():
+            return "esc again to stop", RED
+        return self.note, self.note_style
+
+    def _footer_h(self, width: int, height: int) -> int:
+        """How many rows the footer needs for the keys this row offers."""
+        note, _ = self._footer_note()
+        return len(
+            footer_wrap(self._keys(), width, note, self._footer_cap(height))
+        )
+
+    def _avail(self, width: int, height: int, footer_h: int | None = None) -> int:
+        """Rows the four bands share: the screen, less the header and however
+        many rows the footer wants at this width.
+
+        The footer used to be one row by definition and every band's share was
+        measured from ``height - 2``. It can be several now, so the number is
+        asked for in one place and every share is measured from that — a frame
+        where the layout and the footer disagreed about the footer's height
+        would be a frame with a clipped bottom. ``footer_h`` is for the caller
+        that has already built the rows and can hand over the count instead of
+        having it worked out again.
+        """
+        if footer_h is None:
+            footer_h = self._footer_h(width, height)
+        return max(8, height - 1 - footer_h)
+
+    def _heights(
+        self, height: int, width: int, footer_h: int | None = None
+    ) -> list[int]:
         """How the rows split the screen.
 
         A quarter each for sessions and watchers and the rest to the chat — but
@@ -1008,7 +1139,7 @@ class RowUI:
         six lines. Everything left over goes to the chat, which is the row that
         can use it.
         """
-        avail = max(8, height - 2)  # header and footer
+        avail = self._avail(width, height, footer_h)
         inp = self._entry_h(width, height) + self._status_h()
         quarter = max(2, avail // 4)
         inner = max(8, width - 2)
@@ -1028,10 +1159,11 @@ class RowUI:
             # rows, which is the difference between them on a screen with no
             # room: a message can be typed a line at a time, and a question
             # nobody can read is a question nobody can answer.
+            standing = (
+                self.session.decision is not None or self.session.offer is not None
+            )
             inp = self._status_h() + (
-                self._decision_h(width, height)
-                if self.session.decision is not None
-                else 2
+                self._entry_h(width, height) if standing else 2
             )
             middle = max(1, avail - 4 - inp)
         return [top, middle, inp, bottom]
@@ -1054,6 +1186,8 @@ class RowUI:
         """
         if self.session.decision is not None:
             return self._decision_h(width, height)
+        if self.session.offer is not None:
+            return self._offer_h(width, height)
         return self._input_h(width) + self._menu_h(width, height)
 
     def _decision_h(self, width: int, height: int) -> int:
@@ -1069,8 +1203,31 @@ class RowUI:
         if decision is None:
             return 0
         return decision_height(
-            decision, width, max(3, max(8, height - 2) // DECISION_SHARE)
+            decision, width, max(3, self._avail(width, height) // DECISION_SHARE)
         )
+
+    def _offer_rows(self, offer: Offer, width: int) -> list[tuple[str, str]]:
+        """The core's question, as ``(style, text)`` rows.
+
+        Deliberately plainer than the decision above it. That one is a turn
+        parked mid-flight and says so in red or yellow; this one is an offer
+        about work that has already finished, and painting the two alike would
+        say they are equally urgent — which would be a lie in the direction
+        that costs most, since the decision is the one holding a turn.
+        """
+        rows = [("", rule("offer", width))]
+        for line in fold(offer.question, max(8, width - 4)):
+            rows.append((BOLD, f"  {line}"))
+        rows.append((DIM, "  (y) yes · (n) no"))
+        return rows
+
+    def _offer_h(self, width: int, height: int) -> int:
+        """Rows the offer wants, under the same cap the decision has."""
+        offer = self.session.offer
+        if offer is None:
+            return 0
+        cap = max(3, self._avail(width, height) // DECISION_SHARE)
+        return max(3, min(cap, len(self._offer_rows(offer, width))))
 
     def _status_h(self) -> int:
         """Whether the mode/meter row is on screen at all.
@@ -1103,16 +1260,21 @@ class RowUI:
         self._settle_focus()
         out = [self._header(width)]
         if self.overlay is not None:
-            out += self.overlay.render(width, height - 2)
-            out.append(footer_line(self.overlay.footer(), width))
-            while len(out) < height:
-                out.insert(len(out) - 1, " " * width)
+            footer = self._screen_footer(self.overlay, width, height)
+            body = self._screen_h(self.overlay, width, height)
+            out += self.overlay.render(width, body)
+            out = self._frame(out, footer, width, height)
             # A confirmation can be asked *about* an overlay — remove this
             # skill, delete this profile — so it is drawn over that too, and a
             # toast lands on a screen as readily as on the rows.
-            out = self._over_toasts(out[:height], width)
+            out = self._over_toasts(out, width, len(footer))
             return self._over_confirm(out, width)
-        heights = self._heights(height, width)
+        # Built once and its height handed to the layout, because how many rows
+        # the hints need is a function of the width *and* of which keys this row
+        # offers: two answers worked out separately are two answers that can
+        # differ, and the difference would come off the bottom of the frame.
+        footer = self._footer(width, height)
+        heights = self._heights(height, width, len(footer))
         order = [
             (SESSIONS, self.panes[0], heights[0]),
             (CHAT, self.panes[1], heights[1]),
@@ -1125,7 +1287,9 @@ class RowUI:
         for slot, pane, pane_h in order:
             if slot == INPUT:
                 status = self._render_status(width)
-                prompt = self._render_decision(width, height)
+                prompt = self._render_decision(width, height) or self._render_offer(
+                    width, height
+                )
                 if prompt:  # standing where the box would be (`_entry_h`)
                     out += prompt + status
                     continue
@@ -1134,16 +1298,48 @@ class RowUI:
                 out += self._render_input(width, pane_h - len(status) - len(menu))
             else:
                 out += pane.render(width, pane_h, focused=self.focus == slot)
-        note, style = self.note, self.note_style
-        if self._esc_armed():
-            note, style = "esc again to stop", RED
-        out.append(footer_line(self._keys(), width, note, style))
-        while len(out) < height:
-            out.insert(len(out) - 1, " " * width)
-        out = self._over_toasts(out[:height], width)
+        out = self._frame(out, footer, width, height)
+        out = self._over_toasts(out, width, len(footer))
         return self._over_confirm(out, width)
 
-    def _over_toasts(self, out: list[str], width: int) -> list[str]:
+    def _footer(self, width: int, height: int) -> list[str]:
+        """The key hints for this row, as the rows they will be drawn on."""
+        note, style = self._footer_note()
+        return footer_lines(
+            self._keys(), width, note, style, self._footer_cap(height)
+        )
+
+    def _screen_footer(self, screen: Overlay, width: int, height: int) -> list[str]:
+        """The same for an open screen, which has its own keys and no note."""
+        return footer_lines(
+            screen.footer(), width, max_rows=self._footer_cap(height)
+        )
+
+    def _screen_h(self, screen: Overlay, width: int, height: int) -> int:
+        """Rows a screen's body gets, the header and its footer taken off.
+
+        Asked for by the drawing and by the keys alike (`handle`): what a page
+        key scrolls by has to be what was drawn, or page-down moves by a
+        different amount than the screen showed.
+        """
+        return max(1, height - 1 - len(self._screen_footer(screen, width, height)))
+
+    def _frame(
+        self, out: list[str], footer: list[str], width: int, height: int
+    ) -> list[str]:
+        """The bands and the footer as exactly ``height`` rows.
+
+        The frame's one hard invariant is settled in this one place: whatever
+        the bands came to, the rows above the footer are padded out or cut
+        down to what is left, and the footer goes on last. That order is the
+        point — a band that asked for more rows than the screen has costs a
+        clipped pane, never the key hints the footer was widened to show.
+        """
+        footer = footer[:height]
+        rows = max(0, height - len(footer))
+        return (out + [" " * width] * rows)[:rows] + footer
+
+    def _over_toasts(self, out: list[str], width: int, footer_h: int) -> list[str]:
         """What the core said, over the finished frame (§4.3 item 35).
 
         Directly under the header, and full-width rows replaced whole. Both
@@ -1157,7 +1353,9 @@ class RowUI:
         """
         if not self.toasts:
             return out
-        rows = toasts.render(self.toasts, self.clock(), width, max(0, len(out) - 2))
+        rows = toasts.render(
+            self.toasts, self.clock(), width, max(0, len(out) - 1 - footer_h)
+        )
         if not rows:
             # Nothing live: drop what has expired so the list cannot grow for
             # the length of a session.
@@ -1186,17 +1384,24 @@ class RowUI:
             # — the same arrangement the spinner has, and the reason
             # `next_wake` books a frame while this is up.
             now=self.clock(),
+            period=self.display.decision_pulse_seconds,
         )
 
     def _over_confirm(self, out: list[str], width: int) -> list[str]:
-        """The generic yes/no, drawn over the finished frame (§4.3 item 22).
+        """The generic yes/no, and nothing else (§4.3 item 22).
 
-        Over rather than in: a confirmation is asked *about* what is on screen
-        — really quit, interrupt this turn, apply this signature — and it can
-        arrive on top of an overlay, which is what the Textual app's
-        ConfirmScreen did by being pushed on the screen stack. It is also the
-        one thing here that is deliberately modal: it is a question with two
-        answers and no third thing to be doing meanwhile.
+        Instead of over the finished frame: a confirmation is the one thing
+        here that is deliberately modal — a question with two answers and no
+        third thing to be doing meanwhile — and three rows spliced into the
+        middle of a full screen read as one more band of it rather than as a
+        gate. So the frame it was asked over is built, measured, and then
+        cleared: every row it came to is replaced by blanks and the question
+        is the only thing left to read.
+
+        Built and then cleared, rather than skipped, is what makes "no" cost
+        nothing: the panes keep the heights and the scroll they had, and the
+        frame after the answer is the frame that would have been drawn had the
+        question never been asked.
         """
         question = self.confirm
         if question is None:
@@ -1206,10 +1411,44 @@ class RowUI:
             BOLD + pad(f"  {question.question}", width) + RESET,
             DIM + pad("  (y) yes · (n) no · (esc) no", width) + RESET,
         ]
-        rows = rows[: len(out)]  # a terminal too short for the question
+        # A terminal too short for all three keeps them in the order they are
+        # worth: the question, then the way to answer it, then the rule, which
+        # is decoration on a screen that has nothing left on it to divide.
+        rows = [rows[i] for i in sorted([1, 2, 0][: len(out)])]
         at = max(0, (len(out) - len(rows)) // 2)
-        out[at : at + len(rows)] = rows
-        return out
+        # What the cleared screen is made of. Black, unless this is the
+        # question you do not come back from (`ui.rain` says why that one is
+        # different). The question is spliced over it whole either way — its
+        # rows are padded to the width, so nothing of the field shows through
+        # the three lines that matter.
+        under = (
+            rain(width, len(out), self.clock())
+            if self._raining()
+            else [" " * width] * len(out)
+        )
+        under[at : at + len(rows)] = rows
+        return under
+
+    def _render_offer(self, width: int, height: int) -> list[str]:
+        """The offer, in exactly ``_offer_h`` rows — or none, if none is up.
+
+        The rule says focus the way every other region's does, and the last
+        row is the one kept when there is no room: a question with no visible
+        way to answer it is worse than a question with no visible middle.
+        """
+        offer = self.session.offer
+        if offer is None:
+            return []
+        focused = self.focus == OFFER
+        rows = self._offer_rows(offer, width)
+        rows[0] = (BOLD + CYAN if focused else DIM, rows[0][1])
+        out = [f"{style}{pad(text, width)}{RESET}" for style, text in rows]
+        room = self._offer_h(width, height)
+        if len(out) > room:
+            out = out[: max(0, room - 1)] + out[-1:]
+        while len(out) < room:
+            out.append(" " * width)
+        return out[:room]
 
     def _render_status(self, width: int) -> list[str]:
         """The mode bar and the context meter, sharing one row.
@@ -1277,9 +1516,11 @@ class RowUI:
         # whole pairs off its end and this is the one that must not be the pair
         # that goes. Leaving the message box is ^↑, not escape: escape has a
         # job now.
-        common = [("^↑^↓", "row"), ("esc esc", "stop"), ("?", "keys")]
-        if self.confirm is not None:
-            return [("y", "yes"), ("n", "no"), ("esc", "no")]
+        common = [("^↑^↓", "panel"), ("esc esc", "stop"), ("?", "keys")]
+        # Nothing for `self.confirm`: the dialog blanks the footer along with
+        # the rest of the frame and carries its own two answers on its own
+        # row. Keys that stay the keys of the row underneath are what lets the
+        # layout — and so the frame a "no" comes back to — stay put.
         if self.menu():
             # While a command is being named the menu owns ↑/↓ and the two keys
             # that fill one in, and saying so is the only way anybody finds tab.
@@ -1290,6 +1531,8 @@ class RowUI:
                 ("esc esc", "stop"),
                 ("?", "keys"),
             ]
+        if self.focus == OFFER:
+            return [("y", "yes"), ("n", "no"), ("^↑^↓", "panel"), ("?", "keys")]
         if self.focus == DECISION:
             decision = self.session.decision
             if decision is not None and not decision.asking:
@@ -1300,13 +1543,13 @@ class RowUI:
                     # Offered here too, because they work here too: the box
                     # keeps what is in it while the cursor is away, and the
                     # ring always comes back to this row (`_ring`).
-                    ("^↑^↓", "row"),
+                    ("^↑^↓", "panel"),
                 ]
             return [
                 ("y", "approve"),
                 ("n", "deny"),
                 ("esc", "deny, no reason"),
-                ("^↑^↓", "row"),
+                ("^↑^↓", "panel"),
             ]
         if self.focus == INPUT:
             # Spelled out rather than built from ``common`` so that send and
@@ -1315,8 +1558,9 @@ class RowUI:
             return [
                 ("enter", "send"),
                 ("esc esc", "stop"),
-                ("^↑^↓", "row"),
+                ("^↑^↓", "panel"),
                 ("⇧enter", "new line"),
+                ("⇧tab", "mode"),
                 ("^←→", "word"),
                 ("^l", "switch llm"),
                 ("⇧←→", "select"),
@@ -1334,17 +1578,14 @@ class RowUI:
         elif self.focus == SESSIONS:
             rows += [("enter", "switch"), ("r", "rename"), ("t", "retitle"), ("d", "delete")]
         elif self.focus == CHAT:
-            rows += [
-                ("i", "write"),
-                ("enter", "reuse"),
-                ("y", "copy"),
-                ("⇧tab", "mode"),
-            ]
+            rows += [("enter", "rollback/fork"), ("c", "copy")]
         else:
             rows += [("enter", "peek"), ("d", "unwatch"), ("alt-↑↓", "move")]
-        # Only where they do something. `m` and `a` are the sessions row's, `c`
-        # is everywhere but the chat, and ctrl+l is the chat's — a key list
-        # that lies is worse than a short one.
+        # Only where they do something. `m` and `a` are the sessions row's and
+        # ctrl+l is the chat's; `c` is live everywhere, but it is the config
+        # editor outside the chat and the row copy inside it (`_copy_row`), so
+        # it is offered once per row with the label that is true there — a key
+        # list that lies is worse than a short one.
         if self.focus == SESSIONS:
             rows += [
                 ("m", "llms"),
@@ -1374,7 +1615,12 @@ class RowUI:
         sequence could reach again — re-opening the session was the only way
         back, and nothing on screen said so.
         """
-        middle = DECISION if self.session.decision is not None else INPUT
+        if self.session.decision is not None:
+            middle = DECISION
+        elif self.session.offer is not None:
+            middle = OFFER
+        else:
+            middle = INPUT
         return [SESSIONS, CHAT, middle, WATCHERS]
 
     def _settle_focus(self) -> None:
@@ -1384,17 +1630,15 @@ class RowUI:
         the prompt with no decision left behind it, and the message box while
         a decision is standing in front of it. Both are one line away from
         every path that sets INPUT — a paste, a rollback handing a message
-        back, `i` in the chat, a decision arriving while the box has the
+        back, ctrl+↓ out of the chat, a decision arriving while the box has the
         cursor — and the one that forgot would leave the cursor on a row that
         is not drawn, or walk a key into `_handle_row`'s pane lookup with a
         focus it has no entry for. Asked once, here, rather than remembered
         eleven times.
         """
-        if self.session.decision is None:
-            if self.focus == DECISION:
-                self.focus = INPUT
-        elif self.focus == INPUT:
-            self.focus = DECISION
+        middle = self._ring()[2]
+        if self.focus in (INPUT, DECISION, OFFER) and self.focus != middle:
+            self.focus = middle
 
     def handle(self, key: str, width: int, height: int) -> bool:
         self._settle_focus()
@@ -1408,7 +1652,7 @@ class RowUI:
             return self._handle_confirm(key)
         if self.overlays:
             overlay = self.overlays[-1]
-            alive = overlay.handle(key, width, height - 2)
+            alive = overlay.handle(key, width, self._screen_h(overlay, width, height))
             # A screen that opened a screen has not closed, and one that closed
             # cannot also have opened one — so the two are exclusive and the
             # order only decides which is checked first.
@@ -1423,6 +1667,8 @@ class RowUI:
             # prompt — which is underneath it, not over it — has them the
             # moment it does.
             return self._handle_decision(key)
+        if self.focus == OFFER:
+            return self._handle_offer(key)
         if self.focus == INPUT:
             return self._handle_input(key)
         return self._handle_row(key, width, height)
@@ -1522,20 +1768,40 @@ class RowUI:
         question: str,
         on_answer: Callable[[bool], None] | None = None,
         *,
-        confirm_id: str = "",
+        rain: bool = False,
     ) -> None:
-        """Put a yes/no on screen. The answer goes wherever it belongs.
+        """Put a yes/no over everything. The answer runs ``on_answer``.
 
-        Two kinds of caller, one dialog. The UI's own questions pass
-        ``on_answer`` and nothing is waiting on the other side of a socket for
-        them. `confirm.requested` passes ``confirm_id``: the core is holding a
-        continuation under that id and only the verdict crosses back
-        (`protocol.ConfirmResolve`), which is why the question need not name a
-        session — a triage offer comes from a poll, not a conversation.
+        The UI's own questions only — really quit, interrupt this turn, delete
+        this session — which is why taking the whole screen is fair: each of
+        them answers a key that was just pressed, so there is nothing else the
+        user was in the middle of. What the *core* asks does not come through
+        here; it waits in the session it is about (`confirm_requested`).
         """
-        self.confirm = Confirm(
-            id=confirm_id, question=question, on_answer=on_answer
+        self.confirm = Confirm(question=question, on_answer=on_answer, rain=rain)
+
+    def _raining(self) -> bool:
+        """Whether the cleared screen behind the open question is falling.
+
+        Asked in the two places that must agree — what is drawn, and whether a
+        frame is booked to draw it again — because a field painted once and
+        never repainted hangs mid-drop, and a repaint booked for a screen that
+        is black is a wakeup with nothing to do.
+        """
+        return (
+            self.confirm is not None
+            and self.confirm.rain
+            and self.display.quit_rain
         )
+
+    def _rain_interval(self) -> float:
+        """Seconds between two frames of the field, from the settings.
+
+        Clamped here rather than trusted: the value crossed a wire, this is a
+        repaint loop, and a zero would divide by zero somewhere with the
+        terminal in raw mode. The bounds are the ones `config` documents.
+        """
+        return 1.0 / min(120, max(1, self.display.quit_rain_fps))
 
     def _handle_confirm(self, key: str) -> bool:
         """y, n, escape. Anything else is ignored rather than passed on: a
@@ -1560,14 +1826,27 @@ class RowUI:
         question, self.confirm = self.confirm, None
         if question is None:  # pragma: no cover - guarded by the caller
             return
-        if question.id:
-            self.send(Answer(question.id, confirmed))
         if callable(question.on_answer):
             question.on_answer(confirmed)
 
-    def confirm_requested(self, confirm_id: str, question: str) -> None:
-        """`confirm.requested`, which the Textual UI never drew at all."""
-        self.ask(question, confirm_id=confirm_id)
+    def confirm_requested(self, session_id: str) -> None:
+        """`confirm.requested`, which the Textual UI never drew at all.
+
+        The question itself is already on its session (`client._confirm`);
+        what is left is the two things the *frame* has to say about it. A
+        session that is not on screen says it with the "?" in the sidebar and
+        nothing else (§3.2 property 1) — this arrives from a poll, and a poll
+        may not reach across and take the row somebody is working in.
+
+        For the open session the cursor moves onto it, from the chat or the
+        box only, which is the same bargain `decision_arrived` makes and for
+        the same reason: the offer stands in the box's slot (`_entry_h`), so
+        a cursor left in the box would be a cursor on a row that is no longer
+        drawn. The draft is untouched and comes back with the box.
+        """
+        self.refresh_sidebar()
+        if session_id == self.active_id and self.focus in (CHAT, INPUT):
+            self.focus = OFFER
 
     # ------------------------------------------------------ the decision
 
@@ -1613,9 +1892,9 @@ class RowUI:
         ctrl+↑ and ctrl+↓ leave the way they leave any row, because this is a
         row of the ring now (`_ring`): up to the chat the question is about,
         down to the watchers. What they do *not* do any more is drop into the
-        message box — it is not on screen while this is, and `i` and tab used
-        to aim at it. Nothing here can strand the prompt: every step of the
-        ring comes back to it.
+        message box — it is not on screen while this is, and tab used to aim
+        at it. Nothing here can strand the prompt: every step of the ring
+        comes back to it.
         """
         if key == "quit":
             return False
@@ -1650,6 +1929,46 @@ class RowUI:
         else:
             decision.reason.handle(key)
         return True
+
+    def _handle_offer(self, key: str) -> bool:
+        """Two answers and the ring, which is all this row has.
+
+        No third key, and in particular no "later": the core is holding a
+        continuation under this id and a question that can be walked past
+        without answering is a continuation nothing ever frees. Walking off
+        with ctrl+↑/↓ is not walking past it — the offer is still here, the
+        sidebar still says so, and the ring comes back.
+        """
+        if key == "quit":
+            return False
+        offer = self.session.offer
+        if offer is None:  # answered elsewhere, or its session went away
+            self.focus = INPUT
+            return True
+        if key == "y":
+            self._answer_offer(offer, True)
+        elif key in ("n", "esc"):
+            self._answer_offer(offer, False)
+        elif key in ("ctrl-up", "shift-tab"):
+            self.focus = CHAT
+        elif key in ("ctrl-down", "tab"):
+            self.focus = WATCHERS
+        return True
+
+    def _answer_offer(self, offer: Offer, accepted: bool) -> None:
+        """Answer it and give the slot back — to the box, or to the next one.
+
+        Taken off here rather than when the core agrees, the same as a
+        decision: a question that stays up until an answer comes back is a
+        question that can be answered twice, and this one's continuation is
+        freed by the first answer.
+        """
+        session = self.session
+        session.drop_offer(offer.id)
+        self.refresh_sidebar()
+        self.focus = self._ring()[2]
+        self.send(Answer(offer.id, accepted))
+        self.note = "accepted" if accepted else "declined"
 
     def _resolve(self, approved: bool, reason: str = "") -> None:
         """Answer the open session's decision and let the turn go on.
@@ -1789,38 +2108,13 @@ class RowUI:
         """What the rewind decided, as an intent aimed at the session it was
         opened in — which is not necessarily the one on screen by the time it
         closes."""
-        if overlay.choice == COPY:
-            self.reuse_message(overlay.message, overlay.session_id)
-            return
         if overlay.choice == FORK:
             self.send(Fork(overlay.session_id, overlay.seq))
         elif overlay.choice == ROLLBACK:
             self.send(Rollback(overlay.session_id, overlay.seq))
         # Either cut leaves you at the point the conversation now ends, which
-        # is a place to say the next thing from. `reuse_message` above puts the
-        # cursor in the box for itself.
+        # is a place to say the next thing from.
         self.focus = INPUT
-
-    def reuse_message(self, text: str, session_id: str = "") -> None:
-        """Put one of your own past messages back in the box, to send again or
-        edit into the next one — usually a command that needs a word changed,
-        which is otherwise retyped off the screen.
-
-        Into the draft of the session it was *taken from*, which is what the
-        rewind promises ("an intent aimed at the session it was opened in —
-        which is not necessarily the one on screen by the time it closes").
-        That is the whole of `hand_back`'s errand already, so this goes
-        through it rather than keeping a second copy of the rule that once
-        disagreed with it.
-
-        Added to whatever is already being written rather than replacing it, so
-        activating a message can never lose a draft. It starts its own line,
-        except after a draft left ending in whitespace — that space is how you
-        say "continue here" (``rerun this: `` + the old command).
-        """
-        self.hand_back(
-            session_id or self.active_id, text, note="copied into the message box"
-        )
 
     def _esc_armed(self) -> bool:
         """Whether a first escape is still waiting for its second.
@@ -1896,6 +2190,10 @@ class RowUI:
             # a background session's prompt is not drawn, so nothing about it
             # changes with the clock.
             PULSE_INTERVAL if self.session.decision is not None else None,
+            # And the fifth: the field behind an open confirmation falls by
+            # the clock and by nothing else, so without a frame booked here it
+            # would be painted once and hang there mid-drop.
+            self._rain_interval() if self._raining() else None,
         ]
         if self._esc_armed_at is not None:
             left = ESC_STOP_WINDOW - (self.clock() - self._esc_armed_at)
@@ -1951,11 +2249,12 @@ class RowUI:
         elif key in NEWLINE_KEYS:
             self.input.newline()
         elif key == "shift-tab":
-            # Cycling the mode is the one thing shift+tab does, and it has to
-            # work from here: deciding the agent may act unasked is a thought
-            # you have *while writing the message*, not one you leave the box
-            # to act on. The Textual app bound it `priority=True` for exactly
-            # that reason. ctrl+↑ is how you leave the box.
+            # The message box is the one place the mode can be changed from,
+            # and the right one: deciding the agent may act unasked is a
+            # thought you have *while writing the message*, not one you leave
+            # the box to act on. The Textual app bound it `priority=True` for
+            # exactly that reason. Everywhere else shift+tab is the way back
+            # up the ring, as tab is the way down; ctrl+↑ leaves the box.
             self._cycle_mode()
         elif key == "ctrl-up":
             self.focus = CHAT
@@ -1967,7 +2266,7 @@ class RowUI:
             # printable character, so it cannot be something being typed.
             self._switch_llm()
         elif key == "ctrl-e":
-            self._edit_profile()
+            self._edit_draft()
         elif key == "quit":
             return False
         else:
@@ -2208,7 +2507,7 @@ class RowUI:
             # nothing to do, and in the chat it is a letter somebody is about
             # to type into the box they just left.
             if self.focus == SESSIONS:
-                self.ask(QUIT_QUESTION, self._quit_answer)
+                self.ask(QUIT_QUESTION, self._quit_answer, rain=True)
             return True
         inner = max(8, width - 2)
         slots = self._ring()
@@ -2230,44 +2529,32 @@ class RowUI:
             # may be about to type into the box they just left.
             self.overlay = LlmOverlay(self.catalog)
         elif key == "a" and self.focus == SESSIONS:
-            self.overlay = ProfilesOverlay(self.profiles)
-        elif key == "c" and self.focus != CHAT:
-            # Anywhere but the chat column (§5), which is the one row where the
-            # cursor is on a conversation and `c` reads as a letter.
-            # Fetched as it opens, like every other editable body: the file is
-            # also written by the core — `settings.save` normalises what lands
-            # on disk — so a copy kept from the last time this screen was open
-            # is a copy that can already be wrong.
-            self.overlay = ConfigOverlay(
-                self.settings_json,
-                validate=self.validate_settings,
-                awaiting=SETTINGS_KEY,
+            # Told whether `$EDITOR` can be reached, because that is what
+            # decides where the profile under the cursor opens: the user's own
+            # editor, or the in-app one that stands in when there is no
+            # terminal to hand over (`external_editor`).
+            self.overlay = ProfilesOverlay(
+                self.profiles, external=self.external_editor
             )
+        elif key == "c" and self.focus == CHAT:
+            # The chat column's `c` copies the row under the cursor (§4.3 item
+            # 36). It is the one row where `c` is about a conversation rather
+            # than about the app, which is why the config editor gives it up
+            # here and keeps every other row.
+            self._copy_row(inner)
+        elif key == "c":
+            # Anywhere but the chat column (§5), where `c` is the row copy.
+            self._edit_config()
         elif key == "ctrl-l" and self.focus == CHAT:
             self._switch_llm()
-        elif key == "shift-tab" and self.focus == CHAT:
-            # The mode is a per-session dial, so the key means something only
-            # where a session's conversation is: here and in the message box
-            # (see `_handle_input`). From the sessions and watchers rows
-            # shift+tab keeps moving between rows, which is what the Textual
-            # app's `check_action` decided for the same reason.
-            self._cycle_mode()
         elif key in ("ctrl-down", "tab"):
             self.focus = slots[(slots.index(self.focus) + 1) % len(slots)]
         elif key in ("ctrl-up", "shift-tab"):
             self.focus = slots[(slots.index(self.focus) - 1) % len(slots)]
         elif key == "ctrl-e":
-            self._edit_profile()
-        elif key == "y" and self.focus == CHAT:
-            # §5: new, and colliding with nothing — the decision prompt owns
-            # `y` only while a decision is pending, and it takes keys first.
-            self._copy_row(inner)
-        elif key == "i" and self.focus == CHAT:
-            # Whatever is in that slot: the box, or the prompt standing in it
-            # (`_ring`). "write" is what the footer offers here, and while a
-            # decision is up there is nothing to write into — the answer to
-            # the question is the next thing this session takes.
-            self.focus = slots[2]
+            # The draft, from here too — and the focus goes with it, the way a
+            # paste does (`_edit_draft`, `_paste`).
+            self._edit_draft()
         elif key == "up":
             pane.move(-1, view, inner)
         elif key == "down":
@@ -2292,10 +2579,14 @@ class RowUI:
         elif key == "shift-left":
             pane.collapse_all(inner)
         elif key in ("alt-up", "alt-down") and self.focus == WATCHERS:
-            moved = pane.reorder(-1 if key == "alt-up" else 1, view, inner)
+            moved = self._move_watch(-1 if key == "alt-up" else 1, inner)
             self.note = "moved" if moved else ""
         elif key in ("alt-up", "alt-down") and self.focus == SESSIONS:
-            moved = self._reorder_session(-1 if key == "alt-up" else 1, view, inner)
+            # Said before the core has answered, like the mode bar: the
+            # keypress needs feedback, the frame that arrives is what makes it
+            # true, and the one case the core would refuse — no neighbour to
+            # trade with — has already been ruled out above.
+            moved = self._move_session(-1 if key == "alt-up" else 1, inner)
             self.note = "moved" if moved else ""
         elif key == "enter":
             if self.focus == SESSIONS:
@@ -2318,7 +2609,7 @@ class RowUI:
     # ------------------------------------------------- the clipboard and $EDITOR
 
     def _copy_row(self, inner: int) -> None:
-        """`y`: the chat row under the cursor, to the clipboard (§4.3 item 36).
+        """`c`: the chat row under the cursor, to the clipboard (§4.3 item 36).
 
         Through `hpca.clipboard.ClipboardManager`, which already knows about
         OSC 52, the multiplexer wrapping and the file fallback, and which
@@ -2350,26 +2641,124 @@ class RowUI:
         except Exception as e:  # a tier that raised rather than reporting
             self.toast(f"copy failed: {e}", "error")
 
-    def _edit_profile(self) -> None:
-        """ctrl+e: this profile's memories in `$EDITOR` (§4.3 item 37).
+    @property
+    def external_editor(self) -> bool:
+        """Whether `$EDITOR` can be reached from here at all.
+
+        Read by the keys that now have two ways to do the same job — the
+        config editor, and a profile's files off the profiles screen — so
+        that a UI with no terminal to hand over (a test, the demo, anything
+        driving `RowUI` headless) keeps the in-app form rather than being
+        told there is no editor and left with no way in.
+
+        One question for three hooks and a terminal, because they are wired
+        by one constructor (`UIClient.__init__`) against the one terminal
+        `run.py` owns: a UI holding some of them and not the others would be
+        a UI somebody had taken apart by hand.
+        """
+        return self.suspend is not None and self.edit_text is not None
+
+    def _edit_draft(self) -> None:
+        """ctrl+e: the message being written, in `$EDITOR` (§4.3 item 37).
 
         Textual spelled this `self.suspend()`; here it means leaving the
         alternate screen, putting the line discipline back, running the editor
         on a terminal that behaves like a terminal, and coming back to a full
         repaint. Both halves are injected — `run.py` owns the terminal and
-        `client.py` owns the wire the file comes down — so this method is the
-        key binding, one guard, and nothing else.
+        `client.py` owns the process — so this method is the key binding, one
+        guard, and where the text lands when it comes back.
 
-        Nothing is returned and nothing is waited for: the body has to be
-        fetched before there is anything to edit, so the answer arrives as a
-        toast (`UIClient._profile_body`). The guard is what keeps the key
-        honest in a UI with no wire behind it — a key that silently did
-        nothing would look exactly like an editor that opened and closed.
+        The draft and not the profile, which is what this key used to open:
+        the footer offers it in the message box and nowhere else, and a key
+        advertised next to "send" and "new line" that opened a *memories* file
+        was the one hint in the footer that named the wrong thing entirely.
+        A profile is edited where a profile is chosen (`a`, then the row), and
+        the settings file where the settings are (`c`).
+
+        It works from the rows too, and takes the focus back to the box with
+        it, for the reason `_paste` does the same: editing the message is an
+        unambiguous "I am writing", the rows have no draft of their own, and
+        coming back from the editor to a cursor parked on a chat row would
+        hide the very text that was just edited.
+
+        The editor is captured rather than looked up again when the text comes
+        back, so what was edited is what is written to — the answer arrives
+        from `client.py` and is not obliged to arrive before the next key.
         """
-        if self.suspend is None or self.edit_profile is None:
+        if self.suspend is None or self.edit_text is None:
             self.toast("no editor is wired up here", "warning")
             return
-        self.edit_profile(self.profile)
+        draft = self.input
+        self.edit_text(draft.text(), lambda text: self._draft_edited(draft, text))
+
+    def _draft_edited(self, draft: Editor, text: str) -> None:
+        """What `$EDITOR` left in the file, as the draft it was opened on.
+
+        Said out loud only when it comes back empty: everything else about
+        this is visible — the box is the feedback, and it now holds what the
+        editor holds. An empty buffer is applied rather than refused, because
+        deleting the message and saving is a thing a person does on purpose
+        and the alternative is a key that silently ignores it; but the draft
+        it replaced is gone, so the one case that can lose work says so.
+        """
+        draft.set_text(text)
+        self.focus = INPUT
+        if not text.strip():
+            self.toast("the editor left the message empty", "warning")
+
+    def _edit_config(self) -> None:
+        """`c`: the settings file, in `$EDITOR` — or in the screen, failing that.
+
+        The file is the interface either way (`overlays/config.py` says why at
+        length: the settings model grows a field whenever anything does, and a
+        hand-built form is the copy of it that falls behind). All that changes
+        here is which editor holds the text, and `$EDITOR` is the better one
+        for a file: it has the user's keys, their search, their JSON mode.
+
+        The in-app screen is kept as the way in when there is no terminal to
+        hand over, and as the place a refusal lands: text the settings model
+        would not accept is opened in it with the reason on its rule
+        (`fix_settings`), rather than dropped after a minute of typing. Nothing malformed reaches disk in either case: the core
+        validates `settings.save` again and refuses it (`_save_settings`),
+        which is what keeps a hand-edited file from being one the next start
+        cannot read.
+        """
+        if self.external_editor and self.edit_settings is not None:
+            self.edit_settings()
+            return
+        # Fetched as it opens, like every other editable body: the file is
+        # also written by the core — `settings.save` normalises what lands on
+        # disk — so a copy kept from the last time this screen was open is a
+        # copy that can already be wrong.
+        self.overlay = ConfigOverlay(
+            self.settings_json,
+            validate=self.validate_settings,
+            awaiting=SETTINGS_KEY,
+        )
+
+    def fix_settings(self, text: str, reason: str) -> None:
+        """Put rejected settings back on screen, in the editor that refuses to
+        lose them.
+
+        Called by `client.py` when a file that came back out of `$EDITOR`
+        cannot be saved — either it is not JSON, or the core would not take it
+        — and it is the whole of the answer to "what happens when they save
+        something malformed": the text is not on disk, not on the wire, and
+        not thrown away either.
+
+        ``was`` is set to the file that is still there rather than to the text
+        the screen opens with, and that is the load-bearing line. It is what
+        `EditorOverlay` measures "changed" against, so the rejected text reads
+        as an unsaved edit: escape asks to keep it, and `ConfigOverlay.refuse`
+        will not let the screen close at all while it is still not JSON.
+        Opened over itself, one escape would drop the minute of typing this
+        exists to preserve.
+        """
+        screen = ConfigOverlay(text, validate=self.validate_settings)
+        screen.was = self.settings_json
+        screen.note = reason
+        self.overlay = screen
+        self.toast(reason, "error")
 
     # ------------------------------------------------------- the session keys
 
