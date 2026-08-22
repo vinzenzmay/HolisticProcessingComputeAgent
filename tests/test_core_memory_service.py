@@ -25,7 +25,12 @@ from hpca import curator
 from hpca.agent.struggle import STRUGGLE_KIND
 from hpca.config import Settings
 from hpca.core.deps import CoreDeps
-from hpca.core.memory_service import MemoryService
+from hpca.core.memory_service import (
+    MEMORY_QUEUE_LIMIT,
+    MEMORY_REJECT_LIMIT,
+    MEMORY_REPEAT_LIMIT,
+    MemoryService,
+)
 from hpca.db import connect, init_db
 from hpca.llm import ChatResponse
 from hpca.memory_index import MemoryIndex
@@ -283,7 +288,7 @@ class TestFlaggedEdits:
 
     def test_flagging_writes_nothing_and_says_so(self, harness, session):
         answer = harness.service.queue_edits(session.session_id, [self.add_op()])
-        assert "Nothing is saved yet" in answer
+        assert "nothing saved yet" in answer
         assert stored() == []
 
     def test_an_empty_batch_is_not_queued(self, harness, session):
@@ -327,9 +332,17 @@ class TestFlaggedEdits:
         assert harness.proposals() == []
 
     def test_an_unapplicable_batch_is_reported_and_dropped(self, harness, session):
+        """The addresses resolve at queue time now, so the only way a queued
+        batch stops applying is the file moving under it: the user deleted by
+        hand the entry the agent had flagged for removal. Re-offering a batch
+        that can never land is what popping-before-the-modal used to do."""
+        write_memory("scratch space is under /work")
         harness.service.queue_edits(
-            session.session_id, [MemoryOp(op="remove", scope=SP, match="absent")]
+            session.session_id, [MemoryOp(op="remove", scope=SP, match="scratch")]
         )
+        loaded = Profile.load("default")
+        loaded.memories.clear()
+        loaded.save()
         assert harness.service.propose_flagged_edits(session) is None
         assert harness.said("Flagged memory not applied")
         assert harness.service.pending_edits(session.session_id) == []
@@ -343,6 +356,291 @@ class TestFlaggedEdits:
         assert harness.service.apply_answered(session.session_id, [True]) == 0
         assert stored() == ["added by hand while the review was open"]
         assert harness.said("changed on disk")
+
+
+class TestFlaggingIsAnswerable:
+    """The property whose absence made the `memory` tool loop forever.
+
+    A real session emitted an unbounded series of calls: an `add`, then a
+    `demote` whose substring matched nothing, then the same demote with a
+    shorter substring, and again — because every one of them came back with
+    the same "Noted 1 memory change(s)". Nothing is applied until /conclude,
+    so the result string is the model's only evidence, and a constant is no
+    evidence at all.
+    """
+
+    def add_op(self, text="STAR needs 40G here.", scope=SP):
+        return MemoryOp(op="add", scope=scope, text=text)
+
+    def test_a_demote_that_matches_nothing_says_so(self, harness, session):
+        """The regression: a hit and a miss must not read alike."""
+        hit = harness.service.queue_edits(session.session_id, [self.add_op()])
+        miss = harness.service.queue_edits(
+            session.session_id,
+            [MemoryOp(op="demote", scope=SP, match="create_script fails")],
+        )
+        assert miss != hit
+        assert "NOT queued" in miss
+        assert "create_script fails" in miss
+        assert harness.service.pending_edits(session.session_id) == [self.add_op()]
+
+    def test_a_miss_names_the_entries_that_do_exist(self, harness, session):
+        """So the model can correct itself in one step instead of bisecting
+        its way down to a shorter and shorter substring."""
+        write_memory("scratch space is under /work")
+        answer = harness.service.queue_edits(
+            session.session_id, [MemoryOp(op="remove", scope=SP, match="nope")]
+        )
+        assert "scratch space is under /work" in answer
+
+    def test_an_entry_flagged_earlier_this_session_can_be_addressed(
+        self, harness, session
+    ):
+        """Add-then-correct in one conversation is the commonest shape this
+        tool is used in, and nothing is on disk to match until /conclude."""
+        harness.service.queue_edits(
+            session.session_id, [self.add_op("create_script rejects a bare shebang")]
+        )
+        answer = harness.service.queue_edits(
+            session.session_id,
+            [MemoryOp(op="demote", scope=SP, match="bare shebang")],
+        )
+        assert "NOT queued" not in answer
+        assert len(harness.service.pending_edits(session.session_id)) == 2
+
+    def test_an_identical_operation_is_refused_rather_than_queued_twice(
+        self, harness, session
+    ):
+        harness.service.queue_edits(session.session_id, [self.add_op()])
+        answer = harness.service.queue_edits(session.session_id, [self.add_op()])
+        assert "already queued" in answer
+        assert len(harness.service.pending_edits(session.session_id)) == 1
+
+    def test_an_add_of_something_already_remembered_is_refused(
+        self, harness, session
+    ):
+        write_memory("STAR needs 40G here.")
+        answer = harness.service.queue_edits(session.session_id, [self.add_op()])
+        assert "already present" in answer
+        assert harness.service.pending_edits(session.session_id) == []
+
+    def test_the_queue_state_is_reported_so_the_call_has_an_effect(
+        self, harness, session
+    ):
+        harness.service.queue_edits(session.session_id, [self.add_op("one fact")])
+        answer = harness.service.queue_edits(
+            session.session_id, [self.add_op("another fact")]
+        )
+        assert "(2, nothing saved yet)" in answer
+        assert "one fact" in answer and "another fact" in answer
+
+    def test_the_good_half_of_a_batch_is_kept_and_the_bad_half_named(
+        self, harness, session
+    ):
+        """One bad address must not cost the operations beside it: forcing a
+        whole-batch retry is its own way of generating repeated calls."""
+        answer = harness.service.queue_edits(
+            session.session_id,
+            [self.add_op("a good fact"), MemoryOp(op="remove", match="absent")],
+        )
+        assert "Queued 1 of 2" in answer
+        queued = harness.service.pending_edits(session.session_id)
+        assert [op.text for op in queued] == ["a good fact"]
+
+    def test_the_queue_fills_up_and_then_refuses_terminally(self, harness, session):
+        """The one answer the model cannot act on and reissue, which is what
+        makes it the last defence against a runaway."""
+        for n in range(MEMORY_QUEUE_LIMIT):
+            answer = harness.service.queue_edits(
+                session.session_id, [self.add_op(f"fact {n}", scope=RAG)]
+            )
+            assert "NOT queued" not in answer
+        assert len(harness.service.pending_edits(session.session_id)) == (
+            MEMORY_QUEUE_LIMIT
+        )
+        full = harness.service.queue_edits(
+            session.session_id, [self.add_op("one too many", scope=RAG)]
+        )
+        assert "Refused" in full and "/conclude" in full
+        assert len(harness.service.pending_edits(session.session_id)) == (
+            MEMORY_QUEUE_LIMIT
+        )
+
+    def test_a_batch_straddling_the_limit_takes_what_fits(self, harness, session):
+        for n in range(MEMORY_QUEUE_LIMIT - 1):
+            harness.service.queue_edits(
+                session.session_id, [self.add_op(f"fact {n}", scope=RAG)]
+            )
+        answer = harness.service.queue_edits(
+            session.session_id,
+            [self.add_op("last one in", scope=RAG), self.add_op("over", scope=RAG)],
+        )
+        assert "queue is full" in answer
+        assert len(harness.service.pending_edits(session.session_id)) == (
+            MEMORY_QUEUE_LIMIT
+        )
+
+    def test_a_validated_batch_still_applies_end_to_end(self, harness, session):
+        """The addresses now resolve twice — here and at /conclude — so the
+        two have to agree, or a batch could pass the tool and be dropped at
+        review with only a toast to show for it."""
+        write_memory("the login node is called hpc-login")
+        harness.service.queue_edits(
+            session.session_id,
+            [
+                self.add_op("scratch is /work"),
+                MemoryOp(op="demote", scope=SP, match="login node"),
+                MemoryOp(op="replace", scope=SP, match="scratch is", text="/work2"),
+            ],
+        )
+        assert harness.service.propose_flagged_edits(session) is not None
+        assert harness.service.apply_answered(session.session_id, [True] * 3) == 1
+        loaded = Profile.load("default")
+        assert {(m.text, m.scope) for m in loaded.memories} == {
+            ("/work2", SP),
+            ("the login node is called hpc-login", RAG),
+        }
+        assert harness.service.pending_edits(session.session_id) == []
+
+
+class TestRepeatedRefusalsStop:
+    """The half of the runaway that a better error message does not reach.
+
+    The loop that got shipped to a user was made of *failing* operations, and
+    a refusal touches none of the guards on the accepting side: it never
+    enters the queue, so the queue limit is never approached, and it is never
+    a duplicate of anything queued. Forty identical failing demotes in one
+    session produced forty byte-identical answers — the same unmoving tool
+    result as before, only better worded. So refusals are counted too, and
+    repeating one escalates until the tool stops.
+    """
+
+    def add_op(self, text="STAR needs 40G here.", scope=SP):
+        return MemoryOp(op="add", scope=scope, text=text)
+
+    def miss(self, n=0):
+        """An operation that can never apply: nothing contains this."""
+        return MemoryOp(op="demote", scope=SP, match=f"never matches anything {n}")
+
+    def test_the_same_failing_demote_forty_times_ends_in_a_refusal(
+        self, harness, session
+    ):
+        """The regression, in the shape it was reported: the answers must not
+        all be the same, and one of them must end it."""
+        write_memory("A real entry.")
+        answers = [
+            harness.service.queue_edits(session.session_id, [self.miss()])
+            for _ in range(40)
+        ]
+        assert len(set(answers)) > 1
+        assert any("Do not call this tool again" in answer for answer in answers)
+        assert harness.service.pending_edits(session.session_id) == []
+
+    def test_the_second_identical_refusal_reads_differently_from_the_first(
+        self, harness, session
+    ):
+        """"The reply moved" is the signal that breaks a loop, so the second
+        refusal has to say something the first did not."""
+        first = harness.service.queue_edits(session.session_id, [self.miss()])
+        second = harness.service.queue_edits(session.session_id, [self.miss()])
+        assert second != first
+        assert "told this once already" in second
+        assert "Do not call this tool again" not in second
+
+    def test_the_third_identical_attempt_stops_the_tool(self, harness, session):
+        """The boundary of the repeat ladder: two warnings, then terminal."""
+        for _ in range(MEMORY_REPEAT_LIMIT - 1):
+            answer = harness.service.queue_edits(session.session_id, [self.miss()])
+            assert "Do not call this tool again" not in answer
+        final = harness.service.queue_edits(session.session_id, [self.miss()])
+        assert "Do not call this tool again" in final and "/conclude" in final
+
+    def test_a_stopped_session_refuses_even_a_perfectly_good_change(
+        self, harness, session
+    ):
+        """Terminal means terminal — an answer the model cannot act on and
+        reissue is the whole point of the register."""
+        for _ in range(MEMORY_REPEAT_LIMIT):
+            harness.service.queue_edits(session.session_id, [self.miss()])
+        answer = harness.service.queue_edits(session.session_id, [self.add_op()])
+        assert "Do not call this tool again" in answer
+        assert harness.service.pending_edits(session.session_id) == []
+
+    def test_what_was_already_queued_is_still_named_when_the_tool_stops(
+        self, harness, session
+    ):
+        """Stopping must not also hide what the session banked, or the model
+        has to guess whether its earlier work survived."""
+        harness.service.queue_edits(session.session_id, [self.add_op("a good fact")])
+        for _ in range(MEMORY_REPEAT_LIMIT - 1):
+            harness.service.queue_edits(session.session_id, [self.miss()])
+        final = harness.service.queue_edits(session.session_id, [self.miss()])
+        assert "a good fact" in final
+        assert len(harness.service.pending_edits(session.session_id)) == 1
+
+    def test_one_miss_then_a_correct_operation_is_not_penalised(
+        self, harness, session
+    ):
+        """The model this fix is for reads the inventory it gets back and
+        corrects itself. That must cost it nothing."""
+        write_memory("scratch space is under /work")
+        harness.service.queue_edits(
+            session.session_id, [MemoryOp(op="remove", scope=SP, match="nope")]
+        )
+        answer = harness.service.queue_edits(
+            session.session_id, [MemoryOp(op="remove", scope=SP, match="scratch")]
+        )
+        assert "NOT queued" not in answer
+        assert "Do not call this tool again" not in answer
+        assert len(harness.service.pending_edits(session.session_id)) == 1
+
+    def test_distinct_misses_stop_at_the_ceiling(self, harness, session):
+        """Different wrong operations never repeat, so only the ceiling
+        catches them. Checked at its boundary."""
+        for n in range(MEMORY_REJECT_LIMIT - 1):
+            answer = harness.service.queue_edits(session.session_id, [self.miss(n)])
+            assert "NOT queued" in answer
+            assert "Do not call this tool again" not in answer
+        last = harness.service.queue_edits(
+            session.session_id, [self.miss(MEMORY_REJECT_LIMIT)]
+        )
+        assert "Do not call this tool again" in last
+
+    def test_a_queued_change_clears_the_run_of_refusals(self, harness, session):
+        """Progress is evidence the model is using the tool rather than
+        looping in it, so the ceiling counts refusals *since* the last one
+        that landed. A long working session must not be shut down for misses
+        it recovered from."""
+        for n in range(MEMORY_REJECT_LIMIT - 1):
+            harness.service.queue_edits(session.session_id, [self.miss(n)])
+        harness.service.queue_edits(session.session_id, [self.add_op("a good fact")])
+        for n in range(MEMORY_REJECT_LIMIT - 1):
+            answer = harness.service.queue_edits(
+                session.session_id, [self.miss(100 + n)]
+            )
+            assert "Do not call this tool again" not in answer
+
+    def test_the_repeat_ladder_survives_a_success_in_between(
+        self, harness, session
+    ):
+        """The one thing progress must *not* reset: an operation that was
+        refused twice is no less wrong because a different one worked, and
+        alternating good with bad is otherwise an unbounded loop of its own."""
+        harness.service.queue_edits(session.session_id, [self.miss()])
+        harness.service.queue_edits(session.session_id, [self.add_op("a good fact")])
+        harness.service.queue_edits(session.session_id, [self.miss()])
+        harness.service.queue_edits(session.session_id, [self.add_op("another fact")])
+        final = harness.service.queue_edits(session.session_id, [self.miss()])
+        assert "Do not call this tool again" in final
+
+    def test_one_sessions_refusals_do_not_stop_another(self, harness, session):
+        """The ledger is per session, like the queue it shadows."""
+        for _ in range(MEMORY_REPEAT_LIMIT):
+            harness.service.queue_edits(session.session_id, [self.miss()])
+        other = SessionStore(harness.conn).create(profile="default", title="other")
+        answer = harness.service.queue_edits(other.session_id, [self.add_op()])
+        assert "Do not call this tool again" not in answer
+        assert len(harness.service.pending_edits(other.session_id)) == 1
 
 
 class TestReviewRoundTrip:

@@ -4165,7 +4165,7 @@ class TestMemoryReview:
             for part in entry.parts
             if part.tool == "memory" and part.done
         ]
-        assert results and all("Noted 1 memory change" in r for r in results)
+        assert results and all("Queued 1 memory change" in r for r in results)
 
         # And the fact is there to be offered when the user asks for it.
         llm._outputs = [json.dumps({"proposals": []})]
