@@ -557,7 +557,7 @@ class TestTheChatSelectsClean:
         ui = build()
         ui.chat.cursor = 0
         top = [plain(x) for x in ui.chat.render(120, 30, focused=True)]
-        ui.chat.cursor = 10**9
+        ui.chat.to_end()
         bottom = [plain(x) for x in ui.chat.render(120, 30, focused=True)]
         assert not any(x.startswith("▌") for x in top + bottom)
 
@@ -896,3 +896,79 @@ class TestATurnIsGreyThroughout:
         pane.invalidate()
         pane.cursor = 0
         assert DIM in styled(pane, "412 lines")
+
+
+class TestTheNewestLineStaysOnScreen:
+    """The chat follows its own end — through every way it grows.
+
+    A chat grows in three ways and only one of them is a new row: `chat.append`
+    adds one, `chat.update` fills the row already there as the tokens land, and
+    the live working row comes and goes underneath. Pinning the cursor at the
+    end on *append* alone followed a third of that, so a turn with several
+    steps in it wrote its newest lines below the fold and they had to be
+    scrolled down to by hand. So it is a state (`Pane.follow`) rather than an
+    assertion repeated at each of the places a line can appear.
+    """
+
+    @staticmethod
+    def last_visible(pane: Pane, width: int = 60, height: int = 8) -> str:
+        drawn = [plain(x).rstrip() for x in pane.render(width, height, focused=True)]
+        return next(x for x in reversed(drawn) if x)
+
+    def growing(self, pane: Pane) -> str:
+        """The last line on a screen too short to hold what the pane holds."""
+        return self.last_visible(pane)
+
+    def test_a_row_arriving_scrolls_to_it(self):
+        session = SessionState("s1")
+        session.reset([SAID])
+        session.append(REPLIED)
+        assert "done" in self.growing(session.chat)
+
+    def test_and_so_does_a_row_being_filled_in(self):
+        # The bug this class exists for: an assistant row is appended empty
+        # and then written into, and every token after the first arrived on a
+        # line below the one the screen ended at.
+        session = SessionState("s1")
+        session.reset([SAID])
+        session.append(ChatEntry(kind="assistant", text="", seq=2))
+        for text in ("one", "one two", "one two three\nand a second line"):
+            session.update(ChatEntry(kind="assistant", text=text, seq=2))
+        assert "and a second line" in self.growing(session.chat)
+
+    def test_and_a_step_landing_mid_turn(self):
+        session = SessionState("s1")
+        session.reset([SAID, REPLIED])
+        session.append(WORKED)
+        assert "reasoning" in self.growing(session.chat)
+
+    def test_but_not_once_somebody_has_scrolled_up(self):
+        # Following is a thing the user is doing, and moving off the last line
+        # is how they stop: a reply landing must not yank the screen away from
+        # what is being read.
+        session = SessionState("s1")
+        session.reset([SAID, WORKED])
+        session.chat.render(60, 8, focused=True)
+        session.chat.move(-3, 7, 58)
+        parked = session.chat.cursor
+        session.append(REPLIED)
+        session.chat.render(60, 8, focused=True)
+        assert session.chat.cursor == parked
+        assert not session.chat.follow
+
+    def test_and_scrolling_back_down_to_it_resumes(self):
+        session = SessionState("s1")
+        session.reset([SAID, WORKED])
+        session.chat.render(60, 8, focused=True)
+        session.chat.move(-3, 7, 58)
+        session.chat.move(3, 7, 58)
+        assert session.chat.follow
+        session.append(REPLIED)
+        assert "done" in self.growing(session.chat)
+
+    def test_and_aiming_at_a_row_to_read_it_parks(self):
+        pane = chat_of(SAID, WORKED)
+        pane.render(60, 8, focused=True)
+        pane.cursor = 0
+        assert not pane.follow
+        assert self.last_visible(pane) != ""

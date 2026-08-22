@@ -169,8 +169,22 @@ class Pane:
         self.flush = flush
         # Keys, not positions: see `key_at`.
         self.expanded: set[str] = set()
-        self.cursor = 0  # index into the flattened line list
+        self._cursor = 0  # index into the flattened line list
         self.offset = 0  # first visible flattened line
+        # Whether the cursor is riding the bottom of the list.
+        #
+        # A chat grows in three ways and only one of them is a new row:
+        # `chat.append` adds one, `chat.update` fills the row that is already
+        # there token by token, and the live working row comes and goes under
+        # all of it. Pinning the cursor at the end on append alone therefore
+        # followed a third of the growth — the steps of a long turn arrived
+        # below the fold and had to be scrolled down to by hand. So "the
+        # newest line is the one being read" is kept as a *state* rather than
+        # re-asserted at each of the places a line can appear, and
+        # `_scroll_into_view` — which every path already goes through — is the
+        # one place that honours it. Moving the cursor off the last line is
+        # what turns it off; `to_end` is what turns it back on.
+        self.follow = False
         # A row pinned after the last entry, redrawn from the clock rather
         # than from an event: the working indicator (§4.3 item 16). Kept out
         # of `items` so the chat's rows stay one-for-one with the entries the
@@ -344,6 +358,23 @@ class Pane:
             self._keys.append(self.key_at(len(self.items)))
 
     @property
+    def cursor(self) -> int:
+        """Which flattened line the cursor is on."""
+        return self._cursor
+
+    @cursor.setter
+    def cursor(self, line: int) -> None:
+        """Park it on that line — which is also a statement that it is parked.
+
+        Assigning a line is aiming, and aiming is what somebody does instead
+        of watching the end. The two callers that mean the opposite say so:
+        `to_end` rides deliberately, and `_landed` puts `follow` back when the
+        line aimed at turns out to *be* the last one.
+        """
+        self._cursor = line
+        self.follow = False
+
+    @property
     def head_gap(self) -> str:
         """The space between a row's fold marker and its head on this pane.
 
@@ -481,22 +512,49 @@ class Pane:
 
     # ----------------------------------------------------------- navigation
 
+    def to_end(self) -> None:
+        """Put the cursor on the last line, and keep it there as lines arrive.
+
+        What "the newest line is the one being read" is spelled as. The number
+        is a sentinel rather than a real index because the caller — a session
+        taking a row off the wire — has no terminal width, and so cannot know
+        which flattened line the last one is. `_scroll_into_view` clamps it at
+        the next frame; `follow` is what survives that clamp.
+        """
+        self._cursor = 10**9
+        self.follow = True
+
+    def _landed(self, width: int) -> None:
+        """The cursor was just aimed somewhere. Decide whether it still rides.
+
+        Aiming it at the last line is indistinguishable from following, and
+        should be: opening the newest row is not a request to stop watching
+        the newest row.
+        """
+        self.follow = self._cursor >= len(self.flat(width)) - 1
+
     def _go_to(self, item: int, width: int) -> None:
         for row, (owner, _, _) in enumerate(self.flat(width)):
             if owner == item:
-                self.cursor = row
-                return
+                self._cursor = row
+                break
+        self._landed(width)
 
     def _go_to_key(self, key: str, width: int) -> None:
         self.flat(width)
         for row, name in enumerate(self._keys):
             if name == key:
-                self.cursor = row
-                return
+                self._cursor = row
+                break
+        self._landed(width)
 
     def _scroll_into_view(self, view_h: int, total: int) -> None:
         view_h = max(1, view_h)
-        self.cursor = max(0, min(self.cursor, max(0, total - 1)))
+        if self.follow:
+            # Lines have arrived below it since the last frame — a step, a
+            # token, the working row — and the cursor is riding the end.
+            self._cursor = max(0, total - 1)
+        self._cursor = max(0, min(self._cursor, max(0, total - 1)))
         self.offset = max(0, min(self.offset, max(0, total - view_h)))
         if self.cursor < self.offset:
             self.offset = self.cursor
@@ -507,7 +565,11 @@ class Pane:
         total = len(self.flat(width))
         if not total:
             return
-        self.cursor = max(0, min(total - 1, self.cursor + delta))
+        self._cursor = max(0, min(total - 1, self._cursor + delta))
+        # Scrolling up is how somebody says they are reading something other
+        # than the newest line, and scrolling back down to it says they are
+        # done saying it.
+        self.follow = self._cursor >= total - 1
         self._scroll_into_view(view_h, total)
 
     def expand(self, width: int) -> bool:
