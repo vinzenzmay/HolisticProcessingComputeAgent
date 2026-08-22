@@ -1561,10 +1561,13 @@ class RowUI:
                 ("^↑^↓", "panel"),
                 ("⇧enter", "new line"),
                 ("⇧tab", "mode"),
-                ("^←→", "word"),
+                # No word-motion, selection or cut-word pair here: they are
+                # the editing keys somebody either already has in their
+                # fingers or looks up once, and a footer that lists them
+                # spends its width — the row wraps, and the pairs that wrap
+                # off the end are the ones at the back — on keys nobody scans
+                # the footer for. "? keys" still names all three.
                 ("^l", "switch llm"),
-                ("⇧←→", "select"),
-                ("^⌫ ^del", "cut word"),
                 ("^u", "clear"),
                 ("^e", "$editor"),
                 ("?", "keys"),
