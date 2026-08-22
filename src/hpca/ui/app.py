@@ -2256,6 +2256,15 @@ class RowUI:
             # exactly that reason. Everywhere else shift+tab is the way back
             # up the ring, as tab is the way down; ctrl+↑ leaves the box.
             self._cycle_mode()
+        elif key == "tab":
+            # The ring does not stop here. Tab walked the focus down every
+            # other row and then went quiet at the box, where it fell through
+            # to the draft as whitespace — so the one row it is hardest to
+            # leave by accident was also the only one it could not be walked
+            # out of, and the way on was a key (ctrl+↓) nothing on screen
+            # names. Shift+tab still belongs to the mode here, which is why
+            # this is not symmetric: the way back up is ctrl+↑.
+            self.focus = WATCHERS
         elif key == "ctrl-up":
             self.focus = CHAT
         elif key == "ctrl-down":

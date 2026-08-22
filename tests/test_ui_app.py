@@ -236,6 +236,26 @@ def test_ctrl_down_is_how_the_chat_reaches_the_message_row():
     assert ui.focus == INPUT
 
 
+def test_tab_carries_on_out_of_the_message_row():
+    # Tab walked the ring down every other row and then went quiet here,
+    # falling through to the draft as whitespace — so the focus could only be
+    # taken on round by a key the footer never names.
+    ui = in_the_box()
+    ui.handle("tab", 120, 40)
+    assert ui.focus == WATCHERS
+    assert ui.input.text() == ""
+
+
+def test_and_all_the_way_round_from_where_it_starts():
+    ui = build()
+    seen = []
+    for _ in range(4):
+        seen.append(ui.focus)
+        ui.handle("tab", 120, 40)
+    assert sorted(seen) == sorted(ui._ring())  # every row, once
+    assert ui.focus == seen[0]  # and back where it started
+
+
 def test_typing_lands_in_the_buffer():
     assert typed(in_the_box(), "hello there").input.text() == "hello there"
 
