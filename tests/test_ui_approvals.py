@@ -924,10 +924,49 @@ class TestTheGenericConfirm:
     quit and the skill screens are M8), and the one live caller today is the
     interrupt (see `test_ui_turn.py`)."""
 
-    async def test_it_draws_over_whatever_is_on_screen(self, wire):
+    async def test_it_draws_instead_of_whatever_is_on_screen(self, wire):
         wire.ui.ask("Really quit?")
         assert "Really quit?" in wire.screen()
         assert "(y) yes · (n) no" in wire.screen()
+
+    async def test_and_it_is_the_only_thing_left_to_read(self, wire):
+        # Three rows spliced into a full screen read as another band of it.
+        # The question is a gate, so the screen it gates is cleared.
+        await wire.tell(protocol.SessionRows(rows=list(ROWS)))
+        busy = [plain(row) for row in wire.frame() if plain(row).strip()]
+        assert len(busy) > 3, "the frame under the question was already empty"
+
+        wire.ui.ask("Really quit?")
+        rows = [plain(row) for row in wire.frame() if plain(row).strip()]
+        assert [row.strip() for row in rows] == [
+            "── confirm " + "─" * (wire.width - 11),
+            "Really quit?",
+            "(y) yes · (n) no · (esc) no",
+        ]
+
+    async def test_and_no_puts_back_the_frame_it_hid(self, wire):
+        # Which is what makes the question cheap to answer wrongly: the frame
+        # underneath is built the same way while it is up, so the panes keep
+        # the heights and the scroll they had.
+        await wire.tell(protocol.SessionRows(rows=list(ROWS)))
+        before = wire.frame()
+        wire.ui.ask("Really quit?")
+        await wire.press("n")
+        assert wire.frame() == before
+
+    @pytest.mark.parametrize(
+        "height,rows",
+        [
+            (1, ["Really quit?"]),
+            (2, ["Really quit?", "(y) yes · (n) no · (esc) no"]),
+        ],
+    )
+    async def test_a_terminal_too_short_keeps_the_question(self, wire, height, rows):
+        # The rule is the decoration, and it is decorating nothing now.
+        wire.ui.ask("Really quit?")
+        drawn = [plain(row) for row in wire.ui.render(wire.width, height)]
+        assert [row.strip() for row in drawn] == rows
+        assert widths(drawn) == {wire.width}
 
     @pytest.mark.parametrize("width", [80, 100, 137])
     async def test_and_the_frame_is_still_the_terminal(self, wire, width):

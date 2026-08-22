@@ -1336,14 +1336,20 @@ class RowUI:
         )
 
     def _over_confirm(self, out: list[str], width: int) -> list[str]:
-        """The generic yes/no, drawn over the finished frame (§4.3 item 22).
+        """The generic yes/no, and nothing else (§4.3 item 22).
 
-        Over rather than in: a confirmation is asked *about* what is on screen
-        — really quit, interrupt this turn, apply this signature — and it can
-        arrive on top of an overlay, which is what the Textual app's
-        ConfirmScreen did by being pushed on the screen stack. It is also the
-        one thing here that is deliberately modal: it is a question with two
-        answers and no third thing to be doing meanwhile.
+        Instead of over the finished frame: a confirmation is the one thing
+        here that is deliberately modal — a question with two answers and no
+        third thing to be doing meanwhile — and three rows spliced into the
+        middle of a full screen read as one more band of it rather than as a
+        gate. So the frame it was asked over is built, measured, and then
+        cleared: every row it came to is replaced by blanks and the question
+        is the only thing left to read.
+
+        Built and then cleared, rather than skipped, is what makes "no" cost
+        nothing: the panes keep the heights and the scroll they had, and the
+        frame after the answer is the frame that would have been drawn had the
+        question never been asked.
         """
         question = self.confirm
         if question is None:
@@ -1353,10 +1359,14 @@ class RowUI:
             BOLD + pad(f"  {question.question}", width) + RESET,
             DIM + pad("  (y) yes · (n) no · (esc) no", width) + RESET,
         ]
-        rows = rows[: len(out)]  # a terminal too short for the question
+        # A terminal too short for all three keeps them in the order they are
+        # worth: the question, then the way to answer it, then the rule, which
+        # is decoration on a screen that has nothing left on it to divide.
+        rows = [rows[i] for i in sorted([1, 2, 0][: len(out)])]
         at = max(0, (len(out) - len(rows)) // 2)
-        out[at : at + len(rows)] = rows
-        return out
+        blank = [" " * width] * len(out)
+        blank[at : at + len(rows)] = rows
+        return blank
 
     def _render_status(self, width: int) -> list[str]:
         """The mode bar and the context meter, sharing one row.
@@ -1425,8 +1435,10 @@ class RowUI:
         # that goes. Leaving the message box is ^↑, not escape: escape has a
         # job now.
         common = [("^↑^↓", "panel"), ("esc esc", "stop"), ("?", "keys")]
-        if self.confirm is not None:
-            return [("y", "yes"), ("n", "no"), ("esc", "no")]
+        # Nothing for `self.confirm`: the dialog blanks the footer along with
+        # the rest of the frame and carries its own two answers on its own
+        # row. Keys that stay the keys of the row underneath are what lets the
+        # layout — and so the frame a "no" comes back to — stay put.
         if self.menu():
             # While a command is being named the menu owns ↑/↓ and the two keys
             # that fill one in, and saying so is the only way anybody finds tab.
