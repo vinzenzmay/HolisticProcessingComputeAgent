@@ -53,6 +53,7 @@ from hpca.protocol import (
     SessionFocus,
     SessionFork,
     SessionList,
+    SessionMove,
     SessionNew,
     SessionOpen,
     SessionRename,
@@ -71,6 +72,7 @@ from hpca.protocol import (
     TurnSubmit,
     TurnUnqueue,
     WatchDrop,
+    WatchMove,
     WatchPeek,
 )
 from hpca.sessions import SessionStore
@@ -1157,6 +1159,66 @@ class TestSessionList:
         queue = subscribe(service)
         await service.handle(SessionList())
         assert only(await drain(queue), "SessionRows").rows[0].flags == ["decision"]
+
+
+class TestReorderingTheSidebar:
+    """`session.move` — alt+↑/alt+↓ on a sidebar row.
+
+    The order is a fact about the database, which a front-end may not read
+    (§4.2 rule 2), so the arrangement is made here and comes back as the
+    sidebar. That is what makes it survive a restart, and what stops the next
+    frame putting a locally-shuffled row back where it was.
+    """
+
+    def two(self, conn):
+        """`session` fixture aside, a second row to trade places with. Newer,
+        so it starts above it."""
+        return SessionStore(conn).create(profile="default", title="the other one")
+
+    async def test_a_move_rearranges_the_store_and_re_states_the_sidebar(
+        self, service, session, conn
+    ):
+        self.two(conn)
+        queue = subscribe(service)
+        await service.handle(SessionMove(session_id=session.session_id, delta=-1))
+        rows = only(await drain(queue), "SessionRows").rows
+        assert [r.title for r in rows] == ["a session", "the other one"]
+        # And the store agrees, which is the half that outlives the process.
+        assert [s.title for s in SessionStore(conn).list_all()] == [
+            "a session",
+            "the other one",
+        ]
+
+    async def test_and_down_again_puts_it_back(self, service, session, conn):
+        self.two(conn)
+        await service.handle(SessionMove(session_id=session.session_id, delta=-1))
+        queue = subscribe(service)
+        await service.handle(SessionMove(session_id=session.session_id, delta=+1))
+        rows = only(await drain(queue), "SessionRows").rows
+        assert [r.title for r in rows] == ["the other one", "a session"]
+
+    async def test_a_row_at_the_end_still_gets_the_sidebar_back(
+        self, service, session, conn
+    ):
+        # Nothing moved, and the list is sent anyway: the front-end is
+        # entitled to have moved the row itself while it waited, and this
+        # frame is what puts it back.
+        other = self.two(conn)
+        queue = subscribe(service)
+        await service.handle(SessionMove(session_id=other.session_id, delta=-1))
+        rows = only(await drain(queue), "SessionRows").rows
+        assert [r.title for r in rows] == ["the other one", "a session"]
+
+    async def test_moving_a_row_that_is_gone_says_nothing(self, service, session):
+        # Unlike every other session command, which warns through `_known`:
+        # this one changes the order two rows are drawn in, and a keypress
+        # against a sidebar that has just lost a row is worth a repaint rather
+        # than an interruption.
+        queue = subscribe(service)
+        await service.handle(SessionMove(session_id="no-such-session", delta=-1))
+        events = await drain(queue)
+        assert "Notify" not in kinds(events)
+        assert [r.title for r in only(events, "SessionRows").rows] == ["a session"]
 
 
 class TestSessionNew:
@@ -4159,6 +4221,86 @@ class TestWatchBoxes:
         queue = subscribe(service)
         await service.handle(WatchDrop(watch_id=404))
         assert only(await drain(queue), "Notify").severity == "warning"
+
+    def column(self, service, session, conn, home, *names):
+        """A column of watch boxes, top to bottom, on the focused session."""
+        service._deps.focused_session_id = session.session_id
+        store = WatchStore(conn)
+        return [
+            store.add(
+                kind=KIND_LOG,
+                target=str(home / f"{name}.log"),
+                label=name,
+                session_id=session.session_id,
+            )
+            for name in names
+        ]
+
+    async def test_moving_a_box_rearranges_the_column_and_repaints_it(
+        self, service, session, conn, home
+    ):
+        _, b, _ = self.column(service, session, conn, home, "a", "b", "c")
+        queue = subscribe(service)
+        await service.handle(WatchMove(watch_id=b.id, delta=-1))
+        rows = only(await drain(queue), "PanelUpdate").rows
+        assert [r.title for r in rows] == ["b", "a", "c"]
+        # The store is where it has to have landed: the panel is repainted
+        # from that every two seconds, and read back from it after a restart.
+        assert [
+            w.label for w in WatchStore(conn).list(session_id=session.session_id)
+        ] == ["b", "a", "c"]
+
+    async def test_a_box_at_the_end_still_gets_the_column_back(
+        self, service, session, conn, home
+    ):
+        # Nothing moved, and the frame is sent anyway — the front-end may have
+        # moved the box itself while it waited (`ui.pane.Pane.reorder` does),
+        # and this is what puts it back.
+        a, _ = self.column(service, session, conn, home, "a", "b")
+        queue = subscribe(service)
+        await service.handle(WatchMove(watch_id=a.id, delta=-1))
+        rows = only(await drain(queue), "PanelUpdate").rows
+        assert [r.title for r in rows] == ["a", "b"]
+
+    async def test_moving_a_box_that_is_gone_says_nothing(
+        self, service, session, conn, home
+    ):
+        # The column repaints on a timer, so the box under the cursor can be
+        # dropped between the keypress and the write. Not worth a warning: the
+        # repaint that comes back already tells the user what is there.
+        self.column(service, session, conn, home, "a")
+        queue = subscribe(service)
+        await service.handle(WatchMove(watch_id=404, delta=-1))
+        events = await drain(queue)
+        assert "Notify" not in kinds(events)
+        assert [r.title for r in only(events, "PanelUpdate").rows] == ["a"]
+
+    async def test_one_sessions_column_cannot_disturb_anothers(
+        self, service, session, conn, home
+    ):
+        # Each session has its own column and only one is ever on screen; a
+        # store-wide swap could put a box next to one from a conversation the
+        # user is not even looking at.
+        other = SessionStore(conn).create(profile="default", title="elsewhere")
+        self.column(service, session, conn, home, "a", "b")
+        store = WatchStore(conn)
+        for name in ("x", "y"):
+            store.add(
+                kind=KIND_LOG,
+                target=str(home / f"{name}.log"),
+                label=name,
+                session_id=other.session_id,
+            )
+        mine = store.list(session_id=session.session_id)[1]
+        await service.handle(WatchMove(watch_id=mine.id, delta=-1))
+        assert [w.label for w in store.list(session_id=session.session_id)] == [
+            "b",
+            "a",
+        ]
+        assert [w.label for w in store.list(session_id=other.session_id)] == [
+            "x",
+            "y",
+        ]
 
 
 class TestRunningWork:

@@ -118,6 +118,7 @@ from hpca.protocol import (
     SessionFocus,
     SessionFork,
     SessionList,
+    SessionMove,
     SessionNew,
     SessionOpen,
     SessionRename,
@@ -146,6 +147,7 @@ from hpca.protocol import (
     TurnUnqueue,
     TurnUnqueued,
     WatchDrop,
+    WatchMove,
     WatchPeek,
     WatchPeeked,
 )
@@ -409,6 +411,9 @@ class AgentService:
         if isinstance(command, SessionRollback):
             await self._rollback_session(command.session_id, command.index)
             return
+        if isinstance(command, SessionMove):
+            self._move_session(command.session_id, command.delta)
+            return
         if isinstance(command, SessionFocus):
             # The one sanctioned answer to "what is the user looking at".
             self._deps.focused_session_id = command.session_id
@@ -587,6 +592,9 @@ class AgentService:
             return
         if isinstance(command, WatchDrop):
             await self._drop_watch(command.watch_id)
+            return
+        if isinstance(command, WatchMove):
+            await self._move_watch(command.watch_id, command.delta)
             return
         if isinstance(command, ProcessKill):
             await self._kill_process(command.pid)
@@ -838,6 +846,22 @@ class AgentService:
             )
             return
         self._store_title(session, title, by="user")
+        self._emit_rows()
+
+    def _move_session(self, session_id: str, delta: int) -> None:
+        """`session.move`: rearrange the sidebar, and re-state it.
+
+        The sidebar goes out again whether or not the row actually moved, for
+        the reason `_move_watch` gives at more length: the list on screen is
+        the answer to the keypress, and a front-end that shuffled its own rows
+        ahead of the reply needs the core's order to land on top of it.
+
+        Silent when the row is gone, unlike every other session command
+        (`_known` warns): those change a conversation, and this changes the
+        order two of them are drawn in. A keypress against a sidebar that has
+        just lost a row is worth redrawing the sidebar, not interrupting for.
+        """
+        self._sessions.move(session_id, delta)
         self._emit_rows()
 
     def _store_title(self, session, title: str, *, by: str, log=None) -> None:
@@ -1969,6 +1993,25 @@ class AgentService:
             )
             return
         self._deps.emit(Notify(text=f"Stopped watching {watch.title}"))
+        await self._pollers.refresh_panel(force=True)
+
+    async def _move_watch(self, watch_id: int, delta: int) -> None:
+        """`watch.move`: rearrange the column, and say what it now looks like.
+
+        The repaint is forced and unconditional — sent even when nothing
+        moved, and even though `refresh_panel` would otherwise skip a column
+        that has not changed. The column on screen is the answer to a
+        keypress, and the front-end is entitled to have moved the box itself
+        while it waited (`ui.pane.Pane.reorder` does). A frame per press is
+        cheap; a box left one row from where the store thinks it is, until
+        some unrelated poll happens to change the column, is not.
+
+        Nothing is said when the move does not happen. At the top or the
+        bottom there is no neighbour to trade with, which is what holding the
+        key down looks like, and a box dropped between the keypress and the
+        write is the same stale-cursor case `watch.drop` already tolerates.
+        """
+        await self._deps.db(lambda conn: WatchStore(conn).move(watch_id, delta))
         await self._pollers.refresh_panel(force=True)
 
     # ------------------------------------------------------- running work

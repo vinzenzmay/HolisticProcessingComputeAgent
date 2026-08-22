@@ -580,6 +580,32 @@ class SessionRollback(_Rewind):
     TYPE: ClassVar[str] = "session.rollback"
 
 
+class SessionMove(Command):
+    """alt+↑ / alt+↓ on a sidebar row: shift it one place, for good.
+
+    ``delta`` is an offset and not a slot — ``-1`` for up, ``+1`` for down —
+    because that is the whole gesture the user has. Two presses walk a row
+    past two others; nothing in a keypress can say "third from the top", so
+    nothing in the command tries to.
+
+    The core answers with `session.rows` (and `watch.move` with
+    `panel.update`), which is the point of routing a keypress through the
+    socket at all rather than letting the front-end shuffle its own list. The
+    arrangement is a fact about the database, which §4.2 rule 2 puts out of a
+    front-end's reach, so the only order that survives a restart is the one
+    the core sends back — and a UI that reordered locally would be overwritten
+    by the very next frame anyway.
+
+    A move at the end of the list changes nothing and is answered the same
+    way, with the unchanged list. That is not a refusal worth a message: it is
+    what holding the key down looks like once the row has arrived.
+    """
+
+    TYPE: ClassVar[str] = "session.move"
+    session_id: str
+    delta: int
+
+
 class SessionFocus(Command):
     """Which session the user is looking at; null when none is (§4.4).
 
@@ -1059,6 +1085,23 @@ class WatchPeek(Command):
 class WatchDrop(Command):
     TYPE: ClassVar[str] = "watch.drop"
     watch_id: int
+
+
+class WatchMove(Command):
+    """alt+↑ / alt+↓ on a watch box: shift it one place in the column.
+
+    The right column's half of `session.move`, in the same shape and for the
+    same reasons — see there. Answered with `panel.update`, the column whole,
+    in the order the store now holds.
+
+    Scoped by the core to the column the box is in, which is the session that
+    registered it: a store-wide swap would put it next to a box belonging to a
+    conversation the user is not even looking at.
+    """
+
+    TYPE: ClassVar[str] = "watch.move"
+    watch_id: int
+    delta: int
 
 
 class Shutdown(Command):

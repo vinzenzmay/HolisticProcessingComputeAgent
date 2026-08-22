@@ -35,6 +35,10 @@ class Session:
     thinking: str = ""
     # When something last happened here, ISO-8601 UTC — see `touch`.
     last_active: str = ""
+    # Where the row sits in the sidebar, 1 at the top. Assigned on insert and
+    # only ever rewritten by ``SessionStore.move``; see there for why it is
+    # dense, and why a new session is given the top rather than the bottom.
+    position: int = 0
 
 
 class SessionStore:
@@ -64,12 +68,28 @@ class SessionStore:
             # a session with no turns in it yet reads as new rather than as
             # never having happened.
             last_active=now,
+            # The top of the sidebar; see below.
+            position=1,
         )
         session.checkpoint_ref = session.session_id
+        # A new conversation belongs at the top, which is where newest-first
+        # always put it and where the front-end that opens it expects to find
+        # it. That is the opposite of a new watch box, which lands at the
+        # bottom of its column — the two lists are read in opposite
+        # directions, so "where a new one appears" is opposite too.
+        #
+        # Making room by pushing everyone down one, rather than handing out
+        # ``MIN(position) - 1``: a decreasing counter walks into 0, which is
+        # the "never assigned" sentinel the migration in db.py keys on, and a
+        # session that collided with it would be re-seeded to somewhere else
+        # entirely on the next start. Rewriting every row costs one statement
+        # over the few dozen rows a sidebar holds, and only when a
+        # conversation is created, which is a human-paced event.
+        self._conn.execute("UPDATE sessions SET position = position + 1")
         self._conn.execute(
             "INSERT INTO sessions (session_id, profile, title, created_at, "
-            "checkpoint_ref, mode, backend, thinking, last_active) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "checkpoint_ref, mode, backend, thinking, last_active, position) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 session.session_id,
                 session.profile,
@@ -80,6 +100,7 @@ class SessionStore:
                 session.backend,
                 session.thinking,
                 session.last_active,
+                session.position,
             ),
         )
         self._conn.commit()
@@ -122,22 +143,79 @@ class SessionStore:
         )
         self._conn.commit()
 
+    # Sidebar order: the user's arrangement first, newest-first to break ties.
+    # The fallback is what a database whose rows all still carry position 0
+    # sorts by, so the column reads exactly as it did before `position`
+    # existed even if the backfill in db.py never ran — and it is the pair the
+    # backfill itself reproduces, so nothing jumps on the release that
+    # introduces the column.
+    _ORDER = "ORDER BY position, created_at DESC, rowid DESC"
+
     def list(self, *, profile: str) -> list[Session]:
         rows = self._conn.execute(
-            "SELECT * FROM sessions WHERE profile = ? "
-            "ORDER BY created_at DESC, rowid DESC",
+            f"SELECT * FROM sessions WHERE profile = ? {self._ORDER}",
             (profile,),
         ).fetchall()
         return [self._to_session(row) for row in rows]
 
     def list_all(self) -> list[Session]:
-        """Every session, newest first. The sessions column shows them all:
+        """Every session in sidebar order. The sessions column shows them all:
         each session carries its own profile, so filtering by one would hide
-        the rest whenever a differently-profiled session is open."""
-        rows = self._conn.execute(
-            "SELECT * FROM sessions ORDER BY created_at DESC, rowid DESC"
-        ).fetchall()
+        the rest whenever a differently-profiled session is open.
+
+        Newest first until the user rearranges it with alt+↑/alt+↓, after
+        which it is whatever they arranged — see `move`.
+        """
+        rows = self._conn.execute(f"SELECT * FROM sessions {self._ORDER}").fetchall()
         return [self._to_session(row) for row in rows]
+
+    def move(self, session_id: str, delta: int) -> bool:
+        """Shift a row one step up (``-1``) or down (``+1``) in the sidebar.
+
+        The same gesture as the watch column's, and deliberately the same
+        shape: a swap with the neighbour rather than an absolute slot, because
+        alt+↑ pressed twice is how a row walks past two others and there is no
+        way to say "third from the top".
+
+        Over the whole sidebar rather than one profile's rows, because the
+        whole sidebar is what is drawn (`list_all`): scoping the swap to a
+        profile would let a row jump over the differently-profiled rows
+        between it and its neighbour, landing somewhere the user did not aim.
+
+        Renumbering the list rather than swapping two numbers, for the reason
+        `WatchStore.move` gives: rows that predate the column all share
+        position 0, and swapping two zeroes changes nothing at all. Numbering
+        from 1 also keeps 0 meaning "never assigned", which the backfill in
+        db.py keys on.
+
+        Deleting a session leaves a hole in the numbers and that is all it
+        does — the order of what is left is unchanged, and the next move
+        closes the gaps anyway.
+
+        Returns whether anything moved: at the top or the bottom there is no
+        neighbour to trade with, and that is an ordinary outcome of holding
+        the key down, not a failure worth a message.
+        """
+        rows = self.list_all()
+        index = next(
+            (i for i, row in enumerate(rows) if row.session_id == session_id),
+            None,
+        )
+        if index is None:
+            return False
+        target = index + delta
+        if not 0 <= target < len(rows):
+            return False
+        rows[index], rows[target] = rows[target], rows[index]
+        self._conn.executemany(
+            "UPDATE sessions SET position = ? WHERE session_id = ?",
+            [
+                (position, row.session_id)
+                for position, row in enumerate(rows, 1)
+            ],
+        )
+        self._conn.commit()
+        return True
 
     def set_profile(self, session_id: str, profile: str) -> None:
         self._conn.execute(
@@ -199,4 +277,5 @@ class SessionStore:
             last_active=(
                 row["last_active"] if "last_active" in row.keys() else ""
             ),
+            position=row["position"] if "position" in row.keys() else 0,
         )

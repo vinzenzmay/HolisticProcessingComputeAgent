@@ -131,6 +131,12 @@ SPEC_COMMANDS = {
     "job.cancel",
     "watch.peek",
     "watch.drop",
+    # Nor these two, and they are the same command twice: the arrangement of
+    # the sidebar and of the watch column belongs to the user, and it lives in
+    # the database, which §4.2 rule 2 puts out of a front-end's reach. A UI
+    # that shuffled its own rows would have them put back by the next frame.
+    "session.move",
+    "watch.move",
     "shutdown",
 }
 

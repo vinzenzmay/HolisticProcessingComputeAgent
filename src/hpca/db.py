@@ -58,7 +58,17 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- submitted, or one recorded. What the sidebar shows next to the title, so
     -- a column of thirty sessions says which ones are alive. Empty means never
     -- touched since the column arrived; the backfill below seeds it.
-    last_active TEXT NOT NULL DEFAULT ''
+    last_active TEXT NOT NULL DEFAULT '',
+    -- Where the row sits in the sidebar, counting from 1 at the top. The
+    -- sidebar used to be sorted newest-first and nothing else, which is a
+    -- reasonable default and a bad permanent arrangement: the conversation
+    -- somebody works in all week sinks under every throwaway one. So the
+    -- order is the user's as soon as they touch alt+↑/alt+↓ — see
+    -- SessionStore.move, which is where the numbers are written — and the
+    -- ordering falls back to newest-first for rows that share a position, so
+    -- a database whose rows all still carry 0 lists exactly as it did before
+    -- the column existed.
+    position INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS symbols (
     name TEXT NOT NULL,
@@ -146,6 +156,7 @@ ADDED_COLUMNS = [
     ("sessions", "backend", "TEXT NOT NULL DEFAULT ''"),
     ("sessions", "thinking", "TEXT NOT NULL DEFAULT ''"),
     ("sessions", "last_active", "TEXT NOT NULL DEFAULT ''"),
+    ("sessions", "position", "INTEGER NOT NULL DEFAULT 0"),
     ("watches", "position", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
@@ -163,9 +174,26 @@ ADDED_COLUMNS = [
 # last worked in — the messages have stamps only from the same release. Its
 # creation is the one honest thing left to say about it, and it is at least the
 # right order of magnitude for a sidebar people read as "old / recent".
+#
+# `sessions.position` is the same problem the other way up. Every session made
+# before the column existed carries 0, and the sidebar has always been
+# newest-first, so the seed has to *reproduce* newest-first: each row is given
+# one more than the number of sessions newer than it, which numbers the whole
+# sidebar densely from 1 at the top in exactly the order the user last saw it.
+# The comparison is (created_at, rowid) because that is the pair the old
+# ORDER BY used, so no row moves on the release that introduces the column.
+# Dense and starting at 1 for the same reason as the watches: it leaves
+# "position = 0" meaning "never assigned", which is what this statement and
+# `SessionStore.create` both key on.
 BACKFILLS = [
     "UPDATE watches SET position = id WHERE position = 0",
     "UPDATE sessions SET last_active = created_at WHERE last_active = ''",
+    "UPDATE sessions SET position = ("
+    "    SELECT COUNT(*) + 1 FROM sessions AS newer"
+    "     WHERE newer.created_at > sessions.created_at"
+    "        OR (newer.created_at = sessions.created_at"
+    "            AND newer.rowid > sessions.rowid)"
+    ") WHERE position = 0",
 ]
 
 # Indexes an older database may still carry under an old definition.
