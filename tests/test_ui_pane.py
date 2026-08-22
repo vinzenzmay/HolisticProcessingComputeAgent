@@ -5,10 +5,11 @@ the behaviour: what `→` means depends on whether the entry is already open and
 on whether it has a body at all.
 """
 
+from hpca.ui.ansi import BOLD, DIM
 from hpca.ui.app import CHAT, SESSIONS, WATCHERS
 from hpca.ui.demo import build
 from hpca.ui.pane import Fold, Item, Pane
-from hpca.ui.state import ChatEntry
+from hpca.ui.state import ChatEntry, ChatPart, SessionState
 from tests.ui_harness import frame, plain, widths
 
 # 120 columns of terminal, minus the two the gutter takes.
@@ -424,6 +425,11 @@ class TestTheChatSelectsClean:
         ui.focus = CHAT
         if opened:
             ui.chat.expand_all(118)
+        else:
+            # A transcript opens its newest row by itself, and these are about
+            # what a *closed* row draws — so this is the user having folded it
+            # away again, which is a thing they are allowed to do.
+            ui.chat.collapse_all(118)
         return ui
 
     def said(self, seq=1, kind="user"):
@@ -595,3 +601,166 @@ class TestABodyIsWrappedOnce:
     def test_and_clips_again_at_a_new_width(self):
         item = Item(head="you", preview="a line long enough to want cutting")
         assert item.clipped(12) != item.clipped(80)
+
+
+# ------------------------------------------------- what the chat looks like
+
+
+def chat_of(*entries: ChatEntry) -> Pane:
+    """One chat pane holding exactly these rows, filled the way the real one
+    is — through `reset`, so what opens itself opens itself."""
+    session = SessionState("s1")
+    session.reset(list(entries))
+    return session.chat
+
+
+def styled(pane: Pane, text: str, width: int = 60, height: int = 12) -> str:
+    """The drawn line whose visible text is ``text``, escapes and all."""
+    for line in pane.render(width, height, focused=True):
+        if plain(line).rstrip() == text:
+            return line
+    raise AssertionError(f"no line reading {text!r}")
+
+
+SAID = ChatEntry(kind="user", text="run it again", seq=1)
+REPLIED = ChatEntry(kind="assistant", text="done", seq=2)
+WORKED = ChatEntry(
+    kind="thinking",
+    seq=3,
+    steps=2,
+    parts=[
+        ChatPart(
+            kind="call",
+            tool="read_file",
+            target="/scratch/run.log",
+            result="412 lines",
+            done=True,
+        ),
+        ChatPart(kind="reasoning", text="two shards, one temp path", done=True),
+    ],
+)
+
+
+class TestTheChatFillsFromTheBottom:
+    """A conversation shorter than the pane hangs from the foot of it.
+
+    The newest line is the one being read, and it has to be the same distance
+    from the message box on every frame: a log that grew downwards from the
+    title rule moves the thing the eye is looking for every time a row lands.
+    Only here — a list of sessions is a list, and one that started half way
+    down its column would read as scrolled rather than as short.
+    """
+
+    def test_a_short_conversation_sits_at_the_foot_of_the_pane(self):
+        drawn = [plain(x).rstrip() for x in chat_of(SAID, REPLIED).render(
+            60, 12, focused=True
+        )]
+        assert drawn[-2:] == ["▾ hpca", "done"]
+
+    def test_and_the_room_it_does_not_need_is_above_it(self):
+        drawn = [plain(x).rstrip() for x in chat_of(SAID, REPLIED).render(
+            60, 12, focused=True
+        )]
+        assert drawn[1:5] == ["", "", "", ""]
+        assert drawn[0].startswith("── chat")  # the title stays where it is
+
+    def test_the_pane_is_still_exactly_as_tall_as_it_was_asked_for(self):
+        drawn = chat_of(SAID).render(60, 12, focused=True)
+        assert len(drawn) == 12
+        assert widths(drawn) == {60}
+
+    def test_a_conversation_too_long_to_fit_is_untouched(self):
+        # The bottom is where a scrolled pane already ends; there is no room
+        # to give back and nothing to move.
+        pane = chat_of(*[ChatEntry(kind="user", text=f"n{n}", seq=n) for n in
+                         range(1, 30)])
+        drawn = [plain(x).rstrip() for x in pane.render(60, 12, focused=True)]
+        assert "" not in drawn[1:]
+
+    def test_a_list_still_fills_from_the_top(self):
+        # The sessions pane is not flush, and a gap under its title would read
+        # as a list that had been scrolled away from.
+        pane = Pane("sessions", [Item(head="one"), Item(head="two")])
+        drawn = [plain(x).rstrip() for x in pane.render(60, 12, focused=True)]
+        assert drawn[1:3] == ["▌   one", "    two"]
+
+    def test_the_highlight_lands_on_the_row_the_keys_act_on(self):
+        # The blank lines are drawn above the rows, so every flattened line
+        # moves down by however many there are. If the cursor line and the row
+        # the pane reports as current came apart here, → would open a
+        # different entry from the one under the highlight.
+        pane = chat_of(SAID, REPLIED)
+        for cursor in range(len(pane.flat(58))):
+            pane.cursor = cursor
+            drawn = pane.render(60, 12, focused=True)
+            marked = [plain(x).rstrip() for x in drawn if "\x1b[7m" in x]
+            owner = pane.flat(58)[cursor][0]
+            assert marked == [pane.flat(58)[cursor][1].strip()]
+            assert pane.current(58) == owner
+
+
+class TestTheLabelLinesAreDrawnHeavier:
+    """`you 22-08-2026 13:04:47` and `hpca …` are bold; the words are not.
+
+    With the conversation itself flush at column 0 there is no gutter and no
+    rule left between one turn and the next, so the weight of the label is the
+    whole of what separates them.
+    """
+
+    def test_your_own_label_is_bold(self):
+        pane = chat_of(SAID, REPLIED)
+        pane.cursor = 0  # off the reply, so the highlight is not what shows
+        assert BOLD in styled(pane, "▸ you")
+
+    def test_and_so_is_the_agents(self):
+        pane = chat_of(SAID, REPLIED)
+        pane.cursor = 0
+        assert BOLD in styled(pane, "▾ hpca")
+
+    def test_but_the_words_under_it_are_not(self):
+        # A paragraph in bold is not an indication, it is a shout.
+        pane = chat_of(SAID, REPLIED)
+        pane.cursor = 0
+        assert BOLD not in styled(pane, "done")
+
+    def test_and_neither_is_a_line_that_names_no_speaker(self):
+        pane = chat_of(SAID, WORKED)
+        pane.cursor = 0
+        assert BOLD not in styled(pane, "▾ 2 steps · read_file → reasoning")
+
+
+class TestATurnIsGreyThroughout:
+    """The head and every line it opens into.
+
+    A turn's working is the machinery behind the answer rather than the
+    answer, and it is the bulkiest thing in the log — an opened one is rows of
+    tool names between two paragraphs of prose. Uncoloured was not the same
+    thing: the renderer dims a body it has no colour for and leaves the head
+    at full weight, so a closed turn stood out exactly as loudly as a reply.
+    """
+
+    def test_the_head_of_a_closed_turn_is_grey(self):
+        pane = chat_of(SAID, WORKED)
+        pane.collapse_all(58)
+        pane.cursor = 0
+        assert DIM in styled(pane, "▸ 2 steps · read_file → reasoning")
+
+    def test_and_so_is_every_step_it_opens_into(self):
+        # The head and both of the rows under it: the whole of what an opened
+        # turn puts on the screen, and not only the lines the renderer would
+        # have dimmed by default.
+        pane = chat_of(SAID, WORKED)
+        pane.cursor = 0
+        for text in (
+            "▾ 2 steps · read_file → reasoning",
+            "  ▸ read_file     /scratch/run.log",
+            "    reasoning     two shards, one temp path",
+        ):
+            assert DIM in styled(pane, text), text
+
+    def test_including_what_a_step_returned(self):
+        pane = chat_of(SAID, WORKED)
+        pane.expanded.add("3/0")
+        pane.invalidate()
+        pane.cursor = 0
+        assert DIM in styled(pane, "412 lines")

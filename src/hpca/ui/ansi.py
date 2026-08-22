@@ -44,10 +44,17 @@ BLUE = f"{ESC}[38;5;68m"
 # The two the conversation itself is drawn in, and the only colours chosen for
 # a *reading* job rather than a signalling one: everything above marks
 # something (a state, a rule, a warning), while these two carry paragraphs of
-# text that somebody is going to sit and read. So they are bright — near-white
-# for the user's own words, and a clear amber for the agent's — where the
+# text that somebody is going to sit and read. So they are bright — where the
 # muted 179 the agent used to be drawn in read as grey against a dark
 # terminal, which is the one thing a wall of prose must not do.
+#
+# Which way round they go is a separate decision from how bright they are, and
+# it went the other way in the end: the amber marks the user's own words and
+# the near-white carries the agent's. The agent writes most of what is on the
+# screen, so the calmer colour is the one that has to hold a page of prose,
+# and the handful of lines the user typed are what a scrollback is searched
+# for — a conversation is scanned for one's own questions, not for the
+# answers, and the colour is what finds them.
 WHITE = f"{ESC}[38;5;255m"
 AMBER = f"{ESC}[38;5;215m"
 

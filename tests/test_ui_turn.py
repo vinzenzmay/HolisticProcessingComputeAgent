@@ -517,7 +517,9 @@ class TestLiveStepRows:
             )
         )
         wire.ui.focus = CHAT
-        await wire.press("end", "right")
+        # Closed first: the newest row shows itself, so the turn that has just
+        # landed is already open and → would be aimed at one of its steps.
+        await wire.press("end", "left", "right")
         screen = wire.screen()
         assert "think think" in screen and "/scratch/run.log" in screen
         assert "412 lines" not in screen  # the step is a fold of its own
@@ -547,7 +549,9 @@ class TestLiveStepRows:
             )
         )
         wire.ui.focus = CHAT
-        await wire.press("end", "right")
+        # As above: closed and opened again, so the cursor starts on the
+        # turn's own head line rather than wherever the newest row left it.
+        await wire.press("end", "left", "right")
         first = wire.ui.chat.row_key(wire.inner)
         await wire.press("down")
         assert wire.ui.chat.row_key(wire.inner) != first

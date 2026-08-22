@@ -70,6 +70,16 @@ class Item(Wrapped):
     the `chat.update` that revises the row, and cannot be inherited by
     whatever step ends up third next time.
 
+    ``label`` says the head is a *nameplate* rather than content — `you
+    22-08-2026 13:04:47`, `hpca 22-08-2026 13:05:02` — and is what gets it
+    drawn bold. It is a flag rather than an escape sequence baked into `head`
+    because every line is padded to an exact number of cells before any SGR is
+    wrapped around it (`ansi.pad`), and a head that arrived already styled
+    would be measured with its escapes in it. The rows whose head is a summary
+    of what is under it (a turn's "8 steps · …") are not labels and are not
+    bold: the weight is there to say where one turn ends and the next begins,
+    which is a thing only the speaker lines can say.
+
     ``preview`` is the one line a *closed* row shows of what it is hiding —
     the whole of `body` on one line, clipped to the terminal with `ansi.clip`.
     It is what makes a folded conversation still readable as one: a column of
@@ -83,6 +93,7 @@ class Item(Wrapped):
     body: list[str] = field(default_factory=list)
     preview: str = ""
     accent: str = ""
+    label: bool = False
     kind: str = ""
     text: str = ""
     key: str = ""
@@ -263,6 +274,42 @@ class Pane:
             self._keys.pop()
         index = len(self.items) - 1
         lines, keys, openable = self._item_lines(index, item, self._flat_width)
+        self._flat += lines
+        self._keys += keys
+        self._openable |= openable
+        if self.tail is not None:
+            self._flat.append(self._tail_line())
+            self._keys.append(self.key_at(len(self.items)))
+
+    def reflow_last(self) -> None:
+        """Redraw the newest row in the cache, leaving everything above it.
+
+        `extend`'s twin, and it exists for the same reason: the chat opens the
+        last row and closes it again the moment a newer one arrives
+        (`state.SessionState._open_last`), and a row that opened and closed
+        through `invalidate` would re-flatten the whole conversation twice per
+        message — the O(conversation) event `extend` was written to abolish,
+        put back on the same path.
+
+        It is only ever the *last* row because that is the only one whose
+        lines are a suffix of the cache: everything it draws sits after every
+        other row's lines and before the live tail, so replacing them is a pop
+        and an append rather than a splice. A pane whose cache is already cold
+        has nothing to patch and says so by doing nothing — the next `flat`
+        builds the list from what `expanded` says now.
+        """
+        if self._flat is None or not self.items:
+            return
+        index = len(self.items) - 1
+        if self.tail is not None:
+            self._flat.pop()
+            self._keys.pop()
+        while self._flat and self._flat[-1][0] == index:
+            self._flat.pop()
+            self._keys.pop()
+        lines, keys, openable = self._item_lines(
+            index, self.items[index], self._flat_width
+        )
         self._flat += lines
         self._keys += keys
         self._openable |= openable
@@ -537,7 +584,17 @@ class Pane:
             right += f" · {len(self.expanded)} open"
         title = rule(self.name, width, right)
         out = [(BOLD + CYAN if focused else DIM) + title + RESET]
-        for row in range(self.offset, self.offset + body_h):
+        # A conversation shorter than the pane hangs from the bottom, with the
+        # empty screen above it rather than below: the newest line is the one
+        # being read, and a log that grew downwards from the title rule would
+        # put it a different distance from the message box on every frame —
+        # the eye has to find it again after each reply. Only where the rows
+        # are somebody's words. A list of sessions is a list, and a list that
+        # started half way down the column would read as scrolled rather than
+        # as short.
+        blank = max(0, body_h - len(lines)) if self.flush else 0
+        out += [" " * width] * blank
+        for row in range(self.offset, self.offset + body_h - blank):
             if row >= len(lines):
                 out.append(" " * width)
                 continue
@@ -546,10 +603,16 @@ class Pane:
             gutter = "" if self.flush else ("▌ " if here else "  ")
             painted = pad(gutter + text, width)
             item = self.item_at(owner)
+            # A label line is the row's nameplate, and it is drawn heavier
+            # than what it names. With the words themselves flush at column 0
+            # there is no gutter and no rule left to separate one turn from
+            # the next, so the weight of the `you …` / `hpca …` line is the
+            # whole of what does it.
+            bold = is_head and item is not None and item.label
             if row == self.cursor:
                 # The unfocused pane still shows where it was left, dimmed —
                 # that is the "memory" being visible rather than merely kept.
-                painted = (REVERSE if focused else DIM + REVERSE) + painted + RESET
+                style = REVERSE if focused else DIM + REVERSE
             elif item is not None and item.accent:
                 # Head *and* body, where it used to be the head alone: a
                 # message is drawn in its speaker's colour down to its last
@@ -557,16 +620,18 @@ class Pane:
                 # Dim is what a row with no colour of its own gets, and a
                 # turn's tool output is the whole of that — the one body here
                 # that really is secondary to what is around it.
-                painted = item.accent + painted + RESET
-                if here and self.flush and is_head:
-                    painted = BOLD + painted
+                style = item.accent
+                bold = bold or (here and self.flush and is_head)
             elif not is_head:
-                painted = DIM + painted + RESET
-            elif here and self.flush:
+                style = DIM
+            else:
                 # No gutter column to band the current entry with, so it is
                 # marked by weight instead — and on the head line only,
                 # because a paragraph in bold is not an indication, it is a
                 # shout.
-                painted = BOLD + painted + RESET
-            out.append(painted)
+                style = ""
+                bold = bold or (here and self.flush)
+            if bold:
+                style += BOLD
+            out.append(style + painted + RESET if style else painted)
         return out

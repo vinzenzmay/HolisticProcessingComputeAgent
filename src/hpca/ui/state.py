@@ -219,7 +219,12 @@ def entry_item(entry: ChatEntry) -> Item:
     row = dict(kind=entry.kind, text=entry.text, key=str(entry.seq))
     if entry.kind == "user":
         return Item(
-            head=_label("you", entry.at), body=body, preview=said, accent=WHITE, **row
+            head=_label("you", entry.at),
+            body=body,
+            preview=said,
+            accent=AMBER,
+            label=True,
+            **row,
         )
     if entry.kind == "queued":
         # Still the user's own words, and still copyable as such — the label
@@ -229,11 +234,17 @@ def entry_item(entry: ChatEntry) -> Item:
             body=body,
             preview=said,
             accent=DIM,
+            label=True,
             **row,
         )
     if entry.kind == "error":
         return Item(
-            head=_label("error", entry.at), body=body, preview=said, accent=RED, **row
+            head=_label("error", entry.at),
+            body=body,
+            preview=said,
+            accent=RED,
+            label=True,
+            **row,
         )
     if entry.kind == "thinking":
         steps = entry.steps or len(entry.parts)
@@ -242,9 +253,19 @@ def entry_item(entry: ChatEntry) -> Item:
         # One collapsed box per turn, opening into its steps: the shape
         # `tui/app.py`'s ThinkingBox and StepBox had between them, minus the
         # two widget classes.
+        #
+        # Dim, and dim all the way down. A turn's working is the machinery
+        # behind the answer rather than the answer, and it is the bulkiest
+        # thing in the log — an opened turn is thirty rows of tool names
+        # between two paragraphs of prose. Saying so with the accent rather
+        # than by leaving it unset is what makes the *head* grey too: an
+        # accentless row falls through to `Pane.render`'s default, which dims
+        # the body lines and leaves the head at full weight, so a closed turn
+        # stood out from the conversation exactly as loudly as a reply.
         return Item(
             head=f"{steps} steps" + (f" · {summary}" if summary else ""),
             folds=[part_fold(part) for part in entry.parts],
+            accent=DIM,
             **row,
         )
     if entry.kind in ("event", "recall"):
@@ -257,7 +278,8 @@ def entry_item(entry: ChatEntry) -> Item:
         head=_label("hpca", entry.at),
         body=body,
         preview=said,
-        accent=AMBER,
+        accent=WHITE,
+        label=True,
         **{**row, "kind": entry.kind or "assistant"},
     )
 
@@ -751,6 +773,13 @@ class SessionState:
         # turn can close exactly those and leave alone whatever the user
         # opened by hand.
         self._live: set[str] = set()
+        # The row this UI opened by itself for the other reason: it is the
+        # newest one there is. Same bargain as `_live` above, and kept apart
+        # from it because the two are undone by different events — a live fold
+        # closes when its turn ends, and this one closes when something newer
+        # arrives to take the title off it. One key, never a set: there is
+        # only ever one last row.
+        self._auto = ""
         self.watchers = Pane("watchers", [])
         self.turn = Turn()
         self.context = Context()
@@ -786,7 +815,10 @@ class SessionState:
 
         The only path that may throw rows away, and it throws away what was
         open with them: a reset re-bases the numbering, so a `seq` that is
-        still in `expanded` afterwards would be naming a different row.
+        still in `expanded` afterwards would be naming a different row. What
+        is open when it returns is decided here, after the renumbering, and it
+        is the one row `_open_last` opens — a conversation you have just
+        opened is one whose last message you want to read.
         """
         self.entries = list(entries)
         # The thread this described is gone, so a fresh estimate may speak
@@ -800,8 +832,56 @@ class SessionState:
         }
         self.chat.expanded.clear()
         self.chat.invalidate()
+        self._auto = ""
+        self._open_last()
         self.chat.cursor = 10**9  # open at the newest, as the old app does
         self.loaded = True
+
+    def _open_last(self) -> None:
+        """Show the newest row whole, and remember that nobody asked for it.
+
+        Exactly one row is open by itself, and it is the last one: whatever
+        was said most recently is what is being read, and having to press → to
+        see the reply that just landed is a keypress on every single turn. The
+        rows above it stay a label and a line, which is the folded form the
+        chat is legible in (`entry_item`) — so the log cleans up behind itself
+        as it grows instead of becoming a wall to scroll.
+
+        The key goes in ``_auto`` because the next row to arrive has to undo
+        *this* and nothing else. A row the user opened by hand is a row
+        somebody is reading, and a reply landing is not a reason to take it
+        away — the same distinction `_live` draws for a turn's steps, and the
+        reason neither can be an "everything that is open" set.
+
+        A row with nothing behind it opens into nothing and is left alone: an
+        assistant row is appended before its first token arrives, and opening
+        it would only give it a marker pointing at nothing. `update` picks it
+        up when the text lands.
+        """
+        if not self.chat.items:
+            return
+        index = len(self.chat.items) - 1
+        if not self.chat.items[index].openable:
+            return
+        self._auto = self.chat.key_at(index)
+        self.chat.expanded.add(self._auto)
+        # The row is the last one, so its lines are the tail of the flattened
+        # cache and can be rebuilt in place. `invalidate` would be correct and
+        # would re-flatten the conversation behind it, once per arriving row.
+        self.chat.reflow_last()
+
+    def _close_auto(self) -> None:
+        """The row that opened because it was the last one is not, any more.
+
+        Skipped while the turn that is writing it is still running: a live
+        thinking fold is open for the *other* reason and `end_turn` owns it,
+        and closing it here would fold the steps away halfway through the turn
+        they belong to.
+        """
+        if self._auto and self._auto not in self._live:
+            self.chat.expanded.discard(self._auto)
+            self.chat.reflow_last()
+        self._auto = ""
 
     def append(self, entry: ChatEntry) -> None:
         """One new row. The only path by which a chat grows (§3.2)."""
@@ -816,12 +896,17 @@ class SessionState:
             # merely animated. The turn's end closes it again.
             self._live.add(str(entry.seq))
             self.chat.expanded.add(str(entry.seq))
+        # Whatever was last is not last now, and the row it is losing the
+        # title to is about to be built — so it is closed first, while its
+        # lines are still the tail of the cache.
+        self._close_auto()
         # `extend`, not `items.append` + `invalidate`: whether this row opens
         # itself has just been decided, so its lines can be built now and
         # added to the cache rather than the whole conversation re-flattened
         # on the next frame. This is the append-only invariant (§3.2) being
         # spent rather than merely kept.
         self.chat.extend(entry_item(entry))
+        self._open_last()
         self.chat.cursor = 10**9
         self.loaded = True
 
@@ -839,6 +924,14 @@ class SessionState:
         self.entries[row] = entry
         self.chat.items[row] = entry_item(entry)
         self.chat.invalidate()
+        # A row that had nothing to open when it arrived and has something now
+        # — an assistant row is appended empty and filled token by token — is
+        # the last row finally becoming showable, so it opens here instead.
+        # Only when nothing has auto-opened yet, which is what keeps a stream
+        # of updates from re-opening a row the user has just folded away: once
+        # `_auto` names this row, it names it whether or not it is still open.
+        if not self._auto and row == len(self.entries) - 1:
+            self._open_last()
         return True
 
     def remove(self, seq: int) -> ChatEntry | None:
@@ -862,6 +955,12 @@ class SessionState:
         self.chat.expanded.discard(str(seq))
         self._live.discard(str(seq))
         self.chat.invalidate()
+        # An unqueued message is routinely the newest row there is, and the
+        # row it leaves behind is the last one now: it inherits the opening
+        # rather than the chat ending up with none.
+        if self._auto == str(seq):
+            self._auto = ""
+            self._open_last()
         return entry
 
     def entry_at(self, position: int) -> ChatEntry | None:

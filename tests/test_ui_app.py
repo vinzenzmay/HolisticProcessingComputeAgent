@@ -864,8 +864,12 @@ def test_a_reset_forgets_every_open_entry():
     # row the core has renumbered, which is the one thing keying by identity
     # must not be allowed to get wrong.
     #
+    # Nothing survives it, and what is open afterwards is what the fresh
+    # transcript opened for itself — the newest row of what is left, which is
+    # a decision taken after the renumbering rather than a key that outlived
+    # it.
     ui, _, _, _ = rolled_back()
-    assert ui.chat.expanded == set()
+    assert ui.chat.expanded <= {ui.chat.key_at(len(ui.chat.items) - 1)}
 
 
 def test_the_frame_is_still_exact_after_a_rollback():

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 
-from hpca.ui.ansi import AMBER, RED, WHITE
+from hpca.ui.ansi import AMBER, DIM, RED, WHITE
 from hpca.ui.state import (
     ChatEntry,
     ChatPart,
@@ -40,13 +40,14 @@ class TestEntriesBecomeRows:
         assert (item.kind, item.text) == ("user", "run it again")
 
     def test_and_are_marked_as_yours(self):
-        # White, where the agent is amber: the two colours the conversation is
+        # Amber, where the agent is white: the two colours the conversation is
         # actually read in, and the reason neither is one of the muted ones
-        # the rest of the UI signals with.
-        assert entry_item(entry(1)).accent == WHITE
+        # the rest of the UI signals with. The user's own lines are the few,
+        # and they are what a scrollback is searched for.
+        assert entry_item(entry(1)).accent == AMBER
 
     def test_and_the_agent_gets_a_colour_of_its_own(self):
-        assert entry_item(entry(1, "assistant", "hello")).accent == AMBER
+        assert entry_item(entry(1, "assistant", "hello")).accent == WHITE
 
     def test_a_message_puts_its_words_under_a_label_of_its_own(self):
         # The head says who is speaking and nothing else, so that every line
@@ -80,6 +81,28 @@ class TestEntriesBecomeRows:
 
     def test_an_error_is_red(self):
         assert entry_item(entry(1, "error", "it fell over")).accent == RED
+
+    def test_a_turn_is_grey_and_says_so_itself(self):
+        # Not merely left uncoloured: an accentless row falls through to the
+        # renderer's default, which dims the body and leaves the head at full
+        # weight — so a closed turn shouted as loudly as a reply, and an
+        # opened one was grey on its steps and bright on the line above them.
+        assert entry_item(ChatEntry(kind="thinking", seq=3, steps=4)).accent == DIM
+
+    def test_a_speaker_line_is_marked_as_a_label(self):
+        # What gets it drawn bold. Carried as a flag rather than as an escape
+        # in the head, because every line is padded to an exact number of
+        # cells before any styling is wrapped around it.
+        assert entry_item(entry(1)).label
+        assert entry_item(entry(1, "assistant", "hello")).label
+        assert entry_item(entry(1, "error", "it fell over")).label
+
+    def test_and_a_summary_line_is_not(self):
+        # A turn's head describes what is under it rather than naming who
+        # said it, and the weight is there to separate one speaker from the
+        # next.
+        assert not entry_item(ChatEntry(kind="thinking", seq=3, steps=4)).label
+        assert not entry_item(entry(1, "event", "compacted")).label
 
     def test_a_fold_counts_its_steps(self):
         item = entry_item(
@@ -216,11 +239,13 @@ class TestTheChatIsAppendOnly:
 
     def test_a_reset_forgets_what_was_open(self):
         # The numbering is re-based, so a key still held would name a row the
-        # core has since given to something else.
+        # core has since given to something else. Renumbered here on purpose:
+        # a reset back onto seq 1 could not tell a key that survived from one
+        # the fresh transcript opened for itself.
         session = self.loaded()
         session.chat.expanded = {"1", "2"}
-        session.reset([entry(1, text="only this")])
-        assert session.chat.expanded == set()
+        session.reset([entry(5, text="only this")])
+        assert session.chat.expanded == {"5"}
 
     def test_a_reset_lets_an_estimate_speak_again(self):
         session = self.loaded()
@@ -244,6 +269,96 @@ class TestTheChatIsAppendOnly:
     def test_and_off_the_end_is_nothing_rather_than_an_error(self):
         assert self.loaded().entry_at(99) is None
         assert self.loaded().entry_at(-1) is None
+
+
+class TestTheNewestRowShowsItself:
+    """Exactly one row is open by itself, and it is the last one.
+
+    The chat cleans up behind itself as it grows: whatever was said most
+    recently is shown whole, and the moment something newer arrives it folds
+    back to a label and a line. What the *user* opened is not part of the
+    bargain — that is a row somebody is reading, and a reply landing is not a
+    reason to take it away.
+    """
+
+    def loaded(self) -> SessionState:
+        session = SessionState("s1")
+        session.reset([entry(1, text="one"), entry(2, "assistant", "two")])
+        return session
+
+    def test_the_last_reply_is_open_without_being_asked(self):
+        assert self.loaded().chat.expanded == {"2"}
+
+    def test_a_row_arriving_folds_the_one_it_replaced(self):
+        session = self.loaded()
+        session.append(entry(3, text="three"))
+        assert session.chat.expanded == {"3"}
+
+    def test_and_the_lines_on_screen_agree(self):
+        # The closing is done against the cached line list rather than by
+        # dropping it, so this is the half that would silently go stale.
+        session = self.loaded()
+        session.chat.flat(60)
+        session.append(entry(3, text="three"))
+        rebuilt = [x[1] for x in session.chat.flat(60)]
+        session.chat.invalidate()
+        assert rebuilt == [x[1] for x in session.chat.flat(60)]
+
+    def test_a_row_the_user_opened_is_left_alone(self):
+        # The auto-open is undone by name, not by closing whatever is open.
+        session = self.loaded()
+        session.chat.expanded.add("1")
+        session.append(entry(3, text="three"))
+        assert "1" in session.chat.expanded
+
+    def test_a_row_with_nothing_behind_it_opens_nothing(self):
+        # A notice is one line to begin with, and a marker pointing at an
+        # empty body is worse than no marker.
+        session = self.loaded()
+        session.append(entry(3, "event", "context compacted"))
+        assert session.chat.expanded == set()
+
+    def test_a_reply_that_arrives_empty_opens_when_its_words_do(self):
+        # An assistant row is appended before its first token, so the row
+        # that has to open is the one that had nothing to open at the time.
+        session = self.loaded()
+        session.append(ChatEntry(kind="assistant", text="", seq=3))
+        assert session.chat.expanded == set()
+        session.update(ChatEntry(kind="assistant", text="a re", seq=3))
+        assert session.chat.expanded == {"3"}
+
+    def test_and_stays_open_as_the_rest_of_it_streams_in(self):
+        session = self.loaded()
+        session.append(ChatEntry(kind="assistant", text="", seq=3))
+        for text in ("a re", "a reply", "a reply, whole"):
+            session.update(ChatEntry(kind="assistant", text=text, seq=3))
+        assert session.chat.expanded == {"3"}
+
+    def test_but_one_the_user_folded_away_is_not_reopened(self):
+        # The token after the fold would otherwise undo it, ten times a
+        # second, which is the one way this could be worse than not opening.
+        session = self.loaded()
+        session.append(ChatEntry(kind="assistant", text="a re", seq=3))
+        session.chat.expanded.discard("3")
+        session.update(ChatEntry(kind="assistant", text="a reply", seq=3))
+        assert session.chat.expanded == set()
+
+    def test_a_live_turn_keeps_its_steps_while_the_reply_lands(self):
+        # Two reasons to be open, undone by two different events: the steps
+        # of a running turn belong to `end_turn`, not to the next row.
+        session = self.loaded()
+        session.start_turn()
+        session.append(ChatEntry(kind="thinking", seq=3, steps=2))
+        session.append(ChatEntry(kind="assistant", text="done", seq=4))
+        assert session.chat.expanded == {"3", "4"}
+
+    def test_an_unqueued_row_hands_the_opening_back(self):
+        # `turn.unqueued` takes the newest row away again; the one it leaves
+        # behind is the newest now.
+        session = self.loaded()
+        session.append(entry(3, "queued", "not yet"))
+        session.remove(3)
+        assert session.chat.expanded == {"2"}
 
 
 # ---------------------------------------------------------------- the turn
