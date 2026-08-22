@@ -60,6 +60,14 @@ KEYS = {
     f"{ESC}[1;3B": "alt-down",
     f"{ESC}[1;3C": "ctrl-right",
     f"{ESC}[1;3D": "ctrl-left",
+    # The same four again with the modifier reported as 9 rather than 3, which
+    # is what a terminal sends when it is treating alt as meta (the 8 bit) and
+    # not as the alt modifier proper. Both spellings are alt+arrow to the
+    # person pressing it.
+    f"{ESC}[1;9A": "alt-up",
+    f"{ESC}[1;9B": "alt-down",
+    f"{ESC}[1;9C": "ctrl-right",
+    f"{ESC}[1;9D": "ctrl-left",
     f"{ESC}b": "ctrl-left",
     f"{ESC}f": "ctrl-right",
     # Shift is selection everywhere: plain, by word, and to the ends.
@@ -127,6 +135,24 @@ KEYS = {
 }
 
 
+# The third way a terminal spells alt+<arrow>: an ESC in front of the plain
+# arrow, which is how "meta" has been sent since long before anybody agreed on
+# a modifier byte. It is the default in a good deal of terminals, and it is the
+# one shape a table of whole sequences cannot hold, because the second half is
+# already a key in its own right — so ESC ESC [ A read as the escape key
+# followed by ↑, which moved the cursor and armed half the stop gesture, and
+# reordering a watcher with alt+↑ did nothing at all.
+#
+# Folded onto the same names as the CSI spellings above, and asymmetric for the
+# same reason: on macOS the word-motion key *is* alt.
+META_PREFIXED = {
+    "up": "alt-up",
+    "down": "alt-down",
+    "left": "ctrl-left",
+    "right": "ctrl-right",
+}
+
+
 def escape_span(text: str, at: int) -> int | None:
     """How many characters the escape sequence at ``at`` occupies, or None if
     it has not all arrived yet.
@@ -156,6 +182,21 @@ def escape_span(text: str, at: int) -> int | None:
     if nxt == "O":
         return None if at + 2 >= n else 3
     return 2  # alt-<char>
+
+
+def _meta_prefixed(text: str, at: int) -> tuple[str, int] | None:
+    """The ESC at ``at`` read as a modifier on the sequence behind it.
+
+    Returns the key name and how much to consume, or None if what follows is
+    not one of the arrows — which includes the case that matters most, an ESC
+    with nothing behind it yet or with only a bare ESC behind it. That is the
+    stop gesture, and it has to keep being two escapes and nothing else.
+    """
+    inner = escape_span(text, at + 1)
+    if inner is None or inner <= 1:
+        return None
+    name = META_PREFIXED.get(KEYS.get(text[at + 1 : at + 1 + inner], ""))
+    return None if name is None else (name, 1 + inner)
 
 
 def escape_len(text: str, at: int) -> int:
@@ -221,6 +262,24 @@ def decode(data: bytes | str, *, final: bool = False) -> tuple[list[str], str]:
             if not final:
                 return keys, text[at:]
             size = n - at
+        if size == 1 and not final and escape_span(text, at + 1) is None:
+            # ESC ESC and then a read boundary. What is behind the second one
+            # decides between the stop gesture and a modifier, so the pair is
+            # held for the next read the same way half an arrow key is —
+            # naming the first ESC here is what would split alt+↑ back into
+            # an escape and an arrow.
+            return keys, text[at:]
+        if size == 1 and (folded := _meta_prefixed(text, at)) is not None:
+            # A lone ESC is only ever measured as one character because what
+            # follows it is another ESC — so this is the only place the meta
+            # prefix can be recognised, and it has to be recognised before the
+            # ESC is named as the escape key. Two escapes with nothing after
+            # them are still the stop gesture: only a *sequence* behind the
+            # second one is a modifier rather than a keypress.
+            name, size = folded
+            keys.append(name)
+            at += size
+            continue
         chunk = text[at : at + size]
         if chunk in KEYS:
             keys.append(KEYS[chunk])

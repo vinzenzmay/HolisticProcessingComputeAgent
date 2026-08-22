@@ -936,7 +936,7 @@ class SessionState:
         self.chat.invalidate()
         self._auto = ""
         self._open_last()
-        self.chat.cursor = 10**9  # open at the newest, as the old app does
+        self.chat.to_end()  # open at the newest, as the old app does
         self.loaded = True
 
     def _open_last(self) -> None:
@@ -1009,7 +1009,12 @@ class SessionState:
         # spent rather than merely kept.
         self.chat.extend(self._item(entry))
         self._open_last()
-        self.chat.cursor = 10**9
+        if self.chat.follow:
+            # Only if the newest line is what is being read. Somebody who has
+            # scrolled up is reading something else, and a reply landing is
+            # not a reason to take it away from them — the same distinction
+            # `_close_auto` draws about what is open.
+            self.chat.to_end()
         self.loaded = True
 
     def update(self, entry: ChatEntry) -> bool:
