@@ -42,6 +42,8 @@ from hpca.ui.overlays import (
     choice,
 )
 from hpca.ui.pane import Item, Pane
+from hpca.ui.rain import INTERVAL as RAIN_INTERVAL
+from hpca.ui.rain import rain
 from hpca.ui.state import (
     MODE_COLOURS,
     OWN_MESSAGE_KINDS,
@@ -1415,9 +1417,17 @@ class RowUI:
         # is decoration on a screen that has nothing left on it to divide.
         rows = [rows[i] for i in sorted([1, 2, 0][: len(out)])]
         at = max(0, (len(out) - len(rows)) // 2)
-        blank = [" " * width] * len(out)
-        blank[at : at + len(rows)] = rows
-        return blank
+        # What the cleared screen is made of. Rain rather than blanks by
+        # default (`ui.rain` says why), and the question is spliced over it
+        # whole — its rows are padded to the width, so nothing of the field
+        # shows through the three lines that matter.
+        under = (
+            rain(width, len(out), self.clock())
+            if self.display.confirm_rain
+            else [" " * width] * len(out)
+        )
+        under[at : at + len(rows)] = rows
+        return under
 
     def _render_offer(self, width: int, height: int) -> list[str]:
         """The offer, in exactly ``_offer_h`` rows — or none, if none is up.
@@ -2155,6 +2165,12 @@ class RowUI:
             # a background session's prompt is not drawn, so nothing about it
             # changes with the clock.
             PULSE_INTERVAL if self.session.decision is not None else None,
+            # And the fifth: the field behind an open confirmation falls by
+            # the clock and by nothing else, so without a frame booked here it
+            # would be painted once and hang there mid-drop.
+            RAIN_INTERVAL
+            if self.confirm is not None and self.display.confirm_rain
+            else None,
         ]
         if self._esc_armed_at is not None:
             left = ESC_STOP_WINDOW - (self.clock() - self._esc_armed_at)

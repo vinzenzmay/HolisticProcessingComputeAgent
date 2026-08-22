@@ -94,6 +94,8 @@ class Display:
 
     # Whether a chat row's label carries the instant it was said.
     chat_stamps: bool = True
+    # Whether the screen a confirmation cleared rains behind it (`ui.rain`).
+    confirm_rain: bool = True
     # One breath of the decision prompt's answer line, in seconds. The module
     # default stands in until `hello` lands, which is before there is a
     # decision on screen to pulse (`client._hello` is the first frame).

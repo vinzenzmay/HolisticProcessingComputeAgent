@@ -41,6 +41,8 @@ from hpca.ui.ansi import (
 from hpca.ui.app import CHAT, DECISION, INPUT, OFFER, SESSIONS, WATCHERS, RowUI
 from hpca.ui.approval import approval_details
 from hpca.ui.keys import PASTE
+from hpca.ui.rain import GLYPHS
+from hpca.ui.rain import INTERVAL as RAIN_INTERVAL
 from hpca.ui.state import Confirm, Display
 from tests.ui_harness import connected, plain, widths
 
@@ -931,7 +933,13 @@ class TestTheGenericConfirm:
 
     async def test_and_it_is_the_only_thing_left_to_read(self, wire):
         # Three rows spliced into a full screen read as another band of it.
-        # The question is a gate, so the screen it gates is cleared.
+        # The question is a gate, so the screen it gates is cleared. Asserted
+        # with the field behind it turned off, so that what is under test is
+        # the clearing rather than what the cleared screen is filled with
+        # (`TestTheFieldBehindIt`).
+        await wire.tell(
+            protocol.Hello(display=protocol.DisplaySettings(confirm_rain=False))
+        )
         await wire.tell(protocol.SessionRows(rows=list(ROWS)))
         busy = [plain(row) for row in wire.frame() if plain(row).strip()]
         assert len(busy) > 3, "the frame under the question was already empty"
@@ -943,6 +951,12 @@ class TestTheGenericConfirm:
             "Really quit?",
             "(y) yes · (n) no · (esc) no",
         ]
+
+    async def test_the_cleared_screen_is_not_empty_by_default(self, wire):
+        # It rains (`ui.rain`), which is most of what says the terminal is
+        # alive rather than hung.
+        wire.ui.ask("Really quit?")
+        assert len([r for r in wire.frame() if plain(r).strip()]) > 3
 
     async def test_and_no_puts_back_the_frame_it_hid(self, wire):
         # Which is what makes the question cheap to answer wrongly: the frame
@@ -967,6 +981,86 @@ class TestTheGenericConfirm:
         drawn = [plain(row) for row in wire.ui.render(wire.width, height)]
         assert [row.strip() for row in drawn] == rows
         assert widths(drawn) == {wire.width}
+
+
+class TestTheFieldBehindIt:
+    """The falling glyphs on the screen a confirmation cleared (`ui.rain`).
+
+    Fun, and not only fun: the cleared screen is the one frame this UI draws
+    that has nothing on it, and a terminal that goes blank is a terminal that
+    might have died. A field that is visibly moving says the opposite.
+
+    The clock is pinned wherever a frame is compared to another frame, because
+    that is the design — the field is a pure function of `RowUI.clock()`, so
+    an instant is one answer and not a race.
+    """
+
+    @staticmethod
+    def at(wire, when: float, height: int = 40) -> list[str]:
+        wire.ui.clock = lambda: when
+        return wire.ui.render(wire.width, height)
+
+    async def test_it_fills_the_screen_the_question_cleared(self, wire):
+        wire.ui.ask("Really quit?")
+        rows = [plain(r) for r in self.at(wire, 20.0)]
+        painted = [r for r in rows if r.strip() and "quit" not in r and "─" not in r]
+        assert painted, "the cleared screen is bare"
+        assert any(ch in GLYPHS for r in painted for ch in r)
+
+    async def test_and_spares_the_lines_of_the_question(self, wire):
+        wire.ui.ask("Really quit?")
+        rows = [plain(r).rstrip() for r in self.at(wire, 20.0)]
+        assert "  Really quit?" in rows
+        assert "  (y) yes · (n) no · (esc) no" in rows
+        assert any(r.startswith("── confirm") for r in rows)
+
+    async def test_the_frame_is_still_the_terminal(self, wire):
+        # The one rule a frame may never break, and the reason the glyphs are
+        # halfwidth katakana rather than the full-width block.
+        wire.ui.ask("Really quit?")
+        for when in (0.0, 3.7, 20.0, 91.25):
+            assert widths([plain(r) for r in self.at(wire, when)]) == {wire.width}
+
+    async def test_nothing_of_the_frame_underneath_survives_it(self, wire):
+        await wire.tell(protocol.SessionRows(rows=list(ROWS)))
+        wire.ui.ask("Really quit?")
+        screen = "\n".join(plain(r) for r in self.at(wire, 20.0))
+        assert "the second thing" not in screen
+        assert "edit run.sh" not in screen
+        assert "HPCA" not in screen
+
+    async def test_one_instant_is_one_answer(self, wire):
+        # `render` is called more than once for the same instant, and the
+        # repaint is differential: a field that differed between two frames of
+        # the same moment would flicker for no reason.
+        wire.ui.ask("Really quit?")
+        assert self.at(wire, 20.0) == self.at(wire, 20.0)
+
+    async def test_but_it_moves_with_the_clock(self, wire):
+        wire.ui.ask("Really quit?")
+        assert self.at(wire, 20.0) != self.at(wire, 20.5)
+
+    async def test_it_books_the_repaint_that_animates_it(self, wire):
+        # Nothing else wakes the loop: without this the field would be painted
+        # once, mid-drop, and hang there.
+        assert wire.ui.next_wake() != RAIN_INTERVAL
+        wire.ui.ask("Really quit?")
+        assert wire.ui.next_wake() == RAIN_INTERVAL
+
+    async def test_and_books_nothing_when_it_is_turned_off(self, wire):
+        await wire.tell(
+            protocol.Hello(display=protocol.DisplaySettings(confirm_rain=False))
+        )
+        wire.ui.ask("Really quit?")
+        assert wire.ui.next_wake() is None
+
+    async def test_off_is_a_black_screen_and_the_question(self, wire):
+        await wire.tell(
+            protocol.Hello(display=protocol.DisplaySettings(confirm_rain=False))
+        )
+        wire.ui.ask("Really quit?")
+        rows = [plain(r) for r in self.at(wire, 20.0)]
+        assert len([r for r in rows if r.strip()]) == 3
 
     @pytest.mark.parametrize("width", [80, 100, 137])
     async def test_and_the_frame_is_still_the_terminal(self, wire, width):

@@ -1136,6 +1136,8 @@ class DisplaySettings(_Model):
 
     # `▸ you 22-08-2026 13:04:47` against a bare `▸ you` (`ui.state._label`).
     chat_stamps: bool = True
+    # Whether the cleared screen behind a confirmation rains (`ui.rain`).
+    confirm_rain: bool = True
     # One breath of the decision prompt's answer line, in seconds
     # (`ui.ansi.pulse`). The receiving side treats a value it cannot divide by
     # as "use the built-in", because a repaint loop is not a place to raise.

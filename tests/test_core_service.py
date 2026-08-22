@@ -321,6 +321,7 @@ class TestHandshake:
         first = service.subscribe().get_nowait()
         assert set(type(first.display).model_fields) == {
             "chat_stamps",
+            "confirm_rain",
             "decision_pulse_seconds",
         }
 

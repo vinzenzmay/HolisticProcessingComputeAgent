@@ -281,6 +281,14 @@ class DisplaySettings(_Section):
     # what. Off is for the narrow terminal, and for the reader who wants the
     # conversation and not the clock.
     chat_stamps: bool = True
+    # Whether the screen behind a confirmation rains (`ui.rain`). A yes/no
+    # clears the frame it was asked over, and this fills the black it leaves.
+    # On, because a terminal that goes blank is a terminal that might have
+    # died and an animating one is unmistakably alive — and off, because that
+    # animation is a repaint every 80ms of a screen made mostly of escape
+    # sequences, which is a real cost down a slow link and a fair thing to
+    # decline.
+    confirm_rain: bool = True
     # How long one breath of the decision prompt's answer line takes
     # (`ui.ansi.pulse`). Seconds, fractional.
     #
