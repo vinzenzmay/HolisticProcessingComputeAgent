@@ -1,14 +1,21 @@
 """The read-only window (§4.3 item 31): text too long to be a toast.
 
-Two callers, and they arrive by two routes. A `notify` with a *title* over
+Three callers, and they arrive by two routes. A `notify` with a *title* over
 more lines than a toast can carry is a heading plus a block — `/skills-list`,
 the summary `/compact` just wrote — and `RowUI.toast` sends those here rather
 than cutting them to three lines and pointing at a log that does not record
-them. The other is the tunnel recipe manage-LLMs offers when a scan finds
+them. The second is the tunnel recipe manage-LLMs offers when a scan finds
 nothing: text that has to be *retyped into a shell*, which is the whole reason
 this waits for escape rather than going away on its own. With the mouse
 released the terminal's own selection copies it, which is the argument for
 leaving the mouse released (§4.1 item 6).
+
+The third is Enter on a watch box (`client._peeked`), and it is the one that
+made the text untrusted: a job log is whatever a batch script printed, cursor
+moves and colour codes and all. So the body goes through `safe` here rather
+than at each call site — what it answers is a property of *drawing*, not of
+where the text came from, and a screen that draws arbitrary bytes exactly is
+a screen that can corrupt the repaint underneath it.
 
 Nothing is editable and nothing is chosen: the only keys are the ones that
 scroll, and escape.
@@ -16,7 +23,7 @@ scroll, and escape.
 
 from __future__ import annotations
 
-from hpca.ui.ansi import RESET, fold, pad
+from hpca.ui.ansi import RESET, fold, pad, safe
 from hpca.ui.overlays.base import BACK_KEYS, Overlay
 
 
@@ -31,7 +38,7 @@ class InspectOverlay(Overlay):
 
     def __init__(self, body: str = "", *, title: str = "", accent: str = "") -> None:
         super().__init__()
-        self.text = body
+        self.text = safe(body)
         self.accent = accent
         self.offset = 0
         if title:
@@ -45,6 +52,11 @@ class InspectOverlay(Overlay):
 
         Wrapped because what lands here is a recipe or a listing, and a
         truncated `ssh -L` line is a line nobody can use.
+
+        Each of the text's own lines is folded on its own and an empty one
+        kept as an empty one, so wrapping never *joins*: a log's line
+        structure is most of what it says, and the paragraph a peek used to
+        arrive as was the complaint that sent it here.
         """
         out: list[str] = []
         for paragraph in self.text.split("\n"):

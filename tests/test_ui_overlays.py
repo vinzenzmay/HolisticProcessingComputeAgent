@@ -13,7 +13,7 @@ review, manage-LLMs and the backend form.
 
 import pytest
 
-from hpca.ui.app import CHAT, SESSIONS, RowUI
+from hpca.ui.app import CHAT, SESSIONS, WATCHERS, RowUI
 from hpca.ui.demo import build, sample_catalog
 from hpca.ui.overlays import (
     KEEP_CHANGES,
@@ -36,6 +36,7 @@ from hpca.ui.overlays import (
 from hpca.ui.overlays.backends import KEY_REQUIRED
 from hpca.ui.state import (
     BackendInfo,
+    ChatEntry,
     CopyProfile,
     ProbeBackend,
     RemoveBackend,
@@ -1122,6 +1123,110 @@ class TestInspect:
 
 
 # --------------------------------------------------- the memory review (32)
+
+
+# ------------------------------------------- enter on a watch box (31 again)
+
+
+def peeked(width: int = 120, height: int = 40) -> RowUI:
+    """The demo, with Enter pressed on the first watch box.
+
+    The demo loopback is synchronous, so the answer is already on screen by
+    the time `handle` returns — which is the whole reason these can press a
+    key and read the frame on the next line.
+    """
+    ui = recorded(build())
+    ui.focus = WATCHERS
+    return press(ui, "enter", width=width, height=height)
+
+
+class TestThePeekWindow:
+    """Enter on a watcher opens the read-only window, not a toast.
+
+    The toast was time-bound and drawn over the top rows of the frame, so a
+    log had to be read in the seconds it was up and could not be selected out
+    of the terminal at all. Everything below is that complaint, one claim at a
+    time.
+    """
+
+    def test_it_opens_a_screen(self):
+        assert isinstance(peeked().overlay, InspectOverlay)
+
+    def test_and_names_the_watch_it_is_the_tail_of(self):
+        assert peeked().overlay.title.startswith("job ")
+
+    def test_a_peeked_log_keeps_its_lines(self):
+        ui = peeked()
+        rows = [x.strip() for x in frame(ui, 120, 40)]
+        assert "[12:41:07] merging shard 3 of 8" in rows
+        assert "[12:41:44] merging shard 4 of 8" in rows
+
+    def test_escape_gives_the_rows_back(self):
+        ui = peeked()
+        assert press(ui, "esc").overlay is None
+        assert "job 4821000" in screen(ui)
+        assert "unwatch" in screen(ui)
+
+    def test_and_leaves_the_cursor_on_the_box_it_was_pressed_from(self):
+        # Nothing about opening a screen moves the focus, and `_settle_focus`
+        # only ever adjudicates between the message box and a decision prompt
+        # — so escaping the peek lands back where Enter was pressed rather
+        # than stranding the cursor on a row that is not drawn.
+        ui = press(peeked(), "esc")
+        assert ui.focus == WATCHERS
+
+    def test_an_ordinary_key_does_not_close_it(self):
+        assert isinstance(press(peeked(), "j").overlay, InspectOverlay)
+
+    def test_a_long_log_scrolls(self):
+        ui = recorded(build())
+        ui.window("job 4821000", "\n".join(f"[12:41:07] line {i}" for i in range(4000)))
+        assert "line 0" in screen(ui)
+        press(ui, "pgdn", "pgdn")
+        seen = screen(ui)
+        assert "line 0" not in seen
+        assert "/4000" in seen
+        press(ui, "end")
+        assert "line 3999" in screen(ui)
+
+    def test_a_line_wider_than_the_terminal_is_folded_and_not_cut(self):
+        # A `srun` line with forty flags on it is one line in the file and has
+        # to be readable here, since the terminal's own selection is what
+        # copies it back out.
+        ui = recorded(build())
+        ui.window("job 4821000", "srun " + "--exclusive " * 30)
+        assert screen(ui, 80, 40).count("--exclusive") == 30
+        assert widths(ui.render(80, 40)) == {80}
+
+    def test_a_log_full_of_control_codes_does_not_corrupt_the_frame(self):
+        # A batch script's progress bar is escape sequences and carriage
+        # returns, and this is the first caller whose text is arbitrary bytes.
+        ui = recorded(build())
+        ui.window("job 4821000", "\x1b[2J\x1b[HDone.\r\nnext\tline")
+        assert widths(ui.render(100, 30)) == {100}
+        assert "\x1b[2J" not in screen(ui, 100, 30)
+        assert "Done." in screen(ui, 100, 30)
+
+    def test_what_arrives_while_it_is_open_still_lands(self):
+        # "The main UI should not be impeded": the window is drawn over the
+        # frame and holds nothing of the session's, so a turn that streams
+        # while a log is being read streams into the state behind it and is on
+        # screen the moment escape gives the rows back.
+        ui = peeked()
+        rows = len(ui.session.entries)
+        ui.session.append(
+            ChatEntry(kind="assistant", text="arrived while peeking", seq=9999)
+        )
+        assert isinstance(ui.overlay, InspectOverlay)
+        assert len(ui.session.entries) == rows + 1
+        assert "arrived while peeking" in screen(press(ui, "esc"), 120, 400)
+
+    def test_and_the_conversation_underneath_is_not_disturbed(self):
+        ui = recorded(build())
+        ui.focus = WATCHERS
+        before = (ui.chat.cursor, len(ui.session.entries))
+        press(ui, "enter", "esc")
+        assert (ui.chat.cursor, len(ui.session.entries)) == before
 
 
 def proposals() -> list[Proposal]:

@@ -1045,6 +1045,10 @@ class DemoCore:
         )
 
     def _do_WatchPeek(self, cmd: protocol.WatchPeek) -> None:
+        # The whole of the box's text, not its last line. The real
+        # `service._peek_watch` answers with a state line and then the tail of
+        # the log, and a demo that answered with one line was a demo in which
+        # the window this now opens had nothing to scroll.
         for rows in self._watches.values():
             for row in rows:
                 if row.ref == str(cmd.watch_id):
@@ -1052,7 +1056,7 @@ class DemoCore:
                         protocol.WatchPeeked(
                             watch_id=cmd.watch_id,
                             title=row.title,
-                            text=row.text.split("\n")[-1],
+                            text=row.text,
                         )
                     )
                     return
