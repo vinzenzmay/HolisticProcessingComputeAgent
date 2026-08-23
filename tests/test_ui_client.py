@@ -1285,6 +1285,33 @@ class TestTheProfiles:
         assert wire.ui.profiles[0].default is True
         assert wire.ui.profiles[1].working is True
 
+    async def test_a_new_profile_lands_on_the_open_screen(self, wire):
+        """The bug this pair is here for: create a profile, and the screen you
+        created it from went on showing the list it opened with."""
+        wire.ui.focus = SESSIONS
+        await wire.press("a")
+        await wire.tell(_rows("default", "hpc"))
+        assert "hpc" in wire.screen()
+
+    async def test_and_is_still_there_when_the_screen_closes(self, wire):
+        # The other half of it: the screen hands its list back on the way out
+        # (`RowUI._closed`), so a stale copy there was the answer being undone
+        # after it had already arrived.
+        wire.ui.focus = SESSIONS
+        await wire.press("a")
+        await wire.tell(_rows("default", "hpc"))
+        await wire.press("esc")
+        assert [x.name for x in wire.ui.profiles] == ["default", "hpc"]
+
+
+def _rows(*names: str) -> protocol.ProfileRows:
+    return protocol.ProfileRows(
+        rows=[
+            protocol.ProfileRow(name=name, memories=0, is_default=name == "default")
+            for name in names
+        ]
+    )
+
 
 # ------------------------------------------------------- the M7 intents
 

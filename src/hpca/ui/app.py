@@ -635,6 +635,29 @@ class RowUI:
             return ""
         return theme.flash if self.clock() - self._focus_lit_at < theme.flash_hold else ""
 
+    def set_profiles(self, profiles: list[ProfileInfo]) -> None:
+        """Adopt the profile list that has just arrived, wherever it is shown.
+
+        Assignment alone was not enough, and the gap was visible: creating a
+        profile sends `profile.create` and asks for the list again, but the
+        screen that asked is holding its *own* copy — taken when it opened, so
+        the row for the new profile could not appear on it. Worse, closing that
+        screen wrote the stale copy back over this one (`_closed`), so the
+        answer the core had already sent was lost and the profile stayed
+        invisible until the next start.
+
+        So the open screen is told too. Its list is the one the keys act on and
+        the one `_closed` hands back, which is why it is replaced rather than
+        merely redrawn — and `refresh` keeps the cursor on the row it was on,
+        so a list that grows under the user does not move what they were
+        pointing at.
+        """
+        self.profiles = list(profiles)
+        for screen in self.overlays:
+            if isinstance(screen, ProfilesOverlay):
+                screen.profiles = list(profiles)
+                screen.refresh()
+
     def set_display(self, display: Display) -> None:
         """Adopt display settings that have just arrived, and redraw for them.
 
