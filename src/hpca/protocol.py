@@ -353,9 +353,13 @@ class LLMEntry(_Model):
     an ``api_key``, and a catalog crosses this socket precisely so that a
     picker can be drawn — `SessionRow.model` set the precedent (a bare name
     rather than the entry, "because shipping the entry would put an api_key on
-    the wire to render one"). So the key never travels; ``needs_key`` says
-    whether there is one, which is all the manage-LLMs line ever showed
-    (`discover.DiscoveredBackend.details`).
+    the wire to render one"). So the key never travels.
+
+    ``needs_key`` is what is *still missing*: the endpoint asked for a key and
+    no key we hold has been accepted. It is not "a key is involved" — a row
+    that a stored or pool key already unlocked draws no hint, because "api key
+    required" next to a backend the user has just given a working key to reads
+    as the key not having taken.
 
     ``label`` is the identity, and the one field a command may name an entry
     by (`SessionNew.backend`). Minted by the core (`BackendRegistry.catalog`)

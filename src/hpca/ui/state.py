@@ -762,7 +762,10 @@ class BackendInfo:
     would libel every backend for as long as the scan takes.
 
     There is no api key here and there will not be one: the key never crosses
-    the socket, and ``needs_key`` is all the manage-LLMs line ever drew.
+    the socket. ``needs_key`` is the one thing the manage-LLMs line draws about
+    keys, and it means *still* locked — the endpoint asked for a key and none
+    we hold was accepted (`protocol.LLMEntry`). A backend the user has keyed
+    draws no hint.
     """
 
     label: str = ""

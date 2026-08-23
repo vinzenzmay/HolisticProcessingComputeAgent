@@ -56,6 +56,10 @@ def backend_head(info: BackendInfo, *, star: bool = True) -> str:
     details = [
         x for x in (info.base_url, info.model, context_label(info.context)) if x
     ]
+    # Only while it is still locked. `needs_key` is minted to mean "asked for
+    # a key and none we hold was accepted" (`core.backends.BackendRegistry.
+    # catalog`), so a configured backend, or a scan hit a pool key opened,
+    # says nothing about keys at all.
     if info.needs_key:
         details.append("api key required")
     return f"{lead}{info.label or info.model:<22}{'   '.join(details)}"

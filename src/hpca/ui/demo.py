@@ -328,7 +328,9 @@ def sample_catalog() -> list[protocol.LLMEntry]:
             model="llama-3.3-70b",
             base_url="http://10.12.4.55:20001/v1",
             max_model_len=128000,
-            needs_key=True,
+            # No `needs_key`: this is a configured row, and the core never
+            # mints one — the flag means "still locked" (`protocol.LLMEntry`),
+            # which a backend the user has keyed is not.
             reachable=False,
         ),
     ]

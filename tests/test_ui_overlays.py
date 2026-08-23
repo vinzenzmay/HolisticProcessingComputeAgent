@@ -33,7 +33,7 @@ from hpca.ui.overlays import (
     TextEditOverlay,
     ThinkingOverlay,
 )
-from hpca.ui.overlays.backends import KEY_REQUIRED
+from hpca.ui.overlays.backends import KEY_REQUIRED, backend_head
 from hpca.ui.state import (
     BackendInfo,
     ChatEntry,
@@ -927,6 +927,22 @@ class TestManageLlms:
         from hpca.discover import KEY_REQUIRED as MINTED
 
         assert KEY_REQUIRED == MINTED
+
+    def test_the_key_hint_is_only_for_a_row_still_locked(self):
+        # "api key required" beside a backend the user has already keyed reads
+        # as the key not having been accepted. The flag is minted to mean
+        # "still locked" (`core.backends.BackendRegistry.catalog`); the row
+        # just draws it.
+        locked = BackendInfo(
+            label="locked", model=KEY_REQUIRED, base_url="http://c/v1",
+            needs_key=True, discovered=True,
+        )
+        keyed = BackendInfo(
+            label="qwen3", model="qwen3-27b-fp8", base_url="http://a/v1",
+            reachable=True,
+        )
+        assert "api key required" in backend_head(locked)
+        assert "api key required" not in backend_head(keyed)
 
     def test_remove_is_inert_on_the_discovered_panel(self):
         ui = opened("m")

@@ -398,9 +398,13 @@ class BackendRegistry:
                 model=entry.model,
                 base_url=entry.base_url,
                 max_model_len=entry.max_model_len,
-                # Whether there is a key, never the key. The line says "key:
-                # yes"; nothing on a screen ever needed more than that.
-                needs_key=entry.api_key is not None,
+                # Never for a configured entry: whatever key it needs, it was
+                # given when it was configured, and a key the endpoint has
+                # since refused already reads as ○ (`probe_catalog` counts an
+                # authenticated 401 as unreachable). "api key required" on a
+                # row the user has already keyed says the opposite of what is
+                # true.
+                needs_key=False,
                 active=settings.is_active(entry),
                 reachable=results.get(label),
             )
@@ -416,7 +420,10 @@ class BackendRegistry:
                 model=found.model,
                 base_url=found.base_url,
                 max_model_len=found.max_model_len,
-                needs_key=found.needs_key,
+                # Locked *and still locked*: a pool key that unlocked the
+                # endpoint is carried on the row (`discover.probe_endpoint`),
+                # and that row is one `backend.set` away from working.
+                needs_key=found.needs_key and found.api_key is None,
                 active=(
                     settings.llm.base_url == found.base_url
                     and settings.llm.model == found.model
@@ -611,7 +618,9 @@ class BackendRegistry:
                     model=row.model,
                     base_url=row.base_url,
                     max_model_len=row.max_model_len,
-                    needs_key=row.needs_key,
+                    # As in `catalog`: a row the probe's key already unlocked
+                    # is not a row that needs one.
+                    needs_key=row.needs_key and row.api_key is None,
                     reachable=True,
                     discovered=True,
                 )

@@ -517,8 +517,11 @@ class TestTheCatalogOnTheWire:
         h = Harness(home)
         h.settings.backends = [backend_a(api_key="sk-secret")]
         entry = h.registry.catalog()[0]
-        assert entry.needs_key is True
         assert "sk-secret" not in entry.model_dump_json()
+        # And it does not come back as "api key required" either: the key is
+        # there, and the row saying it is missing is the misreading this flag
+        # was narrowed to avoid.
+        assert entry.needs_key is False
 
     def test_the_active_default_is_marked(self, home):
         h = Harness(home)
@@ -544,6 +547,42 @@ class TestTheCatalogOnTheWire:
         assert answers == {"qwen-a": True, "qwen-b": False}
         marked = h.registry.catalog(reachable=answers)
         assert [e.reachable for e in marked] == [True, False]
+
+    async def test_a_scan_hit_a_pool_key_opened_needs_no_key(self, home):
+        # It answered a 401 and then a stored key opened it: the row carries
+        # that key (`discover.probe_endpoint`), so the user is asked for
+        # nothing and the line says nothing about keys.
+        h = Harness(
+            home,
+            port_scanner=await fake_scan(
+                [
+                    DiscoveredBackend(
+                        base_url="http://127.0.0.1:20001/v1",
+                        model="qwen-a",
+                        needs_key=True,
+                        api_key="sk-pool",
+                    )
+                ]
+            ),
+        )
+        await h.registry.scan()
+        assert [e.needs_key for e in h.registry.catalog()] == [False]
+
+    async def test_but_a_scan_hit_nothing_opened_still_asks(self, home):
+        h = Harness(
+            home,
+            port_scanner=await fake_scan(
+                [
+                    DiscoveredBackend(
+                        base_url="http://127.0.0.1:20001/v1",
+                        model=KEY_REQUIRED,
+                        needs_key=True,
+                    )
+                ]
+            ),
+        )
+        await h.registry.scan()
+        assert [e.needs_key for e in h.registry.catalog()] == [True]
 
     async def test_probing_an_empty_catalog_asks_nothing(self, home):
         assert await Harness(home).registry.probe_catalog() == {}
@@ -1167,7 +1206,9 @@ class TestProbingAnEndpoint:
         h.settings.llm_api_keys = ["sk-good"]
         probed = await h.registry.probe("http://localhost:20001/v1")
         assert [e.model for e in probed.models] == ["qwen-a"]
-        assert probed.models[0].needs_key is True
+        # Unlocked by a pool key, so nothing is required of the user: the row
+        # is one `backend.set` away from working.
+        assert probed.models[0].needs_key is False
 
     async def test_the_pool_includes_keys_already_on_configured_backends(
         self, home

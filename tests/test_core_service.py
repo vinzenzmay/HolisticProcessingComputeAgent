@@ -3171,7 +3171,9 @@ class TestTheLLMCatalog:
         await service.handle(LLMList())
         catalog = only(await drain(queue), "LLMCatalog")
         assert "sk-secret" not in catalog.model_dump_json()
-        assert catalog.entries[0].needs_key is True
+        # Nor any hint that one is still wanted: the key is set, and
+        # ``needs_key`` means "still locked" (`protocol.LLMEntry`).
+        assert catalog.entries[0].needs_key is False
 
     async def test_the_default_backend_is_marked(self, service):
         settings = service._deps.settings
