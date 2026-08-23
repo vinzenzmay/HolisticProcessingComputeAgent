@@ -37,6 +37,28 @@ reach for it when a change touches how a file is *named*, and see
 specs-path-registry.md for what it settled. `shift` measured the key-vs-path
 friction of an interface that no longer exists; it is history, not a check.
 
+## Colours
+
+There are no colour constants. Every colour is a setting
+(`config.PaletteSettings`, under `display.palette`) resolved by `hpca.ui.theme`,
+and drawing code reads `theme.chrome` / `theme.ok` / `theme.warn` /
+`theme.danger` / `theme.agent` / `theme.user` / `theme.faint` **at paint time**.
+That indirection is load-bearing: `from hpca.ui.ansi import CYAN` bound the
+string at import, so a palette that changes while the app runs could not have
+been constants. Same rule for any table of styles — hold the *role name* and
+resolve it in the function (`state.MODE_ROLES`, `toasts.ROLES`), never a dict of
+finished escape sequences at module level.
+
+A colour is an xterm index (`"215"`) or a hex triple (`"#ffaf5f"`); the settings
+model refuses anything else, and `theme` falls back per-role for whatever still
+reaches it. Hot reload is free — the palette rides `DisplaySettings`, which the
+core already restates on save (`core.service._apply_settings` →
+`DisplayChanged` → `RowUI.set_display`). There is no file watcher.
+
+The focus flash (`display.focus_flash_seconds`, 0 turns it off) is the only
+background colour this UI draws; the `REVERSE` cursor row opts out of it, since
+reverse would turn the tint into the text colour.
+
 ## Where the databases are
 
 `hpca.db`, `checkpoints.db` and `rag.db` are *kept* in the app dir, but while

@@ -1111,6 +1111,28 @@ class Shutdown(Command):
 # ---------------------------------------------------------------------- events
 
 
+class Palette(_Model):
+    """The colours, by the job each does. `config.PaletteSettings`' twin.
+
+    Strings rather than parsed colours, and they cross unvalidated on purpose:
+    the receiving side has to check them anyway — it is the side holding a
+    terminal in raw mode, where a malformed escape sequence is not a bad value
+    but a lost screen — so checking them here as well would only move the error
+    message somewhere the user cannot see it.
+    """
+
+    agent: str = "255"
+    user: str = "215"
+    chrome: str = "73"
+    ok: str = "71"
+    warn: str = "172"
+    danger: str = "167"
+    muted: str = "245"
+    faint: str = "240"
+    spinner: list[str] = ["73", "66", "23", "236"]
+    flash: str = "23"
+
+
 class DisplaySettings(_Model):
     """The settings a front-end *renders with*, and nothing else.
 
@@ -1145,6 +1167,12 @@ class DisplaySettings(_Model):
     # (`ui.ansi.pulse`). The receiving side treats a value it cannot divide by
     # as "use the built-in", because a repaint loop is not a place to raise.
     decision_pulse_seconds: float = 1.0
+    # What the front-end draws with (`ui.theme`).
+    palette: Palette = Palette()
+    # How long the pane that just took focus is washed in `palette.flash`.
+    # Zero is off. The receiving side clamps, for the reason the fps above
+    # does: a frame is booked from this, and a negative delay books nothing.
+    focus_flash_seconds: float = 0.1
 
 
 class Hello(Event):

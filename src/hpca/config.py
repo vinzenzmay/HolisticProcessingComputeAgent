@@ -10,11 +10,18 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Annotated, Iterable, Literal
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+)
 
 from hpca.thinking import ThinkingEffort
 
@@ -261,6 +268,71 @@ class WatchSettings(_Section):
     peek_chars: int = Field(default=2000, gt=0)
 
 
+_COLOUR = re.compile(r"^(?:#[0-9a-fA-F]{6}|[0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$")
+
+
+def _colour(value: str) -> str:
+    """One palette entry, checked here rather than in the repaint.
+
+    A colour is either an xterm-256 index (``"215"``) or a hex triple
+    (``"#ffaf5f"``). Refused at load, where the answer is a line beside the
+    field that named it — the alternative is a malformed escape sequence
+    reaching a terminal in raw mode, which does not report a bad setting so
+    much as stop being a terminal.
+    """
+    if not _COLOUR.match(value):
+        raise ValueError(
+            f"{value!r} is not a colour: use an xterm index 0-255 or #rrggbb"
+        )
+    return value
+
+
+Colour = Annotated[str, AfterValidator(_colour)]
+
+
+class PaletteSettings(_Section):
+    """The colours, by the job each one does rather than by what it is.
+
+    Named for roles because that is the part that has to stay true: `warn` is
+    whatever colour warnings are, and a theme that makes it blue has made a
+    choice, not a mistake. A key called `yellow` would be a lie the first time
+    somebody took the offer this section exists to make.
+
+    The defaults are the dark palette the app has always drawn, with three
+    corrections: the chrome is xterm 73 rather than 44, whose chroma put the
+    least important thing on the screen ahead of the most; `warn` is 172 rather
+    than 179, far enough from `user` that a warning and one's own words stop
+    reading as relatives; and `muted`/`faint` are real greys rather than the
+    `DIM` attribute, whose rendering was the terminal theme's opinion and
+    differed from one to the next on the same screen.
+    """
+
+    # The two that carry prose. `agent` holds most of what is on screen, so it
+    # is the calmer of the two; `user` is what a scrollback is searched for.
+    agent: Colour = "255"
+    user: Colour = "215"
+    # Rules, focused pane titles, key hints — structure rather than content.
+    chrome: Colour = "73"
+    # The signal three. Nothing decorative is drawn in these on purpose: the
+    # whole value of `ok` is that seeing it means something is actually well.
+    ok: Colour = "71"
+    warn: Colour = "172"
+    danger: Colour = "167"
+    # Secondary and tertiary text.
+    muted: Colour = "245"
+    faint: Colour = "240"
+    # The working row's drop, head first (`ui.rain.spinner`). Shorter than four
+    # is a shorter trail, not an error — one entry is a plain blinking cell.
+    # It is off the signal green because a spinner says "busy", not "well", and
+    # a green that also means busy is a green that no longer means well.
+    spinner: list[Colour] = Field(
+        default=["73", "66", "23", "236"], min_length=1, max_length=4
+    )
+    # The background the pane that just took focus is washed in. The only
+    # background colour this UI draws; see `focus_flash_seconds`.
+    flash: Colour = "23"
+
+
 class DisplaySettings(_Section):
     """What the front-end draws *with*, as opposed to what the core does.
 
@@ -322,6 +394,23 @@ class DisplaySettings(_Section):
     # but the repaint is only booked every `ui.ansi.PULSE_INTERVAL` (0.1s), so
     # a period under about 0.2s aliases into a flicker rather than a breath.
     decision_pulse_seconds: float = Field(default=1.0, gt=0)
+    # The colours, all of them.
+    palette: PaletteSettings = PaletteSettings()
+    # How long the pane that just took focus is washed in `palette.flash`.
+    #
+    # A hold and not a fade. A decay needs frames to decay over and this is
+    # over in one or two, so the ramp it would walk is a ramp nobody sees; what
+    # the eye is actually caught by is the movement, which a step gives it more
+    # cheaply than a gradient. Two repaints per focus change, one of which had
+    # to happen anyway to redraw the title rule.
+    #
+    # Zero turns it off, which is why the floor is `ge` and not `gt`: a user
+    # who finds the flash startling on a large terminal should be able to say
+    # so, and the persistent focus mark on the title rule is still there
+    # underneath it. Capped at a second because past about a quarter of one it
+    # has stopped being a flash and started being a state, and a state that
+    # says "focus arrived here recently" is not a thing this UI has.
+    focus_flash_seconds: float = Field(default=0.1, ge=0, le=1.0)
 
 
 class LLMBackend(_Section):

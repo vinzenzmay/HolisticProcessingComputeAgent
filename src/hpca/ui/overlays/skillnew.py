@@ -22,7 +22,8 @@ from __future__ import annotations
 
 import json
 
-from hpca.ui.ansi import BOLD, CYAN, DIM, RESET, pad
+from hpca.ui import theme
+from hpca.ui.ansi import BOLD, RESET, pad
 from hpca.ui.editor import Editor
 from hpca.ui.keys import NEWLINE_KEYS
 from hpca.ui.overlays.base import BACK_KEYS, ListOverlay, Overlay, framed
@@ -195,14 +196,14 @@ class SkillCreatorOverlay(Overlay):
             mark = "●" if name == self.level else "○"
             parts.append(f"{mark} {name} ({what})")
         row = pad("  " + "   ".join(parts), width)
-        return (BOLD + CYAN + row + RESET) if focused else (DIM + row + RESET)
+        return (BOLD + theme.chrome + row + RESET) if focused else (theme.faint + row + RESET)
 
     def body_rows(self, width: int, height: int) -> list[str]:
         out: list[str] = []
         for at, (field, hint) in enumerate(FIELDS):
             here = at == self.at
             label = f" {field}" + (f"  ({hint})" if here else "")
-            out.append((BOLD + CYAN if here else DIM) + pad(label, width) + RESET)
+            out.append((BOLD + theme.chrome if here else theme.faint) + pad(label, width) + RESET)
             if field == LEVEL:
                 out.append(self.level_row(width, here))
                 continue

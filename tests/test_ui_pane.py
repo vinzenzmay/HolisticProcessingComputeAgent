@@ -5,7 +5,8 @@ the behaviour: what `→` means depends on whether the entry is already open and
 on whether it has a body at all.
 """
 
-from hpca.ui.ansi import BOLD, DIM
+from hpca.ui import theme
+from hpca.ui.ansi import BOLD
 from hpca.ui.app import CHAT, SESSIONS, WATCHERS
 from hpca.ui.demo import build
 from hpca.ui.pane import Fold, Item, Pane
@@ -875,7 +876,7 @@ class TestATurnIsGreyThroughout:
         pane = chat_of(SAID, WORKED)
         pane.collapse_all(58)
         pane.cursor = 0
-        assert DIM in styled(pane, "▸    2 steps · read_file → reasoning")
+        assert theme.faint in styled(pane, "▸    2 steps · read_file → reasoning")
 
     def test_and_so_is_every_step_it_opens_into(self):
         # The head and both of the rows under it: the whole of what an opened
@@ -888,14 +889,14 @@ class TestATurnIsGreyThroughout:
             "  ▸    read_file     /scratch/run.log",
             "       reasoning     two shards, one temp path",
         ):
-            assert DIM in styled(pane, text), text
+            assert theme.faint in styled(pane, text), text
 
     def test_including_what_a_step_returned(self):
         pane = chat_of(SAID, WORKED)
         pane.expanded.add("3/0")
         pane.invalidate()
         pane.cursor = 0
-        assert DIM in styled(pane, "412 lines")
+        assert theme.faint in styled(pane, "412 lines")
 
 
 class TestTheNewestLineStaysOnScreen:

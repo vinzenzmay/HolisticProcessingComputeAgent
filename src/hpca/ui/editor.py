@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from hpca.ui import theme
 from hpca.ui.ansi import (
-    DIM,
     RESET,
     cell_width,
     char_width,
@@ -379,7 +379,7 @@ class Editor:
             if not numbers:
                 prefix = ""
             elif index == 0 or rows[index - 1][0] != row:
-                prefix = f"{DIM}{row + 1:>{gutter - 1}} {RESET}"
+                prefix = f"{theme.faint}{row + 1:>{gutter - 1}} {RESET}"
             else:
                 prefix = " " * gutter
             seg = self.lines[row][start:end]

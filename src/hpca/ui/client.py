@@ -32,8 +32,7 @@ from collections.abc import Callable
 from hpca import protocol
 from hpca.agent.modes import next_mode
 from hpca.transport import Connection
-from hpca.ui import state
-from hpca.ui.ansi import GREEN, RED
+from hpca.ui import state, theme
 from hpca.ui.app import RowUI
 from hpca.ui.pane import Item
 
@@ -42,7 +41,7 @@ logger = logging.getLogger("hpca.ui.client")
 # The `PanelRow.classes` the core sends, as colours. Open-ended on the wire on
 # purpose (`watches.watch_class`), so a class this table has never heard of
 # draws plain rather than raising.
-WATCH_ACCENTS = {"watch-live": GREEN, "watch-dead": RED}
+WATCH_ROLES = {"watch-live": "ok", "watch-dead": "danger"}
 
 # What the box's border title is padded to, so the state columns line up.
 TITLE_COLUMN = 16
@@ -104,7 +103,9 @@ def _panel_item(row: protocol.PanelRow) -> Item:
     lines = row.text.split("\n") if row.text else [""]
     accent = ""
     for name in row.classes.split():
-        accent = WATCH_ACCENTS.get(name, accent)
+        role = WATCH_ROLES.get(name)
+        if role is not None:
+            accent = getattr(theme, role)
     head = f"{row.title:<{TITLE_COLUMN}}{lines[0]}" if row.title else lines[0]
     return Item(
         head=head,
@@ -773,6 +774,10 @@ class UIClient:
             quit_rain=msg.quit_rain,
             quit_rain_fps=msg.quit_rain_fps,
             decision_pulse_seconds=msg.decision_pulse_seconds,
+            focus_flash_seconds=msg.focus_flash_seconds,
+            # A plain mapping, not the wire model: `state.Display` may not
+            # hold a pydantic object any more than `app.py` may import one.
+            palette=msg.palette.model_dump(),
         )
 
     def _display_changed(self, msg: protocol.DisplayChanged) -> None:

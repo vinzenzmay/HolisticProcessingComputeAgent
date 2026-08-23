@@ -98,6 +98,7 @@ from hpca.protocol import (
     LLMCatalog,
     LLMList,
     MemoryResolve,
+    Palette,
     Message,
     ModeSet,
     Notify,
@@ -3096,11 +3097,25 @@ def _display_settings(settings) -> DisplaySettings:
     section = getattr(settings, "display", None)
     if section is None:  # pragma: no cover - a settings object that is a fake
         return DisplaySettings()
+    palette = section.palette
     return DisplaySettings(
         chat_stamps=section.chat_stamps,
         quit_rain=section.quit_rain,
         quit_rain_fps=section.quit_rain_fps,
         decision_pulse_seconds=section.decision_pulse_seconds,
+        focus_flash_seconds=section.focus_flash_seconds,
+        palette=Palette(
+            agent=palette.agent,
+            user=palette.user,
+            chrome=palette.chrome,
+            ok=palette.ok,
+            warn=palette.warn,
+            danger=palette.danger,
+            muted=palette.muted,
+            faint=palette.faint,
+            spinner=list(palette.spinner),
+            flash=palette.flash,
+        ),
     )
 
 

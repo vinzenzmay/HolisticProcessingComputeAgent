@@ -11,11 +11,21 @@ from collections import namedtuple
 from collections.abc import Callable
 
 from hpca import __version__ as VERSION
-from hpca.ui import commands, toasts
-from hpca.ui.ansi import BOLD, CYAN, DIM, GREEN, RED, RESET, REVERSE, YELLOW
-from hpca.ui.ansi import PULSE_INTERVAL
-from hpca.ui.ansi import cell_width, cut, fold, footer_lines, footer_wrap, pad
-from hpca.ui.ansi import rule, safe
+from hpca.ui import commands, theme, toasts
+from hpca.ui.ansi import (
+    BOLD,
+    PULSE_INTERVAL,
+    RESET,
+    REVERSE,
+    cell_width,
+    cut,
+    fold,
+    footer_lines,
+    footer_wrap,
+    pad,
+    rule,
+    safe,
+)
 from hpca.ui.approval import decision_height, render_decision
 from hpca.ui.editor import Editor
 from hpca.ui.keys import NEWLINE_KEYS, is_paste, paste_text
@@ -44,7 +54,6 @@ from hpca.ui.overlays import (
 from hpca.ui.pane import Item, Pane
 from hpca.ui.rain import rain
 from hpca.ui.state import (
-    MODE_COLOURS,
     OWN_MESSAGE_KINDS,
     Answer,
     BackendInfo,
@@ -77,6 +86,7 @@ from hpca.ui.state import (
     Submit,
     Toast,
     Unqueue,
+    mode_colour,
     mode_line,
     when,
 )
@@ -231,8 +241,17 @@ STATUS_TIERS = (
     StatusTier(hint=False, switch=False, cells=0),
 )
 
-# What the meter's severity paints it (`ui.meter.severity`).
-METER_STYLES = {"warn": YELLOW, "danger": BOLD + RED}
+# What the meter's severity paints it (`ui.meter.severity`) — the palette role
+# by name, resolved at paint time, and whether that tier is also bold. Names
+# rather than sequences for the reason `state.MODE_ROLES` gives: a table built
+# at import outlives the palette it was built from.
+METER_ROLES = {"warn": ("warn", False), "danger": ("danger", True)}
+
+
+def meter_style(severity: str) -> str:
+    """The style the context meter's bar is drawn in at `severity`."""
+    role, bold = METER_ROLES.get(severity, ("faint", False))
+    return (BOLD if bold else "") + getattr(theme, role)
 
 
 class RowUI:
@@ -278,7 +297,7 @@ class RowUI:
         self.focus = CHAT
         self.frame_ms = 0.0
         self._note = ""
-        self.note_style = YELLOW
+        self.note_style = theme.warn
         # Set from `hello`, and what the header falls back to when no session
         # is open to have a profile of its own.
         self.core_profile = ""
@@ -304,6 +323,11 @@ class RowUI:
         # two processes share a wall clock and not a monotonic one.
         self.wall = time.time
         self._esc_armed_at: float | None = None
+        # When focus last *moved*, for the flash that says where it went
+        # (`_flash`). None until it has moved at all: the pane the app opens
+        # on was not arrived at, so lighting it would be an answer to a
+        # question nobody asked.
+        self._focus_lit_at: float | None = None
         # Everything the overlays draw and nothing else reads. Handed in
         # rather than fetched, for the reason every screen in `overlays/` is:
         # the UI opens no files and no sockets (rule 2 of §4.2). Both now come
@@ -489,7 +513,7 @@ class RowUI:
     def note(self, text: str) -> None:
         # Anything set as an ordinary note is an ordinary note; a toast that
         # wants another colour sets both, and the next note takes it back.
-        self._note, self.note_style = text, YELLOW
+        self._note, self.note_style = text, theme.warn
 
     @property
     def chat(self) -> Pane:
@@ -547,6 +571,70 @@ class RowUI:
             )
         return session
 
+    def _move_focus(self, slots: list[int], step: int) -> None:
+        """Move focus one pane along the ring, and light the pane it lands on.
+
+        The flash is here rather than in `render` because this is the only
+        place that knows focus *changed* as opposed to merely being somewhere:
+        a frame drawn for any other reason must not relight the pane, or the
+        wash would come back every time a token arrived.
+        """
+        self.focus = slots[(slots.index(self.focus) + step) % len(slots)]
+        self._focus_lit_at = self.clock()
+
+    @staticmethod
+    def _wash(rows: list[str], tint: str) -> list[str]:
+        """`rows` with `tint` behind them, or `rows` if there is no tint.
+
+        Two things make this more than a prefix. A row is written as runs and
+        every run opens with a RESET that states the whole style (`ui.rain`,
+        `pane.Item.paint`), so a background set once at the left edge would be
+        cleared by the first one and the wash would stop partway across; the
+        tint is therefore restated after every reset in the row.
+
+        And the cursor's row is skipped, because it is drawn REVERSE — which
+        swaps foreground and background, so a tint under it would come out as
+        the *text* colour and the one row the user is pointing at would be the
+        one row drawn wrong. It keeps its highlight, which is a stronger mark
+        than the wash anyway.
+        """
+        if not tint:
+            return rows
+        return [
+            row if REVERSE in row else tint + row.replace(RESET, RESET + tint) + RESET
+            for row in rows
+        ]
+
+    def _flash_wake(self) -> float | None:
+        """Seconds until the flash stops being true, or None if it already is.
+
+        None rather than zero for a spent flash, which is the rule the whole
+        `next_wake` list is built on: zero is a repaint that books another
+        repaint, and this is the one contributor that would do it forever,
+        since nothing ever clears the timestamp.
+        """
+        if theme.flash_hold <= 0 or self._focus_lit_at is None:
+            return None
+        left = theme.flash_hold - (self.clock() - self._focus_lit_at)
+        return left if left > 0 else None
+
+    def _flash(self, slot: int) -> str:
+        """The background the pane in `slot` is washed in, or "" for none.
+
+        Held and then gone — no ramp. A decay needs frames to decay over and
+        this is over in one or two of them, so what the eye is caught by is the
+        movement, which a step gives it more cheaply than a gradient would.
+
+        Zero hold is the setting turned off, and it short-circuits before the
+        clock is read: `focus_flash_seconds` of 0 should cost nothing at all,
+        not a subtraction whose answer is always false.
+        """
+        if theme.flash_hold <= 0 or slot != self.focus:
+            return ""
+        if self._focus_lit_at is None:
+            return ""
+        return theme.flash if self.clock() - self._focus_lit_at < theme.flash_hold else ""
+
     def set_display(self, display: Display) -> None:
         """Adopt display settings that have just arrived, and redraw for them.
 
@@ -555,8 +643,18 @@ class RowUI:
         view would be doing the work at the one moment the user is watching.
         `restyle` is cheap — it rebuilds `Item`s from entries already held —
         and it keeps what is open open, which `reset` would not.
+
+        The palette is swapped *first*, and that ordering is the whole of what
+        makes a saved theme land in one frame: `restyle` rebuilds rows, and a
+        row rebuilt before the swap would be built in the colours that are on
+        their way out. Everything drawn after this line is drawn in the new
+        palette, including the rows this call is about to rebuild.
+
+        A colour this cannot draw keeps the built-in one for that role and no
+        more (`theme._sound`), which is why there is nothing to catch here.
         """
         self.display = display
+        theme.apply(**dict(display.palette), flash_hold=display.focus_flash_seconds)
         for session in [self._blank, *self._states.values()]:
             session.restyle(display)
 
@@ -718,7 +816,7 @@ class RowUI:
                             f"{session.watch_count} watches"
                             + (" · open" if i == self.active else ""),
                         ],
-                        accent=GREEN if i == self.active else "",
+                        accent=theme.ok if i == self.active else "",
                         key=session.session_id,
                     )
                     for i, session in enumerate(self.sessions)
@@ -862,7 +960,7 @@ class RowUI:
         # that outlives the toast.
         head = f"{title}: " if title else ""
         self._note = head + " ".join(safe(text).split())
-        self.note_style = RED if severity == "error" else YELLOW
+        self.note_style = theme.danger if severity == "error" else theme.warn
         # And, when it is a heading over a block, the window as well. `title`
         # is the signal (`protocol.Notify.title`): the core sets it exactly
         # where an answer is a heading plus a body — the skills a profile can
@@ -1101,7 +1199,7 @@ class RowUI:
         so the measurement and the drawing ask the same question of it.
         """
         if self._esc_armed():
-            return "esc again to stop", RED
+            return "esc again to stop", theme.danger
         return self.note, self.note_style
 
     def _footer_h(self, width: int, height: int) -> int:
@@ -1218,7 +1316,7 @@ class RowUI:
         rows = [("", rule("offer", width))]
         for line in fold(offer.question, max(8, width - 4)):
             rows.append((BOLD, f"  {line}"))
-        rows.append((DIM, "  (y) yes · (n) no"))
+        rows.append((theme.faint, "  (y) yes · (n) no"))
         return rows
 
     def _offer_h(self, width: int, height: int) -> int:
@@ -1285,6 +1383,7 @@ class RowUI:
         # for it here rather than anything pushing frames at the UI.
         self.session.tick(self.wall())
         for slot, pane, pane_h in order:
+            at = len(out)
             if slot == INPUT:
                 status = self._render_status(width)
                 prompt = self._render_decision(width, height) or self._render_offer(
@@ -1292,12 +1391,18 @@ class RowUI:
                 )
                 if prompt:  # standing where the box would be (`_entry_h`)
                     out += prompt + status
+                    out[at:] = self._wash(out[at:], self._flash(slot))
                     continue
                 menu = self._render_menu(width, height)
                 out += menu + status
                 out += self._render_input(width, pane_h - len(status) - len(menu))
             else:
                 out += pane.render(width, pane_h, focused=self.focus == slot)
+            # The pane's whole rectangle, now that it is built: the flash is a
+            # background under rows that were drawn without one, which is the
+            # only way to add one to a UI that has never had a background at
+            # all (`ui.theme.sgr`, `background=True`).
+            out[at:] = self._wash(out[at:], self._flash(slot))
         out = self._frame(out, footer, width, height)
         out = self._over_toasts(out, width, len(footer))
         return self._over_confirm(out, width)
@@ -1407,9 +1512,9 @@ class RowUI:
         if question is None:
             return out
         rows = [
-            YELLOW + rule("confirm", width) + RESET,
+            theme.warn + rule("confirm", width) + RESET,
             BOLD + pad(f"  {question.question}", width) + RESET,
-            DIM + pad("  (y) yes · (n) no · (esc) no", width) + RESET,
+            theme.faint + pad("  (y) yes · (n) no · (esc) no", width) + RESET,
         ]
         # A terminal too short for all three keeps them in the order they are
         # worth: the question, then the way to answer it, then the rule, which
@@ -1441,7 +1546,7 @@ class RowUI:
             return []
         focused = self.focus == OFFER
         rows = self._offer_rows(offer, width)
-        rows[0] = (BOLD + CYAN if focused else DIM, rows[0][1])
+        rows[0] = (BOLD + theme.chrome if focused else theme.faint, rows[0][1])
         out = [f"{style}{pad(text, width)}{RESET}" for style, text in rows]
         room = self._offer_h(width, height)
         if len(out) > room:
@@ -1469,9 +1574,9 @@ class RowUI:
         else:  # narrower than the poorest tier: the mode alone, clipped
             left, right = cut(left, max(0, width - 1)), ""
         gap = width - cell_width(left) - cell_width(right)
-        meter = METER_STYLES.get(self.session.context.severity, DIM)
+        meter = meter_style(self.session.context.severity)
         return [
-            MODE_COLOURS.get(self.session.mode, DIM)
+            mode_colour(self.session.mode)
             + left
             + RESET
             + " " * gap
@@ -1487,12 +1592,12 @@ class RowUI:
         # the answer will be written by. Empty — and so absent — when no
         # session is open to be pinned to anything.
         title = rule("message", width, self.model)
-        out = [(BOLD + CYAN if focused else DIM) + title + RESET]
+        out = [(BOLD + theme.chrome if focused else theme.faint) + title + RESET]
         rows = max(1, height - 1)
         body = self.input.render(self._input_body(width), rows, focused=focused)
         for index, line in enumerate(body):
             marker = "› " if index == 0 else "  "
-            out.append((CYAN if focused else DIM) + marker + RESET + line)
+            out.append((theme.chrome if focused else theme.faint) + marker + RESET + line)
         return out[:height]
 
     def _header(self, width: int) -> str:
@@ -2079,7 +2184,7 @@ class RowUI:
             )
         else:
             self.note = self._why_not_stoppable()
-            self.note_style = DIM
+            self.note_style = theme.faint
 
     def _why_not_stoppable(self) -> str:
         """Why the stop gesture did nothing, in the three shapes that has.
@@ -2102,7 +2207,7 @@ class RowUI:
             return
         if not self.session_for(session_id).turn.interruptible:
             self.note = "that turn finished while you were deciding"
-            self.note_style = DIM
+            self.note_style = theme.faint
             return
         self.send(Interrupt(session_id))
         self.note = "stopped the turn"
@@ -2197,6 +2302,14 @@ class RowUI:
             # the clock and by nothing else, so without a frame booked here it
             # would be painted once and hang there mid-drop.
             self._rain_interval() if self._raining() else None,
+            # And the sixth: the focus flash is held for a fixed time and then
+            # is not, so the frame that clears it has to be booked or the wash
+            # stays until the next keypress happens to redraw. One wake and
+            # then nothing — unlike the four above, this one is spent: once
+            # the hold is over it returns None for good, which is the whole of
+            # why a flash costs two repaints and an animation costs ten a
+            # second.
+            self._flash_wake(),
         ]
         if self._esc_armed_at is not None:
             left = ESC_STOP_WINDOW - (self.clock() - self._esc_armed_at)
@@ -2236,7 +2349,7 @@ class RowUI:
             # thing from no spinner, and `_stop_from_the_row` gives the same
             # three answers to the same question.
             self.note = self._why_not_stoppable()
-            self.note_style = DIM
+            self.note_style = theme.faint
             return True
         self.send(Interrupt(self.active_id))
         self.note = "stopped the turn"
@@ -2382,7 +2495,7 @@ class RowUI:
             # the turn had since changed would be worse than one that was
             # refused. An ordinary message queues; this one waits for the user.
             self.note = "wait for this turn — a command cannot be queued"
-            self.note_style = DIM
+            self.note_style = theme.faint
             return
         if screen and self._screen_command(name, args):
             # The screen commands that *do* reach the core — a
@@ -2560,9 +2673,9 @@ class RowUI:
         elif key == "ctrl-l" and self.focus == CHAT:
             self._switch_llm()
         elif key in ("ctrl-down", "tab"):
-            self.focus = slots[(slots.index(self.focus) + 1) % len(slots)]
+            self._move_focus(slots, +1)
         elif key in ("ctrl-up", "shift-tab"):
-            self.focus = slots[(slots.index(self.focus) - 1) % len(slots)]
+            self._move_focus(slots, -1)
         elif key == "ctrl-e":
             # The draft, from here too — and the focus goes with it, the way a
             # paste does (`_edit_draft`, `_paste`).

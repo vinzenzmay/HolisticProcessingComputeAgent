@@ -21,15 +21,15 @@ exactly ``width`` cells is a frame the repaint tears (see `ansi.cell_width`).
 
 from __future__ import annotations
 
-from hpca.ui.ansi import BOLD, DIM, GREEN, RESET, WHITE
+from hpca.ui import theme
+from hpca.ui.ansi import BOLD, RESET
 
 # Halfwidth katakana, which are the glyphs the effect is remembered for, plus
 # digits for the flicker. Halfwidth deliberately: `ア` (U+30A2) is two cells
 # wide and `ｱ` (U+FF71) is one, so the full-width block would put a column of
 # the frame half a cell out of step with every row it fell through.
-GLYPHS = tuple(
-    [chr(code) for code in range(0xFF66, 0xFF9E)] + list("0123456789")
-)
+KATAKANA = tuple(chr(code) for code in range(0xFF66, 0xFF9E))
+GLYPHS = KATAKANA + tuple("0123456789")
 
 # Rows a second. The spread is the whole illusion — one speed reads as a
 # curtain being lowered rather than as rain — and the range is bounded below
@@ -88,12 +88,22 @@ FPS = 60
 # difference is not visible against the difference in what it costs to send.
 #
 # Each one opens with a RESET so that it says the whole state rather than a
-# change to it: the row is written as runs, and a `GREEN` following the head
+# change to it: the row is written as runs, and a `theme.ok` following the head
 # would otherwise inherit the head's BOLD — and the eye reads bold green as a
 # second head, which puts two heads in one drop.
-HEAD_STYLE = RESET + BOLD + WHITE
-BODY_STYLE = RESET + GREEN
-TAIL_STYLE = RESET + DIM + GREEN
+# Read when the field is drawn rather than bound here: the palette is a
+# setting now, and a module constant is exactly the staleness `ui.theme`
+# exists to prevent — it would hold whichever colours were current at import
+# and go on raining them after the settings editor had said otherwise.
+def _tiers() -> tuple[str, str, str]:
+    """Head, body and tail, in the palette in force now."""
+    return (
+        RESET + BOLD + theme.agent,
+        RESET + theme.ok,
+        RESET + theme.faint + theme.ok,
+    )
+
+
 BODY_ROWS = 3
 
 
@@ -132,6 +142,9 @@ def rain(width: int, height: int, now: float) -> list[str]:
     # sequence per *cell* rather than per run costs about a third again.
     cells = [[" "] * width for _ in range(height)]
     styles: list[list[str]] = [[""] * width for _ in range(height)]
+    # Once for the frame, not once per drop: the palette cannot change while
+    # one frame is being built, and this is the hottest loop the UI has.
+    head_style, body_style, tail_style = _tiers()
     tick = int(now * CHURN)
     for x in range(width):
         speed = MIN_SPEED + _unit(x * 0x9E3779B1) * (MAX_SPEED - MIN_SPEED)
@@ -149,11 +162,11 @@ def rain(width: int, height: int, now: float) -> list[str]:
                 _mix(x * 0x27D4EB2D + y * 0x165667B1 + tick) % len(GLYPHS)
             ]
             if depth == 0:
-                styles[y][x] = HEAD_STYLE
+                styles[y][x] = head_style
             elif depth <= BODY_ROWS:
-                styles[y][x] = BODY_STYLE
+                styles[y][x] = body_style
             else:
-                styles[y][x] = TAIL_STYLE
+                styles[y][x] = tail_style
     return [_row(cells[y], styles[y]) for y in range(height)]
 
 
@@ -177,3 +190,85 @@ def _row(glyphs: list[str], styles: list[str]) -> str:
     if current:
         out.append(RESET)
     return "".join(out)
+
+
+# --------------------------------------------------------------- the spinner
+
+# The same effect, four cells wide, for the working row.
+#
+# A one-character spinner says "something is happening" and nothing else; this
+# screen already has a vocabulary for waiting, and it is the one behind the
+# quit question. So the working row gets a drop of it: four columns, the head
+# oscillating between the walls instead of falling, and the trail behind it —
+# behind in the direction it *came from*, which is what makes the bounce read
+# as a bounce rather than as two unrelated slides.
+#
+# It does not rain. A column that fell off the bottom would need somewhere to
+# fall to, and the row it is on is one line high; the oscillation is what
+# gives the same glyphs the same restlessness in the space there is.
+SPINNER_WIDTH = 4
+
+# Where the head is on each frame of the cycle. Six frames rather than eight:
+# the walls are not held for a second frame, because a drop that pauses at the
+# end of its travel reads as a stutter in the animation rather than as a turn.
+SPINNER_STEPS = (0, 1, 2, 3, 2, 1)
+
+def spinner_trail() -> tuple[str, ...]:
+    """What the trail costs in brightness, by how far behind the head it is.
+
+    Four tiers where `rain` has three, and the reason the argument there does
+    not apply is arithmetic: a full screen of drops pays a distinct SGR
+    sequence per row of every one of them, and this pays at most four per
+    frame. So the decay can be a real ramp, which over four cells is the whole
+    of what makes the trail read as fading rather than as a block of one colour
+    with a bright end.
+
+    It is `palette.spinner` and not a tier of the signal colours, because a
+    spinner says *busy* and the signal three say how things are — a green that
+    also means busy is a green that no longer means well. Shorter than four is
+    a shorter trail rather than an error, and one entry is a plain blinking
+    cell, which is a legitimate thing to ask a spinner to be.
+
+    Each opens with a RESET so it states the whole style rather than a change
+    to it, for the reason `_tiers` gives: these are written as runs, and a
+    colour that inherited the previous cell's BOLD would read as a second head.
+    """
+    return tuple(RESET + colour for colour in theme.spinner)
+
+
+def spinner(frame: int) -> tuple[str, tuple[str, ...]]:
+    """One frame of it: ``SPINNER_WIDTH`` glyphs, and the style of each.
+
+    Returned apart, and that is not a convenience. Every line this UI draws is
+    built plain and measured before any SGR is wrapped around it
+    (`ansi.pad`, `pane.Item`), so a spinner that arrived already coloured
+    would be a working row measured with its escapes in it. The glyphs go into
+    the line; the styles are put on afterwards, over the padded row.
+
+    Katakana only, where the field mixes digits in: the digits are the
+    flicker in a screenful of them, and in four cells a `7` is not a flicker,
+    it is a number the eye tries to read off the working row.
+
+    ``frame`` is a count, not a clock — `state.Turn` derives it from the same
+    tick that decides when the row is next drawn, so the glyphs churn only on
+    frames that were going to be painted anyway.
+    """
+    step = frame % len(SPINNER_STEPS)
+    head = SPINNER_STEPS[step]
+    # Where it came from, which is the side the trail is on. Reading the
+    # previous step rather than working the direction out from the frame index
+    # is what makes the two turning points fall out for free: at a wall the
+    # drop has just arrived from the one place it can have come from.
+    came_from = SPINNER_STEPS[step - 1]
+    direction = 1 if head >= came_from else -1
+    glyphs = [" "] * SPINNER_WIDTH
+    styles = [""] * SPINNER_WIDTH
+    for depth, style in enumerate(spinner_trail()):
+        x = head - direction * depth
+        if not 0 <= x < SPINNER_WIDTH:
+            continue
+        glyphs[x] = KATAKANA[
+            _mix(x * 0x27D4EB2D + frame * 0x165667B1) % len(KATAKANA)
+        ]
+        styles[x] = style
+    return "".join(glyphs), tuple(styles)

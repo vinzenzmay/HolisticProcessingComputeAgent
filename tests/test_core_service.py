@@ -84,7 +84,7 @@ from hpca.skills import (
     write_skill,
 )
 from hpca.transcript import RESULT_RULE
-from hpca.ui.state import SPINNER_FRAMES
+from hpca.ui.rain import KATAKANA as SPINNER_GLYPHS
 from hpca.watches import KIND_JOB, KIND_LOG, WatchStore
 from tests.ui_harness import connected
 
@@ -257,7 +257,7 @@ async def relay(queue, wire):
 
 def spinner_lines(wire) -> list[str]:
     """The working rows on screen — one while a turn runs, none after."""
-    return [line for line in wire.frame() if any(f in line for f in SPINNER_FRAMES)]
+    return [line for line in wire.frame() if any(f in line for f in SPINNER_GLYPHS)]
 
 
 class TestAssembly:
@@ -322,8 +322,24 @@ class TestHandshake:
         assert set(type(first.display).model_fields) == {
             "chat_stamps",
             "decision_pulse_seconds",
+            "focus_flash_seconds",
+            "palette",
             "quit_rain",
             "quit_rain_fps",
+        }
+        # And the palette is colours and nothing else — no paths, no names, no
+        # anything a front-end could be handed by calling it a display key.
+        assert set(type(first.display.palette).model_fields) == {
+            "agent",
+            "chrome",
+            "danger",
+            "faint",
+            "flash",
+            "muted",
+            "ok",
+            "spinner",
+            "user",
+            "warn",
         }
 
     async def test_the_digest_follows_the_settings(self, home, conn, llm):

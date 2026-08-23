@@ -20,15 +20,18 @@ Two shapes cross the seam in each direction:
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from hpca.ui.ansi import AMBER, DIM, GREEN, PULSE_PERIOD, RED, WHITE, YELLOW
+from hpca.ui import rain, theme
+from hpca.ui.ansi import PULSE_PERIOD, RESET
 from hpca.ui.approval import Decision
 from hpca.ui.editor import Editor
 from hpca.ui.meter import render_bar, severity
 from hpca.ui.pane import Fold, Item, Pane
 from hpca.ui.rain import FPS as RAIN_FPS
+from hpca.ui.theme import FLASH_HOLD
 
 # The kinds of chat entry that are the user's own words, and so the ones Enter
 # offers the rewind on. `queued` counts: it is a message the user wrote, drawn
@@ -104,6 +107,21 @@ class Display:
     # default stands in until `hello` lands, which is before there is a
     # decision on screen to pulse (`client._hello` is the first frame).
     decision_pulse_seconds: float = PULSE_PERIOD
+    # The colours, as colour *specs* rather than escape sequences — an xterm
+    # index or a hex triple, the way the settings file writes them. They are
+    # turned into sequences once, by `ui.theme.apply`, when this is adopted;
+    # holding them resolved here would put the same palette in two places and
+    # make "which one is on screen" a question with two answers.
+    #
+    # A mapping and not ten fields, because nothing in this module reads an
+    # individual colour: `RowUI.set_display` hands the whole thing to the theme
+    # and the theme is what the drawing code asks. Every key is optional, and
+    # one that is absent keeps the built-in — which is what lets a settings
+    # file name three colours and mean exactly that.
+    palette: Mapping[str, object] = field(default_factory=dict)
+    # How long the pane that just took focus is washed in `palette["flash"]`.
+    # Zero is off.
+    focus_flash_seconds: float = FLASH_HOLD
 
 
 # The mode line's copy, lifted from `tui/mode_bar.py` — the hint is the whole
@@ -118,7 +136,16 @@ MODE_HINTS = {
 # ctrl+m is carriage return in most terminals, so shift+tab is the binding
 # that always works (§5).
 MODE_SWITCH_HINT = "shift+tab to switch"
-MODE_COLOURS = {"manual": YELLOW, "auto": GREEN, "full-auto": RED}
+# Which palette role each mode is drawn in — the role's *name*, resolved when
+# the row is drawn. A table of finished escape sequences would be built at
+# import and go on being right about a palette the settings editor had already
+# replaced, which is the one thing `ui.theme` exists to prevent.
+MODE_ROLES = {"manual": "warn", "auto": "ok", "full-auto": "danger"}
+
+
+def mode_colour(mode: str) -> str:
+    """The colour `mode` is drawn in, or the quiet one if it is not a mode."""
+    return getattr(theme, MODE_ROLES.get(mode, "faint"))
 
 
 def mode_line(mode: str, *, hint: bool = True, switch: bool = True) -> str:
@@ -263,7 +290,7 @@ def entry_item(entry: ChatEntry, *, stamps: bool = True) -> Item:
             head=_label("you", entry.at, stamps),
             body=body,
             preview=said,
-            accent=AMBER,
+            accent=theme.user,
             label=True,
             **row,
         )
@@ -274,7 +301,7 @@ def entry_item(entry: ChatEntry, *, stamps: bool = True) -> Item:
             head=f"{_label('you', entry.at, stamps)} · queued",
             body=body,
             preview=said,
-            accent=DIM,
+            accent=theme.faint,
             label=True,
             **row,
         )
@@ -283,7 +310,7 @@ def entry_item(entry: ChatEntry, *, stamps: bool = True) -> Item:
             head=_label("error", entry.at, stamps),
             body=body,
             preview=said,
-            accent=RED,
+            accent=theme.danger,
             label=True,
             **row,
         )
@@ -306,12 +333,12 @@ def entry_item(entry: ChatEntry, *, stamps: bool = True) -> Item:
         return Item(
             head=f"{steps} steps" + (f" · {summary}" if summary else ""),
             folds=[part_fold(part) for part in entry.parts],
-            accent=DIM,
+            accent=theme.faint,
             **row,
         )
     if entry.kind in ("event", "recall"):
         mark = "↺" if entry.kind == "recall" else "·"
-        return Item(head=f"{mark} {said}", accent=DIM, **row)
+        return Item(head=f"{mark} {said}", accent=theme.faint, **row)
     # Anything else is drawn as the agent talking, including a kind this
     # renderer has never heard of: the text is what matters and dropping the
     # row would lose it.
@@ -319,7 +346,7 @@ def entry_item(entry: ChatEntry, *, stamps: bool = True) -> Item:
         head=_label("hpca", entry.at, stamps),
         body=body,
         preview=said,
-        accent=WHITE,
+        accent=theme.agent,
         label=True,
         **{**row, "kind": entry.kind or "assistant"},
     )
@@ -328,13 +355,19 @@ def entry_item(entry: ChatEntry, *, stamps: bool = True) -> Item:
 # ------------------------------------------------------------- the turn and it
 
 
-# The spinner, and how fast it turns. 0.1s is 10 frames a second: fast enough
-# to read as motion, and slow enough that a session over a loaded SSH link
-# spends a tenth of the repaints a 0.08s spinner would. Nothing else on the
-# screen changes by the clock, so this interval *is* the UI's idle cost while
-# a turn runs — see `RowUI.next_wake`, which books exactly one wake per frame
-# rather than reintroducing a poll.
-SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+# How fast the spinner turns. 0.1s is 10 frames a second: fast enough to read
+# as motion, and slow enough that a session over a loaded SSH link spends a
+# tenth of the repaints a 0.08s spinner would. Nothing else on the screen
+# changes by the clock, so this interval *is* the UI's idle cost while a turn
+# runs — see `RowUI.next_wake`, which books exactly one wake per frame rather
+# than reintroducing a poll.
+#
+# The glyphs themselves are `ui.rain`'s: four cells of the same katakana the
+# quit screen rains, with the drop bouncing between the walls and its trail
+# fading behind it. A braille wheel turned here for a long time and said only
+# "not hung"; the effect the rest of the UI already uses for "alive and
+# waiting" says the same thing in the same language, and the working row is
+# the other place the user is doing nothing but waiting.
 SPINNER_INTERVAL = 0.1
 
 # What the spinner says when the core has not named a step yet. The graph's own
@@ -446,15 +479,45 @@ class Turn:
         return max(0, int(now - self.started_epoch))
 
     def frame(self, now: float) -> str:
-        """The braille glyph for this instant.
+        """The spinner's four cells for this instant, plain.
 
         Derived from the clock rather than advanced by a tick, so the spinner
         needs nothing to drive it: any frame drawn at time *t* shows the same
-        glyph, and a UI that repaints only when something changed can work out
-        when this one next will (`next_frame`).
+        glyphs, and a UI that repaints only when something changed can work out
+        when this one next will (`next_frame`). The churn rides the same
+        counter, so the glyphs are swapped only on frames that were going to be
+        painted anyway — a second clock for them would be a second reason to
+        wake up, for a change nobody asked to see sooner.
         """
-        base = now - (self.started_epoch or 0.0)
-        return SPINNER_FRAMES[int(base / SPINNER_INTERVAL) % len(SPINNER_FRAMES)]
+        return rain.spinner(self._tick(now))[0]
+
+    def _tick(self, now: float) -> int:
+        """Which frame of the animation this instant is."""
+        return int((now - (self.started_epoch or 0.0)) / SPINNER_INTERVAL)
+
+    def paint(self, now: float) -> Callable[[str, str], str]:
+        """Put the trail's colours back on a row that was measured without them.
+
+        Handed to the working row as `pane.Item.paint`, and given the finished,
+        padded line: the spinner is found in it by its own glyphs, which are
+        katakana and cannot collide with the activity text beside them. A row
+        too narrow to have kept them is left alone rather than guessed at —
+        `ansi.pad` truncates, and the answer to "the spinner was cut off" is a
+        line with no colour in it, not one with colour in the wrong cells.
+        """
+        glyphs, styles = rain.spinner(self._tick(now))
+
+        def paint(row: str, style: str) -> str:
+            at = row.find(glyphs)
+            if at < 0:
+                return row
+            lit = "".join(s + g for g, s in zip(glyphs, styles))
+            # Back into the style the row is being drawn in, not out of it: on
+            # the cursor's own row that is REVERSE, and a bare RESET here would
+            # end the highlight four cells in.
+            return f"{row[:at]}{lit}{RESET}{style}{row[at + len(glyphs) :]}"
+
+        return paint
 
     def next_frame(self, now: float) -> float:
         """Seconds until `frame` would answer differently."""
@@ -1181,7 +1244,12 @@ class SessionState:
                 self.chat.set_tail(None)
             return
         self.chat.set_tail(
-            Item(head=self.turn.line(now), kind=WORKING_KIND, key=WORKING_KEY)
+            Item(
+                head=self.turn.line(now),
+                kind=WORKING_KIND,
+                key=WORKING_KEY,
+                paint=self.turn.paint(now),
+            )
         )
 
     def next_wake(self, now: float) -> float | None:

@@ -19,6 +19,7 @@ from __future__ import annotations
 import pytest
 
 from hpca import protocol
+from hpca.ui import theme
 from hpca.agent.context import ToolContext
 from hpca.agent.file_tools import add_file_tools
 from hpca.agent.modes import script_preview
@@ -27,17 +28,7 @@ from hpca.config import Settings
 from hpca.db import connect, init_db
 from hpca.runner import ProcessRunner
 from hpca.trash import TrashManager
-from hpca.ui.ansi import (
-    BOLD,
-    CYAN,
-    DIM,
-    PULSE_INTERVAL,
-    PULSE_PERIOD,
-    PULSE_RAMP,
-    RED,
-    WHITE,
-    YELLOW,
-)
+from hpca.ui.ansi import BOLD, PULSE_INTERVAL, PULSE_PERIOD
 from hpca.ui.app import CHAT, DECISION, INPUT, OFFER, SESSIONS, WATCHERS, RowUI
 from hpca.ui.approval import approval_details
 from hpca.ui.keys import PASTE
@@ -706,12 +697,12 @@ class TestTheRuleSaysWhereTheKeysAre:
     async def test_the_rule_is_teal_when_the_prompt_is_focused(self, wire):
         await parked(wire, BASH_GATE)
         assert wire.ui.focus == DECISION
-        assert self.rule_row(wire).startswith(BOLD + CYAN)
+        assert self.rule_row(wire).startswith(BOLD + theme.chrome)
 
     async def test_and_dim_when_it_is_not(self, wire):
         await parked(wire, BASH_GATE)
         wire.ui.focus = CHAT
-        assert self.rule_row(wire).startswith(DIM)
+        assert self.rule_row(wire).startswith(theme.faint)
 
     async def test_it_is_the_same_sentence_the_panes_write(self, wire):
         # Not merely "teal": the exact styles `Pane.render` puts on its own
@@ -722,19 +713,19 @@ class TestTheRuleSaysWhereTheKeysAre:
         unfocused = self.rule_row(wire)
         chat = [x for x in wire.ui.render(120, 40) if "── chat ─" in x][0]
         wire.ui.focus = CHAT
-        assert focused.startswith(BOLD + CYAN) and chat.startswith(BOLD + CYAN)
-        assert unfocused.startswith(DIM)
+        assert focused.startswith(BOLD + theme.chrome) and chat.startswith(BOLD + theme.chrome)
+        assert unfocused.startswith(theme.faint)
 
     async def test_a_destructive_gate_still_says_so_in_red(self, wire):
         await parked(wire, DELETE_GATE)
-        assert self.heading(wire, "Destructive operation").startswith(RED + BOLD)
+        assert self.heading(wire, "Destructive operation").startswith(theme.danger + BOLD)
 
     async def test_and_an_execution_gate_in_yellow(self, wire):
         # The distinction the docstring of `ui/approval.py` insists on: a
         # script about to run is not the same warning as something about to be
         # lost, and one colour for both would be a warning that says nothing.
         await parked(wire, BASH_GATE)
-        assert self.heading(wire, "Run this —").startswith(YELLOW + BOLD)
+        assert self.heading(wire, "Run this —").startswith(theme.warn + BOLD)
 
     async def test_the_two_kinds_are_still_told_apart_while_focused(self, wire):
         # The thing the naive fix would have broken: the prompt is focused
@@ -753,7 +744,7 @@ class TestTheRuleSaysWhereTheKeysAre:
         # being refused is still the same class of thing.
         await parked(wire, DELETE_GATE)
         await wire.press("n")
-        assert self.heading(wire, "Denied —").startswith(RED + BOLD)
+        assert self.heading(wire, "Denied —").startswith(theme.danger + BOLD)
 
     async def test_the_rule_costs_no_rows_either_way(self, wire):
         # Focus is a colour and never a layout: a prompt that grew a row when
@@ -795,8 +786,8 @@ class TestHowFastTheAnswerLineBreathes:
             )
         )
         await parked(wire, BASH_GATE)
-        assert self.hint(wire, 2.0).startswith(CYAN)
-        assert self.hint(wire, 6.0).startswith(WHITE)
+        assert self.hint(wire, 2.0).startswith(theme.chrome)
+        assert self.hint(wire, 6.0).startswith(theme.agent)
 
     async def test_and_a_slower_one_is_visibly_slower(self, wire):
         # The same instant, two periods, two colours — which is the whole of
@@ -824,14 +815,14 @@ class TestHowFastTheAnswerLineBreathes:
         )
         await parked(wire, BASH_GATE)
         assert widths(wire.ui.render(120, 40)) == {120}
-        assert self.hint(wire, PULSE_PERIOD / 4).startswith(CYAN)
+        assert self.hint(wire, PULSE_PERIOD / 4).startswith(theme.chrome)
 
     async def test_the_default_is_one_second(self, wire):
         # Changed from 2.4: the line reads as a prompt waiting for an answer,
         # and a two-and-a-half-second cycle is slow enough that a glance
         # catches it standing still.
         assert PULSE_PERIOD == 1.0
-        assert wire.ui.display == Display()
+        assert wire.ui.display.decision_pulse_seconds == Display().decision_pulse_seconds
 
 
 class TestTheAnswerLinePulses:
@@ -869,13 +860,13 @@ class TestTheAnswerLinePulses:
         # every colour the line can ever be drawn in.
         steps = int(PULSE_PERIOD / PULSE_INTERVAL) + 1
         drawn = {self.hint(wire, x * PULSE_INTERVAL) for x in range(steps)}
-        assert {x.split("m", 1)[0] + "m" for x in drawn} <= set(PULSE_RAMP)
+        assert {x.split("m", 1)[0] + "m" for x in drawn} <= set(theme.pulse)
         assert len(drawn) > 2, "a ramp, and not a two-colour blink"
 
     async def test_and_reaches_both_ends_of_the_sweep(self, wire):
         await parked(wire, BASH_GATE)
-        assert self.hint(wire, PULSE_PERIOD / 4).startswith(CYAN)
-        assert self.hint(wire, PULSE_PERIOD * 3 / 4).startswith(WHITE)
+        assert self.hint(wire, PULSE_PERIOD / 4).startswith(theme.chrome)
+        assert self.hint(wire, PULSE_PERIOD * 3 / 4).startswith(theme.agent)
 
     async def test_the_frame_books_the_repaint_that_animates_it(self, wire):
         # Without this the colour would be whichever one the keypress that

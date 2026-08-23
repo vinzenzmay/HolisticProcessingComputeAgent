@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from hpca.ui.ansi import DIM, RESET, fold, pad
+from hpca.ui import theme
+from hpca.ui.ansi import RESET, fold, pad
 from hpca.ui.overlays.base import BACK_KEYS, Overlay, options
 
 FORK, ROLLBACK = "fork", "rollback"
@@ -26,9 +27,9 @@ def quoted(message: str, width: int) -> list[str]:
     lines: list[str] = []
     for paragraph in preview.split("\n"):
         lines += fold(paragraph, max(8, width - 6))
-    out = [DIM + pad(f"    {line}", width) + RESET for line in lines[:PREVIEW_LINES]]
+    out = [theme.faint + pad(f"    {line}", width) + RESET for line in lines[:PREVIEW_LINES]]
     if len(lines) > PREVIEW_LINES:
-        out.append(DIM + pad("    …", width) + RESET)
+        out.append(theme.faint + pad("    …", width) + RESET)
     return out
 
 

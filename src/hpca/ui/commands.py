@@ -31,7 +31,8 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
-from hpca.ui.ansi import BOLD, CYAN, DIM, RESET, REVERSE, cut, pad, rule, safe
+from hpca.ui import theme
+from hpca.ui.ansi import BOLD, RESET, REVERSE, cut, pad, rule, safe
 
 # Both prefixes, everywhere. `\` is what a user whose keyboard layout puts `/`
 # behind a modifier reaches for, and the Textual entry accepted it from the
@@ -216,7 +217,7 @@ def menu_rows(
         row = pad(marker + body, width)
         head = f"{marker}/{command.name}"
         if command.builtin and row.startswith(head):
-            row = BOLD + CYAN + row[: len(head)] + RESET + row[len(head) :]
+            row = BOLD + theme.chrome + row[: len(head)] + RESET + row[len(head) :]
         out.append(REVERSE + row + RESET if at == index else row)
     return out
 
@@ -225,7 +226,7 @@ def menu_title(matches: Sequence[Command], width: int) -> str:
     """The rule over the menu, with the hint dropped on a narrow terminal."""
     label = f"{MENU_TITLE} ({len(matches)})"
     hint = MENU_HINT if width >= len(label) + len(MENU_HINT) + 8 else ""
-    return DIM + rule(label, width, hint) + RESET
+    return theme.faint + rule(label, width, hint) + RESET
 
 
 def unknown(name: str) -> str:

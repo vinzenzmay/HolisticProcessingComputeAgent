@@ -8,7 +8,7 @@ and something else in another would be the marks stopping being worth reading.
 
 from __future__ import annotations
 
-from hpca.ui.ansi import DIM, GREEN
+from hpca.ui import theme
 from hpca.ui.pane import Item
 from hpca.ui.state import BackendInfo
 
@@ -17,7 +17,15 @@ from hpca.ui.state import BackendInfo
 # drawn as "not answering" would libel every backend for as long as the probes
 # take (`protocol.LLMEntry.reachable`, `protocol.LLMCatalog.probed`).
 MARKS: dict[bool | None, str] = {True: "●", False: "○", None: "·"}
-MARK_COLOURS: dict[bool | None, str] = {True: GREEN, False: DIM, None: DIM}
+# Reachable is the only one that gets a colour of its own; unknown and
+# unreachable are both "nothing to say yet". Roles by name, resolved when the
+# row is drawn (`ui.theme`).
+MARK_ROLES: dict[bool | None, str] = {True: "ok", False: "faint", None: "faint"}
+
+
+def mark_colour(reachable: bool | None) -> str:
+    """The colour a backend's ● is drawn in."""
+    return getattr(theme, MARK_ROLES[reachable])
 
 # What `★` means, and it is only ever this: the backend a session gets by not
 # choosing one. Not "the one this screen would pick".
@@ -77,7 +85,7 @@ def backend_item(info: BackendInfo, *, star: bool = True) -> Item:
     return Item(
         head=backend_head(info, star=star),
         body=body,
-        accent=MARK_COLOURS[info.reachable],
+        accent=mark_colour(info.reachable),
         kind="backend",
         text=info.label,
         key=row_key(info),
