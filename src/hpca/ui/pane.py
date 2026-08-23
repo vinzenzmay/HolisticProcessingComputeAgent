@@ -730,7 +730,18 @@ class Pane:
             # the next, so the weight of the `you …` / `hpca …` line is the
             # whole of what does it.
             bold = is_head and item is not None and item.label
-            if row == self.cursor:
+            # The live row is excepted from the highlight, and it is the one
+            # row where excepting it is right: `follow` pins the cursor to the
+            # end, so a running turn puts it there and leaves it there — and
+            # REVERSE across a status line is a grey band the width of the
+            # terminal, under the one line the user is actually reading. The
+            # spinner made it plain rather than caused it: its cells state
+            # their own colour (`state.Turn.paint`), so they dropped out of
+            # the reverse and the band appeared with four holes in it. And
+            # nothing is lost by dropping it: the cursor lands there because the row
+            # is last, not because anybody moved it, and the moment the turn
+            # ends the row goes and the cursor is back on somebody's words.
+            if row == self.cursor and item is not self.tail:
                 # The unfocused pane still shows where it was left, dimmed —
                 # that is the "memory" being visible rather than merely kept.
                 style = REVERSE if focused else theme.faint + REVERSE
