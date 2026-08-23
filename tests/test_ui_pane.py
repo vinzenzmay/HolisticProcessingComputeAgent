@@ -6,7 +6,7 @@ on whether it has a body at all.
 """
 
 from hpca.ui import theme
-from hpca.ui.ansi import BOLD
+from hpca.ui.ansi import BOLD, REVERSE
 from hpca.ui.app import CHAT, SESSIONS, WATCHERS
 from hpca.ui.demo import build
 from hpca.ui.pane import Fold, Item, Pane
@@ -897,6 +897,45 @@ class TestATurnIsGreyThroughout:
         pane.invalidate()
         pane.cursor = 0
         assert theme.faint in styled(pane, "412 lines")
+
+
+class TestTheLiveRowIsNotHighlighted:
+    """The working row refuses the cursor's highlight.
+
+    `follow` pins the cursor to the end of the chat, so a running turn parks it
+    on the live row and leaves it there — and REVERSE across a status line is a
+    grey band the width of the terminal under the one line being read. The row
+    is a report on the turn rather than a row anything can be done to, so the
+    cursor resting there has nothing to say, and it stops saying it.
+    """
+
+    @staticmethod
+    def working() -> Pane:
+        pane = chat_of(SAID)
+        pane.set_tail(Item(head="ｸｪﾍﾕ reading…"))
+        pane.cursor = len(pane.flat(58)) - 1
+        return pane
+
+    @staticmethod
+    def row(pane: Pane, needle: str, *, focused: bool = True) -> str:
+        drawn = [x for x in pane.render(60, 12, focused=focused) if needle in plain(x)]
+        assert drawn, f"no line containing {needle!r}"
+        return drawn[0]
+
+    def test_no_reverse_on_it(self):
+        assert REVERSE not in self.row(self.working(), "reading…")
+
+    def test_and_none_unfocused_either(self):
+        # Where the band was worst: the chat is not focused while a turn runs
+        # — the keys are in the message box — so it was drawn faint-reversed,
+        # which is a grey wash rather than a highlight.
+        assert REVERSE not in self.row(self.working(), "reading…", focused=False)
+
+    def test_a_real_row_under_the_cursor_still_is(self):
+        pane = chat_of(SAID)
+        pane.set_tail(Item(head="ｸｪﾍﾕ reading…"))
+        pane.cursor = 0
+        assert REVERSE in self.row(pane, "you")
 
 
 class TestTheNewestLineStaysOnScreen:
