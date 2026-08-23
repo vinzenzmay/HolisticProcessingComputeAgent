@@ -365,9 +365,9 @@ class TestRecalledMemory:
         messages = [
             {
                 "role": "user",
-                "content": "run my snakemake workflow",
+                "content": "run my sniffles workflow",
                 "api_content": (
-                    "run my snakemake workflow\n\n<memory-context>\n"
+                    "run my sniffles workflow\n\n<memory-context>\n"
                     "[System note: recalled memory, NOT new user input.]\n"
                     "Past struggle (2026-06-02): dry-runs fail here.\n"
                     "</memory-context>"
@@ -377,7 +377,7 @@ class TestRecalledMemory:
         ]
         entries = build_entries(messages)
         assert [e.kind for e in entries] == ["user", "recall", "assistant"]
-        assert entries[0].text == "run my snakemake workflow"
+        assert entries[0].text == "run my sniffles workflow"
         assert entries[1].text == "Past struggle (2026-06-02): dry-runs fail here."
         # the system-note scaffolding is not shown to the user
         assert "System note" not in entries[1].text

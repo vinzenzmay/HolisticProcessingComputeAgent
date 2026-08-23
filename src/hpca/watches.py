@@ -4,7 +4,7 @@ The right column used to show only what hpca itself started — its own
 subprocesses and its own sbatch submissions — which is a thin slice of what
 actually runs on a cluster, and a slice already visible in the chat log. The
 work that matters is usually somebody else's: an sbatch script submitted by
-hand, a snakemake run spawning one tool after another, a log some long-running
+hand, a pipeline spawning one tool after another, a log some long-running
 program appends to. Checking on those means ``squeue``, then ssh to the node,
 then ``tail``. A watch pins one of them to the panel instead.
 

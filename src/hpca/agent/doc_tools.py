@@ -23,7 +23,7 @@ from hpca.agent.tools import Tool, ToolRegistry
 from hpca.embeddings import EmbeddingError
 from hpca.paths import resolve_path
 from hpca.rag import chunk_text, embed_fitting
-from hpca.symbols import index_python_source, parse_help_flags, parse_manpage_flags
+from hpca.symbols import parse_help_flags, parse_manpage_flags
 from hpca.verify_code import basename, commands_needing_docs
 
 MANPAGE_MAX_LINES = 400
@@ -166,9 +166,7 @@ async def learn_command(executable: str, subcommand: str, ctx: ToolContext) -> s
     return None
 
 
-async def autoindex_script_commands(
-    kind: str, content: str, ctx: ToolContext
-) -> list[str]:
+async def autoindex_script_commands(content: str, ctx: ToolContext) -> list[str]:
     """Learn the flags of every external program a script drives (§5.2).
 
     Runs before the verification gate so that gate has something to check.
@@ -179,7 +177,7 @@ async def autoindex_script_commands(
     """
     if ctx.symbols is None:
         return []
-    pending = commands_needing_docs(kind, content, index=ctx.symbols)
+    pending = commands_needing_docs(content, index=ctx.symbols)
     learned: list[str] = []
     for executable, subcommand in pending[:MAX_AUTOINDEX_PROBES]:
         name = basename(executable)
@@ -300,11 +298,9 @@ async def _rag_index_text(ctx: ToolContext, source: str, text: str) -> int | str
 
 
 class IndexDocsParams(BaseModel):
-    what: Literal["python_source", "manpages", "docs_dir"] = Field(
-        description="What to index"
-    )
+    what: Literal["manpages", "docs_dir"] = Field(description="What to index")
     target: str = Field(
-        description="python_source/docs_dir: path of a directory; "
+        description="docs_dir: path of a directory; "
         "manpages: space-separated command names, e.g. 'grep samtools-view'"
     )
 
@@ -313,11 +309,6 @@ async def index_docs(args: IndexDocsParams, ctx: ToolContext) -> str:
     if ctx.symbols is None:
         raise RuntimeError("No symbol index configured in this session")
     rag_ready = ctx.rag is not None and ctx.embedder is not None
-
-    if args.what == "python_source":
-        root = resolve_path(args.target, ctx.workdir)
-        files = index_python_source(ctx.symbols, root)
-        return f"Indexed {files} Python files from {root}."
 
     if args.what == "docs_dir":
         if not rag_ready:
@@ -430,7 +421,7 @@ def add_doc_tools(registry: ToolRegistry) -> ToolRegistry:
     registry.register(
         Tool(
             name="index_docs",
-            description="Index Python source or man pages into the symbol index",
+            description="Index man pages or a documentation directory",
             params=IndexDocsParams,
             handler=index_docs,
         )

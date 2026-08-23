@@ -17,9 +17,6 @@ EXPECTED_BUILTIN_IDS = {
     "oom_kill",
     "time_limit",
     "command_not_found",
-    "python_traceback",
-    "r_error",
-    "snakemake_rule_failure",
     "missing_input",
     "permission_denied",
     "quota_exceeded",
@@ -89,22 +86,19 @@ class TestScanLog:
         assert [m.signature_id for m in matches] == ["oom_kill"]
         assert "oom-kill" in matches[0].matched_line
 
-    def test_python_traceback_excerpt_contains_error_line(self, tmp_path, signatures):
-        lines = (
-            ["setup ok"] * 5
-            + [
-                "Traceback (most recent call last):",
-                '  File "run.py", line 3, in <module>',
-                "    main()",
-                "ValueError: bad chromosome name",
-            ]
-        )
+    def test_excerpt_contains_the_error_line(self, tmp_path, signatures):
+        lines = ["setup ok"] * 5 + [
+            "minimap2: command not found",
+            "align.sh: line 3: exiting",
+        ]
         log = self.write_log(tmp_path, lines)
         matches = scan_log(log, signatures)
         ids = [m.signature_id for m in matches]
-        assert "python_traceback" in ids
-        excerpt = next(m for m in matches if m.signature_id == "python_traceback").excerpt
-        assert "ValueError: bad chromosome name" in excerpt
+        assert "command_not_found" in ids
+        excerpt = next(
+            m for m in matches if m.signature_id == "command_not_found"
+        ).excerpt
+        assert "minimap2: command not found" in excerpt
 
     def test_time_limit(self, tmp_path, signatures):
         log = self.write_log(
@@ -164,7 +158,6 @@ def make_job(tmp_path, job_id="1"):
         script_key="align",
         sbatch_stdout_path=str(tmp_path / "job.out"),
         sbatch_stderr_path=str(tmp_path / "job.err"),
-        snakemake_log_path=None,
         last_checked=None,
         exit_info="FAILED, exit 1",
     )
@@ -173,7 +166,7 @@ def make_job(tmp_path, job_id="1"):
 class TestTriageJob:
     def test_report_combines_meta_and_matches(self, tmp_path, signatures):
         (tmp_path / "job.out").write_text("starting\n")
-        (tmp_path / "job.err").write_text("Traceback (most recent call last):\nKeyError: 'x'\n")
+        (tmp_path / "job.err").write_text("minimap2: command not found\n")
         job = make_job(tmp_path)
         status = JobStatus(
             job_id="1", state="FAILED", raw_state="FAILED", exit_code=1,
@@ -182,7 +175,7 @@ class TestTriageJob:
         report = triage_job(job, status, signatures=signatures)
         assert report.job_id == "1"
         assert report.state == "FAILED"
-        assert "python_traceback" in [m.signature_id for m in report.matches]
+        assert "command_not_found" in [m.signature_id for m in report.matches]
 
     def test_state_derived_oom_without_log_match(self, tmp_path, signatures):
         (tmp_path / "job.err").write_text("no obvious error text\n")
@@ -208,14 +201,14 @@ class TestTriageJob:
         assert "mysterious one-off failure" in report.fallback_excerpt
 
     def test_extra_logs_scanned(self, tmp_path, signatures):
-        rule_log = tmp_path / "rule_align.log"
-        rule_log.write_text("Error in rule align:\n    jobid: 3\n")
+        tool_log = tmp_path / "align.log"
+        tool_log.write_text("bwa: command not found\n")
         job = make_job(tmp_path)
         status = JobStatus(job_id="1", state="FAILED", raw_state="FAILED", exit_code=1)
         report = triage_job(
-            job, status, signatures=signatures, extra_logs=[rule_log]
+            job, status, signatures=signatures, extra_logs=[tool_log]
         )
-        assert "snakemake_rule_failure" in [m.signature_id for m in report.matches]
+        assert "command_not_found" in [m.signature_id for m in report.matches]
 
 
 class TestFormatReport:
@@ -236,7 +229,7 @@ class TestFormatReport:
 
     def test_bounded_size(self, tmp_path, signatures):
         (tmp_path / "job.err").write_text(
-            "\n".join(["x" * 200] * 100 + ["Traceback (most recent call last):"] * 5)
+            "\n".join(["x" * 200] * 100 + ["minimap2: command not found"] * 5)
         )
         job = make_job(tmp_path)
         status = JobStatus(job_id="1", state="FAILED", raw_state="FAILED", exit_code=1)

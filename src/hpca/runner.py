@@ -210,9 +210,9 @@ class ProcessRunner:
         return list(reversed(self._records.values()))
 
 
-# Script suffixes the agent's own tools produce; used to recover which script
+# The script suffix the agent's own tools produce; used to recover which script
 # a process ran from its recorded command line.
-SCRIPT_SUFFIXES = (".sh", ".py", ".R", ".smk")
+SCRIPT_SUFFIX = ".sh"
 
 
 def script_path_for(cmd: str) -> Path | None:
@@ -230,7 +230,7 @@ def script_path_for(cmd: str) -> Path | None:
         return None
     for token in tokens:
         path = Path(token)
-        if path.suffix in SCRIPT_SUFFIXES and path.is_file():
+        if path.suffix == SCRIPT_SUFFIX and path.is_file():
             return path
     return None
 

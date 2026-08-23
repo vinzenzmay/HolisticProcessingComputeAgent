@@ -522,18 +522,18 @@ class TestEditRepairAndFuzz:
     async def test_leading_whitespace_is_still_meaning_not_fuzz(
         self, tools, ctx, tmp_path
     ):
-        # Indentation is meaning (Python); the ladder never strips it, the
-        # near-miss advice still points at the line.
+        # Indentation is meaning (nested config); the ladder never strips it,
+        # the near-miss advice still points at the line.
         path = tmp_path / "code.txt"
-        path.write_text("def f():\n    return 1\n")
+        path.write_text("align:\n    threads: 1\n")
         result = await call(
             tools, "edit_file", ctx,
             path=str(path),
-            old_lines=["return 1"],
-            new_lines=["return 2"],
+            old_lines=["threads: 1"],
+            new_lines=["threads: 2"],
         )
         assert "NOT edited" in result and "line 2" in result
-        assert path.read_text() == "def f():\n    return 1\n"
+        assert path.read_text() == "align:\n    threads: 1\n"
 
     async def test_ambiguity_at_a_fuzzy_level_is_still_refused(
         self, tools, ctx, tmp_path
@@ -934,18 +934,18 @@ class TestCreateFile:
         # must not be a second way around the syntax/docs gate.
         result = await call(
             tools, "create_file", ctx,
-            path=str(tmp_path / "qc.py"), content_lines=["def broken(:"],
+            path=str(tmp_path / "qc.sh"), content_lines=["if true; then"],
         )
-        assert "NOT created" in result and "SyntaxError" in result
-        assert not (tmp_path / "qc.py").exists()
+        assert "NOT created" in result and "syntax" in result.lower()
+        assert not (tmp_path / "qc.sh").exists()
 
     async def test_a_valid_script_is_written(self, tools, ctx, tmp_path):
         result = await call(
             tools, "create_file", ctx,
-            path=str(tmp_path / "qc.py"), content_lines=["print('ok')"],
+            path=str(tmp_path / "qc.sh"), content_lines=["echo ok"],
         )
         assert "NOT created" not in result
-        assert (tmp_path / "qc.py").read_text() == "print('ok')\n"
+        assert (tmp_path / "qc.sh").read_text() == "echo ok\n"
 
     async def test_creating_a_file_is_not_a_destructive_call(
         self, tools, ctx, tmp_path

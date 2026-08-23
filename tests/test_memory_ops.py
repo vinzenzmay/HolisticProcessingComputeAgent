@@ -193,8 +193,8 @@ class TestDemoteOperation:
 
     def test_demote_moves_to_rag(self):
         result = apply_batch(
-            profile_with(("Snakemake dry-runs fail.", SP)),
-            [MemoryOp(op="demote", match="Snakemake")],
+            profile_with(("Sniffles dry-runs fail.", SP)),
+            [MemoryOp(op="demote", match="Sniffles")],
         )
         assert result.profile.memories[0].scope is RAG
         assert result.profile.system_prompt_tokens() == 0  # out of the budget
@@ -214,8 +214,8 @@ class TestDemoteOperation:
         assert len([m for m in result.profile.memories if m.scope is RAG]) == 1
 
     def test_describe(self):
-        op = MemoryOp(op="demote", match="Snakemake")
-        assert op.describe() == "move “Snakemake” from system-prompt to rag"
+        op = MemoryOp(op="demote", match="Sniffles")
+        assert op.describe() == "move “Sniffles” from system-prompt to rag"
 
     def test_full_scope_message_suggests_demotion(self):
         with pytest.raises(MemoryOpError) as excinfo:

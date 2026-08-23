@@ -81,9 +81,9 @@ class TestSearch:
 
     def test_current_session_excluded(self, store, conn):
         session = make_session(conn)
-        record(store, session, [("user", "snakemake fails")])
-        assert store.search("snakemake") != []
-        assert store.search("snakemake", exclude_session_id=session.session_id) == []
+        record(store, session, [("user", "sniffles fails")])
+        assert store.search("sniffles") != []
+        assert store.search("sniffles", exclude_session_id=session.session_id) == []
 
     def test_profile_scoping(self, store, conn):
         genetics = make_session(conn, profile="genetics")

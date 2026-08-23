@@ -50,26 +50,26 @@ class TestKeywordMatching:
         return Memory(text=text, scope=MemoryScope.RAG, kind=STRUGGLE_KIND)
 
     def test_keywords_parsed(self):
-        memory = self.make_note("Snakemake DAG errors are hard.\nkeywords: snakemake, dag")
-        assert note_keywords(memory) == ["snakemake", "dag"]
+        memory = self.make_note("Sniffles DAG errors are hard.\nkeywords: sniffles, dag")
+        assert note_keywords(memory) == ["sniffles", "dag"]
 
     def test_note_without_keywords(self):
         assert note_keywords(self.make_note("no keyword line here")) == []
 
     def test_matching_struggle_found(self):
         memories = [
-            self.make_note("Snakemake DAGs are fiddly.\nkeywords: snakemake, dag")
+            self.make_note("Sniffles DAGs are fiddly.\nkeywords: sniffles, dag")
         ]
-        assert matching_struggles(memories, "run my snakemake workflow")
+        assert matching_struggles(memories, "run my sniffles workflow")
 
     def test_non_struggle_memories_ignored(self):
         memories = [
-            Memory(text="keywords: snakemake", scope=MemoryScope.RAG, kind="learning")
+            Memory(text="keywords: sniffles", scope=MemoryScope.RAG, kind="learning")
         ]
-        assert matching_struggles(memories, "snakemake please") == []
+        assert matching_struggles(memories, "sniffles please") == []
 
     def test_unrelated_request_no_match(self):
-        memories = [self.make_note("x\nkeywords: snakemake, dag")]
+        memories = [self.make_note("x\nkeywords: sniffles, dag")]
         assert matching_struggles(memories, "align a bam file") == []
 
     def test_word_boundary(self):

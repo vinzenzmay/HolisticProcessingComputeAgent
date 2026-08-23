@@ -11,7 +11,7 @@ from hpca.runner import ProcessRunner
 from hpca.slurm import SlurmClient
 from hpca.watches import KIND_JOB, KIND_LOG, LOG_PRESENT, WatchStore
 
-SQUEUE_RUNNING = "27744534|RUNNING|node042|1-04:42:02|3-19:17:58|snakemake_run|None\n"
+SQUEUE_RUNNING = "27744534|RUNNING|node042|1-04:42:02|3-19:17:58|align_run|None\n"
 SACCT_DONE = "27744534|COMPLETED|0:0|01:00:00||4G|02:00:00\n"
 
 
@@ -118,7 +118,7 @@ class TestWatchJob:
         assert "RUNNING" in result
         [watch] = ctx.watches.list(profile="default")
         assert (watch.kind, watch.target, watch.label) == (
-            KIND_JOB, "27744534", "snakemake_run"
+            KIND_JOB, "27744534", "align_run"
         )
         assert watch.state == "RUNNING"
 

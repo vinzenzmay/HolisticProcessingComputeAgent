@@ -82,14 +82,14 @@ class TestProposals:
                 reply(
                     {
                         "kind": "struggle",
-                        "text": "Snakemake dry-runs fail with site profiles.",
-                        "keywords": ["snakemake", "dry-run"],
+                        "text": "Sniffles dry-runs fail with site profiles.",
+                        "keywords": ["sniffles", "dry-run"],
                     }
                 )
             ]
         )
         proposal = (await propose_reflections(llm, MESSAGES))[0]
-        assert proposal.memory_text().endswith("keywords: snakemake, dry-run")
+        assert proposal.memory_text().endswith("keywords: sniffles, dry-run")
 
     async def test_nothing_to_save_is_valid(self):
         llm = FakeLLM([reply()])

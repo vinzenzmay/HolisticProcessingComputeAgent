@@ -292,7 +292,7 @@ class TestDuplication:
         profile.add_memory("Cluster is cubi, scheduler is Slurm.", scope=SP)
         profile.add_memory("The user prefers R.", scope=SP)
         profile.add_memory(
-            "Snakemake dry-runs fail here.", scope=RAG, kind="struggle"
+            "Sniffles dry-runs fail here.", scope=RAG, kind="struggle"
         )
         profile.save()
         return profile
@@ -303,7 +303,7 @@ class TestDuplication:
         assert [(m.scope, m.text) for m in copy.memories] == [
             (SP, "Cluster is cubi, scheduler is Slurm."),
             (SP, "The user prefers R."),
-            (RAG, "Snakemake dry-runs fail here."),
+            (RAG, "Sniffles dry-runs fail here."),
         ]
 
     def test_metadata_preserved_and_provenance_recorded(self, hpca_home):
@@ -355,7 +355,7 @@ class TestDuplication:
     def test_editing_a_copied_memory_does_not_touch_the_original(self, hpca_home):
         self.base()
         copy = Profile.duplicate("base", "variants")
-        copy.memories[1].text = "The user prefers Python now."
+        copy.memories[1].text = "The user prefers minimap2 now."
         copy.save()
         assert Profile.load("base").memories[1].text == "The user prefers R."
 

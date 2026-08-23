@@ -11,10 +11,10 @@ MEMORY_LABEL = "Memory (site facts, preferences, learnings)"
 class TestOrchestratorPrompt:
     def test_memories_injected_under_the_merged_label(self):
         prompt = orchestrator_system_prompt(
-            system_prompt_memories="Cluster is cubi.\n\nUser prefers R over Python."
+            system_prompt_memories="Cluster is cubi.\n\nUser prefers minimap2 over bwa."
         )
         assert f"{MEMORY_LABEL}:\nCluster is cubi." in prompt
-        assert "User prefers R over Python." in prompt
+        assert "User prefers minimap2 over bwa." in prompt
 
     def test_empty_memories_add_no_section(self):
         prompt = orchestrator_system_prompt()

@@ -1,7 +1,6 @@
-"""Deterministic syntax/dry-run checks (§5.2) — no LLM involved.
+"""Deterministic syntax checks (§5.2) — no LLM involved.
 
-Every script is checked with the native mechanism of its language before any
-execution. A missing checker binary (no R, no snakemake on this host) is
+Every script is checked before any execution. A missing checker binary is
 reported as *skipped*, never as a failure — index/tool coverage is always
 partial and must not hard-block the user.
 """
@@ -10,18 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import shutil
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-ScriptKind = str  # bash | python | R | snakemake
-
-CHECKERS: dict[str, list[str]] = {
-    "bash": ["bash", "-n"],
-    "python": [sys.executable, "-m", "py_compile"],
-    "R": ["Rscript", "--no-init-file", "-e"],
-    "snakemake": ["snakemake", "--dry-run", "--quiet", "-s"],
-}
+CHECKER = ["bash", "-n"]
+CHECKER_LABEL = "bash -n"
 
 
 @dataclass
@@ -32,28 +24,13 @@ class CheckResult:
     skipped: bool = False
 
 
-async def syntax_check(kind: ScriptKind, path: Path) -> CheckResult:
-    if kind not in CHECKERS:
-        raise ValueError(
-            f"Unknown script kind {kind!r}; expected one of {sorted(CHECKERS)}"
-        )
-    if kind == "bash":
-        argv = ["bash", "-n", str(path)]
-        label = "bash -n"
-    elif kind == "python":
-        argv = [sys.executable, "-m", "py_compile", str(path)]
-        label = "py_compile"
-    elif kind == "R":
-        argv = ["Rscript", "--no-init-file", "-e", f'invisible(parse(file="{path}"))']
-        label = "Rscript parse()"
-    else:  # snakemake
-        argv = ["snakemake", "--dry-run", "--quiet", "-s", str(path)]
-        label = "snakemake -n"
+async def syntax_check(path: Path) -> CheckResult:
+    argv = [*CHECKER, str(path)]
 
     if shutil.which(argv[0]) is None:
         return CheckResult(
             ok=True,
-            checker=label,
+            checker=CHECKER_LABEL,
             errors=f"checker {argv[0]!r} not found on this host — check skipped",
             skipped=True,
         )
@@ -66,5 +43,5 @@ async def syntax_check(kind: ScriptKind, path: Path) -> CheckResult:
     stdout, stderr = await proc.communicate()
     output = (stderr + b"\n" + stdout).decode(errors="replace").strip()
     if proc.returncode == 0:
-        return CheckResult(ok=True, checker=label)
-    return CheckResult(ok=False, checker=label, errors=output)
+        return CheckResult(ok=True, checker=CHECKER_LABEL)
+    return CheckResult(ok=False, checker=CHECKER_LABEL, errors=output)
