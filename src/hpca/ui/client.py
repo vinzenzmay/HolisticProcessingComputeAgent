@@ -952,9 +952,13 @@ class UIClient:
         connect. The skills a profile already listed are kept across the
         refresh — this event says nothing about them, and dropping them would
         empty a screen that is open over them.
+
+        Handed to `RowUI.set_profiles` rather than assigned, because the
+        profiles screen holds its own copy of this list and is usually the
+        thing that asked for it — see there for what assigning alone cost.
         """
         known = {x.name: x.skills for x in self.ui.profiles}
-        self.ui.profiles = [
+        self.ui.set_profiles([
             state.ProfileInfo(
                 name=row.name,
                 memories=row.memories,
@@ -964,7 +968,7 @@ class UIClient:
                 skills=known.get(row.name, []),
             )
             for row in msg.rows
-        ]
+        ])
 
     def _reset(self, msg: protocol.ChatReset) -> None:
         self._session(msg.session_id).reset([_entry(e) for e in msg.entries])
