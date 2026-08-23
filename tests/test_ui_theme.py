@@ -134,11 +134,15 @@ class TestWhatTheSwapReaches:
         theme.apply(spinner=["9", "1"])
         assert rain.spinner_trail() == (RESET + "\x1b[38;5;9m", RESET + "\x1b[38;5;1m")
 
-    def test_a_shorter_trail_lights_fewer_cells(self):
+    def test_a_shorter_trail_fades_over_fewer_cells(self):
+        # A ramp of one is a spinner with no fade in it, which the palette is
+        # allowed to ask for. Not a spinner with holes: the cells the trail
+        # does not reach take the ramp's dimmest end, which here is its only
+        # end, so all four are that one colour (`rain.spinner`).
         theme.apply(spinner=["9"])
         glyphs, styles = rain.spinner(0)
         assert len(glyphs) == rain.SPINNER_WIDTH, "still four cells wide"
-        assert sum(1 for s in styles if s) == 1, "one of them lit"
+        assert set(styles) == {RESET + "\x1b[38;5;9m"}
 
     def test_the_rain_itself(self):
         theme.apply(ok="#ff0000")
