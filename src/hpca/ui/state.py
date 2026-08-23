@@ -20,10 +20,21 @@ Two shapes cross the seam in each direction:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from hpca.ui.ansi import AMBER, DIM, GREEN, PULSE_PERIOD, RED, WHITE, YELLOW
+from hpca.ui import rain
+from hpca.ui.ansi import (
+    AMBER,
+    DIM,
+    GREEN,
+    PULSE_PERIOD,
+    RED,
+    RESET,
+    WHITE,
+    YELLOW,
+)
 from hpca.ui.approval import Decision
 from hpca.ui.editor import Editor
 from hpca.ui.meter import render_bar, severity
@@ -328,13 +339,19 @@ def entry_item(entry: ChatEntry, *, stamps: bool = True) -> Item:
 # ------------------------------------------------------------- the turn and it
 
 
-# The spinner, and how fast it turns. 0.1s is 10 frames a second: fast enough
-# to read as motion, and slow enough that a session over a loaded SSH link
-# spends a tenth of the repaints a 0.08s spinner would. Nothing else on the
-# screen changes by the clock, so this interval *is* the UI's idle cost while
-# a turn runs — see `RowUI.next_wake`, which books exactly one wake per frame
-# rather than reintroducing a poll.
-SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+# How fast the spinner turns. 0.1s is 10 frames a second: fast enough to read
+# as motion, and slow enough that a session over a loaded SSH link spends a
+# tenth of the repaints a 0.08s spinner would. Nothing else on the screen
+# changes by the clock, so this interval *is* the UI's idle cost while a turn
+# runs — see `RowUI.next_wake`, which books exactly one wake per frame rather
+# than reintroducing a poll.
+#
+# The glyphs themselves are `ui.rain`'s: four cells of the same katakana the
+# quit screen rains, with the drop bouncing between the walls and its trail
+# fading behind it. A braille wheel turned here for a long time and said only
+# "not hung"; the effect the rest of the UI already uses for "alive and
+# waiting" says the same thing in the same language, and the working row is
+# the other place the user is doing nothing but waiting.
 SPINNER_INTERVAL = 0.1
 
 # What the spinner says when the core has not named a step yet. The graph's own
@@ -446,15 +463,45 @@ class Turn:
         return max(0, int(now - self.started_epoch))
 
     def frame(self, now: float) -> str:
-        """The braille glyph for this instant.
+        """The spinner's four cells for this instant, plain.
 
         Derived from the clock rather than advanced by a tick, so the spinner
         needs nothing to drive it: any frame drawn at time *t* shows the same
-        glyph, and a UI that repaints only when something changed can work out
-        when this one next will (`next_frame`).
+        glyphs, and a UI that repaints only when something changed can work out
+        when this one next will (`next_frame`). The churn rides the same
+        counter, so the glyphs are swapped only on frames that were going to be
+        painted anyway — a second clock for them would be a second reason to
+        wake up, for a change nobody asked to see sooner.
         """
-        base = now - (self.started_epoch or 0.0)
-        return SPINNER_FRAMES[int(base / SPINNER_INTERVAL) % len(SPINNER_FRAMES)]
+        return rain.spinner(self._tick(now))[0]
+
+    def _tick(self, now: float) -> int:
+        """Which frame of the animation this instant is."""
+        return int((now - (self.started_epoch or 0.0)) / SPINNER_INTERVAL)
+
+    def paint(self, now: float) -> Callable[[str, str], str]:
+        """Put the trail's colours back on a row that was measured without them.
+
+        Handed to the working row as `pane.Item.paint`, and given the finished,
+        padded line: the spinner is found in it by its own glyphs, which are
+        katakana and cannot collide with the activity text beside them. A row
+        too narrow to have kept them is left alone rather than guessed at —
+        `ansi.pad` truncates, and the answer to "the spinner was cut off" is a
+        line with no colour in it, not one with colour in the wrong cells.
+        """
+        glyphs, styles = rain.spinner(self._tick(now))
+
+        def paint(row: str, style: str) -> str:
+            at = row.find(glyphs)
+            if at < 0:
+                return row
+            lit = "".join(s + g for g, s in zip(glyphs, styles))
+            # Back into the style the row is being drawn in, not out of it: on
+            # the cursor's own row that is REVERSE, and a bare RESET here would
+            # end the highlight four cells in.
+            return f"{row[:at]}{lit}{RESET}{style}{row[at + len(glyphs) :]}"
+
+        return paint
 
     def next_frame(self, now: float) -> float:
         """Seconds until `frame` would answer differently."""
@@ -1181,7 +1228,12 @@ class SessionState:
                 self.chat.set_tail(None)
             return
         self.chat.set_tail(
-            Item(head=self.turn.line(now), kind=WORKING_KIND, key=WORKING_KEY)
+            Item(
+                head=self.turn.line(now),
+                kind=WORKING_KIND,
+                key=WORKING_KEY,
+                paint=self.turn.paint(now),
+            )
         )
 
     def next_wake(self, now: float) -> float | None:

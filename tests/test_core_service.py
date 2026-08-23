@@ -84,7 +84,7 @@ from hpca.skills import (
     write_skill,
 )
 from hpca.transcript import RESULT_RULE
-from hpca.ui.state import SPINNER_FRAMES
+from hpca.ui.rain import KATAKANA as SPINNER_GLYPHS
 from hpca.watches import KIND_JOB, KIND_LOG, WatchStore
 from tests.ui_harness import connected
 
@@ -257,7 +257,7 @@ async def relay(queue, wire):
 
 def spinner_lines(wire) -> list[str]:
     """The working rows on screen — one while a turn runs, none after."""
-    return [line for line in wire.frame() if any(f in line for f in SPINNER_FRAMES)]
+    return [line for line in wire.frame() if any(f in line for f in SPINNER_GLYPHS)]
 
 
 class TestAssembly:

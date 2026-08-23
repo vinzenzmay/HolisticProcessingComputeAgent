@@ -21,15 +21,14 @@ exactly ``width`` cells is a frame the repaint tears (see `ansi.cell_width`).
 
 from __future__ import annotations
 
-from hpca.ui.ansi import BOLD, DIM, GREEN, RESET, WHITE
+from hpca.ui.ansi import BOLD, DIM, ESC, GREEN, RESET, WHITE
 
 # Halfwidth katakana, which are the glyphs the effect is remembered for, plus
 # digits for the flicker. Halfwidth deliberately: `ア` (U+30A2) is two cells
 # wide and `ｱ` (U+FF71) is one, so the full-width block would put a column of
 # the frame half a cell out of step with every row it fell through.
-GLYPHS = tuple(
-    [chr(code) for code in range(0xFF66, 0xFF9E)] + list("0123456789")
-)
+KATAKANA = tuple(chr(code) for code in range(0xFF66, 0xFF9E))
+GLYPHS = KATAKANA + tuple("0123456789")
 
 # Rows a second. The spread is the whole illusion — one speed reads as a
 # curtain being lowered rather than as rain — and the range is bounded below
@@ -177,3 +176,76 @@ def _row(glyphs: list[str], styles: list[str]) -> str:
     if current:
         out.append(RESET)
     return "".join(out)
+
+
+# --------------------------------------------------------------- the spinner
+
+# The same effect, four cells wide, for the working row.
+#
+# A one-character spinner says "something is happening" and nothing else; this
+# screen already has a vocabulary for waiting, and it is the one behind the
+# quit question. So the working row gets a drop of it: four columns, the head
+# oscillating between the walls instead of falling, and the trail behind it —
+# behind in the direction it *came from*, which is what makes the bounce read
+# as a bounce rather than as two unrelated slides.
+#
+# It does not rain. A column that fell off the bottom would need somewhere to
+# fall to, and the row it is on is one line high; the oscillation is what
+# gives the same glyphs the same restlessness in the space there is.
+SPINNER_WIDTH = 4
+
+# Where the head is on each frame of the cycle. Six frames rather than eight:
+# the walls are not held for a second frame, because a drop that pauses at the
+# end of its travel reads as a stutter in the animation rather than as a turn.
+SPINNER_STEPS = (0, 1, 2, 3, 2, 1)
+
+# What the trail costs in brightness, by how far behind the head it is. Four
+# tiers here where `rain` has three, and the reason the argument there does not
+# apply is arithmetic: a full screen of drops pays a distinct SGR sequence per
+# row of every one of them, and this pays at most four per frame. So the decay
+# can be a real ramp, which over four cells is the whole of what makes the
+# trail read as fading rather than as a block of green with a white end.
+SPINNER_TRAIL = (
+    RESET + BOLD + WHITE,
+    RESET + GREEN,
+    RESET + DIM + GREEN,
+    RESET + f"{ESC}[38;5;22m",
+)
+
+
+def spinner(frame: int) -> tuple[str, tuple[str, ...]]:
+    """One frame of it: ``SPINNER_WIDTH`` glyphs, and the style of each.
+
+    Returned apart, and that is not a convenience. Every line this UI draws is
+    built plain and measured before any SGR is wrapped around it
+    (`ansi.pad`, `pane.Item`), so a spinner that arrived already coloured
+    would be a working row measured with its escapes in it. The glyphs go into
+    the line; the styles are put on afterwards, over the padded row.
+
+    Katakana only, where the field mixes digits in: the digits are the
+    flicker in a screenful of them, and in four cells a `7` is not a flicker,
+    it is a number the eye tries to read off the working row.
+
+    ``frame`` is a count, not a clock — `state.Turn` derives it from the same
+    tick that decides when the row is next drawn, so the glyphs churn only on
+    frames that were going to be painted anyway.
+    """
+    step = frame % len(SPINNER_STEPS)
+    head = SPINNER_STEPS[step]
+    # Where it came from, which is the side the trail is on. Reading the
+    # previous step rather than working the direction out from the frame index
+    # is what makes the two turning points fall out for free: at a wall the
+    # drop has just arrived from the one place it can have come from.
+    came_from = SPINNER_STEPS[step - 1]
+    direction = 1 if head >= came_from else -1
+    glyphs = [" "] * SPINNER_WIDTH
+    styles = [""] * SPINNER_WIDTH
+    for depth, style in enumerate(SPINNER_TRAIL):
+        x = head - direction * depth
+        if not 0 <= x < SPINNER_WIDTH:
+            continue
+        glyphs[x] = KATAKANA[
+            _mix(x * 0x27D4EB2D + frame * 0x165667B1) % len(KATAKANA)
+        ]
+        styles[x] = style
+    return "".join(glyphs), tuple(styles)

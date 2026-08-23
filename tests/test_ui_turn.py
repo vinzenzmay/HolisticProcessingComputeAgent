@@ -20,7 +20,8 @@ import pytest
 
 from hpca import protocol
 from hpca.ui.app import CHAT, INPUT, SESSIONS, WATCHERS, RowUI
-from hpca.ui.state import SPINNER_FRAMES, Context
+from hpca.ui.rain import KATAKANA as SPINNER_GLYPHS
+from hpca.ui.state import Context
 from tests.ui_harness import Wire, at_wall, connected, plain, widths
 
 STARTED = "2026-08-21T10:00:00+00:00"
@@ -91,7 +92,7 @@ async def working(wire: Wire, activity: str = "running read_file") -> Wire:
 
 
 def spinner_lines(wire: Wire) -> list[str]:
-    return [x for x in wire.frame() if any(f in x for f in SPINNER_FRAMES)]
+    return [x for x in wire.frame() if any(f in x for f in SPINNER_GLYPHS)]
 
 
 def spinner(wire: Wire) -> str:

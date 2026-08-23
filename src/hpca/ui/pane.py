@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from hpca.ui.ansi import BOLD, CYAN, DIM, RESET, REVERSE, clip, fold, pad, rule
@@ -115,6 +116,17 @@ class Item(Wrapped):
     text: str = ""
     key: str = ""
     folds: list[Fold] = field(default_factory=list)
+    # Colour inside the head line, for the one row that needs it. Everything
+    # said above about `label` applies twice over here: the row is built plain,
+    # wrapped and padded to an exact number of cells, and only then handed to
+    # this — which is given the finished row and the style it is about to be
+    # drawn in, and returns the same cells with escapes threaded through them.
+    # Restoring that style is the callable's job, since an SGR it opens inside
+    # a reversed row has to close back into the reverse rather than out of it.
+    #
+    # It exists for the working row's spinner (`ui.rain.spinner`), which is
+    # four cells of a fading trail and cannot say that with one accent.
+    paint: Callable[[str, str], str] | None = None
 
     def clipped(self, cells: int) -> str:
         """``preview``, cut to one line — the closed row's half of `folded`.
@@ -741,5 +753,7 @@ class Pane:
                 bold = bold or (here and self.flush)
             if bold:
                 style += BOLD
+            if item is not None and item.paint is not None:
+                painted = item.paint(painted, style)
             out.append(style + painted + RESET if style else painted)
         return out

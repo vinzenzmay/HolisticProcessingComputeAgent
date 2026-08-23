@@ -10,7 +10,17 @@ from __future__ import annotations
 
 import re
 
-from hpca.ui.ansi import AMBER, DIM, RED, WHITE
+from hpca.ui.ansi import (
+    AMBER,
+    DIM,
+    RED,
+    RESET,
+    REVERSE,
+    WHITE,
+    cell_width,
+    pad,
+)
+from hpca.ui.rain import KATAKANA, SPINNER_STEPS, SPINNER_TRAIL, SPINNER_WIDTH, spinner
 from hpca.ui.state import (
     ChatEntry,
     ChatPart,
@@ -383,6 +393,85 @@ class TestTheTurn:
         turn.activity_is("reading", "10:00:00")
         turn.activity_is("", "")
         assert turn.activity == ""
+
+
+class TestTheSpinner:
+    """Four cells of katakana, bouncing, with the trail behind where it was."""
+
+    def test_it_is_four_cells_wide_on_every_frame(self):
+        for frame in range(len(SPINNER_STEPS) * 3):
+            glyphs, styles = spinner(frame)
+            assert len(glyphs) == len(styles) == SPINNER_WIDTH
+            assert cell_width(glyphs) == SPINNER_WIDTH
+
+    def test_the_head_walks_out_and_back(self):
+        heads = [spinner(f)[1].index(SPINNER_TRAIL[0]) for f in range(6)]
+        assert heads == [0, 1, 2, 3, 2, 1]
+        assert spinner(6)[1].index(SPINNER_TRAIL[0]) == 0, "and round again"
+
+    def test_the_trail_is_on_the_side_it_came_from(self):
+        # Heading right at cell 2: the lit cells behind it are 1 and 0, and
+        # the cell it is about to move into is dark. The other way round is
+        # what a trail drawn ahead of the head would look like, and it reads
+        # as the drop being pushed rather than as it moving.
+        styles = spinner(2)[1]
+        assert styles[3] == ""
+        assert [styles[1], styles[0]] == [SPINNER_TRAIL[1], SPINNER_TRAIL[2]]
+        # And going the other way it is the mirror of that: heading left at
+        # cell 2, the one lit cell behind it is 3 and cell 1 is dark.
+        styles = spinner(4)[1]
+        assert styles[1] == ""
+        assert styles[3] == SPINNER_TRAIL[1]
+
+    def test_it_fades_rather_than_stopping(self):
+        # Distinct styles all the way down, or the "decay" is two shades and a
+        # step: at the widest reach all four cells are lit and each is dimmer.
+        styles = spinner(3)[1]
+        assert list(styles) == list(reversed(SPINNER_TRAIL))
+
+    def test_the_glyphs_churn(self):
+        assert spinner(0)[0] != spinner(6)[0], "same position, new characters"
+
+    def test_and_are_never_digits(self):
+        # The rain mixes them in for the flicker; four cells is not a field,
+        # and a lone "7" on the working row is a number somebody tries to read.
+        seen = {ch for f in range(200) for ch in spinner(f)[0]} - {" "}
+        assert seen <= set(KATAKANA)
+
+
+class TestThePaintedWorkingRow:
+    def paint(self, turn: Turn, now: float, width: int = 60, style: str = ""):
+        return turn.paint(now)(pad(turn.line(now), width), style)
+
+    def test_the_line_itself_carries_no_escapes(self):
+        # Every row is measured before it is styled (`ansi.pad`), so a spinner
+        # that arrived coloured would be a working row padded to the wrong
+        # width — and one cell of that is a torn repaint.
+        turn = Turn(working=True, activity="reading")
+        assert "\x1b" not in turn.line(0.0)
+        assert cell_width(turn.line(0.0)) == len(turn.line(0.0))
+
+    def test_the_colours_go_on_over_the_padded_row(self):
+        turn = Turn(working=True, activity="reading")
+        painted = self.paint(turn, 0.0)
+        assert SPINNER_TRAIL[0] in painted
+        assert re.sub(r"\x1b\[[0-9;]*m", "", painted) == pad(turn.line(0.0), 60)
+
+    def test_and_close_back_into_the_style_the_row_is_drawn_in(self):
+        # On the cursor's own row that is REVERSE, and a bare reset after the
+        # spinner would end the highlight four cells into the line.
+        turn = Turn(working=True, activity="reading")
+        painted = self.paint(turn, 0.0, style=REVERSE)
+        head, _, rest = painted.partition(RESET + REVERSE)
+        assert SPINNER_TRAIL[0] in head, "the trail was drawn"
+        assert rest.startswith(" reading"), "and the highlight taken up again"
+
+    def test_a_row_too_narrow_to_have_kept_it_is_left_alone(self):
+        # `pad` truncates; the answer to a cut-off spinner is a plain line, not
+        # colour landing on whatever cells are left.
+        turn = Turn(working=True, activity="reading")
+        painted = turn.paint(0.0)(pad(turn.line(0.0), 2), "")
+        assert "\x1b" not in painted
 
 
 class TestTheContextMeter:

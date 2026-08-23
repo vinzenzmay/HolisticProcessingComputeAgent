@@ -159,9 +159,12 @@ JOINERS = "‍‌"
 ONE_CELL_GLYPHS = (
     "─│└▌▏█"          # rules, gutters, the cursor block and the meter
     "▸▾●○★•"          # row markers and the backend dots
-    "→←↑↓⇧⇥⌫⏎⟳↺⇔"     # the key hints, and the working spinner's cousin
+    "→←↑↓⇧⇥⌫⏎⟳↺⇔"     # the key hints
     "…—–·›“”§✓✗⚠≤÷"   # typography and status marks
-    "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"     # the braille spinner frames
+    # The halfwidth katakana the spinner and the quit screen are drawn from.
+    # Halfwidth is the whole reason they can be in here: `ア` is two cells and
+    # `ｱ` is one, which is also why `rain` picked this block (see its GLYPHS).
+    + "".join(chr(code) for code in range(0xFF66, 0xFF9E))
 )
 
 # Printable ASCII plus the above. `frozenset.issuperset` walks the string in C,
