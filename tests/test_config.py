@@ -8,19 +8,126 @@ from hpca.config import (LLMBackend, LLMSettings, Settings, SettingsError,
                          app_dir, llm_settings_for, settings_path)
 
 
+NAME = ".HolisticProcessingComputeAgent"
+
+
+@pytest.fixture
+def home(monkeypatch, tmp_path):
+    """A home directory of our own, with no $HPCA_HOME over it.
+
+    `app_dir` reads the real filesystem to decide — whether ``~/work`` is
+    there, whether an app dir is already in one place or the other — so these
+    tests need a home they can arrange, not a string.
+    """
+    monkeypatch.delenv("HPCA_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    return tmp_path
+
+
 class TestAppDir:
-    def test_defaults_to_home_dotdir(self, monkeypatch):
-        monkeypatch.delenv("HPCA_HOME", raising=False)
-        monkeypatch.setenv("HOME", "/home/someone")
-        assert str(app_dir()) == "/home/someone/.HolisticProcessingComputeAgent"
+    def test_defaults_to_home_dotdir(self, home):
+        # A laptop: no ~/work, so nothing changes about where things go.
+        assert app_dir() == home / NAME
+
+    def test_prefers_work_when_it_exists(self, home):
+        # A cluster node: ~/work is the fast filesystem, and this is the whole
+        # point of the rule.
+        (home / "work").mkdir()
+        assert app_dir() == home / "work" / NAME
+
+    def test_work_wins_on_a_first_start(self, home):
+        # Nothing exists yet either side, so the rule alone decides — and the
+        # directory it names is what the first run creates.
+        (home / "work").mkdir()
+        assert not app_dir().exists()
+        assert app_dir() == home / "work" / NAME
+
+    def test_an_existing_home_dir_is_not_abandoned(self, home):
+        # ~/work appearing under a user who has been running out of ~ must not
+        # silently strand their databases. Moving the directory is what moves
+        # the app.
+        (home / "work").mkdir()
+        (home / NAME).mkdir()
+        assert app_dir() == home / NAME
+
+    def test_moving_the_directory_moves_the_app(self, home):
+        # The other half of the same story: once it is over there, it is over
+        # there, even though the one in ~ has not been cleaned up.
+        (home / "work").mkdir()
+        (home / NAME).mkdir()
+        (home / "work" / NAME).mkdir()
+        assert app_dir() == home / "work" / NAME
 
     def test_env_override(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HPCA_HOME", str(tmp_path / "custom"))
         assert app_dir() == tmp_path / "custom"
 
+    def test_env_override_beats_work(self, home, monkeypatch):
+        (home / "work").mkdir()
+        monkeypatch.setenv("HPCA_HOME", str(home / "custom"))
+        assert app_dir() == home / "custom"
+
     def test_settings_path_inside_app_dir(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HPCA_HOME", str(tmp_path))
         assert settings_path() == tmp_path / "settings.json"
+
+
+class TestTheConfiguredAppDir:
+    """``app_dir`` in settings.json, which sends the data somewhere else."""
+
+    def _write(self, root, value):
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "settings.json").write_text(json.dumps({"app_dir": value}))
+
+    def test_settings_redirect_the_data(self, home, tmp_path):
+        self._write(home / NAME, str(tmp_path / "elsewhere"))
+        assert app_dir() == tmp_path / "elsewhere"
+
+    def test_read_from_the_directory_the_rule_found(self, home, tmp_path):
+        (home / "work").mkdir()
+        self._write(home / "work" / NAME, str(tmp_path / "elsewhere"))
+        assert app_dir() == tmp_path / "elsewhere"
+
+    def test_a_tilde_is_expanded(self, home):
+        self._write(home / NAME, "~/somewhere")
+        assert app_dir() == home / "somewhere"
+
+    def test_redirects_do_not_chain(self, home, tmp_path):
+        # One hop. The file at the far end is the settings the app runs on,
+        # and its own app_dir key says nothing about where it lives.
+        self._write(home / NAME, str(tmp_path / "one"))
+        self._write(tmp_path / "one", str(tmp_path / "two"))
+        assert app_dir() == tmp_path / "one"
+
+    @pytest.mark.parametrize("value", [None, "", "   ", 7, []])
+    def test_no_answer_leaves_the_directory_alone(self, home, value):
+        self._write(home / NAME, value)
+        assert app_dir() == home / NAME
+
+    def test_a_malformed_file_does_not_cost_the_data_directory(self, home):
+        (home / NAME).mkdir()
+        (home / NAME / "settings.json").write_text("{not json")
+        assert app_dir() == home / NAME
+
+    def test_the_env_override_is_not_redirectable(self, monkeypatch, tmp_path):
+        # $HPCA_HOME that a file inside the directory it names could overrule
+        # would be no override at all — and the whole suite runs behind it.
+        monkeypatch.setenv("HPCA_HOME", str(tmp_path))
+        self._write(tmp_path, str(tmp_path / "elsewhere"))
+        assert app_dir() == tmp_path
+
+    def test_saving_keeps_the_redirect(self, monkeypatch, tmp_path):
+        # It is a modelled field precisely so that save() cannot drop it: an
+        # unmodelled key would survive hand-editing right up until the
+        # settings editor next wrote the file.
+        monkeypatch.setenv("HPCA_HOME", str(tmp_path))
+        settings_path().parent.mkdir(parents=True, exist_ok=True)
+        settings_path().write_text(json.dumps({"app_dir": "/data/hpca"}))
+        Settings.load().save()
+        assert json.loads(settings_path().read_text())["app_dir"] == "/data/hpca"
+
+    def test_unset_by_default(self):
+        assert Settings().app_dir is None
 
 
 class TestDefaults:

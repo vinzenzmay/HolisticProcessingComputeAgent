@@ -28,10 +28,23 @@ now cd into the project or wherever you want to start the agent and run it: `hpc
 
 ## Workings under the hood
 
-HPCA uses `~/.HolisticProcessingComputeAgent/` to store information.
+HPCA keeps everything it stores in one directory, written `<app dir>` below.
 
-* Config & settings: `~/.HolisticProcessingComputeAgent/settings.json`
-* sessions, skills, profiles, trash bin: `~/.HolisticProcessingComputeAgent/hpca.db`
+* Config & settings: `<app dir>/settings.json`
+* sessions, skills, profiles, trash bin: `<app dir>/hpca.db`
+
+Where that directory is, is decided on the first run and never again:
+
+* `~/work/.HolisticProcessingComputeAgent` when a `~/work` exists — the case on
+  a cluster, where `$HOME` is NFS and `~/work` is not.
+* `~/.HolisticProcessingComputeAgent` otherwise, which is a local machine.
+
+An app dir that already exists wins over that rule, so `~/work` appearing under
+a user who has been running out of `~` strands nothing: moving the directory is
+what moves the app. To put it somewhere else entirely, set `"app_dir"` in
+`settings.json` (a `~` in it is expanded) — that key is read from wherever the
+rule above found the file, and everything else follows it there. `$HPCA_HOME`
+overrides the lot, for a one-off run.
 
 ### TUI
 

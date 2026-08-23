@@ -1,6 +1,6 @@
 """Application settings (§7 of the project plan).
 
-Settings live in ``~/.HolisticProcessingComputeAgent/settings.json`` and are
+Settings live in ``<app_dir>/settings.json`` (see :func:`app_dir`) and are
 edited both by the in-app settings menu and by hand, so loading is lenient:
 missing keys fall back to defaults and unknown keys are ignored. Only malformed
 JSON or values of the wrong type/range are reported as errors.
@@ -27,13 +27,76 @@ from hpca.thinking import ThinkingEffort
 
 APP_DIR_NAME = ".HolisticProcessingComputeAgent"
 
+# The directory a cluster gives you to actually work in. On the login nodes
+# ``$HOME`` is NFS and ``~/work`` is not, which is why this matters at all:
+# everything the app keeps — the databases, the logs, the checkpoints — is
+# written there by preference, and `hpca.dbcache` exists to paper over what it
+# costs when it cannot be. A laptop has no ``~/work`` and never grows one, so
+# the same build lands in ``~`` there without being told.
+WORK_DIR_NAME = "work"
+
+
+def _default_app_dir() -> Path:
+    """Where the data goes when nothing has said otherwise.
+
+    Resolved from what is on disk rather than recorded at first start, which
+    reaches the same answer with nothing to keep in sync — the first run
+    creates the directory the rule names, and every run after that finds it
+    exactly where the rule looks.
+
+    An app dir that already exists wins over the rule, and that is the whole
+    of the migration story: a user who has been running out of ``~`` goes on
+    running out of ``~`` when ``~/work`` appears, and moving the directory is
+    what moves the app. Nothing is abandoned by a mount showing up.
+    """
+    home = Path.home()
+    work = home / WORK_DIR_NAME / APP_DIR_NAME
+    plain = home / APP_DIR_NAME
+    if (home / WORK_DIR_NAME).is_dir():
+        for existing in (work, plain):
+            if existing.is_dir():
+                return existing
+        return work
+    return plain
+
+
+def _configured_app_dir(root: Path) -> Path:
+    """``app_dir`` out of ``root``'s settings file, if it names one.
+
+    Read as raw JSON and not through `Settings`, because this runs *before*
+    there is a settings file to speak of: the model's own loader asks
+    :func:`settings_path`, which asks this, and validating the whole file to
+    learn one string would make a single bad key cost the app its data
+    directory. Anything unreadable, malformed, or not a string is no answer,
+    and the caller keeps the directory it already had.
+
+    One hop, deliberately: the file at the far end is the settings the app
+    then runs on, and a chain of redirects is a loop waiting to be written by
+    hand.
+    """
+    try:
+        data = json.loads((root / "settings.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return root
+    named = data.get("app_dir") if isinstance(data, dict) else None
+    if not isinstance(named, str) or not named.strip():
+        return root
+    return Path(named).expanduser()
+
 
 def app_dir() -> Path:
-    """Application data directory; override with $HPCA_HOME (used by tests)."""
+    """Application data directory.
+
+    Three answers, in order. ``$HPCA_HOME`` is the override and wins outright
+    — it is what the tests and `evals/smoke_pty.py` run behind, and a variable
+    that could be overruled by a file inside the directory it names would be
+    no override at all. Otherwise the rule above picks a root, and that root's
+    settings file may redirect to somewhere else entirely.
+    """
     override = os.environ.get("HPCA_HOME")
     if override:
         return Path(override)
-    return Path.home() / APP_DIR_NAME
+    return _configured_app_dir(_default_app_dir())
 
 
 def settings_path() -> Path:
@@ -467,6 +530,21 @@ class Settings(_Section):
     database: DatabaseSettings = DatabaseSettings()
     watches: WatchSettings = WatchSettings()
     display: DisplaySettings = DisplaySettings()
+    # Where everything above is kept, when the default is not where you want
+    # it. Null is "wherever `app_dir` decides", which is ``~/work`` on a
+    # cluster node and ``~`` on a machine that has no ``~/work``; a path here
+    # overrides both, and ``~`` in it is expanded.
+    #
+    # It is a real field and not merely a key `app_dir` happens to read,
+    # because :meth:`save` writes the whole model back over the file — an
+    # unmodelled key would survive being hand-edited exactly until the
+    # settings editor next saved, and then the app would silently move house.
+    #
+    # Read before this model is loaded (`_configured_app_dir` parses the raw
+    # JSON), so the value is only ever consulted from the file the rule found:
+    # writing it into the settings of the directory it points *at* says
+    # nothing, and points at nothing.
+    app_dir: str | None = None
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Settings":
