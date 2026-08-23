@@ -21,7 +21,8 @@ past a key the endpoint rejected but you know is right.
 
 from __future__ import annotations
 
-from hpca.ui.ansi import BOLD, CYAN, DIM, RESET, pad
+from hpca.ui import theme
+from hpca.ui.ansi import BOLD, RESET, pad
 from hpca.ui.editor import Editor
 from hpca.ui.overlays.backends import backend_item
 from hpca.ui.overlays.base import BACK_KEYS, ListOverlay, Overlay
@@ -168,7 +169,7 @@ class BackendFormOverlay(Overlay):
                 drawn = self.values[name].render(
                     max(8, width - len(prefix)), 1, focused=True
                 )[0]
-                rows.append(CYAN + prefix + RESET + drawn)
+                rows.append(theme.chrome + prefix + RESET + drawn)
                 continue
             text = self.value(name)
             if name == KEY:
@@ -176,17 +177,17 @@ class BackendFormOverlay(Overlay):
                 # this window is over a terminal somebody may be sharing.
                 text = MASK * len(text) + ("▏" if here else "")
             shown = text or ("" if here else hint)
-            style = BOLD + CYAN if here else (DIM if not text else "")
+            style = BOLD + theme.chrome if here else (theme.faint if not text else "")
             rows.append(style + pad(prefix + shown, width) + RESET)
             if here and locked:
                 rows.append(
-                    DIM
+                    theme.faint
                     + pad("    the endpoint this was opened on — not editable", width)
                     + RESET
                 )
         rows.append(" " * width)
         rows.append(
-            DIM + pad(f"  {FIELDS[self.at][2]}", width) + RESET
+            theme.faint + pad(f"  {FIELDS[self.at][2]}", width) + RESET
         )
         return rows
 

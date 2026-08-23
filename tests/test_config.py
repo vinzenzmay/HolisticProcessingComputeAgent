@@ -535,3 +535,75 @@ class TestDisplaySettings:
         path.write_text(json.dumps({"display": {"decision_pulse_seconds": -2}}))
         with pytest.raises(SettingsError):
             Settings.load(path)
+
+
+class TestThePalette:
+    """The colours, which a user is meant to be able to replace outright."""
+
+    def test_the_defaults_are_the_dark_palette(self):
+        palette = Settings().display.palette
+        assert (palette.chrome, palette.warn) == ("73", "172")
+        assert palette.spinner == ["73", "66", "23", "236"]
+
+    def test_an_xterm_index_and_a_hex_triple_are_both_colours(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text(
+            json.dumps({"display": {"palette": {"ok": "12", "danger": "#ff8800"}}})
+        )
+        loaded = Settings.load(path)
+        assert (loaded.display.palette.ok, loaded.display.palette.danger) == (
+            "12",
+            "#ff8800",
+        )
+
+    def test_naming_one_colour_keeps_the_rest(self, tmp_path):
+        # The whole offer: a theme is an edit to the palette, not a
+        # replacement of it, so a file naming one colour still draws.
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"display": {"palette": {"user": "33"}}}))
+        loaded = Settings.load(path)
+        assert loaded.display.palette.user == "33"
+        assert loaded.display.palette.agent == "255"
+
+    @pytest.mark.parametrize("bad", ["nope", "256", "#ff88", "#gggggg", "-1", ""])
+    def test_what_is_not_a_colour_is_refused(self, tmp_path, bad):
+        # Refused at load, where the answer is a line beside the field that
+        # named it. A malformed escape sequence reaching a terminal in raw
+        # mode does not report a bad setting so much as stop being a terminal.
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"display": {"palette": {"ok": bad}}}))
+        with pytest.raises(SettingsError):
+            Settings.load(path)
+
+    def test_a_spinner_with_no_cells_is_refused(self, tmp_path):
+        # An empty trail is a spinner that draws nothing, which is a working
+        # row that has stopped saying anything is happening.
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"display": {"palette": {"spinner": []}}}))
+        with pytest.raises(SettingsError):
+            Settings.load(path)
+
+    def test_a_shorter_trail_is_allowed(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"display": {"palette": {"spinner": ["9"]}}}))
+        assert Settings.load(path).display.palette.spinner == ["9"]
+
+    def test_the_flash_can_be_turned_off(self, tmp_path):
+        # Zero is off, which is why the floor is ge and not gt: a user who
+        # finds the wash startling should be able to say so.
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"display": {"focus_flash_seconds": 0}}))
+        assert Settings.load(path).display.focus_flash_seconds == 0
+
+    def test_but_not_held_forever(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"display": {"focus_flash_seconds": 5}}))
+        with pytest.raises(SettingsError):
+            Settings.load(path)
+
+    def test_a_palette_survives_a_round_trip(self, tmp_path):
+        path = tmp_path / "settings.json"
+        settings = Settings()
+        settings.display.palette.chrome = "#88ccff"
+        settings.save(path)
+        assert Settings.load(path).display.palette.chrome == "#88ccff"

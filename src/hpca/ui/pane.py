@@ -5,7 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from hpca.ui.ansi import BOLD, CYAN, DIM, RESET, REVERSE, clip, fold, pad, rule
+from hpca.ui import theme
+from hpca.ui.ansi import BOLD, RESET, REVERSE, clip, fold, pad, rule
 
 # How far a row's head sits from its fold marker, on the two kinds of pane.
 #
@@ -703,7 +704,7 @@ class Pane:
         if self.expanded:
             right += f" · {len(self.expanded)} open"
         title = rule(self.name, width, right)
-        out = [(BOLD + CYAN if focused else DIM) + title + RESET]
+        out = [(BOLD + theme.chrome if focused else theme.faint) + title + RESET]
         # A conversation shorter than the pane hangs from the bottom, with the
         # empty screen above it rather than below: the newest line is the one
         # being read, and a log that grew downwards from the title rule would
@@ -732,7 +733,7 @@ class Pane:
             if row == self.cursor:
                 # The unfocused pane still shows where it was left, dimmed —
                 # that is the "memory" being visible rather than merely kept.
-                style = REVERSE if focused else DIM + REVERSE
+                style = REVERSE if focused else theme.faint + REVERSE
             elif item is not None and item.accent:
                 # Head *and* body, where it used to be the head alone: a
                 # message is drawn in its speaker's colour down to its last
@@ -743,7 +744,7 @@ class Pane:
                 style = item.accent
                 bold = bold or (here and self.flush and is_head)
             elif not is_head:
-                style = DIM
+                style = theme.faint
             else:
                 # No gutter column to band the current entry with, so it is
                 # marked by weight instead — and on the head line only,

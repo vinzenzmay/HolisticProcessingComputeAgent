@@ -7,16 +7,14 @@ wrapped around it afterwards.
 
 import re
 
+from hpca.ui import theme
 from hpca.ui.ansi import (
     CLIP,
-    CYAN,
-    DIM,
     ONE_CELL_GLYPHS,
     PULSE_PERIOD,
-    PULSE_RAMP,
+
     RESET,
     REVERSE,
-    WHITE,
     cell_width,
     char_width,
     clip,
@@ -98,7 +96,7 @@ class TestFooterLine:
 
     def test_every_row_of_a_wrapped_footer_is_exactly_the_width(self):
         for width in range(20, 120):
-            for row in footer_lines(PAIRS, width, "sent", CYAN, max_rows=5):
+            for row in footer_lines(PAIRS, width, "sent", theme.chrome, max_rows=5):
                 assert len(plain(row)) == width, (width, plain(row))
 
     def test_the_rows_stop_at_the_cap_and_the_rest_fall_off_the_end(self):
@@ -113,11 +111,11 @@ class TestFooterLine:
 
     def test_keys_are_bright_and_labels_dim(self):
         drawn = footer_lines([("q", "quit")], 40)[0]
-        assert f"{CYAN}q{RESET} {DIM}quit{RESET}" in drawn
+        assert f"{theme.chrome}q{RESET} {theme.faint}quit{RESET}" in drawn
 
     def test_a_note_is_drawn_in_the_style_it_was_given(self):
-        drawn = footer_lines(PAIRS, 120, "sent", CYAN)[0]
-        assert f"{CYAN}sent{RESET}" in drawn
+        drawn = footer_lines(PAIRS, 120, "sent", theme.chrome)[0]
+        assert f"{theme.chrome}sent{RESET}" in drawn
         assert len(plain(drawn)) == 120
 
     def test_a_note_shares_the_row_while_there_is_only_one(self):
@@ -323,22 +321,22 @@ class TestThePulse:
     clock and of nothing else (`ui/approval.py` says why it breathes)."""
 
     def test_it_starts_white_and_ends_teal(self):
-        assert PULSE_RAMP[0] == WHITE
-        assert PULSE_RAMP[-1] == CYAN
+        assert theme.pulse[0] == theme.agent
+        assert theme.pulse[-1] == theme.chrome
 
     def test_every_step_between_them_is_a_256_colour_escape(self):
         # The whole UI addresses colour as `38;5;N`, and a 24-bit sequence
         # here would be the one row of the frame a 256-colour terminal drew
         # in something else entirely.
-        assert all(re.fullmatch(r"\x1b\[38;5;\d+m", x) for x in PULSE_RAMP)
+        assert all(re.fullmatch(r"\x1b\[38;5;\d+m", x) for x in theme.pulse)
 
     def test_and_no_step_repeats_the_one_before_it(self):
         # A ramp with a repeat in it is a pulse that stalls for a frame.
-        assert len(set(PULSE_RAMP)) == len(PULSE_RAMP)
+        assert len(set(theme.pulse)) == len(theme.pulse)
 
     def test_the_ends_of_the_sweep_are_the_two_it_was_asked_for(self):
-        assert pulse(PULSE_PERIOD / 4) == CYAN
-        assert pulse(PULSE_PERIOD * 3 / 4) == WHITE
+        assert pulse(PULSE_PERIOD / 4) == theme.chrome
+        assert pulse(PULSE_PERIOD * 3 / 4) == theme.agent
 
     def test_it_is_the_same_colour_one_period_later(self):
         assert pulse(0.3) == pulse(0.3 + PULSE_PERIOD)
@@ -348,8 +346,8 @@ class TestThePulse:
 
     def test_it_never_answers_with_a_colour_that_is_not_on_the_ramp(self):
         walk = [pulse(x / 97 * PULSE_PERIOD) for x in range(97)]
-        assert set(walk) <= set(PULSE_RAMP)
-        assert set(walk) == set(PULSE_RAMP), "and every one of them is reachable"
+        assert set(walk) <= set(theme.pulse)
+        assert set(walk) == set(theme.pulse), "and every one of them is reachable"
 
     def test_a_pinned_clock_pins_the_colour(self):
         # Which is what makes it testable at all: the frame asks the clock,

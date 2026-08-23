@@ -14,7 +14,8 @@ carries whatever string the core wants back, and nothing here looks inside it.
 
 from __future__ import annotations
 
-from hpca.ui.ansi import DIM, RESET, pad
+from hpca.ui import theme
+from hpca.ui.ansi import RESET, pad
 from hpca.ui.overlays.base import ListOverlay
 from hpca.ui.pane import Item, Pane
 
@@ -82,7 +83,7 @@ class NewSessionOverlay(ListOverlay):
         return max(1, super().view(height) - 1)  # the hint line under the rule
 
     def body(self, width: int, height: int) -> list[str]:
-        hint = DIM + pad(f"  {STAGE_HINTS[self.stage]}", width) + RESET
+        hint = theme.faint + pad(f"  {STAGE_HINTS[self.stage]}", width) + RESET
         return [hint] + super().body(width, max(1, height - 1))
 
     def chose(self, item: Item | None) -> bool:

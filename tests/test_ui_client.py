@@ -25,7 +25,7 @@ import pytest
 from hpca import protocol
 from hpca.transport import InProcessConnection
 from hpca.ui.app import CHAT, INPUT, SESSIONS, WATCHERS, RowUI
-from hpca.ui import state
+from hpca.ui import state, theme
 from hpca.ui.client import UIClient
 from hpca.ui.overlays import HelpOverlay, InspectOverlay
 from tests.ui_harness import Peer, Wire, clocked, on_entry, plain, settle, widths
@@ -182,9 +182,12 @@ class TestTheSettingsTheUiDrawsWith:
                 ),
             )
         )
-        assert wire.ui.display == state.Display(
-            chat_stamps=False, decision_pulse_seconds=4.0
-        )
+        assert wire.ui.display.chat_stamps is False
+        assert wire.ui.display.decision_pulse_seconds == 4.0
+        # And the palette came with them, on the same frame: the colours are
+        # display settings like any other, so a first frame that carried the
+        # stamps but not the theme would draw one row in the built-in palette.
+        assert wire.ui.display.palette["chrome"] == "73"
 
     async def test_and_before_the_first_chat_that_uses_them(self, wire):
         # The ordering that matters: `hello` is the first frame, and the
@@ -1605,3 +1608,72 @@ class TestMemoryProposals:
         await wire.press("y")
         sent = wire.peer.last(protocol.MemoryResolve)
         assert (sent.session_id, sent.approved) == ("s1", [True])
+
+
+class TestThePaletteArrivesTheSameWay:
+    """A theme is a display setting, so it travels the path they all do.
+
+    Which is the whole of "hot reload": the core already restates the display
+    section whenever a save changes it (`core.service._apply_settings`), and
+    the colours ride that. There is no file watcher and nothing polls — the
+    editor saves, the core diffs, and the next frame is drawn in the new
+    palette.
+    """
+
+    def teardown_method(self):
+        # The palette is module state; a test that swapped it and walked away
+        # would be the next test's surprise.
+        theme.reset()
+
+    async def test_a_saved_colour_reaches_the_next_frame(self, wire):
+        await started(wire, [entry(1, text="run it", at=AT)])
+        await wire.tell(
+            protocol.DisplayChanged(
+                display=protocol.DisplaySettings(
+                    palette=protocol.Palette(user="#ff0000")
+                )
+            )
+        )
+        assert theme.user == "\x1b[38;2;255;0;0m"
+        assert any("38;2;255;0;0" in row for row in wire.ui.render(120, 40))
+
+    async def test_and_the_conversation_survives_it(self, wire):
+        # `restyle`, not `reset`: recolouring is not a reason to lose what was
+        # said, what is open in it, or where the cursor was.
+        await started(wire, [entry(1, text="run it", at=AT)])
+        await wire.tell(
+            protocol.DisplayChanged(
+                display=protocol.DisplaySettings(
+                    palette=protocol.Palette(agent="#00ff00")
+                )
+            )
+        )
+        assert "run it" in wire.screen()
+        assert [x.key for x in wire.ui.chat.items] == ["1"]
+
+    async def test_a_colour_the_theme_cannot_draw_costs_only_that_colour(
+        self, wire
+    ):
+        # The settings model refuses these where the user can read why. This
+        # is the far side of the wire, in the process holding a terminal in
+        # raw mode, and there a palette is not worth a lost screen.
+        await started(wire, [entry(1, text="run it", at=AT)])
+        await wire.tell(
+            protocol.DisplayChanged(
+                display=protocol.DisplaySettings(
+                    palette=protocol.Palette(user="rubbish", chrome="#0000ff")
+                )
+            )
+        )
+        assert theme.user == theme.sgr("215"), "the bad one kept the built-in"
+        assert theme.chrome == "\x1b[38;2;0;0;255m", "the good one applied"
+        assert "run it" in wire.screen(), "and the frame still draws"
+
+    async def test_the_flash_hold_travels_with_it(self, wire):
+        await started(wire, [entry(1, text="run it", at=AT)])
+        await wire.tell(
+            protocol.DisplayChanged(
+                display=protocol.DisplaySettings(focus_flash_seconds=0.4)
+            )
+        )
+        assert theme.flash_hold == 0.4

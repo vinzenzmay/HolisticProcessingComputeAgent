@@ -6,6 +6,8 @@ feed keys, read the frame back and look at it".
 
 import pytest
 
+from hpca.ui import theme
+from hpca.ui.ansi import RESET, REVERSE
 from hpca.ui.app import (
     CHAT,
     FOOTER_ROWS,
@@ -16,6 +18,7 @@ from hpca.ui.app import (
     WATCHERS,
     RowUI,
 )
+from hpca.ui import demo
 from hpca.ui.demo import build
 from hpca.ui.keys import PASTE, decode
 from hpca.ui.state import Interrupt
@@ -617,11 +620,10 @@ def test_the_footer_says_esc_again_to_stop():
 
 
 def test_the_hint_is_in_red():
-    from hpca.ui.ansi import RED
-
+    
     ui = half_a_message()
     ui.handle("esc", 120, 40)
-    assert RED + "esc again to stop" in ui.render(160, 40)[-1]
+    assert theme.danger + "esc again to stop" in ui.render(160, 40)[-1]
 
 
 def test_the_armed_footer_is_still_exactly_the_width():
@@ -1191,3 +1193,92 @@ def test_a_real_escape_still_arms_it_when_nothing_follows():
     for key in keys:
         ui.handle(key, 120, 40)
     assert ui._esc_armed_at is not None
+
+
+class TestTheFocusFlash:
+    """The pane that just took focus is washed once, and then is not.
+
+    A one-cell title rule is a thin thing to say "focus is here now" with, and
+    the flash is the loud half of that sentence: it says *where it went* in the
+    frame the keypress drew, and then gets out of the way.
+    """
+
+    def ui(self, hold: float = 0.1):
+        ui = clocked(demo.build())
+        theme.apply(flash_hold=hold)
+        return ui
+
+    def washed(self, ui) -> list[str]:
+        """The rows of the frame carrying the flash background."""
+        return [row for row in ui.render(100, 30) if theme.flash in row]
+
+    def test_nothing_is_washed_before_focus_has_moved(self):
+        # The pane the app opens on was not arrived at, so lighting it would
+        # answer a question nobody asked.
+        assert self.washed(self.ui()) == []
+
+    def test_tab_washes_the_pane_it_lands_on(self):
+        ui = self.ui()
+        ui.handle("tab", 100, 30)
+        assert self.washed(ui), "the pane focus arrived at is lit"
+
+    def test_and_shift_tab_too(self):
+        ui = self.ui()
+        ui.handle("shift-tab", 100, 30)
+        assert self.washed(ui)
+
+    def test_it_is_over_when_the_hold_is(self):
+        ui = self.ui(hold=0.1)
+        ui.handle("tab", 100, 30)
+        assert self.washed(ui)
+        ui._now += 0.2
+        assert self.washed(ui) == [], "and does not come back"
+
+    def test_a_frame_drawn_for_any_other_reason_does_not_relight_it(self):
+        # The flash is stamped where focus *changes*, not where it is: a wash
+        # that returned on every repaint would fire whenever a token arrived.
+        ui = self.ui()
+        ui.handle("tab", 100, 30)
+        ui._now += 0.2
+        ui.render(100, 30)
+        ui.render(100, 30)
+        assert self.washed(ui) == []
+
+    def test_a_hold_of_zero_turns_it_off(self):
+        ui = self.ui(hold=0)
+        ui.handle("tab", 100, 30)
+        assert self.washed(ui) == []
+
+    def test_the_cursor_row_keeps_its_highlight_instead(self):
+        # It is drawn REVERSE, which swaps foreground and background — a tint
+        # under it would come out as the text colour, so the one row the user
+        # is pointing at would be the one row drawn wrong.
+        ui = self.ui()
+        ui.handle("tab", 100, 30)
+        reversed_rows = [row for row in ui.render(100, 30) if REVERSE in row]
+        assert reversed_rows, "there is a cursor row"
+        assert all(theme.flash not in row for row in reversed_rows)
+
+    def test_the_wash_survives_the_resets_inside_a_row(self):
+        # A row is written as runs and each opens with a RESET stating the
+        # whole style, so a background set once at the left edge would be
+        # cleared by the first one and stop partway across.
+        ui = self.ui()
+        ui.handle("tab", 100, 30)
+        for row in self.washed(ui):
+            for piece in row.split(RESET)[:-1]:
+                assert theme.flash in piece + RESET or piece == ""
+
+    def test_it_books_the_frame_that_clears_it(self):
+        # And only that one: a spent flash returns None, or it would be a
+        # repaint that schedules another repaint, forever.
+        ui = self.ui(hold=0.1)
+        ui.handle("tab", 100, 30)
+        assert 0 < ui._flash_wake() <= 0.1
+        ui._now += 0.2
+        assert ui._flash_wake() is None
+
+    def test_and_books_nothing_at_all_when_it_is_off(self):
+        ui = self.ui(hold=0)
+        ui.handle("tab", 100, 30)
+        assert ui._flash_wake() is None

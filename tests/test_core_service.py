@@ -322,8 +322,24 @@ class TestHandshake:
         assert set(type(first.display).model_fields) == {
             "chat_stamps",
             "decision_pulse_seconds",
+            "focus_flash_seconds",
+            "palette",
             "quit_rain",
             "quit_rain_fps",
+        }
+        # And the palette is colours and nothing else — no paths, no names, no
+        # anything a front-end could be handed by calling it a display key.
+        assert set(type(first.display.palette).model_fields) == {
+            "agent",
+            "chrome",
+            "danger",
+            "faint",
+            "flash",
+            "muted",
+            "ok",
+            "spinner",
+            "user",
+            "warn",
         }
 
     async def test_the_digest_follows_the_settings(self, home, conn, llm):

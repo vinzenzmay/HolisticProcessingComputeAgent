@@ -19,6 +19,7 @@ from datetime import datetime
 import pytest
 
 from hpca import protocol
+from hpca.ui import theme
 from hpca.ui.app import CHAT, INPUT, SESSIONS, WATCHERS, RowUI
 from hpca.ui.rain import KATAKANA as SPINNER_GLYPHS
 from hpca.ui.state import Context
@@ -797,7 +798,7 @@ class TestTheModeBar:
 
     async def test_the_mode_colours_the_line(self, wire):
         line = [x for x in wire.ui.render(120, 40) if "mode: auto" in plain(x)][0]
-        assert "\x1b[38;5;71m" in line  # GREEN, as auto
+        assert "\x1b[38;5;71m" in line  # theme.ok, as auto
 
     async def test_it_follows_the_session_on_screen(self, wire):
         wire.ui.open_session("s2")

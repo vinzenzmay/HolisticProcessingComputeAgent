@@ -32,7 +32,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 
-from hpca.ui.ansi import BOLD, CYAN, DIM, RESET, YELLOW, pad, rule
+from hpca.ui import theme
+from hpca.ui.ansi import BOLD, RESET, pad, rule
 from hpca.ui.editor import Editor
 from hpca.ui.keys import NEWLINE_KEYS
 from hpca.ui.pane import Item, Pane
@@ -78,7 +79,7 @@ def framed(
     and `Editor.render` both are), because padding a styled line a second time
     is how a row ends up one cell short: `pad` counts the SGR escapes.
     """
-    out = [BOLD + CYAN + rule(title, width, note) + RESET]
+    out = [BOLD + theme.chrome + rule(title, width, note) + RESET]
     tail = list(tail)
     room = max(0, height - 1 - len(tail))
     body = list(body)
@@ -96,7 +97,7 @@ def keyed(text: str, width: int, key_cells: int = 12, at: int = 6) -> str:
     cell short. Lifted out of `help.py`, where three screens had copied it.
     """
     row = pad(text, width)
-    return row[:at] + CYAN + row[at : at + key_cells] + RESET + row[at + key_cells :]
+    return row[:at] + theme.chrome + row[at : at + key_cells] + RESET + row[at + key_cells :]
 
 
 def options(pairs: Iterable[tuple[str, str]], width: int) -> list[str]:
@@ -215,8 +216,8 @@ class Overlay:
         if not self.asking:
             return []
         return [
-            YELLOW + pad(f"  {self.asking}", width) + RESET,
-            DIM + pad("  (y) yes · (n) no · (esc) no", width) + RESET,
+            theme.warn + pad(f"  {self.asking}", width) + RESET,
+            theme.faint + pad("  (y) yes · (n) no · (esc) no", width) + RESET,
         ]
 
     def ask(self, question: str) -> None:
@@ -406,7 +407,7 @@ class EditorOverlay(Overlay):
                 0, height - 1
             )
         if self.blocked:
-            return [YELLOW + pad(f"  {self.blocked}", width) + RESET] + [
+            return [theme.warn + pad(f"  {self.blocked}", width) + RESET] + [
                 " " * width
             ] * max(0, height - 1)
         return self.editor.render(
@@ -494,7 +495,7 @@ class PromptOverlay(Overlay):
     def render(self, width: int, height: int) -> list[str]:
         tail = list(self.question_rows(width))
         if self.hint:
-            tail = [DIM + pad(f"  {self.hint}", width) + RESET] + tail
+            tail = [theme.faint + pad(f"  {self.hint}", width) + RESET] + tail
         return framed(
             self.heading(),
             self.editor.render(width, max(1, height - 1 - len(tail)), focused=True),

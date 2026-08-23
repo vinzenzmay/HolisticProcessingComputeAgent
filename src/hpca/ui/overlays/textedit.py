@@ -13,7 +13,8 @@ changes, and no edits means no question.
 
 from __future__ import annotations
 
-from hpca.ui.ansi import DIM, RESET, pad
+from hpca.ui import theme
+from hpca.ui.ansi import RESET, pad
 from hpca.ui.overlays.base import EditorOverlay
 
 # What the three uses are called on the rule, and what the parent does with the
@@ -64,5 +65,5 @@ class TextEditOverlay(EditorOverlay):
 
     def body(self, width: int, height: int) -> list[str]:
         about = ABOUT.get(self.kind, "")
-        rows = [DIM + pad(f"  {about}", width) + RESET] if about else []
+        rows = [theme.faint + pad(f"  {about}", width) + RESET] if about else []
         return rows + super().body(width, max(1, height - len(rows)))

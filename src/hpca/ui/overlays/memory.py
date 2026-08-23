@@ -19,7 +19,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from hpca.ui.ansi import BOLD, DIM, RESET, pad
+from hpca.ui import theme
+from hpca.ui.ansi import BOLD, RESET, pad
 from hpca.ui.overlays.base import BACK_KEYS, Overlay, options
 from hpca.ui.overlays.rewind import quoted
 from hpca.ui.state import Proposal, ResolveMemory
@@ -67,7 +68,7 @@ class MemoryReviewOverlay(Overlay):
     def body(self, width: int, height: int) -> list[str]:
         proposal = self.current
         if proposal is None:
-            return [DIM + pad(f"  {NOTHING}", width) + RESET]
+            return [theme.faint + pad(f"  {NOTHING}", width) + RESET]
         # `scope` and `kind` are open strings on the wire (`protocol.Proposal`
         # mirrors `agent.conclude`), so they are shown rather than translated —
         # a kind this screen has never heard of still has to be readable.
@@ -79,7 +80,7 @@ class MemoryReviewOverlay(Overlay):
         kept = sum(self.verdicts)
         if self.verdicts:
             rows.append(
-                DIM
+                theme.faint
                 + pad(
                     f"      so far: {kept} kept, "
                     f"{len(self.verdicts) - kept} discarded",

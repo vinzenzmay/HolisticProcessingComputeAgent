@@ -34,19 +34,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from hpca.transcript import call_arguments
-from hpca.ui.ansi import (
-    BOLD,
-    CYAN,
-    DIM,
-    PULSE_PERIOD,
-    RED,
-    RESET,
-    YELLOW,
-    fold,
-    pad,
-    pulse,
-    rule,
-)
+from hpca.ui import theme
+from hpca.ui.ansi import BOLD, PULSE_PERIOD, RESET, fold, pad, pulse, rule
 from hpca.ui.editor import Editor
 
 # The two halves of the prompt. "ask" is the y/n question; "reason" keeps the
@@ -243,8 +232,8 @@ def prompt_rows(
     is how long one breath takes (`Display.decision_pulse_seconds`).
     """
     payload = decision.payload
-    accent = YELLOW if approval_kind(payload) == "execution" else RED
-    rows = [(BOLD + CYAN if focused else DIM, rule("decision", width))]
+    accent = theme.warn if approval_kind(payload) == "execution" else theme.danger
+    rows = [(BOLD + theme.chrome if focused else theme.faint, rule("decision", width))]
     title = (
         approval_title(payload)
         if decision.asking
@@ -259,10 +248,10 @@ def prompt_rows(
         # being decided on, and it has to be told apart from the sentence
         # above it at a glance.
         for line in _wrapped(script, width - 6, SCRIPT_LINES):
-            rows.append((DIM, f"  │ {line}"))
+            rows.append((theme.faint, f"  │ {line}"))
     asking = decision.asking
     hint = approval_hint(payload) if asking else approval_reason_hint()
-    style = pulse(now, period) if asking and now is not None else DIM
+    style = pulse(now, period) if asking and now is not None else theme.faint
     rows.append((style, f"  {hint}"))
     return rows
 
@@ -306,7 +295,7 @@ def render_decision(
         allowed = max(0, room - keep_head - keep_tail)
         if allowed and middle:
             middle = middle[: max(0, allowed - 1)] + [
-                (DIM, f"  {_more(len(middle) - max(0, allowed - 1))}")
+                (theme.faint, f"  {_more(len(middle) - max(0, allowed - 1))}")
             ]
         else:
             middle = []
@@ -318,5 +307,5 @@ def render_decision(
         body = decision.reason.render(max(4, width - 2), box, focused=focused)
         for index, line in enumerate(body):
             marker = "› " if index == 0 else "  "
-            out.append((YELLOW if focused else DIM) + marker + RESET + line)
+            out.append((theme.warn if focused else theme.faint) + marker + RESET + line)
     return out[:height]

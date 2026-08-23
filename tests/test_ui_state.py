@@ -10,17 +10,15 @@ from __future__ import annotations
 
 import re
 
-from hpca.ui.ansi import (
-    AMBER,
-    DIM,
-    RED,
-    RESET,
-    REVERSE,
-    WHITE,
-    cell_width,
-    pad,
+from hpca.ui import theme
+from hpca.ui.ansi import RESET, REVERSE, cell_width, pad
+from hpca.ui.rain import (
+    KATAKANA,
+    SPINNER_STEPS,
+    SPINNER_WIDTH,
+    spinner,
+    spinner_trail,
 )
-from hpca.ui.rain import KATAKANA, SPINNER_STEPS, SPINNER_TRAIL, SPINNER_WIDTH, spinner
 from hpca.ui.state import (
     ChatEntry,
     ChatPart,
@@ -55,10 +53,10 @@ class TestEntriesBecomeRows:
         # actually read in, and the reason neither is one of the muted ones
         # the rest of the UI signals with. The user's own lines are the few,
         # and they are what a scrollback is searched for.
-        assert entry_item(entry(1)).accent == AMBER
+        assert entry_item(entry(1)).accent == theme.user
 
     def test_and_the_agent_gets_a_colour_of_its_own(self):
-        assert entry_item(entry(1, "assistant", "hello")).accent == WHITE
+        assert entry_item(entry(1, "assistant", "hello")).accent == theme.agent
 
     def test_a_message_puts_its_words_under_a_label_of_its_own(self):
         # The head says who is speaking and nothing else, so that every line
@@ -91,14 +89,14 @@ class TestEntriesBecomeRows:
         assert item.body == ["first", "second"]
 
     def test_an_error_is_red(self):
-        assert entry_item(entry(1, "error", "it fell over")).accent == RED
+        assert entry_item(entry(1, "error", "it fell over")).accent == theme.danger
 
     def test_a_turn_is_grey_and_says_so_itself(self):
         # Not merely left uncoloured: an accentless row falls through to the
         # renderer's default, which dims the body and leaves the head at full
         # weight — so a closed turn shouted as loudly as a reply, and an
         # opened one was grey on its steps and bright on the line above them.
-        assert entry_item(ChatEntry(kind="thinking", seq=3, steps=4)).accent == DIM
+        assert entry_item(ChatEntry(kind="thinking", seq=3, steps=4)).accent == theme.faint
 
     def test_a_speaker_line_is_marked_as_a_label(self):
         # What gets it drawn bold. Carried as a flag rather than as an escape
@@ -405,9 +403,9 @@ class TestTheSpinner:
             assert cell_width(glyphs) == SPINNER_WIDTH
 
     def test_the_head_walks_out_and_back(self):
-        heads = [spinner(f)[1].index(SPINNER_TRAIL[0]) for f in range(6)]
+        heads = [spinner(f)[1].index(spinner_trail()[0]) for f in range(6)]
         assert heads == [0, 1, 2, 3, 2, 1]
-        assert spinner(6)[1].index(SPINNER_TRAIL[0]) == 0, "and round again"
+        assert spinner(6)[1].index(spinner_trail()[0]) == 0, "and round again"
 
     def test_the_trail_is_on_the_side_it_came_from(self):
         # Heading right at cell 2: the lit cells behind it are 1 and 0, and
@@ -416,18 +414,18 @@ class TestTheSpinner:
         # as the drop being pushed rather than as it moving.
         styles = spinner(2)[1]
         assert styles[3] == ""
-        assert [styles[1], styles[0]] == [SPINNER_TRAIL[1], SPINNER_TRAIL[2]]
+        assert [styles[1], styles[0]] == [spinner_trail()[1], spinner_trail()[2]]
         # And going the other way it is the mirror of that: heading left at
         # cell 2, the one lit cell behind it is 3 and cell 1 is dark.
         styles = spinner(4)[1]
         assert styles[1] == ""
-        assert styles[3] == SPINNER_TRAIL[1]
+        assert styles[3] == spinner_trail()[1]
 
     def test_it_fades_rather_than_stopping(self):
         # Distinct styles all the way down, or the "decay" is two shades and a
         # step: at the widest reach all four cells are lit and each is dimmer.
         styles = spinner(3)[1]
-        assert list(styles) == list(reversed(SPINNER_TRAIL))
+        assert list(styles) == list(reversed(spinner_trail()))
 
     def test_the_glyphs_churn(self):
         assert spinner(0)[0] != spinner(6)[0], "same position, new characters"
@@ -454,7 +452,7 @@ class TestThePaintedWorkingRow:
     def test_the_colours_go_on_over_the_padded_row(self):
         turn = Turn(working=True, activity="reading")
         painted = self.paint(turn, 0.0)
-        assert SPINNER_TRAIL[0] in painted
+        assert spinner_trail()[0] in painted
         assert re.sub(r"\x1b\[[0-9;]*m", "", painted) == pad(turn.line(0.0), 60)
 
     def test_and_close_back_into_the_style_the_row_is_drawn_in(self):
@@ -463,7 +461,7 @@ class TestThePaintedWorkingRow:
         turn = Turn(working=True, activity="reading")
         painted = self.paint(turn, 0.0, style=REVERSE)
         head, _, rest = painted.partition(RESET + REVERSE)
-        assert SPINNER_TRAIL[0] in head, "the trail was drawn"
+        assert spinner_trail()[0] in head, "the trail was drawn"
         assert rest.startswith(" reading"), "and the highlight taken up again"
 
     def test_a_row_too_narrow_to_have_kept_it_is_left_alone(self):

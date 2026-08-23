@@ -20,26 +20,18 @@ Two shapes cross the seam in each direction:
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from hpca.ui import rain
-from hpca.ui.ansi import (
-    AMBER,
-    DIM,
-    GREEN,
-    PULSE_PERIOD,
-    RED,
-    RESET,
-    WHITE,
-    YELLOW,
-)
+from hpca.ui import rain, theme
+from hpca.ui.ansi import PULSE_PERIOD, RESET
 from hpca.ui.approval import Decision
 from hpca.ui.editor import Editor
 from hpca.ui.meter import render_bar, severity
 from hpca.ui.pane import Fold, Item, Pane
 from hpca.ui.rain import FPS as RAIN_FPS
+from hpca.ui.theme import FLASH_HOLD
 
 # The kinds of chat entry that are the user's own words, and so the ones Enter
 # offers the rewind on. `queued` counts: it is a message the user wrote, drawn
@@ -115,6 +107,21 @@ class Display:
     # default stands in until `hello` lands, which is before there is a
     # decision on screen to pulse (`client._hello` is the first frame).
     decision_pulse_seconds: float = PULSE_PERIOD
+    # The colours, as colour *specs* rather than escape sequences — an xterm
+    # index or a hex triple, the way the settings file writes them. They are
+    # turned into sequences once, by `ui.theme.apply`, when this is adopted;
+    # holding them resolved here would put the same palette in two places and
+    # make "which one is on screen" a question with two answers.
+    #
+    # A mapping and not ten fields, because nothing in this module reads an
+    # individual colour: `RowUI.set_display` hands the whole thing to the theme
+    # and the theme is what the drawing code asks. Every key is optional, and
+    # one that is absent keeps the built-in — which is what lets a settings
+    # file name three colours and mean exactly that.
+    palette: Mapping[str, object] = field(default_factory=dict)
+    # How long the pane that just took focus is washed in `palette["flash"]`.
+    # Zero is off.
+    focus_flash_seconds: float = FLASH_HOLD
 
 
 # The mode line's copy, lifted from `tui/mode_bar.py` — the hint is the whole
@@ -129,7 +136,16 @@ MODE_HINTS = {
 # ctrl+m is carriage return in most terminals, so shift+tab is the binding
 # that always works (§5).
 MODE_SWITCH_HINT = "shift+tab to switch"
-MODE_COLOURS = {"manual": YELLOW, "auto": GREEN, "full-auto": RED}
+# Which palette role each mode is drawn in — the role's *name*, resolved when
+# the row is drawn. A table of finished escape sequences would be built at
+# import and go on being right about a palette the settings editor had already
+# replaced, which is the one thing `ui.theme` exists to prevent.
+MODE_ROLES = {"manual": "warn", "auto": "ok", "full-auto": "danger"}
+
+
+def mode_colour(mode: str) -> str:
+    """The colour `mode` is drawn in, or the quiet one if it is not a mode."""
+    return getattr(theme, MODE_ROLES.get(mode, "faint"))
 
 
 def mode_line(mode: str, *, hint: bool = True, switch: bool = True) -> str:
@@ -274,7 +290,7 @@ def entry_item(entry: ChatEntry, *, stamps: bool = True) -> Item:
             head=_label("you", entry.at, stamps),
             body=body,
             preview=said,
-            accent=AMBER,
+            accent=theme.user,
             label=True,
             **row,
         )
@@ -285,7 +301,7 @@ def entry_item(entry: ChatEntry, *, stamps: bool = True) -> Item:
             head=f"{_label('you', entry.at, stamps)} · queued",
             body=body,
             preview=said,
-            accent=DIM,
+            accent=theme.faint,
             label=True,
             **row,
         )
@@ -294,7 +310,7 @@ def entry_item(entry: ChatEntry, *, stamps: bool = True) -> Item:
             head=_label("error", entry.at, stamps),
             body=body,
             preview=said,
-            accent=RED,
+            accent=theme.danger,
             label=True,
             **row,
         )
@@ -317,12 +333,12 @@ def entry_item(entry: ChatEntry, *, stamps: bool = True) -> Item:
         return Item(
             head=f"{steps} steps" + (f" · {summary}" if summary else ""),
             folds=[part_fold(part) for part in entry.parts],
-            accent=DIM,
+            accent=theme.faint,
             **row,
         )
     if entry.kind in ("event", "recall"):
         mark = "↺" if entry.kind == "recall" else "·"
-        return Item(head=f"{mark} {said}", accent=DIM, **row)
+        return Item(head=f"{mark} {said}", accent=theme.faint, **row)
     # Anything else is drawn as the agent talking, including a kind this
     # renderer has never heard of: the text is what matters and dropping the
     # row would lose it.
@@ -330,7 +346,7 @@ def entry_item(entry: ChatEntry, *, stamps: bool = True) -> Item:
         head=_label("hpca", entry.at, stamps),
         body=body,
         preview=said,
-        accent=WHITE,
+        accent=theme.agent,
         label=True,
         **{**row, "kind": entry.kind or "assistant"},
     )

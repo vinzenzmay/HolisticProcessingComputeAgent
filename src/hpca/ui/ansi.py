@@ -37,49 +37,39 @@ RESET = f"{ESC}[0m"
 BOLD = f"{ESC}[1m"
 DIM = f"{ESC}[2m"
 REVERSE = f"{ESC}[7m"
-CYAN = f"{ESC}[38;5;44m"
-GREEN = f"{ESC}[38;5;71m"
-YELLOW = f"{ESC}[38;5;179m"
-RED = f"{ESC}[38;5;167m"
-BLUE = f"{ESC}[38;5;68m"
-# The two the conversation itself is drawn in, and the only colours chosen for
-# a *reading* job rather than a signalling one: everything above marks
-# something (a state, a rule, a warning), while these two carry paragraphs of
-# text that somebody is going to sit and read. So they are bright — where the
-# muted 179 the agent used to be drawn in read as grey against a dark
-# terminal, which is the one thing a wall of prose must not do.
+# The colours are not here any more. They are settings (`config.PaletteSettings`)
+# resolved by `ui.theme`, which is what lets a user build their own palette —
+# and they could not stay constants to do it: twenty-one modules said
+# `from hpca.ui.ansi import CYAN`, which binds the string at import, so a
+# palette that changes while the app runs has to be *looked up* when the row is
+# drawn. What is left in this module is the part that has no colour in it: the
+# attributes below, the width arithmetic, and `pad`.
 #
-# Which way round they go is a separate decision from how bright they are, and
-# it went the other way in the end: the amber marks the user's own words and
-# the near-white carries the agent's. The agent writes most of what is on the
-# screen, so the calmer colour is the one that has to hold a page of prose,
-# and the handful of lines the user typed are what a scrollback is searched
-# for — a conversation is scanned for one's own questions, not for the
-# answers, and the colour is what finds them.
-WHITE = f"{ESC}[38;5;255m"
-AMBER = f"{ESC}[38;5;215m"
+# The role names those constants became: CYAN is `theme.chrome`, GREEN is
+# `theme.ok`, YELLOW `theme.warn`, RED `theme.danger`, WHITE `theme.agent`,
+# AMBER `theme.user`, and the DIM attribute is `theme.faint` — a real grey, on
+# the argument that what DIM looked like was the terminal theme's opinion and
+# differed from one to the next on the same screen. BLUE is simply gone; it had
+# no call site at all.
 
 # ------------------------------------------------------------- the pulse
 
 # The one colour on the screen that is a function of the clock rather than of
-# what is on the row. The decision prompt's answer line breathes between WHITE
-# and CYAN, because a parked turn is a turn nobody is driving: the "!" in the
-# sidebar says a *background* session is waiting, and this says the session in
-# front of you is — a thing a static dim line failed to say, since it looks
-# exactly like the key hints under every other row.
+# what is on the row. The decision prompt's answer line breathes between the
+# colour prose is written in and the colour the chrome is, because a parked
+# turn is a turn nobody is driving: the "!" in the sidebar says a *background*
+# session is waiting, and this says the session in front of you is — a thing a
+# static dim line failed to say, since it looks exactly like the key hints
+# under every other row.
 #
 # The ramp is walked rather than the two ends being swapped, because a hard
 # switch between two colours is a blink, and a blinking line is read as broken
-# rather than as waiting. Seven steps is what the 256-colour palette actually
-# has between these two: the cube is 6x6x6, white-to-teal moves along one axis
-# of it, and asking for more steps than that only repeats colours. They are
-# interpolated in *level* space (the cube's 0-5 per channel) rather than in
-# RGB — the levels are unevenly spaced (0, 95, 135, 175, 215, 255), so
-# quantising an even RGB walk rounds the three channels at different points
-# and puts a grey step in the middle of a walk that should never leave the
-# cyans.
-PULSE_ENDS = ((5, 5, 5), (0, 4, 4))  # near-white, and the levels CYAN is
-PULSE_STEPS = 6
+# rather than as waiting. It is built by `ui.theme.ramp` now that both ends are
+# settings, and the care that used to be described here lives with it: an
+# index walk is interpolated in *level* space rather than in RGB, because the
+# cube's levels are unevenly spaced and quantising an even RGB walk rounds the
+# three channels at different points — which drops a grey step into the middle
+# of a walk that should never have left its hue.
 
 # How long one breath takes, and how often the frame it is on has to be drawn
 # again. The period is a setting now (`config.DisplaySettings`, arriving as
@@ -99,25 +89,6 @@ PULSE_PERIOD = 1.0
 PULSE_INTERVAL = 0.1
 
 
-def _pulse_ramp() -> tuple[str, ...]:
-    """The colours the answer line takes, palest first.
-
-    Built once at import: it is seven strings and it never depends on anything
-    the UI knows, so computing it per frame would be arithmetic in the
-    repaint's way for no answer that could ever differ.
-    """
-    start, end = PULSE_ENDS
-    ramp = [WHITE]
-    for step in range(PULSE_STEPS):
-        share = step / (PULSE_STEPS - 1)
-        r, g, b = (round(a + (z - a) * share) for a, z in zip(start, end))
-        ramp.append(f"{ESC}[38;5;{16 + 36 * r + 6 * g + b}m")
-    return tuple(ramp)
-
-
-PULSE_RAMP = _pulse_ramp()
-
-
 def pulse(now: float, period: float = PULSE_PERIOD) -> str:
     """The answer line's colour at this instant, and at no other.
 
@@ -135,10 +106,13 @@ def pulse(now: float, period: float = PULSE_PERIOD) -> str:
     thing an exception can do is take the frame down with the terminal in raw
     mode. Belt and braces, and the braces are the ones the user can read.
     """
+    from hpca.ui import theme  # deferred: `theme` imports this module
+
     if period <= 0:
         period = PULSE_PERIOD
+    ramp = theme.pulse
     phase = (math.sin(now * math.tau / period) + 1) / 2
-    return PULSE_RAMP[min(len(PULSE_RAMP) - 1, int(phase * len(PULSE_RAMP)))]
+    return ramp[min(len(ramp) - 1, int(phase * len(ramp)))]
 
 
 # Joiners ask for the glyph after them, so a slice must never end on one.
@@ -475,7 +449,7 @@ def footer_lines(
     pairs: list[tuple[str, str]],
     width: int,
     note: str = "",
-    style: str = YELLOW,
+    style: str = "",
     max_rows: int = 1,
 ) -> list[str]:
     """The ``key label`` pairs, keys bright and labels dim, over as many rows
@@ -497,9 +471,13 @@ def footer_lines(
     looks for one — under a stack of key rows is not where the eye would find
     it. Costing a row is the price of that, and only while a note is up.
     """
+    from hpca.ui import theme  # deferred: `theme` imports this module
+
     note = _footer_note(note, width)
+    style = style or theme.warn
     rows = footer_wrap(pairs, width, note, max_rows)
     at = len(rows) - 1 if note and len(rows) > 1 else 0
+    key_style, label_style = theme.chrome, theme.faint
     out: list[str] = []
     for index, row in enumerate(rows):
         head = f"{style}{note}{RESET}  " if note and index == at else ""
@@ -507,7 +485,7 @@ def footer_lines(
         styled: list[str] = []
         for key, label in row:
             used += cell_width(key) + 1 + cell_width(label) + (2 if styled else 0)
-            styled.append(f"{CYAN}{key}{RESET} {DIM}{label}{RESET}")
+            styled.append(f"{key_style}{key}{RESET} {label_style}{label}{RESET}")
         out.append(" " + head + "  ".join(styled) + " " * max(0, width - used))
     return out
 

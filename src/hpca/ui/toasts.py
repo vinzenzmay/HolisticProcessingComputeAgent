@@ -31,7 +31,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from hpca.ui.ansi import BOLD, DIM, RED, RESET, YELLOW, fold, pad, rule, safe
+from hpca.ui import theme
+from hpca.ui.ansi import BOLD, RESET, fold, pad, rule, safe
 from hpca.ui.state import Toast
 
 # How long one stays up when the core does not say. Longer for the ones the
@@ -39,7 +40,15 @@ from hpca.ui.state import Toast
 TIMEOUTS = {"information": 5.0, "warning": 8.0, "error": 10.0}
 
 # The severity colours, and the word on the rule.
-STYLES = {"information": DIM, "warning": YELLOW, "error": RED}
+# The palette role each severity is drawn in, by name — resolved when the
+# toast is drawn, not when this module is loaded, so a saved palette reaches
+# a toast that is already on screen.
+ROLES = {"information": "faint", "warning": "warn", "error": "danger"}
+
+
+def severity_style(severity: str) -> str:
+    """The colour a toast of `severity` is drawn in."""
+    return getattr(theme, ROLES.get(severity, "faint"))
 
 # At most three at once and at most eight rows between them: a toast covers the
 # top of the sessions column, and a stack that could cover the column entirely
@@ -86,7 +95,7 @@ def one(toast: Toast, width: int, height: int) -> list[str]:
     """One toast, at most ``height`` rows of exactly ``width`` cells."""
     if height < 1 or width < 4:
         return []
-    style = STYLES.get(toast.severity, DIM)
+    style = severity_style(toast.severity)
     out = [style + rule(toast.severity, width) + RESET]
     body = max(4, width - 4)
     room = height - 1
@@ -112,7 +121,7 @@ def one(toast: Toast, width: int, height: int) -> list[str]:
     for line in lines[: max(0, keep)]:
         out.append(style + pad("  " + line, width) + RESET)
     if clipped and len(out) < height + 1:
-        out.append(DIM + pad(f"  {CLIPPED}", width) + RESET)
+        out.append(theme.faint + pad(f"  {CLIPPED}", width) + RESET)
     return out[:height]
 
 

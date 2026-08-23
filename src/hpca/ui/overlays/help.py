@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from hpca.ui.ansi import BOLD, CYAN, DIM, RESET, pad, rule
+from hpca.ui import theme
+from hpca.ui.ansi import BOLD, RESET, pad, rule
 from hpca.ui.overlays.base import Overlay, keyed
 
 
@@ -111,7 +112,7 @@ class HelpOverlay(Overlay):
     def _body(self, width: int) -> list[str]:
         out = []
         for name, keys in self.SECTIONS:
-            out.append(DIM + pad(f"  {name}", width) + RESET)
+            out.append(theme.faint + pad(f"  {name}", width) + RESET)
             for key, label in keys:
                 out.append(keyed(f"      {key:<12}{label}", width))
             out.append(" " * width)
@@ -123,7 +124,7 @@ class HelpOverlay(Overlay):
         self.offset = max(0, min(self.offset, max(0, len(body) - rows)))
         more = len(body) > rows
         tail = f"{self.offset + rows}/{len(body)}" if more else ""
-        out = [BOLD + CYAN + rule("keys", width, tail) + RESET]
+        out = [BOLD + theme.chrome + rule("keys", width, tail) + RESET]
         out += body[self.offset : self.offset + rows]
         while len(out) < height:
             out.append(" " * width)
