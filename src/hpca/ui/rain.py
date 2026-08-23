@@ -252,6 +252,15 @@ def spinner(frame: int) -> tuple[str, tuple[str, ...]]:
     ``frame`` is a count, not a clock — `state.Turn` derives it from the same
     tick that decides when the row is next drawn, so the glyphs churn only on
     frames that were going to be painted anyway.
+
+    Every cell carries a glyph, including the ones ahead of the head that the
+    trail does not reach. That is not decoration: `Turn.paint` writes each lit
+    cell in its own colour, out of whatever style the row is being drawn in,
+    and on the cursor's own row that style is REVERSE — so a cell left blank
+    was a cell of the highlight's background showing through, and the head
+    dragged a grey notch across the row as it travelled. A glyph in the
+    faintest tier is the same "nothing is happening here" said in a way that
+    covers its cell.
     """
     step = frame % len(SPINNER_STEPS)
     head = SPINNER_STEPS[step]
@@ -261,14 +270,20 @@ def spinner(frame: int) -> tuple[str, tuple[str, ...]]:
     # drop has just arrived from the one place it can have come from.
     came_from = SPINNER_STEPS[step - 1]
     direction = 1 if head >= came_from else -1
-    glyphs = [" "] * SPINNER_WIDTH
-    styles = [""] * SPINNER_WIDTH
-    for depth, style in enumerate(spinner_trail()):
+    trail = spinner_trail()
+    # The dimmest tier the ramp has, for the cells the trail does not reach.
+    # The end of the ramp rather than a colour of its own, because "the field
+    # the drop moves through" is exactly what the far end of a trail already
+    # looks like — and a ramp of one is then four cells of one colour, which
+    # is the plain blinking spinner that ramp asked for, four wide.
+    unlit = trail[-1] if trail else ""
+    glyphs = [
+        KATAKANA[_mix(x * 0x27D4EB2D + frame * 0x165667B1) % len(KATAKANA)]
+        for x in range(SPINNER_WIDTH)
+    ]
+    styles = [unlit] * SPINNER_WIDTH
+    for depth, style in enumerate(trail):
         x = head - direction * depth
-        if not 0 <= x < SPINNER_WIDTH:
-            continue
-        glyphs[x] = KATAKANA[
-            _mix(x * 0x27D4EB2D + frame * 0x165667B1) % len(KATAKANA)
-        ]
-        styles[x] = style
+        if 0 <= x < SPINNER_WIDTH:
+            styles[x] = style
     return "".join(glyphs), tuple(styles)

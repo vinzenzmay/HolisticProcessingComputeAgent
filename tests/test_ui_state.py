@@ -409,17 +409,27 @@ class TestTheSpinner:
 
     def test_the_trail_is_on_the_side_it_came_from(self):
         # Heading right at cell 2: the lit cells behind it are 1 and 0, and
-        # the cell it is about to move into is dark. The other way round is
-        # what a trail drawn ahead of the head would look like, and it reads
-        # as the drop being pushed rather than as it moving.
+        # the cell it is about to move into is at the bottom of the ramp. The
+        # other way round is what a trail drawn ahead of the head would look
+        # like, and it reads as the drop being pushed rather than as it moving.
         styles = spinner(2)[1]
-        assert styles[3] == ""
+        assert styles[3] == spinner_trail()[-1]
         assert [styles[1], styles[0]] == [spinner_trail()[1], spinner_trail()[2]]
         # And going the other way it is the mirror of that: heading left at
-        # cell 2, the one lit cell behind it is 3 and cell 1 is dark.
+        # cell 2, the one lit cell behind it is 3 and cell 1 is unlit.
         styles = spinner(4)[1]
-        assert styles[1] == ""
+        assert styles[1] == spinner_trail()[-1]
         assert styles[3] == spinner_trail()[1]
+
+    def test_no_cell_is_ever_left_blank(self):
+        # A blank cell is the row's own background showing between the glyphs,
+        # and on the cursor's row that background is the REVERSE highlight —
+        # so the head dragged a grey notch along with it. Every cell carries a
+        # glyph and a style; the unreached ones are simply the dimmest.
+        for frame in range(len(SPINNER_STEPS) * 3):
+            glyphs, styles = spinner(frame)
+            assert " " not in glyphs
+            assert all(styles), "and every one of them is written in a colour"
 
     def test_it_fades_rather_than_stopping(self):
         # Distinct styles all the way down, or the "decay" is two shades and a
@@ -433,7 +443,7 @@ class TestTheSpinner:
     def test_and_are_never_digits(self):
         # The rain mixes them in for the flicker; four cells is not a field,
         # and a lone "7" on the working row is a number somebody tries to read.
-        seen = {ch for f in range(200) for ch in spinner(f)[0]} - {" "}
+        seen = {ch for f in range(200) for ch in spinner(f)[0]}
         assert seen <= set(KATAKANA)
 
 
