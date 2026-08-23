@@ -63,7 +63,7 @@ your skills (invoke a skill with `/<skill>`; see *Skills* below).
 
 * **Watches — pin a job or a log to the right column** — most of what runs on
   a cluster was not started by hpca: an sbatch script you submitted by hand, a
-  snakemake run spawning sniffles, the log that tool appends to. Ask the agent
+  pipeline run spawning sniffles, the log that tool appends to. Ask the agent
   to watch one ("keep an eye on the sniffles log", "watch job 27744534") and it
   gets a live box in the right column: a Slurm job's state, node and remaining
   time, refreshed from `squeue` (and from `sacct` once it leaves the queue), or

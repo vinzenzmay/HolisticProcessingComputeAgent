@@ -22,14 +22,14 @@ def struggle(text, **kwargs):
 class TestNoteLine:
     def test_keywords_line_stripped_and_provenance_shown(self):
         memory = struggle(
-            "Snakemake dry-runs fail here.\nkeywords: snakemake, dry-run",
+            "Sniffles dry-runs fail here.\nkeywords: sniffles, dry-run",
             created="2026-06-02",
             backend="qwen3-6b",
         )
         line = note_line(memory)
         assert line == (
             "Past struggle (2026-06-02, backend qwen3-6b): "
-            "Snakemake dry-runs fail here."
+            "Sniffles dry-runs fail here."
         )
 
     def test_without_metadata(self):

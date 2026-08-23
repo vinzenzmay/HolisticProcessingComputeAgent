@@ -1,9 +1,9 @@
 """Watch tools (§5.1): watch_log, watch_job, list_watches, unwatch.
 
 The user's own description of the problem these solve: an sbatch job submits a
-snakemake workflow, snakemake spawns sniffles, sniffles writes a log — and
-finding out whether any of that is still alive means squeue, then ssh to the
-node, then tail. The agent can already *find* the job and the log while working
+pipeline, the pipeline spawns sniffles, sniffles writes a log — and finding out
+whether any of that is still alive means squeue, then ssh to the node, then
+tail. The agent can already *find* the job and the log while working
 on the task; these tools let it pin what it found to the right column, where a
 glance answers the question from then on.
 

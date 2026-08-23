@@ -28,7 +28,6 @@ CREATE TABLE IF NOT EXISTS jobs (
     script_key TEXT,
     sbatch_stdout_path TEXT,
     sbatch_stderr_path TEXT,
-    snakemake_log_path TEXT,
     last_checked TEXT,
     exit_info TEXT
 );

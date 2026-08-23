@@ -40,10 +40,10 @@ class TestIndexing:
         profile = profile_with(
             ("Cluster is cubi.", SP),
             ("User prefers R.", SP),
-            ("Snakemake dry-runs fail with site profiles.", RAG),
+            ("Sniffles dry-runs fail with site profiles.", RAG),
         )
         assert index.reindex(profile) == 1
-        hits = index.search("snakemake", profile="default")
+        hits = index.search("sniffles", profile="default")
         assert len(hits) == 1
 
     def test_reindex_replaces_not_appends(self, index):
@@ -71,17 +71,17 @@ class TestIndexing:
 class TestSearch:
     def test_matches_any_term(self, index):
         index.reindex(
-            profile_with(("Snakemake dry-runs fail with site profiles.", RAG))
+            profile_with(("Sniffles dry-runs fail with site profiles.", RAG))
         )
-        assert index.search("my snakemake workflow broke", profile="default")
+        assert index.search("my sniffles workflow broke", profile="default")
 
     def test_no_match(self, index):
-        index.reindex(profile_with(("Snakemake dry-runs fail.", RAG)))
+        index.reindex(profile_with(("Sniffles dry-runs fail.", RAG)))
         assert index.search("kubernetes ingress", profile="default") == []
 
     def test_short_words_ignored(self, index):
         """Two-letter words would match nearly everything."""
-        index.reindex(profile_with(("Snakemake dry-runs fail.", RAG)))
+        index.reindex(profile_with(("Sniffles dry-runs fail.", RAG)))
         assert index.search("is it ok", profile="default") == []
 
     def test_limit_respected(self, index):
@@ -140,7 +140,7 @@ class TestBuiltinMemories:
         assert index.search("deepvariant joint genotyping", profile="default") == []
 
     def test_builtin_survives_profile_reindex(self, index):
-        index.reindex(profile_with(("Snakemake dry-runs fail.", 3)))
+        index.reindex(profile_with(("Sniffles dry-runs fail.", 3)))
         hits = index.search("copy paste clipboard terminal", profile="default")
         assert any("wl-clipboard" in h.text for h in hits)
 

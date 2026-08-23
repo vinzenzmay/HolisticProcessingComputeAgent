@@ -34,7 +34,6 @@ class JobRow:
     script_key: str
     sbatch_stdout_path: str
     sbatch_stderr_path: str
-    snakemake_log_path: str | None
     last_checked: str | None
     exit_info: str | None
 
@@ -70,12 +69,11 @@ class JobStore:
         script_key: str,
         stdout_path: str,
         stderr_path: str,
-        snakemake_log_path: str | None = None,
     ) -> JobRow:
         self._conn.execute(
             "INSERT INTO jobs (job_id, kind, session_id, profile, submit_time, "
-            "state, script_key, sbatch_stdout_path, sbatch_stderr_path, "
-            "snakemake_log_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "state, script_key, sbatch_stdout_path, sbatch_stderr_path) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 job_id,
                 kind,
@@ -86,7 +84,6 @@ class JobStore:
                 script_key,
                 stdout_path,
                 stderr_path,
-                snakemake_log_path,
             ),
         )
         self._conn.commit()

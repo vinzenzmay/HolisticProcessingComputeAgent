@@ -34,38 +34,10 @@
     A required tool or module is missing from the environment. Check
     spelling, load the right environment module / conda env in the script.
 
-- id: python_traceback
-  title: Python exception
-  patterns:
-    - 'Traceback \(most recent call last\)'
-  hint: >-
-    The Python script raised an exception; the last excerpt line names the
-    error type and message.
-
-- id: r_error
-  title: R error
-  patterns:
-    - "^Error in "
-    - "^Error: "
-    - "Execution halted"
-  hint: The R script failed; see the Error line in the excerpt.
-
-- id: snakemake_rule_failure
-  title: Snakemake rule failure
-  patterns:
-    - "Error in rule "
-    - "SnakemakeError"
-    - "WorkflowError"
-  hint: >-
-    A workflow rule failed; check the rule's own log file listed near
-    'Error in rule' for the underlying tool error.
-
 - id: missing_input
   title: Missing file
   patterns:
     - "No such file or directory"
-    - "MissingInputException"
-    - "FileNotFoundError"
   hint: >-
     An input path does not exist (or a filesystem was unavailable). Verify
     the path and any preceding step that should have produced it.

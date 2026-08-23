@@ -341,8 +341,6 @@ def triage_job(
     extra_logs: list[Path] | None = None,
 ) -> TriageReport:
     log_paths = [Path(job.sbatch_stdout_path), Path(job.sbatch_stderr_path)]
-    if job.snakemake_log_path:
-        log_paths.append(Path(job.snakemake_log_path))
     log_paths.extend(extra_logs or [])
 
     matches: list[SignatureMatch] = []

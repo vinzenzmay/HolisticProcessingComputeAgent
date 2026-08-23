@@ -1,19 +1,16 @@
 """Exact-match symbol table (§5.6.1) — no embeddings involved.
 
-Function/class signatures come from indexed Python source via ``ast``; CLI
-flags come from man-page OPTIONS sections. This is what the verification gate
-(§5.2) and ``lookup_symbol`` query: "does ``samtools view -e`` exist?" is an
-exact-match question.
+CLI flags come from man-page OPTIONS sections and ``--help`` output. This is
+what the verification gate (§5.2) and ``lookup_symbol`` query: "does
+``samtools view -e`` exist?" is an exact-match question.
 """
 
 from __future__ import annotations
 
-import ast
 import json
 import re
 import sqlite3
 from dataclasses import dataclass, field
-from pathlib import Path
 
 SECTION_RE = re.compile(r"^[A-Z][A-Z /-]+$")
 FLAG_ENTRY_RE = re.compile(r"^\s+(-{1,2}[A-Za-z0-9][\w.-]*)")
@@ -24,96 +21,13 @@ METAVAR_RE = re.compile(r"^[A-Z][A-Z0-9_|.\[\]]*$|^<[^>]+>$")
 @dataclass
 class Symbol:
     name: str
-    kind: str  # function | method | class | cli-flag | cli
+    kind: str  # cli-flag | cli
     parent: str = ""
     signature: str = ""
     params: list[str] = field(default_factory=list)
     source: str = ""
     lineno: int = 0
     doc: str = ""
-
-
-# ------------------------------------------------------------------- python
-
-
-def _render_signature(name: str, args: ast.arguments) -> tuple[str, list[str]]:
-    parts: list[str] = []
-    params: list[str] = []
-
-    positional = args.posonlyargs + args.args
-    defaults: list[ast.expr | None] = [None] * (
-        len(positional) - len(args.defaults)
-    ) + list(args.defaults)
-    for arg, default in zip(positional, defaults):
-        if arg.arg in ("self", "cls"):
-            continue
-        params.append(arg.arg)
-        parts.append(
-            arg.arg if default is None else f"{arg.arg}={ast.unparse(default)}"
-        )
-    if args.vararg:
-        parts.append(f"*{args.vararg.arg}")
-    elif args.kwonlyargs:
-        parts.append("*")
-    for arg, default in zip(args.kwonlyargs, args.kw_defaults):
-        params.append(arg.arg)
-        parts.append(
-            arg.arg if default is None else f"{arg.arg}={ast.unparse(default)}"
-        )
-    if args.kwarg:
-        parts.append(f"**{args.kwarg.arg}")
-    return f"{name}({', '.join(parts)})", params
-
-
-def _first_doc_line(node) -> str:
-    doc = ast.get_docstring(node)
-    return doc.splitlines()[0] if doc else ""
-
-
-def parse_python_module(text: str, *, module: str, source: str) -> list[Symbol]:
-    """Public functions, classes, and methods of one module; [] on bad syntax."""
-    try:
-        tree = ast.parse(text)
-    except SyntaxError:
-        return []
-    symbols: list[Symbol] = []
-
-    def add_function(node, kind: str, parent: str) -> None:
-        if node.name.startswith("_"):
-            return
-        signature, params = _render_signature(node.name, node.args)
-        symbols.append(
-            Symbol(
-                name=node.name,
-                kind=kind,
-                parent=parent,
-                signature=signature,
-                params=params,
-                source=source,
-                lineno=node.lineno,
-                doc=_first_doc_line(node),
-            )
-        )
-
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            add_function(node, "function", module)
-        elif isinstance(node, ast.ClassDef) and not node.name.startswith("_"):
-            symbols.append(
-                Symbol(
-                    name=node.name,
-                    kind="class",
-                    parent=module,
-                    signature=node.name,
-                    source=source,
-                    lineno=node.lineno,
-                    doc=_first_doc_line(node),
-                )
-            )
-            for item in node.body:
-                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    add_function(item, "method", f"{module}.{node.name}")
-    return symbols
 
 
 # ---------------------------------------------------------------- man pages
@@ -247,14 +161,6 @@ class SymbolIndex:
         ).fetchall()
         return [row["name"] for row in rows]
 
-    def kwargs_for(self, function_name: str) -> list[str] | None:
-        row = self._conn.execute(
-            "SELECT params FROM symbols WHERE name = ? "
-            "AND kind IN ('function', 'method') LIMIT 1",
-            (function_name,),
-        ).fetchone()
-        return json.loads(row["params"]) if row else None
-
     def has_command(self, command: str) -> bool:
         row = self._conn.execute(
             "SELECT 1 FROM symbols WHERE parent = ? AND kind = 'cli-flag' LIMIT 1",
@@ -281,21 +187,3 @@ class SymbolIndex:
             lineno=row["lineno"] or 0,
             doc=row["doc"] or "",
         )
-
-
-def index_python_source(index: SymbolIndex, root: Path) -> int:
-    """Index every parseable .py under root; returns files indexed."""
-    root = Path(root)
-    indexed = 0
-    for path in sorted(root.rglob("*.py")):
-        relative = path.relative_to(root.parent)
-        module = ".".join(relative.with_suffix("").parts)
-        source = str(path)
-        index.clear_source(source)
-        symbols = parse_python_module(
-            path.read_text(errors="replace"), module=module, source=source
-        )
-        if symbols:
-            index.add(symbols)
-            indexed += 1
-    return indexed

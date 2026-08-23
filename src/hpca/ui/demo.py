@@ -33,7 +33,7 @@ from hpca.ui.state import ProfileInfo, SkillInfo
 
 TASKS = [
     "annotate the cohort BAMs with sniffles",
-    "why did the snakemake run stall at merge_vcf",
+    "why did the pipeline stall at merge_vcf",
     "write the methods section for the SV paper",
     "check GPU utilisation on the last training job",
     "rebuild the reference index on scratch",

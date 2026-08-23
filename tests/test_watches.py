@@ -309,7 +309,7 @@ class TestLogPolling:
 
 
 SQUEUE_MIXED = """\
-27744534|RUNNING|node042|1-04:42:02|3-19:17:58|snakemake_pipeline|None
+27744534|RUNNING|node042|1-04:42:02|3-19:17:58|align_pipeline|None
 27744999|PENDING|(null)|0:00|5-00:00:00|sniffles_call|Resources
 """
 

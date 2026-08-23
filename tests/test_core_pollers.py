@@ -436,7 +436,7 @@ class TestWatchedJobs:
         self, conn, deps, recorder, session
     ):
         watch = WatchStore(conn).add(
-            kind=KIND_JOB, target="27744534", label="snakemake",
+            kind=KIND_JOB, target="27744534", label="sniffles",
             profile="default", session_id=session.session_id,
         )
         WatchStore(conn).update(watch.id, state="PENDING")
@@ -444,7 +444,7 @@ class TestWatchedJobs:
         deps.slurm = SlurmClient(run=FakeRun([(0, squeue, "")]))
         await pollers(deps, recorder).poll_watched_jobs()
 
-        assert any("snakemake: PENDING → RUNNING" in t for t in recorder.toasts)
+        assert any("sniffles: PENDING → RUNNING" in t for t in recorder.toasts)
         assert recorder.keys == ["w1"]
 
     async def test_a_settled_job_stops_costing_a_call(

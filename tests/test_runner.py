@@ -269,9 +269,9 @@ class TestScriptPathFor:
         assert script_path_for(f"bash {script}") == script
 
     def test_finds_it_past_arguments(self, tmp_path):
-        script = tmp_path / "run.py"
-        script.write_text("print(1)\n")
-        assert script_path_for(f"python3 {script} --threads 8") == script
+        script = tmp_path / "run.sh"
+        script.write_text("echo 1\n")
+        assert script_path_for(f"bash {script} --threads 8") == script
 
     def test_ignores_a_missing_file(self, tmp_path):
         assert script_path_for(f"bash {tmp_path / 'gone.sh'}") is None

@@ -197,7 +197,7 @@ TUI; the agent still has one.
 **Watches (right column, "Watchers").** What hpca started is only a slice of
 what runs on a cluster, and it is a slice already in the chat log — so the
 column's job is somebody *else's* work: an sbatch script submitted by hand, a
-snakemake run spawning tool after tool, the log some long-running tool appends
+pipeline run spawning tool after tool, the log some long-running tool appends
 to. Finding out whether any of that is alive otherwise means `squeue`, then ssh
 to the node, then `tail`. The agent pins one to the column instead:
 
@@ -764,8 +764,8 @@ skill without the user reading it — the same rule as memory (§6).
 
 Core tools:
 
-* `create_script(kind: bash|python|R|snakemake, name, content)` — writes the
-  script, immediately syntax-checks it (§5.2), registers the path.
+* `create_script(name, content)` — writes the bash script, immediately
+  syntax-checks it (§5.2), registers the path.
 * `run_bash(timeout_s, content_lines)` — runs *and blocks*, returning captured
   output as the tool result. Writes a throwaway script, `bash -n`-checks it, and
   runs it through the same tracked runner (it is not a free-form shell — see
@@ -794,8 +794,6 @@ Core tools:
   separate tool rather than a flag.
 * `submit_job(name, args)` — submits an sbatch script to the cluster,
   records the job ID and log paths in the job DB (§5.4), starts periodic tracking.
-  *(The design imagined a `kind: sbatch|snakemake` switch; only the sbatch path is
-  implemented — a snakemake-cluster submission tool does not exist yet.)*
 * `job_status(job_id)` / `get_job_report(job_id)` — structured status / triaged
   failure report (§5.5).
 * `cancel_job(job_id)` — HITL-gated.
@@ -848,9 +846,6 @@ execution, using native mechanisms — no LLM involved:
 | Artifact | Check |
 |---|---|
 | bash script | `bash -n` |
-| Python script | `python -m py_compile` |
-| R script | `Rscript -e 'parse(file="...")'` |
-| snakemake workflow | `snakemake -n` (dry run) |
 | sbatch submission | `sbatch --test-only` |
 
 Missing checker binaries are reported as `skipped`, never a hard failure. Failures
@@ -882,13 +877,10 @@ against the indexed documentation and source (§5.6):
    found wrong and replaced by the denylist + own-scripts rule, though the safety
    intent — never run the agent's own scripts early — is preserved.)* Man pages are
    still read for refused commands, since fetching one never runs anything.
-1. **Deterministic extraction** of used APIs: Python via `ast` (imports, calls,
-   keyword names), and bash via command tokenization (command + flags). Wrapper
-   prefixes (`conda run -n env …`, `time`, `nohup`) are unwrapped and absolute
-   paths reduced to their basename, so flags are attributed to the program that
-   owns them rather than to the wrapper. *(R and snakemake `shell:` extraction were
-   designed but are not yet implemented — the extractor returns nothing for them,
-   so those scripts pass the semantic gate on syntax alone.)*
+1. **Deterministic extraction** of used APIs: bash command tokenization
+   (command + flags). Wrapper prefixes (`conda run -n env …`, `time`, `nohup`)
+   are unwrapped and absolute paths reduced to their basename, so flags are
+   attributed to the program that owns them rather than to the wrapper.
 2. **Exact lookup, not embeddings:** extracted symbols are checked against the
    symbol table (§5.6) — CLI flags against the learned flag set, functions and
    kwargs against indexed signatures. Flag matching allows attached values and
@@ -965,7 +957,7 @@ Tables (minimum):
 ```
 jobs(job_id PK, kind, session_id, profile, submit_time, state,
      script_key, sbatch_stdout_path, sbatch_stderr_path,
-     snakemake_log_path, last_checked, exit_info)
+     last_checked, exit_info)
 job_logs(job_id FK, rule_or_step, log_path, tool_name)
 sessions(session_id PK, profile, title, created_at, checkpoint_ref)
 processes(pid, session_id, cmd, state, stdout_path, stderr_path, started_at,
@@ -1006,14 +998,12 @@ per turn and no single instance knows about processes an earlier one started.
 The model must never see raw `squeue`/`sacct` dumps or multi-MB logs. A triage
 pipeline turns "job 48812 failed" into a compact structured report:
 
-1. From the job DB, collect *all* related logs (slurm stdout/stderr, snakemake main
-   log, per-rule logs, tool logs).
+1. From the job DB, collect *all* related logs (slurm stdout/stderr, tool logs).
 2. Parse `sacct` fields (State, ExitCode, Elapsed, MaxRSS, ReqMem, Timelimit) into
    JSON.
 3. Scan logs (tail-first) against a **signature library** of known error patterns:
    OOM-kill (`oom-kill`, `Out Of Memory`), `DUE TO TIME LIMIT`, command not found,
-   Python tracebacks, R errors (`Error in …`), snakemake rule failures
-   (`Error in rule …`), missing input files, permission denied, quota exceeded, …
+   missing input files, permission denied, quota exceeded, …
    The signature library is a data file (`error_signatures.yaml`) and
    user-extensible.
 4. Extract the ~30 most relevant lines per matched signature.
@@ -1248,5 +1238,3 @@ local-script assistant before any Slurm integration exists.
   hop required? (Decides the job-runner implementation, §2.)
 * Which exact model(s) will be served first, and does the serving stack support
   JSON-schema-constrained decoding? (Decides how much retry middleware is exercised.)
-* Snakemake profiles/executors in use on the cluster (affects `snakemake -n`
-  invocation and log locations).
