@@ -1,15 +1,16 @@
 """Semantic verification gate: code vs indexed docs (§5.2).
 
 Syntax checks miss the small model's dominant failure mode — plausible but
-wrong API usage (invented CLI flags). This gate extracts used commands
-deterministically (tokenization, no LLM) and checks them against the symbol
-table. Mechanical mismatches block with an actionable
+wrong API usage (invented CLI flags, misspelled kwargs). This gate extracts
+used APIs deterministically (ast / tokenization, no LLM) and checks them
+against the symbol table. Mechanical mismatches block with an actionable
 message; ``not_indexed`` is a warning, never a block — index coverage is
 always partial (§5.2.4).
 """
 
 from __future__ import annotations
 
+import ast
 import shlex
 from dataclasses import dataclass
 
@@ -22,6 +23,7 @@ BASH_KEYWORDS = {
     "cd", "read", "[", "[[", "{", "}", "!",
 }
 SEGMENT_SEPARATORS = {"|", "||", "&&", ";", "&"}
+PYTHON_BUILTINS = frozenset(dir(__builtins__)) | {"print", "range", "len"}
 
 # Wrappers that run *another* program; the flags after them belong to that
 # program, not the wrapper. ENVIRONMENT_TOOL_GUIDANCE actively tells the agent
@@ -136,11 +138,35 @@ def _parse_segment(tokens: list[str]) -> BashUsage | None:
     return (command, subcommands, flags)
 
 
+PythonCall = tuple[str, list[str]]  # function name, kwarg names
+
+
+def extract_python(content: str) -> list[PythonCall]:
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return []
+    calls: list[PythonCall] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                name = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                name = node.func.attr
+            else:
+                continue
+            kwargs = [kw.arg for kw in node.keywords if kw.arg]
+            calls.append((name, kwargs))
+    return calls
+
+
 # --------------------------------------------------------------------- gate
 
 
-def verify_script(content: str, *, index: SymbolIndex) -> list[SymbolReport]:
-    return _verify_bash(content, index)
+def verify_script(kind: str, content: str, *, index: SymbolIndex) -> list[SymbolReport]:
+    if kind == "bash":
+        return _verify_bash(content, index)
+    return _verify_python(content, index)
 
 
 def _flag_matches(flag: str, known: set[str]) -> bool:
@@ -203,7 +229,44 @@ def _verify_bash(content: str, index: SymbolIndex) -> list[SymbolReport]:
     return reports
 
 
-def commands_needing_docs(content: str, *, index: SymbolIndex) -> list[tuple[str, str]]:
+def _verify_python(content: str, index: SymbolIndex) -> list[SymbolReport]:
+    reports: list[SymbolReport] = []
+    for name, kwargs in extract_python(content):
+        if not kwargs:
+            continue  # nothing checkable; stay quiet on print(x) etc.
+        params = index.kwargs_for(name)
+        if params is None:
+            if name not in PYTHON_BUILTINS:
+                reports.append(
+                    SymbolReport(
+                        symbol=f"{name}(...)",
+                        status="not_indexed",
+                        detail="function not in the symbol index; kwargs unchecked",
+                    )
+                )
+            continue
+        unknown = [kw for kw in kwargs if kw not in params]
+        if unknown:
+            signature = index.lookup(name)
+            rendered = signature[0].signature if signature else ", ".join(params)
+            reports.append(
+                SymbolReport(
+                    symbol=f"{name}(...)",
+                    status="mismatch",
+                    detail=(
+                        f"unknown keyword argument(s) {', '.join(unknown)}; "
+                        f"indexed signature is {rendered}"
+                    ),
+                )
+            )
+        else:
+            reports.append(SymbolReport(symbol=f"{name}(...)", status="confirmed"))
+    return reports
+
+
+def commands_needing_docs(
+    kind: str, content: str, *, index: SymbolIndex
+) -> list[tuple[str, str]]:
     """Commands used with flags that the index cannot check yet.
 
     Feeds the on-demand indexing step in ``create_script``: an unindexed
@@ -212,6 +275,8 @@ def commands_needing_docs(content: str, *, index: SymbolIndex) -> list[tuple[str
     written in the script — possibly an absolute path — so the caller can run
     it to fetch help text. Deduplicated by command name.
     """
+    if kind != "bash":
+        return []
     seen: set[str] = set()
     pending: list[tuple[str, str]] = []
     for executable, subcommands, flags in extract_bash(content):

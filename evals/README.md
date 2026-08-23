@@ -8,7 +8,7 @@ results, and the quick "baseline ref vs working tree" recipe live in
 `edit_eval.py` runs file-editing tasks in two tiers — `--tier core` (default;
 12 everyday tasks: one-line replacement, mid-file edits in a ~300-line file,
 CRLF, unicode context, append idiom, multi-line block, duplicated-block
-disambiguation, nested indentation, line deletion, create_file, config value,
+disambiguation, Python indentation, line deletion, create_file, config value,
 planted trailing-space trap), `--tier hard` (shapes the old tooling
 structurally mishandled: an edit deep in a 700-line file, byte-preserved CRLF,
 a typographic-quote line), or `--tier all` — against the live LLM

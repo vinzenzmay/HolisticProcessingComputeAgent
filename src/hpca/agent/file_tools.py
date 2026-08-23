@@ -16,8 +16,8 @@ and they split "new file" from "change a file" rather than overlapping.
 ``edit_file`` exists for the cost: without it the only way to change a
 400-line script is to re-send all 400 lines through ``create_script``, paying
 for the file twice in one window. ``create_file`` exists because prose had no
-tool at all — ``create_script`` writes only into the scripts dir under the
-bash suffix — so a specs.md had to go through a ``cat << 'EOF'`` heredoc
+tool at all — ``create_script`` writes only into the scripts dir under a
+language suffix — so a specs.md had to go through a ``cat << 'EOF'`` heredoc
 in run_bash.
 
 Both are held to the same rules as everything else that writes: a script's
@@ -394,8 +394,7 @@ _FUZZY_TRANSLATE = str.maketrans(
 
 def _fuzzy_line(line: str) -> str:
     """A line as fuzzy matching sees it. Leading whitespace survives on
-    purpose: indentation is meaning (nested config, heredocs), trailing
-    whitespace never is."""
+    purpose: indentation is meaning (Python), trailing whitespace never is."""
     return (
         unicodedata.normalize("NFKC", line).translate(_FUZZY_TRANSLATE).rstrip()
     )
@@ -562,7 +561,7 @@ async def edit_file(args: EditFileParams, ctx: ToolContext) -> str:
     on a scratch copy, so a refused edit leaves the real file untouched rather
     than briefly broken.
     """
-    from hpca.agent.builtin_tools import check_script_content, is_script_suffix
+    from hpca.agent.builtin_tools import KIND_BY_SUFFIX, check_script_content
 
     try:
         path = _existing(args.path, ctx)
@@ -628,15 +627,16 @@ async def edit_file(args: EditFileParams, ctx: ToolContext) -> str:
         )
 
     warnings: list[str] = []
-    if is_script_suffix(path.suffix):
-        # §5.2 on a scratch copy: the checker reads a file, and the real one
+    kind = KIND_BY_SUFFIX.get(path.suffix)
+    if kind is not None:
+        # §5.2 on a scratch copy: the checkers read a file, and the real one
         # must not spend even a moment holding content the gate would refuse.
         ctx.scripts_dir.mkdir(parents=True, exist_ok=True)
         scratch = ctx.scripts_dir / f"edit_{time.time_ns()}{path.suffix}"
         scratch.write_text(edited)
         try:
             refused, warnings = await check_script_content(
-                scratch, edited, ctx, refusal="NOT edited"
+                kind, scratch, edited, ctx, refusal="NOT edited"
             )
         finally:
             scratch.unlink(missing_ok=True)
@@ -699,7 +699,7 @@ async def create_file(args: CreateFileParams, ctx: ToolContext) -> str:
     """Write a new text file.
 
     The gap this fills is prose. ``create_script`` writes only into the scripts
-    dir under the bash suffix, and ``edit_file`` needs a file to already
+    dir under a language suffix, and ``edit_file`` needs a file to already
     exist, so the one way to author a specs.md was a ``cat << 'EOF'`` heredoc
     through run_bash — a hundred lines of documentation squeezed through bash
     quoting, where a single stray line costs the whole file (that is exactly
@@ -710,7 +710,7 @@ async def create_file(args: CreateFileParams, ctx: ToolContext) -> str:
     §5.3 to gate, so writing a document does not stop for approval — and keeps
     "change a file" as one tool rather than two ways in.
     """
-    from hpca.agent.builtin_tools import check_script_content, is_script_suffix
+    from hpca.agent.builtin_tools import KIND_BY_SUFFIX, check_script_content
 
     try:
         path = _target(args.path, ctx)
@@ -752,7 +752,8 @@ async def create_file(args: CreateFileParams, ctx: ToolContext) -> str:
     content = "\n".join(content_lines) + "\n"
 
     warnings: list[str] = []
-    if is_script_suffix(path.suffix):
+    kind = KIND_BY_SUFFIX.get(path.suffix)
+    if kind is not None:
         # §5.2 on a scratch copy, as edit_file does: a second way to put
         # content into a script file must not be a second way around the gate,
         # and a refused file must never have existed at the real path.
@@ -761,7 +762,7 @@ async def create_file(args: CreateFileParams, ctx: ToolContext) -> str:
         scratch.write_text(content)
         try:
             refused, warnings = await check_script_content(
-                scratch, content, ctx, refusal="NOT created"
+                kind, scratch, content, ctx, refusal="NOT created"
             )
         finally:
             scratch.unlink(missing_ok=True)

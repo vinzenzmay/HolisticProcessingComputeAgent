@@ -764,8 +764,8 @@ skill without the user reading it — the same rule as memory (§6).
 
 Core tools:
 
-* `create_script(name, content)` — writes the bash script, immediately
-  syntax-checks it (§5.2), registers the path.
+* `create_script(kind: bash|python, name, content)` — writes the script,
+  immediately syntax-checks it (§5.2), registers the path.
 * `run_bash(timeout_s, content_lines)` — runs *and blocks*, returning captured
   output as the tool result. Writes a throwaway script, `bash -n`-checks it, and
   runs it through the same tracked runner (it is not a free-form shell — see
@@ -846,6 +846,7 @@ execution, using native mechanisms — no LLM involved:
 | Artifact | Check |
 |---|---|
 | bash script | `bash -n` |
+| Python script | `python -m py_compile` |
 | sbatch submission | `sbatch --test-only` |
 
 Missing checker binaries are reported as `skipped`, never a hard failure. Failures
@@ -877,10 +878,11 @@ against the indexed documentation and source (§5.6):
    found wrong and replaced by the denylist + own-scripts rule, though the safety
    intent — never run the agent's own scripts early — is preserved.)* Man pages are
    still read for refused commands, since fetching one never runs anything.
-1. **Deterministic extraction** of used APIs: bash command tokenization
-   (command + flags). Wrapper prefixes (`conda run -n env …`, `time`, `nohup`)
-   are unwrapped and absolute paths reduced to their basename, so flags are
-   attributed to the program that owns them rather than to the wrapper.
+1. **Deterministic extraction** of used APIs: Python via `ast` (imports, calls,
+   keyword names), and bash via command tokenization (command + flags). Wrapper
+   prefixes (`conda run -n env …`, `time`, `nohup`) are unwrapped and absolute
+   paths reduced to their basename, so flags are attributed to the program that
+   owns them rather than to the wrapper.
 2. **Exact lookup, not embeddings:** extracted symbols are checked against the
    symbol table (§5.6) — CLI flags against the learned flag set, functions and
    kwargs against indexed signatures. Flag matching allows attached values and
@@ -1003,7 +1005,7 @@ pipeline turns "job 48812 failed" into a compact structured report:
    JSON.
 3. Scan logs (tail-first) against a **signature library** of known error patterns:
    OOM-kill (`oom-kill`, `Out Of Memory`), `DUE TO TIME LIMIT`, command not found,
-   missing input files, permission denied, quota exceeded, …
+   Python tracebacks, missing input files, permission denied, quota exceeded, …
    The signature library is a data file (`error_signatures.yaml`) and
    user-extensible.
 4. Extract the ~30 most relevant lines per matched signature.
