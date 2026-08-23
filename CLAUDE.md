@@ -59,6 +59,21 @@ The focus flash (`display.focus_flash_seconds`, 0 turns it off) is the only
 background colour this UI draws; the `REVERSE` cursor row opts out of it, since
 reverse would turn the tint into the text colour.
 
+## Where the app dir is
+
+`config.app_dir()` is the one answer, and it is computed rather than constant:
+`$HPCA_HOME` if set (what the whole suite and `evals/smoke_pty.py` run behind),
+else `~/work/.HolisticProcessingComputeAgent` when `~/work` is a directory, else
+`~/.HolisticProcessingComputeAgent` — with an app dir that *already exists*
+beating the rule, so a `~/work` appearing does not strand a user's databases.
+Then one hop: that directory's settings.json may name an `app_dir`, which wins.
+
+Consequences for tests: the rule reads the real filesystem, so a test that does
+not set `$HPCA_HOME` and does not fake `$HOME` will resolve against the machine
+it runs on. `Settings.app_dir` is a modelled field on purpose — `save()` writes
+the whole model back, so an unmodelled key would be erased by the next save
+from the config editor.
+
 ## Where the databases are
 
 `hpca.db`, `checkpoints.db` and `rag.db` are *kept* in the app dir, but while
