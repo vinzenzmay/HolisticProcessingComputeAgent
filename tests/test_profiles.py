@@ -355,7 +355,7 @@ class TestDuplication:
     def test_editing_a_copied_memory_does_not_touch_the_original(self, hpca_home):
         self.base()
         copy = Profile.duplicate("base", "variants")
-        copy.memories[1].text = "The user prefers minimap2 now."
+        copy.memories[1].text = "The user prefers Python now."
         copy.save()
         assert Profile.load("base").memories[1].text == "The user prefers R."
 

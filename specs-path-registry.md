@@ -89,7 +89,7 @@ needs no `new_name` argument — the old interface had no way to express one
 without it.
 
 **One handle was never a path and stays: a script's name.** It is the file's own
-name in `ctx.scripts_dir`, so `create_script(name=…)` writes `<name>.sh`
+name in `ctx.scripts_dir`, so `create_script(name=…)` writes `<name>.<suffix>`
 there, `{name}` in a run_bash line expands to it, and `start_background_script` /
 `submit_job` take it. All of that resolves by looking in the directory
 (`script_path`), so naming survived without a table.

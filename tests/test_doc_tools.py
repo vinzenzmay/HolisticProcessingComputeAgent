@@ -110,6 +110,16 @@ class TestReadSource:
 
 
 class TestIndexDocs:
+    async def test_python_source(self, tools, ctx, tmp_path):
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "mod.py").write_text("def fn(a, b=2):\n    pass\n")
+        result = await call(
+            tools, "index_docs", ctx, what="python_source", target="pkg"
+        )
+        assert "1 Python files" in result
+        assert ctx.symbols.kwargs_for("fn") == ["a", "b"]
+
     async def test_manpages_via_fake_fetch(self, tools, ctx, monkeypatch):
         async def fake_fetch(name):
             return MAN_PAGE if name == "samtools-view" else None

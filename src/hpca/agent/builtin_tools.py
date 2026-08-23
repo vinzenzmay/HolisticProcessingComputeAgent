@@ -29,9 +29,10 @@ model to act on.
 from __future__ import annotations
 
 import re
+import sys
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -43,7 +44,11 @@ from hpca.checks import syntax_check
 from hpca.paths import PathError, resolve_path
 from hpca.verify_code import format_gate_failure, format_gate_warnings, verify_script
 
-SCRIPT_SUFFIX = ".sh"  # scripts are bash, and only bash
+SCRIPT_SUFFIX = {"bash": ".sh", "python": ".py"}
+# Which checker a file on disk answers to, read off its suffix — how edit_file
+# decides whether the content it is about to write is a script §5.2 must gate.
+# Anything else (.txt, .yaml, .csv) has no checker and is left to itself.
+KIND_BY_SUFFIX = {suffix: kind for kind, suffix in SCRIPT_SUFFIX.items()}
 RUN_TIMEOUT_DEFAULT = 60
 RUN_TIMEOUT_MAX = 600
 RUN_OUTPUT_LINES = 60  # per stream, before the model is pointed at the log
@@ -57,7 +62,7 @@ RUN_OUTPUT_CHARS = 4000
 # 2000 characters is several times the longest genuine look-around (twenty
 # bounded finds is ~1200) and far below any document.
 RUN_SCRIPT_MAX_CHARS = 2000
-INTERPRETER = ["bash"]
+INTERPRETER = {".sh": ["bash"], ".py": [sys.executable]}
 KEY_CHARS = r"[a-z0-9_.-]+"
 KEY_PATTERN = rf"^{KEY_CHARS}$"
 
@@ -72,15 +77,8 @@ _KEY_REF = re.compile(rf"(?<![$\\]){{({KEY_CHARS})}}")
 MAX_KEYS_IN_NOTE = 30
 
 
-def is_script_suffix(suffix: str) -> bool:
-    """Whether a file on disk answers to the syntax checker, read off its
-    suffix — how edit_file and create_file decide whether the content they are
-    about to write is a script §5.2 must gate. Anything else (.txt, .yaml,
-    .csv) has no checker and is left to itself."""
-    return suffix == SCRIPT_SUFFIX
-
-
 class CreateScriptParams(BaseModel):
+    kind: Literal["bash", "python"] = Field(description="Script language")
     name: str = Field(
         pattern=KEY_PATTERN, description="Name for the script, without a suffix"
     )
@@ -96,14 +94,17 @@ def script_path(name: str, ctx: object) -> Path | None:
     """The kept script called ``name``, or None.
 
     A script's name IS its file name in the scripts dir, so there is nothing to
-    look up: the name plus the one suffix is the path. That is the whole of what
-    the registry did for scripts, minus the table.
+    look up: the two suffixes are tried in turn. That is the whole of what the
+    registry did for scripts, minus the table.
     """
     scripts_dir = getattr(ctx, "scripts_dir", None)
     if scripts_dir is None:
         return None
-    candidate = Path(scripts_dir) / f"{name}{SCRIPT_SUFFIX}"
-    return candidate if candidate.is_file() else None
+    for suffix in SCRIPT_SUFFIX.values():
+        candidate = Path(scripts_dir) / f"{name}{suffix}"
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def script_names(ctx: object) -> list[str]:
@@ -111,11 +112,12 @@ def script_names(ctx: object) -> list[str]:
     scripts_dir = getattr(ctx, "scripts_dir", None)
     if scripts_dir is None or not Path(scripts_dir).is_dir():
         return []
+    suffixes = set(SCRIPT_SUFFIX.values())
     return sorted(
         {
             entry.stem
             for entry in Path(scripts_dir).iterdir()
-            if entry.suffix == SCRIPT_SUFFIX and not entry.stem.startswith("bash_")
+            if entry.suffix in suffixes and not entry.stem.startswith("bash_")
         }
     )
 
@@ -178,7 +180,7 @@ def _strict_bash(lines: list[str]) -> list[str]:
 
 
 async def check_script_content(
-    path: Path, content: str, ctx: ToolContext, *, refusal: str
+    kind: str, path: Path, content: str, ctx: ToolContext, *, refusal: str
 ) -> tuple[str, list[str]]:
     """§5.2's mandatory gate on one script's content: the syntax check first,
     then the semantic code-vs-docs check against the indexed symbols.
@@ -193,7 +195,7 @@ async def check_script_content(
     *mandatory*: a second way to put content into a script file would be a
     second way around it.
     """
-    check = await syntax_check(path)
+    check = await syntax_check(kind, path)
     if not check.ok:
         return (
             f"{refusal}: {check.checker} found syntax errors — fix them and "
@@ -209,10 +211,10 @@ async def check_script_content(
         # index_docs is explicit-only and nothing ever calls it (§5.2, §5.6).
         from hpca.agent.doc_tools import autoindex_script_commands
 
-        await autoindex_script_commands(content, ctx)
+        await autoindex_script_commands(kind, content, ctx)
     if ctx.symbols is not None and ctx.symbols.count() > 0:
         # semantic code-vs-docs gate (§5.2): mismatches block, gaps only warn
-        reports = verify_script(content, index=ctx.symbols)
+        reports = verify_script(kind, content, index=ctx.symbols)
         mismatches = [r for r in reports if r.status == "mismatch"]
         if mismatches:
             return format_gate_failure(mismatches, refusal=refusal), []
@@ -224,7 +226,7 @@ async def check_script_content(
 
 async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
     ctx.scripts_dir.mkdir(parents=True, exist_ok=True)
-    path = ctx.scripts_dir / f"{args.name}{SCRIPT_SUFFIX}"
+    path = ctx.scripts_dir / f"{args.name}{SCRIPT_SUFFIX[args.kind]}"
     # Fail before writing anything, so a late refusal cannot leave a half-made
     # script behind. A name is free exactly when no kept script answers to it —
     # which now needs no table to decide, only the directory.
@@ -263,22 +265,23 @@ async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
             "Script NOT created: the whole script is a single shebang line, so "
             f"it would do nothing. {hints.SCRIPT_SHEBANG_ONLY}"
         )
-    # execution scripts fail loudly; run_bash (exploration) stays lenient
-    lines = _strict_bash(lines)
+    if args.kind == "bash":
+        # execution scripts fail loudly; run_bash (exploration) stays lenient
+        lines = _strict_bash(lines)
     content = "\n".join(lines) + "\n"
     path.write_text(content)
     refused, warnings = await check_script_content(
-        path, content, ctx, refusal="Script NOT created"
+        args.kind, path, content, ctx, refusal="Script NOT created"
     )
     if refused:
         path.unlink(missing_ok=True)  # never keep a script that failed the gate
         return refused
     note = f" ({'; '.join(warnings)})" if warnings else ""
+    strict = f" {hints.BASH_STRICT_MODE}" if args.kind == "bash" else ""
     return (
-        f"Created script {args.name!r} at {path}; "
+        f"Created script {args.name!r} at {path} ({args.kind}); "
         f"syntax check ok{note}. Start it with start_background_script, or run "
-        f"it now with run_bash: {{{args.name}}} expands to its path. "
-        f"{hints.BASH_STRICT_MODE}"
+        f"it now with run_bash: {{{args.name}}} expands to its path.{strict}"
     )
 
 
@@ -371,6 +374,11 @@ async def start_background_script(
             f"NOT started: there is no script called {args.name!r}. "
             f"The scripts you have kept are: {known}"
         )
+    interpreter = INTERPRETER.get(path.suffix)
+    if interpreter is None:
+        raise ValueError(
+            f"Cannot start {args.name!r}: unknown script type {path.suffix!r}"
+        )
     # A model that does not get an immediate result readily starts the script
     # twice; both copies then write the same outputs, and the corrupted result
     # is far worse than the wasted CPU (seen in a live session: two sniffles
@@ -382,7 +390,7 @@ async def start_background_script(
             f"{running}), and a second copy would write the same output files. "
             f"{hints.SCRIPT_ALREADY_RUNNING}"
         )
-    argv = INTERPRETER + [str(path)] + (args.args.split() if args.args else [])
+    argv = interpreter + [str(path)] + (args.args.split() if args.args else [])
     record = await ctx.runner.start(argv, name=args.name, background=True)
     return (
         f"Started {args.name!r} (pid {record.pid}). It runs in the "
@@ -559,7 +567,7 @@ def _cited_lines(script_lines: list[str], stderr: str, path: Path) -> str:
     broken line are not mutually exclusive.
 
     Only bash's own messages about *this* script count — they carry its path,
-    and `awk: line 3` or a tool's own "line 12" number something else
+    and `awk: line 3` or a Python traceback's "line 12" number something else
     entirely.
     """
     marker = re.compile(rf"{re.escape(str(path))}: line (\d+):")
@@ -625,7 +633,7 @@ async def run_bash(args: RunBashParams, ctx: ToolContext) -> str:
             f"nothing. {hints.RUN_BASH_SHEBANG_ONLY}"
         )
     path.write_text("\n".join(lines) + "\n")
-    check = await syntax_check(path)
+    check = await syntax_check("bash", path)
     if not check.ok:
         path.unlink(missing_ok=True)
         return (
@@ -678,7 +686,7 @@ def default_tool_registry() -> ToolRegistry:
     registry.register(
         Tool(
             name="create_script",
-            description="Create a bash script (syntax-checked)",
+            description="Create a bash or python script (syntax-checked)",
             params=CreateScriptParams,
             handler=create_script,
         )

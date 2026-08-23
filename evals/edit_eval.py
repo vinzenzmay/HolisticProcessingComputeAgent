@@ -621,33 +621,32 @@ def build_tasks() -> list[Task]:
         )
     )
 
-    # 8. indentation-sensitive edit (whitespace is meaning in this file)
-    conf = (
-        "pipeline:\n"
-        "  align:\n"
-        "    threads: 8\n"
-        "    options:\n"
-        "      preset: map-ont\n"
-        "  call:\n"
-        "    threads: 4\n"
+    # 8. indentation-sensitive Python edit (goes through py_compile gate)
+    py = (
+        "def process(items):\n"
+        "    results = []\n"
+        "    for item in items:\n"
+        "        if item.valid:\n"
+        "            results.append(item.value)\n"
+        "    return results\n"
     )
     tasks.append(
         Task(
-            name="nested_indent",
+            name="python_indent",
             prompt=(
-                "The config is registered as 'conf'. Under align.options, "
-                "change preset: map-ont to preset: map-hifi, keeping the "
-                "nesting valid."
+                "The Python file is registered as 'pyfile'. Inside the loop, "
+                "change results.append(item.value) to "
+                "results.append(item.value * 2), keeping the code valid."
             ),
-            files={"conf": ("pipeline.yaml", conf)},
-            check=lambda ws: "      preset: map-hifi"
-            in (ws / "pipeline.yaml").read_text(),
+            files={"pyfile": ("process.py", py)},
+            check=lambda ws: "            results.append(item.value * 2)"
+            in (ws / "process.py").read_text(),
             fake_calls=[
-                _read("conf"),
+                _read("pyfile"),
                 _edit(
-                    "conf",
-                    ["      preset: map-ont"],
-                    ["      preset: map-hifi"],
+                    "pyfile",
+                    ["            results.append(item.value)"],
+                    ["            results.append(item.value * 2)"],
                 ),
             ],
         )

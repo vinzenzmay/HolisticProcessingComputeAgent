@@ -4,7 +4,12 @@ import pytest
 
 from hpca.db import connect, init_db
 from hpca.symbols import Symbol, SymbolIndex
-from hpca.verify_code import commands_needing_docs, extract_bash, verify_script
+from hpca.verify_code import (
+    commands_needing_docs,
+    extract_bash,
+    extract_python,
+    verify_script,
+)
 
 
 class TestExtractBash:
@@ -121,6 +126,21 @@ class TestUnwrapWrappers:
         assert usages == [("/opt/conda/envs/bio/bin/samtools", ["view"], ["-b"])]
 
 
+class TestExtractPython:
+    def test_calls_with_kwargs(self):
+        calls = extract_python(
+            "import pysam\n"
+            "af = pysam.AlignmentFile('x.bam', mode='rb')\n"
+            "align(reads, reference, threads=4, min_quality=20)\n"
+        )
+        by_name = {c[0]: c[1] for c in calls}
+        assert by_name["AlignmentFile"] == ["mode"]
+        assert by_name["align"] == ["threads", "min_quality"]
+
+    def test_syntax_error_returns_empty(self):
+        assert extract_python("def broken(:") == []
+
+
 @pytest.fixture
 def index(tmp_path):
     conn = connect(tmp_path / "hpca.db")
@@ -148,7 +168,9 @@ def index(tmp_path):
 
 class TestVerifyBash:
     def test_known_flags_confirmed(self, index):
-        reports = verify_script("samtools view -b -q 20 in.bam\n", index=index)
+        reports = verify_script(
+            "bash", "samtools view -b -q 20 in.bam\n", index=index
+        )
         assert all(r.status == "confirmed" for r in reports)
         assert {r.symbol for r in reports} == {
             "samtools view -b",
@@ -156,14 +178,14 @@ class TestVerifyBash:
         }
 
     def test_invented_flag_is_mismatch(self, index):
-        reports = verify_script("samtools view -e in.bam\n", index=index)
+        reports = verify_script("bash", "samtools view -e in.bam\n", index=index)
         mismatch = next(r for r in reports if r.status == "mismatch")
         assert "-e" in mismatch.symbol
         assert "-b" in mismatch.detail  # known flags listed for the fix loop
 
     def test_unindexed_command_reported_once(self, index):
         reports = verify_script(
-            "bwa mem -t 4 ref.fa reads.fq\nbwa index ref.fa\n", index=index
+            "bash", "bwa mem -t 4 ref.fa reads.fq\nbwa index ref.fa\n", index=index
         )
         not_indexed = [r for r in reports if r.status == "not_indexed"]
         assert len(not_indexed) == 1
@@ -171,28 +193,52 @@ class TestVerifyBash:
 
     def test_subcommand_resolution(self, index):
         # index stores "samtools-view"; the script says "samtools view"
-        reports = verify_script("samtools view -o out.bam in.bam\n", index=index)
+        reports = verify_script("bash", "samtools view -o out.bam in.bam\n", index=index)
         assert reports[0].status == "confirmed"
 
     def test_absolute_path_resolves_to_the_basename_key(self, index):
         reports = verify_script(
-            "/opt/conda/envs/bio/bin/samtools view -b in.bam\n", index=index
+            "bash", "/opt/conda/envs/bio/bin/samtools view -b in.bam\n", index=index
         )
         assert reports[0].status == "confirmed"
 
     def test_attached_short_option_value_is_not_a_mismatch(self, index):
         # `-q20` and `-q 20` are the same flag; an exact-match test would
         # block a correct script (this bit `sort -k1,1` in a live run)
-        reports = verify_script("samtools view -q20 in.bam\n", index=index)
+        reports = verify_script("bash", "samtools view -q20 in.bam\n", index=index)
         assert reports[0].status == "confirmed"
 
     def test_clustered_short_options_accepted(self, index):
-        reports = verify_script("samtools view -bq in.bam\n", index=index)
+        reports = verify_script("bash", "samtools view -bq in.bam\n", index=index)
         assert reports[0].status == "confirmed"
 
     def test_invented_long_flag_still_blocked(self, index):
-        reports = verify_script("grep --notaflag x f\n", index=index)
+        reports = verify_script("bash", "grep --notaflag x f\n", index=index)
         assert reports[0].status == "mismatch"
+
+
+class TestVerifyPython:
+    def test_valid_kwargs_confirmed(self, index):
+        reports = verify_script(
+            "python", "align(r, ref, threads=8)\n", index=index
+        )
+        assert reports[0].status == "confirmed"
+
+    def test_typo_kwarg_is_mismatch(self, index):
+        reports = verify_script(
+            "python", "align(r, ref, min_qualty=20)\n", index=index
+        )
+        mismatch = next(r for r in reports if r.status == "mismatch")
+        assert "min_qualty" in mismatch.detail
+        assert "min_quality" in mismatch.detail  # signature shown for the fix
+
+    def test_unindexed_call_with_kwargs_reported(self, index):
+        reports = verify_script("python", "mystery(x, mode='rb')\n", index=index)
+        assert reports[0].status == "not_indexed"
+
+    def test_unindexed_call_without_kwargs_skipped(self, index):
+        # print(x), range(n), ... — nothing checkable, stay quiet (§5.2.4)
+        assert verify_script("python", "print(align_result)\n", index=index) == []
 
 
 # ------------------------------------------------- create_script integration
@@ -223,7 +269,7 @@ async def create(ctx, key, lines):
     tools = default_tool_registry()
     tool = tools.get("create_script")
     args = tool.params.model_validate(
-        {"name": key, "content_lines": lines}
+        {"kind": "bash", "name": key, "content_lines": lines}
     )
     return await tool.handler(args, ctx)
 
@@ -371,6 +417,7 @@ class TestProbeSafety:
 class TestCommandsNeedingDocs:
     def test_only_unindexed_commands_used_with_flags(self, index):
         pending = commands_needing_docs(
+            "bash",
             "grep -v x f\nbwa mem -t 4 ref.fa\ncat plain.txt\n",
             index=index,
         )
@@ -378,7 +425,10 @@ class TestCommandsNeedingDocs:
 
     def test_deduplicated_by_command(self, index):
         pending = commands_needing_docs(
-            "bwa index ref.fa\nbwa mem -t 4 ref.fa\nbwa aln -n 2 r.fq\n",
+            "bash", "bwa index ref.fa\nbwa mem -t 4 ref.fa\nbwa aln -n 2 r.fq\n",
             index=index,
         )
         assert [name for name, _ in pending] == ["bwa"]
+
+    def test_non_bash_kinds_are_skipped(self, index):
+        assert commands_needing_docs("python", "subprocess.run(['bwa'])", index=index) == []

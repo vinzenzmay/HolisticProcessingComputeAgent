@@ -111,7 +111,7 @@ class TestOnlyBackgroundWork:
         create = tools.get("create_script")
         await create.handler(
             create.params.model_validate(
-                {"name": "job", "content_lines": ["exit 4"]}
+                {"kind": "bash", "name": "job", "content_lines": ["exit 4"]}
             ),
             ctx,
         )
@@ -148,7 +148,7 @@ class TestNoDuplicateStart:
         create = tools.get("create_script")
         await create.handler(
             create.params.model_validate(
-                {"name": key, "content_lines": lines}
+                {"kind": "bash", "name": key, "content_lines": lines}
             ),
             ctx,
         )

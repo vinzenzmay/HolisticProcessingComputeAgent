@@ -42,6 +42,7 @@ class TestCreateScript:
             tools,
             "create_script",
             ctx,
+            kind="bash",
             name="hello_sh",
             content_lines=["echo hello"],
         )
@@ -56,21 +57,33 @@ class TestCreateScript:
             tools,
             "create_script",
             ctx,
+            kind="bash",
             name="bad_sh",
             content_lines=["if [ 1 -eq 1 ]; then", "echo unclosed"],
         )
         assert "syntax" in result.lower()
         assert script_path("bad_sh", ctx) is None
 
+    async def test_invalid_python_reports_error_text(self, tools, ctx):
+        result = await call(
+            tools,
+            "create_script",
+            ctx,
+            kind="python",
+            name="bad_py",
+            content_lines=["def broken(:", "    pass"],
+        )
+        assert "SyntaxError" in result
+
     async def test_a_name_already_taken_raises(self, tools, ctx):
         await call(
             tools, "create_script", ctx,
-            name="x", content_lines=["echo 1"],
+            kind="bash", name="x", content_lines=["echo 1"],
         )
         with pytest.raises(PathError, match="already exists"):
             await call(
                 tools, "create_script", ctx,
-                name="x", content_lines=["echo 2"],
+                kind="bash", name="x", content_lines=["echo 2"],
             )
 
     async def test_a_name_whose_script_is_gone_can_be_reused(self, tools, ctx):
@@ -78,12 +91,12 @@ class TestCreateScript:
         # script frees the name — there is no separate registration to go stale.
         await call(
             tools, "create_script", ctx,
-            name="x", content_lines=["echo 1"],
+            kind="bash", name="x", content_lines=["echo 1"],
         )
         script_path("x", ctx).unlink()
         result = await call(
             tools, "create_script", ctx,
-            name="x", content_lines=["echo 2"],
+            kind="bash", name="x", content_lines=["echo 2"],
         )
         assert "echo 2" in script_path("x", ctx).read_text()
         assert "syntax check ok" in result
@@ -95,7 +108,7 @@ class TestCreateScript:
         of the script, and every rewrite after that shrinks the file further."""
         result = await call(
             tools, "create_script", ctx,
-            name="x",
+            kind="bash", name="x",
             content_lines=["echo start", omitted_list(["echo body"] * 40)],
         )
         assert "NOT created" in result
@@ -114,7 +127,7 @@ class TestCreateScript:
         old marker, so the guard has to know that wording as well."""
         result = await call(
             tools, "create_script", ctx,
-            name="x",
+            kind="bash", name="x",
             content_lines=["echo start", "... 22 more lines elided ..."],
         )
         assert "NOT created" in result
@@ -123,7 +136,7 @@ class TestCreateScript:
     async def test_the_refusal_names_the_offending_line(self, tools, ctx):
         result = await call(
             tools, "create_script", ctx,
-            name="x",
+            kind="bash", name="x",
             content_lines=["echo one", "echo two", "... 7 more lines elided ..."],
         )
         assert "line 3 of content_lines" in result
@@ -135,7 +148,7 @@ class TestCreateScript:
         an ordinary script saying 'lines' and a number is not a placeholder."""
         result = await call(
             tools, "create_script", ctx,
-            name="x",
+            kind="bash", name="x",
             content_lines=["echo 'skipping 22 more lines'", "echo done"],
         )
         assert "ok" in result.lower()
@@ -283,7 +296,7 @@ class TestStartScript:
     async def test_runs_and_names_its_logs(self, tools, ctx):
         await call(
             tools, "create_script", ctx,
-            name="greeter",
+            kind="bash", name="greeter",
             content_lines=['echo "hi from script"'],
         )
         result = await call(
@@ -299,7 +312,7 @@ class TestStartScript:
     async def test_passes_args(self, tools, ctx):
         await call(
             tools, "create_script", ctx,
-            name="argsy", content_lines=['echo "arg1=$1"'],
+            kind="bash", name="argsy", content_lines=['echo "arg1=$1"'],
         )
         await call(
             tools, "start_background_script", ctx,
@@ -308,6 +321,18 @@ class TestStartScript:
         record = ctx.runner.list()[0]
         await ctx.runner.wait(record.pid)
         assert "arg1=banana" in record.stdout_path.read_text()
+
+    async def test_python_script_started_with_python(self, tools, ctx):
+        await call(
+            tools, "create_script", ctx,
+            kind="python", name="pyhello",
+            content_lines=['print("python says hi")'],
+        )
+        await call(tools, "start_background_script", ctx, name="pyhello")
+        record = ctx.runner.list()[0]
+        await ctx.runner.wait(record.pid)
+        assert record.state == "finished"
+        assert "python says hi" in record.stdout_path.read_text()
 
 
 class TestToolSuiteShape:
@@ -334,7 +359,7 @@ class TestSingleLineScriptGate:
     async def test_shebang_only_script_rejected(self, tools, ctx):
         result = await call(
             tools, "create_script", ctx,
-            name="oneliner",
+            kind="bash", name="oneliner",
             content_lines=["#!/bin/bash for i in 1 2 3; do echo $i; done"],
         )
         assert "NOT created" in result
@@ -343,14 +368,14 @@ class TestSingleLineScriptGate:
     async def test_single_command_line_without_shebang_ok(self, tools, ctx):
         result = await call(
             tools, "create_script", ctx,
-            name="shortie", content_lines=["echo hi"],
+            kind="bash", name="shortie", content_lines=["echo hi"],
         )
         assert "ok" in result.lower()
 
     async def test_multiline_with_shebang_ok(self, tools, ctx):
         result = await call(
             tools, "create_script", ctx,
-            name="proper",
+            kind="bash", name="proper",
             content_lines=["#!/bin/bash", "for i in 1 2 3; do echo $i; done"],
         )
         assert "ok" in result.lower()
@@ -498,7 +523,7 @@ class TestRunBashFailingLines:
         # What ran is what is quoted: `{name}` resolved, as the script has it.
         await call(
             tools, "create_script", ctx,
-            name="data", content_lines=["echo hi"],
+            kind="bash", name="data", content_lines=["echo hi"],
         )
         script = ctx.scripts_dir / "data.sh"
         result = await call(
@@ -526,11 +551,11 @@ class TestRunBashScriptInterpolation:
     async def test_a_kept_script_is_run_by_name(self, tools, ctx):
         await call(
             tools, "create_script", ctx,
-            name="qc",
-            content_lines=["echo \"qc ran $1\""],
+            kind="python", name="qc",
+            content_lines=["import sys", "print('qc ran', sys.argv[1])"],
         )
         result = await call(
-            tools, "run_bash", ctx, content_lines=["bash {qc} --strict"]
+            tools, "run_bash", ctx, content_lines=["python3 {qc} --strict"]
         )
         assert "qc ran --strict" in result
         assert "exit 0" in result
@@ -557,7 +582,7 @@ class TestRunBashScriptInterpolation:
     ):
         await call(
             tools, "create_script", ctx,
-            name="reads", content_lines=["echo hi"],
+            kind="bash", name="reads", content_lines=["echo hi"],
         )
         result = await call(tools, "run_bash", ctx, content_lines=["cat {readz}"])
         assert "{readz}" in result
@@ -627,7 +652,7 @@ class TestBashFailFast:
     async def test_failure_before_a_success_echo_is_not_masked(self, tools, ctx):
         await call(
             tools, "create_script", ctx,
-            name="run_thing",
+            kind="bash", name="run_thing",
             content_lines=[
                 "false",                       # the "tool" fails
                 'echo "Done. Output: out.vcf"',  # would otherwise mask it
@@ -645,7 +670,7 @@ class TestBashFailFast:
     async def test_strict_mode_is_injected_after_the_shebang(self, tools, ctx):
         await call(
             tools, "create_script", ctx,
-            name="shebanged",
+            kind="bash", name="shebanged",
             content_lines=["#!/bin/bash", "echo hi"],
         )
         text = script_path("shebanged", ctx).read_text()
@@ -656,7 +681,7 @@ class TestBashFailFast:
     async def test_strict_mode_prepended_when_no_shebang(self, tools, ctx):
         await call(
             tools, "create_script", ctx,
-            name="bare", content_lines=["echo hi"],
+            kind="bash", name="bare", content_lines=["echo hi"],
         )
         assert script_path("bare", ctx).read_text().startswith(
             "set -euo pipefail\n"
@@ -665,7 +690,7 @@ class TestBashFailFast:
     async def test_the_models_own_set_e_is_respected(self, tools, ctx):
         await call(
             tools, "create_script", ctx,
-            name="own",
+            kind="bash", name="own",
             content_lines=["set -e", "echo hi"],
         )
         text = script_path("own", ctx).read_text()
@@ -676,9 +701,17 @@ class TestBashFailFast:
     ):
         result = await call(
             tools, "create_script", ctx,
-            name="noted", content_lines=["echo hi"],
+            kind="bash", name="noted", content_lines=["echo hi"],
         )
         assert "fail-fast" in result
+
+    async def test_non_bash_scripts_are_not_touched(self, tools, ctx):
+        await call(
+            tools, "create_script", ctx,
+            kind="python", name="py", content_lines=["print('hi')"],
+        )
+        text = script_path("py", ctx).read_text()
+        assert "set -euo pipefail" not in text  # python fails on exception anyway
 
     async def test_run_bash_stays_lenient_for_exploration(self, tools, ctx):
         # `command -v missing` returns non-zero; exploration must still get the
