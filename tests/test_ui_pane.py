@@ -9,7 +9,7 @@ from hpca.ui import theme
 from hpca.ui.ansi import BOLD, REVERSE
 from hpca.ui.app import CHAT, SESSIONS, WATCHERS
 from hpca.ui.demo import build
-from hpca.ui.pane import Fold, Item, Pane
+from hpca.ui.pane import SPACER_KEY, Fold, Item, Pane
 from hpca.ui.state import ChatEntry, ChatPart, SessionState
 from tests.ui_harness import frame, plain, widths
 
@@ -696,10 +696,13 @@ class TestTheChatFillsFromTheBottom:
     """
 
     def test_a_short_conversation_sits_at_the_foot_of_the_pane(self):
+        # The blank at the very bottom is the last row's own spacer, and it is
+        # what stands between the conversation and the message box under it
+        # (`pane.SPACER_LINES`).
         drawn = [plain(x).rstrip() for x in chat_of(SAID, REPLIED).render(
             60, 12, focused=True
         )]
-        assert drawn[-2:] == ["▾    hpca", "done"]
+        assert drawn[-3:] == ["▾    hpca", "done", ""]
 
     def test_and_the_room_it_does_not_need_is_above_it(self):
         drawn = [plain(x).rstrip() for x in chat_of(SAID, REPLIED).render(
@@ -715,9 +718,13 @@ class TestTheChatFillsFromTheBottom:
 
     def test_a_conversation_too_long_to_fit_is_untouched(self):
         # The bottom is where a scrolled pane already ends; there is no room
-        # to give back and nothing to move.
+        # to give back and nothing to move. Asked with the spacing off, so
+        # that "no blank rows" still means "nothing was given back" — with it
+        # on, every row carries a blank of its own and the question could not
+        # be put this way.
         pane = chat_of(*[ChatEntry(kind="user", text=f"n{n}", seq=n) for n in
                          range(1, 30)])
+        pane.spacer = 0
         drawn = [plain(x).rstrip() for x in pane.render(60, 12, focused=True)]
         assert "" not in drawn[1:]
 
@@ -737,9 +744,13 @@ class TestTheChatFillsFromTheBottom:
         for cursor in range(len(pane.flat(58))):
             pane.cursor = cursor
             drawn = pane.render(60, 12, focused=True)
+            # Where the cursor ended up, which is not always where it was
+            # aimed: a spacer is not a line anything may sit on, so the pane
+            # puts it back on the row the blank belongs to.
+            at = pane.cursor
             marked = [plain(x).rstrip() for x in drawn if "\x1b[7m" in x]
-            owner = pane.flat(58)[cursor][0]
-            assert marked == [pane.flat(58)[cursor][1].strip()]
+            owner = pane.flat(58)[at][0]
+            assert marked == [pane.flat(58)[at][1].strip()]
             assert pane.current(58) == owner
 
 
@@ -811,7 +822,10 @@ class TestTheHeadRowsStandOffTheProse:
         # is exactly how it would look wrong.
         pane = chat_of(SAID, REPLIED)
         pane.set_tail(Item(head="working"))
-        assert pane.flat(58)[-1][1] == "     working"
+        # Its own blanks are under it, the way an entry's are (`_tail_height`),
+        # so the head line is the first of the lines it draws rather than the
+        # last line of the pane.
+        assert pane.flat(58)[-1 - pane.spacer][1] == "     working"
 
     def test_a_list_keeps_its_single_space(self):
         # Nothing to fix there: a sidebar indents its bodies four columns
@@ -1001,8 +1015,16 @@ class TestTheNewestLineStaysOnScreen:
         session = SessionState("s1")
         session.reset([SAID, WORKED])
         session.chat.render(60, 8, focused=True)
-        session.chat.move(-3, 7, 58)
-        session.chat.move(3, 7, 58)
+        # A row at a time, which is what the arrow keys send: a spacer is
+        # stepped over without being landed on, so three presses up is three
+        # rows up and three back down is the row it started on. A single move
+        # of several *lines* is not the same distance in both directions once
+        # the blanks are in the way, and never was meant to be — page up and
+        # page down move a screenful, not a remembered place.
+        for _ in range(3):
+            session.chat.move(-1, 7, 58)
+        for _ in range(3):
+            session.chat.move(1, 7, 58)
         assert session.chat.follow
         session.append(REPLIED)
         assert "done" in self.growing(session.chat)
@@ -1013,3 +1035,172 @@ class TestTheNewestLineStaysOnScreen:
         pane.cursor = 0
         assert not pane.follow
         assert self.last_visible(pane) != ""
+
+
+# ------------------------------------------------ the blank under every row
+
+
+class TestTheRowsAreHeldApart:
+    """One blank line under each chat row (`display.spacer_lines`).
+
+    A chat is a column of paragraphs, and the only thing saying where one
+    stopped was the weight of the next `you` / `hpca` nameplate — enough on a
+    two-line exchange, and not enough once a reply runs to twenty. A blank
+    line is what prose has always used for that.
+
+    The blank belongs to the row *above* it rather than to the row below,
+    which is what keeps `extend` an append: a spacer owned by the arriving row
+    would mean patching the one before it every time a message landed, which
+    is the O(conversation) event that method exists to abolish.
+    """
+
+    @staticmethod
+    def texts(pane: Pane, width: int = 58) -> list[str]:
+        return [text for _, text, _ in pane.flat(width)]
+
+    def test_a_blank_follows_each_row(self):
+        pane = chat_of(SAID, REPLIED)
+        assert self.texts(pane) == [
+            "▸    you",
+            "run it again",
+            "",
+            "▾    hpca",
+            "done",
+            "",
+        ]
+
+    def test_a_closed_row_gets_one_too(self):
+        # Both exits of `_item_lines` append it. A gap that came and went as
+        # rows were folded would read as the conversation jumping.
+        pane = chat_of(SAID, REPLIED)
+        pane.expanded.clear()
+        pane.invalidate()
+        assert self.texts(pane)[-1] == ""
+        assert self.texts(pane)[-2].startswith("done")
+
+    def test_and_the_count_is_the_setting(self):
+        pane = chat_of(SAID, REPLIED)
+        pane.spacer = 3
+        assert self.texts(pane)[-3:] == ["", "", ""]
+
+    def test_zero_is_the_pane_as_it_was(self):
+        pane = chat_of(SAID, REPLIED)
+        pane.spacer = 0
+        assert self.texts(pane) == ["▸    you", "run it again", "▾    hpca", "done"]
+
+    def test_the_lists_are_not_spaced(self):
+        # A sessions column is one-line titles that were never hard to tell
+        # apart, and doubling its height would cost the chat the rows it is
+        # given.
+        pane = Pane("sessions", [Item(head="one"), Item(head="two")])
+        assert pane.spacer == 0
+        assert self.texts(pane) == ["  one", "  two"]
+
+    def test_a_row_arriving_brings_its_own(self):
+        # Through `extend`, which patches the flattened cache rather than
+        # rebuilding it: the spacing must not be a property of how a row got
+        # onto the pane.
+        session = SessionState("s1")
+        session.reset([SAID])
+        session.append(REPLIED)
+        assert self.texts(session.chat)[-1] == ""
+
+    def test_and_so_does_the_live_row(self):
+        # While a turn runs the spinner is the last row on the pane, so the
+        # gap under the conversation has to survive one starting.
+        pane = chat_of(SAID, REPLIED)
+        pane.set_tail(Item(head="working"))
+        assert self.texts(pane)[-2:] == ["     working", ""]
+
+    def test_and_a_spinner_frame_does_not_relayout(self):
+        # `set_tail` patches the head line in place; the blanks under it are
+        # already right, and rewriting them is the relayout it exists to
+        # avoid.
+        pane = chat_of(SAID, REPLIED)
+        pane.set_tail(Item(head="working"))
+        was = len(pane.flat(58))
+        pane.set_tail(Item(head="working ."))
+        assert pane._flat is not None  # the cache survived the frame
+        assert len(pane.flat(58)) == was
+        assert self.texts(pane)[-2:] == ["     working .", ""]
+
+    def test_changing_it_redraws_the_pane(self):
+        pane = chat_of(SAID, REPLIED)
+        pane.flat(58)
+        pane.spacer = 2
+        assert pane._flat is None
+
+    def test_but_restating_it_does_not(self):
+        # `set_display` restates every display key on every save, and an
+        # unconditional invalidate here would throw the chat's flattened cache
+        # away each time somebody changed a colour.
+        pane = chat_of(SAID, REPLIED)
+        pane.flat(58)
+        pane.spacer = pane.spacer
+        assert pane._flat is not None
+
+
+class TestNothingLandsOnABlank:
+    """The cursor steps over the spacers rather than onto them.
+
+    `_keys` is what the cursor reads itself off, and a blank that answered
+    with a real key would let the highlight sit on an empty line — which on
+    this pane is a reversed band the width of the terminal under the reply
+    being read.
+    """
+
+    def test_the_blanks_are_keyed_apart_from_the_rows(self):
+        pane = chat_of(SAID, REPLIED)
+        pane.flat(58)
+        assert pane._keys == ["1", "1", SPACER_KEY, "2", "2", SPACER_KEY]
+
+    def test_following_parks_on_the_last_row_not_its_blank(self):
+        session = SessionState("s1")
+        session.reset([SAID, REPLIED])
+        session.chat.render(60, 12, focused=True)
+        assert session.chat.follow
+        assert session.chat._keys[session.chat.cursor] != SPACER_KEY
+
+    def test_and_so_the_highlight_is_never_an_empty_band(self):
+        session = SessionState("s1")
+        session.reset([SAID, REPLIED])
+        drawn = session.chat.render(60, 12, focused=True)
+        banded = [plain(x).rstrip() for x in drawn if REVERSE in x]
+        assert banded == ["done"]
+
+    def test_an_arrow_moves_one_row(self):
+        pane = chat_of(SAID, REPLIED)
+        pane.render(60, 12, focused=True)
+        pane.cursor = 4  # "done"
+        pane.move(-1, 11, 58)
+        assert pane.cursor == 3  # the label above it, not the blank between
+        pane.move(1, 11, 58)
+        assert pane.cursor == 4
+
+    def test_aiming_at_a_blank_lands_on_the_row_it_belongs_to(self):
+        pane = chat_of(SAID, REPLIED)
+        pane.cursor = 2  # the blank under the user's message
+        pane.render(60, 12, focused=True)
+        assert pane.cursor == 1
+        assert pane.current(58) == 0
+
+    def test_following_shows_the_end_of_the_list_not_just_the_cursor(self):
+        # The two used to be the same line. With the cursor parked on the last
+        # *row* and its blanks below it, a scroll that followed the cursor
+        # would push those blanks off the foot of the pane — and the gap
+        # between the conversation and the message box is what they are for.
+        pane = chat_of(*[ChatEntry(kind="user", text=f"n{n}", seq=n)
+                         for n in range(1, 30)])
+        drawn = [plain(x).rstrip() for x in pane.render(60, 12, focused=True)]
+        assert drawn[-1] == ""
+        assert drawn[-2] == "n29"
+
+    def test_and_the_bottom_of_the_pane_still_resumes_following(self):
+        # Page-down at the foot clamps onto the last line, which is a blank —
+        # and the answer to "are we at the end" has to be yes anyway.
+        pane = chat_of(SAID, REPLIED)
+        pane.render(60, 12, focused=True)
+        pane.move(-10, 11, 58)
+        assert not pane.follow
+        pane.move(10**9, 11, 58)
+        assert pane.follow

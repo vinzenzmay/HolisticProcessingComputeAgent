@@ -4,6 +4,8 @@
 feed keys, read the frame back and look at it".
 """
 
+from dataclasses import replace
+
 import pytest
 
 from hpca.ui import theme
@@ -1174,7 +1176,10 @@ def test_and_it_still_moves_the_cursor_once():
     ui.focus = CHAT
     ui.chat.cursor = 5
     fed(ui, b"\x1b", b"[A")
-    assert ui.chat.cursor == 4
+    # One row up, which is two lines: the blank under a row belongs to it and
+    # is stepped over rather than landed on (`pane.SPACER_LINES`). Once is the
+    # thing being checked, and once is what it moved.
+    assert ui.chat.cursor == 3
 
 
 def test_two_split_arrows_never_stop_the_turn():
@@ -1282,3 +1287,41 @@ class TestTheFocusFlash:
         ui = self.ui(hold=0)
         ui.handle("tab", 100, 30)
         assert ui._flash_wake() is None
+
+
+# ------------------------------------- the gap between the log and the box
+
+
+class TestTheChatStandsOffTheMessageBox:
+    """The last row's own blank is what separates the two bands.
+
+    Nothing in the layout reserves a margin: the chat hangs from the foot of
+    its pane, so the blank the newest row leaves under itself is the row that
+    ends up between the conversation and the box you type into. Which is why
+    `display.spacer_lines` turns both off together — it is one mechanism, and
+    a gap that outlived the spacing would be a margin nobody asked for.
+    """
+
+    @staticmethod
+    def above_the_box(ui, width: int = 96, height: int = 34) -> str:
+        rows = [x.rstrip() for x in frame(ui, width, height)]
+        for n, line in enumerate(rows):
+            if line.startswith("mode:") or line.startswith("── message"):
+                return rows[n - 1]
+        raise AssertionError("no message box on this frame")
+
+    def test_the_row_above_it_is_blank(self):
+        assert self.above_the_box(build()) == ""
+
+    def test_and_turning_the_spacing_off_closes_it_up(self):
+        ui = build()
+        ui.set_display(replace(ui.display, spacer_lines=0))
+        assert self.above_the_box(ui) != ""
+
+    def test_the_setting_reaches_every_session_not_only_the_open_one(self):
+        # `set_display` restyles them all: a chat that took the new spacing on
+        # the way back into view would do the work at the one moment the user
+        # is watching.
+        ui = build()
+        ui.set_display(replace(ui.display, spacer_lines=2))
+        assert {x.chat.spacer for x in ui.sessions} == {2}

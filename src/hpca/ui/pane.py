@@ -25,6 +25,32 @@ from hpca.ui.ansi import BOLD, RESET, REVERSE, clip, fold, pad, rule
 FLUSH_HEAD_GAP = "    "
 LIST_HEAD_GAP = " "
 
+# How many blank rows a pane leaves under each of its entries by default, and
+# what the key of such a row is.
+#
+# One, on the pane that asks for them: a chat is a column of paragraphs with
+# nothing between them, and "where does this message stop" was being answered
+# by the weight of the next nameplate alone — which is a lot to ask of one
+# line's boldness once a reply runs past the fold. The blank is the cheapest
+# thing that answers it, and it is the last row of every entry rather than the
+# first row of the next so that `extend` stays an append: a spacer belonging
+# to the row *below* would mean patching the row above every time one arrived,
+# which is the O(conversation) event that method exists to abolish.
+#
+# The key is a sentinel and not the owning row's, because these lines are the
+# one thing on a pane that nothing may land on: `_keys` is what the cursor
+# reads itself off, and a spacer answering with a real key would let the
+# highlight sit on an empty line and draw a reversed band the width of the
+# terminal. Navigation steps over anything wearing it (`_skip`), while the
+# *owner* index the line carries is still the row above — so an entry stays
+# marked as the current one while its own blank is on screen.
+SPACER_LINES = 1
+SPACER_KEY = "\x00spacer"
+# The most a settings file may ask for, and the number `config.DisplaySettings`
+# writes as a literal of its own — the core reads that module with no
+# front-end in the process, so it may not reach in here for it.
+MAX_SPACER_LINES = 8
+
 
 class Wrapped:
     """A row that remembers its ``body`` wrapped, so nothing wraps it twice.
@@ -162,10 +188,16 @@ class Pane:
     """
 
     def __init__(
-        self, name: str, items: list[Item], *, flush: bool = False
+        self, name: str, items: list[Item], *, flush: bool = False, spacer: int = 0
     ) -> None:
         self.name = name
         self.items = items
+        # Blank rows under every entry (`SPACER_LINES`). Zero here rather than
+        # `SPACER_LINES`, because the setting that carries it is a *display*
+        # setting and only the chat is told what it says: a sessions list whose
+        # rows were held apart by blanks would be twice as tall for a column
+        # of titles that were never hard to tell apart in the first place.
+        self._spacer = max(0, spacer)
         # Whether the rows on this pane are *text somebody will select*.
         #
         # A pane spends four columns before a character of its content is
@@ -214,6 +246,27 @@ class Pane:
         self._openable: set[str] = set()
         self._flat_width = -1
 
+    @property
+    def spacer(self) -> int:
+        """Blank rows drawn under each entry — `SPACER_LINES` says why."""
+        return self._spacer
+
+    @spacer.setter
+    def spacer(self, rows: int) -> None:
+        """Change it, and rebuild only if it actually changed.
+
+        The guard is not thrift, it is the difference between a settings save
+        and a reset: `set_display` restates every display key on every save, so
+        an unconditional `invalidate` here would re-flatten every conversation
+        the app holds each time somebody changed a colour — and would throw
+        away the flattened cache the chat's append-only invariant is built on.
+        """
+        rows = max(0, rows)
+        if rows == self._spacer:
+            return
+        self._spacer = rows
+        self.invalidate()
+
     # ------------------------------------------------------------- content
 
     def flat(self, width: int) -> list[tuple[int, str, bool]]:
@@ -234,8 +287,7 @@ class Pane:
             keys += names
             openable |= opens
         if self.tail is not None:
-            lines.append(self._tail_line())
-            keys.append(self.key_at(len(self.items)))
+            self._push_tail(lines, keys)
         self._flat, self._keys, self._openable = lines, keys, openable
         self._flat_width = width
         return lines
@@ -283,6 +335,7 @@ class Pane:
                 room = max(8, width - len(body_pad))
                 lines.append((index, body_pad + item.clipped(room), False))
                 keys.append(key)
+            self._pad_out(index, lines, keys)
             return lines, keys, openable
         # Folded by cells rather than by characters: a body line of CJK holds
         # half as many characters in the same row, and counting them would
@@ -304,7 +357,31 @@ class Pane:
             for piece in part.folded(max(8, width - len(step_pad))):
                 lines.append((index, f"{step_pad}{piece}", False))
                 keys.append(sub)
+        self._pad_out(index, lines, keys)
         return lines, keys, openable
+
+    def _pad_out(
+        self,
+        index: int,
+        lines: list[tuple[int, str, bool]],
+        keys: list[str],
+    ) -> None:
+        """Append this row's blank rows to the lines it just drew.
+
+        Called from both of `_item_lines`' exits rather than once around it,
+        because the closed row returns early — and a spacer that only the open
+        branch appended would be a gap that came and went as rows were folded,
+        which reads as the conversation jumping rather than as it breathing.
+
+        The lines are empty rather than a run of spaces: `render` pads every
+        line it draws out to the width anyway, and a spacer made of spaces
+        would be a row of cells that a drag-select picks up as trailing
+        whitespace on the pane whose whole point is that what you drag is what
+        you paste.
+        """
+        for _ in range(self._spacer):
+            lines.append((index, "", False))
+            keys.append(SPACER_KEY)
 
     def extend(self, item: Item) -> None:
         """Add a row without throwing the flattened line list away.
@@ -323,16 +400,14 @@ class Pane:
             return
         # The live row sits after the last entry, so it moves down one.
         if self.tail is not None:
-            self._flat.pop()
-            self._keys.pop()
+            self._pop_tail()
         index = len(self.items) - 1
         lines, keys, openable = self._item_lines(index, item, self._flat_width)
         self._flat += lines
         self._keys += keys
         self._openable |= openable
         if self.tail is not None:
-            self._flat.append(self._tail_line())
-            self._keys.append(self.key_at(len(self.items)))
+            self._push_tail(self._flat, self._keys)
 
     def reflow_last(self) -> None:
         """Redraw the newest row in the cache, leaving everything above it.
@@ -355,8 +430,7 @@ class Pane:
             return
         index = len(self.items) - 1
         if self.tail is not None:
-            self._flat.pop()
-            self._keys.pop()
+            self._pop_tail()
         while self._flat and self._flat[-1][0] == index:
             self._flat.pop()
             self._keys.pop()
@@ -367,8 +441,7 @@ class Pane:
         self._keys += keys
         self._openable |= openable
         if self.tail is not None:
-            self._flat.append(self._tail_line())
-            self._keys.append(self.key_at(len(self.items)))
+            self._push_tail(self._flat, self._keys)
 
     @property
     def cursor(self) -> int:
@@ -404,6 +477,41 @@ class Pane:
         # spinner, and it still belongs in the head column.
         return (len(self.items), f" {self.head_gap}{self.tail.head}", True)
 
+    def _tail_height(self) -> int:
+        """How many flattened lines the live row occupies — itself, and the
+        blanks under it.
+
+        It gets them for the same reason an entry does: while a turn is
+        running the spinner *is* the last row on the pane, and a gap that
+        vanished the moment one started would be the foot of the chat twitching
+        once a turn.
+        """
+        return 1 + self._spacer
+
+    def _push_tail(
+        self, lines: list[tuple[int, str, bool]], keys: list[str]
+    ) -> None:
+        """Put the live row, and its blanks, on the end of a line list."""
+        lines.append(self._tail_line())
+        keys.append(self.key_at(len(self.items)))
+        for _ in range(self._spacer):
+            lines.append((len(self.items), "", False))
+            keys.append(SPACER_KEY)
+
+    def _pop_tail(self) -> None:
+        """Take it back off the cache — `_tail_height` lines, not one.
+
+        The counterpart of `_push_tail`, and the reason both are methods
+        rather than the two lines they used to be inline: `extend`,
+        `reflow_last` and `set_tail` all lift the live row off the end of the
+        cache and put it back, and three copies of "pop one" is three places
+        that had to be found again the moment the row stopped being one line.
+        """
+        for _ in range(self._tail_height()):
+            if self._flat:
+                self._flat.pop()
+                self._keys.pop()
+
     def set_tail(self, item: Item | None) -> None:
         """Pin (or take away) the live row after the last entry.
 
@@ -418,8 +526,14 @@ class Pane:
         if (item is None) != (was is None):
             self.invalidate()
         elif item is not None and self._flat is not None:
-            self._flat[-1] = self._tail_line()
-            self._keys[-1] = self.key_at(len(self.items))
+            # The head line, wherever the blanks under it left it. Only the
+            # frame of the spinner changed, so the blanks are already right
+            # and rewriting them would be the relayout this branch exists to
+            # avoid.
+            at = len(self._flat) - self._tail_height()
+            if at >= 0:
+                self._flat[at] = self._tail_line()
+                self._keys[at] = self.key_at(len(self.items))
 
     def invalidate(self) -> None:
         self._flat = None
@@ -544,7 +658,7 @@ class Pane:
         should be: opening the newest row is not a request to stop watching
         the newest row.
         """
-        self.follow = self._cursor >= len(self.flat(width)) - 1
+        self.follow = self._cursor >= self._last_line(width)
 
     def _go_to(self, item: int, width: int) -> None:
         for row, (owner, _, _) in enumerate(self.flat(width)):
@@ -561,13 +675,63 @@ class Pane:
                 break
         self._landed(width)
 
+    def _landable(self, line: int) -> bool:
+        """Whether the cursor may sit on that flattened line.
+
+        Everything may be landed on except a spacer (`SPACER_LINES`), which is
+        a blank the pane drew and not a row anybody wrote. Read off `_keys`,
+        so it is only an answer after `flat` has run — which is the case at
+        every call site here, since a cursor is only ever moved against a line
+        list that exists.
+        """
+        return not (0 <= line < len(self._keys) and self._keys[line] == SPACER_KEY)
+
+    def _skip(self, line: int, step: int, total: int) -> int:
+        """The nearest line the cursor may sit on, walking ``step`` from
+        ``line``.
+
+        Turning round at the end rather than stopping there is what makes ↓ on
+        the last message do the obvious thing: the lines under it are its own
+        blanks, so travelling down runs out of pane, and the answer is the row
+        those blanks belong to rather than the blank itself.
+        """
+        if total <= 0:
+            return 0
+        start = max(0, min(line, total - 1))
+        at = start
+        while 0 <= at < total and not self._landable(at):
+            at += step
+        if 0 <= at < total:
+            return at
+        at = start
+        while 0 <= at < total and not self._landable(at):
+            at -= step
+        return max(0, min(at, total - 1))
+
+    def _last_line(self, width: int) -> int:
+        """The last line the cursor may ride — the end of the pane, or the row
+        above the blanks the end of the pane now is."""
+        total = len(self.flat(width))
+        return self._skip(total - 1, -1, total) if total else 0
+
     def _scroll_into_view(self, view_h: int, total: int) -> None:
         view_h = max(1, view_h)
         if self.follow:
             # Lines have arrived below it since the last frame — a step, a
-            # token, the working row — and the cursor is riding the end.
-            self._cursor = max(0, total - 1)
+            # token, the working row — and the cursor is riding the end. The
+            # end of the *rows*: with spacers on, the last flattened line is a
+            # blank, and parking the highlight there would draw a reversed
+            # band the width of the terminal under the reply being read.
+            self._cursor = self._skip(max(0, total - 1), -1, total)
+            # And the *list* rides the bottom, not the cursor. The two used to
+            # be the same line and are not any more: with the cursor parked on
+            # the last row and its blanks below it, letting the scroll follow
+            # the cursor would push those blanks off the foot of the pane —
+            # and the gap between the conversation and the message box is
+            # exactly what they are there for.
+            self.offset = max(0, total - view_h)
         self._cursor = max(0, min(self._cursor, max(0, total - 1)))
+        self._cursor = self._skip(self._cursor, -1, total)
         self.offset = max(0, min(self.offset, max(0, total - view_h)))
         if self.cursor < self.offset:
             self.offset = self.cursor
@@ -579,10 +743,14 @@ class Pane:
         if not total:
             return
         self._cursor = max(0, min(total - 1, self._cursor + delta))
+        # Over the blanks, in whichever direction the key was pressed: a
+        # spacer is a row of the pane and not a row of the conversation, and
+        # stopping on one would cost a keypress per message.
+        self._cursor = self._skip(self._cursor, 1 if delta >= 0 else -1, total)
         # Scrolling up is how somebody says they are reading something other
         # than the newest line, and scrolling back down to it says they are
         # done saying it.
-        self.follow = self._cursor >= total - 1
+        self.follow = self._cursor >= self._skip(total - 1, -1, total)
         self._scroll_into_view(view_h, total)
 
     def expand(self, width: int) -> bool:

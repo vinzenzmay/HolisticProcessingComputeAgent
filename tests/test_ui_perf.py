@@ -221,11 +221,14 @@ class TestARowArriving:
         ui = build(chat=100)
         ui.session.append(ChatEntry(kind="assistant", text="one\ntwo", seq=10**6))
         # Open, because it is the newest row: its label and both of its lines,
-        # at the bottom of the list and in that order.
+        # at the bottom of the list and in that order — and then the blank the
+        # row leaves under itself (`pane.SPACER_LINES`), which `extend` has to
+        # carry along with the lines or the spacing would be a property of how
+        # a row arrived.
         last = len(ui.chat.items) - 1
         lines = [text.strip() for owner, text, _ in ui.chat.flat(WIDTH - 2)
                  if owner == last]
-        assert lines == ["▾    hpca", "one", "two"]
+        assert lines == ["▾    hpca", "one", "two"] + [""] * ui.chat.spacer
 
 
 # ------------------------------------------------- cost tracks area, not n
