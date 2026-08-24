@@ -14,6 +14,10 @@ FORK, ROLLBACK = "fork", "rollback"
 PREVIEW_CHARS = 300
 PREVIEW_LINES = 6  # what the Textual dialog's max-height comes to
 
+# Said under both choices, since both do it: the message is not only cut away,
+# it is handed back to the message box to be sent again or edited first.
+BACK_TO_THE_BOX = "either way the message comes back to the box"
+
 
 def quoted(message: str, width: int) -> list[str]:
     """A few lines of what is being decided about, cut and marked as cut.
@@ -84,6 +88,13 @@ class RewindOverlay(ChoiceDialog):
     fork loses nothing, so it is the only one of the two that is safe under a
     key pressed by habit. Escape is still how you leave without either.
 
+    Both cuts end the conversation just before this message, and the reason
+    to make one is almost always to say it differently — so either choice
+    hands the message back to the box (`RowUI._rewind`, and `adopt` for the
+    fork, whose box belongs to a session that does not exist yet). The line
+    under the options says so, because a message reappearing where the user
+    is about to type is the kind of help that is alarming unannounced.
+
     The choice is read back by the caller rather than acted on here, for the
     reason app.py captures the session before pushing the screen: what happens
     belongs to the conversation the choice was made in.
@@ -97,6 +108,12 @@ class RewindOverlay(ChoiceDialog):
         ("esc", "cancel"),
     ]
     PICKS = {"f": FORK, "enter": FORK, "r": ROLLBACK}
+
+    def body(self, width: int, height: int) -> list[str]:
+        return super().body(width, height) + [
+            " " * width,
+            theme.faint + pad(f"      {BACK_TO_THE_BOX}", width) + RESET,
+        ]
 
     def keymap(self) -> list[tuple[str, str]]:
         return [

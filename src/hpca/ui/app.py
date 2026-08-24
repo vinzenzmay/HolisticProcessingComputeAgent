@@ -308,6 +308,12 @@ class RowUI:
         # can say and a confirmation is answered a keypress later than it is
         # asked (§4.3 item 38).
         self.quitting = False
+        # The message a fork was made at, waiting for the session that fork
+        # creates. A rollback can hand its message straight back — the
+        # conversation it belongs to is the one on screen — but a fork's copy
+        # does not exist until the core answers, so the text waits here and
+        # `adopt` puts it in the box of the session that arrives.
+        self._forked_draft = ""
         # The screens over the rows, innermost last. A stack rather than one
         # slot because the profiles screen is genuinely three deep — the list,
         # a profile's skills, one skill's file — and escaping the file has to
@@ -687,7 +693,16 @@ class RowUI:
         `session.created` names a conversation the user is about to be looking
         at; waiting for the next `session.rows` to list it would mean opening
         something the sidebar does not show.
+
+        It is also where a fork's message lands: `_rewind` could not put it
+        anywhere when the choice was made, because the session it belongs to
+        is the one this event brings. Nothing else creates a session without
+        clearing that text first, so an arrival with it still set is the fork
+        that asked for it.
         """
+        if self._forked_draft:
+            self._into_draft(session, self._forked_draft)
+            self._forked_draft = ""
         self._states[session.session_id] = session
         if session in self.sessions:
             return
@@ -1844,6 +1859,9 @@ class RowUI:
         elif isinstance(overlay, NewSessionOverlay) and overlay.chosen:
             # Only now, at the end of both stages: the command that makes a
             # conversation is sent once, and escaping either picker sends none.
+            # A fork whose copy never arrived must not hand its message to
+            # this one — a session made from the picker is not that fork.
+            self._forked_draft = ""
             self.send(NewSession(overlay.profile, overlay.backend))
             self.note = f"new session under “{overlay.profile}”"
         elif isinstance(overlay, ConfigOverlay) and overlay.saved:
@@ -2238,10 +2256,32 @@ class RowUI:
     def _rewind(self, overlay: RewindOverlay) -> None:
         """What the rewind decided, as an intent aimed at the session it was
         opened in — which is not necessarily the one on screen by the time it
-        closes."""
+        closes.
+
+        Either cut ends the conversation just before the message it was made
+        at, and the reason to make one is almost always to say that message
+        differently — so the message comes back to the box, the way a
+        cancelled queued one does (`hand_back`). Added to the draft rather
+        than replacing it, so nothing typed in between is lost.
+        """
+        # Both halves put the message where it goes *before* the command
+        # leaves, and both need to: the fork's copy can be created and adopted
+        # inside `send` (the demo's peer answers synchronously), and whatever
+        # the core says about the cut is the more specific news, so it must be
+        # the note left standing when it arrives.
         if overlay.choice == FORK:
+            # Not into this session's box: the fork's own is the one to type
+            # in, and it arrives with `session.created` (see `adopt`).
+            self._forked_draft = overlay.message
             self.send(Fork(overlay.session_id, overlay.seq))
         elif overlay.choice == ROLLBACK:
+            # Handed back as the cut is sent rather than when the trimmed
+            # transcript lands: a rollback has no reply of its own
+            # (`protocol.SessionRollback`), and a core that refuses it answers
+            # with a warning the user reads with the message still in the box
+            # — which is the recoverable half of being wrong here, since the
+            # draft is added to and never overwritten.
+            self.hand_back(overlay.session_id, overlay.message)
             self.send(Rollback(overlay.session_id, overlay.seq))
         # Either cut leaves you at the point the conversation now ends, which
         # is a place to say the next thing from.
