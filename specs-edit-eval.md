@@ -54,6 +54,10 @@ export HPCA_TEST_LLM_KEY=cubi
 # 1. plumbing sanity, no backend needed (expect success_rate 1.0):
 pixi run -e dev python evals/edit_eval.py --dry-run --tier all
 
+#    every run does this first and aborts on failure; alone, it checks the
+#    task checks themselves over all four tiers in about a second (§10):
+pixi run -e dev python evals/edit_eval.py --self-check
+
 # 2. treatment = the working tree:
 pixi run -e dev python evals/edit_eval.py \
     --tier all --repeats 3 --label treatment --out /tmp/treatment.json
@@ -545,3 +549,102 @@ model then uses (verified in a kept transcript). What was lost is one warning:
 used to say "nothing exists there yet", and it makes missing parents, so a
 typo lands the file somewhere plausible and reports success. Hence the caution
 in that result — the tool knows it is writing where nothing was.
+
+
+## 10. Checking the checks (2026-08-24)
+
+A `success_rate` is worth exactly what its checks are worth, and several of
+these were worth less than they looked. `simple_replace` — change one line of
+a five-line script — was graded like this:
+
+```python
+check=lambda ws: 'echo "starting run v2"' in (ws / "runner.sh").read_text()
+```
+
+Replaying a transcript by hand (the §7.1 habit, applied to something else)
+turned up a run that had written the new line over `set -euo pipefail`: one
+line destroyed, the line it was told to change still sitting there untouched,
+and `success: true`. **Presence of the wanted text is not absence of the wrong
+outcome**, and eight of the thirty-one tasks across the four tiers were graded
+on presence alone. The failure mode is quiet by construction — a check that is
+too generous does not error, it just returns a number that is too high, which
+then goes into a document and gets believed.
+
+### What a task declares now
+
+A `Task` may carry an `expected`: one correct outcome, as whole files, keyed
+by workspace-relative name (`None` for a file that has to be gone). It does
+two jobs.
+
+It is the **default check** — whole-file equality, which is the only check a
+run that also destroyed a neighbouring line cannot satisfy. A `str` compares
+through universal newlines (so `crlf_file` grades every character except the
+line endings, which are `crlf_preserved`'s business); `bytes` compares byte
+for byte. The single tolerance is a missing final newline, a text-file wart no
+task here grades.
+
+And it is the **fixture `--self-check` mutates**. Declare it even where the
+check itself has to stay tolerant, because tolerance is exactly what needs the
+guard. Four checks are still hand-written, each for a reason the whole-file
+comparison would get wrong:
+
+| task | why it stays tolerant |
+|---|---|
+| `trailing_space_trap` | the planted trailing space is the trap, not the grade — whether the new line carries one is the model's business, so the comparison is per line and rstripped |
+| `smart_quote_line` | the typography is what the *match* has to absorb, not what the write has to reproduce; the title line is graded on its words, the two lines around it exactly |
+| `second_file_after_first` | two files, a header, and a row count — and an elision placeholder is the thing it exists to catch |
+| the `create_*` / write tasks | "exactly these two lines" means the content, not blank-line taste (`_wrote_lines`) |
+
+Checks are also wrapped so an exception reads as a failure rather than an
+error: most of them read a file the task was supposed to write, and a check
+that cannot read it did not see a success.
+
+### The guard
+
+`evals/edit_eval.py --self-check` runs every task's check against a correct
+outcome and against every one-line corruption of it, over all four tiers, in
+about a second. It runs **before every eval too**, dry or live, and aborts the
+run — an eval whose checks cannot tell a correct file from a wrecked one is
+worse than no eval, because the number still looks like a measurement.
+
+Two mutation families, because they catch different tolerances:
+
+- **a line dropped** — stands in for a neighbour overwritten, a block deleted,
+  an edit landing one line up. This is what caught `simple_replace`.
+- **a line added** — content written twice, a placeholder copied back as text,
+  a rewrite that kept the old line and appended the new one. This is what a
+  `lines[:3] == wanted` check waves through, and one of those was in the
+  `paths` tier.
+
+Plus the file missing entirely, and — for a file the task was told to delete —
+still being there.
+
+The guard was checked in both directions: with the old presence-only checks
+restored in a copy, `--self-check` fails and names `simple_replace` and the
+three `create_*` path tasks; against the tightened ones it passes, and
+`--dry-run --tier all` still scores 1.0 over 28 runs, so nothing was tightened
+past what the tooling actually produces.
+
+### What this costs the numbers already in this document
+
+Every `success_rate` recorded before 2026-08-24 was measured with at least
+some presence-only checks and is therefore an **upper bound**, not comparable
+with anything measured after. That includes the v0.17.0→v0.18.0 reference
+figures, the envelope-vs-native tables in §7, and the arm comparison on
+`exp/edit-arms`. The direction of the error is known — old numbers are too
+high, never too low — and the effects those runs measured were large enough
+that the ranking is unlikely to move; but a future comparison has to be
+baseline-vs-treatment on *this* harness, not against a figure quoted here.
+
+### What is still unguarded
+
+`long_specs_write` declares no expected outcome: it asks for 150+ lines of
+plan prose, where "one line dropped" is not corruption. Its check stays
+structural (every section present, every agreed decision present, no `TBD`),
+now also refusing a document carrying an elision placeholder. `--self-check`
+names it on every run rather than passing over it silently.
+
+One pre-existing breakage, unrelated: `--dry-run --tier shift` scores 0.0 on
+this branch, because each shift route scripts a `register_path` call and there
+is no path registry any more. That tier is history rather than a check (see
+CLAUDE.md), and its scripts were not repaired.

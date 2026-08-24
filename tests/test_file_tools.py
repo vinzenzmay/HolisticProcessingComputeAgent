@@ -2,6 +2,7 @@
 
 import pytest
 
+from hpca.agent import hints
 from hpca.agent.context import ToolContext
 from hpca.agent.file_tools import add_file_tools, edit_preview
 from hpca.agent.history import ELISION_SENTINEL, omitted_list
@@ -767,6 +768,37 @@ class TestEditPreview:
 
     def test_a_deletion_shows_only_removed_lines(self, ctx):
         assert edit_preview({"old_lines": ["gone"], "new_lines": []}, ctx) == "- gone"
+
+
+class TestWhatTheToolDescriptionsPromise:
+    """The description is what the model reads while it is deciding, and the
+    result is what it reads afterwards. When the two disagree about whether a
+    deletion can be undone, the one that shapes the decision is the one that
+    was wrong — so the size limit belongs in both."""
+
+    def test_delete_points_at_edit_file_for_changing_a_file(self, tools):
+        # The delete-then-recreate loop this whole line of work started from:
+        # a model that wants to change three lines reaches for the tool whose
+        # description does not mention the alternative.
+        assert "edit_file" in tools.get("delete_file").description
+
+    def test_delete_does_not_promise_an_unconditional_backup(self, tools):
+        # It said "(trash-backed)" flat out, which is false for any file above
+        # safety.backup_limit_gb — the handler says so, but only once the file
+        # is already gone.
+        description = tools.get("delete_file").description
+        assert "backup size limit" in description
+
+    def test_the_create_exists_hint_routes_to_edit_file(self):
+        assert "edit_file" in hints.CREATE_FILE_EXISTS
+
+    def test_the_create_exists_hint_does_not_name_the_delete_tool(self):
+        # It used to read "to replace it wholesale, delete_file first (the old
+        # version stays recoverable from the trash)" — a named tool plus a
+        # reassurance, which is a recipe and was followed as one. The caveat
+        # survives; the tool name does not, because the name is the part that
+        # gets copied into the next call.
+        assert "delete_file" not in hints.CREATE_FILE_EXISTS
 
 
 class TestDescribeCall:

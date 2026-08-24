@@ -891,7 +891,13 @@ def add_file_tools(registry: ToolRegistry) -> ToolRegistry:
     registry.register(
         Tool(
             name="delete_file",
-            description="Delete a file by path (trash-backed)",
+            description=(
+                "Delete a file at a path. To change one, use edit_file "
+                "instead: deleting and writing it again loses every line you "
+                "do not retype. Deleted files go to the trash and come back "
+                "with restore_file — except ones over the backup size "
+                "limit, which are gone for good"
+            ),
             params=DeleteFileParams,
             handler=delete_file,
             is_destructive_call=_delete_resolvable,

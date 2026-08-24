@@ -296,8 +296,25 @@ class Task:
     # registry key -> (file name, content). Content written verbatim (bytes
     # when bytes are given, e.g. CRLF fixtures).
     files: dict[str, tuple[str, str | bytes]]
-    # predicate on the workspace dir: did the task succeed?
-    check: Callable[[Path], bool]
+    # One correct outcome, as whole files: workspace-relative name -> the
+    # content a correct run leaves there (a str compares through universal
+    # newlines, bytes compares byte for byte), or None for a file that has to
+    # be gone.
+    #
+    # It does two jobs. It is the default `check` — whole-file equality, which
+    # is the only check a run that also destroyed a neighbouring line cannot
+    # satisfy. And it is the fixture `--self-check` mutates: the task's check
+    # is run against this outcome and against every one-line corruption of it,
+    # so a check that would pass a wrecked file fails before a token is spent.
+    # Declare it even where the check itself has to stay tolerant (a trailing
+    # space the task does not grade, blank-line taste) — tolerance is exactly
+    # what needs the guard. Leave it out only where the result is genuinely
+    # open, and `--self-check` reports the task as unguarded rather than
+    # letting the gap pass unseen.
+    expected: dict[str, str | bytes | None] = field(default_factory=dict)
+    # predicate on the workspace dir: did the task succeed? None derives one
+    # from `expected`.
+    check: Callable[[Path], bool] | None = None
     # registry key -> relative name, registered but NOT created. A key may
     # legitimately point at nothing: register_path takes a path before it
     # exists, so the model meets one whenever it names a file it is about to
@@ -328,6 +345,16 @@ class Task:
     # not the call itself but whether a path survives the distance to it.
     # Built per run (it may need the workspace path), so it is a callable.
     preamble: Callable[[Path], list[dict]] | None = None
+
+    def __post_init__(self) -> None:
+        if self.check is None:
+            if not self.expected:
+                raise ValueError(
+                    f"task {self.name}: give it a check, or an expected result "
+                    "to derive one from"
+                )
+            self.check = _matches(self.expected)
+        self.check = _never_raises(self.check)
 
 
 def _edit(key: str, old: list[str], new: list[str]) -> dict:
@@ -416,8 +443,17 @@ def _second_file_ok(ws: Path) -> bool:
         return False
     if any(_ELISION_IN_FILE.search(p.read_text()) for p in (first, second)):
         return False
+    for path in (first, second):
+        # The two-line comment header is part of the ask, and `_data_rows`
+        # skips comments — so without this, a file that lost one of them
+        # counted as whole.
+        head = path.read_text().splitlines()[:2]
+        if len(head) < 2 or not all(line.startswith("#") for line in head):
+            return False
     cd8 = sum(1 for _, _, lineage in _CLUSTER_ROWS if lineage == "Cd8")
-    return len(_data_rows(first)) >= len(_CLUSTER_ROWS) and len(_data_rows(second)) >= cd8
+    # `==`, not `>=`: a row the model invented is as wrong as one it lost, and
+    # a placeholder line that survives the marker check is an extra row.
+    return len(_data_rows(first)) == len(_CLUSTER_ROWS) and len(_data_rows(second)) == cd8
 
 
 BIG_FILE_HEADER = "# run manifest — generated, do not hand-edit sections A/B\n"
@@ -431,6 +467,92 @@ def _big_file() -> str:
         else:
             lines.append(f"entry_{i:03d} = value_{i:03d}")
     return "\n".join(lines) + "\n"
+
+
+def _never_raises(check: Callable[[Path], bool]) -> Callable[[Path], bool]:
+    """A check that cannot read the file did not see a success.
+
+    Most checks here read a file the task was supposed to write, and raise
+    FileNotFoundError when it is not there. In a run that reads out as an
+    error rather than a failure, which is the wrong story about what happened;
+    in `--self-check` it stops the sweep at the first task instead of
+    reporting every one. Swallowing the exception would hide a typo'd check as
+    a tier that suddenly scores zero — except that `--self-check` runs every
+    check against a correct outcome first, and says so when one rejects it.
+    """
+
+    def guarded(ws: Path) -> bool:
+        try:
+            return bool(check(ws))
+        except Exception:
+            return False
+
+    return guarded
+
+
+def _same_text(got: str, want: str) -> bool:
+    """``got`` is ``want``, give or take the final newline.
+
+    Exact, with one tolerance: a file that ends without its last newline. That
+    is a text-file wart no task here grades, while everything a corrupted run
+    leaves behind — a destroyed neighbour, a leftover blank line, a line
+    written twice — still fails.
+    """
+    return got == want or (want.endswith("\n") and got == want[:-1])
+
+
+def _matches(expected: dict[str, str | bytes | None]) -> Callable[[Path], bool]:
+    """Every file in ``expected``, whole.
+
+    The default check, and the reason it is the default: presence of the
+    wanted text is not absence of the wrong outcome. ``simple_replace`` asked
+    for one line of a five-line script to change and checked only that the new
+    line was somewhere in the file — so a live run that wrote it over
+    ``set -euo pipefail``, destroying one line and leaving the line it was told
+    to change exactly where it was, scored a pass (2026-08-24; "Checking the
+    checks" in specs-edit-eval.md). Where the correct result is determined,
+    comparing the whole file is the only check that cannot be fooled that way.
+    """
+
+    def check(ws: Path) -> bool:
+        for name, content in expected.items():
+            path = ws / name
+            if content is None:
+                if path.exists():
+                    return False
+                continue
+            if not path.is_file():
+                return False
+            if isinstance(content, bytes):
+                if path.read_bytes() != content:
+                    return False
+            elif not _same_text(path.read_text(), content):
+                return False
+        return True
+
+    return check
+
+
+def _wrote_lines(name: str, lines: list[str]) -> Callable[[Path], bool]:
+    """A file whose non-blank lines are exactly ``lines``.
+
+    For the tasks that say "exactly these two lines" and mean the content, not
+    blank-line taste. Tighter than the substring checks it replaces in the way
+    that matters for a written file: an elision placeholder copied back as
+    content — the failure ``second_file_after_first`` exists for — is an extra
+    line, and no longer passes.
+    """
+
+    def check(ws: Path) -> bool:
+        path = ws / name
+        if not path.is_file():
+            return False
+        text = path.read_text()
+        if _ELISION_IN_FILE.search(text):
+            return False
+        return [ln.strip() for ln in text.splitlines() if ln.strip()] == lines
+
+    return check
 
 
 def build_tasks() -> list[Task]:
@@ -452,7 +574,11 @@ def build_tasks() -> list[Task]:
                 "echo \"starting run\" so it says \"starting run v2\" instead."
             ),
             files={"runner": ("runner.sh", small_sh)},
-            check=lambda ws: 'echo "starting run v2"' in (ws / "runner.sh").read_text(),
+            expected={
+                "runner.sh": small_sh.replace(
+                    'echo "starting run"', 'echo "starting run v2"'
+                )
+            },
             fake_calls=[
                 _read("runner"),
                 _edit("runner", ['echo "starting run"'], ['echo "starting run v2"']),
@@ -470,8 +596,12 @@ def build_tasks() -> list[Task]:
                 "threads = 16, keeping the trailing comment exactly as it is."
             ),
             files={"manifest": ("manifest.cfg", _big_file())},
-            check=lambda ws: "threads = 16        # section C: tunables"
-            in (ws / "manifest.cfg").read_text(),
+            expected={
+                "manifest.cfg": _big_file().replace(
+                    "threads = 4        # section C: tunables",
+                    "threads = 16        # section C: tunables",
+                )
+            },
             fake_calls=[
                 _read("manifest"),
                 _edit(
@@ -493,7 +623,14 @@ def build_tasks() -> list[Task]:
                 "retries = 2 to retries = 5. The file uses CRLF line endings."
             ),
             files={"winconf": ("settings.ini", crlf)},
-            check=lambda ws: b"retries = 5" in (ws / "settings.ini").read_bytes(),
+            # str rather than bytes: whether the CRLFs survive is the hard
+            # tier's question (`crlf_preserved`), and read_text folds them, so
+            # this grades every character except the ones that task grades.
+            expected={
+                "settings.ini": (
+                    "[settings]\nretries = 5\ntimeout = 30\nverbose = false\n"
+                )
+            },
             fake_calls=[
                 _read("winconf"),
                 # read_text() applies universal newlines, so handlers see LF
@@ -516,8 +653,9 @@ def build_tasks() -> list[Task]:
                 "to normalize = true. Leave the comment line untouched."
             ),
             files={"unifile": ("analysis.cfg", uni)},
-            check=lambda ws: "normalize = true" in (ws / "analysis.cfg").read_text()
-            and "don’t touch" in (ws / "analysis.cfg").read_text(),
+            expected={
+                "analysis.cfg": uni.replace("normalize = false", "normalize = true")
+            },
             fake_calls=[
                 _read("unifile"),
                 _edit("unifile", ["normalize = false"], ["normalize = true"]),
@@ -535,8 +673,7 @@ def build_tasks() -> list[Task]:
                 "node04 at the end of the file, after node03."
             ),
             files={"hosts": ("hosts.txt", hosts)},
-            check=lambda ws: (ws / "hosts.txt").read_text().rstrip("\n").split("\n")
-            == ["node01", "node02", "node03", "node04"],
+            expected={"hosts.txt": "node01\nnode02\nnode03\nnode04\n"},
             fake_calls=[
                 _read("hosts"),
                 _edit("hosts", ["node03"], ["node03", "node04"]),
@@ -562,11 +699,15 @@ def build_tasks() -> list[Task]:
                 "samtools sort -@ 8 in.bam -o sorted.bam && samtools index sorted.bam"
             ),
             files={"pipeline": ("pipeline.sh", block_sh)},
-            check=lambda ws: (
-                "samtools sort -@ 8 in.bam -o sorted.bam && samtools index sorted.bam"
-                in (ws / "pipeline.sh").read_text()
-                and "flagstat" not in (ws / "pipeline.sh").read_text()
-            ),
+            expected={
+                "pipeline.sh": (
+                    "#!/bin/bash\n"
+                    "module load samtools\n"
+                    "samtools sort -@ 8 in.bam -o sorted.bam && "
+                    "samtools index sorted.bam\n"
+                    'echo "pipeline done"\n'
+                )
+            },
             fake_calls=[
                 _read("pipeline"),
                 _edit(
@@ -594,12 +735,6 @@ def build_tasks() -> list[Task]:
         "threads = 8\n"
         "mem_gb = 16\n"
     )
-    def _check_dup(ws: Path) -> bool:
-        text = (ws / "stages.cfg").read_text()
-        call_part = text.split("[stage: call]")[-1]
-        align_part = text.split("[stage: call]")[0]
-        return "mem_gb = 64" in call_part and "mem_gb = 16" in align_part
-
     tasks.append(
         Task(
             name="duplicate_blocks",
@@ -609,7 +744,16 @@ def build_tasks() -> list[Task]:
                 "'call' stage ONLY; leave the 'align' stage at 16."
             ),
             files={"stages": ("stages.cfg", dup)},
-            check=_check_dup,
+            # The align block coming through untouched is half the task, and
+            # writing that half by hand is what the old check got wrong: it
+            # looked for "mem_gb = 16" anywhere above the call header, which a
+            # run that flattened the threads line still satisfies.
+            expected={
+                "stages.cfg": (
+                    "[stage: align]\nthreads = 8\nmem_gb = 16\n\n"
+                    "[stage: call]\nthreads = 8\nmem_gb = 64\n"
+                )
+            },
             fake_calls=[
                 _read("stages"),
                 _edit(
@@ -639,8 +783,11 @@ def build_tasks() -> list[Task]:
                 "results.append(item.value * 2), keeping the code valid."
             ),
             files={"pyfile": ("process.py", py)},
-            check=lambda ws: "            results.append(item.value * 2)"
-            in (ws / "process.py").read_text(),
+            expected={
+                "process.py": py.replace(
+                    "results.append(item.value)", "results.append(item.value * 2)"
+                )
+            },
             fake_calls=[
                 _read("pyfile"),
                 _edit(
@@ -668,8 +815,9 @@ def build_tasks() -> list[Task]:
                 "print lines; keep everything else exactly as it is."
             ),
             files={"debugfile": ("job.txt", dbg)},
-            check=lambda ws: (ws / "job.txt").read_text()
-            == "input = load()\nresult = transform(input)\nsave(result)\n",
+            expected={
+                "job.txt": "input = load()\nresult = transform(input)\nsave(result)\n"
+            },
             fake_calls=[
                 _read("debugfile"),
                 _edit(
@@ -694,9 +842,8 @@ def build_tasks() -> list[Task]:
                 "heading '# Run notes' and a line 'Started 2026-08-06.'"
             ),
             files={},
-            check=lambda ws: (ws / "NOTES.md").is_file()
-            and "# Run notes" in (ws / "NOTES.md").read_text()
-            and "Started 2026-08-06." in (ws / "NOTES.md").read_text(),
+            expected={"NOTES.md": "# Run notes\nStarted 2026-08-06.\n"},
+            check=_wrote_lines("NOTES.md", ["# Run notes", "Started 2026-08-06."]),
             fake_calls=[
                 {
                     "action": "tool_call",
@@ -728,7 +875,7 @@ def build_tasks() -> list[Task]:
                 "from 10 to 50. Keep the YAML indentation intact."
             ),
             files={"runconf": ("run.yaml", yaml)},
-            check=lambda ws: "  epochs: 50" in (ws / "run.yaml").read_text(),
+            expected={"run.yaml": yaml.replace("  epochs: 10", "  epochs: 50")},
             fake_calls=[
                 _read("runconf"),
                 _edit("runconf", ["  epochs: 10"], ["  epochs: 50"]),
@@ -747,8 +894,16 @@ def build_tasks() -> list[Task]:
                 "beta = 7."
             ),
             files={"trapfile": ("params.txt", trap)},
-            check=lambda ws: "beta = 7" in (ws / "params.txt").read_text()
-            and "beta = 2" not in (ws / "params.txt").read_text(),
+            # The trailing space is the trap, not the grade — whether the new
+            # line carries one is the model's business — so the comparison is
+            # per line and rstripped. Everything else is exact: alpha and gamma
+            # have to still be there, which the old check never asked.
+            expected={"params.txt": "alpha = 1\nbeta = 7\ngamma = 3\n"},
+            check=lambda ws: [
+                line.rstrip()
+                for line in (ws / "params.txt").read_text().splitlines()
+            ]
+            == ["alpha = 1", "beta = 7", "gamma = 3"],
             fake_calls=[
                 _read("trapfile"),
                 _edit("trapfile", ["beta = 2 "], ["beta = 7"]),
@@ -796,8 +951,12 @@ def build_hard_tasks() -> list[Task]:
                 "the line before editing."
             ),
             files={"pipeline": ("pipeline.cfg", _deep_file())},
-            check=lambda ws: "chunk_size = 8192      # stage K: io tuning, keep power of two"
-            in (ws / "pipeline.cfg").read_text(),
+            expected={
+                "pipeline.cfg": _deep_file().replace(
+                    "chunk_size = 4096      # stage K: io tuning, keep power of two",
+                    "chunk_size = 8192      # stage K: io tuning, keep power of two",
+                )
+            },
             fake_calls=[
                 _read("pipeline"),
                 _edit(
@@ -826,10 +985,14 @@ def build_hard_tasks() -> list[Task]:
                 "keep its CRLF line endings."
             ),
             files={"clusterconf": ("cluster.ini", crlf_body)},
-            check=lambda ws: (
-                b"max_jobs = 32\r\n" in (ws / "cluster.ini").read_bytes()
-                and b"queue = short\r\n" in (ws / "cluster.ini").read_bytes()
-            ),
+            # bytes, so the line endings are graded rather than folded away:
+            # that is the whole point of this one.
+            expected={
+                "cluster.ini": (
+                    b"[cluster]\r\nqueue = short\r\n"
+                    b"max_jobs = 32\r\nnotify = none\r\n"
+                )
+            },
             fake_calls=[
                 _read("clusterconf"),
                 _edit("clusterconf", ["max_jobs = 8"], ["max_jobs = 32"]),
@@ -928,6 +1091,11 @@ def build_hard_tasks() -> list[Task]:
         text = path.read_text()
         if len(text.split("\n")) < 150 or "TBD" in text:
             return False
+        # A placeholder copied back as content is how a long incremental write
+        # actually breaks (`second_file_after_first`), and a document carrying
+        # one is not a finished plan however many sections it has.
+        if _ELISION_IN_FILE.search(text):
+            return False
         lowered = text.lower()
         # every agreed decision landed (any of its marker phrases), and every
         # section exists — case-insensitive; the tooling is under test, not
@@ -996,6 +1164,24 @@ def build_hard_tasks() -> list[Task]:
         "title = “Weekly QC – node health”\n"
         "footer = plain\n"
     )
+    def _smart_quote_ok(ws: Path) -> bool:
+        # The typography is what the MATCH has to absorb, not what the write
+        # has to reproduce, so the title line is graded on its words. The two
+        # lines around it are graded exactly — that is the half the old check
+        # left open.
+        lines = (ws / "report.cfg").read_text().splitlines()
+        if len(lines) != 3:
+            return False
+        header, title, footer = lines
+        return (
+            header == "# report strings"
+            and footer == "footer = plain"
+            and "Daily" in title
+            and "Weekly" not in title
+            and "QC" in title
+            and "node health" in title
+        )
+
     tasks.append(
         Task(
             name="smart_quote_line",
@@ -1005,8 +1191,8 @@ def build_hard_tasks() -> list[Task]:
                 "line as it is."
             ),
             files={"report": ("report.cfg", smart)},
-            check=lambda ws: "Daily QC" in (ws / "report.cfg").read_text()
-            and "Weekly" not in (ws / "report.cfg").read_text(),
+            expected={"report.cfg": smart.replace("Weekly QC", "Daily QC")},
+            check=_smart_quote_ok,
             fake_calls=[
                 _read("report"),
                 _edit(
@@ -1034,8 +1220,15 @@ def build_hard_tasks() -> list[Task]:
             ),
             files={},
             missing={"results": "results"},
-            check=lambda ws: (ws / "results" / "README.md").is_file()
-            and "nightly QC" in (ws / "results" / "README.md").read_text(),
+            expected={
+                "results/README.md": (
+                    "# Results\nPopulated by the nightly QC run.\n"
+                )
+            },
+            check=_wrote_lines(
+                "results/README.md",
+                ["# Results", "Populated by the nightly QC run."],
+            ),
             fake_calls=[
                 {
                     "action": "tool_call",
@@ -1067,8 +1260,8 @@ def build_hard_tasks() -> list[Task]:
             ),
             files={},
             missing={"notes": "notes.txt"},
-            check=lambda ws: (ws / "notes.txt").is_file()
-            and (ws / "notes.txt").read_text().strip() == "no output yet",
+            expected={"notes.txt": "no output yet\n"},
+            check=_wrote_lines("notes.txt", ["no output yet"]),
             fake_calls=[
                 _read("notes"),
                 {
@@ -1110,6 +1303,10 @@ def build_hard_tasks() -> list[Task]:
                 "containing only the clusters whose lineage is Cd8."
             ),
             files={"clusters": ("clusters.csv", _clusters_csv())},
+            expected={
+                "annotation.tsv": "\n".join(_annotation_lines()) + "\n",
+                "annotation_cd8.tsv": "\n".join(_annotation_lines("Cd8")) + "\n",
+            },
             check=_second_file_ok,
             # A refusal is a legitimate route here — the treatment branch
             # bounces a marker payload rather than writing it — so the budget
@@ -1160,9 +1357,8 @@ def build_shift_tasks() -> list[Task]:
             missing={"outdir": "reslts"},
             templated=True,
             system_note=_SHIFT_SYSTEM_NOTE,
-            check=lambda ws: (ws / "results" / "README.md").is_file()
-            and "nightly QC" in (ws / "results" / "README.md").read_text()
-            and "# Results" in (ws / "results" / "README.md").read_text(),
+            expected={"results/README.md": "\n".join(readme_lines) + "\n"},
+            check=_wrote_lines("results/README.md", readme_lines),
             fake_calls=[
                 _register("results_dir", "{workspace}/results"),
                 _create("results_dir", "README.md", readme_lines),
@@ -1192,9 +1388,11 @@ def build_shift_tasks() -> list[Task]:
             unregistered={"conf/sampler.cfg": sampler},
             templated=True,
             system_note=_SHIFT_SYSTEM_NOTE,
-            check=lambda ws: "max_reads = 5000"
-            in (ws / "conf" / "sampler.cfg").read_text()
-            and "seed = 17" in (ws / "conf" / "sampler.cfg").read_text(),
+            expected={
+                "conf/sampler.cfg": sampler.replace(
+                    "max_reads = 1000", "max_reads = 5000"
+                )
+            },
             fake_calls=[
                 _register("sampler", "{workspace}/conf/sampler.cfg"),
                 _edit("sampler", ["max_reads = 1000"], ["max_reads = 5000"]),
@@ -1219,11 +1417,15 @@ def build_shift_tasks() -> list[Task]:
             unregistered={"analysis/inputs.txt": "sample_a\nsample_b\n"},
             templated=True,
             system_note=_SHIFT_SYSTEM_NOTE,
-            check=lambda ws: (ws / "analysis" / "SUMMARY.md").is_file()
-            and "# Analysis summary"
-            in (ws / "analysis" / "SUMMARY.md").read_text()
-            and "All samples passed QC."
-            in (ws / "analysis" / "SUMMARY.md").read_text(),
+            expected={
+                "analysis/SUMMARY.md": (
+                    "# Analysis summary\nAll samples passed QC.\n"
+                )
+            },
+            check=_wrote_lines(
+                "analysis/SUMMARY.md",
+                ["# Analysis summary", "All samples passed QC."],
+            ),
             fake_calls=[
                 _register("analysis_dir", "{workspace}/analysis"),
                 _create(
@@ -1397,29 +1599,43 @@ def _recall_mid_preamble(workspace: Path) -> list[dict]:
     return pad[:half] + established + pad[half:]
 
 
+# The annotation as the edit tasks are supposed to leave it: one cell_type
+# changed, every other row exactly where it was.
+ANNOTATION_EDITED = ANNOTATION_TSV.replace("12\tProlif\tCd8", "12\tProlif_S\tCd8")
+
+
 def _annotation_edited(ws: Path) -> bool:
+    # "Leave every other row exactly as it is" is the ask, so every other row
+    # is the check. The old one asked only about cluster 12, which a run that
+    # rewrote the file around it still passed.
     path = ws / DEEP_DIR / "annotation.tsv"
-    if not path.is_file():
-        return False
-    text = path.read_text()
-    return "12\tProlif_S\tCd8" in text and "12\tProlif\tCd8" not in text
+    return path.is_file() and _same_text(path.read_text(), ANNOTATION_EDITED)
 
 
 def _readme_written(ws: Path) -> bool:
     path = ws / DEEP_DIR / "README.md"
     if not path.is_file():
         return False
-    lines = [line.strip() for line in path.read_text().splitlines() if line.strip()]
-    return lines[:3] == README_LINES
+    text = path.read_text()
+    if _ELISION_IN_FILE.search(text):
+        return False
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    # `== `, not `[:3] ==`: the ask is "exactly these three lines", and a
+    # fourth line the model invented is not those three lines.
+    return lines == README_LINES
 
 
 def _backup_deleted(ws: Path) -> bool:
     # Both halves matter: the right file gone AND the neighbour untouched. A
     # near-miss path that deletes annotation.tsv is the failure this tier is
     # looking for, and "the backup is gone" alone would score it as a pass.
+    neighbour = ws / DEEP_DIR / "annotation.tsv"
     return (
         not (ws / DEEP_DIR / "annotation_backup.tsv").exists()
-        and (ws / DEEP_DIR / "annotation.tsv").is_file()
+        and neighbour.is_file()
+        # Present is not intact: a run that deleted the backup and then edited
+        # the wrong file has still lost the user's data.
+        and _same_text(neighbour.read_text(), ANNOTATION_TSV)
     )
 
 
@@ -1478,6 +1694,15 @@ _BACKUP = "{workspace}/" + DEEP_DIR + "/annotation_backup.tsv"
 _README = "{workspace}/" + DEEP_DIR + "/README.md"
 _EDIT = {"old_lines": ["12\tProlif\tCd8"], "new_lines": ["12\tProlif_S\tCd8"]}
 
+# One correct outcome per verb, for `--self-check` to mutate. The three checks
+# above are shared by all nine tasks, so these are too.
+_README_DONE = {f"{DEEP_DIR}/README.md": "\n".join(README_LINES) + "\n"}
+_ANNOTATION_DONE = {f"{DEEP_DIR}/annotation.tsv": ANNOTATION_EDITED}
+_BACKUP_GONE = {
+    f"{DEEP_DIR}/annotation_backup.tsv": None,
+    f"{DEEP_DIR}/annotation.tsv": ANNOTATION_TSV,
+}
+
 
 def build_path_tasks() -> list[Task]:
     """Can a long path survive a long context, across the three write verbs?
@@ -1503,6 +1728,7 @@ def build_path_tasks() -> list[Task]:
                 "{workspace}/" + DEEP_DIR + " with exactly these three lines:\n"
                 + body
             ),
+            expected=_README_DONE,
             check=_readme_written,
             fake_calls=[_fake_create(_README, README_LINES)],
         ),
@@ -1518,6 +1744,7 @@ def build_path_tasks() -> list[Task]:
                 "mislabelled: change its cell_type from Prolif to Prolif_S. "
                 "Leave every other row exactly as it is."
             ),
+            expected=_ANNOTATION_DONE,
             check=_annotation_edited,
             fake_calls=[_fake_target("edit_file", _ANNOTATION, **_EDIT)],
         ),
@@ -1533,6 +1760,7 @@ def build_path_tasks() -> list[Task]:
                 "we do not need the previous round any more. Do not touch "
                 "annotation.tsv."
             ),
+            expected=_BACKUP_GONE,
             check=_backup_deleted,
             fake_calls=[_fake_target("delete_file", _BACKUP)],
         ),
@@ -1548,6 +1776,7 @@ def build_path_tasks() -> list[Task]:
                 "directory you told me about earlier, with exactly these three "
                 "lines:\n" + body
             ),
+            expected=_README_DONE,
             check=_readme_written,
             fake_calls=[_fake_create(_README, README_LINES)],
         ),
@@ -1563,6 +1792,7 @@ def build_path_tasks() -> list[Task]:
                 "directory, cluster 12 is mislabelled: change its cell_type "
                 "from Prolif to Prolif_S. Leave every other row exactly as it is."
             ),
+            expected=_ANNOTATION_DONE,
             check=_annotation_edited,
             fake_calls=[_fake_target("edit_file", _ANNOTATION, **_EDIT)],
         ),
@@ -1578,6 +1808,7 @@ def build_path_tasks() -> list[Task]:
                 "cluster-annotation results directory — annotation_backup.tsv. "
                 "Do not touch annotation.tsv."
             ),
+            expected=_BACKUP_GONE,
             check=_backup_deleted,
             fake_calls=[_fake_target("delete_file", _BACKUP)],
         ),
@@ -1593,6 +1824,7 @@ def build_path_tasks() -> list[Task]:
                 "directory you told me about earlier, with exactly these three "
                 "lines:\n" + body
             ),
+            expected=_README_DONE,
             check=_readme_written,
             fake_calls=[_fake_create(_README, README_LINES)],
         ),
@@ -1608,6 +1840,7 @@ def build_path_tasks() -> list[Task]:
                 "directory, cluster 12 is mislabelled: change its cell_type "
                 "from Prolif to Prolif_S. Leave every other row exactly as it is."
             ),
+            expected=_ANNOTATION_DONE,
             check=_annotation_edited,
             fake_calls=[_fake_target("edit_file", _ANNOTATION, **_EDIT)],
         ),
@@ -1623,6 +1856,7 @@ def build_path_tasks() -> list[Task]:
                 "cluster-annotation results directory — annotation_backup.tsv. "
                 "Do not touch annotation.tsv."
             ),
+            expected=_BACKUP_GONE,
             check=_backup_deleted,
             fake_calls=[_fake_target("delete_file", _BACKUP)],
         ),
@@ -1785,6 +2019,120 @@ def _render_prompt(task: Task, workspace: Path) -> str:
     else:
         prompt = task.prompt
     return _in_this_branchs_words(prompt, task, workspace)
+
+
+# ------------------------------------------------------ checking the checks
+
+
+def _fixture_files(task: Task) -> dict[str, str | bytes]:
+    """The workspace a task starts from, before the model touches anything."""
+    files = {name: content for _, (name, content) in task.files.items()}
+    files.update(getattr(task, "unregistered", {}))
+    return files
+
+
+def _write_file(path: Path, content: str | bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(content, bytes):
+        path.write_bytes(content)
+    else:
+        path.write_text(content)
+
+
+def _mutants(
+    content: str | bytes | None,
+) -> list[tuple[str, str | bytes | None]]:
+    """One-line corruptions of a correct file, and its absence, each labelled.
+
+    Two families, because they catch different tolerances. Dropping a line
+    stands in for a neighbour overwritten, a block deleted, an edit landing
+    one line up — the failure that scored a pass in the audit that added this.
+    Adding a line stands in for content written twice, a placeholder copied
+    back as text, or a rewrite that kept the old line and appended the new
+    one; that is the one a `lines[:3] == wanted` check waves through, and one
+    of those was in this file.
+
+    A check that survives both is not proving much about prose, but it is
+    proving the one thing a success_rate has to mean: the file it looked at
+    was not wrecked.
+    """
+    if content is None:
+        # A file the task was told to delete; the corruption is it still being
+        # there.
+        return [("still there", "not deleted\n")]
+    if isinstance(content, bytes):
+        sep = b"\r\n" if b"\r\n" in content else b"\n"
+        junk = b"corrupted"
+        lines = content.split(sep)
+    else:
+        sep, junk = "\n", "corrupted"
+        lines = content.split("\n")
+    trailing = lines[-1:] == [sep[:0]]  # the file's own final newline
+    body = lines[:-1] if trailing else lines
+    tail = lines[len(body) :]
+    out: list[tuple[str, str | bytes | None]] = [
+        (f"line {i + 1} dropped", sep.join(lines[:i] + lines[i + 1 :]))
+        for i, line in enumerate(lines)
+        if line
+    ]
+    out.append(("a line appended", sep.join(body + [junk] + tail)))
+    out.append(("a line inserted", sep.join(body[:1] + [junk] + body[1:] + tail)))
+    out.append(("gone", None))
+    return out
+
+
+def self_check(tasks: list[Task]) -> tuple[list[str], list[str]]:
+    """Run every task's check against a correct outcome and against corruptions
+    of it. Returns (failures, tasks with no declared outcome).
+
+    This runs before every eval rather than living in a test file because of
+    how the failure mode presents: a check that scores a wrecked file as a
+    success does not fail loudly, it quietly inflates a number that then goes
+    into a document and gets believed. One did, and it was caught by
+    reading a transcript by hand, which is not a method.
+    """
+    failures: list[str] = []
+    unguarded: list[str] = []
+    for task in tasks:
+        fixture = _fixture_files(task)
+        with tempfile.TemporaryDirectory(prefix="hpca_selfcheck_") as tmp:
+            ws = Path(tmp)
+
+            def build(*, correct: bool, mutation=None) -> None:
+                for entry in list(ws.iterdir()):
+                    shutil.rmtree(entry) if entry.is_dir() else entry.unlink()
+                for name, content in fixture.items():
+                    _write_file(ws / name, content)
+                if not correct:
+                    return
+                layer = dict(task.expected)
+                if mutation is not None:
+                    layer[mutation[0]] = mutation[1]
+                for name, content in layer.items():
+                    path = ws / name
+                    if content is None:
+                        if path.exists():
+                            path.unlink()
+                    else:
+                        _write_file(path, content)
+
+            build(correct=False)
+            if task.check(ws):
+                failures.append(f"{task.name}: passes on the untouched fixture")
+            if not task.expected:
+                unguarded.append(task.name)
+                continue
+            build(correct=True)
+            if not task.check(ws):
+                failures.append(f"{task.name}: rejects a correct outcome")
+                continue
+            for name, content in task.expected.items():
+                for what, mutant in _mutants(content):
+                    build(correct=True, mutation=(name, mutant))
+                    if task.check(ws):
+                        failures.append(f"{task.name}: passes with {name} {what}")
+                        break  # one report per file is enough to fix it
+    return failures, unguarded
 
 
 async def run_task(task: Task, llm, tools: ToolRegistry, keep: bool = False) -> dict:
@@ -2023,6 +2371,12 @@ async def main() -> int:
         "every tier",
     )
     parser.add_argument(
+        "--self-check",
+        action="store_true",
+        help="check the task checks themselves against a correct outcome and "
+        "every one-line corruption of it, over every tier, and exit",
+    )
+    parser.add_argument(
         "--tool-protocol",
         choices=["envelope", "native"],
         default="envelope",
@@ -2051,6 +2405,34 @@ async def main() -> int:
         if not tasks:
             print(f"no task matches --only {args.only!r}")
             return 2
+
+    # The checks are checked first, always: an eval whose success_rate cannot
+    # tell a correct file from a corrupted one is worse than no eval, because
+    # the number still looks like a measurement. Under a second, and it aborts
+    # the run rather than warning about it.
+    if args.self_check:
+        tasks = (
+            build_tasks() + build_hard_tasks() + build_shift_tasks()
+            + build_path_tasks()
+        )
+    failures, unguarded = self_check(tasks)
+    if unguarded:
+        print(
+            "no declared outcome, so not mutation-tested: "
+            + ", ".join(unguarded)
+        )
+    if failures:
+        print(
+            "SELF-CHECK FAILED — these checks cannot tell a correct run from a "
+            "corrupted one:"
+        )
+        for line in failures:
+            print("  " + line)
+        return 2
+    if args.self_check:
+        print(f"self-check: {len(tasks)} tasks, checks hold")
+        return 0
+
     tools = _eval_tool_registry()
 
     live = None
