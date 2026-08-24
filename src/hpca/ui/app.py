@@ -27,17 +27,22 @@ from hpca.ui.ansi import (
     safe,
 )
 from hpca.ui.approval import decision_height, render_decision
+from hpca.ui.compaction import (
+    ACCEPT,
+    COMMENT_REFUSAL,
+    DISCARD,
+    RETRY,
+    CompactReview,
+    render_review,
+    review_height,
+)
 from hpca.ui.editor import Editor
 from hpca.ui.keys import NEWLINE_KEYS, is_paste, paste_text
 from hpca.ui.overlays import (
-    ACCEPT,
-    DISCARD,
     FORK,
     NO_SESSION,
-    RETRY,
     ROLLBACK,
     UNQUEUE,
-    CompactReviewOverlay,
     ConfigOverlay,
     HelpOverlay,
     InspectOverlay,
@@ -111,15 +116,18 @@ ESC_STOP_WINDOW = 1.0
 # was outside the ring once, and that was a lockout: its own keys moved the
 # focus away and nothing could move it back, so the turn stayed parked on a
 # question that could no longer be answered.
-SESSIONS, CHAT, INPUT, WATCHERS, DECISION, OFFER = range(6)
+SESSIONS, CHAT, INPUT, WATCHERS, DECISION, OFFER, REVIEW = range(7)
 
-# The other thing that can stand in the message box's slot: a question the
-# core raised about this conversation — today, triage offering to remember a
-# failed job's error signature (`state.Offer`). It is in the ring for the same
-# reason DECISION is, and it is a slot rather than a modal for a reason of its
-# own: it arrives from a poll, so the user is as likely as not reading another
-# session when it lands, and a question that takes the screen from work it has
-# nothing to do with is a question asked in the wrong place.
+# The other two things that can stand in the message box's slot. OFFER is a
+# question the core raised about this conversation — today, triage offering to
+# remember a failed job's error signature (`state.Offer`). REVIEW is the
+# summary `/compact` wrote, waiting to be accepted (`ui/compaction.py`). Both
+# are in the ring for the same reason DECISION is, and both are slots rather
+# than modals for a reason of their own: they arrive a poll or a whole model
+# call after the thing that caused them, so the user is as likely as not
+# reading another session when one lands, and a question that takes the screen
+# away from work it has nothing to do with is a question asked in the wrong
+# place. What they do in a session that is not on screen is mark its row.
 
 # The question the aimed half of the stop gesture asks first. Enter on the
 # working row is a key that can be hit while steering through a log the agent
@@ -789,13 +797,12 @@ class RowUI:
         parked = session.decision is not None or "decision" in flags
         # The offer is second to the decision and not beside it: one column,
         # and of the two the parked turn is the one that stops work.
-        marks = (
-            DECISION_MARK
-            if parked
-            else OFFER_MARK
-            if session.offer is not None
-            else " "
-        )
+        # The summary waits under the same glyph as an offer, and after it:
+        # both are questions about work that has already been done, and the
+        # column has room for one answer. What tells them apart is opening the
+        # session, which is the only thing that can answer either.
+        asking = session.offer is not None or session.compaction is not None
+        marks = DECISION_MARK if parked else OFFER_MARK if asking else " "
         # `busy`, not `working`: a silent backend call — a compaction, the
         # titler, a `/conclude` — is something in flight in that conversation
         # and the row has to say so, even though there is no turn to stop
@@ -1312,7 +1319,9 @@ class RowUI:
             # room: a message can be typed a line at a time, and a question
             # nobody can read is a question nobody can answer.
             standing = (
-                self.session.decision is not None or self.session.offer is not None
+                self.session.decision is not None
+                or self.session.offer is not None
+                or self.session.review.up
             )
             inp = self._status_h() + (
                 self._entry_h(width, height) if standing else 2
@@ -1340,6 +1349,8 @@ class RowUI:
             return self._decision_h(width, height)
         if self.session.offer is not None:
             return self._offer_h(width, height)
+        if self.session.review.up:
+            return self._review_h(width, height)
         return self._input_h(width) + self._menu_h(width, height)
 
     def _decision_h(self, width: int, height: int) -> int:
@@ -1356,6 +1367,20 @@ class RowUI:
             return 0
         return decision_height(
             decision, width, max(3, self._avail(width, height) // DECISION_SHARE)
+        )
+
+    def _review_h(self, width: int, height: int) -> int:
+        """Rows the compaction review wants, under the decision's own cap.
+
+        The same share and for the same reason: a summary has to be readable,
+        and the conversation it is a summary *of* has to stay on screen behind
+        it — which is the whole difference between this and the screen it used
+        to be (`ui/compaction.py`). What does not fit scrolls.
+        """
+        return review_height(
+            self.session.review,
+            width,
+            max(4, self._avail(width, height) // DECISION_SHARE),
         )
 
     def _offer_rows(self, offer: Offer, width: int) -> list[tuple[str, str]]:
@@ -1440,8 +1465,10 @@ class RowUI:
             at = len(out)
             if slot == INPUT:
                 status = self._render_status(width)
-                prompt = self._render_decision(width, height) or self._render_offer(
-                    width, height
+                prompt = (
+                    self._render_decision(width, height)
+                    or self._render_offer(width, height)
+                    or self._render_review(width, height)
                 )
                 if prompt:  # standing where the box would be (`_entry_h`)
                     out += prompt + status
@@ -1609,6 +1636,30 @@ class RowUI:
             out.append(" " * width)
         return out[:room]
 
+    def _render_review(self, width: int, height: int) -> list[str]:
+        """The open session's compaction review, and only the open session's.
+
+        The rule the decision above it follows, for the same reason: a summary
+        offered in a background conversation is a question about *that*
+        history, and folding it from a screen showing another one is the one
+        mistake this exchange exists to make impossible. It marks that row in
+        the sidebar (`_marks`) and waits; opening the session puts it up.
+        """
+        review = self.session.review
+        if not review.up:
+            return []
+        return render_review(
+            review,
+            width,
+            self._review_h(width, height),
+            focused=self.focus == REVIEW,
+            # Same breath the decision's answer line takes, and booked in
+            # `next_wake` the same way: this is a question, and the row that
+            # says how to answer it is the row that moves.
+            now=self.clock(),
+            period=self.display.decision_pulse_seconds,
+        )
+
     def _render_status(self, width: int) -> list[str]:
         """The mode bar and the context meter, sharing one row.
 
@@ -1692,6 +1743,25 @@ class RowUI:
             ]
         if self.focus == OFFER:
             return [("y", "yes"), ("n", "no"), ("^↑^↓", "panel"), ("?", "keys")]
+        if self.focus == REVIEW:
+            if not self.session.review.asking:
+                return [
+                    ("enter", "ask again"),
+                    ("esc", "back to the summary"),
+                    ("⇧enter", "new line"),
+                    ("^↑^↓", "panel"),
+                ]
+            return [
+                ("enter", "fold it in"),
+                ("r", "again"),
+                ("d", "discard"),
+                ("↑↓", "scroll"),
+                # Not "esc esc stop": nothing is running here to stop, and the
+                # one escape this row does take is the one that gives the
+                # message box back with the offer still waiting.
+                ("esc", "later"),
+                ("^↑^↓", "panel"),
+            ]
         if self.focus == DECISION:
             decision = self.session.decision
             if decision is not None and not decision.asking:
@@ -1781,6 +1851,13 @@ class RowUI:
             middle = DECISION
         elif self.session.offer is not None:
             middle = OFFER
+        elif self.session.review.up:
+            # Last of the three, because it is the only one that can be put
+            # off: a decision holds a turn and an offer holds a continuation,
+            # while a summary waits in the core for as long as it takes. So
+            # one arriving over either of them queues behind it rather than
+            # taking the slot from a question that cannot be escaped.
+            middle = REVIEW
         else:
             middle = INPUT
         return [SESSIONS, CHAT, middle, WATCHERS]
@@ -1799,7 +1876,7 @@ class RowUI:
         eleven times.
         """
         middle = self._ring()[2]
-        if self.focus in (INPUT, DECISION, OFFER) and self.focus != middle:
+        if self.focus in (INPUT, DECISION, OFFER, REVIEW) and self.focus != middle:
             self.focus = middle
 
     def handle(self, key: str, width: int, height: int) -> bool:
@@ -1831,6 +1908,8 @@ class RowUI:
             return self._handle_decision(key)
         if self.focus == OFFER:
             return self._handle_offer(key)
+        if self.focus == REVIEW:
+            return self._handle_review(key)
         if self.focus == INPUT:
             return self._handle_input(key)
         return self._handle_row(key, width, height)
@@ -1862,6 +1941,14 @@ class RowUI:
                 self.input.insert_text(text)
             else:
                 decision.reason.insert_text(text)
+            return
+        review = self.session.review
+        if review.up and not review.asking:
+            # The one editor the review has. At the summary itself there is
+            # none — that text is the model's, not somebody to paste into —
+            # so a paste there falls through to the draft below, which is
+            # where the box it was aimed at will be when the prompt goes.
+            review.comment.insert_text(text)
             return
         self.focus = INPUT
         self.input.insert_text(text)
@@ -1917,26 +2004,6 @@ class RowUI:
         elif isinstance(overlay, SkillRemoveOverlay) and overlay.removed:
             self.forget_skills(overlay.removed)
             self.note = f"removed skill “{overlay.removed}”"
-        elif isinstance(overlay, CompactReviewOverlay) and overlay.action:
-            session = self.session_for(overlay.session_id)
-            self.send(
-                ResolveCompact(
-                    overlay.session_id, overlay.action, overlay.comment
-                )
-            )
-            # The offer is answered, so it is no longer waiting in the session.
-            # A retry brings a new one down the wire; the other two answers end
-            # the exchange.
-            session.compaction = None
-            if overlay.action == ACCEPT:
-                # Said here rather than waited for: a fold rewrites the thread
-                # without taking a message out of it, so no `chat.reset`
-                # follows and nothing else would ever unstick the measured
-                # fill — the bar would keep showing the pre-fold 92%, unmarked,
-                # for as long as the session stayed quiet. The core's fresh
-                # `context.estimate` is a round trip away.
-                session.context.superseded()
-            self.note = COMPACT_NOTES[overlay.action]
         elif isinstance(overlay, RenameOverlay) and overlay.name:
             self.send(Rename(overlay.session_id, overlay.name))
             # Shown before the core answers, like the mode bar: the next
@@ -2171,6 +2238,103 @@ class RowUI:
         self.send(Decide(session.session_id, approved, reason))
         self.note = "approved" if approved else "declined"
 
+    # -------------------------------------------------- the compaction review
+
+    def _handle_review(self, key: str) -> bool:
+        """The three verdicts, the box that asks for another summary, and the
+        arrows that read the thing being decided on.
+
+        Two stages, gated the way the approval's are and for the same reason:
+        "d" in the middle of "drop the sbatch flags" is not a verdict. The
+        arrows are this row's own — a summary is text to be read before it is
+        answered, so ↑↓ scroll it here where they move a cursor nowhere else —
+        and ctrl+↑/ctrl+↓ still leave, because this is a row of the ring.
+        """
+        if key == "quit":
+            return False
+        review = self.session.review
+        if not review.up:  # answered elsewhere, or its session went away
+            self.focus = self._ring()[2]
+            return True
+        if not review.asking:
+            # Only the two ctrl pairs leave from the box; tab and shift-tab
+            # are characters while there is a cursor in a field, which is the
+            # same line the refusal box draws.
+            if key == "ctrl-up":
+                self.focus = CHAT  # a half-written complaint stays where it is
+            elif key == "ctrl-down":
+                self.focus = WATCHERS
+            else:
+                return self._review_comment(review, key)
+            return True
+        if key in ("ctrl-up", "shift-tab"):
+            self.focus = CHAT
+        elif key in ("ctrl-down", "tab"):
+            self.focus = WATCHERS
+        elif key in ("enter", "a"):
+            self._resolve_compact(ACCEPT)
+        elif key == "d":
+            self._resolve_compact(DISCARD)
+        elif key == "r":
+            review.again()
+            self.note = ""
+        elif key == "esc":
+            # Answers nothing. The core goes on holding the offer, the sidebar
+            # goes on saying so, and the message box comes back — which is
+            # what makes this safe on a prompt that cost a generation.
+            review.standing = False
+            self.focus = self._ring()[2]
+            self.note = "summary kept — /compact opens it again"
+            self.note_style = theme.faint
+        else:
+            # Whatever is left is the summary's own: the arrows read it, and
+            # anything else is a key this row does not have.
+            review.scroll(key)
+        return True
+
+    def _review_comment(self, review: CompactReview, key: str) -> bool:
+        """The box that says what the next summary has to do differently."""
+        if key == "esc":
+            review.back()
+            self.note = ""
+        elif key == "enter":
+            if not review.comment_text():
+                # The same generation again, with the model none the wiser.
+                self.note = COMMENT_REFUSAL
+            else:
+                self._resolve_compact(RETRY, review.comment_text())
+        elif key in NEWLINE_KEYS:
+            review.comment.newline()
+        else:
+            review.comment.handle(key)
+            self.note = ""
+        return True
+
+    def _resolve_compact(self, action: str, comment: str = "") -> None:
+        """Answer the open session's summary and give the slot back.
+
+        Cleared here rather than when the core agrees, the same as a decision:
+        a question that stays on screen until the answer comes back is a
+        question that can be answered twice, and a summary answered twice is a
+        history folded twice.
+        """
+        session = self.session
+        if session.compaction is None:
+            return
+        self.send(ResolveCompact(session.session_id, action, comment))
+        session.compaction = None
+        if action == ACCEPT:
+            # Said here rather than waited for: a fold rewrites the thread
+            # without taking a message out of it, so no `chat.reset` follows
+            # and nothing else would ever unstick the measured fill — the bar
+            # would keep showing the pre-fold 92%, unmarked, for as long as
+            # the session stayed quiet. The core's fresh `context.estimate` is
+            # a round trip away.
+            session.context.superseded()
+        self.refresh_sidebar()
+        self.focus = self._ring()[2]
+        self.note = COMPACT_NOTES[action]
+
     # ------------------------------------------------------- the queue
 
     def _queued(self, overlay: QueuedOverlay) -> None:
@@ -2396,7 +2560,9 @@ class RowUI:
             # frame it would save. Only while a decision is on *this* screen:
             # a background session's prompt is not drawn, so nothing about it
             # changes with the clock.
-            PULSE_INTERVAL if self.session.decision is not None else None,
+            PULSE_INTERVAL
+            if self.session.decision is not None or self.session.review.up
+            else None,
             # And the fifth: the field behind an open confirmation falls by
             # the clock and by nothing else, so without a frame booked here it
             # would be painted once and hang there mid-drop.
@@ -2612,10 +2778,19 @@ class RowUI:
         # profile is asking (`core.service._list_skills`), and it is empty —
         # null on the wire — exactly when there is nothing open.
         self.send(RunCommand(name, args, self.active_id))
+        if name == "compact" and not args and self.session.compaction is not None:
+            # A summary this session already holds, put back up now rather
+            # than a round trip from now: the core answers a bare `/compact`
+            # on a held offer by re-offering the same text, so waiting for it
+            # would be a keystroke that appeared to do nothing. With a brief
+            # after the command there is a *new* summary coming, and standing
+            # the old one up would be showing the wrong text for a few
+            # seconds.
+            self.review_compaction()
         # Nothing is said about the meter here, and `/compact` is the reason
         # the note is worth making: the fill it invalidates is invalidated by
         # the *fold*, which now happens a review later or not at all
-        # (`_closed`, CompactReviewOverlay). Marking it stale on the keystroke
+        # (`_resolve_compact`). Marking it stale on the keystroke
         # would draw the `~` over a summary the user is about to discard.
         self.input.clear()
         self.note = f"/{name}"
@@ -3065,21 +3240,37 @@ class RowUI:
         self.overlay = MemoryReviewOverlay(session.proposals, session.session_id)
 
     def review_compaction(self, session_id: str = "") -> None:
-        """Put the summary a session was offered up for review.
+        """Stand the summary a session was offered back up in its own column.
 
-        `land` rather than the `overlay` setter, for the reason `land` exists:
-        this arrives a model call after the keystroke, and in those seconds the
-        user is free to have opened the config editor and typed half a settings
-        file into it. Nothing is lost by waiting — the core holds the offer
-        until it is answered.
+        What `/compact` does when the core answers "there is already one of
+        these" — and what an escaped review is brought back by. The prompt is
+        the session's, not the screen's (`ui/compaction.py`), so this puts it
+        in the entry band of the conversation it belongs to and lands the
+        cursor on it only when that conversation is the one on screen: a
+        summary re-opened in a background session is still that session's
+        question.
         """
         session = self.session_for(session_id or self.active_id)
         if session.compaction is None:
             self.note = "nothing to review"
             return
-        self.land(
-            CompactReviewOverlay(session.compaction, session.session_id)
-        )
+        session.review.standing = True
+        self.compaction_arrived(session.session_id)
+
+    def compaction_arrived(self, session_id: str) -> None:
+        """A summary is waiting in a session — this one, or another one.
+
+        Another one changes exactly one thing about the frame: the "?" in the
+        sidebar. This one puts the prompt up and lands on it so its keys work
+        at once, but only from the chat column or the message box — the box
+        because the prompt is standing in its slot and the cursor would
+        otherwise be on a row that is no longer drawn, the chat because that
+        is the conversation being summarized. A user who had walked off to the
+        sessions or watchers column is left where they are.
+        """
+        self.refresh_sidebar()
+        if session_id == self.active_id and self.focus in (CHAT, INPUT):
+            self.focus = REVIEW
 
     def inspect(self, title: str, body: str) -> None:
         """A read-only window over text too long to be a toast (item 31)."""

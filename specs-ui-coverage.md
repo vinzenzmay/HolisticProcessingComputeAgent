@@ -330,8 +330,10 @@ core sends.
 `Context.superseded()` clears `measured` without clearing the fill, so the
 number keeps drawing and starts drawing with the `~`, and the core's fresh
 `context.estimate` is allowed to speak again. Called where the fold actually
-happens — `RowUI._closed` on an accepted `CompactReviewOverlay`, since the
-review landed and `/compact` no longer folds on the keystroke.
+happens — `RowUI._resolve_compact` on an accepted summary, since the review
+landed and `/compact` no longer folds on the keystroke. (The review was a
+screen when this was written; it is now the inline prompt in the session's own
+column, `ui/compaction.py`, and the call moved with it.)
 `test_ui_commands.py::TestWhatACompactDoesToTheMeter` cites this section by
 name; §9.5's nit went with the move.
 

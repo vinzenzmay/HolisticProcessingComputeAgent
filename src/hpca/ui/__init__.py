@@ -68,6 +68,8 @@ The modules, per specs-ui-replacement.md §3:
   the ``flush`` mode the chat is drawn in;
 * ``approval`` — the inline decision prompt: what a gated call says about
   itself, and the box that refuses it;
+* ``compaction`` — the other inline prompt: the summary `/compact` wrote, the
+  three things that can happen to it, and the box that asks for another one;
 * ``state`` — the plain dataclasses the rows are drawn from: sessions, chat,
   turn, context, and the intents a keypress becomes;
 * ``client`` — the one module that knows the protocol: events become state,

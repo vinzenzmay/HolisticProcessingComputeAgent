@@ -1169,14 +1169,15 @@ class UIClient:
             )
 
     def _compact_proposed(self, msg: protocol.CompactProposed) -> None:
-        """A summary `/compact` wrote, and the screen that answers it.
+        """A summary `/compact` wrote, and the prompt that answers it.
 
-        Held on the session first, for the reason the memory proposals above
-        are: the offer belongs to the conversation it was written for, and
-        answering it against another one would fold the wrong history. On
-        screen straight away only when that conversation is the one on screen —
-        and through `RowUI.land`, which parks it rather than landing on top of
-        whatever the user opened in the seconds the summary took to write.
+        Held on the session, not on the screen, for the reason the memory
+        proposals above are: the offer belongs to the conversation it was
+        written for, and answering it against another one would fold the wrong
+        history. That is also all it takes to put it up — the review stands in
+        the entry band of the session holding it (`ui/compaction.py`), so a
+        summary for the open conversation is on screen at once and one for any
+        other conversation marks its row and waits.
 
         Nothing is lost by not showing it: the core holds the offer until it is
         answered, so the toast can send the user back to it with `/compact`
@@ -1190,9 +1191,8 @@ class UIClient:
             attempt=msg.attempt,
             truncated=msg.truncated,
         )
-        if msg.session_id == self.ui.active_id:
-            self.ui.review_compaction(msg.session_id)
-        else:
+        self.ui.compaction_arrived(msg.session_id)
+        if msg.session_id != self.ui.active_id:
             self.ui.toast(
                 f"a compaction summary is waiting in "
                 f"“{session.title or msg.session_id}” — /compact opens it"
