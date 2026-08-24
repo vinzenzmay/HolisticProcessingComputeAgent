@@ -1378,6 +1378,42 @@ class TestMemoryReview:
         drawn = MemoryReviewOverlay().render(80, 12)
         assert widths(drawn) == {80}
 
+    # A `/conclude` proposal is a paragraph, not a line, and this screen used
+    # to show the first 300 characters of it with a "…" on the end — which
+    # reads as a memory the model cut off rather than a screen that did.
+
+    def test_a_long_proposal_is_shown_whole(self):
+        ui = recorded(build())
+        text = " ".join(f"sentence {n} about the cluster." for n in range(20))
+        ui.session.proposals = [Proposal(scope="rag", kind="learning", text=text)]
+        ui.review_memories()
+        seen = screen(ui)
+        assert "sentence 0" in seen and "sentence 19" in seen
+        assert "…" not in seen
+
+    def test_and_scrolls_when_it_does_not_fit(self):
+        ui = recorded(build())
+        ui.session.proposals = [
+            Proposal(
+                scope="rag",
+                kind="learning",
+                text="\n".join(f"line {n}" for n in range(80)),
+            )
+        ]
+        ui.review_memories()
+        assert "line 0" in screen(ui, height=24)
+        press(ui, "pgdn", height=24)
+        assert "line 0" not in screen(ui, height=24)
+
+    def test_and_the_next_proposal_starts_at_its_top(self):
+        # Landing half-way down would hide the beginning of a memory nobody
+        # has read a word of yet.
+        ui = self._open()
+        press(ui, "down", "down")
+        assert ui.overlay.offset == 2
+        press(ui, "y")
+        assert ui.overlay.offset == 0
+
 
 SUMMARY = (
     "[earlier in this session]\n"
