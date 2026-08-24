@@ -545,3 +545,110 @@ model then uses (verified in a kept transcript). What was lost is one warning:
 used to say "nothing exists there yet", and it makes missing parents, so a
 typo lands the file somewhere plausible and reports success. Hence the caution
 in that result — the tool knows it is writing where nothing was.
+
+## 10. Line arrays vs exact strings (2026-08-24)
+
+Every other agent harness takes the text to replace as one exact string —
+pi's `edit` is `{path, edits: [{oldText, newText}]}`, Claude Code's Edit is
+`old_string`/`new_string`, so are `str_replace_based_edit_tool` and Aider's
+SEARCH/REPLACE blocks — and that is the shape agent-trained models were RL'd
+on. HPCA takes `old_lines`/`new_lines`, arrays of lines, against a decoding
+failure recorded in `EditFileParams`. Three arms asked which wins here.
+
+* **a** — `old_lines` / `new_lines`, `list[str]`. Today, untouched.
+* **b** — `old_text` / `new_text`, single exact strings.
+* **c** — `edits: [{old_text, new_text}]`, pi's exact schema.
+
+Only the interface differs. The match ladder, the elision refusal, the §5.2
+gate, the trash backup and the BOM/line-ending restore are shared, and the
+standing guidance is restated in each arm's vocabulary
+(`prompts.for_edit_arm`) so no arm is told to fill a field its schema does not
+have. Arms b and c locate `old_text` as a **substring**, which is what
+`oldText` means everywhere else; matching it as whole lines is a bug, not a
+variant (see below).
+
+core tier, 25 repeats, n=300 per arm, Qwen3.8-27B-FP8, envelope protocol,
+constrained decoding on. Raw JSON in `evals/results/edit-arms-2026-08-24/`.
+
+| metric | a (arrays) | b (strings) | c (pi schema) |
+|---|---|---|---|
+| success | **0.993** | 0.740 | 0.723 |
+| failed edits / run | **0.007** | 0.997 | 1.110 |
+| tool calls / task | **1.937** | 3.173 | 3.130 |
+| completion tokens | **33,646** | 58,449 | 64,203 |
+
+**The arrays win decisively, and the mechanism is not a guess.** Replaying the
+transcripts, the same model on the same task sends
+
+    arm a:  "old_lines": ["echo \"starting run\""]     <- escaped correctly
+    arm b:  "old_text":  "echo "                        <- string ends where \" was needed
+
+It closes the string exactly where it would have to emit `\"`, then retries
+the identical call until its decision budget dies. It does this inside a bare
+string field and **not** inside an array element. Constrained decoding was on
+for both (verified, not assumed), so the grammar permitted the escape in both;
+and `_example_args` shows both arms an equally uninformative `<placeholder>`,
+so neither is advantaged by its example. The shape is the whole difference.
+
+The per-task split is exactly what that predicts — every task that loses needs
+an escaped character inside a string, every task with plain single-line
+content is untouched at 1.00:
+
+| task | needs | a | b | c |
+|---|---|---|---|---|
+| `simple_replace` | embedded `"` | 1.00 | 0.20 | 0.24 |
+| `multiline_block` | embedded `\n` | 1.00 | 0.00 | 0.04 |
+| `delete_lines` | embedded `\n` | 1.00 | 0.00 | 0.00 |
+| `duplicate_blocks` | embedded `\n` | 1.00 | 0.84 | 0.44 |
+| `config_value`, `python_indent`, `crlf_file`, `unicode_context`, `trailing_space_trap` | nothing | 1.00 | 1.00 | 1.00 |
+
+So `EditFileParams`' comment is right, and right for a slightly larger reason
+than it claims: it is not only `\n` that a small model mangles inside a long
+string, it is `\"` as well. **The trained-shape argument is real for frontier
+models and does not transfer to a 27B under constrained decoding.** Do not
+re-run this experiment on the strength of "but pi does it with strings".
+
+**Arm c does not clear batching.** It bundled two changes — bare strings and
+`edits[]` — and the string defect dominates, so its 3.130 calls/task says
+nothing about whether batching helps: the model fails before batching can pay.
+Whether several changes to one file should cost one call is still open, and
+the clean way to ask is a fourth arm, `edits: [{old_lines, new_lines}]` —
+batching in the array form that demonstrably works. That question matters
+beyond call count: it sets the cost ratio between three edits and one
+delete-then-recreate rewrite.
+
+**Whole-line deletion is genuinely harder in the string shape.** Replacing a
+span with `""` leaves the newline that terminated it behind as a blank line,
+so the caller must remember to include it in `old_text`. Line arrays make
+deletion unambiguous by construction (`new_lines: []`). `delete_lines` scored
+0.00 on both string arms.
+
+### 10.1 Two things this run found about the harness itself
+
+**The first arm b was a bug, and the metrics did not say so.** It reused arm
+a's whole-line ladder, so `old_text: "starting run"` could not match the line
+`echo "starting run"` — it advertised string semantics and enforced line
+semantics. `simple_replace` scored 0/25 and the run looked like a finding.
+§7.1's rule caught it: replay the last decision before believing the shape the
+metrics suggest. The fixed arm scored 0.740 rather than 0.767 — the bug was
+worth almost nothing, and the real result was somewhere else entirely.
+
+**`simple_replace`'s check passes files it should fail.** It is presence-only:
+
+```python
+check=lambda ws: 'echo "starting run v2"' in (ws / "runner.sh").read_text()
+```
+
+A replay caught a run that replaced `set -euo pipefail` with the v2 line —
+destroying one line, leaving the original `echo "starting run"` in place — and
+scored `success: true`. Presence of the wanted text is not absence of the
+wrong outcome. This inflates every number the harness has produced, arm a's
+0.993 and the historical figures in this document included, and it means the
+string arms' scores here are generous rather than harsh. Worth tightening to
+assert the old line is gone and the untouched lines survived; until then, read
+every `success_rate` in this document as an upper bound.
+
+The hard tier was not run for b and c. At ~6.6 min per repeat it would cost
+hours to confirm a core result whose mechanism is already understood, and the
+mechanism — escapes inside a bare string field — does not become truer or
+falser on longer files.
