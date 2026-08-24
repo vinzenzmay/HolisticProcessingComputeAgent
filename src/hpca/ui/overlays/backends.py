@@ -9,6 +9,7 @@ and something else in another would be the marks stopping being worth reading.
 from __future__ import annotations
 
 from hpca.ui import theme
+from hpca.ui.ansi import column
 from hpca.ui.pane import Item
 from hpca.ui.state import BackendInfo
 
@@ -49,6 +50,13 @@ def context_label(size: int) -> str:
     return str(size)
 
 
+# Where a backend's details start, for a label short enough to leave room.
+# The gutter here is three spaces rather than two, because the details
+# themselves are joined by three and a narrower one would read as another
+# join (`ansi.column`).
+NAME_COLUMN = 22
+
+
 def backend_head(info: BackendInfo, *, star: bool = True) -> str:
     """One line: the marks, the label, and the three details behind it."""
     mark = MARKS[info.reachable]
@@ -62,7 +70,8 @@ def backend_head(info: BackendInfo, *, star: bool = True) -> str:
     # says nothing about keys at all.
     if info.needs_key:
         details.append("api key required")
-    return f"{lead}{info.label or info.model:<22}{'   '.join(details)}"
+    name = info.label or info.model
+    return lead + column(name, NAME_COLUMN, "   ".join(details), gap=3)
 
 
 def row_key(info: BackendInfo) -> str:

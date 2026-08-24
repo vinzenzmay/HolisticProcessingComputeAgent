@@ -18,6 +18,7 @@ from hpca.ui.ansi import (
     cell_width,
     char_width,
     clip,
+    column,
     fold,
     footer_lines,
     footer_wrap,
@@ -261,6 +262,43 @@ class TestFold:
 
     def test_and_a_wide_character_is_never_split_across_two(self):
         assert all(x in ("中", "文") for line in fold(WIDE * 5, 3) for x in line)
+
+
+class TestTwoColumnRows:
+    """`column`: a name on the left, what it has on the right, and a gutter
+    between them that a long name cannot close.
+
+    The bug it was written for is one screenshot: a profile whose name is
+    exactly as wide as the column drew `svirlpool validation3 sessions`, two
+    facts read as one phrase.
+    """
+
+    def test_a_short_name_puts_the_second_column_where_it_belongs(self):
+        assert column("hpc", 20, "3 sessions") == "hpc" + " " * 17 + "3 sessions"
+
+    def test_a_name_the_width_of_the_column_still_gets_a_gutter(self):
+        assert column("svirlpool validation", 20, "3 sessions") == (
+            "svirlpool validation  3 sessions"
+        )
+
+    def test_and_so_does_a_longer_one(self):
+        assert column("svirlpool validation runs", 20, "3 sessions") == (
+            "svirlpool validation runs  3 sessions"
+        )
+
+    def test_the_column_is_counted_in_cells(self):
+        # Ten ideographs are twenty cells, not ten characters' worth of them:
+        # a row padded by character count would put this one's second column
+        # ten cells right of everybody else's.
+        assert column(WIDE * 10, 20, "x") == WIDE * 10 + "  x"
+
+    def test_nothing_on_the_right_pads_nothing(self):
+        assert column("hpc", 20) == "hpc"
+
+    def test_the_gutter_can_be_asked_to_be_wider(self):
+        assert column("a-very-long-backend-label", 22, "http://x/v1", gap=3) == (
+            "a-very-long-backend-label   http://x/v1"
+        )
 
 
 class TestClip:

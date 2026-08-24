@@ -296,6 +296,29 @@ def clip(text: str, cells: int) -> str:
     return cut(text, room).rstrip() + CLIP
 
 
+# The least space that may stand between two columns of a row. One is a word
+# break; two is a gutter, and a gutter is what says the name on the left and
+# the count on the right are two different facts rather than one long phrase.
+GAP = 2
+
+
+def column(text: str, width: int, second: str = "", gap: int = GAP) -> str:
+    """``text`` in a column ``width`` cells wide, then ``second`` after it.
+
+    What `f"{name:<20}{detail}"` was doing, with the two things that spelling
+    gets wrong. It counts *characters*, so a name with a two-cell glyph in it
+    pushes the second column a cell right of everyone else's; and it pads to
+    exactly the width, so a name that is already that long has its detail
+    written straight onto the end of it — `svirlpool validation3 sessions`,
+    which is the bug this exists to make unspellable. The column is a minimum
+    here, never a maximum: a name is not truncated to keep an alignment, it
+    simply takes the room it needs and the gutter follows it.
+    """
+    if not second:
+        return text
+    return f"{text}{' ' * max(gap, width - cell_width(text))}{second}"
+
+
 def fold(text: str, width: int) -> list[str]:
     """``text`` broken into lines of at most ``width`` cells.
 

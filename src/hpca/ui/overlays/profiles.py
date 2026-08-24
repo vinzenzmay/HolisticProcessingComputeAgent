@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from hpca.ui.ansi import column
 from hpca.ui.overlays.base import ListOverlay, PromptOverlay
 from hpca.ui.overlays.skills import SkillsOverlay
 from hpca.ui.overlays.textedit import ARCHIVE, MEMORIES, TextEditOverlay
@@ -55,6 +56,11 @@ UNREADABLE = "its files could not be read — nothing here would be safe to save
 NAME_NEW, NAME_COPY = "new", "copy"
 
 
+# Where what a profile *has* starts, for a name short enough to leave room
+# (`ansi.column`).
+NAME_COLUMN = 22
+
+
 def profile_item(info: ProfileInfo) -> Item:
     """One row: `name ★ · 12 memories · copied from hpc`.
 
@@ -84,7 +90,7 @@ def profile_item(info: ProfileInfo) -> Item:
     if info.copied_from:
         body.append(f"started as a copy of {info.copied_from}")
     return Item(
-        head=f"{info.name + star:<22}{'  ·  '.join(said)}",
+        head=column(info.name + star, NAME_COLUMN, "  ·  ".join(said)),
         body=body,
         kind="profile",
         text=info.name,

@@ -374,6 +374,17 @@ class TestProfilesList:
         ui.focus = SESSIONS
         assert "3 sessions" in screen(press(ui, "a"))
 
+    def test_a_long_name_keeps_a_gutter_before_what_it_has(self):
+        # Two facts, not one phrase: a name as wide as the column used to draw
+        # `svirlpool validation3 sessions` (`ansi.column`).
+        ui = RowUI(
+            profiles=[
+                ProfileInfo(name="svirlpool validation22", memories=2, sessions=3)
+            ]
+        )
+        ui.focus = SESSIONS
+        assert "svirlpool validation22  2 memories" in screen(press(ui, "a"))
+
     def test_a_profile_nobody_has_talked_under_says_nothing_about_sessions(self):
         # Zero is also what an uncountable answer looks like, so the row omits
         # the phrase rather than claiming "0 sessions".

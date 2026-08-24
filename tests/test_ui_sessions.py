@@ -51,7 +51,7 @@ from hpca.ui.overlays import (
     RewindOverlay,
     choice,
 )
-from hpca.ui.state import BackendInfo, ProfileInfo
+from hpca.ui.state import BackendInfo, ProfileInfo, SessionState
 from tests.ui_harness import Wire, connected, frame, on_entry, plain, widths
 
 # Two conversations under two profiles, one of them the default — which is the
@@ -217,6 +217,24 @@ class TestStartingOne:
         # start a conversation under a profile of that name.
         ui = RowUI(profiles=[ProfileInfo(name="hpc", memories=12)])
         assert [x.text for x in ui._profile_rows()] == ["default", "hpc"]
+
+    async def test_a_long_profile_name_keeps_its_gutter(self):
+        # The bug as it was seen: a profile named exactly as wide as the
+        # column drew `svirlpool validation3 sessions`, the name and the count
+        # read as one phrase (`ansi.column`).
+        ui = RowUI(
+            sessions=[
+                SessionState(session_id="s1", profile="svirlpool validation"),
+                SessionState(session_id="s2", profile="svirlpool validation"),
+            ]
+        )
+        row = next(x for x in ui._profile_rows() if x.text == "svirlpool validation")
+        assert row.head == "svirlpool validation  2 sessions"
+
+    async def test_and_a_short_one_still_lines_up_with_the_rest(self):
+        ui = RowUI(sessions=[SessionState(session_id="s1", profile="hpc")])
+        row = next(x for x in ui._profile_rows() if x.text == "hpc")
+        assert row.head == "hpc" + " " * 17 + "1 session"
 
     async def test_choosing_one_asks_the_core_for_a_session(self, wire):
         await started(wire)
