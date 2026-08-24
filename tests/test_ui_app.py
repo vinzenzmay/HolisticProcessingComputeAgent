@@ -1325,3 +1325,36 @@ class TestTheChatStandsOffTheMessageBox:
         ui = build()
         ui.set_display(replace(ui.display, spacer_lines=2))
         assert {x.chat.spacer for x in ui.sessions} == {2}
+
+
+# ------------------------------------------ one inverted row on the frame
+
+
+class TestOnlyOneRowIsEverInverted:
+    """Whichever band has the keys, the rest of the screen has no grey bar.
+
+    Every pane used to draw its own cursor row reversed — the unfocused ones
+    dimmed — so picking a session and starting to type left three rows all
+    claiming to be the one being pointed at. Where a pane was left is still
+    visible without it: a list bands its entry with `▌` and the chat draws its
+    head line bold, and neither depends on focus.
+    """
+
+    def test_at_most_one_row_of_the_frame_is_inverted(self):
+        # The header is excepted — it is a title bar drawn reversed by design,
+        # not a row anything is pointing at.
+        for slot in (SESSIONS, CHAT, WATCHERS, INPUT):
+            ui = build()
+            ui.focus = slot
+            inverted = [x for x in ui.render(96, 30)[1:] if REVERSE in x]
+            assert len(inverted) <= 1, f"{slot}: {len(inverted)} inverted rows"
+
+    def test_the_sessions_row_stops_inverting_once_the_box_takes_focus(self):
+        # The case as it is met: pick a conversation in the sidebar, start
+        # typing, and the row you picked should stop shouting.
+        ui = build()
+        ui.focus = SESSIONS
+        picked = [x for x in ui.render(96, 30)[1:] if REVERSE in x]
+        assert len(picked) == 1
+        ui.focus = INPUT
+        assert picked[0] not in ui.render(96, 30)

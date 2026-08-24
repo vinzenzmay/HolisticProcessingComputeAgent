@@ -909,10 +909,18 @@ class Pane:
             # nothing is lost by dropping it: the cursor lands there because the row
             # is last, not because anybody moved it, and the moment the turn
             # ends the row goes and the cursor is back on somebody's words.
-            if row == self.cursor and item is not self.tail:
-                # The unfocused pane still shows where it was left, dimmed —
-                # that is the "memory" being visible rather than merely kept.
-                style = REVERSE if focused else theme.faint + REVERSE
+            if row == self.cursor and focused and item is not self.tail:
+                # Only the focused pane inverts a row, so at most one row on
+                # the whole screen is ever drawn that way. It used to be every
+                # pane at once — the unfocused ones dimmed — on the reasoning
+                # that a pane should show where it was left. It does still
+                # show it: a list bands its current entry with `▌` and the
+                # chat draws its head line bold, and neither depends on focus.
+                # What the dimmed reverse added on top of those was a second
+                # and a third grey band across a screen that already says
+                # where the keys are, so picking a session and typing left
+                # three rows claiming to be the one being pointed at.
+                style = REVERSE
             elif item is not None and item.accent:
                 # Head *and* body, where it used to be the head alone: a
                 # message is drawn in its speaker's colour down to its last

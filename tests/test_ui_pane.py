@@ -1204,3 +1204,48 @@ class TestNothingLandsOnABlank:
         assert not pane.follow
         pane.move(10**9, 11, 58)
         assert pane.follow
+
+
+# --------------------------------------- one inverted row on the screen, max
+
+
+class TestOnlyTheFocusedPaneInvertsARow:
+    """The highlight belongs to the pane the keys are in, and to no other.
+
+    Every pane used to draw one — the unfocused ones faint-reversed — on the
+    reasoning that a pane should show where it was left. It still shows it: a
+    list bands its current entry with `▌` and the chat draws its head line
+    bold, and neither of those depends on focus. What the dimmed reverse added
+    on top of them was a second and a third grey band across a screen that
+    already says where the keys are, so picking a session and starting to type
+    left three rows all claiming to be the one being pointed at.
+    """
+
+    @staticmethod
+    def inverted(pane: Pane, *, focused: bool) -> list[str]:
+        drawn = pane.render(60, 12, focused=focused)
+        return [plain(x).rstrip() for x in drawn if REVERSE in x]
+
+    def test_the_focused_pane_still_has_one(self):
+        pane = chat_of(SAID, REPLIED)
+        assert self.inverted(pane, focused=True) == ["done"]
+
+    def test_and_the_unfocused_pane_has_none(self):
+        pane = chat_of(SAID, REPLIED)
+        assert self.inverted(pane, focused=False) == []
+
+    def test_a_list_still_says_where_it_was_left(self):
+        # The `▌` gutter is what carries it there, and it is drawn whether or
+        # not the pane has the keys — so nothing is actually lost.
+        pane = Pane("sessions", [Item(head="one"), Item(head="two")])
+        drawn = [plain(x).rstrip() for x in pane.render(60, 12, focused=False)]
+        assert drawn[1] == "▌   one"
+        assert REVERSE not in "".join(pane.render(60, 12, focused=False))
+
+    def test_and_the_chat_says_it_with_weight(self):
+        pane = chat_of(SAID, REPLIED)
+        pane.cursor = 0
+        drawn = pane.render(60, 12, focused=False)
+        head = next(x for x in drawn if plain(x).rstrip() == "▸    you")
+        assert BOLD in head
+        assert REVERSE not in head
