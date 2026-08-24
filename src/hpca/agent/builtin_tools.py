@@ -701,11 +701,8 @@ def default_tool_registry() -> ToolRegistry:
         Tool(
             name="create_script",
             description=(
-                "Create a bash or python script (syntax-checked) — those two "
-                "languages ONLY. Anything else that runs — a Snakefile, a "
-                "Makefile, a nextflow .nf, an R script — is not a script "
-                "here: write it with create_file at the path it needs, then "
-                "create_script a short bash script that calls it"
+                "Create a syntax-checked bash or python script. Other "
+                "languages or forms need to be created with 'create_file'."
             ),
             params=CreateScriptParams,
             handler=create_script,
