@@ -49,6 +49,25 @@ class TestOrchestratorPrompt:
         prompt = orchestrator_system_prompt(memory_meter="0% — 0/2400 tokens")
         assert MEMORY_LABEL not in prompt
 
+    def test_the_script_split_is_stated_by_language(self):
+        # The live model asked for a snakemake workflow called create_script
+        # with kind=bash, and was right by the rule it had been given: the
+        # guidance offered "a pipeline" as something create_script makes, and
+        # put create_file behind "a file that is not a script" followed by
+        # prose genres a Snakefile is none of. So the axis is the language now.
+        prompt = orchestrator_system_prompt()
+        assert "create_script writes bash and python, and those two only" in prompt
+        for other in ("Snakefile", "Makefile", "nextflow .nf", "R script"):
+            assert other in prompt
+        # and the thing that misled it is gone
+        assert "a file that is not a script" not in prompt
+
+    def test_and_running_one_of_those_takes_two_files(self):
+        # A create_file'd workflow has a path and no script name, so
+        # start_background_script cannot reach it; the wrapper is the answer.
+        prompt = orchestrator_system_prompt()
+        assert "snakemake -s <path>" in prompt
+
     def test_session_search_guidance_only_when_tool_present(self):
         assert "session_search" not in orchestrator_system_prompt()
         with_tool = orchestrator_system_prompt(session_search=True)
