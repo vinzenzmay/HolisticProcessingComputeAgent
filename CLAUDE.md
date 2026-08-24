@@ -26,9 +26,17 @@ A dev machine often has live tunnels on ports 20000 (embeddings) / 20001 (LLM), 
 
 Any change touching edit_file/read_file/create_file, the middleware retry
 loop, or editing guidance gets measured, not eyeballed: run the live eval in
-`evals/edit_eval.py` as baseline-ref-vs-working-tree — recipe and the
-v0.17.0→v0.18.0 reference numbers in specs-edit-eval.md. Like test-live it
+`evals/edit_eval.py` as baseline-ref-vs-working-tree — recipe in
+specs-edit-eval.md. Compare a baseline you ran yourself, not a number quoted
+in that document: the task checks were tightened on 2026-08-24 (§10), and
+every figure recorded before that is an upper bound measured with checks that
+scored some corrupted files as successes. Like test-live it
 costs real generations; run it deliberately, never as part of a default suite.
+
+Every run first checks its own task checks — against a correct outcome and
+against every one-line corruption of it — and aborts rather than producing a
+number it cannot stand behind; `--self-check` alone does just that, over all
+four tiers, in about a second, and is the thing to run after touching a task.
 
 Tiers: `core` and `hard` are the standing regression set. `paths` is the
 long-context one (~95k of session in front of a ~200-character path, over
