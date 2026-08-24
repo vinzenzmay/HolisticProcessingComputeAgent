@@ -309,3 +309,48 @@ def orchestrator_system_prompt(
 
 def _metered(label: str, meter: str) -> str:
     return f"{label} [{meter}]" if meter else label
+
+
+# ------------------------------------------------------- edit-arm vocabulary
+#
+# The edit_file experiment (see hpca.agent.file_tools, HPCA_EDIT_ARM) swaps the
+# tool's arguments between arrays of lines and pi-style exact strings. Guidance
+# that still says "old_lines" while the schema asks for "old_text" would make
+# the arms measure a contradiction rather than an interface, so the standing
+# text is restated in whichever vocabulary is live.
+#
+# Substitution rather than three hand-written blocks on purpose: everything the
+# arms are NOT testing then stays byte-identical, which is what keeps arm a's
+# text exactly the text every past measurement was taken against.
+_ARM_SUBSTITUTIONS = (
+    ("placeholder in old_lines, content in new_lines",
+     "placeholder in old_text, content in new_text"),
+    ("call edit_file with just the lines to replace",
+     "call edit_file with just the text to replace"),
+    ("copy the lines into old_lines exactly as they appear",
+     "copy the text into old_text exactly as it appears"),
+    ("put the file's current last line in old_lines, and that same "
+     "line followed by the new lines in new_lines",
+     "put the file's current last line in old_text, and that same "
+     "line followed by the new lines in new_text"),
+    ("old_lines", "old_text"),
+    ("new_lines", "new_text"),
+)
+
+_ARM_C_EXTRA = (
+    " When one file needs several changes, send them as separate entries in "
+    "one edit_file call rather than calling it once per change."
+)
+
+
+def for_edit_arm(text: str) -> str:
+    """``text`` in the vocabulary of the live edit arm. Arm a: unchanged."""
+    from hpca.agent.file_tools import EDIT_ARM
+
+    if EDIT_ARM not in ("b", "c"):
+        return text
+    for old, new in _ARM_SUBSTITUTIONS:
+        text = text.replace(old, new)
+    if EDIT_ARM == "c":
+        text += _ARM_C_EXTRA
+    return text

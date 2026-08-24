@@ -143,6 +143,15 @@ def _system_prompt(note: str = "", native: bool = False) -> str:
         from hpca.agent.prompts import SCRIPT_GUIDANCE as script_guidance
     except Exception:
         script_guidance = ""
+    # The edit-arm experiment renames edit_file's arguments; the standing
+    # guidance has to follow, or the arms measure a prompt that contradicts
+    # the schema. A branch without the helper is arm a by definition.
+    try:
+        from hpca.agent.prompts import for_edit_arm
+
+        script_guidance = for_edit_arm(script_guidance)
+    except Exception:
+        pass
     # Likewise PATH_WORKFLOW_GUIDANCE. Leaving it out was a real measurement
     # bug, not a simplification: it is the block that says what a file tool's
     # key argument accepts, so without it the shift tier judged the path
@@ -154,9 +163,14 @@ def _system_prompt(note: str = "", native: bool = False) -> str:
     except Exception:
         path_guidance = ""
     default = _DEFAULT_SYSTEM_NOTE if HAS_REGISTRY else _NO_REGISTRY_SYSTEM_NOTE
-    return f"{guidance}\n\n{path_guidance}\n\n{script_guidance}\n\n" + (
-        note or default
-    )
+    task_note = note or default
+    try:
+        from hpca.agent.prompts import for_edit_arm
+
+        task_note = for_edit_arm(task_note)
+    except Exception:
+        pass
+    return f"{guidance}\n\n{path_guidance}\n\n{script_guidance}\n\n" + task_note
 
 
 # ----------------------------------------------------------- history shape
@@ -1641,6 +1655,33 @@ class FakeLLM:
         # key -> path relative to the workspace, for the translation below.
         self._key_paths = key_paths or {}
 
+    @staticmethod
+    def _in_this_arms_shape(call: dict) -> dict:
+        """A scripted edit_file call in the live arm's argument shape.
+
+        The tasks are written once, in arm a's vocabulary; the dry run has to
+        keep proving the plumbing on every arm, so the translation lives here
+        rather than in thirty task definitions.
+        """
+        if call.get("tool") != "edit_file":
+            return call
+        try:
+            from hpca.agent.file_tools import EDIT_ARM
+        except Exception:
+            return call
+        if EDIT_ARM not in ("b", "c"):
+            return call
+        args = dict(call.get("arguments") or {})
+        if "old_lines" not in args:
+            return call
+        old_text = "\n".join(args.pop("old_lines") or [])
+        new_text = "\n".join(args.pop("new_lines") or [])
+        if EDIT_ARM == "b":
+            args["old_text"], args["new_text"] = old_text, new_text
+        else:
+            args["edits"] = [{"old_text": old_text, "new_text": new_text}]
+        return {**call, "arguments": args}
+
     def _in_this_branchs_shape(self, call: dict, workspace: Path) -> dict:
         """A scripted key-based call, rewritten for a branch that has no keys.
 
@@ -1700,7 +1741,11 @@ class FakeLLM:
         self._queue = [
             translated
             for call in self._queue
-            for translated in [self._in_this_branchs_shape(_sub(call), workspace)]
+            for translated in [
+                self._in_this_arms_shape(
+                    self._in_this_branchs_shape(_sub(call), workspace)
+                )
+            ]
             if translated
         ]
 

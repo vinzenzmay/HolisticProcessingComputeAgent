@@ -30,6 +30,7 @@ entirely.
 
 from __future__ import annotations
 
+import os
 import re
 import time
 import unicodedata
@@ -887,6 +888,285 @@ async def copy_file(args: CopyFileParams, ctx: ToolContext) -> str:
     return f"Copied {source} to {target}{note}."
 
 
+# --------------------------------------------------------------- edit arms
+#
+# An experiment scaffold, not a shipped interface. HPCA's edit_file takes
+# arrays of lines; every other agent harness (pi's `edit`, Claude Code's Edit,
+# Anthropic's str_replace_based_edit_tool, Aider's SEARCH/REPLACE) takes a
+# single exact string, and that is the shape agent-trained models were RL'd on.
+# Arrays were chosen here against a real decoding failure — see EditFileParams
+# — so which one wins on THIS backend is an empirical question, and this is how
+# the eval asks it.
+#
+#   a (default) - today's list[str] old_lines / new_lines. Untouched.
+#   b           - old_text / new_text, single strings. The trained shape.
+#   c           - edits: [{old_text, new_text}], pi's exact schema: several
+#                 changes to one file in one call.
+#
+# Only the *interface* differs. The matching ladder, the elision refusal, the
+# 5.2 script gate, the trash backup and the BOM/line-ending restore are the
+# same code for all three, so a difference in the numbers is a difference in
+# how well the model can fill the arguments - which is the whole question.
+EDIT_ARM = os.environ.get("HPCA_EDIT_ARM", "a").strip().lower() or "a"
+
+
+def _text_to_lines(text: str) -> list[str]:
+    """A string argument as the shared core wants it.
+
+    Empty means "delete these lines", matching pi's newText: "" - which is why
+    this cannot simply be ``text.split()``, since that yields [""], a single
+    blank line, and would turn every deletion into a blank.
+    """
+    return text.split("\n") if text else []
+
+
+class EditFileParamsB(BaseModel):
+    path: str = Field(description="Path of the file to edit")
+    old_text: str = Field(
+        min_length=1,
+        description=(
+            "The exact text to replace, copied from read_file without the "
+            "line numbers - indentation, spacing and line breaks included. "
+            "Include enough surrounding text that it occurs only once."
+        ),
+    )
+    new_text: str = Field(
+        default="",
+        description=(
+            "The text to put in its place. Send an empty string to delete "
+            "the old text."
+        ),
+    )
+
+
+class EditSpec(BaseModel):
+    old_text: str = Field(
+        min_length=1,
+        description=(
+            "The exact text to replace, copied from read_file without the "
+            "line numbers. Include enough surrounding text that it occurs "
+            "only once."
+        ),
+    )
+    new_text: str = Field(
+        default="",
+        description=(
+            "The text to put in its place. Empty string deletes the old text."
+        ),
+    )
+
+
+class EditFileParamsC(BaseModel):
+    path: str = Field(description="Path of the file to edit")
+    edits: list[EditSpec] = Field(
+        min_length=1,
+        description=(
+            "Every change to make to this file, applied in order. Put all of "
+            "a file's changes in one call rather than calling edit_file "
+            "repeatedly."
+        ),
+    )
+
+
+def _arm_pairs(args) -> list[tuple[list[str], list[str]]]:
+    """(old_lines, new_lines) per change, whichever arm's arguments arrived."""
+    if isinstance(args, EditFileParamsC):
+        return [
+            (_text_to_lines(e.old_text), _text_to_lines(e.new_text))
+            for e in args.edits
+        ]
+    return [(_text_to_lines(args.old_text), _text_to_lines(args.new_text))]
+
+
+def _arm_change(args) -> str:
+    pairs = _arm_pairs(args)
+    if len(pairs) == 1:
+        old, new = pairs[0]
+        if not new:
+            return f"{_lines(len(old))} deleted"
+        return f"{_lines(len(old))} -> {_lines(len(new))}"
+    return f"{len(pairs)} edits"
+
+
+async def _edit_file_arm(args, ctx: ToolContext) -> str:
+    """Arms b and c: same pipeline as ``edit_file``, different arguments.
+
+    Deliberately a separate function rather than a refactor of ``edit_file``:
+    arm a is the baseline every past measurement was taken against, and an
+    experiment that quietly rewrites its control measures nothing.
+
+    All-or-nothing across the list. A partial application would leave the file
+    in a state neither the model nor the user asked for, and the model's next
+    read would disagree with its own record of what it sent.
+    """
+    from hpca.agent.builtin_tools import KIND_BY_SUFFIX, check_script_content
+
+    try:
+        path = _existing(args.path, ctx)
+    except ValueError as exc:
+        return f"NOT edited: {exc}"
+    if path.is_dir():
+        return (
+            f"NOT edited: {path} is a directory. "
+            f"{hints.EDIT_FILE_ON_DIRECTORY}"
+        )
+    try:
+        text, bom, ending = _read_for_edit(path)
+    except (UnicodeDecodeError, OSError) as exc:
+        return (
+            f"NOT edited: {path} could not be read as text "
+            f"({type(exc).__name__})."
+        )
+
+    pairs = _arm_pairs(args)
+    for index, (_, new_lines) in enumerate(pairs):
+        field = f"new_text (edit {index + 1})" if len(pairs) > 1 else "new_text"
+        refused_marker = _elision_refusal(
+            new_lines,
+            refusal="NOT edited",
+            field=field,
+            outcome="The file is unchanged.",
+        )
+        if refused_marker:
+            return refused_marker
+
+    file_lines = text.split("\n")
+    first_start = None
+    for index, (old_lines, new_lines) in enumerate(pairs):
+        where = f" (edit {index + 1})" if len(pairs) > 1 else ""
+        hits = _match_ladder(file_lines, old_lines)
+        if not hits:
+            stripped = _strip_line_number_prefixes(old_lines)
+            if stripped is not None:
+                hits = _match_ladder(file_lines, stripped)
+                if hits:
+                    old_lines = stripped
+        if not hits:
+            return (
+                f"NOT edited{where}: that text is not in {path}."
+                f"{_near_miss(file_lines, old_lines)}"
+            )
+        if len(hits) > 1:
+            spots = ", ".join(f"line {i + 1}" for i in hits[:5])
+            return (
+                f"NOT edited{where}: that text occurs {len(hits)} times in "
+                f"{path} ({spots}), so which one you mean is ambiguous. "
+                f"{hints.EDIT_FILE_AMBIGUOUS}"
+            )
+        start = hits[0]
+        if first_start is None:
+            first_start = start
+        file_lines = (
+            file_lines[:start] + new_lines + file_lines[start + len(old_lines):]
+        )
+
+    edited = "\n".join(file_lines)
+    if edited == text:
+        return (
+            f"NOT edited: the replacement produces identical content - "
+            f"old_text and new_text are the same. {hints.EDIT_FILE_NO_OP}"
+        )
+
+    warnings: list[str] = []
+    kind = KIND_BY_SUFFIX.get(path.suffix)
+    if kind is not None:
+        ctx.scripts_dir.mkdir(parents=True, exist_ok=True)
+        scratch = ctx.scripts_dir / f"edit_{time.time_ns()}{path.suffix}"
+        scratch.write_text(edited)
+        try:
+            refused, warnings = await check_script_content(
+                kind, scratch, edited, ctx, refusal="NOT edited"
+            )
+        finally:
+            scratch.unlink(missing_ok=True)
+        if refused:
+            return refused
+
+    entry = _require_trash(ctx).backup(path)
+    out = edited.replace("\n", ending) if ending != "\n" else edited
+    path.write_bytes((bom + out).encode())
+    extra = f" ({'; '.join(warnings)})" if warnings else ""
+    no_backup = (
+        ""
+        if entry.trashed_path
+        else " NO backup was kept (the file is above the backup size limit), "
+        "so this cannot be undone."
+    )
+    return (
+        f"Edited {path} at line {(first_start or 0) + 1}: {_arm_change(args)}"
+        f"{extra}. {hints.NO_READ_BACK}{no_backup}{_tbd_note(edited)}"
+    )
+
+
+def _describe_edit_arm(args, ctx: ToolContext) -> str:
+    path = _target(args.path, ctx)
+    size = path.stat().st_size if path.is_file() else 0
+    backed_up = ctx.trash is not None and size < ctx.trash.backup_limit_bytes
+    backup_note = (
+        "the current file is copied to trash first"
+        if backed_up
+        else "NO BACKUP (file exceeds the backup size limit) - irreversible"
+    )
+    return f"edit {path}\n({_arm_change(args)}; {backup_note})"
+
+
+def _edit_resolvable_arm(args, ctx: ToolContext) -> bool:
+    try:
+        return _target(args.path, ctx).is_file()
+    except Exception:
+        return False
+
+
+def edit_preview_arm(arguments: dict, ctx: object = None) -> str:
+    """The lines out then the lines in, as ``edit_preview`` renders arm a."""
+    specs = arguments.get("edits")
+    if not isinstance(specs, list):
+        specs = [arguments]
+    out = []
+    for spec in specs:
+        if not isinstance(spec, dict):
+            continue
+        out += [
+            f"- {line}" for line in _text_to_lines(spec.get("old_text") or "")
+        ]
+        out += [
+            f"+ {line}" for line in _text_to_lines(spec.get("new_text") or "")
+        ]
+    return "\n".join(out)
+
+
+_ARM_B_DESCRIPTION = (
+    "Change part of a text file in place: give the exact text to replace and "
+    "what to put there, instead of rewriting the whole file. Read the file "
+    "first and copy the text from it exactly"
+)
+
+_ARM_C_DESCRIPTION = (
+    "Change part of a text file in place: give the exact text to replace and "
+    "what to put there, instead of rewriting the whole file. Read the file "
+    "first and copy the text from it exactly. Put every change to one file "
+    "in a single call, as separate entries in edits"
+)
+
+
+def _arm_edit_tool():
+    """The edit_file the current arm registers, or None for arm a."""
+    if EDIT_ARM == "b":
+        params, description = EditFileParamsB, _ARM_B_DESCRIPTION
+    elif EDIT_ARM == "c":
+        params, description = EditFileParamsC, _ARM_C_DESCRIPTION
+    else:
+        return None
+    return Tool(
+        name="edit_file",
+        description=description,
+        params=params,
+        handler=_edit_file_arm,
+        is_destructive_call=_edit_resolvable_arm,
+        describe_call=_describe_edit_arm,
+    )
+
+
 def add_file_tools(registry: ToolRegistry) -> ToolRegistry:
     registry.register(
         Tool(
@@ -927,7 +1207,8 @@ def add_file_tools(registry: ToolRegistry) -> ToolRegistry:
         )
     )
     registry.register(
-        Tool(
+        _arm_edit_tool()
+        or Tool(
             name="edit_file",
             description=(
                 "Change part of a text file in place: give the exact lines to "
