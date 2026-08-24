@@ -41,6 +41,12 @@ OWN_MESSAGE_KINDS = ("user", "queued")
 # What a step's label is padded to in an opened entry, so tool names line up.
 TOOL_COLUMN = 14
 
+# What separates a call from what it returned inside an opened step. The same
+# string `transcript.RESULT_RULE` writes into the session log, so a step reads
+# the same on screen as it does in the file — copied for the reason the whole
+# of `ChatPart` is copied: this module may not import the agent side.
+RESULT_RULE = "── result ──"
+
 # How the UI writes an instant, wherever it writes one: a chat row's label and
 # a sidebar row's activity. Day first and seconds included — the seconds are
 # not decoration here, because a turn's question and its answer routinely land
@@ -219,14 +225,51 @@ def _one_line(text: str) -> str:
     return " ".join(text.split())
 
 
+def _first_line(text: str) -> str:
+    """The first line with anything on it — a head's worth of a call.
+
+    Not `_one_line`, which would run a fifty-line script together into one
+    smear: the lines of a script are separate commands, and joining them makes
+    a line that reads as a command nobody wrote. One line of it, and the fold
+    marker says the rest is behind the row.
+    """
+    for line in text.split("\n"):
+        if line.strip():
+            return _one_line(line)
+    return ""
+
+
+def part_body(part: ChatPart) -> list[str]:
+    """What a step opens into: the call itself, and then what it returned.
+
+    Both halves, not just the result. A head has one line and a `run_bash`
+    call's is a fifty-line script — so a row that opened into its output alone
+    showed the user the stdout of a command they could not read. The same
+    choice `transcript.Step.body` makes for the log, and the rule between the
+    halves is its string; copied rather than imported because this module may
+    not pull in the agent side (see `ChatPart`).
+
+    A call still in flight has only its half, and gets no heading over an
+    empty result: that reads as a tool that answered with nothing.
+    """
+    call = part.text.strip()
+    result = part.result.strip()
+    if not call:
+        return result.split("\n") if result else []
+    if not result:
+        return call.split("\n")
+    return [*call.split("\n"), "", RESULT_RULE, *result.split("\n")]
+
+
 def part_fold(part: ChatPart) -> Fold:
     """One step, as a row of its own inside the turn's fold.
 
     The head is the call — the tool and what it was aimed at — and the body is
-    what came back. Two levels rather than one because a tool result is
-    routinely a whole file: the steps of a turn have to stay readable as a
-    list, and the four hundred lines `read_file` returned must be one more
-    keypress away rather than in between the steps either side of it.
+    the call in full with the result under it. Two levels rather than one
+    because a tool result is routinely a whole file: the steps of a turn have
+    to stay readable as a list, and the four hundred lines `read_file`
+    returned must be one more keypress away rather than in between the steps
+    either side of it.
 
     A call whose result has not landed says so with a trailing "…", because
     the alternative is a row that looks finished and is not (`Part.done`) —
@@ -234,13 +277,13 @@ def part_fold(part: ChatPart) -> Fold:
     while the tool is still running.
     """
     label = part.tool or part.kind or "step"
-    detail = part.target or _one_line(part.text)
+    detail = part.target or _first_line(part.text)
     head = f"{label:<{TOOL_COLUMN}}{detail}".rstrip()
     if not part.done and not part.result:
         head = f"{head} …"
     if part.failed:
         head = f"{head}  ✗"
-    return Fold(head=head, body=part.result.split("\n") if part.result else [])
+    return Fold(head=head, body=part_body(part))
 
 
 def entry_item(entry: ChatEntry, *, stamps: bool = True) -> Item:

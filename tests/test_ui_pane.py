@@ -881,13 +881,14 @@ class TestATurnIsGreyThroughout:
     def test_and_so_is_every_step_it_opens_into(self):
         # The head and both of the rows under it: the whole of what an opened
         # turn puts on the screen, and not only the lines the renderer would
-        # have dimmed by default.
+        # have dimmed by default. Both open — a step's head is one line, and
+        # what it holds (a script, a block of reasoning) is behind it.
         pane = chat_of(SAID, WORKED)
         pane.cursor = 0
         for text in (
             "▾    2 steps · read_file → reasoning",
             "  ▸    read_file     /scratch/run.log",
-            "       reasoning     two shards, one temp path",
+            "  ▸    reasoning     two shards, one temp path",
         ):
             assert theme.faint in styled(pane, text), text
 

@@ -20,6 +20,7 @@ from hpca.ui.rain import (
     spinner_trail,
 )
 from hpca.ui.state import (
+    RESULT_RULE,
     ChatEntry,
     ChatPart,
     Context,
@@ -183,6 +184,54 @@ class TestEntriesBecomeRows:
         )
         assert len(item.folds) == 1
         assert "a note" in item.folds[0].head
+
+    def test_a_step_opens_into_the_call_as_well_as_the_result(self):
+        # The head has one line and a run_bash call's is a fifty-line script:
+        # a row that opened into its output alone showed the stdout of a
+        # command the user could not read.
+        script = "set -e\ncp /very/long/source /very/long/destination\necho done"
+        item = entry_item(
+            ChatEntry(
+                kind="thinking",
+                seq=3,
+                parts=[
+                    ChatPart(
+                        kind="call",
+                        tool="run_bash",
+                        text=script,
+                        result="done",
+                        done=True,
+                    )
+                ],
+            )
+        )
+        assert item.folds[0].body == [*script.split("\n"), "", RESULT_RULE, "done"]
+
+    def test_a_scripted_call_heads_with_one_line_not_the_whole_script(self):
+        # Joined-up script lines read as a command nobody wrote; the fold
+        # marker is what says the rest is behind the row.
+        item = entry_item(
+            ChatEntry(
+                kind="thinking",
+                seq=3,
+                parts=[
+                    ChatPart(kind="call", tool="run_bash", text="set -e\nrm -rf /x")
+                ],
+            )
+        )
+        assert item.folds[0].head.startswith("run_bash")
+        assert "set -e" in item.folds[0].head
+        assert "rm -rf" not in item.folds[0].head
+
+    def test_a_call_still_in_flight_opens_into_itself_with_no_result_heading(self):
+        item = entry_item(
+            ChatEntry(
+                kind="thinking",
+                seq=3,
+                parts=[ChatPart(kind="call", tool="run_bash", text="sleep 5")],
+            )
+        )
+        assert item.folds[0].body == ["sleep 5"]
 
     def test_a_queued_message_is_drawn_as_the_chat_it_will_become(self):
         # Still the user's words and still copyable as such; the label is what
