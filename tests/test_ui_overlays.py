@@ -205,6 +205,13 @@ class TestRewindOverlay:
         assert "fork the session from here" in seen
         assert "roll this conversation back to here" in seen
 
+    def test_it_says_where_the_message_goes(self):
+        # Both cuts hand it back to the box, and a message reappearing where
+        # the user is about to type is alarming if the dialog never said so.
+        ui = build()
+        on_own_message(ui)
+        assert "comes back to the box" in screen(press(ui, "enter"))
+
     def test_and_no_longer_the_copy(self):
         # It is `c` on the chat row now, which needs no dialog in front of it.
         ui = build()

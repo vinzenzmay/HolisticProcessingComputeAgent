@@ -774,7 +774,7 @@ class TestTheRewindIsConnected:
             protocol.ChatReset(session_id="s1", entries=list(EXCHANGES[:2]))
         )
         assert [e.text for e in wire.ui.session.entries] == ["q1", "a1"]
-        assert "q2" not in wire.screen()
+        assert "q2" not in "\n".join(x.head for x in wire.ui.chat.items)
 
     async def test_rollback_to_the_first_message_empties_the_thread(self, wire):
         await started(wire)
@@ -792,13 +792,59 @@ class TestTheRewindIsConnected:
             protocol.ChatReset(session_id="s1", entries=list(EXCHANGES[:2]))
         )
         wire.ui.focus = INPUT
-        await wire.press(*"q2 but better", "enter")
+        # The cut message is already in the box, cursor at the end of it, so
+        # saying it differently is typing the difference — which is what a
+        # rewind is for.
+        await wire.press(*" but better", "enter")
         sent = wire.peer.last(protocol.TurnSubmit)
         # One message, on the session that was trimmed: nothing the UI holds
         # resends the cut rows, and what the model sees is the core's to say
         # (`test_core_service.py` drives the graph for that half).
         assert (sent.session_id, sent.text) == ("s1", "q2 but better")
         assert [e.text for e in wire.ui.session.entries] == ["q1", "a1"]
+
+    async def test_the_cut_message_comes_back_to_the_box(self, wire):
+        # A rewind is made in order to say that message differently, and
+        # retyping it by hand was the whole of the friction.
+        await self.at_q2(wire)
+        await wire.press("r")
+        assert wire.ui.input.text() == "q2"
+        assert wire.ui.focus == INPUT
+
+    async def test_and_does_not_overwrite_what_was_being_written(self, wire):
+        # `_into_draft`'s rule, which is why the message is added to the draft
+        # rather than replacing it: a cut must not cost the user a sentence.
+        await self.at_q2(wire)
+        wire.ui.input.set_text("half a thought")
+        await wire.press("r")
+        assert wire.ui.input.text() == "half a thought\nq2"
+
+    async def test_a_fork_hands_the_message_to_the_copy(self, wire):
+        # Not to the source, which still has the message in its log — the
+        # copy is the conversation the message is going to be said in again.
+        await self.at_q2(wire)
+        await wire.press("f")
+        assert wire.ui.session_for("s1").draft.text() == ""
+        await wire.tell(
+            protocol.SessionCreated(
+                row=protocol.SessionRow(session_id="f1", title="a fork")
+            )
+        )
+        assert wire.ui.active_id == "f1"
+        assert wire.ui.input.text() == "q2"
+
+    async def test_a_session_made_from_the_picker_inherits_nothing(self, wire):
+        # The fork's text waits on the app for the `session.created` that
+        # answers it, so a session created any other way must not pick it up.
+        await self.at_q2(wire)
+        await wire.press("f")
+        wire.ui._forked_draft = ""  # as `_closed` clears it for `session.new`
+        await wire.tell(
+            protocol.SessionCreated(
+                row=protocol.SessionRow(session_id="n1", title="a new one")
+            )
+        )
+        assert wire.ui.input.text() == ""
 
     async def test_a_refused_rollback_is_shown_and_cuts_nothing(self, wire):
         # Refusing is the core's job — `TurnScheduler.rewind_blocker` is the
