@@ -643,6 +643,36 @@ class TestDisplaySettings:
         with pytest.raises(SettingsError):
             Settings.load(path)
 
+    def test_a_chat_row_leaves_one_blank_line_under_itself(self):
+        assert Settings().display.spacer_lines == 1
+
+    def test_and_the_spacing_can_be_turned_off(self, tmp_path):
+        # Zero is a real answer and not a grudging one: on a short terminal
+        # every blank is a line of conversation that is not on screen.
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"display": {"spacer_lines": 0}}))
+        assert Settings.load(path).display.spacer_lines == 0
+
+    def test_or_opened_up(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"display": {"spacer_lines": 2}}))
+        assert Settings.load(path).display.spacer_lines == 2
+
+    def test_but_not_negative(self, tmp_path):
+        # A count a repaint loop builds a list from.
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"display": {"spacer_lines": -1}}))
+        with pytest.raises(SettingsError):
+            Settings.load(path)
+
+    def test_and_not_a_pane_made_of_gap(self, tmp_path):
+        # Past a handful the chat is one message a screen, which is not a
+        # spacious log — it is a broken one.
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"display": {"spacer_lines": 800}}))
+        with pytest.raises(SettingsError):
+            Settings.load(path)
+
 
 class TestThePalette:
     """The colours, which a user is meant to be able to replace outright."""

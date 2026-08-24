@@ -28,6 +28,7 @@ from hpca.ui.app import CHAT, INPUT, SESSIONS, WATCHERS, RowUI
 from hpca.ui import state, theme
 from hpca.ui.client import UIClient
 from hpca.ui.overlays import HelpOverlay, InspectOverlay
+from hpca.ui.pane import MAX_SPACER_LINES
 from tests.ui_harness import Peer, Wire, clocked, on_entry, plain, settle, widths
 
 ROWS = [
@@ -258,6 +259,36 @@ class TestTheSettingsTheUiDrawsWith:
             ),
         )
         assert wire.ui.session_for("s3").chat.items[0].head == "you"
+
+    async def test_the_spacing_reaches_the_pane_that_draws_it(self, wire):
+        # The setting is a number on `Display`, and the pane is what turns it
+        # into rows — so the check is on the pane rather than on the copy of
+        # the value, which any assignment would satisfy.
+        await started(wire, [entry(1, text="run it", at=AT)])
+        await wire.tell(
+            protocol.DisplayChanged(
+                display=protocol.DisplaySettings(spacer_lines=2)
+            )
+        )
+        assert wire.ui.chat.spacer == 2
+
+    async def test_and_a_count_no_frame_could_use_is_clamped(self, wire):
+        # A core built from a hand-edited settings file that pydantic never
+        # saw. Clamped here rather than trusted, the way the fps is: a repaint
+        # loop is not a place to find out.
+        await started(wire, [entry(1, text="run it", at=AT)])
+        await wire.tell(
+            protocol.DisplayChanged(
+                display=protocol.DisplaySettings(spacer_lines=-3)
+            )
+        )
+        assert wire.ui.chat.spacer == 0
+        await wire.tell(
+            protocol.DisplayChanged(
+                display=protocol.DisplaySettings(spacer_lines=10**6)
+            )
+        )
+        assert wire.ui.chat.spacer == MAX_SPACER_LINES
 
 
 # -------------------------------------------------------------- the sidebar

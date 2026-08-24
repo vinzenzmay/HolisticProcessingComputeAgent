@@ -1204,6 +1204,12 @@ class DisplaySettings(_Model):
     # Zero is off. The receiving side clamps, for the reason the fps above
     # does: a frame is booked from this, and a negative delay books nothing.
     focus_flash_seconds: float = 0.1
+    # Blank rows under each chat row (`ui.pane.SPACER_LINES`). The receiving
+    # side clamps rather than trusts, for the reason the fps above does: this
+    # is a count a repaint loop builds a list from, and a negative one would
+    # be a `range` that quietly draws nothing while a very large one is a pane
+    # made of gap.
+    spacer_lines: int = 1
 
 
 class Hello(Event):

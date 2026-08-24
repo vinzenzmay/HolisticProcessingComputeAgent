@@ -29,7 +29,7 @@ from hpca.ui.ansi import PULSE_PERIOD, RESET
 from hpca.ui.approval import Decision
 from hpca.ui.editor import Editor
 from hpca.ui.meter import render_bar, severity
-from hpca.ui.pane import Fold, Item, Pane
+from hpca.ui.pane import SPACER_LINES, Fold, Item, Pane
 from hpca.ui.rain import FPS as RAIN_FPS
 from hpca.ui.theme import FLASH_HOLD
 
@@ -128,6 +128,12 @@ class Display:
     # How long the pane that just took focus is washed in `palette["flash"]`.
     # Zero is off.
     focus_flash_seconds: float = FLASH_HOLD
+    # Blank rows under each chat row, and so the gap above the message box —
+    # the chat hangs from the bottom of its pane, so its last row's blanks are
+    # what stands between the conversation and what you type into it. Zero is
+    # off. The module default stands in until `hello` lands, which is before
+    # there is a conversation to space out.
+    spacer_lines: int = SPACER_LINES
 
 
 # The mode line's copy, lifted from `tui/mode_bar.py` — the hint is the whole
@@ -970,8 +976,11 @@ class SessionState:
         # state, and this is the one place it can belong to the same session.
         self.menu_at = 0
         # The one flush pane: its rows are prose somebody is going to select
-        # with the mouse, so it spends no columns in front of them.
-        self.chat = Pane("chat", [], flush=True)
+        # with the mouse, so it spends no columns in front of them. And the
+        # one spaced pane, for the same reason one level on: the rows are
+        # paragraphs, and paragraphs are told apart by the blank between them
+        # (`pane.SPACER_LINES`).
+        self.chat = Pane("chat", [], flush=True, spacer=self.display.spacer_lines)
         # The folds this UI opened by itself, because their steps were
         # arriving while the user watched. Remembered so that the end of the
         # turn can close exactly those and leave alone whatever the user
@@ -1045,6 +1054,11 @@ class SessionState:
         only side that knows it.
         """
         self.display = display
+        # Assigned before the rebuild, not after: the setter invalidates only
+        # when the count actually changed, and a `spacer` handed over after
+        # `invalidate` would leave the cache holding the old spacing until the
+        # next thing that happened to throw it away.
+        self.chat.spacer = display.spacer_lines
         self.chat.items = [self._item(entry) for entry in self.entries]
         self.chat.invalidate()
 

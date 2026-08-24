@@ -478,6 +478,29 @@ class DisplaySettings(_Section):
     # has stopped being a flash and started being a state, and a state that
     # says "focus arrived here recently" is not a thing this UI has.
     focus_flash_seconds: float = Field(default=0.1, ge=0, le=1.0)
+    # Blank rows drawn under each chat row — a message, a turn's working, a
+    # notice — and so also the gap between the foot of the conversation and
+    # the message box, since the chat hangs from the bottom of its pane.
+    #
+    # One, because a chat is a column of paragraphs and the only thing saying
+    # where one stops was the weight of the next `you` / `hpca` nameplate: it
+    # is enough on a two-line exchange and not enough once a reply runs to
+    # twenty, where the eye has to walk back up to find the boundary. A blank
+    # line is what prose has always used for that.
+    #
+    # Zero is off, and off is a real answer rather than a grudging one: on a
+    # short terminal every blank is a line of conversation that is not on
+    # screen, and somebody reading a long turn on a 24-row window is trading
+    # a boundary they can already see for rows they cannot spare.
+    #
+    # Capped at 8. Past there the pane is mostly gap — one message a screen —
+    # which is not a spacious log, it is a broken one, and a cap is cheaper
+    # than the bug report from whoever typed 800 to see what happened.
+    #
+    # Only the chat. The sessions and watchers columns are lists of one-line
+    # titles that were never hard to tell apart, and doubling their height
+    # would cost the chat the rows `_heights` gives it.
+    spacer_lines: int = Field(default=1, ge=0, le=8)
 
 
 class LLMBackend(_Section):

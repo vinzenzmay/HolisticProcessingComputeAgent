@@ -34,7 +34,7 @@ from hpca.agent.modes import next_mode
 from hpca.transport import Connection
 from hpca.ui import state, theme
 from hpca.ui.app import RowUI
-from hpca.ui.pane import Item
+from hpca.ui.pane import MAX_SPACER_LINES, Item
 
 logger = logging.getLogger("hpca.ui.client")
 
@@ -783,6 +783,10 @@ class UIClient:
             quit_rain_fps=msg.quit_rain_fps,
             decision_pulse_seconds=msg.decision_pulse_seconds,
             focus_flash_seconds=msg.focus_flash_seconds,
+            # Clamped here rather than trusted, the way the docstring on the
+            # wire model says: a core built from a hand-edited settings file
+            # that pydantic never saw is the case this is for.
+            spacer_lines=max(0, min(MAX_SPACER_LINES, msg.spacer_lines)),
             # A plain mapping, not the wire model: `state.Display` may not
             # hold a pydantic object any more than `app.py` may import one.
             palette=msg.palette.model_dump(),

@@ -327,6 +327,7 @@ class TestHandshake:
             "palette",
             "quit_rain",
             "quit_rain_fps",
+            "spacer_lines",
         }
         # And the palette is colours and nothing else — no paths, no names, no
         # anything a front-end could be handed by calling it a display key.
