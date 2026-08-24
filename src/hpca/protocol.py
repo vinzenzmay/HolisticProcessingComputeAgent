@@ -1131,8 +1131,8 @@ class Palette(_Model):
     ok: str = "71"
     warn: str = "172"
     danger: str = "167"
-    muted: str = "245"
-    faint: str = "240"
+    muted: str = "250"
+    faint: str = "245"
     spinner: list[str] = ["73", "66", "23", "236"]
     flash: str = "23"
 

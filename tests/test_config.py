@@ -652,6 +652,16 @@ class TestThePalette:
         assert (palette.chrome, palette.warn) == ("73", "172")
         assert palette.spinner == ["73", "66", "23", "236"]
 
+    def test_the_greys_are_readable_on_a_dark_terminal(self):
+        # A turn's working — the bulkiest thing in the log — is drawn entirely
+        # in `faint`, and the grey it used to be (240, #585858) sat under 3:1
+        # against a dark ground: legible on the screen it was picked on, murky
+        # on the next one. Tertiary means quieter than the prose, not harder
+        # to read than it, and `muted` stays the brighter of the two.
+        palette = Settings().display.palette
+        assert (palette.muted, palette.faint) == ("250", "245")
+        assert int(palette.muted) > int(palette.faint)
+
     def test_an_xterm_index_and_a_hex_triple_are_both_colours(self, tmp_path):
         path = tmp_path / "settings.json"
         path.write_text(

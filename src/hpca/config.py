@@ -381,9 +381,13 @@ class PaletteSettings(_Section):
     ok: Colour = "71"
     warn: Colour = "172"
     danger: Colour = "167"
-    # Secondary and tertiary text.
-    muted: Colour = "245"
-    faint: Colour = "240"
+    # Secondary and tertiary text. Both a step brighter than the greys this
+    # started with (245/240): a turn's working is drawn entirely in `faint`,
+    # and #585858 on a dark terminal is under 3:1 against the ground — a step
+    # row was legible on the screen it was picked on and murky on the next
+    # one. Tertiary means quieter than the prose, not harder to read than it.
+    muted: Colour = "250"
+    faint: Colour = "245"
     # The working row's drop, head first (`ui.rain.spinner`). Shorter than four
     # is a shorter trail, not an error — one entry is a plain blinking cell.
     # It is off the signal green because a spinner says "busy", not "well", and
