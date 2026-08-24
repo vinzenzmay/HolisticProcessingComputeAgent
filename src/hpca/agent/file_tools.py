@@ -914,8 +914,9 @@ def add_file_tools(registry: ToolRegistry) -> ToolRegistry:
         Tool(
             name="create_file",
             description=(
-                "Write a new text file: a large script, specs, notes, a README, a config, etc. "
-                "at a path, one array element per line. Past ~150 "
+                "Write a NEW text file — specs, notes, a README, a config — "
+                "at a path, one array element per line. Use this instead of "
+                "echoing or heredoc'ing a file through run_bash. Past ~150 "
                 "lines send a skeleton (headings + one `TBD: ...` line each) "
                 "and fill per section with edit_file. It will not overwrite: "
                 "to change a file that exists, call edit_file"
