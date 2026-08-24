@@ -1247,8 +1247,9 @@ class TestSessionNew:
         await service.handle(SessionNew(profile="default"))
         events = await drain(queue)
         # created first: the UI has to open it, and a sidebar cannot say which
-        # of its lines is the new one.
-        assert kinds(events) == ["SessionCreated", "SessionRows"]
+        # of its lines is the new one. The profiles follow, because a row
+        # there counts the conversations filed under each profile.
+        assert kinds(events) == ["SessionCreated", "SessionRows", "ProfileRows"]
         created = events[0].row
         assert created.session_id in {r.session_id for r in events[1].rows}
 
@@ -3317,6 +3318,34 @@ class TestTheProfileListing:
         await service.handle(ProfileDelete(name="doomed"))
         rows = only(await drain(queue), "ProfileRows").rows
         assert "doomed" not in {r.name for r in rows}
+
+    async def test_the_sessions_are_counted(self, service, conn):
+        # The other number on the row, and the one a front-end cannot work out
+        # for itself: the sidebar holds the sessions it was sent, and rule 2
+        # of §4.2 keeps the table out of its reach.
+        Profile.create("bioinformatics")
+        store = SessionStore(conn)
+        store.create(profile="bioinformatics", title="one")
+        store.create(profile="bioinformatics", title="two")
+        queue = subscribe(service)
+        await service.handle(ProfileList())
+        rows = {r.name: r for r in only(await drain(queue), "ProfileRows").rows}
+        assert rows["bioinformatics"].sessions == 2
+        assert rows["default"].sessions == 0
+
+    async def test_a_new_session_restates_the_listing(self, service):
+        queue = subscribe(service)
+        await service.handle(SessionNew(profile="default"))
+        rows = {r.name: r for r in only(await drain(queue), "ProfileRows").rows}
+        assert rows["default"].sessions == 1
+
+    async def test_deleting_a_session_restates_the_listing(
+        self, service, session
+    ):
+        queue = subscribe(service)
+        await service.handle(SessionDelete(session_id=session.session_id))
+        rows = {r.name: r for r in only(await drain(queue), "ProfileRows").rows}
+        assert rows["default"].sessions == 0
 
     async def test_an_approved_memory_restates_the_listing(
         self, service, session, llm

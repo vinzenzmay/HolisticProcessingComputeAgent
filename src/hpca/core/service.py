@@ -762,6 +762,11 @@ class AgentService:
             )
         self._deps.emit(SessionCreated(row=self._row(session)))
         self._emit_rows()
+        # The profiles screen counts conversations per profile, and this is
+        # one of the three places that number moves (`_new_session`, a fork,
+        # a deletion). The sidebar cannot be totalled up for it: it holds the
+        # sessions a front-end was sent, and the count is the core's answer.
+        self._emit_profiles()
 
     async def _reusable_session(self):
         """The conversation on screen, when starting a new one would only
@@ -1250,6 +1255,7 @@ class AgentService:
                     )
                 )
         self._emit_rows()
+        self._emit_profiles()  # one conversation fewer under its profile
         await self._pollers.refresh_panel(force=True)
         self._deps.emit(Notify(text=f"Deleted “{session.title}”"))
 
@@ -1292,6 +1298,7 @@ class AgentService:
             return
         self._deps.emit(SessionCreated(row=self._row(fork)))
         self._emit_rows()
+        self._emit_profiles()  # one more conversation under this profile
         self._deps.emit(
             Notify(
                 text=f"Forked “{source.title}” — "

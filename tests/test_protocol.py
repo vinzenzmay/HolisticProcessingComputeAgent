@@ -846,6 +846,7 @@ class TestTheProfileListing:
         assert set(ProfileRow.model_fields) == {
             "name",
             "memories",
+            "sessions",
             "copied_from",
             "is_default",
             "working",

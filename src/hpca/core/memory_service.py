@@ -1091,6 +1091,7 @@ class MemoryService:
         opened and fixed, and it cannot be opened from a screen that failed to
         draw.
         """
+        counts = self._session_counts()
         rows = []
         for name in Profile.list_profiles():
             memories, copied_from = 0, ""
@@ -1105,6 +1106,7 @@ class MemoryService:
                 ProfileRow(
                     name=name,
                     memories=memories,
+                    sessions=counts.get(name, 0),
                     copied_from=copied_from,
                     # Two different questions: which profile a deleted one's
                     # sessions fall back to, and which one the core is running
@@ -1114,6 +1116,28 @@ class MemoryService:
                 )
             )
         self._deps.emit(ProfileRows(rows=rows))
+
+    def _session_counts(self) -> dict[str, int]:
+        """How many conversations each profile has, or nothing at all.
+
+        Read through the direct connection rather than the async seam, the way
+        `core.backends` reads the same table: this is a synchronous restatement
+        called from write paths that are themselves synchronous, and one
+        `COUNT(*) GROUP BY` on the sessions table is not what `deps.db` exists
+        to keep off the loop.
+
+        A core built without a connection (a test with nothing but a fake LLM)
+        counts nothing, and the row then says nothing about sessions rather
+        than refusing to draw — the same bargain the memory count makes with a
+        profile file it cannot read.
+        """
+        if self._deps.conn is None:
+            return {}
+        try:
+            return SessionStore(self._deps.conn).counts_by_profile()
+        except Exception:
+            logger.exception("could not count sessions per profile")
+            return {}
 
     def profile_body(self, name: str, kind: str) -> tuple[str, str]:
         """One editable profile file as text, and why it could not be read.
