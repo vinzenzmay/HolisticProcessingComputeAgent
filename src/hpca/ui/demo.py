@@ -833,6 +833,7 @@ class DemoCore:
                     protocol.ProfileRow(
                         name=x.name,
                         memories=x.memories,
+                        sessions=x.sessions,
                         copied_from=x.copied_from,
                         is_default=x.default,
                         working=x.working,

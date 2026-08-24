@@ -974,6 +974,7 @@ class UIClient:
             state.ProfileInfo(
                 name=row.name,
                 memories=row.memories,
+                sessions=row.sessions,
                 copied_from=row.copied_from,
                 default=row.is_default,
                 working=row.working,

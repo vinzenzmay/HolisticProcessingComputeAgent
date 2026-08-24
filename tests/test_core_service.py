@@ -1247,8 +1247,9 @@ class TestSessionNew:
         await service.handle(SessionNew(profile="default"))
         events = await drain(queue)
         # created first: the UI has to open it, and a sidebar cannot say which
-        # of its lines is the new one.
-        assert kinds(events) == ["SessionCreated", "SessionRows"]
+        # of its lines is the new one. The profiles follow, because a row
+        # there counts the conversations filed under each profile.
+        assert kinds(events) == ["SessionCreated", "SessionRows", "ProfileRows"]
         created = events[0].row
         assert created.session_id in {r.session_id for r in events[1].rows}
 
@@ -3317,6 +3318,97 @@ class TestTheProfileListing:
         await service.handle(ProfileDelete(name="doomed"))
         rows = only(await drain(queue), "ProfileRows").rows
         assert "doomed" not in {r.name for r in rows}
+
+    async def test_the_sessions_are_counted(self, service, conn):
+        # The other number on the row, and the one a front-end cannot work out
+        # for itself: the sidebar holds the sessions it was sent, and rule 2
+        # of §4.2 keeps the table out of its reach.
+        Profile.create("bioinformatics")
+        store = SessionStore(conn)
+        store.create(profile="bioinformatics", title="one")
+        store.create(profile="bioinformatics", title="two")
+        queue = subscribe(service)
+        await service.handle(ProfileList())
+        rows = {r.name: r for r in only(await drain(queue), "ProfileRows").rows}
+        assert rows["bioinformatics"].sessions == 2
+        assert rows["default"].sessions == 0
+
+    async def test_a_new_session_restates_the_listing(self, service):
+        queue = subscribe(service)
+        await service.handle(SessionNew(profile="default"))
+        rows = {r.name: r for r in only(await drain(queue), "ProfileRows").rows}
+        assert rows["default"].sessions == 1
+
+    async def test_deleting_a_session_restates_the_listing(
+        self, service, session
+    ):
+        queue = subscribe(service)
+        await service.handle(SessionDelete(session_id=session.session_id))
+        rows = {r.name: r for r in only(await drain(queue), "ProfileRows").rows}
+        assert rows["default"].sessions == 0
+
+    async def test_an_approved_memory_restates_the_listing(
+        self, service, session, llm
+    ):
+        # The count is only ever sent when it is asked for, and nothing asks
+        # again after a review: a profile that had just gained a memory went
+        # on saying what it said when the client connected, until a restart.
+        await run_turn(service, session.session_id, "how many reads?")
+        llm._outputs = [proposals("the cohort is in /data/cohort")]
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(
+                name="memorize",
+                args="where the cohort lives",
+                session_id=session.session_id,
+            )
+        )
+        await wait_for(queue, "MemoryProposals")
+        await drain(queue)
+        await service.handle(
+            MemoryResolve(session_id=session.session_id, approved=[True])
+        )
+        rows = {r.name: r for r in only(await drain(queue), "ProfileRows").rows}
+        assert rows["default"].memories == 1
+
+    async def test_approving_two_memories_restates_the_listing_once(
+        self, service, session, llm
+    ):
+        # One answer is one change to one count; a frame per approved item
+        # would repaint the screen behind the review three times over.
+        await run_turn(service, session.session_id, "how many reads?")
+        llm._outputs = [proposals("the cohort is in /data/cohort", "reads are bams")]
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(
+                name="memorize",
+                args="where the cohort lives",
+                session_id=session.session_id,
+            )
+        )
+        await wait_for(queue, "MemoryProposals")
+        await drain(queue)
+        await service.handle(
+            MemoryResolve(session_id=session.session_id, approved=[True, True])
+        )
+        rows = {r.name: r for r in only(await drain(queue), "ProfileRows").rows}
+        assert rows["default"].memories == 2
+
+    async def test_a_hand_edited_memory_file_restates_the_listing(self, service):
+        # The other way the count moves, and the one where the screen showing
+        # it is usually the screen the editor was opened from.
+        Profile.create("bioinformatics")
+        edited = Profile.load("bioinformatics")
+        edited.add_memory("BAMs live on /scratch", scope=MemoryScope.SYSTEM_PROMPT)
+        edited.add_memory("fastqs live on /data", scope=MemoryScope.SYSTEM_PROMPT)
+        queue = subscribe(service)
+        await service.handle(
+            ProfileSave(
+                name="bioinformatics", kind="memories", text=edited.render()
+            )
+        )
+        rows = {r.name: r for r in only(await drain(queue), "ProfileRows").rows}
+        assert rows["bioinformatics"].memories == 2
 
     async def test_a_profile_that_will_not_load_is_listed_anyway(self, service):
         # The screen is partly *how* a broken profile gets opened and fixed,

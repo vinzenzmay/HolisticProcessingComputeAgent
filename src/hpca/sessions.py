@@ -169,6 +169,19 @@ class SessionStore:
         rows = self._conn.execute(f"SELECT * FROM sessions {self._ORDER}").fetchall()
         return [self._to_session(row) for row in rows]
 
+    def counts_by_profile(self) -> dict[str, int]:
+        """How many conversations each profile has, for the profiles screen.
+
+        Counted in sqlite rather than by listing and grouping in Python: the
+        caller wants one number per profile and this is drawn on a screen, not
+        walked. Profiles with no session are simply absent — the caller knows
+        the profile names, this only knows the ones that were used.
+        """
+        rows = self._conn.execute(
+            "SELECT profile, COUNT(*) AS n FROM sessions GROUP BY profile"
+        ).fetchall()
+        return {row["profile"]: row["n"] for row in rows}
+
     def move(self, session_id: str, delta: int) -> bool:
         """Shift a row one step up (``-1``) or down (``+1``) in the sidebar.
 
