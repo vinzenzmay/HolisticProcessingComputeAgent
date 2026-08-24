@@ -173,5 +173,5 @@ built-in**):
 ## Development
 
 ```bash
-uv run pytest        # or: pixi run -e dev pytest
+pixi run -e dev pytest        # or: uv run pytest
 ```
