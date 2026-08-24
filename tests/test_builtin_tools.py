@@ -360,10 +360,11 @@ class TestCreateScriptSaysWhichLanguagesItHas:
     come from the description, before the call."""
 
     def test_the_tool_description_closes_the_pair(self, tools):
+        # Both languages named, and — the part that was missing — somewhere for
+        # a file that is neither to go. The exact wording is not pinned; that
+        # a reader is told the pair is closed and where else to look is.
         description = next(t for t in tools if t.name == "create_script").description
-        assert "ONLY" in description
-        assert "Snakefile" in description
-        # and says where the file that is not one of the two goes instead
+        assert "bash" in description and "python" in description
         assert "create_file" in description
 
     def test_and_so_does_the_kind_field(self):
