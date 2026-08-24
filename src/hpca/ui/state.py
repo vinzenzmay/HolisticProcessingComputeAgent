@@ -792,6 +792,28 @@ class Proposal:
 
 
 @dataclass
+class CompactProposal:
+    """A summary `/compact` wrote, waiting to be accepted (`compact.proposed`).
+
+    Held on the session for the reason the `Offer` above is: it arrives a model
+    call after the keystroke, and by then the user may be reading another
+    conversation. Answering it against the wrong one would fold the wrong
+    history.
+
+    ``summary`` is the message as the core would store it, because that is what
+    the user is being asked to accept — not a preview of it. ``truncated`` is
+    the core's warning that the text is cut, which is the one thing a reader
+    cannot tell for themselves.
+    """
+
+    summary: str = ""
+    folded: int = 0
+    guidance: str = ""
+    attempt: int = 1
+    truncated: bool = False
+
+
+@dataclass
 class BackendInfo:
     """One LLM the UI can draw and name — the plain twin of `protocol.LLMEntry`.
 
@@ -976,6 +998,11 @@ class SessionState:
         # strand that one with nothing left on any screen able to answer it.
         self.offers: list[Offer] = []
         self.proposals: list[Proposal] = []
+        # The summary this conversation is being asked to accept, or None.
+        # One slot, unlike `offers` above: a second `/compact` on a session
+        # that is already holding one either re-offers it or replaces it, so
+        # there is never a queue of summaries of the same history.
+        self.compaction: CompactProposal | None = None
         # A reply landed here while the user was looking at another
         # conversation (§4.3 item 15). Local, because the core has no flag for
         # it and could not have one: "you have not read this" is a fact about
@@ -1694,6 +1721,25 @@ class ResolveMemory:
 
 
 @dataclass(frozen=True)
+class ResolveCompact:
+    """The verdict on a `compact.proposed` offer.
+
+    Three answers rather than a yes/no, because a summary is a thing that can
+    be *nearly* right: `retry` sends it back with ``comment`` saying what it
+    has to do differently, which is the one field here carrying text. The
+    summary itself never travels back — the core holds it, so what lands is
+    what the model wrote (`protocol.CompactResolve`).
+
+    Closing the review without answering sends none of these: the core goes on
+    holding the offer and `/compact` brings it back.
+    """
+
+    session_id: str
+    action: str = "discard"  # "accept", "retry", "discard"
+    comment: str = ""
+
+
+@dataclass(frozen=True)
 class Fetch:
     """Ask for a body an editor is about to open — and about to overwrite.
 
@@ -1827,6 +1873,7 @@ Intent = (
     | SaveSkill
     | DeleteSkill
     | ResolveMemory
+    | ResolveCompact
     | RunCommand
     | Fetch
     | FetchSkills

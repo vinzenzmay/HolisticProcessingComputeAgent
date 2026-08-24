@@ -288,7 +288,12 @@ def build_graph(
                 await on_evict(older)
             except Exception:
                 pass  # extraction is best-effort too
-        return {"compacted": {"upto": already + len(older), "summary": summary}}
+        return {
+            "compacted": {
+                "upto": already + len(older),
+                "summary": summary.message,
+            }
+        }
 
     async def orchestrator(state: AgentState, config) -> dict:
         thread_id = _thread_id(config)
@@ -629,10 +634,16 @@ async def deliver_event(graph, *, session_id: str, text: str) -> None:
     await graph.aupdate_state(config, {"messages": [{"role": "user", "content": text}]})
 
 
-async def compact_now(
-    graph, *, session_id: str, llm, guidance: str | None = None
+async def propose_compaction(
+    graph,
+    *,
+    session_id: str,
+    llm,
+    guidance: str | None = None,
+    previous_attempt: str | None = None,
+    comment: str | None = None,
 ) -> dict | None:
-    """Fold a session's history on the user's say-so (``/compact``).
+    """The fold ``/compact`` *would* make, computed and not written.
 
     The automatic fold in the orchestrator waits for the window to fill and
     keeps a recent tail verbatim, because it fires unasked and mid-task. This
@@ -643,11 +654,18 @@ async def compact_now(
     ``guidance`` is the text the user typed after the command — what the
     summary must carry, or the next step it should be written for. It reaches
     the summarizer and stays in the folded view (see :mod:`hpca.agent.compact`).
+    ``previous_attempt`` and ``comment`` are a retry: the summary the user
+    turned down and what they said about it.
 
-    Returns ``{"folded": n, "upto": int, "summary": Message}``, or None when
-    there is nothing new to fold. The stored history is never rewritten, here
-    as in the automatic path: only the view the model receives changes, so the
-    user can still scroll back to every message behind the summary.
+    Nothing is written here, which is the whole point of the split — a summary
+    the user has not seen yet must not already be the conversation's history.
+    :func:`apply_compaction` is what lands it, once they say so.
+
+    Returns ``{"folded": n, "upto": int, "summary": Message, "truncated":
+    bool}``, or None when there is nothing new to fold. ``upto`` is a position
+    in the stored history and stays meaningful while the thread grows: a turn
+    that runs between the offer and the answer is simply left verbatim behind
+    the summary.
     """
     config = {"configurable": {"thread_id": session_id}}
     snapshot = await graph.aget_state(config)
@@ -661,15 +679,75 @@ async def compact_now(
     # Fold the previous summary in too, so compacting twice carries the early
     # session forward instead of forgetting it.
     summary = await compact.summarize(
-        llm, ([previous] if previous else []) + older, guidance=guidance
+        llm,
+        ([previous] if previous else []) + older,
+        guidance=guidance,
+        previous=previous_attempt,
+        comment=comment,
     )
-    compacted = {"upto": len(messages), "summary": summary}
+    return {
+        "folded": len(older),
+        "upto": len(messages),
+        "summary": summary.message,
+        "truncated": summary.truncated,
+    }
+
+
+async def apply_compaction(
+    graph, *, session_id: str, upto: int, summary: Message
+) -> bool:
+    """Land a proposed fold. False when it no longer describes this thread.
+
+    The two ways a proposal goes stale, both from the seconds it spends on
+    screen waiting for an answer: the thread was trimmed behind it (``upto``
+    now points past the end of a shorter history), or something folded past
+    this point in the meantime. Neither is an error worth raising — the
+    conversation is intact either way, which is exactly what "nothing lands
+    until the user accepts" is for — so the caller says so and stops.
+
+    The stored history is never rewritten, here as in the automatic path: only
+    the view the model receives changes, so the user can still scroll back to
+    every message behind the summary.
+    """
+    config = {"configurable": {"thread_id": session_id}}
+    snapshot = await graph.aget_state(config)
+    values = snapshot.values or {}
+    if upto > len(values.get("messages", [])):
+        return False
+    if upto <= (values.get("compacted") or {}).get("upto", 0):
+        return False
     # Written as START, the way every out-of-band write enters this graph: no
     # node produced it. Naming the node explicitly is not optional — LangGraph
     # otherwise infers it from the last node that wrote, which is ambiguous on
     # a thread whose most recent write was itself an external one.
-    await graph.aupdate_state(config, {"compacted": compacted}, as_node=START)
-    return {"folded": len(older), **compacted}
+    await graph.aupdate_state(
+        config, {"compacted": {"upto": upto, "summary": summary}}, as_node=START
+    )
+    return True
+
+
+async def compact_now(
+    graph, *, session_id: str, llm, guidance: str | None = None
+) -> dict | None:
+    """Fold a session's history on the user's say-so, in one step.
+
+    Propose and apply with nobody asked in between — what a front-end does
+    when it has no way to hold a summary up for review, and what the tests
+    drive. The interactive path is the two halves separately, with
+    ``compact.proposed`` in the gap (`core.service._compact`).
+    """
+    proposed = await propose_compaction(
+        graph, session_id=session_id, llm=llm, guidance=guidance
+    )
+    if proposed is None:
+        return None
+    await apply_compaction(
+        graph,
+        session_id=session_id,
+        upto=proposed["upto"],
+        summary=proposed["summary"],
+    )
+    return proposed
 
 
 async def thread_message_count(graph, *, session_id: str) -> int:

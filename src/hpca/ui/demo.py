@@ -122,6 +122,25 @@ SHIPPED_SKILLS = (
 # table is the core's and rule 2 of §4.2 keeps a front-end out of it.
 COMMAND_COUNTS: dict[str, int] = {"compact": 5, "memorize": 2, "conclude": 1}
 
+# What `/compact` offers in the demo. The first attempt stops mid-sentence on
+# purpose — that is the complaint the review screen exists to let the user make
+# — and the retry answers with the whole thing.
+DEMO_SUMMARY = (
+    "[earlier in this session]\n"
+    "The user is aligning a 40-sample cohort with STAR on /scratch/proj/rna. "
+    "Job 8813 was killed for memory at 32G; --mem=40G ran to completion in "
+    "1h12m. The QC report at /scratch/proj/rna/qc/multiqc.html is unread. "
+    "Two samples (S17, S31) have"
+)
+DEMO_SUMMARY_FULL = (
+    "[earlier in this session]\n"
+    "The user is aligning a 40-sample cohort with STAR on /scratch/proj/rna. "
+    "Job 8813 was killed for memory at 32G; --mem=40G ran to completion in "
+    "1h12m. The QC report at /scratch/proj/rna/qc/multiqc.html is unread. "
+    "Two samples (S17, S31) have duplicate read groups and were left out of "
+    "the merge; the decision on whether to re-header or drop them is open."
+)
+
 LEARNINGS = {
     "hpc": (
         "The cluster's scratch is /scratch/proj, and $HOME is NFS — never write\n"
@@ -417,6 +436,10 @@ class DemoCore:
         # has to be noticed in the sidebar rather than being what opens first.
         self._parked = self.rows[4].session_id if len(self.rows) > 4 else ""
         self._live: dict[str, protocol.Entry] = {}
+        # The compaction summaries offered and not yet answered, one per
+        # session — the demo's copy of what the core holds between
+        # `compact.proposed` and `compact.resolve`.
+        self._compactions: dict[str, dict] = {}
         # What the manage-LLMs screen has done to the catalog: the scans it
         # has run, what they turned up, and what `r` removed.
         self._scans = 0
@@ -951,7 +974,63 @@ class DemoCore:
         # is visible in the demo rather than only in the tests.
         COMMAND_COUNTS[cmd.name] = COMMAND_COUNTS.get(cmd.name, 0) + 1
         self.emit(protocol.CommandCounts(counts=dict(COMMAND_COUNTS)))
+        if cmd.name == "compact" and cmd.session_id:
+            # The one command the demo does answer for real, because its answer
+            # is a *screen*: the compaction review is otherwise unreachable
+            # without a backend behind it, and a screen nobody can open in the
+            # demo is a screen nobody reviews.
+            self._offer_compaction(cmd.session_id, cmd.args)
+            return
         self.emit(protocol.Notify(text=f"the demo core does not run /{cmd.name}"))
+
+    def _offer_compaction(self, session_id: str, guidance: str) -> None:
+        held = self._compactions.get(session_id)
+        if held is None or guidance:
+            held = {
+                "attempt": (held or {}).get("attempt", 0) + 1 if guidance else 1,
+                "guidance": guidance,
+                "summary": DEMO_SUMMARY,
+                # Cut on the first attempt, whole on the second: the demo's
+                # job is to show what the *again* answer is for.
+                "truncated": True,
+            }
+            self._compactions[session_id] = held
+        self.emit(
+            protocol.CompactProposed(
+                session_id=session_id,
+                summary=held["summary"],
+                folded=len(self.entries(session_id)),
+                guidance=held["guidance"],
+                attempt=held["attempt"],
+                truncated=held["truncated"],
+            )
+        )
+
+    def _do_CompactResolve(self, cmd: protocol.CompactResolve) -> None:
+        held = self._compactions.pop(cmd.session_id, None)
+        if held is None:
+            return
+        if cmd.action == "retry":
+            self._compactions[cmd.session_id] = {
+                "attempt": held["attempt"] + 1,
+                "guidance": held["guidance"],
+                "summary": f"{DEMO_SUMMARY_FULL}\n\n(asked: {cmd.comment})",
+                "truncated": False,
+            }
+            self._offer_compaction(cmd.session_id, "")
+            return
+        if cmd.action == "accept":
+            self.emit(
+                protocol.Notify(
+                    text="Context compacted: the demo folded 12 messages."
+                )
+            )
+            return
+        self.emit(
+            protocol.Notify(
+                text="Compaction discarded — the conversation is unchanged."
+            )
+        )
 
     def _do_SessionRename(self, cmd: protocol.SessionRename) -> None:
         if not cmd.title.strip():

@@ -93,6 +93,10 @@ SPEC_COMMANDS = {
     "command.run",
     "confirm.resolve",
     "memory.resolve",
+    # Nor this one: §4.1 had `/compact` fold on the spot, and a fold is the one
+    # thing a front-end cannot undo. The summary is offered first now, so there
+    # is a verdict to send back (`compact.proposed` below).
+    "compact.resolve",
     "mode.set",
     "thinking.set",
     "backend.set",
@@ -170,6 +174,9 @@ SPEC_EVENTS = {
     "panel.update",
     "watch.peeked",
     "memory.proposals",
+    # The summary `/compact` wrote, before it is anybody's history: the offer
+    # half of the round trip `compact.resolve` answers.
+    "compact.proposed",
     "confirm.requested",
     "context.estimate",
     "notify",

@@ -719,6 +719,33 @@ class MemoryResolve(Command):
     approved: list[bool] = Field(default_factory=list)
 
 
+class CompactResolve(Command):
+    """The answer to a `compact.proposed` offer.
+
+    The third round trip of the same shape as `memory.resolve` and
+    `confirm.resolve`, and for the same reason: the core holds the thing being
+    decided — here the candidate summary and the position in the history it
+    covers — and only the verdict crosses. A front-end therefore cannot hand
+    back an edited summary, which is the one way a fold could quietly become
+    something the model never wrote.
+
+    Three answers, because a summary is not a yes/no. `accept` lands the fold.
+    `retry` throws this attempt away and asks for another one, and `comment` is
+    what the user said was wrong with it — the whole point of the exchange, and
+    why this carries text at all. `discard` leaves the conversation as it was.
+
+    Saying nothing is also allowed: a review closed without an answer sends no
+    command, and the core keeps holding the offer, so `/compact` brings it back
+    instead of paying for a second summary.
+    """
+
+    TYPE: ClassVar[str] = "compact.resolve"
+    session_id: str
+    action: Literal["accept", "retry", "discard"] = "discard"
+    # What the summary has to do differently. Only `retry` reads it.
+    comment: str = ""
+
+
 class ModeSet(Command):
     TYPE: ClassVar[str] = "mode.set"
     session_id: str
@@ -1701,6 +1728,36 @@ class MemoryProposals(Event):
     TYPE: ClassVar[str] = "memory.proposals"
     session_id: str
     proposals: list[Proposal] = Field(default_factory=list)
+
+
+class CompactProposed(Event):
+    """A summary `/compact` wrote, before it is anybody's history.
+
+    A fold cannot be undone from the front-end — the summary becomes what the
+    model sees — and a summary is exactly the kind of thing that comes back
+    wrong: cut off, or missing the one path the next step needs. So the
+    user-driven path offers it first and waits (`compact.resolve`), and this
+    is the offer.
+
+    ``summary`` is the message content as it would be stored, prefix and all,
+    because that is what the user is being asked to accept. ``folded`` is how
+    many messages it stands in for and ``guidance`` what they typed after the
+    command, both so the screen can say what is being decided. ``attempt``
+    counts from 1 and rises with every retry.
+
+    ``truncated`` is the one thing the text cannot say for itself: the backend
+    stopped at its length budget, or the cap cut the end off. It is a hint for
+    the screen to warn with, not an error — a cut summary is still a summary,
+    and whether it is good enough is the user's call.
+    """
+
+    TYPE: ClassVar[str] = "compact.proposed"
+    session_id: str
+    summary: str
+    folded: int = 0
+    guidance: str = ""
+    attempt: int = 1
+    truncated: bool = False
 
 
 class ConfirmRequested(Event):

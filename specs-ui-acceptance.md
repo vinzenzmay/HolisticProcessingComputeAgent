@@ -440,13 +440,23 @@ off file by file.
 ## Compaction — `test_tui_compact.py`
 
 - `/compact` is offered in the slash menu and listed when `/` is typed.
-- It folds the conversation into a summary.
-- The next turn runs on the summary.
+- It writes a summary and shows it, and folds nothing until that summary is
+  accepted: the review names how many messages would fold, the instruction the
+  summary was written for, and whether the model's length budget cut it short.
+- Enter accepts and the fold lands; the next turn runs on the summary.
+- `r` asks for another summary with a line saying what was wrong with this one;
+  that comment and the rejected text both reach the summarizer, and the next
+  offer says which attempt it is. An empty comment is refused, not sent.
+- `d` discards the summary and leaves the conversation as it was.
+- Escape answers nothing: the offer is kept, and a bare `/compact` re-opens the
+  same summary rather than writing a second one. An instruction after the
+  command is a new brief, so it does write one.
 - An instruction after the command steers the summary; a bare `/compact` asks
   for nothing in particular.
-- The chat shows what was kept — the summary itself, not just a count.
+- The accepted summary is shown in full while it is being decided, and the fold
+  is reported in the chat afterwards.
 - The context meter stops showing the pre-fold measured number and falls back
-  to an estimate.
+  to an estimate — when the summary is accepted, not when the command is typed.
 - A backend failure leaves the session untouched.
 - Without a session there is nothing to compact; an empty session is left alone;
   compacting twice over says so.

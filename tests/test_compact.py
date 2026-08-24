@@ -11,10 +11,18 @@ class FakeLLM:
     def __init__(self, summary="the user is aligning reads; STAR needs 40G"):
         self._summary = summary
         self.calls = []
+        # What the summarizer asked for, not just what it said: the budget and
+        # the thinking flag are two of the three reasons a summary came back
+        # cut off, and neither shows up in the text.
+        self.kwargs = []
+        self.finish_reason = "stop"
 
     async def chat(self, messages, **kwargs):
         self.calls.append(messages)
-        return ChatResponse(content=self._summary)
+        self.kwargs.append(kwargs)
+        return ChatResponse(
+            content=self._summary, finish_reason=self.finish_reason
+        )
 
 
 def history(count, chars=100):
@@ -81,9 +89,10 @@ class TestSplit:
 class TestSummarize:
     async def test_produces_one_user_message(self):
         summary = await compact.summarize(FakeLLM(), history(20))
-        assert summary["role"] == "user"  # the shape the model already knows
-        assert summary["content"].startswith(compact.SUMMARY_PREFIX)
-        assert "STAR needs 40G" in summary["content"]
+        # the shape the model already knows
+        assert summary.message["role"] == "user"
+        assert summary.content.startswith(compact.SUMMARY_PREFIX)
+        assert "STAR needs 40G" in summary.content
 
     async def test_prompt_asks_to_keep_identifiers(self):
         llm = FakeLLM()
@@ -98,12 +107,122 @@ class TestSummarize:
 
     async def test_is_summary_recognizes_its_own_output(self):
         summary = await compact.summarize(FakeLLM(), history(20))
-        assert compact.is_summary(summary)
+        assert compact.is_summary(summary.message)
         assert not compact.is_summary({"role": "user", "content": "hello"})
 
     async def test_summary_is_length_bounded(self):
         summary = await compact.summarize(FakeLLM(summary="x" * 9000), history(20))
-        assert len(summary["content"]) < compact.MAX_SUMMARY_CHARS + 60
+        assert len(summary.content) < compact.MAX_SUMMARY_CHARS + 60
+
+
+class TestWhatMadeSummariesLookBroken:
+    """The `/compact` complaint: the summary on screen stopped mid-sentence.
+
+    Three causes, all of them in this module and none of them visible to the
+    user — which is why the review screen is also told when it happened
+    (`Summary.truncated`).
+    """
+
+    async def test_the_generation_budget_matches_the_cap(self):
+        """The first cause: the budget was twice the cap, so anything over
+        ~200 words was written and then sliced by `[:cap]`."""
+        llm = FakeLLM()
+        await compact.summarize(llm, history(20))
+        assert llm.kwargs[-1]["max_tokens"] == compact.budget(
+            compact.MAX_SUMMARY_CHARS
+        )
+        await compact.summarize(llm, history(20), guidance="keep the paths")
+        assert llm.kwargs[-1]["max_tokens"] == compact.budget(
+            compact.MAX_GUIDED_SUMMARY_CHARS
+        )
+
+    async def test_the_summarizer_never_thinks(self):
+        """The second: reasoning is billed against the same budget as the
+        answer, so on a reasoning backend the summary is what runs out."""
+        llm = FakeLLM()
+        await compact.summarize(llm, history(20))
+        assert llm.kwargs[-1]["enable_thinking"] is False
+
+    async def test_a_cut_summary_says_it_was_cut(self):
+        """The third: a backend that stops at max_tokens said so in
+        `finish_reason` and nothing read it."""
+        llm = FakeLLM()
+        llm.finish_reason = "length"
+        summary = await compact.summarize(llm, history(20))
+        assert summary.truncated
+
+    async def test_and_so_does_one_the_cap_cut(self):
+        summary = await compact.summarize(FakeLLM(summary="x" * 9000), history(20))
+        assert summary.truncated
+
+    async def test_an_ordinary_summary_does_not(self):
+        assert not (await compact.summarize(FakeLLM(), history(20))).truncated
+
+
+class TestClip:
+    def test_short_text_is_left_alone(self):
+        assert compact.clip("all of it", 100) == ("all of it", False)
+
+    def test_a_long_one_is_cut_at_a_sentence(self):
+        text = "First sentence. Second one runs on and on and on and on."
+        cut, lost = compact.clip(text, 30)
+        assert lost
+        assert cut.startswith("First sentence.")
+        assert "runs on" not in cut
+
+    def test_a_cut_says_so(self):
+        cut, _ = compact.clip("First sentence. " + "x" * 100, 30)
+        assert cut.endswith(compact.ELLIPSIS)
+
+    def test_no_sentence_end_falls_back_to_a_word(self):
+        cut, lost = compact.clip("aaa bbb ccc ddd eee fff ggg", 12)
+        assert lost
+        # never mid-word, which is what "the tool looks broken" was
+        assert cut.replace(compact.ELLIPSIS, "").split()[-1] in ("aaa", "bbb", "ccc")
+
+
+class TestRevision:
+    """The retry: the user turned a summary down and said what was wrong."""
+
+    async def test_the_comment_and_the_rejected_text_both_reach_the_model(self):
+        llm = FakeLLM()
+        await compact.summarize(
+            llm,
+            history(20),
+            previous="STAR needs 40G and the run died at",
+            comment="you cut it off — finish the sentence",
+        )
+        system = llm.calls[-1][0]["content"]
+        assert "you cut it off" in system
+        assert "STAR needs 40G and the run died at" in system
+
+    async def test_the_comment_does_not_become_a_standing_instruction(self):
+        """It is about this summary, not about the session: "make it shorter"
+        must not be waiting in the folded view for the next ten turns."""
+        summary = await compact.summarize(
+            FakeLLM(), history(20), comment="make it shorter"
+        )
+        assert "make it shorter" not in summary.content
+        assert compact.FOCUS_PREFIX not in summary.content
+
+    async def test_a_retry_gets_the_roomier_cap(self):
+        """The commonest complaint is that it stopped too early, so the second
+        attempt is not held to the tighter of the two bounds."""
+        llm = FakeLLM()
+        await compact.summarize(llm, history(20), comment="finish it")
+        assert llm.kwargs[-1]["max_tokens"] == compact.budget(
+            compact.MAX_GUIDED_SUMMARY_CHARS
+        )
+
+    def test_the_body_handed_back_is_the_model_own_text(self):
+        message = {
+            "role": "user",
+            "content": (
+                f"{compact.SUMMARY_PREFIX}\nwhat happened\n\n"
+                f"{compact.FOCUS_PREFIX}\nkeep the paths"
+            ),
+        }
+        assert compact.summary_body(message) == "what happened"
 
 
 class TestTranscript:
@@ -142,15 +261,15 @@ class TestGuidedSummarize:
         summary = await compact.summarize(
             llm := FakeLLM(), history(20), guidance="next I run the full cohort"
         )
-        assert compact.is_summary(summary)  # still a summary message
-        assert "next I run the full cohort" in summary["content"]
-        assert compact.FOCUS_PREFIX in summary["content"]
+        assert compact.is_summary(summary.message)  # still a summary message
+        assert "next I run the full cohort" in summary.content
+        assert compact.FOCUS_PREFIX in summary.content
         assert llm.calls  # sanity: it really went through the model
 
     async def test_without_an_instruction_nothing_is_added(self):
         llm = FakeLLM()
         summary = await compact.summarize(llm, history(20))
-        assert compact.FOCUS_PREFIX not in summary["content"]
+        assert compact.FOCUS_PREFIX not in summary.content
         assert "word limit" not in llm.calls[0][0]["content"]
 
     async def test_a_guided_summary_may_be_longer(self):
@@ -158,13 +277,13 @@ class TestGuidedSummarize:
         guided = await compact.summarize(
             FakeLLM(summary="x" * 9000), history(20), guidance="keep every path"
         )
-        assert compact.MAX_SUMMARY_CHARS < len(guided["content"])
-        assert len(guided["content"]) < compact.MAX_GUIDED_SUMMARY_CHARS + 200
+        assert compact.MAX_SUMMARY_CHARS < len(guided.content)
+        assert len(guided.content) < compact.MAX_GUIDED_SUMMARY_CHARS + 200
 
     async def test_a_blank_instruction_is_no_instruction(self):
         llm = FakeLLM()
         summary = await compact.summarize(llm, history(20), guidance="   ")
-        assert compact.FOCUS_PREFIX not in summary["content"]
+        assert compact.FOCUS_PREFIX not in summary.content
         assert "word limit" not in llm.calls[0][0]["content"]
 
 
