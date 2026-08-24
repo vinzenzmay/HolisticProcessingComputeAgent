@@ -3318,6 +3318,69 @@ class TestTheProfileListing:
         rows = only(await drain(queue), "ProfileRows").rows
         assert "doomed" not in {r.name for r in rows}
 
+    async def test_an_approved_memory_restates_the_listing(
+        self, service, session, llm
+    ):
+        # The count is only ever sent when it is asked for, and nothing asks
+        # again after a review: a profile that had just gained a memory went
+        # on saying what it said when the client connected, until a restart.
+        await run_turn(service, session.session_id, "how many reads?")
+        llm._outputs = [proposals("the cohort is in /data/cohort")]
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(
+                name="memorize",
+                args="where the cohort lives",
+                session_id=session.session_id,
+            )
+        )
+        await wait_for(queue, "MemoryProposals")
+        await drain(queue)
+        await service.handle(
+            MemoryResolve(session_id=session.session_id, approved=[True])
+        )
+        rows = {r.name: r for r in only(await drain(queue), "ProfileRows").rows}
+        assert rows["default"].memories == 1
+
+    async def test_approving_two_memories_restates_the_listing_once(
+        self, service, session, llm
+    ):
+        # One answer is one change to one count; a frame per approved item
+        # would repaint the screen behind the review three times over.
+        await run_turn(service, session.session_id, "how many reads?")
+        llm._outputs = [proposals("the cohort is in /data/cohort", "reads are bams")]
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(
+                name="memorize",
+                args="where the cohort lives",
+                session_id=session.session_id,
+            )
+        )
+        await wait_for(queue, "MemoryProposals")
+        await drain(queue)
+        await service.handle(
+            MemoryResolve(session_id=session.session_id, approved=[True, True])
+        )
+        rows = {r.name: r for r in only(await drain(queue), "ProfileRows").rows}
+        assert rows["default"].memories == 2
+
+    async def test_a_hand_edited_memory_file_restates_the_listing(self, service):
+        # The other way the count moves, and the one where the screen showing
+        # it is usually the screen the editor was opened from.
+        Profile.create("bioinformatics")
+        edited = Profile.load("bioinformatics")
+        edited.add_memory("BAMs live on /scratch", scope=MemoryScope.SYSTEM_PROMPT)
+        edited.add_memory("fastqs live on /data", scope=MemoryScope.SYSTEM_PROMPT)
+        queue = subscribe(service)
+        await service.handle(
+            ProfileSave(
+                name="bioinformatics", kind="memories", text=edited.render()
+            )
+        )
+        rows = {r.name: r for r in only(await drain(queue), "ProfileRows").rows}
+        assert rows["bioinformatics"].memories == 2
+
     async def test_a_profile_that_will_not_load_is_listed_anyway(self, service):
         # The screen is partly *how* a broken profile gets opened and fixed,
         # and it cannot be opened from a screen that failed to draw.

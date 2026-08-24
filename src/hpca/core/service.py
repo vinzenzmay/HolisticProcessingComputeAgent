@@ -114,8 +114,6 @@ from hpca.protocol import (
     ProfileDuplicate,
     ProfileGet,
     ProfileList,
-    ProfileRow,
-    ProfileRows,
     ProfileSave,
     ProfileSet,
     SessionClose,
@@ -1584,40 +1582,12 @@ class AgentService:
     def _emit_profiles(self) -> None:
         """The profiles, whole — the answer to `profile.list`.
 
-        Read here rather than derived by a front-end, which is what was
-        happening: a picker was assembled out of `hello`'s profile plus
-        whatever profiles the sidebar rows named, which misses every profile
-        that has no session, and can carry neither the memory count nor the
-        provenance because those live in files only the core reads.
-
-        A broken profile file counts nothing rather than taking the listing
-        down with it: the screen exists partly so that such a profile can be
-        opened and fixed, and it cannot be opened from a screen that failed to
-        draw.
+        Built by the memory service, which owns the files these rows are read
+        from and is where their counts change: an approved review or a hand
+        edit restates the listing from in there, so a memory just saved shows
+        up without reopening the app (`MemoryService.emit_profiles`).
         """
-        rows = []
-        for name in Profile.list_profiles():
-            memories, copied_from = 0, ""
-            try:
-                profile = Profile.load(name)
-            except Exception:
-                logger.exception("could not read profile %s", name)
-            else:
-                memories = len(profile.memories)
-                copied_from = profile.copied_from
-            rows.append(
-                ProfileRow(
-                    name=name,
-                    memories=memories,
-                    copied_from=copied_from,
-                    # Two different questions: which profile a deleted one's
-                    # sessions fall back to, and which one the core is running
-                    # under right now (`protocol.ProfileRow`).
-                    is_default=name == DEFAULT_PROFILE,
-                    working=name == self._deps.profile,
-                )
-            )
-        self._deps.emit(ProfileRows(rows=rows))
+        self._memory.emit_profiles()
 
     async def _set_profile(self, name: str) -> None:
         """`profile.set`: the profile the core works under when nothing else

@@ -48,6 +48,7 @@ says whether a warning is wanted — see :meth:`warn_about_struggles`.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -71,7 +72,14 @@ from hpca.memory_ops import (
     drift_detected,
 )
 from hpca.profiles import DEFAULT_PROFILE, Memory, MemoryScope, Profile
-from hpca.protocol import MemoryProposals, Notify, Proposal, TurnActivity
+from hpca.protocol import (
+    MemoryProposals,
+    Notify,
+    ProfileRow,
+    ProfileRows,
+    Proposal,
+    TurnActivity,
+)
 from hpca.runner import running_session_ids
 from hpca.sessions import Session, SessionStore
 from hpca.skills import (
@@ -92,6 +100,8 @@ from hpca.skills import (
 if TYPE_CHECKING:
     from hpca.agent.tools import ToolRegistry
     from hpca.curator import CuratorReport
+
+logger = logging.getLogger("hpca.core.memory_service")
 
 Severity = Literal["information", "warning", "error"]
 
@@ -881,6 +891,18 @@ class MemoryService:
         if pending is None:
             return 0
         flags = list(approved) + [False] * (len(pending.items) - len(approved))
+        kept = self._apply(pending, flags)
+        if kept:
+            # What was just written is a number on the profiles screen, and
+            # nothing else would have said so: `profile.rows` is sent when it
+            # is asked for, and the only thing that asks is a client opening
+            # (`emit_profiles`). Once per answer rather than once per approved
+            # item — three memories are one change to one count.
+            self.emit_profiles()
+        return kept
+
+    def _apply(self, pending: ProposalSet, flags: list[bool]) -> int:
+        """The applier for the kind of set this is — see `KIND_*`."""
         if pending.kind == KIND_FLAGGED:
             return self._apply_flagged(pending, flags)
         if pending.kind == KIND_REFLECTION:
@@ -1038,6 +1060,7 @@ class MemoryService:
         for name, report in reports.items():
             if report.changed:
                 self.invalidate(name)
+                self.emit_profiles()  # entries left the file for the archive
                 self._notify(
                     f"Memory curation ({name}): {report.summary()} — "
                     f"archived entries are in {name}.archive.md"
@@ -1045,6 +1068,52 @@ class MemoryService:
         return reports
 
     # ----------------------------------------------------- profile / skills
+
+    def emit_profiles(self) -> None:
+        """The profiles, whole — the answer to `profile.list`.
+
+        Read here rather than derived by a front-end, which is what was
+        happening: a picker was assembled out of `hello`'s profile plus
+        whatever profiles the sidebar rows named, which misses every profile
+        that has no session, and can carry neither the memory count nor the
+        provenance because those live in files only the core reads.
+
+        It lives on this service rather than on `CoreService` because it is
+        not only an answer to a question. The row carries a *count*, and the
+        count changes in here — an approved review, a hand-edited file, a
+        curator pass — so each of those restates the listing. Before that, a
+        profile that had just gained two memories went on saying "1 memory"
+        until the next start: nothing but `profile.list` ever sent these rows,
+        and nothing asked for them again.
+
+        A broken profile file counts nothing rather than taking the listing
+        down with it: the screen exists partly so that such a profile can be
+        opened and fixed, and it cannot be opened from a screen that failed to
+        draw.
+        """
+        rows = []
+        for name in Profile.list_profiles():
+            memories, copied_from = 0, ""
+            try:
+                profile = Profile.load(name)
+            except Exception:
+                logger.exception("could not read profile %s", name)
+            else:
+                memories = len(profile.memories)
+                copied_from = profile.copied_from
+            rows.append(
+                ProfileRow(
+                    name=name,
+                    memories=memories,
+                    copied_from=copied_from,
+                    # Two different questions: which profile a deleted one's
+                    # sessions fall back to, and which one the core is running
+                    # under right now (`protocol.ProfileRow`).
+                    is_default=name == DEFAULT_PROFILE,
+                    working=name == self._deps.profile,
+                )
+            )
+        self._deps.emit(ProfileRows(rows=rows))
 
     def profile_body(self, name: str, kind: str) -> tuple[str, str]:
         """One editable profile file as text, and why it could not be read.
@@ -1141,6 +1210,9 @@ class MemoryService:
         else:
             self._notify(f"Saved memories for “{name}”.")
         self.invalidate(name)
+        # A hand edit is the other way the count moves, and whoever made it is
+        # usually standing on the profiles screen that shows it.
+        self.emit_profiles()
 
     def save_profile_archive(self, name: str, text: str) -> None:
         """Persist a hand-edited archive file. Emptying it removes the file —
