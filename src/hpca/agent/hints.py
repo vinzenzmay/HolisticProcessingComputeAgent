@@ -31,8 +31,9 @@ from __future__ import annotations
 # ---------------------------------------------------------------- writing files
 
 CREATE_FILE_EXISTS = (
-    "Change it with edit_file; to replace it wholesale, delete_file first "
-    "(the old version stays recoverable from the trash)."
+    "To change part of it, call edit_file. Delete it first only when nothing "
+    "in the file survives the change — delete-then-create silently loses "
+    "every line you do not retype."
 )
 
 CREATE_FILE_PARENT_IS_FILE = (
