@@ -14,6 +14,12 @@ exit. Both mechanisms stay — one decides who waits, the other how long.
 The trade is durability: a hard kill loses at most one sync interval, and only
 if the node's ``/tmp`` is gone too — a surviving working dir is recovered on the
 next start.
+
+Two things keep the copies themselves cheap. The databases that churn are
+*rebuilt* rather than duplicated, so a file that is mostly free list does not
+cross NFS as one (``COMPACT_DB_NAMES``); and a periodic sync skips any database
+nothing has written to since it last went home (``fingerprint``). Neither
+applies to the final sync, which always copies everything.
 """
 
 from __future__ import annotations
@@ -43,6 +49,28 @@ logger = logging.getLogger("hpca.dbcache")
 # execution, and sharing one file produced writer contention ("database is
 # locked") with tool code updating the app tables mid-turn.
 DB_NAMES = ("hpca.db", "checkpoints.db", "rag.db")
+
+# The databases every copy of which is written *compacted* — rebuilt with
+# ``VACUUM INTO`` rather than page-copied with the backup API.
+#
+# sqlite never shrinks a file on its own: ``auto_vacuum`` is NONE, deleted
+# pages go on the free list, and the backup API reproduces that free list
+# page for page. checkpoints.db is where that bites — LangGraph writes a full
+# state snapshot per super-step and a deleted session frees every page it
+# ever wrote, so the file measured 94% free pages (150 MB of air around
+# 9 MB of live checkpoints) and all 160 MB of it crossed NFS at every seed,
+# every sync and every exit. Rebuilding copies only the live pages, which
+# makes the copy both smaller *and* cheaper to make.
+#
+# rag.db is deliberately absent, and not because a rebuild would fail — VACUUM
+# copies a virtual table's shadow tables and carries its schema row across
+# without ever instantiating the module, so vec0 survives it untouched. It is
+# absent because it has nothing to reclaim: an embedding index grows, it does
+# not churn, and it was measured at zero free pages beside checkpoints.db's
+# 36,767. Rebuilding it would re-create every index on a hundred thousand
+# chunks, every sync, to save nothing. ``_write_copy`` falls back on its own
+# if a rebuild fails anyway, so this list is the default and not a promise.
+COMPACT_DB_NAMES = frozenset({"hpca.db", "checkpoints.db"})
 
 LEASE_NAME = "db.lease"
 
@@ -131,19 +159,83 @@ def quarantine_corrupt(path: Path) -> Path:
     return aside
 
 
-def copy_database(src: Path, dst: Path) -> Path | None:
-    """Copy one sqlite database with the online-backup API.
+# Sources a rebuild has already failed for, so the fallback is taken directly
+# rather than after wasting another failed VACUUM on every sync. Keyed by the
+# source path as given — which is stable here, since both sides of the cache
+# ask for a database by a path this module composed itself.
+_COMPACT_UNSUPPORTED: set[str] = set()
 
-    Not ``shutil.copy``: the backup API is page-level and transactionally
-    consistent even while another connection writes the source, so the live
-    checkpointer and RagStore connections need not be quiesced. It also gets
-    WAL right — the destination is one self-contained file, with no
-    ``-wal``/``-shm`` sidecars to copy along — and it carries ``rag.db``'s
-    ``vec0`` virtual tables without the sqlite-vec extension being loaded,
-    because it copies pages rather than rows.
 
-    The backup lands in a sibling temp file that is renamed over ``dst`` only
-    once complete. Backing up straight into ``dst`` proved able to destroy
+def _vacuum_into(source: sqlite3.Connection, tmp: Path) -> None:
+    """Rebuild ``source`` into the not-yet-existing file ``tmp``.
+
+    Its own function so the fallback in ``_write_copy`` has a seam to be
+    tested through: the rebuild is hard to make fail on purpose, which is
+    rather the point of keeping a fallback at all.
+    """
+    # A parameter, not an f-string: the path is a value here and sqlite takes
+    # it as one.
+    source.execute("VACUUM INTO ?", (str(tmp),))
+
+
+def _write_copy(src: Path, tmp: Path, *, compact: bool) -> None:
+    """Write a standalone copy of ``src`` to the fresh path ``tmp``.
+
+    ``compact`` rebuilds rather than duplicates: ``VACUUM INTO`` writes only
+    the live pages, so the copy carries none of the source's free list. It is
+    still one statement inside a read transaction, so it is as safe under a
+    live writer as the backup API is.
+
+    The fallback is for a rebuild that fails for a reason this code cannot
+    anticipate. A database that can be page-copied is not one a sync should
+    give up on, so the failure is logged, the page copy is taken instead, and
+    the source is remembered — the answer is a property of the database, and
+    retrying it every sync would waste a whole failed rebuild each time.
+    """
+    source = sqlite3.connect(src)
+    try:
+        if compact and str(src) not in _COMPACT_UNSUPPORTED:
+            try:
+                _vacuum_into(source, tmp)
+                return
+            except sqlite3.Error as e:
+                _COMPACT_UNSUPPORTED.add(str(src))
+                logger.warning(
+                    "cannot rebuild %s compacted (%s); copying its pages "
+                    "instead, free list and all",
+                    src,
+                    e,
+                )
+                tmp.unlink(missing_ok=True)  # a partial rebuild may remain
+        target = sqlite3.connect(tmp)
+        try:
+            source.backup(target)
+            # Leave the destination standalone: another node may read it.
+            target.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            target.close()
+    finally:
+        source.close()
+
+
+def copy_database(src: Path, dst: Path, *, compact: bool = False) -> Path | None:
+    """Copy one sqlite database, page for page or rebuilt compact.
+
+    Not ``shutil.copy``: both mechanisms are transactionally consistent even
+    while another connection writes the source, so the live checkpointer and
+    RagStore connections need not be quiesced, and both get WAL right — the
+    destination is one self-contained file, with no ``-wal``/``-shm``
+    sidecars to copy along.
+
+    The default is the page-level backup API, which carries ``rag.db``'s
+    ``vec0`` virtual tables without the sqlite-vec extension being loaded
+    because it copies pages rather than rows. ``compact`` asks instead for a
+    rebuild that leaves the source's free pages behind — see
+    ``COMPACT_DB_NAMES`` for which databases want that and why, and
+    ``_write_copy`` for what happens when a rebuild fails.
+
+    The copy lands in a sibling temp file that is renamed over ``dst`` only
+    once complete. Writing straight into ``dst`` proved able to destroy
     it: an interrupted write on a network filesystem left a home copy with
     its first page zeroed, and the backup API then refused that file in both
     directions ("file is not a database") — one torn file blocked seed,
@@ -159,25 +251,41 @@ def copy_database(src: Path, dst: Path) -> Path | None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_name(dst.name + ".backup-tmp")
     tmp.unlink(missing_ok=True)  # a killed copy may have left one behind
-    source = sqlite3.connect(src)
     try:
-        target = sqlite3.connect(tmp)
-        try:
-            source.backup(target)
-            # Leave the destination standalone: another node may read it.
-            target.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        finally:
-            target.close()
+        _write_copy(src, tmp, compact=compact)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
-    finally:
-        source.close()
     quarantined = None
     if dst.exists() and not _is_sqlite(dst):
         quarantined = quarantine_corrupt(dst)
     os.replace(tmp, dst)
     return quarantined
+
+
+def fingerprint(path: Path) -> tuple:
+    """What ``path`` and its WAL sidecar look like from the outside.
+
+    The cheap answer to "has anything been written since the last sync": two
+    stats on node-local storage, against a whole-file copy over NFS. Size and
+    mtime of both files, because a WAL-mode commit lands in the ``-wal``
+    sidecar and may leave the main file untouched for a long time.
+
+    Deliberately conservative in one direction only. A stat that changes
+    without the content changing costs one needless copy; the opposite —
+    content changing without either stat moving — is what would lose data, so
+    the only place this is trusted is a periodic sync, never the final one.
+    A missing file is a value like any other (None), so a WAL appearing or
+    being checkpointed away both read as a change.
+    """
+    out = []
+    for p in (path, path.with_name(path.name + "-wal")):
+        try:
+            st = p.stat()
+            out.append((st.st_size, st.st_mtime_ns))
+        except OSError:
+            out.append(None)
+    return tuple(out)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -274,6 +382,12 @@ class DbCache:
         self._configured_dir = Path(local_dir) if local_dir is not None else None
         self._local: Path | None = None
         self._holds_lease = False
+        # What each database looked like when it was last successfully synced
+        # home (see ``fingerprint``). A name absent from here has never been
+        # synced by this run and is always copied — which is what gives the
+        # first sync of a run the chance to replace a bloated home copy with
+        # a compacted one even if nothing has written to it yet.
+        self._synced: dict[str, tuple] = {}
         # sync() and release() both run on worker threads, and shutdown can
         # start while a periodic sync is still copying. Reentrant because
         # release() syncs before it lets go.
@@ -336,13 +450,25 @@ class DbCache:
         self._seed(skip=recovered)
         return True
 
-    def sync(self) -> bool:
+    def sync(self, *, force: bool = False) -> bool:
         """Write the local databases back to home.
+
+        A database nothing has written to since its last sync is skipped:
+        every tick otherwise pushed all three whole files across NFS, and
+        ``rag.db`` alone is hundreds of megabytes that only change when
+        something is indexed. ``fingerprint`` is what "written to" is read
+        from, and it can only err towards copying too often.
+
+        ``force`` syncs regardless, and ``release`` uses it. A skipped sync
+        is only ever safe because the local copy is still there: a hard kill
+        in the window leaves the working dir behind and the next start
+        recovers it (``_recover``). The final sync has no such window — the
+        working dir is about to be deleted — so it never skips.
 
         Never raises — home being briefly unreachable is a reason to try again
         next tick, not to take the app down. Returns whether *everything* got
         there, which is what ``release`` needs to know before it deletes the
-        only other copy.
+        only other copy; a database that was already there counts as arrived.
         """
         with self._lock:
             if not self.active or self._local is None:
@@ -352,8 +478,18 @@ class DbCache:
                 src = self._local / name
                 if not src.exists():
                     continue
+                # Read before the copy, not after: opening and closing a
+                # connection to a WAL database can checkpoint it and remove
+                # the sidecar, which would move the stamp under us. Stale in
+                # that direction only costs one extra copy next tick.
+                stamp = fingerprint(src)
+                if not force and self._synced.get(name) == stamp:
+                    continue
                 try:
-                    aside = copy_database(src, self.home / name)
+                    aside = copy_database(
+                        src, self.home / name, compact=name in COMPACT_DB_NAMES
+                    )
+                    self._synced[name] = stamp
                     if aside is not None:
                         self.warnings.append(
                             f"home copy of {name} was corrupt; moved it to "
@@ -361,7 +497,9 @@ class DbCache:
                         )
                 except Exception:
                     # One unreadable database must not cost the others their
-                    # sync; the next tick tries again.
+                    # sync; the next tick tries again — which it only will if
+                    # this name is not left looking already-synced.
+                    self._synced.pop(name, None)
                     logger.exception("sync back failed for %s", name)
                     complete = False
             try:
@@ -388,7 +526,7 @@ class DbCache:
             if not self.active:
                 return
             try:
-                synced = self.sync()
+                synced = self.sync(force=True)
             except Exception:  # pragma: no cover - sync is already total
                 logger.exception("final sync back failed")
                 synced = False
@@ -415,7 +553,9 @@ class DbCache:
             if not src.exists():
                 continue
             try:
-                aside = copy_database(src, self.home / name)
+                aside = copy_database(
+                    src, self.home / name, compact=name in COMPACT_DB_NAMES
+                )
                 recovered.add(name)
                 logger.info("recovered %s from %s", name, src)
                 if aside is not None:
@@ -430,7 +570,13 @@ class DbCache:
 
     def _seed(self, *, skip: set[str]) -> None:
         """Copy home's databases into the working dir. Names in ``skip`` were
-        just recovered, so the two sides already agree."""
+        just recovered, so the two sides already agree.
+
+        Compacted like the sync back, and this is the direction where it pays
+        most: a rebuild reads only the live pages, so seeding a home copy
+        that is mostly free list moves a fraction of the bytes over NFS *and*
+        starts the run from a small working copy.
+        """
         assert self._local is not None
         for name in self.names:
             if name in skip:
@@ -439,7 +585,9 @@ class DbCache:
             if not src.exists():
                 continue  # first run for this database; the app creates it
             try:
-                copy_database(src, self._local / name)
+                copy_database(
+                    src, self._local / name, compact=name in COMPACT_DB_NAMES
+                )
             except Exception:
                 logger.exception("could not seed %s from %s", name, src)
                 if not _is_sqlite(src):

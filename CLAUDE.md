@@ -82,10 +82,19 @@ the app runs they are opened from a node-local working dir (`$TMPDIR`, else
 node, where each sqlite call costs network round-trips. See `hpca.dbcache` and
 specs-db-local-cache.md; `settings.database.local_cache` turns it off.
 
+Copies are not naive. `hpca.db` and `checkpoints.db` are *rebuilt* on every
+copy (`VACUUM INTO`) rather than page-copied, because sqlite never shrinks a
+file and checkpoint churn had left one 94% free pages — 160 MB of file around
+9 MB of live rows, all of it crossing NFS four times a run. `rag.db` stays on
+the backup API: no free pages to reclaim, and a rebuild would re-index it. And
+a periodic sync skips any database nothing has written to since it last went
+home; the final sync never skips. See §2.4–2.5 of the spec.
+
 Consequences when debugging: mid-run, the app dir's copies are stale by up to
-one sync interval; `<app_dir>/dbcache.log` records recovery and sync failures;
-and a leftover `db.lease` plus a surviving working dir is what a crashed run
-looks like, recovered on the next start.
+one sync interval — or longer for a database nothing is writing to, which is
+skipped entirely until it changes; `<app_dir>/dbcache.log` records recovery and
+sync failures; and a leftover `db.lease` plus a surviving working dir is what a
+crashed run looks like, recovered on the next start.
 
 ## Dev dependencies
 

@@ -17,10 +17,12 @@ import sys
 
 import pytest
 
+from hpca import dbcache
 from hpca.dbcache import (
     DB_NAMES,
     DbCache,
     copy_database,
+    fingerprint,
     local_dir_for,
     local_root,
 )
@@ -43,6 +45,41 @@ def read_notes(path):
         return [row[0] for row in conn.execute("SELECT text FROM notes")]
     finally:
         conn.close()
+
+
+def make_churned_db(path, rows=2000):
+    """A database most of whose pages are free: filled, then emptied.
+
+    What checkpoints.db looks like after a few sessions — sqlite keeps the
+    pages a delete released on the free list and never shrinks the file.
+    """
+    make_db(path, rows=("kept",))
+    conn = sqlite3.connect(path)
+    conn.executemany(
+        "INSERT INTO notes (text) VALUES (?)", [("x" * 400,)] * rows
+    )
+    conn.commit()
+    conn.execute("DELETE FROM notes WHERE text LIKE 'x%'")
+    conn.commit()
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.close()
+
+
+def free_pages(path):
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute("PRAGMA freelist_count").fetchone()[0]
+    finally:
+        conn.close()
+
+
+@pytest.fixture(autouse=True)
+def forget_compact_memo():
+    """``_COMPACT_UNSUPPORTED`` is module state keyed by path; tmp_path makes
+    every test's paths unique, but a shared set still leaks across a run."""
+    dbcache._COMPACT_UNSUPPORTED.clear()
+    yield
+    dbcache._COMPACT_UNSUPPORTED.clear()
 
 
 class TestLocalRoot:
@@ -423,7 +460,7 @@ class TestRelease:
         cache = DbCache(home, local_dir=local)
         cache.acquire()
 
-        def boom():
+        def boom(**kwargs):
             raise OSError("home unreachable")
 
         cache.sync = boom
@@ -656,3 +693,249 @@ class TestCorruptHomeCopy:
         warnings = cache.drain_warnings()
         assert any("hpca.db" in w and "corrupt" in w for w in warnings)
         assert cache.drain_warnings() == []
+
+
+class TestCompactCopy:
+    """``compact=True``: rebuild rather than duplicate. See COMPACT_DB_NAMES."""
+
+    def test_a_rebuilt_copy_drops_the_free_list(self, tmp_path):
+        src = tmp_path / "checkpoints.db"
+        make_churned_db(src)
+        assert free_pages(src) > 0  # the state the rebuild exists to fix
+
+        copy_database(src, tmp_path / "dst.db", compact=True)
+
+        assert free_pages(tmp_path / "dst.db") == 0
+        assert (tmp_path / "dst.db").stat().st_size < src.stat().st_size
+
+    def test_a_rebuilt_copy_keeps_every_row(self, tmp_path):
+        make_db(tmp_path / "src.db", rows=("a", "b", "c"))
+        copy_database(tmp_path / "src.db", tmp_path / "dst.db", compact=True)
+        assert read_notes(tmp_path / "dst.db") == ["a", "b", "c"]
+
+    def test_a_rebuilt_copy_has_no_wal_sidecar_either(self, tmp_path):
+        make_db(tmp_path / "src.db")
+        copy_database(tmp_path / "src.db", tmp_path / "dst.db", compact=True)
+        assert not (tmp_path / "dst.db-wal").exists()
+
+    def test_a_page_copy_still_carries_the_free_list(self, tmp_path):
+        # The default, and what rag.db keeps getting: page for page.
+        src = tmp_path / "rag.db"
+        make_churned_db(src)
+        copy_database(src, tmp_path / "dst.db")
+        assert free_pages(tmp_path / "dst.db") == free_pages(src)
+
+    def test_a_rebuild_carries_vec0_tables_across(self, tmp_path):
+        # Not the reason rag.db stays on the page copy: VACUUM copies a
+        # virtual table's shadow tables and its schema row without ever
+        # instantiating the module, so a rebuild would be correct here — it
+        # would just be expensive work for a file with no free pages.
+        sqlite_vec = pytest.importorskip("sqlite_vec")
+        src = tmp_path / "rag.db"
+        conn = sqlite3.connect(src)
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+        conn.execute("CREATE VIRTUAL TABLE vecs USING vec0(embedding float[4])")
+        conn.execute(
+            "INSERT INTO vecs (rowid, embedding) VALUES (1, ?)",
+            (struct.pack("4f", 1.0, 0.0, 0.0, 0.0),),
+        )
+        conn.commit()
+        conn.close()
+
+        copy_database(src, tmp_path / "dst.db", compact=True)
+
+        check = sqlite3.connect(tmp_path / "dst.db")
+        check.enable_load_extension(True)
+        sqlite_vec.load(check)
+        check.enable_load_extension(False)
+        hits = check.execute(
+            "SELECT rowid FROM vecs WHERE embedding MATCH ? AND k = 1",
+            (struct.pack("4f", 1.0, 0.0, 0.0, 0.0),),
+        ).fetchall()
+        check.close()
+        assert [row[0] for row in hits] == [1]
+
+    def test_a_failing_rebuild_falls_back_to_the_page_copy(
+        self, tmp_path, monkeypatch
+    ):
+        def refuse(source, tmp):
+            raise sqlite3.OperationalError("no")
+
+        monkeypatch.setattr(dbcache, "_vacuum_into", refuse)
+        make_db(tmp_path / "src.db", rows=("kept",))
+
+        copy_database(tmp_path / "src.db", tmp_path / "dst.db", compact=True)
+
+        assert read_notes(tmp_path / "dst.db") == ["kept"]
+
+    def test_a_failing_rebuild_is_not_retried_every_sync(
+        self, tmp_path, monkeypatch
+    ):
+        attempts = []
+
+        def refuse(source, tmp):
+            attempts.append(tmp)
+            raise sqlite3.OperationalError("no")
+
+        monkeypatch.setattr(dbcache, "_vacuum_into", refuse)
+        make_db(tmp_path / "src.db")
+
+        copy_database(tmp_path / "src.db", tmp_path / "dst.db", compact=True)
+        copy_database(tmp_path / "src.db", tmp_path / "dst.db", compact=True)
+
+        assert len(attempts) == 1
+        assert str(tmp_path / "src.db") in dbcache._COMPACT_UNSUPPORTED
+
+    def test_a_corrupt_source_still_raises(self, tmp_path):
+        (tmp_path / "src.db").write_bytes(b"this is not a database")
+        with pytest.raises(sqlite3.DatabaseError):
+            copy_database(tmp_path / "src.db", tmp_path / "dst.db", compact=True)
+        assert not (tmp_path / "dst.db").exists()
+        assert not (tmp_path / "dst.db.backup-tmp").exists()
+
+
+class TestFingerprint:
+    def test_a_write_changes_it(self, tmp_path):
+        make_db(tmp_path / "a.db")
+        before = fingerprint(tmp_path / "a.db")
+        conn = sqlite3.connect(tmp_path / "a.db")
+        conn.execute("INSERT INTO notes (text) VALUES ('b')")
+        conn.commit()
+        conn.close()
+        assert fingerprint(tmp_path / "a.db") != before
+
+    def test_reading_does_not(self, tmp_path):
+        make_db(tmp_path / "a.db")
+        before = fingerprint(tmp_path / "a.db")
+        assert read_notes(tmp_path / "a.db") == ["a"]
+        assert fingerprint(tmp_path / "a.db") == before
+
+    def test_a_missing_database_has_one_too(self, tmp_path):
+        assert fingerprint(tmp_path / "nothing.db") == (None, None)
+
+    def test_a_wal_sidecar_appearing_is_a_change(self, tmp_path):
+        make_db(tmp_path / "a.db")
+        before = fingerprint(tmp_path / "a.db")
+        (tmp_path / "a.db-wal").write_bytes(b"")
+        assert fingerprint(tmp_path / "a.db") != before
+
+
+class TestSyncSkipsUnchanged:
+    def test_an_unchanged_database_is_not_copied_again(self, home, local):
+        cache = DbCache(home, local_dir=local)
+        cache.acquire()
+        make_db(cache.path_for("hpca.db"), rows=("synced",))
+        cache.sync()
+        assert read_notes(home / "hpca.db") == ["synced"]
+
+        # Behind the cache's back: a second sync that actually copied would
+        # overwrite this, so its survival is the proof the copy was skipped.
+        (home / "hpca.db").unlink()
+        make_db(home / "hpca.db", rows=("untouched-by-the-second-sync",))
+        assert cache.sync() is True
+
+        assert read_notes(home / "hpca.db") == ["untouched-by-the-second-sync"]
+
+    def test_a_changed_database_is_synced_again(self, home, local):
+        cache = DbCache(home, local_dir=local)
+        cache.acquire()
+        make_db(cache.path_for("hpca.db"), rows=("first",))
+        cache.sync()
+
+        conn = sqlite3.connect(cache.path_for("hpca.db"))
+        conn.execute("INSERT INTO notes (text) VALUES ('second')")
+        conn.commit()
+        conn.close()
+        cache.sync()
+
+        assert read_notes(home / "hpca.db") == ["first", "second"]
+
+    def test_the_first_sync_of_a_run_copies_even_with_nothing_written(
+        self, home, local
+    ):
+        # What replaces a home copy that is mostly free list with a compacted
+        # one on a run that never happens to write to it.
+        make_churned_db(home / "checkpoints.db")
+        before = (home / "checkpoints.db").stat().st_size
+        cache = DbCache(home, local_dir=local)
+        cache.acquire()
+
+        cache.sync()
+
+        assert (home / "checkpoints.db").stat().st_size < before
+        assert read_notes(home / "checkpoints.db") == ["kept"]
+
+    def test_a_skipped_database_still_refreshes_the_lease(self, home, local):
+        cache = DbCache(home, local_dir=local)
+        cache.acquire()
+        make_db(cache.path_for("hpca.db"))
+        cache.sync()
+        first = json.loads((home / "db.lease").read_text())["heartbeat"]
+
+        cache.sync()
+
+        assert json.loads((home / "db.lease").read_text())["heartbeat"] >= first
+
+    def test_a_failed_sync_is_retried_on_the_next_tick(self, home, local):
+        cache = DbCache(home, local_dir=local)
+        cache.acquire()
+        (local / "hpca.db").write_bytes(b"this is not a database")
+        assert cache.sync() is False
+
+        (local / "hpca.db").unlink()
+        make_db(local / "hpca.db", rows=("repaired",))
+        assert cache.sync() is True
+        assert read_notes(home / "hpca.db") == ["repaired"]
+
+    def test_force_copies_regardless(self, home, local):
+        cache = DbCache(home, local_dir=local)
+        cache.acquire()
+        make_db(cache.path_for("hpca.db"), rows=("local",))
+        cache.sync()
+        (home / "hpca.db").unlink()
+        make_db(home / "hpca.db", rows=("stale",))
+
+        cache.sync(force=True)
+
+        assert read_notes(home / "hpca.db") == ["local"]
+
+    def test_release_syncs_even_when_nothing_changed(self, home, local):
+        # The working dir is about to be deleted, so the final sync has no
+        # surviving copy to fall back on and must never skip.
+        cache = DbCache(home, local_dir=local)
+        cache.acquire()
+        make_db(cache.path_for("hpca.db"), rows=("final",))
+        cache.sync()
+        (home / "hpca.db").unlink()
+        make_db(home / "hpca.db", rows=("stale",))
+
+        cache.release()
+
+        assert read_notes(home / "hpca.db") == ["final"]
+
+
+class TestSeedCompacts:
+    def test_seeding_leaves_the_free_list_behind(self, home, local):
+        make_churned_db(home / "checkpoints.db")
+        DbCache(home, local_dir=local).acquire()
+        assert free_pages(local / "checkpoints.db") == 0
+        assert read_notes(local / "checkpoints.db") == ["kept"]
+
+    def test_rag_db_is_seeded_page_for_page(self, home, local):
+        # Not in COMPACT_DB_NAMES: its vec0 tables need the extension loaded
+        # before a rebuild could re-create them.
+        make_churned_db(home / "rag.db")
+        DbCache(home, local_dir=local).acquire()
+        assert free_pages(local / "rag.db") == free_pages(home / "rag.db")
+
+    def test_recovery_compacts_too(self, home, local):
+        local.mkdir(parents=True)
+        make_churned_db(local / "checkpoints.db")
+        before = (local / "checkpoints.db").stat().st_size
+
+        DbCache(home, local_dir=local).acquire()
+
+        assert (home / "checkpoints.db").stat().st_size < before
+        assert read_notes(home / "checkpoints.db") == ["kept"]
