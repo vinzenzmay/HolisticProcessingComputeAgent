@@ -282,6 +282,10 @@ off file by file.
 - Deletion is blocked while a reply is in progress or a sub-process is running;
   an idle profile is deletable.
 - A new session runs under the profile chosen in the picker.
+- A row that names something and then says what it has — a profile and its
+  counts, a skill and its description, a backend and its details — keeps at
+  least two spaces between the two, whatever the name's length, and the column
+  is counted in terminal cells rather than characters (`ansi.column`).
 - The chosen profile's memories reach the prompt.
 - Sessions of all profiles stay listed, tagged with their profile.
 - Opening a session switches to its profile.

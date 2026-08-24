@@ -15,6 +15,7 @@ screen was opened about and that profile is what it carries.
 
 from __future__ import annotations
 
+from hpca.ui.ansi import column
 from hpca.ui.overlays.base import ListOverlay
 from hpca.ui.overlays.textedit import SKILL, TextEditOverlay
 from hpca.ui.pane import Item
@@ -30,6 +31,11 @@ EMPTY = "(no skills for this profile)"
 DELETE_QUESTION = "Delete skill “{name}”?"
 
 
+# Where a skill's description starts, for a name short enough to leave room
+# (`ansi.column`).
+NAME_COLUMN = 24
+
+
 def skill_item(skill: SkillInfo) -> Item:
     """One row: the name, and what it is for.
 
@@ -39,7 +45,7 @@ def skill_item(skill: SkillInfo) -> Item:
     """
     head = skill.name
     if skill.description:
-        head = f"{skill.name:<24}{skill.description}"
+        head = column(skill.name, NAME_COLUMN, skill.description)
     return Item(head=head, kind="skill", text=skill.name, key=skill.name)
 
 

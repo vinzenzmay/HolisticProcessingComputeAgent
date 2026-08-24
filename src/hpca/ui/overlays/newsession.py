@@ -15,7 +15,7 @@ carries whatever string the core wants back, and nothing here looks inside it.
 from __future__ import annotations
 
 from hpca.ui import theme
-from hpca.ui.ansi import RESET, pad
+from hpca.ui.ansi import RESET, column, pad
 from hpca.ui.overlays.base import ListOverlay
 from hpca.ui.pane import Item, Pane
 
@@ -35,6 +35,13 @@ STAGE_HINTS = {
 }
 
 
+# Where the detail after a name starts, when the name is short enough to
+# leave room for it. A profile or a backend label longer than this pushes
+# its own detail right and keeps the gutter (`ansi.column`), because a name
+# nobody chose to be short is not a reason to run two facts together.
+NAME_COLUMN = 20
+
+
 def choice(name: str, detail: str = "", *, value: str = "") -> Item:
     """One row of either list: what is drawn, and what goes on the wire.
 
@@ -42,7 +49,7 @@ def choice(name: str, detail: str = "", *, value: str = "") -> Item:
     backend is not, which is why the two are separate fields rather than one.
     """
     return Item(
-        head=f"{name:<20}{detail}".rstrip(),
+        head=column(name, NAME_COLUMN, detail),
         text=value or name,
         key=value or name,
     )
