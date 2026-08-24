@@ -351,6 +351,39 @@ class TestToolSuiteShape:
         assert all(not t.destructive for t in tools)
 
 
+class TestCreateScriptSaysWhichLanguagesItHas:
+    """The two places a model is told, at the two moments it can still act on
+    it. Asked for a snakemake workflow, the live model called create_script
+    with kind=bash — reasonably, given a one-line description that reads like a
+    superset and a `kind` field labelled only "Script language". No kind would
+    have worked: a Snakefile is neither bash nor python, so the refusal had to
+    come from the description, before the call."""
+
+    def test_the_tool_description_closes_the_pair(self, tools):
+        description = next(t for t in tools if t.name == "create_script").description
+        assert "ONLY" in description
+        assert "Snakefile" in description
+        # and says where the file that is not one of the two goes instead
+        assert "create_file" in description
+
+    def test_and_so_does_the_kind_field(self):
+        from hpca.agent.builtin_tools import CreateScriptParams
+
+        kind = CreateScriptParams.model_fields["kind"].description
+        assert "only two" in kind
+        assert "Snakefile" in kind
+        assert "create_file" in kind
+
+    def test_the_tool_still_takes_the_two_it_does_have(self, tools):
+        from hpca.agent.builtin_tools import CreateScriptParams
+
+        assert CreateScriptParams(
+            kind="python", name="x", content_lines=["print(1)"]
+        ).kind == "python"
+        with pytest.raises(Exception):
+            CreateScriptParams(kind="snakemake", name="x", content_lines=["rule all:"])
+
+
 class TestSingleLineScriptGate:
     """The live model mangles newline escapes in JSON strings under guided
     decoding, so content arrives as an array of lines; a "script" that is

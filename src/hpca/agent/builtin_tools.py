@@ -78,7 +78,21 @@ MAX_KEYS_IN_NOTE = 30
 
 
 class CreateScriptParams(BaseModel):
-    kind: Literal["bash", "python"] = Field(description="Script language")
+    # "Script language" read as a menu of the languages this tool supports,
+    # which is how a model that has already chosen the tool sees it — so it
+    # picked the nearer of the two for a file that is neither. The field is
+    # read at the moment the kind is decided, which is the last moment the
+    # mistake is still cheap, so it says the pair is closed and where else to
+    # go. The tool description says it earlier and louder; both are needed,
+    # because they are read at different decisions.
+    kind: Literal["bash", "python"] = Field(
+        description=(
+            "Script language — bash or python are the only two this tool "
+            "writes. A file in any other language (a Snakefile, a Makefile, "
+            "a nextflow .nf, an R script) is not a script here: write it with "
+            "create_file instead"
+        )
+    )
     name: str = Field(
         pattern=KEY_PATTERN, description="Name for the script, without a suffix"
     )
@@ -686,7 +700,13 @@ def default_tool_registry() -> ToolRegistry:
     registry.register(
         Tool(
             name="create_script",
-            description="Create a bash or python script (syntax-checked)",
+            description=(
+                "Create a bash or python script (syntax-checked) — those two "
+                "languages ONLY. Anything else that runs — a Snakefile, a "
+                "Makefile, a nextflow .nf, an R script — is not a script "
+                "here: write it with create_file at the path it needs, then "
+                "create_script a short bash script that calls it"
+            ),
             params=CreateScriptParams,
             handler=create_script,
         )

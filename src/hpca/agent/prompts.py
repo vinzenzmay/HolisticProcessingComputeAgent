@@ -79,12 +79,28 @@ DISCOVERY_GUIDANCE = (
 # The single most common way the agent burns its tool budget: it cannot run an
 # environment-managed tool and thrashes trying to activate one. The idiom that
 # ends that thrashing lives in ENVIRONMENT_TOOL_GUIDANCE below.
+#
+# The create_file half used to be the negative branch — "a file that is not a
+# script", then a list of prose genres — under an opening line that offered "a
+# pipeline" as something create_script makes. Asked for a snakemake workflow,
+# the live model read both sentences exactly as written and called
+# create_script with kind=bash; `bash -n` refused it, and kind=python would
+# have been refused too, because a Snakefile is neither. There is no
+# create_script call that writes one, so the classification had to be made
+# before the tool was picked, and by the axis that actually decides it: what
+# LANGUAGE the file is, not whether it runs. Hence the split stated as bash and
+# python against everything else, with the executable examples named on the
+# create_file side, where prose examples alone could never put them.
+#
+# The two-file shape is spelled out for the same reason: a workflow written by
+# create_file has a path and no script *name*, so start_background_script — which
+# takes names — cannot reach it, and the bash wrapper is what closes that.
 SCRIPT_GUIDANCE = (
-    "Run real work (a tool, a pipeline) with create_script then "
-    "start_background_script — those bash scripts run fail-fast (`set -euo "
-    "pipefail` is added), so a failed command stops the script and is reported "
-    "as failed. Because of that, never end a script with an unconditional "
-    "`echo \"Done\"`: let the exit code report success. Choose between the two "
+    "Running real work — driving a tool, launching a pipeline — means "
+    "create_script then start_background_script; those bash scripts run "
+    "fail-fast (`set -euo pipefail` is added), so a failed command stops the "
+    "script and is reported as failed. Because of that, never end a script "
+    "with an unconditional `echo \"Done\"`: let the exit code report success. Choose between the two "
     "run tools by when you need the answer, not by what the script is: "
     "start_background_script for work that outlives this turn (it returns a pid "
     "and tells you later how it ended), run_bash when you want the output now — "
@@ -94,9 +110,16 @@ SCRIPT_GUIDANCE = (
     "line-continuations between arguments; a stray `\",` turns your command "
     "into garbage the tool rejects. Write paths out literally; do not leave a "
     "shell variable unset. "
-    "To WRITE a file that is not a script — a specs or design document, "
-    "notes, a README, a config, a sample sheet — call create_file with the "
-    "path of the new file and the content one line per array element. "
+    "create_script writes bash and python, and those two only. Every "
+    "other file is a create_file, with the path of the new file and the "
+    "content one line per array element: prose (a specs or design "
+    "document, notes, a README), data (a config, a sample sheet), and "
+    "equally anything that RUNS in a language create_script does not "
+    "have — a Snakefile, a Makefile, a nextflow .nf, an R script. Being "
+    "real work does not make a file a script here; being bash or python "
+    "does. To then run one of those, create_file it at the path it needs "
+    "to live at, then create_script a short bash script that calls it "
+    "(`snakemake -s <path> ...`) and start that. "
     "Never build a file out of `echo` lines or a `cat << EOF` heredoc in "
     "run_bash: the content then has to survive bash quoting, a single stray "
     "line costs the whole file, and run_bash refuses a script that long "
