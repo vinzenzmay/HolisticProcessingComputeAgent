@@ -16,11 +16,9 @@ import pytest
 from hpca.ui.app import CHAT, SESSIONS, WATCHERS, RowUI
 from hpca.ui.demo import build, sample_catalog
 from hpca.ui.overlays import (
-    CUT_WARNING,
     KEEP_CHANGES,
     PREVIEW_CHARS,
     BackendFormOverlay,
-    CompactReviewOverlay,
     ConfigOverlay,
     ModelPickerOverlay,
     HelpOverlay,
@@ -39,7 +37,6 @@ from hpca.ui.overlays.backends import KEY_REQUIRED, backend_head
 from hpca.ui.state import (
     BackendInfo,
     ChatEntry,
-    CompactProposal,
     CopyProfile,
     ProbeBackend,
     RemoveBackend,
@@ -52,7 +49,6 @@ from hpca.ui.state import (
     FetchSkills,
     ProfileInfo,
     Proposal,
-    ResolveCompact,
     ResolveMemory,
     SaveProfile,
     SaveSettings,
@@ -1415,129 +1411,6 @@ class TestMemoryReview:
         assert ui.overlay.offset == 0
 
 
-SUMMARY = (
-    "[earlier in this session]\n"
-    "The user is aligning a 40-sample cohort with STAR on /scratch/proj. "
-    "Job 8813 died with an OOM at 32G; 40G was the fix. The QC report is "
-    "still unread."
-)
-
-
-def proposal(**kw) -> CompactProposal:
-    return CompactProposal(
-        **{"summary": SUMMARY, "folded": 46, **kw}
-    )
-
-
-class TestTheCompactionReview:
-    """specs-ui-acceptance.md, "Compaction": the summary is read before it is
-    anybody's history, and a bad one is sent back with a sentence about it.
-
-    The screen exists because a fold cannot be undone: `/compact` used to write
-    the summary and *then* show it, so "it stops mid-sentence" was something
-    the user could only ever say after the fact.
-    """
-
-    def _open(self, **kw) -> RowUI:
-        ui = recorded(build())
-        ui.session.compaction = proposal(**kw)
-        ui.review_compaction()
-        return ui
-
-    def test_it_shows_what_is_being_decided(self):
-        seen = screen(self._open())
-        assert "46 messages fold into this summary" in seen
-        assert "died with an OOM at 32G" in seen
-
-    def test_and_the_instruction_the_summary_was_written_for(self):
-        assert "asked to keep: the STAR flags" in screen(
-            self._open(guidance="the STAR flags")
-        )
-
-    def test_a_cut_summary_is_flagged_as_cut(self):
-        # The one thing the text cannot say about itself, and the reason the
-        # core carries `truncated` at all.
-        assert CUT_WARNING in screen(self._open(truncated=True))
-
-    def test_an_untruncated_one_is_not(self):
-        assert CUT_WARNING not in screen(self._open())
-
-    def test_a_retry_says_which_attempt_this_is(self):
-        assert "attempt 3" in screen(self._open(attempt=3))
-
-    def test_enter_accepts_it(self):
-        ui = press(self._open(), "enter")
-        assert sent(ui, ResolveCompact)[-1].action == "accept"
-        assert ui.overlay is None
-
-    def test_and_names_the_session_it_was_offered_for(self):
-        ui = self._open()
-        session_id = ui.active_id
-        press(ui, "enter")
-        assert sent(ui, ResolveCompact)[-1].session_id == session_id
-
-    def test_d_discards_it(self):
-        ui = press(self._open(), "d")
-        assert sent(ui, ResolveCompact)[-1].action == "discard"
-
-    def test_escape_answers_nothing(self):
-        # The core goes on holding the offer, so escape is not a verdict —
-        # which is what makes it safe on a screen that cost a generation.
-        ui = press(self._open(), "esc")
-        assert sent(ui, ResolveCompact) == []
-        assert ui.overlay is None
-
-    def test_r_asks_again_with_what_the_user_typed(self):
-        ui = press(self._open(), "r", *"finish the last sentence", "enter")
-        answer = sent(ui, ResolveCompact)[-1]
-        assert answer.action == "retry"
-        assert answer.comment == "finish the last sentence"
-
-    def test_an_empty_comment_is_refused_rather_than_sent(self):
-        # The same generation again, with the model none the wiser.
-        ui = press(self._open(), "r", "enter")
-        assert sent(ui, ResolveCompact) == []
-        assert isinstance(ui.overlay, CompactReviewOverlay)
-
-    def test_escaping_the_comment_box_keeps_the_summary_on_screen(self):
-        ui = press(self._open(), "r", *"never mind", "esc")
-        assert isinstance(ui.overlay, CompactReviewOverlay)
-        assert not ui.overlay.commenting
-        assert sent(ui, ResolveCompact) == []
-        # and it can still be accepted
-        press(ui, "enter")
-        assert sent(ui, ResolveCompact)[-1].action == "accept"
-
-    def test_the_summary_scrolls(self):
-        ui = self._open(summary="\n".join(f"line {n}" for n in range(80)))
-        assert "line 0" in screen(ui, height=24)
-        press(ui, "pgdn", width=120, height=24)
-        assert "line 0" not in screen(ui, height=24)
-
-    def test_nothing_to_review_opens_nothing(self):
-        ui = build()
-        ui.session.compaction = None
-        ui.review_compaction()
-        assert ui.overlay is None
-
-    def test_a_screen_with_no_summary_still_draws(self):
-        drawn = CompactReviewOverlay().render(80, 12)
-        assert widths(drawn) == {80}
-
-    def test_it_waits_rather_than_landing_on_an_open_screen(self):
-        # It arrives a model call after the keystroke, and by then the user may
-        # be halfway through a settings file (`RowUI.land`).
-        ui = recorded(build())
-        ui.focus = SESSIONS
-        ui.handle("c", 120, 40)  # the config editor
-        assert isinstance(ui.overlay, ConfigOverlay)
-        ui.session.compaction = proposal()
-        ui.review_compaction()
-        assert isinstance(ui.overlay, ConfigOverlay)
-        ui.handle("esc", 120, 40)
-        assert isinstance(ui.overlay, CompactReviewOverlay)
-
-
 # ---------------------------------------------------------- the frame itself
 
 # Overlays are where the width discipline breaks, because they draw frames
@@ -1570,7 +1443,6 @@ def all_screens() -> dict:
         "models": ModelPickerOverlay(catalog_rows),
         "inspect": InspectOverlay("a line\n" * 40, title="skills"),
         "memory": MemoryReviewOverlay(proposals(), "s1"),
-        "compact": CompactReviewOverlay(proposal(truncated=True), "s1"),
         "prompt": PromptOverlay("a name", title="new profile", hint="short"),
     }
 

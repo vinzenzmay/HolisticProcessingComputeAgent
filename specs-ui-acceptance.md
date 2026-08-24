@@ -437,18 +437,29 @@ off file by file.
 - `/skill-remove` removes the chosen skill; cancel keeps it; no own skills
   notifies.
 
-## Compaction — `test_tui_compact.py`
+## Compaction — `test_tui_compact.py`, `test_ui_compaction.py`
 
 - `/compact` is offered in the slash menu and listed when `/` is typed.
 - It writes a summary and shows it, and folds nothing until that summary is
   accepted: the review names how many messages would fold, the instruction the
   summary was written for, and whether the model's length budget cut it short.
+- The review is inline and per session, not a modal: it stands in the message
+  box's slot at the foot of the conversation it summarizes, which stays on
+  screen behind it. A summary waiting in a background session flags that
+  session's sidebar row and puts nothing on the current one; opening it reveals
+  the prompt, and answering it there names that session.
+- A summary longer than the prompt's share of the screen scrolls, and the rule
+  says how far down it is. The prompt never takes more than half of what is
+  left after the header and the footer.
+- The comment box lives on the session, so a half-typed complaint survives a
+  switch to another conversation and back.
 - Enter accepts and the fold lands; the next turn runs on the summary.
 - `r` asks for another summary with a line saying what was wrong with this one;
   that comment and the rejected text both reach the summarizer, and the next
   offer says which attempt it is. An empty comment is refused, not sent.
 - `d` discards the summary and leaves the conversation as it was.
-- Escape answers nothing: the offer is kept, and a bare `/compact` re-opens the
+- Escape answers nothing and gives the message box back: the offer is kept, the
+  sidebar still says so, and a bare `/compact` re-opens the
   same summary rather than writing a second one. An instruction after the
   command is a new brief, so it does write one.
 - An instruction after the command steers the summary; a bare `/compact` asks

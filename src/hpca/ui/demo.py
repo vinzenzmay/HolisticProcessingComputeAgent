@@ -975,10 +975,10 @@ class DemoCore:
         COMMAND_COUNTS[cmd.name] = COMMAND_COUNTS.get(cmd.name, 0) + 1
         self.emit(protocol.CommandCounts(counts=dict(COMMAND_COUNTS)))
         if cmd.name == "compact" and cmd.session_id:
-            # The one command the demo does answer for real, because its answer
-            # is a *screen*: the compaction review is otherwise unreachable
-            # without a backend behind it, and a screen nobody can open in the
-            # demo is a screen nobody reviews.
+            # The one command the demo does answer for real, because its
+            # answer is a *prompt*: the compaction review is otherwise
+            # unreachable without a backend behind it, and a prompt nobody can
+            # raise in the demo is a prompt nobody reviews.
             self._offer_compaction(cmd.session_id, cmd.args)
             return
         self.emit(protocol.Notify(text=f"the demo core does not run /{cmd.name}"))

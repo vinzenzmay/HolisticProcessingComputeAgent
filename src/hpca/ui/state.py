@@ -27,6 +27,7 @@ from datetime import datetime
 from hpca.ui import rain, theme
 from hpca.ui.ansi import PULSE_PERIOD, RESET
 from hpca.ui.approval import Decision
+from hpca.ui.compaction import CompactProposal, CompactReview
 from hpca.ui.editor import Editor
 from hpca.ui.meter import render_bar, severity
 from hpca.ui.pane import SPACER_LINES, Fold, Item, Pane
@@ -798,28 +799,6 @@ class Proposal:
 
 
 @dataclass
-class CompactProposal:
-    """A summary `/compact` wrote, waiting to be accepted (`compact.proposed`).
-
-    Held on the session for the reason the `Offer` above is: it arrives a model
-    call after the keystroke, and by then the user may be reading another
-    conversation. Answering it against the wrong one would fold the wrong
-    history.
-
-    ``summary`` is the message as the core would store it, because that is what
-    the user is being asked to accept — not a preview of it. ``truncated`` is
-    the core's warning that the text is cut, which is the one thing a reader
-    cannot tell for themselves.
-    """
-
-    summary: str = ""
-    folded: int = 0
-    guidance: str = ""
-    attempt: int = 1
-    truncated: bool = False
-
-
-@dataclass
 class BackendInfo:
     """One LLM the UI can draw and name — the plain twin of `protocol.LLMEntry`.
 
@@ -1007,11 +986,14 @@ class SessionState:
         # strand that one with nothing left on any screen able to answer it.
         self.offers: list[Offer] = []
         self.proposals: list[Proposal] = []
-        # The summary this conversation is being asked to accept, or None.
-        # One slot, unlike `offers` above: a second `/compact` on a session
-        # that is already holding one either re-offers it or replaces it, so
-        # there is never a queue of summaries of the same history.
-        self.compaction: CompactProposal | None = None
+        # The summary this conversation is being asked to accept, and what has
+        # been done about it so far (`compaction.CompactReview`). One slot,
+        # unlike `offers` above: a second `/compact` on a session that is
+        # already holding one either re-offers it or replaces it, so there is
+        # never a queue of summaries of the same history. Held here rather
+        # than in one shared prompt for the reason `decision` is — the review
+        # is per conversation, and so is the half-typed complaint in its box.
+        self.review = CompactReview()
         # A reply landed here while the user was looking at another
         # conversation (§4.3 item 15). Local, because the core has no flag for
         # it and could not have one: "you have not read this" is a fact about
@@ -1256,6 +1238,29 @@ class SessionState:
         # re-binds the anchor and the turn is a turn again, and where there is
         # no turn `working` is already False.
         self.turn.parked = False
+
+    # ------------------------------------------------------ the compaction
+
+    @property
+    def compaction(self) -> CompactProposal | None:
+        """The summary this conversation is being asked to accept, or None.
+
+        A property over `review.proposal` rather than a field beside it, so
+        that "is there a summary waiting here?" has one answer and the drawing
+        state cannot drift from the offer it belongs to.
+        """
+        return self.review.proposal
+
+    @compaction.setter
+    def compaction(self, proposal: CompactProposal | None) -> None:
+        """A new offer, and a review of it that has had nothing done to it yet.
+
+        Assigning replaces the whole review rather than only its proposal,
+        which is what makes a retry's second summary arrive scrolled to the
+        top with an empty comment box: the complaint that produced it has been
+        sent, and leaving it in the box would invite sending it twice.
+        """
+        self.review = CompactReview(proposal) if proposal is not None else CompactReview()
 
     # ---------------------------------------------------------- the offers
 
