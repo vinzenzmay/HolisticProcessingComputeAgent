@@ -114,8 +114,6 @@ from hpca.protocol import (
     ProfileDuplicate,
     ProfileGet,
     ProfileList,
-    ProfileRow,
-    ProfileRows,
     ProfileSave,
     ProfileSet,
     SessionClose,
@@ -764,6 +762,11 @@ class AgentService:
             )
         self._deps.emit(SessionCreated(row=self._row(session)))
         self._emit_rows()
+        # The profiles screen counts conversations per profile, and this is
+        # one of the three places that number moves (`_new_session`, a fork,
+        # a deletion). The sidebar cannot be totalled up for it: it holds the
+        # sessions a front-end was sent, and the count is the core's answer.
+        self._emit_profiles()
 
     async def _reusable_session(self):
         """The conversation on screen, when starting a new one would only
@@ -1252,6 +1255,7 @@ class AgentService:
                     )
                 )
         self._emit_rows()
+        self._emit_profiles()  # one conversation fewer under its profile
         await self._pollers.refresh_panel(force=True)
         self._deps.emit(Notify(text=f"Deleted “{session.title}”"))
 
@@ -1294,6 +1298,7 @@ class AgentService:
             return
         self._deps.emit(SessionCreated(row=self._row(fork)))
         self._emit_rows()
+        self._emit_profiles()  # one more conversation under this profile
         self._deps.emit(
             Notify(
                 text=f"Forked “{source.title}” — "
@@ -1584,40 +1589,12 @@ class AgentService:
     def _emit_profiles(self) -> None:
         """The profiles, whole — the answer to `profile.list`.
 
-        Read here rather than derived by a front-end, which is what was
-        happening: a picker was assembled out of `hello`'s profile plus
-        whatever profiles the sidebar rows named, which misses every profile
-        that has no session, and can carry neither the memory count nor the
-        provenance because those live in files only the core reads.
-
-        A broken profile file counts nothing rather than taking the listing
-        down with it: the screen exists partly so that such a profile can be
-        opened and fixed, and it cannot be opened from a screen that failed to
-        draw.
+        Built by the memory service, which owns the files these rows are read
+        from and is where their counts change: an approved review or a hand
+        edit restates the listing from in there, so a memory just saved shows
+        up without reopening the app (`MemoryService.emit_profiles`).
         """
-        rows = []
-        for name in Profile.list_profiles():
-            memories, copied_from = 0, ""
-            try:
-                profile = Profile.load(name)
-            except Exception:
-                logger.exception("could not read profile %s", name)
-            else:
-                memories = len(profile.memories)
-                copied_from = profile.copied_from
-            rows.append(
-                ProfileRow(
-                    name=name,
-                    memories=memories,
-                    copied_from=copied_from,
-                    # Two different questions: which profile a deleted one's
-                    # sessions fall back to, and which one the core is running
-                    # under right now (`protocol.ProfileRow`).
-                    is_default=name == DEFAULT_PROFILE,
-                    working=name == self._deps.profile,
-                )
-            )
-        self._deps.emit(ProfileRows(rows=rows))
+        self._memory.emit_profiles()
 
     async def _set_profile(self, name: str) -> None:
         """`profile.set`: the profile the core works under when nothing else

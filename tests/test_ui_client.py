@@ -1306,13 +1306,20 @@ class TestTheProfiles:
                 rows=[
                     protocol.ProfileRow(name="default", memories=0, is_default=True),
                     protocol.ProfileRow(
-                        name="hpc", memories=12, copied_from="default", working=True
+                        name="hpc",
+                        memories=12,
+                        sessions=3,
+                        copied_from="default",
+                        working=True,
                     ),
                 ]
             )
         )
         assert [x.name for x in wire.ui.profiles] == ["default", "hpc"]
         assert wire.ui.profiles[1].copied_from == "default"
+        # Counted by the core and carried here: a front-end totalling up its
+        # own sidebar would count the sessions it happens to have been sent.
+        assert wire.ui.profiles[1].sessions == 3
         assert wire.ui.profiles[0].default is True
         assert wire.ui.profiles[1].working is True
 

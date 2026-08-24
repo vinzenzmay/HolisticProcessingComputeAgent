@@ -135,6 +135,7 @@ def profiles() -> list[ProfileInfo]:
         ProfileInfo(
             name="hpc",
             memories=12,
+            sessions=3,
             working=True,
             skills=[SkillInfo("merge-vcfs", "how to merge shards")],
         ),
@@ -371,6 +372,18 @@ class TestProfilesList:
         ui = RowUI(profiles=profiles())
         ui.focus = SESSIONS
         assert "12 memories" in screen(press(ui, "a"))
+
+    def test_and_counts_the_conversations_filed_under_it(self):
+        ui = RowUI(profiles=profiles())
+        ui.focus = SESSIONS
+        assert "3 sessions" in screen(press(ui, "a"))
+
+    def test_a_profile_nobody_has_talked_under_says_nothing_about_sessions(self):
+        # Zero is also what an uncountable answer looks like, so the row omits
+        # the phrase rather than claiming "0 sessions".
+        ui = RowUI(profiles=profiles())
+        ui.focus = SESSIONS
+        assert "0 sessions" not in screen(press(ui, "a"))
 
     def test_and_shows_provenance(self):
         ui = RowUI(profiles=profiles())

@@ -441,6 +441,12 @@ class ProfileRow(_Model):
     other". The memories are counted rather than sent: the screen shows a
     count, and the text of one is a `profile.save` round trip away.
 
+    ``sessions`` is counted the same way and for the same reason, and it is
+    the core's answer rather than something a front-end can total up from the
+    sidebar: the sidebar holds the sessions it has been sent, and a profile
+    that has conversations under it is still a profile the user may be about
+    to delete.
+
     Two flags rather than one, because they answer different questions. The
     ★ marks the *default* profile, which is where a deleted profile's sessions
     land and so the one that cannot be deleted; ``working`` marks the one the
@@ -450,6 +456,10 @@ class ProfileRow(_Model):
 
     name: str
     memories: int = 0
+    # How many conversations are filed under it. Zero is both "none" and "the
+    # core could not count them"; the row simply says nothing about sessions
+    # in either case, which is what it did before it could count at all.
+    sessions: int = 0
     copied_from: str = ""
     is_default: bool = False
     working: bool = False
