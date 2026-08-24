@@ -67,8 +67,13 @@ these databases hold whole conversations.
 
 ### 2.3 Copying
 
-Every copy in both directions uses the **sqlite online-backup API**
-(`sqlite3.Connection.backup`), never `shutil.copy`. Reasons:
+Every copy in both directions is one of two mechanisms, never `shutil.copy`:
+the **sqlite online-backup API** (`sqlite3.Connection.backup`), or a
+**rebuild** (`VACUUM INTO`) for the databases in `COMPACT_DB_NAMES`. Both are
+transactionally consistent under a live writer and both leave a standalone
+destination; they differ in what they do with free pages (§2.4).
+
+The backup API is the default. Reasons:
 
 - it is page-level and transactionally consistent even while another connection
   is writing the source (it restarts if the source changes mid-copy), so the
@@ -80,9 +85,10 @@ Every copy in both directions uses the **sqlite online-backup API**
   pages, not rows.
 
 After each backup the destination gets `PRAGMA wal_checkpoint(TRUNCATE)` so the
-file left in home is standalone.
+file left in home is standalone. A rebuild needs no such step — its output is
+standalone already.
 
-The backup lands in a sibling temp file (`<name>.backup-tmp`) that is renamed
+The copy lands in a sibling temp file (`<name>.backup-tmp`) that is renamed
 over the destination only once complete. Backing up straight into the
 destination proved able to destroy it: an interrupted write on the network
 filesystem left a home copy with exactly its first page zeroed (BIH cluster,
@@ -90,6 +96,74 @@ filesystem left a home copy with exactly its first page zeroed (BIH cluster,
 ("file is not a database") — one torn file blocked seed, recovery and every
 later sync-back at once. The rename is atomic, so the destination is only ever
 its old self or the finished copy.
+
+### 2.4 Compaction
+
+sqlite never shrinks a database on its own. `auto_vacuum` is `NONE`, so the
+pages a delete releases go on the free list and the file keeps its size
+forever — and the backup API reproduces that free list page for page, so the
+bloat is copied across NFS at every seed, every sync and every exit.
+
+`checkpoints.db` is where this bites. LangGraph writes a full state snapshot
+per super-step, so an ordinary session churns thousands of pages, and deleting
+a session frees every page it ever wrote. Measured on a real app dir after a
+handful of sessions: **159.8 MB of file holding 8.7 MB of live checkpoints —
+36,767 of 39,013 pages free.** Deleting a session *does* remove its rows
+(`AgentService._delete_session` drops the session row, the episodic messages,
+the watches and the checkpointer thread); what it cannot do is give the space
+back.
+
+So the databases in `COMPACT_DB_NAMES` — `hpca.db` and `checkpoints.db` — are
+**rebuilt rather than duplicated**, in every direction: seed, recovery and
+sync-back. `VACUUM INTO` writes only the live pages, which makes the copy both
+smaller and cheaper to make; on seed it is the bigger win, because the pages
+never read are pages never fetched over NFS.
+
+`rag.db` is deliberately excluded, and *not* because a rebuild would fail —
+VACUUM copies a virtual table's shadow tables and carries its schema row across
+without instantiating the module, so `vec0` survives it untouched (verified
+empirically). It is excluded because it has nothing to reclaim: an embedding
+index grows, it does not churn, and it measured **zero** free pages beside
+`checkpoints.db`'s 36,767. Rebuilding it would re-create every index over a
+hundred thousand chunks, every sync, to save nothing.
+
+A rebuild that fails anyway falls back to the page copy — logged, and
+remembered per source path (`_COMPACT_UNSUPPORTED`) so a whole failed rebuild
+is not wasted on every tick. `COMPACT_DB_NAMES` is the default, not a promise.
+
+### 2.5 Skipping a sync that would change nothing
+
+A periodic sync copies only the databases that have been *written to* since
+their last successful sync. Before this, every tick pushed all three whole
+files to home whether or not anything had touched them — and `rag.db` alone is
+hundreds of megabytes that only change when something is indexed.
+
+"Written to" is `fingerprint(path)`: the size and `st_mtime_ns` of the database
+**and of its `-wal` sidecar**, both, because a WAL-mode commit lands in the
+sidecar and can leave the main file untouched for a long time. Two stats on
+node-local storage against a whole-file copy over NFS. A missing file is a
+value like any other, so a WAL appearing or being checkpointed away both read
+as a change.
+
+The fingerprint is read *before* the copy and stored after: opening and closing
+a connection to a WAL database can checkpoint it and remove the sidecar, which
+would move the stamp under us. Stale in that direction costs one needless copy
+on the next tick, which is the harmless direction.
+
+Two rules keep the skip safe:
+
+- **`release()` passes `force=True`.** A skipped periodic sync is only ever
+  safe because the local copy still exists — a hard kill in the window leaves
+  the working dir behind and the next start recovers it. The final sync has no
+  such window: the working dir is about to be deleted, so it never skips.
+- **A name with no recorded fingerprint is always copied.** So the first sync
+  of a run copies regardless, which is what lets a run that never happens to
+  write to a database still replace a bloated home copy with a compacted one.
+
+A failed copy clears the name's stamp, so the next tick retries it. The lease
+heartbeat is refreshed on every tick regardless of what was skipped. `sync()`
+still returns "did everything get home", and a database that was already there
+counts as arrived.
 
 **Corrupt-file quarantine:** a file under a database's name that is non-empty
 but does not start with sqlite's 16-byte magic is moved aside to
@@ -117,9 +191,11 @@ no tables yet.
 
 **Running:** a timer syncs local→home every `sync_interval_s` (default 60,
 0 disables), on a worker thread, skipped while a previous sync is still in
-flight. The lease heartbeat is refreshed by the same tick.
+flight, and per database skipped again if nothing has written to it (§2.5).
+The lease heartbeat is refreshed by the same tick either way.
 
-**Exit** (`DbCache.release()`): final sync, delete the working dir, drop the
+**Exit** (`DbCache.release()`): final sync — `force=True`, so it never skips a
+database — delete the working dir, drop the
 lease. Deleting is deliberate — after a *clean* exit home is authoritative, so
 leaving the copies behind would only make the next start do pointless recovery
 work. A crash skips this, which is exactly when recovery is wanted.
