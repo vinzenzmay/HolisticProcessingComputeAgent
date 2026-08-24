@@ -2,7 +2,7 @@
 
 The app's databases live in an NFS home on a cluster node, where every sqlite
 call is a network round-trip. DbCache keeps the working copies on node-local
-storage and syncs them back to home. See specs-db-local-cache.md.
+storage and syncs them back to home. See specs/specs-db-local-cache.md.
 """
 
 from __future__ import annotations

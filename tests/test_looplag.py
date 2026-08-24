@@ -1,4 +1,4 @@
-"""Tests for hpca.looplag: the event-loop lag probe (specs-core-process.md §8).
+"""Tests for hpca.looplag: the event-loop lag probe (specs/specs-core-process.md §8).
 
 The probe is the instrument the core-subprocess refactor is judged with, so
 these tests are about it being *trustworthy*, not about it being fast: a block

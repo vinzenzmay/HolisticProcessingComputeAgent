@@ -3,7 +3,7 @@
     pixi run -e dev python -m hpca.ui.run --demo
 
 The only module that touches a terminal, which is what keeps everything above
-it testable without one (specs-ui-replacement.md §3.1). It knows about I/O and
+it testable without one (specs/specs-ui-replacement.md §3.1). It knows about I/O and
 about nothing else: what a key *means* is `app.py`'s business, what an event
 means is `client.py`'s, and neither of them has to be async for this to work.
 
@@ -94,7 +94,7 @@ class Loop:
         self.client = client
         self.conn = conn
         # A `hpca.looplag.LoopLagProbe`, or None. This loop is the thing the
-        # measurement is *about* (specs-core-process.md §8) — the whole case
+        # measurement is *about* (specs/specs-core-process.md §8) — the whole case
         # for moving the agent into its own process is that synchronous work
         # here makes the UI stutter — so the probe starts and stops with it.
         # Where the report goes is the caller's business: this module never

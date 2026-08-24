@@ -1,7 +1,7 @@
 """The protocol client: events become state, intents become commands.
 
 The only module in `hpca.ui` that imports `hpca.protocol`, and the reason
-`app.py` can be tested by comparing strings (specs-ui-replacement.md §3.1). It
+`app.py` can be tested by comparing strings (specs/specs-ui-replacement.md §3.1). It
 draws nothing and it reads no terminal: one direction takes a frame off the
 wire and mutates `ui/state.py` objects, the other takes an intent from a
 keypress and puts a command on the wire.
@@ -232,7 +232,7 @@ class UIClient:
             self.command(protocol.TurnInterrupt(session_id=session))
         elif isinstance(intent, state.Decide):
             # The half-typed reason was a UI draft until this moment; only the
-            # finished string crosses (specs-core-process.md §4.4).
+            # finished string crosses (specs/specs-core-process.md §4.4).
             self.command(
                 protocol.DecisionResolve(
                     session_id=session,

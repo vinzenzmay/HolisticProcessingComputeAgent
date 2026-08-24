@@ -3,7 +3,14 @@
 A terminal-based AI agent that uses local or remote LLMs to help users of an HPC
 Slurm cluster with biomedical data processing. It runs on a compute node, talks to
 an OpenAI-compatible LLM backend (e.g. vLLM behind an SSH tunnel), and provides a
-three-column TUI: sessions, chat, and running sub-processes/jobs.
+four-row TUI: sessions, chat, and running sub-processes/jobs.
+
+![The HPCA TUI: header, sessions, chat, mode and context line, message entry, watchers, hotkeys](images/HPCA_UI.png)
+
+The rows, top to bottom: the header (version, session, mode, event-loop lag),
+the **sessions** list, the **chat**, the mode/context line, the **message**
+entry with the LLM it is talking to, the **watchers** column for jobs and logs,
+and the hotkey footer.
 
 See [project.md](project.md) for the full design document.
 

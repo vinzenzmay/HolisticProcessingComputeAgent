@@ -4,7 +4,7 @@ Each overlay is an independent render/handle pair, so most of these construct
 the app and press the key that opens it — which is also the only thing that
 proves the key is wired.
 
-The claims come from specs-ui-acceptance.md: "Profiles", "Backends", "Thinking
+The claims come from specs/specs-ui-acceptance.md: "Profiles", "Backends", "Thinking
 effort", "Memory", "Skills and self-review", and the config-editor bullets
 under "Navigating the entry". The M7 screens are the settings editor, the
 profiles list and its three children, thinking, switch-LLM, inspect, the memory
@@ -256,7 +256,7 @@ class TestRewindOverlay:
 
 
 class TestConfigEditor:
-    """specs-ui-acceptance.md, "Navigating the entry", the `c` bullets."""
+    """specs/specs-ui-acceptance.md, "Navigating the entry", the `c` bullets."""
 
     def test_c_opens_the_config_editor(self):
         assert isinstance(opened("c").overlay, ConfigOverlay)
@@ -339,7 +339,7 @@ class TestConfigEditor:
 
 
 class TestProfilesList:
-    """specs-ui-acceptance.md, "Profiles"."""
+    """specs/specs-ui-acceptance.md, "Profiles"."""
 
     def test_a_opens_the_profiles_screen(self):
         assert isinstance(opened("a").overlay, ProfilesOverlay)
@@ -656,7 +656,7 @@ class TestProfileSkills:
 
 
 class TestThinking:
-    """specs-ui-acceptance.md, "Thinking effort"."""
+    """specs/specs-ui-acceptance.md, "Thinking effort"."""
 
     def _open(self):
         ui = recorded(build())
@@ -724,7 +724,7 @@ class TestThinking:
 
 
 class TestSwitchLlm:
-    """specs-ui-acceptance.md, "Backends", the ctrl+L bullets."""
+    """specs/specs-ui-acceptance.md, "Backends", the ctrl+L bullets."""
 
     def _open(self):
         ui = recorded(build())

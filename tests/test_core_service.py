@@ -414,7 +414,7 @@ class TestTurns:
         `test_profiles.py`, `orchestrator_system_prompt` in `test_prompts.py`
         — and the join in `service.system_prompt_for` was not: this test used
         to assert that the content was a non-empty string, which is true of a
-        prompt with no memories in it at all (specs-ui-coverage.md §3.14 row
+        prompt with no memories in it at all (specs/specs-ui-coverage.md §3.14 row
         2). If the memories stopped arriving, nothing on screen would change
         and nothing here would fail.
 
@@ -1455,7 +1455,7 @@ class TestSessionOpen:
     async def test_a_session_reopened_mid_turn_keeps_its_type_ahead(
         self, service, session, llm
     ):
-        # The known gap of specs-ui-replacement.md §4.2: the queue is core
+        # The known gap of specs/specs-ui-replacement.md §4.2: the queue is core
         # state now, so a reset that leaves it out deletes the user's
         # type-ahead from under them.
         release = await park_turn(service, llm, session.session_id)
@@ -1861,7 +1861,7 @@ class TestAResumeAfterACoreRestart:
     survives; the turn that asked it does not, and with it goes the record of
     which chat rows are that exchange's. Without something to bind to, the
     resume can only stay silent and let the next `chat.reset` show the reply
-    — the gap specs-ui-replacement.md §4.2 records against M5.
+    — the gap specs/specs-ui-replacement.md §4.2 records against M5.
     """
 
     def build(self, home, conn, checkpointer, llm):
@@ -4155,7 +4155,7 @@ class TestBackendDiscovery:
     async def test_and_says_so_with_the_catalog_the_screen_must_redraw(
         self, service
     ):
-        """A refused remove restates the catalog (specs-ui-coverage.md §9.1).
+        """A refused remove restates the catalog (specs/specs-ui-coverage.md §9.1).
 
         The screen takes the row off itself when it sends `backend.remove` —
         it cannot wait a round trip to stop drawing a row the user just
@@ -5124,7 +5124,7 @@ class TestTheOtherSlashCommands:
 
 
 class TestSkillDrafting:
-    """`/skill-creator <what it should do>` — specs-ui-acceptance.md, "Skills".
+    """`/skill-creator <what it should do>` — specs/specs-ui-acceptance.md, "Skills".
 
     The form belongs to the front-end and the draft cannot: a draft is a
     generation, and only the core makes those. So the request crosses as
@@ -5333,7 +5333,7 @@ class TestStartup:
     """What happens once, before anyone types anything.
 
     All of it lived in `tui/app.py`'s `on_mount` and had exactly one caller
-    each (`specs-ui-coverage.md` §3.1, §3.3), so deleting that module deleted
+    each (`specs/specs-ui-coverage.md` §3.1, §3.3), so deleting that module deleted
     the behaviour with it: the trash was never swept, the curator never ran,
     and nothing ever discovered — or checked — a backend.
     """

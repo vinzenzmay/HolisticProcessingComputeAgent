@@ -88,7 +88,7 @@ class TestApplyStatuses:
     These were once driven through `jobs.poll_active`, a wrapper that made the
     sacct call itself. The core does the two halves separately — the store on
     the DB thread, sacct on the loop — so the wrapper had no callers left and
-    went with this milestone (specs-ui-coverage.md §1, the one-caller sweep).
+    went with this milestone (specs/specs-ui-coverage.md §1, the one-caller sweep).
     The fold it wrapped is where the behaviour was, and it stays tested here;
     the *cycle* around it belongs to `tests/test_core_pollers.py`, which
     covers the skipped query and the terminal job nothing asks about twice.

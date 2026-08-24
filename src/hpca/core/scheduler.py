@@ -1,4 +1,4 @@
-"""Who runs next, and what happens while they do (specs-core-process.md §7).
+"""Who runs next, and what happens while they do (specs/specs-core-process.md §7).
 
 This is `HpcaApp`'s turn machinery — `_turns`, `_pending_work`, `drain_work`,
 `_deliver_event`, the interrupt path and the approval park — with every reach
@@ -551,7 +551,7 @@ class TurnScheduler:
         **What was never in the thread comes back:** every message still
         queued behind that turn. The UI used to re-add all of this itself
         (`tui/app.py:4585`) out of state it owned. It owns none of it now — the
-        gap specs-ui-replacement.md §4.2 records.
+        gap specs/specs-ui-replacement.md §4.2 records.
         """
         self._entry_seqs[session_id] = max(len(entries), 0)
         self._last_exchange[session_id] = _tail_exchange(entries)
@@ -1001,7 +1001,7 @@ class TurnScheduler:
         the model did not see it and the next turn must not — so it travels as
         `turn.failed`, which is also what stops the spinner, and a front-end
         draws it as an ephemeral `error` entry of its own
-        (specs-ui-replacement.md §3.2). Emitting one from here as well would
+        (specs/specs-ui-replacement.md §3.2). Emitting one from here as well would
         put two of them on screen.
         """
         live = self._live.get(session_id)
@@ -1219,7 +1219,7 @@ class TurnScheduler:
         its time: a script that runs for minutes, or a chain of tool rounds
         gone astray, is exactly what a user wants to stop, and refusing there
         left them watching a spinner they could not answer
-        (`tui/app.py:_can_interrupt`, and specs-ui-acceptance.md's "a turn
+        (`tui/app.py:_can_interrupt`, and specs/specs-ui-acceptance.md's "a turn
         currently running a tool is interruptible").
 
         What cancelling mid-tool does NOT do is stop what the tool started: a

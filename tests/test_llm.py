@@ -366,7 +366,7 @@ class TestNativeTools:
         assert make_client(handler, tool_protocol="native").uses_native_tools() is True
 
     def test_envelope_is_the_default(self):
-        # Measured, not just portable (specs-edit-eval.md §7.3/§7.4): native is
+        # Measured, not just portable (specs/specs-edit-eval.md §7.3/§7.4): native is
         # correct on Qwen3.8 but costs ~24% more tokens for the same success
         # rate, and a cut-off long write cannot be salvaged on that channel.
         def handler(request):

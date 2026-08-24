@@ -1,6 +1,6 @@
 """M5b — typing ahead of a running turn, and taking it back.
 
-The claims are `specs-ui-acceptance.md`'s "Queueing while a turn runs" and the
+The claims are `specs/specs-ui-acceptance.md`'s "Queueing while a turn runs" and the
 half of "Stopping a turn" that M5b owns: the confirm on the working row, the
 message that comes back, and where it comes back *to*.
 

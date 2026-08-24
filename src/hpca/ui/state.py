@@ -3,7 +3,7 @@
 Plain dataclasses and one class with panes in it. No pydantic, no protocol, no
 I/O — `client.py` is the only module that has heard of a wire, and it fills
 these in from events; `app.py` renders them and never sees anything else
-(specs-ui-replacement.md §3.1).
+(specs/specs-ui-replacement.md §3.1).
 
 Two shapes cross the seam in each direction:
 
@@ -60,7 +60,7 @@ def when(stamp: str) -> str:
 
     Local, and that is the whole reason the conversion lives on this side of
     the wire: the core stamps in UTC because it need not be on the same
-    machine as the front-end (specs-core-process.md), and only the front-end
+    machine as the front-end (specs/specs-core-process.md), and only the front-end
     knows which clock a person is reading.
 
     Empty rather than a placeholder when the core sent nothing — a row from a
@@ -311,7 +311,7 @@ def entry_item(entry: ChatEntry, *, stamps: bool = True) -> Item:
     the conversation, and a terminal's drag-to-select takes all four along
     with the text — which matters here because selecting out of the chat is
     the terminal's job in this UI and not the UI's own
-    (specs-ui-replacement.md §4.1 item 6). So the label is a line of its own
+    (specs/specs-ui-replacement.md §4.1 item 6). So the label is a line of its own
     and the message is `body`, which `Pane(flush=True)` draws at column 0 with
     nothing in front of it: what you drag across is what you paste.
 
@@ -482,7 +482,7 @@ class Turn:
     # already popped its `TurnState` — so `Interrupt` finds nothing to
     # interrupt and the core answers by emitting nothing at all. Kept on the
     # turn rather than read off the session's `Decision` because it is what
-    # the working row's own hint is drawn from (specs-ui-coverage.md §4).
+    # the working row's own hint is drawn from (specs/specs-ui-coverage.md §4).
     parked: bool = False
     # `started_at` parsed once, because the alternative is parsing an ISO
     # string ten times a second for as long as a turn runs.
@@ -949,7 +949,7 @@ class SessionState:
         # Which row of the "/" menu is highlighted, for as long as this
         # session's draft is a command being named. Held here and not on the
         # app because the draft is held here: a parked `/…` draft has to bring
-        # its menu back with it (specs-ui-acceptance.md, "Drafts"), and the
+        # its menu back with it (specs/specs-ui-acceptance.md, "Drafts"), and the
         # menu's *contents* need no parking at all — they are a function of the
         # draft, so restoring the draft restores them. Only the cursor is
         # state, and this is the one place it can belong to the same session.
@@ -1325,7 +1325,7 @@ class SessionState:
         spinner is a function of the clock (`Turn.frame`), so a frame of it
         rewrites one cached line rather than relaying out the log — the
         performance requirement the Textual `WorkingIndicator` paid 44ms of
-        loop lag to learn (specs-ui-acceptance.md, "The spinner").
+        loop lag to learn (specs/specs-ui-acceptance.md, "The spinner").
 
         It is a *row*, after the last message, because Enter on it is the
         interrupt gesture and because typing ahead must never bury it: rows

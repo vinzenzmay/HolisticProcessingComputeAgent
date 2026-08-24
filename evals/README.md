@@ -3,7 +3,7 @@
 This is the standing instrument for assessing any change to the file tools,
 the editing guidance, or the backend — method, measured v0.17.0→v0.18.0
 results, and the quick "baseline ref vs working tree" recipe live in
-[specs-edit-eval.md](../specs-edit-eval.md).
+[specs/specs-edit-eval.md](../specs/specs-edit-eval.md).
 
 `edit_eval.py` runs file-editing tasks in two tiers — `--tier core` (default;
 12 everyday tasks: one-line replacement, mid-file edits in a ~300-line file,

@@ -1,6 +1,6 @@
 """Tests for the slash commands and the menu that offers them (M8).
 
-The claims come from specs-ui-acceptance.md: "Slash-command menu" whole, the
+The claims come from specs/specs-ui-acceptance.md: "Slash-command menu" whole, the
 `/memorize` and `/conclude` claims under "Memory", "Compaction", and the
 `/skill-*` claims under "Skills and self-review".
 
@@ -68,7 +68,7 @@ def app(skills=None, profile: str = "hpc", bodies=None) -> RowUI:
 
     ``bodies`` answers the editors that fetch what they show. The config
     editor is the one used here — as the screen a user opens while a draft is
-    still out (specs-ui-coverage.md §9.8).
+    still out (specs/specs-ui-coverage.md §9.8).
     """
     ui = RowUI(profiles=[ProfileInfo(name=profile)])
     session = SessionState("s1", profile=profile)
@@ -102,7 +102,7 @@ def sent(ui: RowUI, kind: type) -> list:
 
 
 class TestTheMenu:
-    """specs-ui-acceptance.md, "Slash-command menu"."""
+    """specs/specs-ui-acceptance.md, "Slash-command menu"."""
 
     def test_a_slash_lists_every_command(self):
         ui = press(app(), "/")
@@ -245,7 +245,7 @@ class TestFrequencyOrdering:
 
 
 class TestAParkedDraft:
-    """specs-ui-acceptance.md, "Drafts" — left undone in M6."""
+    """specs/specs-ui-acceptance.md, "Drafts" — left undone in M6."""
 
     def _two(self) -> RowUI:
         from hpca.ui.state import SessionState
@@ -331,7 +331,7 @@ class TestTheSevenBuiltins:
 
 
 class TestWhatACompactDoesToTheMeter:
-    """specs-ui-coverage.md §3.6: both halves were green and the seam was not.
+    """specs/specs-ui-coverage.md §3.6: both halves were green and the seam was not.
 
     The core folds the thread and re-derives the fill (`forget_session` then
     `estimate_context`), and deliberately sends no `chat.reset` — a fold
@@ -543,7 +543,7 @@ class TestASkillByName:
 
 
 class TestSkillCreator:
-    """specs-ui-acceptance.md, "Skills and self-review", `/skill-creator`."""
+    """specs/specs-ui-acceptance.md, "Skills and self-review", `/skill-creator`."""
 
     def _form(self, ui: RowUI | None = None) -> RowUI:
         return press(ui or app(), *"/skill-creator", "enter")

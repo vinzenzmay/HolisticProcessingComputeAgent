@@ -465,7 +465,7 @@ class BackendRegistry:
 
         Configured entries first, then what a scan turned up — because the
         screen's "add this to the list" is a `backend.set` on a discovered row
-        (`specs-ui-replacement.md` §4.2), and because a label is the only way
+        (`specs/specs-ui-replacement.md` §4.2), and because a label is the only way
         to name a key-locked backend without putting its key on the wire.
 
         A key-locked scan hit resolves to nothing on purpose: `KEY_REQUIRED`

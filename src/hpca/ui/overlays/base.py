@@ -333,7 +333,7 @@ class ListOverlay(Overlay):
 class EditorOverlay(Overlay):
     """Raw text in the frame; escape asks to keep changes, if there are any.
 
-    "No edits means no question" is the claim (specs-ui-acceptance.md,
+    "No edits means no question" is the claim (specs/specs-ui-acceptance.md,
     Profiles), and it is one comparison against the text the screen opened
     with — which is also what makes an accidental open-and-escape free.
     """

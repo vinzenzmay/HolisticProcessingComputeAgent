@@ -1,6 +1,6 @@
 """Tests for hpca.coreproc: starting the core child, and where it listens.
 
-The core runs as a child process (specs-core-process.md §2). What is testable
+The core runs as a child process (specs/specs-core-process.md §2). What is testable
 without a real core is precisely the fiddly part: a socket path that fits in
 ``sun_path`` and is not reachable by the rest of a shared login node, a
 handshake that fails loudly instead of hanging, and a stop() that ends in

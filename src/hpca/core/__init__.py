@@ -1,4 +1,4 @@
-"""The agent runtime, with no front-end in it (specs-core-process.md).
+"""The agent runtime, with no front-end in it (specs/specs-core-process.md).
 
 Everything here must run headless. The rule that keeps that true is simple and
 worth stating once: **nothing under `hpca.core` may import Textual, and nothing

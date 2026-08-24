@@ -4,7 +4,7 @@ Pure functions over plain data, deliberately: what a typed line *means* has to
 be decidable without a core, a database or a terminal, and the menu is then one
 more thing `RowUI.render` can be asked for as a string.
 
-Three rules from `specs-ui-acceptance.md`, "Slash-command menu", live here:
+Three rules from `specs/specs-ui-acceptance.md`, "Slash-command menu", live here:
 
 * **Substring, not prefix.** ``skill`` finds every command with "skill" in the
   name, which is how a user who remembers half a name finds the whole one.

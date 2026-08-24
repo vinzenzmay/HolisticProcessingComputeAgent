@@ -1,6 +1,6 @@
 """Profile memory: what is frozen, what is recalled, and what may be written.
 
-Lifted out of `HpcaApp` (specs-core-process.md §7). Five properties in here are
+Lifted out of `HpcaApp` (specs/specs-core-process.md §7). Five properties in here are
 load-bearing and cheap to break by accident, so they are stated once, at the
 top, rather than left to be rediscovered from the code:
 
@@ -1183,7 +1183,7 @@ class MemoryService:
         It was own-only for a milestone while the screens had already widened,
         so a skill created at the project level appeared on the profile's
         skills screen and answered Enter with "has no skill of its own"
-        (specs-ui-coverage.md §9.9).
+        (specs/specs-ui-coverage.md §9.9).
         """
         # Project before profile on a name clash, matching load precedence and
         # `delete_profile_skill`: the file the user can see is the one they

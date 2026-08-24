@@ -257,7 +257,7 @@ class Entry(_Model):
     seq: int = 0
     # When this happened, ISO-8601 UTC — see the transcript original. UTC on
     # the wire and not the core's local rendering of it, because a core and a
-    # front-end need not be on the same machine (specs-core-process.md) and
+    # front-end need not be on the same machine (specs/specs-core-process.md) and
     # only the front-end knows which clock a person is reading.
     at: str = ""
 

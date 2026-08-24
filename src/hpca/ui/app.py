@@ -132,7 +132,7 @@ SESSIONS, CHAT, INPUT, WATCHERS, DECISION, OFFER, REVIEW = range(7)
 # The question the aimed half of the stop gesture asks first. Enter on the
 # working row is a key that can be hit while steering through a log the agent
 # is writing into, so it confirms; `esc esc` does not, because the doubling is
-# already the confirmation (specs-ui-acceptance.md, "Stopping a turn").
+# already the confirmation (specs/specs-ui-acceptance.md, "Stopping a turn").
 INTERRUPT_QUESTION = "Interrupt this turn and re-edit your last message?"
 
 # What the prompt may take of the screen. Half of what is left after the header
@@ -179,7 +179,7 @@ COMPACT_NOTES = {
 # What quitting asks, and what ctrl+q is worth. `q` confirms because it is one
 # letter away from every other key on the sessions column; ctrl+q is not bound
 # at all because it belongs to zellij, which is what a cluster user runs this
-# inside (specs-ui-acceptance.md, "Backends").
+# inside (specs/specs-ui-acceptance.md, "Backends").
 QUIT_QUESTION = "Really quit?"
 
 # What a completed stop gesture says when there was no turn under it, in the
@@ -193,7 +193,7 @@ NOTHING_TO_STOP = "nothing running to stop"
 # And the third, which reads like a running turn and is not one: a turn parked
 # on an approval has been handed back to the user, and the core has no
 # `TurnState` left to interrupt. Answer it — either way — and it can be
-# stopped again (specs-ui-coverage.md §4).
+# stopped again (specs/specs-ui-coverage.md §4).
 PARKED_ON_A_DECISION = "this turn is waiting for your answer — decide it first"
 
 # The title over the tunnel recipe an empty scan comes back with — the words
@@ -814,7 +814,7 @@ class RowUI:
         # two things to say about a session that is not on screen. The same
         # `working` the mark above was drawn from, or the "*" would overwrite
         # a "⟳" the core's flag put there and nothing local knew about — a
-        # reconnect, or a second front-end (specs-ui-coverage.md §9.14).
+        # reconnect, or a second front-end (specs/specs-ui-coverage.md §9.14).
         if session.updated and not (parked or working):
             marks = marks[0] + UPDATED_MARK
         return marks
@@ -1805,7 +1805,7 @@ class RowUI:
         if self.focus == SESSIONS and self.session_pane.here() == NEW_SESSION_KEY:
             # The three session keys do nothing on this row, so the footer
             # does not offer them: a key list that lies is worse than a short
-            # one (specs-ui-acceptance.md, "rename keys are inert").
+            # one (specs/specs-ui-acceptance.md, "rename keys are inert").
             rows += [("enter", "start a session")]
         elif self.focus == SESSIONS:
             rows += [("enter", "switch"), ("r", "rename"), ("t", "retitle"), ("d", "delete")]
@@ -2509,7 +2509,7 @@ class RowUI:
         The same answer the spinner gives — "running read_file", "LLM
         processing" — because that is already the app's own word for what it
         is doing, so a spike in `looplag.log` names the step that caused it
-        rather than a time nobody can place (specs-core-process.md §8).
+        rather than a time nobody can place (specs/specs-core-process.md §8).
 
         Every busy session, not just the one on screen: a turn in a
         conversation the user has left blocks this loop exactly as hard as the
@@ -3344,7 +3344,7 @@ class RowUI:
         `default`, and the cursor still starts on `default` — so a user
         working under `hpc` picks `hpc` with one press of ↓ and gets the
         fallback by pressing Enter twice. Putting the working profile first
-        instead is `specs-ui-coverage.md` §7's suggestion and is not what this
+        instead is `specs/specs-ui-coverage.md` §7's suggestion and is not what this
         does today.
         """
         names: list[str] = []
@@ -3418,7 +3418,7 @@ class RowUI:
         """Take a conversation off the UI: its row, its chat and its draft.
 
         Its draft in particular, which is the one piece of it that lives
-        nowhere else (specs-ui-acceptance.md, "Drafts"): the chat can be asked
+        nowhere else (specs/specs-ui-acceptance.md, "Drafts"): the chat can be asked
         for again and the row will come back in the next `session.rows`, but
         an unsent message belongs to the session and goes with it.
 

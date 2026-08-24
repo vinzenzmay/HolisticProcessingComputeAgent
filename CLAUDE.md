@@ -27,7 +27,7 @@ A dev machine often has live tunnels on ports 20000 (embeddings) / 20001 (LLM), 
 Any change touching edit_file/read_file/create_file, the middleware retry
 loop, or editing guidance gets measured, not eyeballed: run the live eval in
 `evals/edit_eval.py` as baseline-ref-vs-working-tree — recipe in
-specs-edit-eval.md. Compare a baseline you ran yourself, not a number quoted
+specs/specs-edit-eval.md. Compare a baseline you ran yourself, not a number quoted
 in that document: the task checks were tightened on 2026-08-24 (§10), and
 every figure recorded before that is an upper bound measured with checks that
 scored some corrupted files as successes. Like test-live it
@@ -42,7 +42,7 @@ Tiers: `core` and `hard` are the standing regression set. `paths` is the
 long-context one (~95k of session in front of a ~200-character path, over
 create/edit/delete) — it costs ~15 min a side because each run re-prefills, so
 reach for it when a change touches how a file is *named*, and see
-specs-path-registry.md for what it settled. `shift` measured the key-vs-path
+specs/specs-path-registry.md for what it settled. `shift` measured the key-vs-path
 friction of an interface that no longer exists; it is history, not a check.
 
 ## Colours
@@ -88,7 +88,7 @@ from the config editor.
 the app runs they are opened from a node-local working dir (`$TMPDIR`, else
 `/tmp`) and synced back every 60s and on exit — `$HOME` is NFS on a cluster
 node, where each sqlite call costs network round-trips. See `hpca.dbcache` and
-specs-db-local-cache.md; `settings.database.local_cache` turns it off.
+specs/specs-db-local-cache.md; `settings.database.local_cache` turns it off.
 
 Copies are not naive. `hpca.db` and `checkpoints.db` are *rebuilt* on every
 copy (`VACUUM INTO`) rather than page-copied, because sqlite never shrinks a

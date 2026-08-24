@@ -2,7 +2,7 @@
 
 No wire and no pydantic here — that is the point of the module. Everything
 below is synchronous and compares strings or ints, which is the property
-specs-ui-replacement.md §3.1 is protecting when it says `app.py` must not
+specs/specs-ui-replacement.md §3.1 is protecting when it says `app.py` must not
 import the protocol.
 """
 
@@ -553,7 +553,7 @@ class TestWhen:
 
     On this side of the wire because only this side knows which clock that is
     — the core stamps UTC precisely so it need not be on the same machine
-    (specs-core-process.md).
+    (specs/specs-core-process.md).
     """
 
     def test_a_stamp_is_written_day_first_with_seconds(self):

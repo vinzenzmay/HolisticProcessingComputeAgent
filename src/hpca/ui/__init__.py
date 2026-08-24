@@ -52,12 +52,13 @@ UI talking. A closed row shows one line of what it holds, clipped with a
 and each sidebar row when its conversation was last worked in — UTC on the
 wire, the reader's own clock on screen (``state.when``). What is deliberately still
 missing: mouse support, which is what keeps that selection working at all, so
-the mouse stays released. specs-ui-replacement.md §4 is the full list of what is absent, and
-specs-ui-coverage.md §3 is an audit of it, most of which is now wired: what
-is still open there is the injection warning on a flagged memory batch, the
-watchers column's arrangement, and re-reading memories at a session boundary.
+the mouse stays released. specs/specs-ui-replacement.md §4 is the full list
+of what is absent, and specs/specs-ui-coverage.md §3 is an audit of it, most of
+which is now wired: what is still open there is the injection warning on a
+flagged memory batch, the watchers column's arrangement, and re-reading
+memories at a session boundary.
 
-The modules, per specs-ui-replacement.md §3:
+The modules, per specs/specs-ui-replacement.md §3:
 
 * ``ansi`` — the escape constants and the string helpers every other module
   pads, rules and highlights with;

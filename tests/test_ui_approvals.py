@@ -1,6 +1,6 @@
 """M5b — the inline approval, the refusal that says why, and the yes/no.
 
-The claims are `specs-ui-acceptance.md`'s "Inline approval prompts" and
+The claims are `specs/specs-ui-acceptance.md`'s "Inline approval prompts" and
 "Declining with a reason", in its own order, plus §4.3 items 22 and 23 (the
 generic confirm, and `confirm.requested` — which the Textual UI never drew at
 all, so that one is new behaviour arriving with the port rather than a port of
@@ -631,7 +631,7 @@ class TestDecliningWithAReason:
 
 
 class TestTheHalfWrittenReasonIsADraft:
-    """specs-core-process.md §4.4: the decision moves to the core, the reason
+    """specs/specs-core-process.md §4.4: the decision moves to the core, the reason
     stays in the UI — "a draft, same class as ``_drafts``"."""
 
     async def at_the_box(self, wire):

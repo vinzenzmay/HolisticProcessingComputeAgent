@@ -674,7 +674,7 @@ def uses_native_tools(llm: Any) -> bool:
     callers ask it and they must not disagree: ``decide`` below, choosing how
     to send the request, and the system-prompt builders, choosing which
     respond-vs-tool guidance to include. A prompt that describes the envelope
-    while the request goes out natively is the failure specs-edit-eval.md §7
+    while the request goes out natively is the failure specs/specs-edit-eval.md §7
     measured, so they read the same source.
 
     ``getattr`` rather than a plain call: a fake client in a test has no

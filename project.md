@@ -61,7 +61,7 @@ so streaming output never freezes the UI. What replaced it keeps every one of th
 properties except the styling, and the styling was never load-bearing.
 
 The reason for the move is measured, and written up in
-[specs-ui-baseline.md](specs-ui-baseline.md): Textual's *repaint* is flat and
+[specs/specs-ui-baseline.md](specs/specs-ui-baseline.md): Textual's *repaint* is flat and
 perfectly fine, but its *arrange* pass is O(conversation) — 2.9 ms at 100 chat
 entries, 126 ms at 5000, and 994 ms at the 95th percentile, which is a second of
 frozen terminal on a keypress. A scroll invalidates layout, so a long session pays
@@ -608,7 +608,7 @@ the orchestrator's or another subagent's context.
   resolves from sqlite whatever is in the context window, while a long path
   that has scrolled out of a compacted conversation is gone.
   That argument is the one the removal had to answer, and it was answered by
-  measuring it rather than by reasoning about it: see specs-path-registry.md
+  measuring it rather than by reasoning about it: see specs/specs-path-registry.md
   for the head-to-head at ~95k of context, which is where a key is supposed to
   win. What the registry cost in the meantime was constant and visible in the
   field — an `UnknownKeyError` listing keys the model never chose, in a session
@@ -656,7 +656,7 @@ the orchestrator's or another subagent's context.
   works on any OpenAI-compatible backend, including one too old to have a
   tool-call parser — and as of v0.22.0 that portability is no longer the only
   argument for it: re-measured on Qwen3.8 it is also cheaper, faster and the
-  only channel that can salvage a cut-off long write (specs-edit-eval.md
+  only channel that can salvage a cut-off long write (specs/specs-edit-eval.md
   §7.3, §7.4).
   `native` puts the call on the backend's own tool-calling channel: the branch
   choice becomes the backend's, the tool list moves out of the prompt into the
@@ -671,7 +671,7 @@ the orchestrator's or another subagent's context.
   prompt's respond-vs-tool guidance moves with it — so a verdict arriving
   mid-session would leave the prompt describing a format the model can no
   longer emit, which is the most expensive bug this area has had
-  (specs-edit-eval.md §7). It needs the server started for it
+  (specs/specs-edit-eval.md §7). It needs the server started for it
   (vLLM: `--enable-auto-tool-choice` plus a `--tool-call-parser` matching the
   model — `qwen3_coder` for the Qwen3.8 the cluster serves). A backend
   without it rejects the request with a 400 rather than degrading quietly, and
@@ -706,7 +706,7 @@ the orchestrator's or another subagent's context.
   string instead of a list in 6 of 6 generations, and the model answered in
   prose rather than fix the shape on the retry. Same example source
   (`_example_args`) both ways, so the two cannot show different shapes.
-  Measured head to head (specs-edit-eval.md §7.2, n=36): the two are level on
+  Measured head to head (specs/specs-edit-eval.md §7.2, n=36): the two are level on
   success, and fail differently — the envelope's grammar can loop until
   `max_tokens` (one run cost 224s and the turn), which is a tail the native
   channel structurally lacks; native spends more completion tokens for fewer

@@ -46,7 +46,8 @@ GROUNDED_ANSWERING_GUIDANCE = (
     "information already present in this conversation."
 )
 
-# What is left of the path block once the registry is gone (specs-path-registry.md).
+# What is left of the path block once the registry is gone
+# (specs/specs-path-registry.md).
 # It says the one thing a path-taking interface still needs said — where a
 # relative path is anchored — and the one handle that is still not a path: a
 # kept script's name.

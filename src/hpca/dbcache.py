@@ -1,4 +1,5 @@
-"""Node-local working copies of the sqlite databases (see specs-db-local-cache.md).
+"""Node-local working copies of the sqlite databases
+(see specs/specs-db-local-cache.md).
 
 On a cluster node ``$HOME`` is NFS, where every sqlite call is network
 round-trips plus a remote fsync. HPCA hits sqlite constantly — the checkpointer

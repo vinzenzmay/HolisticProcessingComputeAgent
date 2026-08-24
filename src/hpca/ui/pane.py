@@ -205,7 +205,7 @@ class Pane:
         # the fold marker, and four again on the indent under it — and a
         # terminal's own drag-to-select takes every one of them along with the
         # words. Selecting out of the chat is the terminal's job here
-        # (specs-ui-replacement.md §4.1 item 6), so on the one pane whose rows
+        # (specs/specs-ui-replacement.md §4.1 item 6), so on the one pane whose rows
         # are somebody's prose the columns come off: content lines start at
         # column 0 with nothing in front of them, and the current entry is
         # marked by weight instead of by a character. The lists — sessions,
@@ -387,7 +387,7 @@ class Pane:
         """Add a row without throwing the flattened line list away.
 
         The counterpart of the chat's append-only invariant
-        (specs-ui-replacement.md §3.2), and what that invariant is *for*: a
+        (specs/specs-ui-replacement.md §3.2), and what that invariant is *for*: a
         message arriving costs the lines that message draws, not a re-flatten
         of the conversation behind it. `invalidate` would be correct and
         O(conversation), which is the shape this UI exists to not have.
@@ -594,7 +594,7 @@ class Pane:
         a key behind for a later row to inherit.
 
         Only for the panes the core repaints whole (the sidebar, the watchers).
-        The chat is never rebuilt; it appends (specs-ui-replacement.md §3.2).
+        The chat is never rebuilt; it appends (specs/specs-ui-replacement.md §3.2).
         """
         # The client repaints a column without knowing the terminal size; the
         # width only decides which flattened line the cursor lands on, and the

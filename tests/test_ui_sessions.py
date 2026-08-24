@@ -1076,7 +1076,7 @@ class TestDrafts:
         # `SessionState`. The menu half arrived with M8 and is asserted where
         # the menu is — `test_ui_commands.py::TestAParkedDraft`. This comment
         # used to say there was no menu in this build, which the two files
-        # then contradicted each other about (specs-ui-coverage.md §6).
+        # then contradicted each other about (specs/specs-ui-coverage.md §6).
         await self.two_sessions(wire)
         wire.ui.focus = INPUT
         await wire.press(*"/comp")

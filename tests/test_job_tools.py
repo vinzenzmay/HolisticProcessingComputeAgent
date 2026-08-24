@@ -104,7 +104,7 @@ class TestSubmitJob:
 
     async def test_an_unknown_script_is_refused_not_raised(self, tools, tmp_path):
         """It reaches the model as a sentence it can act on, listing what does
-        exist — the shape specs-edit-eval.md §1 asks every refusal to have."""
+        exist — the shape specs/specs-edit-eval.md §1 asks every refusal to have."""
         ctx = make_ctx(tmp_path, FakeRun([]))
         result = await call(tools, "submit_job", ctx, name="ghost")
         assert "NOT submitted" in result and "ghost" in result

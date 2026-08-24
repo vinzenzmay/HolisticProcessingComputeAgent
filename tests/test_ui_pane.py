@@ -450,7 +450,7 @@ class TestTheChatSelectsClean:
 
     Selecting text out of the chat is the terminal's own drag-to-select in
     this UI — the mouse is deliberately left released so it keeps working
-    (specs-ui-replacement.md §4.1 items 5 and 6) — and a terminal selects
+    (specs/specs-ui-replacement.md §4.1 items 5 and 6) — and a terminal selects
     whole screen columns. So every column the pane spends in front of a line
     of the conversation is a character that lands in the paste buffer, and
     these tests are that promise: a message's own lines start at column 0 and

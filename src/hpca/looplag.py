@@ -1,4 +1,4 @@
-"""Event-loop scheduling delay, measured (specs-core-process.md §8).
+"""Event-loop scheduling delay, measured (specs/specs-core-process.md §8).
 
 The case for moving the agent into its own process is that the TUI stutters
 because synchronous work — file IO in tool handlers, sqlite, ast walks,

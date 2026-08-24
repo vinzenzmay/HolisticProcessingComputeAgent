@@ -56,7 +56,7 @@ except Exception:
 
 # Which interface this checkout has. Every branch below that differs between the
 # two sides keys on this one flag, so the same harness file scores both — the
-# recipe in specs-edit-eval.md copies it into a baseline worktree unchanged.
+# recipe in specs/specs-edit-eval.md copies it into a baseline worktree unchanged.
 HAS_REGISTRY = PathRegistry is not None
 
 LIVE_URL = os.environ.get("HPCA_TEST_LLM_URL", "http://localhost:20001/v1")
@@ -510,7 +510,7 @@ def _matches(expected: dict[str, str | bytes | None]) -> Callable[[Path], bool]:
     line was somewhere in the file — so a live run that wrote it over
     ``set -euo pipefail``, destroying one line and leaving the line it was told
     to change exactly where it was, scored a pass (2026-08-24; "Checking the
-    checks" in specs-edit-eval.md). Where the correct result is determined,
+    checks" in specs/specs-edit-eval.md). Where the correct result is determined,
     comparing the whole file is the only check that cannot be fooled that way.
     """
 

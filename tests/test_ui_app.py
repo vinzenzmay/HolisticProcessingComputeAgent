@@ -281,7 +281,7 @@ def test_alt_enter_grows_the_row():
 def test_enter_sends():
     # The demo's first session is the one left mid-turn, so what comes back is
     # the queued row rather than an answer: one row, and the box cleared for
-    # whatever is typed next (specs-ui-acceptance.md, "Queueing while a turn
+    # whatever is typed next (specs/specs-ui-acceptance.md, "Queueing while a turn
     # runs").
     ui = typed(in_the_box(), "hello there")
     before = len(ui.panes[1].items)
@@ -586,7 +586,7 @@ def test_the_frame_is_still_exact_with_an_empty_watcher_row():
 def half_a_message() -> RowUI:
     # `recorded`, because the note is not evidence: the four tests that used
     # "stopped the turn" as their proof would all have passed with the
-    # `Interrupt` deleted (specs-ui-coverage.md §4). What the gesture does is
+    # `Interrupt` deleted (specs/specs-ui-coverage.md §4). What the gesture does is
     # send one, so that is what these read.
     ui = recorded(clocked(build()))
     ui.focus = INPUT
@@ -731,7 +731,7 @@ def parked_on_an_approval() -> RowUI:
     """A turn stopped dead waiting for an approval.
 
     The scheduler has already popped its `TurnState` and returned without a
-    `turn.finished` (specs-ui-coverage.md §4), so nothing clears `working` and
+    `turn.finished` (specs/specs-ui-coverage.md §4), so nothing clears `working` and
     an `Interrupt` sent now reaches a core that has no turn to stop.
 
     Aimed from the chat and not from the message box, which is not on screen
@@ -1091,7 +1091,7 @@ def test_a_paste_from_a_row_goes_to_the_message_box():
 def test_a_paste_into_the_config_editor_lands_there_instead():
     ui = build()
     # Not from the chat column: `c` is a letter there and the editor is
-    # deliberately not offered (specs-ui-acceptance.md, "Navigating the entry").
+    # deliberately not offered (specs/specs-ui-acceptance.md, "Navigating the entry").
     ui.focus = SESSIONS
     ui.handle("c", 120, 40)
     pasted('  "x": 1', ui)

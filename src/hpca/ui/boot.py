@@ -6,7 +6,7 @@
 `tui/app.py`'s `on_mount`/`on_unmount` that is not about widgets, and it is
 deliberately the only place in `hpca.ui` that knows `hpca.core` exists.
 
-**Why in-process, and why that is not a shortcut.** `specs-ui-replacement.md`
+**Why in-process, and why that is not a shortcut.** `specs/specs-ui-replacement.md`
 §2 puts the subprocess split (`--serve`) last on purpose: it buys crash
 isolation, not correctness. `InProcessConnection.pair()` is the same
 `Connection` surface the socket presents, down to close ending the peer's
@@ -15,7 +15,7 @@ iteration, so the day the core moves out only `Core.start` changes.
 **The shutdown order is load-bearing, not tidiness.** Checkpointer, then DbIO,
 then sqlite, then the RAG store, and only then the final sync home — because
 the sync must copy a quiesced database, and nothing may open a file inside the
-working dir after it has been removed. `specs-ui-acceptance.md` records it
+working dir after it has been removed. `specs/specs-ui-acceptance.md` records it
 under "Node-local databases", and `tests/test_ui_boot.py` asserts it of this
 module — the order, the wait message and the Ctrl+C that does not obey it, the
 sync interval and what `0` means, the notices reaching the wire, and the
@@ -534,7 +534,7 @@ def _open_llm_screen(ui) -> None:
 
 
 def _lag_probe(ui):
-    """Event-loop scheduling delay, measured (specs-core-process.md §8).
+    """Event-loop scheduling delay, measured (specs/specs-core-process.md §8).
 
     The instrument for the measurement that justifies this whole
     architecture: the case for moving the agent into its own process is that
@@ -616,7 +616,7 @@ async def start(
         app_dir=app_dir,
         wire=core_end,
         # The one thing the core cannot do about a dead backend: put the
-        # screen that fixes it in front of the user (`specs-auto-connect.md`,
+        # screen that fixes it in front of the user (`specs/specs-auto-connect.md`,
         # and `tui/app.py`'s `_ensure_backend_connected` before it).
         on_no_backend=lambda: _open_llm_screen(ui),
     )

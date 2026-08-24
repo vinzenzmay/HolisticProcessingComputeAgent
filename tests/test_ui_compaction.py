@@ -1,6 +1,6 @@
 """The compaction review, where it now lives: inline, in the session column.
 
-The claims are `specs-ui-acceptance.md`'s "Compaction" bullets, with the two
+The claims are `specs/specs-ui-acceptance.md`'s "Compaction" bullets, with the two
 this move adds — the review stands in the message box's slot rather than over
 the whole terminal, and a summary waiting in one conversation stays that
 conversation's question. That is the rule the inline approval next door has

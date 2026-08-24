@@ -851,7 +851,7 @@ class TestTheSettingsFileInTheEditor:
 
 
 class TestQuit:
-    """specs-ui-acceptance.md, "Backends", the `q` bullets. §4.3 item 38."""
+    """specs/specs-ui-acceptance.md, "Backends", the `q` bullets. §4.3 item 38."""
 
     def _sessions(self) -> RowUI:
         ui = clocked(build())

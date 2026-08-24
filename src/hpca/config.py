@@ -124,7 +124,7 @@ class LLMSettings(_Section):
     # old to have a tool-call parser.
     #
     # Envelope stays the default, and v0.22.0 is where that stopped being a
-    # portability argument and became a measured one. specs-edit-eval.md §7.3:
+    # portability argument and became a measured one. specs/specs-edit-eval.md §7.3:
     # on Qwen3.8-27B the shape error that made native lose on Qwen3.6 is gone
     # and native is now correct — but over n=72 it costs 24.5% more completion
     # tokens and 20.3% more wall for the same success rate, and §7.4 is the
@@ -148,7 +148,7 @@ class LLMSettings(_Section):
     # conversation — the system prompt's respond-vs-tool guidance moves with
     # it — so a verdict that arrives mid-session would leave the prompt
     # describing a format the model can no longer emit. That mismatch is the
-    # most expensive bug this area has had (specs-edit-eval.md §7).
+    # most expensive bug this area has had (specs/specs-edit-eval.md §7).
     tool_protocol: Literal["envelope", "native"] = "envelope"
     max_retries: int = 3
     request_timeout_s: int = 120
@@ -284,7 +284,7 @@ class EndpointsSettings(_Section):
 
 
 class DatabaseSettings(_Section):
-    """Where the sqlite databases actually run (see specs-db-local-cache.md).
+    """Where the sqlite databases actually run (see specs/specs-db-local-cache.md).
 
     On a cluster node ``$HOME`` is NFS, where every sqlite call is network
     round-trips plus a remote fsync, and the TUI lags whenever the agent

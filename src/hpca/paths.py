@@ -5,7 +5,7 @@ short key and asked the model to name files by key: it saved a small model from
 re-typing a 90-character cluster path, and it cost a round-trip to mint the key
 plus a second vocabulary — ``dir_key``, ``subpath``, ``source_key`` — that no
 agent corpus the model was trained on contains. Measured, the second cost was
-the larger one (specs-path-registry.md): keys were invented, misremembered, and
+the larger one (specs/specs-path-registry.md): keys were invented, misremembered, and
 mixed with paths, and the tool's answer to all three was an ``UnknownKeyError``
 that listed keys the model had never chosen.
 

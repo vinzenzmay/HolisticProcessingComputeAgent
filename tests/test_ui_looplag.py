@@ -1,4 +1,4 @@
-"""The lag probe's wiring into the row UI (specs-core-process.md §8).
+"""The lag probe's wiring into the row UI (specs/specs-core-process.md §8).
 
 The probe itself is tested in `test_looplag.py`; these are the same claims
 `test_tui_looplag.py` makes of the Textual app, moved onto the front-end that
@@ -6,7 +6,7 @@ replaces it — because §8's whole point is a number taken before and after,
 against the same yardstick, and an instrument that only exists on the side
 being replaced measures nothing.
 
-The claims are `specs-ui-acceptance.md`, "Lag instrumentation": off unless
+The claims are `specs/specs-ui-acceptance.md`, "Lag instrumentation": off unless
 `$HPCA_LOOPLAG`, disabled means no task is ever started, a spike names the
 running step, and a run leaves a report block behind.
 """

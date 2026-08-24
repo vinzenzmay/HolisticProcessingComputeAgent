@@ -807,7 +807,7 @@ class TestUsesNativeTools:
     They must never disagree: a prompt that spells out the envelope's
     {"action": "respond"} branch while the request goes out on the native
     channel names a format the model cannot emit, which is what took the core
-    tier to 12/17 in specs-edit-eval.md §7.
+    tier to 12/17 in specs/specs-edit-eval.md §7.
     """
 
     def test_a_native_client_is_native(self):

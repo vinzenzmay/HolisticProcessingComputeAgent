@@ -5,7 +5,7 @@ mocked. A scripted peer sends the events a core would and records the commands
 that come back, and every assertion is either about a frame (a string) or about
 a typed command on the wire.
 
-The three things this file exists to hold on to, from specs-ui-replacement.md
+The three things this file exists to hold on to, from specs/specs-ui-replacement.md
 §3.2 and `protocol.ChatUpdate`:
 
 * the chat is append-only between resets, and a row is named by its `seq`;

@@ -3,7 +3,7 @@
 Only the visible slice of a pane is ever turned into lines, so scrolling a
 5000-entry chat must cost what scrolling a 100-entry one costs. That is the
 property, and these are the dimensions it has to hold in — each one chosen
-because the measurement in specs-ui-baseline.md found a specific pathology
+because the measurement in specs/specs-ui-baseline.md found a specific pathology
 there in the UI this replaced. The Textual figure each test guards against is
 named in its own docstring, so a future reader can tell what the threshold is
 *for* rather than guessing at a number.
@@ -26,7 +26,7 @@ run.
 
 **Median, not mean.** One GC pause or one scheduler hiccup drags a mean far
 enough to fail a test that is measuring something else. The median of
-per-frame samples is what specs-ui-baseline.md reports and what is asserted
+per-frame samples is what specs/specs-ui-baseline.md reports and what is asserted
 here.
 
 **The frame is not the only clock.** A frame slices a cached list of lines,
@@ -193,7 +193,7 @@ class TestARowArriving:
     """A message landing costs that message, not the conversation behind it.
 
     This is `Pane.extend`, and it is the half of the append-only invariant
-    (specs-ui-replacement.md §3.2) that is actually spent rather than merely
+    (specs/specs-ui-replacement.md §3.2) that is actually spent rather than merely
     kept: the flattened line list is added to, so what a row costs is the
     lines that row draws.
 

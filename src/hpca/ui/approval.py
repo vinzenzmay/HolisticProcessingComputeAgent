@@ -12,7 +12,7 @@ convenience: a decision waiting in one session must not cover the other
 columns or block a session the user switched to. Approvals are per session
 while the user may be reading something else, so a decision that arrives in a
 background session lights the sidebar's "!" and nothing more — opening that
-session is what reveals its prompt (specs-ui-acceptance.md, "Inline approval
+session is what reveals its prompt (specs/specs-ui-acceptance.md, "Inline approval
 prompts"). This is the rationale written down at ``tui/approval_screen.py``
 lines 9-15, kept because it is the reason the shape is what it is.
 

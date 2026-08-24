@@ -9,7 +9,7 @@ terminal and a tmp home) and checks that the databases are where they should
 be, that a command reaches the service, and that the wait message lands on a
 terminal the user can still read.
 
-`specs-ui-acceptance.md` records the same guarantees under "Node-local
+`specs/specs-ui-acceptance.md` records the same guarantees under "Node-local
 databases"; `tests/test_tui_dbcache.py` asserts them of the Textual app.
 """
 
@@ -577,7 +577,7 @@ class TestTheWholeRun:
         — and the front-end this file builds opens the screen that fixes it.
 
         Both halves were green on their own for a milestone
-        (`specs-ui-coverage.md` §3.1): `auto_connect` had ten tests and no
+        (`specs/specs-ui-coverage.md` §3.1): `auto_connect` had ten tests and no
         caller, and the UI had a manage-LLMs screen nothing could open.
         """
         from hpca.core.backends import NO_BACKEND_MESSAGE

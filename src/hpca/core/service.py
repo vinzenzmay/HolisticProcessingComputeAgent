@@ -1076,7 +1076,7 @@ class AgentService:
         if log is not None and entries:
             try:
                 # On a thread: this is an append to a file that is very likely
-                # on an NFS home, and specs-core-process.md §1 names exactly
+                # on an NFS home, and specs/specs-core-process.md §1 names exactly
                 # that as a latency source the loop must not carry.
                 await asyncio.to_thread(_write_entries, log, entries)
             except Exception:  # SessionLog swallows OSError; this is the rest
@@ -2831,7 +2831,7 @@ class AgentService:
         repeats, this one is the work that happens exactly once, and all of it
         used to be `tui/app.py`'s `on_mount` — which is why every piece of it
         had exactly one caller and lost it when that module went
-        (`specs-ui-coverage.md` §3.1, §3.3).
+        (`specs/specs-ui-coverage.md` §3.1, §3.3).
 
         It is core work rather than front-end work for one reason each: the
         sweep and the curator are driven by settings keys (`trash_ttl_days`,
@@ -3056,7 +3056,7 @@ def build_service(
             # the global setting: a session pinned to a backend whose entry
             # overrides tool_protocol must be told about the protocol it is
             # really using, or the prompt describes a format the channel has
-            # no room for (specs-edit-eval.md §7).
+            # no room for (specs/specs-edit-eval.md §7).
             native_tools=uses_native_tools(backends.client_for(session_id)),
         )
 

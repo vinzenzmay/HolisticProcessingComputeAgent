@@ -2,7 +2,7 @@
 
 Everything here is either a frame (a string) or a typed command on a real
 `InProcessConnection.pair()`; the transport is never mocked and the core is a
-scripted peer. The claims are `specs-ui-acceptance.md`'s, in its own order:
+scripted peer. The claims are `specs/specs-ui-acceptance.md`'s, in its own order:
 "The spinner", "Thinking box, tool rows, logging", "Context meter", "Agent
 modes", and the model-line bullet under "Backends".
 
@@ -611,7 +611,7 @@ class TestLiveStepRows:
 
 class TestTheContextMeterState:
     """The widget state `render_bar` and `severity` are fed, which is what
-    `specs-ui-acceptance.md` asks survive the port."""
+    `specs/specs-ui-acceptance.md` asks survive the port."""
 
     def test_a_session_with_no_reply_yet_says_so(self):
         assert Context(window=32_768).bar() == (
