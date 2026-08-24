@@ -1674,8 +1674,16 @@ class FakeLLM:
         args = dict(call.get("arguments") or {})
         if "old_lines" not in args:
             return call
-        old_text = "\n".join(args.pop("old_lines") or [])
-        new_text = "\n".join(args.pop("new_lines") or [])
+        old_list = args.pop("old_lines") or []
+        new_list = args.pop("new_lines") or []
+        old_text = "\n".join(old_list)
+        new_text = "\n".join(new_list)
+        # Whole-line deletion is where line semantics and substring semantics
+        # genuinely differ: splicing a list out removes the lines, while
+        # replacing a span with "" leaves the newline that terminated them
+        # behind as a blank line. The scripted route has to say what it means.
+        if old_list and not new_list:
+            old_text += "\n"
         if EDIT_ARM == "b":
             args["old_text"], args["new_text"] = old_text, new_text
         else:

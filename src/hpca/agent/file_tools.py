@@ -968,23 +968,72 @@ class EditFileParamsC(BaseModel):
     )
 
 
-def _arm_pairs(args) -> list[tuple[list[str], list[str]]]:
-    """(old_lines, new_lines) per change, whichever arm's arguments arrived."""
+def _arm_pairs(args) -> list[tuple[str, str]]:
+    """(old_text, new_text) per change, whichever arm's arguments arrived."""
     if isinstance(args, EditFileParamsC):
-        return [
-            (_text_to_lines(e.old_text), _text_to_lines(e.new_text))
-            for e in args.edits
-        ]
-    return [(_text_to_lines(args.old_text), _text_to_lines(args.new_text))]
+        return [(e.old_text, e.new_text) for e in args.edits]
+    return [(args.old_text, args.new_text)]
+
+
+def _substring_hits(text: str, needle: str) -> list[int]:
+    """Every offset where ``needle`` occurs in ``text``, overlaps included."""
+    hits, start = [], text.find(needle)
+    while start != -1:
+        hits.append(start)
+        start = text.find(needle, start + 1)
+    return hits
+
+
+def _fuzzy_text(text: str) -> str:
+    """``text`` as fuzzy substring matching sees it.
+
+    The same folding ``_fuzzy_line`` does — smart quotes, Unicode dashes and
+    exotic spaces — minus the per-line rstrip, which cannot be applied to a
+    span that is not whole lines. Character-preserving, so an offset into the
+    folded text is the same offset into the original.
+    """
+    import unicodedata as _ud
+
+    return _ud.normalize("NFKC", text).translate(_FUZZY_TRANSLATE)
+
+
+def _arm_locate(text: str, old_text: str) -> tuple[list[int], str]:
+    """Where ``old_text`` sits in ``text``, and the needle that found it.
+
+    A substring, not a run of whole lines — that is what ``oldText`` means
+    everywhere else this shape is used, and matching it as lines is what made
+    the first version of this arm unable to change part of a line.
+
+    Two levels, strictest first, mirroring ``_match_ladder``: exact, then the
+    fuzzy fold. NFKC is length-preserving for the characters folded here, so
+    the offsets a fuzzy hit reports still index the original text.
+    """
+    hits = _substring_hits(text, old_text)
+    if hits:
+        return hits, old_text
+    folded_text, folded_needle = _fuzzy_text(text), _fuzzy_text(old_text)
+    if len(folded_text) == len(text) and len(folded_needle) == len(old_text):
+        hits = _substring_hits(folded_text, folded_needle)
+        if hits:
+            return hits, old_text
+    # A needle copied straight out of read_file's numbered listing.
+    stripped = _strip_line_number_prefixes(old_text.split("\n"))
+    if stripped is not None:
+        needle = "\n".join(stripped)
+        hits = _substring_hits(text, needle)
+        if hits:
+            return hits, needle
+    return [], old_text
 
 
 def _arm_change(args) -> str:
     pairs = _arm_pairs(args)
     if len(pairs) == 1:
         old, new = pairs[0]
+        old_n, new_n = len(_text_to_lines(old)), len(_text_to_lines(new))
         if not new:
-            return f"{_lines(len(old))} deleted"
-        return f"{_lines(len(old))} -> {_lines(len(new))}"
+            return f"{_lines(old_n)} deleted"
+        return f"{_lines(old_n)} -> {_lines(new_n)}"
     return f"{len(pairs)} edits"
 
 
@@ -1019,10 +1068,10 @@ async def _edit_file_arm(args, ctx: ToolContext) -> str:
         )
 
     pairs = _arm_pairs(args)
-    for index, (_, new_lines) in enumerate(pairs):
+    for index, (_, new_text) in enumerate(pairs):
         field = f"new_text (edit {index + 1})" if len(pairs) > 1 else "new_text"
         refused_marker = _elision_refusal(
-            new_lines,
+            _text_to_lines(new_text),
             refusal="NOT edited",
             field=field,
             outcome="The file is unchanged.",
@@ -1030,37 +1079,30 @@ async def _edit_file_arm(args, ctx: ToolContext) -> str:
         if refused_marker:
             return refused_marker
 
-    file_lines = text.split("\n")
-    first_start = None
-    for index, (old_lines, new_lines) in enumerate(pairs):
+    edited = text
+    first_line = None
+    for index, (old_text, new_text) in enumerate(pairs):
         where = f" (edit {index + 1})" if len(pairs) > 1 else ""
-        hits = _match_ladder(file_lines, old_lines)
-        if not hits:
-            stripped = _strip_line_number_prefixes(old_lines)
-            if stripped is not None:
-                hits = _match_ladder(file_lines, stripped)
-                if hits:
-                    old_lines = stripped
+        hits, needle = _arm_locate(edited, old_text)
         if not hits:
             return (
                 f"NOT edited{where}: that text is not in {path}."
-                f"{_near_miss(file_lines, old_lines)}"
+                f"{_near_miss(edited.split(chr(10)), old_text.split(chr(10)))}"
             )
         if len(hits) > 1:
-            spots = ", ".join(f"line {i + 1}" for i in hits[:5])
+            spots = ", ".join(
+                f"line {edited.count(chr(10), 0, i) + 1}" for i in hits[:5]
+            )
             return (
                 f"NOT edited{where}: that text occurs {len(hits)} times in "
                 f"{path} ({spots}), so which one you mean is ambiguous. "
                 f"{hints.EDIT_FILE_AMBIGUOUS}"
             )
-        start = hits[0]
-        if first_start is None:
-            first_start = start
-        file_lines = (
-            file_lines[:start] + new_lines + file_lines[start + len(old_lines):]
-        )
+        at = hits[0]
+        if first_line is None:
+            first_line = edited.count("\n", 0, at) + 1
+        edited = edited[:at] + new_text + edited[at + len(needle):]
 
-    edited = "\n".join(file_lines)
     if edited == text:
         return (
             f"NOT edited: the replacement produces identical content - "
@@ -1093,7 +1135,7 @@ async def _edit_file_arm(args, ctx: ToolContext) -> str:
         "so this cannot be undone."
     )
     return (
-        f"Edited {path} at line {(first_start or 0) + 1}: {_arm_change(args)}"
+        f"Edited {path} at line {first_line or 1}: {_arm_change(args)}"
         f"{extra}. {hints.NO_READ_BACK}{no_backup}{_tbd_note(edited)}"
     )
 

@@ -11,7 +11,7 @@
     "total_completion_tokens": 0,
     "max_prompt_tokens": 0,
     "has_registry": false,
-    "total_wall_s": 0.1
+    "total_wall_s": 0.0
   },
   "runs": [
     {
@@ -23,7 +23,7 @@
       "decisions": 2,
       "completion_tokens": 0,
       "prompt_tokens": 0,
-      "wall_s": 0.01,
+      "wall_s": 0.0,
       "error": "",
       "repeat": 0
     },
