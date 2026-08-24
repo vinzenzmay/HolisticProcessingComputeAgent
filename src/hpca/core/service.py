@@ -3262,6 +3262,7 @@ def _display_settings(settings) -> DisplaySettings:
         quit_rain_fps=section.quit_rain_fps,
         decision_pulse_seconds=section.decision_pulse_seconds,
         focus_flash_seconds=section.focus_flash_seconds,
+        spacer_lines=section.spacer_lines,
         palette=Palette(
             agent=palette.agent,
             user=palette.user,
