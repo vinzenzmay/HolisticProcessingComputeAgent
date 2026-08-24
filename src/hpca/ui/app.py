@@ -30,10 +30,14 @@ from hpca.ui.approval import decision_height, render_decision
 from hpca.ui.editor import Editor
 from hpca.ui.keys import NEWLINE_KEYS, is_paste, paste_text
 from hpca.ui.overlays import (
+    ACCEPT,
+    DISCARD,
     FORK,
     NO_SESSION,
+    RETRY,
     ROLLBACK,
     UNQUEUE,
+    CompactReviewOverlay,
     ConfigOverlay,
     HelpOverlay,
     InspectOverlay,
@@ -75,6 +79,7 @@ from hpca.ui.state import (
     Peek,
     ProfileInfo,
     Rename,
+    ResolveCompact,
     Retitle,
     Rollback,
     RunCommand,
@@ -151,6 +156,17 @@ FOOTER_SHARE = 4
 # the answer to "I cannot see mine" is to type another letter, not to give the
 # list half the screen.
 MENU_ROWS = 8
+
+# What the footer says once a compaction review has been answered, one line per
+# verdict. Said locally because two of the three change nothing the core will
+# report on: a discarded summary produces a notify, and a retry produces
+# nothing at all until the next summary arrives some seconds later — leaving
+# the user with a screen that closed and no word about why.
+COMPACT_NOTES = {
+    ACCEPT: "context compacted",
+    RETRY: "asking for another summary…",
+    DISCARD: "compaction discarded — nothing changed",
+}
 
 # What quitting asks, and what ctrl+q is worth. `q` confirms because it is one
 # letter away from every other key on the sessions column; ctrl+q is not bound
@@ -1901,6 +1917,26 @@ class RowUI:
         elif isinstance(overlay, SkillRemoveOverlay) and overlay.removed:
             self.forget_skills(overlay.removed)
             self.note = f"removed skill “{overlay.removed}”"
+        elif isinstance(overlay, CompactReviewOverlay) and overlay.action:
+            session = self.session_for(overlay.session_id)
+            self.send(
+                ResolveCompact(
+                    overlay.session_id, overlay.action, overlay.comment
+                )
+            )
+            # The offer is answered, so it is no longer waiting in the session.
+            # A retry brings a new one down the wire; the other two answers end
+            # the exchange.
+            session.compaction = None
+            if overlay.action == ACCEPT:
+                # Said here rather than waited for: a fold rewrites the thread
+                # without taking a message out of it, so no `chat.reset`
+                # follows and nothing else would ever unstick the measured
+                # fill — the bar would keep showing the pre-fold 92%, unmarked,
+                # for as long as the session stayed quiet. The core's fresh
+                # `context.estimate` is a round trip away.
+                session.context.superseded()
+            self.note = COMPACT_NOTES[overlay.action]
         elif isinstance(overlay, RenameOverlay) and overlay.name:
             self.send(Rename(overlay.session_id, overlay.name))
             # Shown before the core answers, like the mode bar: the next
@@ -2576,15 +2612,11 @@ class RowUI:
         # profile is asking (`core.service._list_skills`), and it is empty —
         # null on the wire — exactly when there is nothing open.
         self.send(RunCommand(name, args, self.active_id))
-        if command.folds:
-            # `/compact` rewrites the thread without taking a message out of
-            # it, so no `chat.reset` follows and nothing else would ever
-            # unstick the measured fill: the bar would keep showing the
-            # pre-fold 92%, unmarked, for as long as the session stayed quiet.
-            # Said here, where the command is known, rather than waited for —
-            # the core's fresh `context.estimate` is a round trip away and the
-            # number on screen is wrong the moment the command goes out.
-            self.session.context.superseded()
+        # Nothing is said about the meter here, and `/compact` is the reason
+        # the note is worth making: the fill it invalidates is invalidated by
+        # the *fold*, which now happens a review later or not at all
+        # (`_closed`, CompactReviewOverlay). Marking it stale on the keystroke
+        # would draw the `~` over a summary the user is about to discard.
         self.input.clear()
         self.note = f"/{name}"
 
@@ -3031,6 +3063,23 @@ class RowUI:
             self.note = "nothing to review"
             return
         self.overlay = MemoryReviewOverlay(session.proposals, session.session_id)
+
+    def review_compaction(self, session_id: str = "") -> None:
+        """Put the summary a session was offered up for review.
+
+        `land` rather than the `overlay` setter, for the reason `land` exists:
+        this arrives a model call after the keystroke, and in those seconds the
+        user is free to have opened the config editor and typed half a settings
+        file into it. Nothing is lost by waiting — the core holds the offer
+        until it is answered.
+        """
+        session = self.session_for(session_id or self.active_id)
+        if session.compaction is None:
+            self.note = "nothing to review"
+            return
+        self.land(
+            CompactReviewOverlay(session.compaction, session.session_id)
+        )
 
     def inspect(self, title: str, body: str) -> None:
         """A read-only window over text too long to be a toast (item 31)."""

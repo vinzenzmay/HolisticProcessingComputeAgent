@@ -51,12 +51,6 @@ class Command:
     # indistinguishable, and bolding both would bury the names it exists to
     # help pick between.
     builtin: bool = True
-    # Whether running it makes the last measured context size a statement
-    # about a thread that no longer exists. Only `/compact` does: it folds the
-    # conversation into a summary *without* removing a message, so the core
-    # deliberately sends no `chat.reset` — and the meter would otherwise sit
-    # at the pre-fold 92% until the next reply (`state.Context.superseded`).
-    folds: bool = False
     # Whether the command acts on one conversation. The profile-scoped ones
     # (`/skills-list`, `/skill-creator`, `/skill-remove`) are still *sent* with
     # the open session's id where there is one, because that is how the core
@@ -77,9 +71,8 @@ BUILTINS: tuple[Command, ...] = (
     Command("conclude", "/conclude — propose memories from this conversation"),
     Command(
         "compact",
-        "/compact [what to keep / what you do next] — fold this conversation "
-        "into a summary and free the context",
-        folds=True,
+        "/compact [what to keep / what you do next] — summarize this "
+        "conversation; nothing is folded until you accept the summary",
     ),
     Command(
         "skill-creator",

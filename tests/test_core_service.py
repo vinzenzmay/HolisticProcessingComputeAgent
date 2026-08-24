@@ -33,6 +33,7 @@ from hpca.protocol import (
     Command,
     CommandList,
     CommandRun,
+    CompactResolve,
     ConfirmResolve,
     DecisionResolve,
     JobCancel,
@@ -4613,9 +4614,21 @@ class TestMemoryReview:
 
 
 class TestCompact:
-    """`/compact`: fold the history, and — deliberately — do not reset the chat."""
+    """`/compact`: write the fold, offer it, and — deliberately — do not reset
+    the chat.
 
-    async def test_the_thread_is_folded_and_the_summary_reported(
+    The summary is the one thing this core produces that cannot be undone from
+    the front-end, so it lands only on `compact.resolve` with `accept`. Every
+    test here that folds says so explicitly.
+    """
+
+    async def accept(self, service, session_id):
+        """The half of the exchange the user does."""
+        await service.handle(
+            CompactResolve(session_id=session_id, action="accept")
+        )
+
+    async def test_the_summary_is_offered_and_nothing_is_folded_yet(
         self, service, session, llm
     ):
         await run_turn(service, session.session_id, "how many reads?")
@@ -4624,12 +4637,151 @@ class TestCompact:
         await service.handle(
             CommandRun(name="compact", session_id=session.session_id)
         )
-        events = await wait_for(queue, "Notify")
-        toast = [e for e in events if type(e).__name__ == "Notify"][-1]
-        assert toast.title == "Context compacted"
-        assert "we counted the reads in the cohort" in toast.text
+        offer = only(await wait_for(queue, "CompactProposed"), "CompactProposed")
+        assert "we counted the reads in the cohort" in offer.summary
+        assert offer.folded > 0 and offer.attempt == 1
+        # The point of the whole exchange: the thread is untouched until the
+        # answer comes back.
+        values = await service._thread_values(session.session_id)
+        assert not values.get("compacted")
+
+    async def test_accepting_folds_the_thread_and_says_so(
+        self, service, session, llm
+    ):
+        await run_turn(service, session.session_id, "how many reads?")
+        llm._outputs = ["we counted the reads in the cohort"]
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(name="compact", session_id=session.session_id)
+        )
+        await wait_for(queue, "CompactProposed")
+        await self.accept(service, session.session_id)
+        toast = only(await wait_for(queue, "Notify"), "Notify")
+        assert "Context compacted" in toast.text
         values = await service._thread_values(session.session_id)
         assert values["compacted"]["upto"] > 0
+        assert "we counted the reads" in values["compacted"]["summary"]["content"]
+
+    async def test_discarding_leaves_the_conversation_alone(
+        self, service, session, llm
+    ):
+        await run_turn(service, session.session_id, "how many reads?")
+        llm._outputs = ["a summary"]
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(name="compact", session_id=session.session_id)
+        )
+        await wait_for(queue, "CompactProposed")
+        await service.handle(
+            CompactResolve(session_id=session.session_id, action="discard")
+        )
+        assert "discarded" in only(await wait_for(queue, "Notify"), "Notify").text
+        values = await service._thread_values(session.session_id)
+        assert not values.get("compacted")
+
+    async def test_a_retry_carries_the_comment_and_the_rejected_text(
+        self, service, session, llm
+    ):
+        await run_turn(service, session.session_id, "how many reads?")
+        llm._outputs = ["the cohort was counted at"]
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(name="compact", session_id=session.session_id)
+        )
+        await wait_for(queue, "CompactProposed")
+        llm._outputs = ["the cohort was counted at 40 samples"]
+        await service.handle(
+            CompactResolve(
+                session_id=session.session_id,
+                action="retry",
+                comment="you cut it off — finish the sentence",
+            )
+        )
+        again = only(await wait_for(queue, "CompactProposed"), "CompactProposed")
+        assert again.attempt == 2
+        assert "40 samples" in again.summary
+        system = llm.prompts[-1][0]["content"]
+        assert "you cut it off" in system
+        assert "the cohort was counted at" in system  # what it is fixing
+        # And still nothing is folded: a retry is not an acceptance.
+        values = await service._thread_values(session.session_id)
+        assert not values.get("compacted")
+
+    async def test_the_offer_survives_a_review_nobody_answered(
+        self, service, session, llm
+    ):
+        """Escape closes the screen and answers nothing, so `/compact` brings
+        the same summary back rather than paying for a second one."""
+        await run_turn(service, session.session_id, "how many reads?")
+        llm._outputs = ["a summary"]
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(name="compact", session_id=session.session_id)
+        )
+        first = only(await wait_for(queue, "CompactProposed"), "CompactProposed")
+        calls = len(llm.prompts)
+        await service.handle(
+            CommandRun(name="compact", session_id=session.session_id)
+        )
+        again = only(await wait_for(queue, "CompactProposed"), "CompactProposed")
+        assert again.summary == first.summary
+        assert len(llm.prompts) == calls  # no second generation
+
+    async def test_a_new_instruction_is_a_new_summary(
+        self, service, session, llm
+    ):
+        await run_turn(service, session.session_id, "how many reads?")
+        llm._outputs = ["a summary"]
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(name="compact", session_id=session.session_id)
+        )
+        await wait_for(queue, "CompactProposed")
+        llm._outputs = ["a summary that keeps the QC findings"]
+        await service.handle(
+            CommandRun(
+                name="compact",
+                args="keep the QC findings",
+                session_id=session.session_id,
+            )
+        )
+        again = only(await wait_for(queue, "CompactProposed"), "CompactProposed")
+        assert "QC findings" in again.summary
+        assert again.guidance == "keep the QC findings"
+
+    async def test_a_summary_the_thread_outgrew_is_refused(
+        self, service, session, llm
+    ):
+        """The review is on screen for as long as the user reads it, and the
+        thread can be rewound behind it. Nothing lands, which is the property
+        the whole exchange is for."""
+        from hpca.agent.graph import rollback_thread
+
+        await run_turn(service, session.session_id, "how many reads?")
+        llm._outputs = ["a summary"]
+        queue = subscribe(service)
+        await service.handle(
+            CommandRun(name="compact", session_id=session.session_id)
+        )
+        await wait_for(queue, "CompactProposed")
+        await rollback_thread(
+            service._graph, session_id=session.session_id, keep=0
+        )
+        await self.accept(service, session.session_id)
+        toast = only(await wait_for(queue, "Notify"), "Notify")
+        assert toast.severity == "warning" and "no longer describes" in toast.text
+        values = await service._thread_values(session.session_id)
+        assert not values.get("compacted")
+
+    async def test_an_answer_to_an_offer_that_is_gone_does_nothing(
+        self, service, session
+    ):
+        # Two front-ends on one core, or a key pressed as the screen closed.
+        await service.handle(
+            CompactResolve(session_id=session.session_id, action="accept")
+        )
+        values = await service._thread_values(session.session_id)
+        assert not values.get("compacted")
 
     async def test_the_chat_is_not_re_stated(self, service, session, llm):
         # The rollback next to it removes messages, so only a reset can
@@ -4642,6 +4794,8 @@ class TestCompact:
         await service.handle(
             CommandRun(name="compact", session_id=session.session_id)
         )
+        await wait_for(queue, "CompactProposed")
+        await self.accept(service, session.session_id)
         events = await wait_for(queue, "Notify")
         assert "ChatReset" not in kinds(events)
         # The fill is restated, though: the measured count described the
@@ -4661,10 +4815,12 @@ class TestCompact:
                 session_id=session.session_id,
             )
         )
-        events = await wait_for(queue, "Notify")
-        toast = [e for e in events if type(e).__name__ == "Notify"][-1]
-        assert "keep the QC findings" in toast.text
+        offer = only(await wait_for(queue, "CompactProposed"), "CompactProposed")
+        assert offer.guidance == "keep the QC findings"
         assert "keep the QC findings" in llm.prompts[-1][0]["content"]
+        await self.accept(service, session.session_id)
+        toast = only(await wait_for(queue, "Notify"), "Notify")
+        assert "keep the QC findings" in toast.text
 
     async def test_a_session_parked_on_an_approval_is_not_folded(
         self, service, session, llm

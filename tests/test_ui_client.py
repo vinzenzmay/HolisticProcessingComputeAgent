@@ -1637,6 +1637,78 @@ class TestMemoryProposals:
         assert (sent.session_id, sent.approved) == ("s1", [True])
 
 
+class TestTheCompactionOffer:
+    """`compact.proposed` and the verdict that answers it.
+
+    The offer arrives a model call after the keystroke, so it travels the same
+    path a memory proposal does: held on the session it names, put on screen
+    only when that session is the one on screen.
+    """
+
+    def offer(self, session_id="s1", **kw) -> protocol.CompactProposed:
+        return protocol.CompactProposed(
+            session_id=session_id,
+            summary="[earlier in this session]\nSTAR needs 40G",
+            folded=42,
+            **kw,
+        )
+
+    async def test_it_opens_the_review_for_the_session_on_screen(self, wire):
+        await started(wire)
+        await wire.tell(self.offer())
+        assert "STAR needs 40G" in wire.screen()
+        assert "42 messages fold" in wire.screen()
+
+    async def test_another_session_s_offer_only_toasts(self, wire):
+        await started(wire)
+        await wire.tell(self.offer("s2"))
+        assert wire.ui.overlay is None
+        assert "/compact opens it" in plain(wire.frame()[-1])
+
+    async def test_and_is_still_held_for_when_it_is_opened(self, wire):
+        await started(wire)
+        await wire.tell(self.offer("s2"))
+        assert wire.ui.session_for("s2").compaction is not None
+
+    async def test_accepting_it_sends_the_verdict(self, wire):
+        await started(wire)
+        await wire.tell(self.offer())
+        await wire.press("enter")
+        answer = wire.peer.last(protocol.CompactResolve)
+        assert (answer.session_id, answer.action) == ("s1", "accept")
+
+    async def test_a_retry_carries_what_the_user_said(self, wire):
+        await started(wire)
+        await wire.tell(self.offer())
+        await wire.press("r", *"you cut it off", "enter")
+        answer = wire.peer.last(protocol.CompactResolve)
+        assert answer.action == "retry"
+        assert answer.comment == "you cut it off"
+
+    async def test_escape_sends_nothing_at_all(self, wire):
+        await started(wire)
+        await wire.tell(self.offer())
+        await wire.press("esc")
+        assert not wire.peer.took(protocol.CompactResolve)
+
+    async def test_a_second_offer_replaces_the_first(self, wire):
+        # A retry answers with another summary of the same history; two of
+        # them queued would be two screens about one decision.
+        await started(wire)
+        await wire.tell(self.offer())
+        await wire.press("r", *"again", "enter")
+        await wire.tell(
+            protocol.CompactProposed(
+                session_id="s1",
+                summary="[earlier in this session]\na fuller summary",
+                folded=42,
+                attempt=2,
+            )
+        )
+        assert "a fuller summary" in wire.screen()
+        assert "attempt 2" in wire.screen()
+
+
 class TestThePaletteArrivesTheSameWay:
     """A theme is a display setting, so it travels the path they all do.
 

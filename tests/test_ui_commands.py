@@ -30,9 +30,11 @@ from hpca.ui.overlays import (
     skill_file,
 )
 from hpca.ui.state import (
+    CompactProposal,
     DeleteSkill,
     DraftSkill,
     ProfileInfo,
+    ResolveCompact,
     RunCommand,
     SaveSkill,
     SessionState,
@@ -336,6 +338,11 @@ class TestWhatACompactDoesToTheMeter:
     rewrites the conversation without taking a message out of it. So nothing
     ever cleared `Context.measured`, `Context.estimate` went on returning
     early, and a session compacted at 92% stayed at 92% indefinitely.
+
+    What changed with the review: the fold happens when the summary is
+    accepted, not when the command is typed, so that is where the number stops
+    describing the prompt. Marking it on the keystroke would draw the `~` over
+    a summary the user is about to turn down.
     """
 
     def measured(self) -> RowUI:
@@ -343,30 +350,49 @@ class TestWhatACompactDoesToTheMeter:
         ui.session.context.measure(9200, 10000)
         return ui
 
-    def test_the_measured_number_stops_claiming_to_be_measured(self):
+    def compacted(self) -> RowUI:
+        """A conversation whose summary has just been accepted."""
         ui = self.measured()
-        assert ui.session.context.measured
         press(ui, *"/compact", "enter")
+        ui.session.compaction = CompactProposal(
+            summary="[earlier in this session]\nwhat happened", folded=12
+        )
+        ui.review_compaction()
+        press(ui, "enter")
+        return ui
+
+    def test_the_command_alone_leaves_the_number_alone(self):
+        ui = self.measured()
+        press(ui, *"/compact", "enter")
+        assert ui.session.context.measured
+
+    def test_the_measured_number_stops_claiming_to_be_measured(self):
+        ui = self.compacted()
+        assert sent(ui, ResolveCompact)[-1].action == "accept"
         assert not ui.session.context.measured
 
     def test_and_the_bar_says_so_with_the_tilde(self):
-        ui = self.measured()
-        press(ui, *"/compact", "enter")
-        assert "~9,200 / 10,000" in screen(ui)
+        assert "~9,200 / 10,000" in screen(self.compacted())
 
     def test_and_the_fresh_estimate_is_no_longer_ignored(self):
-        ui = self.measured()
-        press(ui, *"/compact", "enter")
+        ui = self.compacted()
         ui.session.context.estimate(1200, 10000)
         assert "~1,200 / 10,000" in screen(ui)
 
     def test_the_fill_is_not_blanked_in_the_meantime(self):
         # Not `reset()`: the number is stale, not gone, and "no reply yet" on
         # a conversation with a hundred entries would be the worse lie.
-        ui = self.measured()
-        press(ui, *"/compact", "enter")
+        ui = self.compacted()
         assert ui.session.context.known
         assert "no reply yet" not in screen(ui)
+
+    def test_a_discarded_summary_changes_nothing(self):
+        ui = self.measured()
+        ui.session.compaction = CompactProposal(summary="a summary", folded=3)
+        ui.review_compaction()
+        press(ui, "d")
+        assert sent(ui, ResolveCompact)[-1].action == "discard"
+        assert ui.session.context.measured
 
     def test_a_command_that_does_not_fold_leaves_it_alone(self):
         ui = self.measured()

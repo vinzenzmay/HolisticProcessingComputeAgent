@@ -29,6 +29,13 @@ from hpca.ui.overlays.base import (
     keyed,
     options,
 )
+from hpca.ui.overlays.compact import (
+    ACCEPT,
+    CUT_WARNING,
+    DISCARD,
+    RETRY,
+    CompactReviewOverlay,
+)
 from hpca.ui.overlays.config import ConfigOverlay
 from hpca.ui.overlays.help import HelpOverlay
 from hpca.ui.overlays.inspect import InspectOverlay
@@ -70,11 +77,14 @@ from hpca.ui.overlays.textedit import ARCHIVE, MEMORIES, SKILL, TextEditOverlay
 from hpca.ui.overlays.thinking import NO_SESSION, ThinkingOverlay
 
 __all__ = [
+    "ACCEPT",
     "ARCHIVE",
     "BACKEND",
     "BACK_KEYS",
     "COPY",
+    "CUT_WARNING",
     "DEFAULT_REFUSAL",
+    "DISCARD",
     "EMPTY_LIST",
     "EMPTY_REFUSAL",
     "FORK",
@@ -86,11 +96,13 @@ __all__ = [
     "PREVIEW_LINES",
     "PROFILE",
     "REMOVE_QUESTION",
+    "RETRY",
     "ROLLBACK",
     "SKILL",
     "UNQUEUE",
     "BackendFormOverlay",
     "ChoiceDialog",
+    "CompactReviewOverlay",
     "ConfigOverlay",
     "EditorOverlay",
     "HelpOverlay",

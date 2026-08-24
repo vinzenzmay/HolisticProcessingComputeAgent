@@ -228,7 +228,7 @@ Those two sections were 22 of the original 38, and each was one missing wire.
 | 3.3 two startup jobs lose their only caller | not implemented | **closed** |
 | 3.4 the "updated" sidebar marker is gone | not implemented (2) | **partly closed** — built and wired, no test, and the failure path still does not set it |
 | 3.5 the prompt-injection warning never reaches the screen | not implemented | **still open**, unchanged |
-| 3.6 the context meter lies after `/compact` | not implemented | **closed** (one nit, §9.5) |
+| 3.6 the context meter lies after `/compact` | not implemented | **closed** (the §9.5 nit closed with the compaction review) |
 | 3.7 long answers clipped, inspect window unreachable | degraded | **closed** |
 | 3.8 memories never re-read at a session boundary | not implemented | **still open**, unchanged |
 | 3.9 the skill drafter and skill levels | not implemented (8) | **closed** |
@@ -327,12 +327,13 @@ core sends.
 
 ### 3.6 The context meter lies after `/compact` — **CLOSED**
 
-`Context.superseded()` (state.py:437) clears `measured` without clearing the
-fill, so the number keeps drawing and starts drawing with the `~`, and the
-core's fresh `context.estimate` is allowed to speak again. Called from the
-command dispatch where the command is known (app.py:1842), guarded by
-`Command.folds` so only `/compact` does it. `test_ui_commands.py:327` cites this
-section by name. See §9.5 for the one nit.
+`Context.superseded()` clears `measured` without clearing the fill, so the
+number keeps drawing and starts drawing with the `~`, and the core's fresh
+`context.estimate` is allowed to speak again. Called where the fold actually
+happens — `RowUI._closed` on an accepted `CompactReviewOverlay`, since the
+review landed and `/compact` no longer folds on the keystroke.
+`test_ui_commands.py::TestWhatACompactDoesToTheMeter` cites this section by
+name; §9.5's nit went with the move.
 
 ### 3.7 Long answers clipped, and the window unreachable — **CLOSED**
 
@@ -671,12 +672,13 @@ side and the other silently answers "Unknown command". A single test asserting
 the two sets are equal costs three lines. *Low now, high the day someone adds
 the eighth command.*
 
-**9.5 `/compact` marks the meter superseded even when the core refuses it.**
-`app.py:1842` calls `superseded()` on send. The core refuses a session parked on
-an approval (service.py:2379), an empty one, and a backend failure. In each case
-an accurate measured number is redrawn with a `~` until the next turn
-re-measures. Self-healing and cosmetic, but the acceptance list is explicit that
-"a backend failure leaves the session untouched". *Low.*
+**9.5 `/compact` marks the meter superseded even when the core refuses it —
+CLOSED.** It used to call `superseded()` on send, so a session parked on an
+approval, an empty one and a backend failure each redrew an accurate measured
+number with a `~`. The compaction review moved the call to the moment the fold
+lands (`RowUI._closed`, accept), which is the only moment the number stops
+describing the prompt — and the three refusals never reach it, nor does a
+summary the user discards.
 
 **9.6 `toasts.CLIPPED` still says "… more in the log".** After §3.7 the
 remainder of a *titled* block is on screen in a window, not in a log — and for

@@ -94,7 +94,10 @@ your skills (invoke a skill with `/<skill>`; see *Skills* below).
   overflows the model's window (the meter above the chat shows how full it is),
   and you can fold it yourself with `/compact` — adding what the summary has to
   keep, or the step you are about to take, so it is written for what comes next.
-  Only what the model receives is folded; the chat itself keeps every message.
+  A summary you asked for is shown before it lands: accept it, or send it back
+  with a line saying what it has to do differently (it was cut off, it lost a
+  path) and the agent writes another one. Only what the model receives is
+  folded; the chat itself keeps every message.
 * **Skills** — user-defined procedure files the agent follows for specific tasks
   (see *Skills* below).
 

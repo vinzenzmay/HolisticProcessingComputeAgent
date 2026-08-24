@@ -180,6 +180,7 @@ One envelope in both directions:
 | `command.run` | `name`, `args`, `session_id?` — `/compact`, `/memorize`, `/conclude`, `/skill-*`. Session-scoped commands carry the id explicitly rather than letting the core infer it from the last `session.focus`, which may have moved on between the keystroke and the frame arriving |
 | `confirm.resolve` | `id`, `confirmed` — answers a `confirm.requested`; the core holds the continuation, only the yes/no crosses |
 | `memory.resolve` | `session_id`, `approved: [bool]` — answers a `memory.proposals` offer, positionally. The core holds the proposal objects; only the yes/no crosses, so a front-end cannot smuggle an edited memory back in an approval |
+| `compact.resolve` | `session_id`, `action` (`accept\|retry\|discard`), `comment` — answers a `compact.proposed` offer. Three answers rather than a yes/no, because a summary can be *nearly* right: `retry` sends it back with `comment` saying what it has to do differently. The summary never travels back — the core holds it, so what lands is what the model wrote. Answering nothing is allowed: the core keeps the offer, and a bare `/compact` re-offers it |
 | `mode.set` | `session_id`, `mode` |
 | `thinking.set` | `session_id`, `effort` — the other per-session dial (§3.6); a plain string for the same reason as `mode`, since which levels exist is the served model's business |
 | `backend.set` | `backend` (JSON blob), `session_id?` |
@@ -215,6 +216,7 @@ One envelope in both directions:
 | `panel.update` | `profile`, `session_id?`, `rows: [PanelRow]` |
 | `watch.peeked` | `watch_id`, `title`, `text` — the answer to a `watch.peek`. Deliberately not a `notify`: it answers a keypress (so it echoes `reply_to`), two peeks can cross so the answer must name its box, and how long a tail stays on screen is the renderer's decision, not a timeout the core sets |
 | `memory.proposals` | `session_id`, `proposals` |
+| `compact.proposed` | `session_id`, `summary`, `folded`, `guidance`, `attempt`, `truncated` — the summary `/compact` wrote, before it is anybody's history. A fold cannot be undone from the front-end and a summary is exactly the kind of thing that comes back cut off, so the user-driven path offers it and waits. `truncated` is the one thing the text cannot say for itself: the model stopped at its length budget |
 | `confirm.requested` | `id`, `question` — a yes/no that is not a tool approval (triage offering a learned log signature). Deliberately not `decision.requested`: nothing is parked on it, and conflating them would make an unanswered offer look like a stalled session |
 | `context.estimate` | `session_id`, `used`, `window` |
 | `notify` | `severity`, `text` |

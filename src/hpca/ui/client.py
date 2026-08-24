@@ -352,6 +352,14 @@ class UIClient:
                     session_id=session, approved=list(intent.approved)
                 )
             )
+        elif isinstance(intent, state.ResolveCompact):
+            self.command(
+                protocol.CompactResolve(
+                    session_id=session,
+                    action=intent.action,
+                    comment=intent.comment,
+                )
+            )
         elif isinstance(intent, state.RunCommand):
             self.command(
                 protocol.CommandRun(
@@ -1155,6 +1163,36 @@ class UIClient:
                 f"“{session.title or msg.session_id}”"
             )
 
+    def _compact_proposed(self, msg: protocol.CompactProposed) -> None:
+        """A summary `/compact` wrote, and the screen that answers it.
+
+        Held on the session first, for the reason the memory proposals above
+        are: the offer belongs to the conversation it was written for, and
+        answering it against another one would fold the wrong history. On
+        screen straight away only when that conversation is the one on screen —
+        and through `RowUI.land`, which parks it rather than landing on top of
+        whatever the user opened in the seconds the summary took to write.
+
+        Nothing is lost by not showing it: the core holds the offer until it is
+        answered, so the toast can send the user back to it with `/compact`
+        instead of a second generation.
+        """
+        session = self._session(msg.session_id)
+        session.compaction = state.CompactProposal(
+            summary=msg.summary,
+            folded=msg.folded,
+            guidance=msg.guidance,
+            attempt=msg.attempt,
+            truncated=msg.truncated,
+        )
+        if msg.session_id == self.ui.active_id:
+            self.ui.review_compaction(msg.session_id)
+        else:
+            self.ui.toast(
+                f"a compaction summary is waiting in "
+                f"“{session.title or msg.session_id}” — /compact opens it"
+            )
+
     # ------------------------------------------------------- the read paths
 
     def _profile_body(self, msg: protocol.ProfileBody) -> None:
@@ -1329,6 +1367,7 @@ UIClient._HANDLERS = {
     protocol.ConfirmRequested.__name__: UIClient._confirm,
     protocol.PanelUpdate.__name__: UIClient._panel,
     protocol.MemoryProposals.__name__: UIClient._proposals,
+    protocol.CompactProposed.__name__: UIClient._compact_proposed,
     protocol.ProfileBody.__name__: UIClient._profile_body,
     protocol.SkillRows.__name__: UIClient._skill_rows,
     protocol.SkillDrafted.__name__: UIClient._skill_drafted,

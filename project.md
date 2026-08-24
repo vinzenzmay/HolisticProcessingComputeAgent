@@ -262,6 +262,14 @@ in sync with the `RESERVED HOTKEYS` comment above `HpcaApp.BINDINGS`.
     summary is then written for it, and the brief itself stays in the folded view
     so it keeps framing the turns that follow. The chat is not rewritten; only the
     view the model receives is folded.
+    The summary is **reviewed before it lands**, because a fold cannot be undone:
+    it comes back on a screen with the fold it would make, and the answer is
+    accept (Enter), *again* (`r`, with a line saying what it has to do
+    differently — that sentence and the rejected text both steer the next
+    attempt), or discard (`d`). Escape answers nothing and the offer is kept, so
+    a bare `/compact` re-opens it rather than paying for a second summary. The
+    screen also says when the model's own length budget cut the summary short,
+    which is the complaint the *again* answer exists for.
   * `/skill-creator [WHAT IT SHOULD DO]`, `/skills-list`, `/skill-remove` — manage
     this profile's skills (see §5.1). With a description, the model drafts name,
     description and body from it (and the conversation so far) and the form opens

@@ -34,18 +34,21 @@ import asyncio
 import hashlib
 import logging
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import ValidationError
 
+from hpca.agent import compact
 from hpca.agent.builtin_tools import default_tool_registry
 from hpca.agent.context import ToolContext
 from hpca.agent.doc_tools import add_ask_docs, add_doc_tools
 from hpca.agent.file_tools import add_file_tools
 from hpca.agent.graph import (
     build_graph,
-    compact_now,
+    apply_compaction,
+    propose_compaction,
     fork_thread,
     rollback_thread,
     thread_message_count,
@@ -88,6 +91,8 @@ from hpca.protocol import (
     CommandList,
     CommandRun,
     ConfirmRequested,
+    CompactProposed,
+    CompactResolve,
     ConfirmResolve,
     DecisionRequested,
     DecisionResolve,
@@ -259,6 +264,26 @@ UNTITLED_SESSION = "untitled"
 SESSION_TITLE_MAX = 40
 
 
+@dataclass
+class _Compaction:
+    """A summary offered to the user and waiting for a verdict.
+
+    Everything needed to land it (`upto`, `summary`) or to ask for it again
+    (`guidance`, the rejected text, how many attempts it has taken). ``upto``
+    is a position in the stored history rather than a copy of it, so a turn
+    that runs while the offer is on screen costs nothing: it stays verbatim
+    behind the summary.
+    """
+
+    session_id: str
+    upto: int
+    summary: dict
+    folded: int
+    guidance: str = ""
+    attempt: int = 1
+    truncated: bool = False
+
+
 class AgentService:
     """The whole runtime behind one command/event surface."""
 
@@ -301,6 +326,14 @@ class AgentService:
         # one it was offered.
         self._confirmations: dict[str, Any] = {}
         self._confirm_seq = 0
+        # Summaries `/compact` has written and nobody has accepted yet, one per
+        # session (`_Compaction`). Held here for the same reason the
+        # confirmations above are: the front-end gets to see the summary but
+        # never to hand one back, so the text that lands is the text the model
+        # wrote. In memory, and deliberately not durable — an offer nobody
+        # answered before a restart is a summary of a conversation that has
+        # moved on, and re-asking costs one generation.
+        self._compactions: dict[str, _Compaction] = {}
         # Sessions carrying a provisional name — the truncated first message —
         # and waiting for the model to write a real one after the exchange.
         #
@@ -511,6 +544,12 @@ class AgentService:
             return
         if isinstance(command, MemoryResolve):
             self._resolve_memory(command)
+            return
+        if isinstance(command, CompactResolve):
+            # A retry is another generation, so the answer cannot be awaited
+            # on the dispatch loop; accepting and discarding are cheap, and
+            # both go the same way to keep the three answers in one place.
+            self._spawn(self._resolve_compaction(command))
             return
         if isinstance(command, ModeSet):
             self._set_mode(command.session_id, command.mode)
@@ -1188,6 +1227,10 @@ class AgentService:
         # nothing queued for it can start against a thread that is going away.
         self._scheduler.forget_session(session_id)
         self._untitled.discard(session_id)
+        # A summary of a conversation that is being deleted has nothing left to
+        # fold, and holding it would leave the core answering `compact.resolve`
+        # for a thread the graph no longer has.
+        self._compactions.pop(session_id, None)
         self._backends.forget_session(session_id)
         self._sessions.delete(session_id)
         await self._deps.db(
@@ -2476,7 +2519,7 @@ class AgentService:
         )
 
     async def _compact(self, session, guidance: str) -> None:
-        """`/compact [instruction]`: fold this conversation's history now.
+        """`/compact [instruction]`: write the fold and offer it.
 
         The automatic fold waits for the window to fill and keeps the recent
         turns verbatim, because it fires unasked. This one is asked for, so it
@@ -2484,19 +2527,19 @@ class AgentService:
         material to preserve, or the step the user is about to take, which is
         the same instruction from the summarizer's point of view.
 
-        **No `chat.reset`, and this is the one to be careful about.** A fold
-        looks like the rollback next to it and is not: `rollback_thread`
-        removes messages, so the rows drawn for them describe messages that no
-        longer exist and only a reset can un-draw them, whereas `compact_now`
-        writes a *view* — the stored history is untouched and every row on
-        screen still names a message the thread still has. Re-stating the chat
-        here would be the per-turn rebuild §4.2 exists to delete, in exchange
-        for nothing.
+        **Nothing lands here.** A fold is the one thing in this core the user
+        cannot undo from the front-end: the summary *becomes* what the model
+        sees, and the turns behind it stop reaching it. A summary is also
+        exactly the kind of thing that comes back wrong — cut off, or missing
+        the one path the next step needs — and the old shape put it on screen
+        as a toast *after* it had already happened. So it is written, offered
+        (`compact.proposed`), and applied only when the answer says accept.
 
-        So what crosses is what changed: the summary the model will work from
-        (worth reading once — the user may have named what it had to keep, and
-        a small model does not always keep it), and the fill, because the last
-        measured count described the unfolded prompt.
+        A second `/compact` with nothing typed after it re-offers what is
+        already waiting rather than paying for another summary: the offer
+        survives a screen the user escaped out of, which is what makes escape
+        a safe key there. With an instruction it is a new brief, so it is a
+        new summary.
         """
         session_id = session.session_id
         if session_id in self._scheduler.pending_decisions():
@@ -2510,15 +2553,39 @@ class AgentService:
                 )
             )
             return
+        waiting = self._compactions.get(session_id)
+        if waiting is not None and not guidance:
+            self._offer_compaction(waiting)
+            return
+        await self._propose_compaction(session, guidance)
+
+    async def _propose_compaction(
+        self,
+        session,
+        guidance: str,
+        *,
+        comment: str = "",
+        previous: str = "",
+        attempt: int = 1,
+    ) -> None:
+        """Summarize, hold the result, and put it up for review.
+
+        One path for the first attempt and every retry after it, because they
+        differ only in what the summarizer is told: a retry carries the summary
+        that was turned down and the sentence saying what was wrong with it.
+        """
+        session_id = session.session_id
         self._working(session_id, "compacting context")
         try:
-            folded = await compact_now(
+            proposed = await propose_compaction(
                 self._graph,
                 session_id=session_id,
                 llm=self._backends.labelled_client(
                     "compact", session_id=session_id
                 ),
                 guidance=guidance,
+                previous_attempt=previous or None,
+                comment=comment or None,
             )
         except Exception as e:
             # Nothing was written: the thread is exactly as it was.
@@ -2528,20 +2595,117 @@ class AgentService:
             return
         finally:
             self._working(session_id, "")
-        if folded is None:
+        if proposed is None:
             self._deps.emit(
                 Notify(text="Nothing new to compact in this conversation.")
             )
             return
-        note = (
-            f"Context compacted: {folded['folded']} messages folded into a "
-            "summary."
+        offer = _Compaction(
+            session_id=session_id,
+            upto=proposed["upto"],
+            summary=proposed["summary"],
+            folded=proposed["folded"],
+            guidance=guidance,
+            attempt=attempt,
+            truncated=bool(proposed["truncated"]),
         )
-        if guidance:
-            note = f"{note} Asked to keep: {guidance}"
-        log = open_log(self._deps.settings, session)
+        self._compactions[session_id] = offer
+        self._offer_compaction(offer)
+
+    def _offer_compaction(self, offer: "_Compaction") -> None:
+        """Put a held summary on the wire, first time or again."""
+        self._deps.emit(
+            CompactProposed(
+                session_id=offer.session_id,
+                summary=str(offer.summary.get("content", "")),
+                folded=offer.folded,
+                guidance=offer.guidance,
+                attempt=offer.attempt,
+                truncated=offer.truncated,
+            )
+        )
+
+    async def _resolve_compaction(self, command: CompactResolve) -> None:
+        """`compact.resolve`: land the fold, ask again, or drop it.
+
+        The offer is taken out of the table first, whichever way this goes: a
+        verdict that arrived twice — two front-ends on one core, a key pressed
+        as the screen closed — must not fold the same stretch twice or start
+        two summaries.
+        """
+        offer = self._compactions.pop(command.session_id, None)
+        if offer is None:
+            # Answered for something no longer on offer: the session was
+            # deleted, or another client got there first. Silent — the user
+            # asking for the same thing twice is not a problem to report.
+            return
+        if command.action == "accept":
+            await self._land_compaction(offer)
+            return
+        if command.action == "retry":
+            session = self._session(command.session_id)
+            if session is None:
+                return
+            await self._propose_compaction(
+                session,
+                offer.guidance,
+                comment=command.comment,
+                previous=compact.summary_body(offer.summary),
+                attempt=offer.attempt + 1,
+            )
+            return
+        self._deps.emit(
+            Notify(text="Compaction discarded — the conversation is unchanged.")
+        )
+
+    async def _land_compaction(self, offer: "_Compaction") -> None:
+        """Write an accepted fold into the thread, and say what changed.
+
+        **No `chat.reset`, and this is the one to be careful about.** A fold
+        looks like the rollback next to it and is not: `rollback_thread`
+        removes messages, so the rows drawn for them describe messages that no
+        longer exist and only a reset can un-draw them, whereas this writes a
+        *view* — the stored history is untouched and every row on screen still
+        names a message the thread still has. Re-stating the chat here would be
+        the per-turn rebuild §4.2 exists to delete, in exchange for nothing.
+
+        So what crosses is what changed: a line saying it happened, and the
+        fill, because the last measured count described the unfolded prompt.
+        The summary itself no longer needs a toast — the user has just read it
+        and said yes to it.
+        """
+        session_id = offer.session_id
+        landed = await apply_compaction(
+            self._graph,
+            session_id=session_id,
+            upto=offer.upto,
+            summary=offer.summary,
+        )
+        if not landed:
+            # The thread moved under the offer — rewound behind it, or folded
+            # past this point by the automatic path while the review was open.
+            # Nothing was written, which is the property this whole exchange
+            # exists to keep.
+            self._deps.emit(
+                Notify(
+                    severity="warning",
+                    text="That summary no longer describes this conversation "
+                    "— it changed while you were reading. Run /compact again.",
+                )
+            )
+            return
+        note = (
+            f"Context compacted: {offer.folded} messages folded into a summary."
+        )
+        if offer.guidance:
+            note = f"{note} Asked to keep: {offer.guidance}"
+        session = self._session(session_id)
+        log = open_log(self._deps.settings, session) if session else None
         if log is not None:
-            log.write("context compacted", f"{note}\n{folded['summary']['content']}")
+            log.write(
+                "context compacted",
+                f"{note}\n{offer.summary.get('content', '')}",
+            )
         # The measured count described the unfolded prompt, so it no longer
         # describes what the next turn will send: drop it and re-derive the
         # fill from the folded view, which `estimate_context` already accounts
@@ -2550,13 +2714,7 @@ class AgentService:
         self._backends.estimate_context(
             session_id, await self._thread_values(session_id)
         )
-        self._deps.emit(
-            Notify(
-                title="Context compacted",
-                text=f"{note}\n\n{folded['summary']['content']}",
-                timeout=20,
-            )
-        )
+        self._deps.emit(Notify(text=note))
 
     async def _memorize(self, session, note: str) -> None:
         """`/memorize <note>`: turn the note plus the conversation into
