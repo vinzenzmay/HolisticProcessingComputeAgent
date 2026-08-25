@@ -1,0 +1,12 @@
+# Everything in here is downloaded or produced by a run; only the scripts and
+# SETUP.md are source. Sizes noted because a stray `git add .` would be costly.
+
+# The runtime (pip install of vLLM + torch, ~15 GB)
+venv/
+
+# Model weights (~30.4 GB for Qwen3.8-27B-FP8, ~0.09 GB for the embedder)
+weights/
+
+# Job output: vllm.a40-l40.out, embed-server.log
+*.out
+*.log

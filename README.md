@@ -26,6 +26,22 @@ then `cd HolisticProcessingComputeAgent; pixi install; pixi shell`
 
 now cd into the project or wherever you want to start the agent and run it: `hpca`
 
+### The LLM behind it
+
+HPCA brings no model of its own — it needs an OpenAI-compatible endpoint to talk
+to. [llmServer/SETUP.md](llmServer/SETUP.md) sets one up from nothing: a Slurm
+job running vLLM with Qwen3.8-27B-FP8 on two L40s (262k context), plus the
+embedding sidecar that document search uses.
+
+Started servers announce themselves by dropping a JSON manifest into a shared
+directory, and HPCA finds them there — on the cluster there is nothing to
+configure. **That directory is named on both sides and the two must agree**:
+`endpoints.endpoints_dir` in `<app dir>/settings.json` for HPCA, and
+`HPCA_ENDPOINTS_DIR` (or the default inside `llmServer/write_manifest.sh`) for
+the launch scripts. The shipped default is our group's path on the BIH cluster,
+so on any other cluster both of them need pointing at a directory your group can
+write to — change one and HPCA silently discovers nothing.
+
 ## Use HPCA like an expert
 * **Provide sources**: This agent has the thinking power but not the knowledge: always provide sources if you ask about facts.
 * **No web-search**: Sources must be lokal. HPCA is forbidden to web-search.
@@ -169,6 +185,38 @@ built-in**):
   while running there. Stored under a hidden `.hpca/skills/` in that directory, so
   a repo can carry its own procedures without them leaking into other projects.
 
+
+## Serving your own LLM
+
+HPCA is a client. It needs an OpenAI-compatible endpoint to talk to, and until
+one answers there is nothing for the agent to think with — so if this is a fresh
+setup, the server is the part to do first.
+
+Everything for that is in **[llmServer/](llmServer/)**, and the guide to read is
+**[llmServer/SETUP.md](llmServer/SETUP.md)**. It assumes no prior knowledge of
+vLLM or Slurm and walks the whole way:
+
+1. `./setup_venv.sh` — installs vLLM into `llmServer/venv` (~15 GB).
+2. Download the weights — `Qwen/Qwen3.8-27B-FP8`, ~30 GB. Needs 16 GB of RAM,
+   which is the step that most often fails silently.
+3. Make an API key — `~/.vllm_api_key`, or the job refuses to start.
+4. Point `--gres` and `--partition` at your cluster's GPU nodes. **The one edit
+   you almost certainly need**, and the usual reason a first `sbatch` is
+   rejected or pends forever.
+5. `sbatch llm.a40-l40.sh`, then read the four log lines SETUP.md tells you to
+   grep. Each explains a disappointing result on its own.
+
+What you end up with: `Qwen3.8-27B-FP8` on port 20001 with a 262k context window
+on two L40s (112k on one), ~47 tokens/s, and an embedding sidecar on port 20000
+that document search uses. The job announces itself, so HPCA on the cluster
+connects with nothing configured — but see the endpoints-directory warning under
+[The LLM behind it](#the-llm-behind-it) if you are not on the BIH cluster. From
+a workstation, SETUP.md gives you the SSH tunnel and the `settings.json` to match.
+
+SETUP.md is the how. The *why* — memory arithmetic per card, why two cards are
+load-bearing rather than merely faster, why the KV cache must not be quantised —
+lives in the comment blocks of `llmServer/llm.a40-l40.sh`, next to the values it
+explains. Read those before changing a number in that script.
 
 ## Development
 
