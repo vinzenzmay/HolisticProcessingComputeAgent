@@ -114,9 +114,55 @@ def test_and_nowhere_else(row):
 
 
 @pytest.mark.parametrize("row", [SESSIONS, CHAT, INPUT, WATCHERS])
-def test_the_ring_hint_calls_them_panels(row):
-    assert "^↑^↓ panel" in footer_of(row)
-    assert "^↑^↓ row" not in footer_of(row)
+def test_the_ring_hint_names_tab_and_the_ctrl_arrows_together(row):
+    # One pair, because they are one thing: tab walks the ring on and the
+    # ctrl arrows walk it either way, from the message box as much as from a
+    # pane. Two pairs for the same job cost a footer row at 120 columns.
+    assert "tab ^↑^↓ cycle" in footer_of(row)
+    assert "^↑^↓ panel" not in footer_of(row)
+
+
+def test_the_message_box_does_not_offer_a_key_that_is_a_character_there():
+    # "?" goes into the draft from the box (`_handle_input` falls through to
+    # the editor), so neither the footer nor the header may name it as the
+    # key that opens the key list.
+    ui = build()
+    ui.focus = INPUT
+    assert "? keys" not in footer(ui, 160)
+    assert "? keys" not in plain(ui.render(160, 40)[0])
+
+
+@pytest.mark.parametrize("row", [SESSIONS, CHAT, WATCHERS])
+def test_but_the_three_panes_do_where_it_opens_the_list(row):
+    ui = build()
+    ui.focus = row
+    assert "? keys" in footer(ui, 160)
+    assert "? keys" in plain(ui.render(160, 40)[0])
+
+
+def test_the_header_drops_it_while_a_screen_is_up():
+    # `?` reaches the overlay, not `_handle_row`, so the header stops
+    # promising the key list until the screen closes.
+    ui = build()
+    ui.focus = SESSIONS
+    ui.handle("?", 160, 40)
+    assert "? keys" not in plain(ui.render(160, 40)[0])
+
+
+def test_the_sessions_arrows_are_named_for_what_they_do_there():
+    # They fold a project's sessions away and back — the chat's open the row
+    # under the cursor, and the two rows say different words for it.
+    foot = footer_of(SESSIONS)
+    assert "→← exp./coll." in foot and "⇧→← exp./coll. all" in foot
+    assert "→← open" not in foot
+    assert "→← open" in footer_of(CHAT)
+
+
+def test_enter_on_a_session_opens_it():
+    # "switch" was the word for a thing the key does not do: it opens the
+    # session under the cursor.
+    assert "enter open" in footer_of(SESSIONS)
+    assert "enter switch" not in footer_of(SESSIONS)
 
 
 def test_sessions_offers_rename():

@@ -1715,10 +1715,25 @@ class RowUI:
         left = "  ·  ".join(
             x for x in (f" HPCA {VERSION}", self.profile, self.mode) if x
         )
-        right = f"{self.frame_ms:5.2f}ms  ·  ? keys  "
+        keys = "  ·  ? keys" if self._help_key_works() else ""
+        right = f"{self.frame_ms:5.2f}ms{keys}  "
         gap = width - cell_width(left) - cell_width(right)
         text = left + " " * gap + right if gap > 0 else left
         return REVERSE + pad(text, width) + RESET
+
+    def _help_key_works(self) -> bool:
+        """Whether "?" opens the key list from where the cursor is.
+
+        Only the three panes take it (`_handle_row`). In the message box — and
+        in the two boxes that ask for a reason — "?" is a character somebody
+        is typing, and everywhere else it is inert, so the hint that names it
+        is offered only where pressing it does the thing the hint claims.
+        """
+        return (
+            self.confirm is None
+            and self.overlay is None
+            and self.focus in (SESSIONS, CHAT, WATCHERS)
+        )
 
     def _keys(self) -> list[tuple[str, str]]:
         """Only what applies where the cursor is — the footer's whole job.
@@ -1732,7 +1747,11 @@ class RowUI:
         # whole pairs off its end and this is the one that must not be the pair
         # that goes. Leaving the message box is ^↑, not escape: escape has a
         # job now.
-        common = [("^↑^↓", "panel"), ("esc esc", "stop"), ("?", "keys")]
+        # Tab and the two ctrl arrows are one pair rather than two, because
+        # they are one thing — the way round the ring — and a footer that
+        # spent a second pair on the same job would be a pair wider on every
+        # row, which at 120 columns is the row the chat has to give up.
+        common = [("tab ^↑^↓", "cycle"), ("esc esc", "stop"), ("?", "keys")]
         # Nothing for `self.confirm`: the dialog blanks the footer along with
         # the rest of the frame and carries its own two answers on its own
         # row. Keys that stay the keys of the row underneath are what lets the
@@ -1742,13 +1761,15 @@ class RowUI:
             # that fill one in, and saying so is the only way anybody finds tab.
             return [
                 ("↑↓", "pick"),
-                ("⇥", "complete"),
+                ("tab", "complete"),
                 ("enter", "complete / run"),
                 ("esc esc", "stop"),
-                ("?", "keys"),
+                # No "? keys" and no "tab cycle": this is the message box with
+                # a menu over it, where tab fills a name in and "?" is a
+                # character going into the draft.
             ]
         if self.focus == OFFER:
-            return [("y", "yes"), ("n", "no"), ("^↑^↓", "panel"), ("?", "keys")]
+            return [("y", "yes"), ("n", "no"), ("tab ^↑^↓", "cycle")]
         if self.focus == REVIEW:
             if not self.session.review.asking:
                 return [
@@ -1766,7 +1787,7 @@ class RowUI:
                 # one escape this row does take is the one that gives the
                 # message box back with the offer still waiting.
                 ("esc", "later"),
-                ("^↑^↓", "panel"),
+                ("tab ^↑^↓", "cycle"),
             ]
         if self.focus == DECISION:
             decision = self.session.decision
@@ -1784,7 +1805,7 @@ class RowUI:
                 ("y", "approve"),
                 ("n", "deny"),
                 ("esc", "deny, no reason"),
-                ("^↑^↓", "panel"),
+                ("tab ^↑^↓", "cycle"),
             ]
         if self.focus == INPUT:
             # Spelled out rather than built from ``common`` so that send and
@@ -1793,7 +1814,7 @@ class RowUI:
             return [
                 ("enter", "send"),
                 ("esc esc", "stop"),
-                ("^↑^↓", "panel"),
+                ("tab ^↑^↓", "cycle"),
                 ("⇧enter", "new line"),
                 ("⇧tab", "mode"),
                 # No word-motion, selection or cut-word pair here: they are
@@ -1801,20 +1822,29 @@ class RowUI:
                 # fingers or looks up once, and a footer that lists them
                 # spends its width — the row wraps, and the pairs that wrap
                 # off the end are the ones at the back — on keys nobody scans
-                # the footer for. "? keys" still names all three.
+                # the footer for. The help screen still names all three.
                 ("^l", "switch llm"),
                 ("^u", "clear"),
                 ("^e", "$editor"),
-                ("?", "keys"),
+                # And no "? keys": "?" is a character here, not a key. It goes
+                # into the draft, so a footer that offered it would be naming
+                # something pressing it does not do.
             ]
-        rows = [("↑↓", "line"), ("→←", "open"), ("⇧→←", "open all")]
+        if self.focus == SESSIONS:
+            # Named for what the arrows do *here*: a session row folds its
+            # project's list away and back, where the chat's arrows open the
+            # body of the turn under the cursor. Same keys, different verb, so
+            # the footer says the verb that is true on this row.
+            rows = [("↑↓", "line"), ("→←", "exp./coll."), ("⇧→←", "exp./coll. all")]
+        else:
+            rows = [("↑↓", "line"), ("→←", "open"), ("⇧→←", "open all")]
         if self.focus == SESSIONS and self.session_pane.here() == NEW_SESSION_KEY:
             # The three session keys do nothing on this row, so the footer
             # does not offer them: a key list that lies is worse than a short
             # one (specs/specs-ui-acceptance.md, "rename keys are inert").
             rows += [("enter", "start a session")]
         elif self.focus == SESSIONS:
-            rows += [("enter", "switch"), ("r", "rename"), ("t", "retitle"), ("d", "delete")]
+            rows += [("enter", "open"), ("r", "rename"), ("t", "retitle"), ("d", "delete")]
         elif self.focus == CHAT:
             rows += [("enter", "rollback/fork"), ("c", "copy")]
         else:

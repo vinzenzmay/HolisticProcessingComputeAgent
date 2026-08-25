@@ -194,7 +194,10 @@ class TestTheMenu:
 
     def test_the_footer_offers_the_menu_keys(self):
         foot = plain(press(app(), "/").render(160, 40)[-1])
-        assert "⇥ complete" in foot and "↑↓ pick" in foot
+        assert "tab complete" in foot and "↑↓ pick" in foot
+        # And not the ring's "tab cycle": tab fills a name in while the menu
+        # is up, which is the whole reason the menu names it.
+        assert "tab ^↑^↓ cycle" not in foot
 
 
 class TestFrequencyOrdering:
