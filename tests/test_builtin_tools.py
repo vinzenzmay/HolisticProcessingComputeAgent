@@ -155,6 +155,85 @@ class TestCreateScript:
         assert "skipping 22 more lines" in script_path("x", ctx).read_text()
 
 
+class TestScriptNameCarryingItsOwnSuffix:
+    """The observed loop: the model writes the name the way every script it has
+    ever read is written — `validate_hg002.sh` — the kind's suffix is appended
+    to that, and the file lands as `validate_hg002.sh.sh`. Self-consistent, so
+    nothing refuses it and the doubled name comes straight back out of the
+    result the model then quotes into run_bash."""
+
+    async def test_a_bash_name_ending_in_sh_is_not_doubled(self, tools, ctx):
+        result = await call(
+            tools, "create_script", ctx,
+            kind="bash", name="validate_hg002.sh", content_lines=["echo hi"],
+        )
+        assert (ctx.scripts_dir / "validate_hg002.sh").is_file()
+        assert not (ctx.scripts_dir / "validate_hg002.sh.sh").exists()
+        # and the result names the script the way the model must ask for it
+        assert "validate_hg002.sh.sh" not in result
+        assert "{validate_hg002}" in result
+
+    async def test_a_python_name_ending_in_py_is_not_doubled(self, tools, ctx):
+        await call(
+            tools, "create_script", ctx,
+            kind="python", name="report.py", content_lines=["print(1)"],
+        )
+        assert (ctx.scripts_dir / "report.py").is_file()
+        assert not (ctx.scripts_dir / "report.py.py").exists()
+
+    async def test_a_suffix_of_the_other_kind_is_stripped_too(self, tools, ctx):
+        # Same slip about the same field; the kind decides the suffix.
+        await call(
+            tools, "create_script", ctx,
+            kind="bash", name="convert.py", content_lines=["echo hi"],
+        )
+        assert (ctx.scripts_dir / "convert.sh").is_file()
+
+    async def test_a_dot_that_is_not_a_script_suffix_is_kept(self, tools, ctx):
+        await call(
+            tools, "create_script", ctx,
+            kind="bash", name="align.v2", content_lines=["echo hi"],
+        )
+        assert (ctx.scripts_dir / "align.v2.sh").is_file()
+
+    async def test_the_suffixed_name_still_resolves_afterwards(self, tools, ctx):
+        # The model that wrote `validate_hg002.sh` once will write it again, in
+        # `{braces}` and in start_background_script — it has to keep reaching
+        # the script it made.
+        await call(
+            tools, "create_script", ctx,
+            kind="bash", name="validate_hg002.sh", content_lines=["echo hi"],
+        )
+        assert script_path("validate_hg002.sh", ctx) == (
+            ctx.scripts_dir / "validate_hg002.sh"
+        )
+        assert script_path("validate_hg002", ctx) == (
+            ctx.scripts_dir / "validate_hg002.sh"
+        )
+
+    async def test_the_name_is_taken_under_either_spelling(self, tools, ctx):
+        await call(
+            tools, "create_script", ctx,
+            kind="bash", name="validate_hg002", content_lines=["echo 1"],
+        )
+        with pytest.raises(PathError, match="already exists"):
+            await call(
+                tools, "create_script", ctx,
+                kind="bash", name="validate_hg002.sh", content_lines=["echo 2"],
+            )
+
+    async def test_a_doubled_script_from_an_older_session_still_resolves(
+        self, tools, ctx
+    ):
+        # App dirs already hold `<name>.sh.sh` files written before this, and
+        # the only name they ever answered to is the doubled one.
+        ctx.scripts_dir.mkdir(parents=True, exist_ok=True)
+        legacy = ctx.scripts_dir / "old_job.sh.sh"
+        legacy.write_text("echo legacy\n")
+        assert script_path("old_job.sh", ctx) == legacy
+        assert "old_job.sh" in script_names(ctx)
+
+
 class TestReadFile:
     async def test_reads_registered_file(self, tools, ctx, tmp_path):
         f = tmp_path / "data.txt"

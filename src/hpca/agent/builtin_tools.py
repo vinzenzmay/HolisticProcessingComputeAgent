@@ -93,8 +93,18 @@ class CreateScriptParams(BaseModel):
             "create_file instead"
         )
     )
+    # "without a suffix" alone lost to every script the model has ever read,
+    # all of which are written `something.sh` — so it sent one, and the suffix
+    # `kind` implies was appended to it (`validate_hg002.sh.sh`). The example is
+    # here because a shape shown beats a prohibition stated;
+    # ``strip_script_suffix`` is the net under it, for when this loses too.
     name: str = Field(
-        pattern=KEY_PATTERN, description="Name for the script, without a suffix"
+        pattern=KEY_PATTERN,
+        description=(
+            "Name for the script, with NO suffix — the .sh or .py follows "
+            "from kind and is added for you. Write 'validate_hg002', never "
+            "'validate_hg002.sh'"
+        ),
     )
     # An array of lines, not one string: the live model reliably fills string
     # arrays but mangles \n escapes in long strings under guided decoding.
@@ -104,20 +114,50 @@ class CreateScriptParams(BaseModel):
     )
 
 
+def strip_script_suffix(name: str) -> str:
+    """``validate_hg002.sh`` -> ``validate_hg002``; anything else unchanged.
+
+    The name a script is *called* carries no suffix — create_script appends the
+    one its kind implies. But every script the model has ever seen written down
+    is written `something.sh`, and "without a suffix" in a field description
+    does not outweigh that: it sends `validate_hg002.sh`, the suffix is appended
+    to what it sent, and the file lands as `validate_hg002.sh.sh`. Nothing then
+    breaks loudly — the doubled name is self-consistent, so every lookup keeps
+    working and the model keeps reading `.sh.sh` back out of its own results.
+    That is worse than a refusal, because it is a mistake with no feedback edge.
+
+    Stripping is safe because a name that genuinely wants to end in `.sh` cannot
+    be told apart from this slip by shape, and the slip is the overwhelmingly
+    likelier reading. Both suffixes go, not only the one the chosen kind
+    implies: `name='x.py', kind='bash'` is the same slip about the same field.
+    """
+    path = Path(name)
+    return path.stem if path.suffix in KIND_BY_SUFFIX and path.stem else name
+
+
 def script_path(name: str, ctx: object) -> Path | None:
     """The kept script called ``name``, or None.
 
     A script's name IS its file name in the scripts dir, so there is nothing to
     look up: the two suffixes are tried in turn. That is the whole of what the
     registry did for scripts, minus the table.
+
+    A name that arrives carrying its own suffix resolves too, so a model that
+    writes `{validate_hg002.sh}` in a run_bash line reaches the script
+    create_script kept as `validate_hg002`. The literal form is tried first,
+    which is what keeps a `validate_hg002.sh.sh` written before
+    ``strip_script_suffix`` existed reachable under the only name it ever had.
     """
     scripts_dir = getattr(ctx, "scripts_dir", None)
     if scripts_dir is None:
         return None
-    for suffix in SCRIPT_SUFFIX.values():
-        candidate = Path(scripts_dir) / f"{name}{suffix}"
-        if candidate.is_file():
-            return candidate
+    stripped = strip_script_suffix(name)
+    candidates = (name,) if stripped == name else (name, stripped)
+    for candidate_name in candidates:
+        for suffix in SCRIPT_SUFFIX.values():
+            candidate = Path(scripts_dir) / f"{candidate_name}{suffix}"
+            if candidate.is_file():
+                return candidate
     return None
 
 
@@ -240,14 +280,20 @@ async def check_script_content(
 
 async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
     ctx.scripts_dir.mkdir(parents=True, exist_ok=True)
-    path = ctx.scripts_dir / f"{args.name}{SCRIPT_SUFFIX[args.kind]}"
+    # The name the script is kept under, which is not always the one that was
+    # sent: a `.sh`/`.py` the model wrote out itself would otherwise be doubled
+    # against the suffix the kind implies (see ``strip_script_suffix``). Done
+    # here rather than in the params model so the whole function — the taken
+    # check, the file, and what the result calls the script — speaks one name.
+    name = strip_script_suffix(args.name)
+    path = ctx.scripts_dir / f"{name}{SCRIPT_SUFFIX[args.kind]}"
     # Fail before writing anything, so a late refusal cannot leave a half-made
     # script behind. A name is free exactly when no kept script answers to it —
     # which now needs no table to decide, only the directory.
     taken = script_path(args.name, ctx)
     if taken is not None:
         raise PathError(
-            f"Script {args.name!r} already exists ({taken}); "
+            f"Script {name!r} already exists ({taken}); "
             f"{hints.SCRIPT_NAME_EXISTS}"
         )
     for number, line in enumerate(args.content_lines, 1):
@@ -293,9 +339,9 @@ async def create_script(args: CreateScriptParams, ctx: ToolContext) -> str:
     note = f" ({'; '.join(warnings)})" if warnings else ""
     strict = f" {hints.BASH_STRICT_MODE}" if args.kind == "bash" else ""
     return (
-        f"Created script {args.name!r} at {path} ({args.kind}); "
+        f"Created script {name!r} at {path} ({args.kind}); "
         f"syntax check ok{note}. Start it with start_background_script, or run "
-        f"it now with run_bash: {{{args.name}}} expands to its path.{strict}"
+        f"it now with run_bash: {{{name}}} expands to its path.{strict}"
     )
 
 
