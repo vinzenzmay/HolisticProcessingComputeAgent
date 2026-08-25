@@ -46,7 +46,7 @@ write to — change one and HPCA silently discovers nothing.
 * **Provide sources**: This agent has the thinking power but not the knowledge: always provide sources if you ask about facts.
 * **No web-search**: Sources must be lokal. HPCA is forbidden to web-search.
 * **Knowledge is power**: Let HPCA index any documentation or source code, so it can never invent facts. `please index this ~/my-source/`
-* **small context = smart agent**: if you do large chunks of work, ask the agent to write a **plan.md** and then let it execute it step by step and use `/compact` in between each sttep to keep the agent clever.
+* **small context = smart agent**: if you do large chunks of work, ask the agent to write a **plan.md** and then let it execute it step by step and use `/compact` in between each sttep to keep the agent clever. context size <= 35k is good.
 * **Memory makes you fast**: form memories with `\memorize [text]` so that you don't need to tell the agent every single time where the project files are or that you use conda.
 
 ## Workings under the hood
