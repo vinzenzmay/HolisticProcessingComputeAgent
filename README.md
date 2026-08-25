@@ -207,7 +207,7 @@ vLLM or Slurm and walks the whole way:
    grep. Each explains a disappointing result on its own.
 
 What you end up with: `Qwen3.8-27B-FP8` on port 20001 with a 262k context window
-on two L40s (112k on one), ~47 tokens/s, and an embedding sidecar on port 20000
+on two L40s at ~60 tokens/s, and an embedding sidecar on port 20000
 that document search uses. The job announces itself, so HPCA on the cluster
 connects with nothing configured — but see the endpoints-directory warning under
 [The LLM behind it](#the-llm-behind-it) if you are not on the BIH cluster. From
