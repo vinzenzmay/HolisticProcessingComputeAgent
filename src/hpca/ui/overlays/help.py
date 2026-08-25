@@ -16,14 +16,16 @@ class HelpOverlay(Overlay):
         (
             "anywhere",
             [
-                ("^↑ ^↓", "move between rows (tab / shift-tab outside the box)"),
+                ("^↑ ^↓", "move between rows — tab cycles on too, from"),
+                ("", "every row and from the message box"),
                 ("esc esc", "stop the agent, from any row — one esc does nothing"),
                 ("m", "manage llms — sessions row only"),
                 ("a", "profiles & learnings — sessions row only"),
                 ("c", "config editor — anywhere but the chat row"),
                 ("^l", "switch llm for this session"),
                 ("/thinking", "how hard this session's model reasons"),
-                ("?", "this list"),
+                ("?", "this list — from one of the three rows, where"),
+                ("", "it is not a character somebody is typing"),
                 ("q", "quit"),
             ],
         ),
@@ -82,6 +84,7 @@ class HelpOverlay(Overlay):
             "message box",
             [
                 ("enter", "send"),
+                ("tab", "cycle on to the watchers row"),
                 ("shift-tab", "cycle this session's agent mode — only here"),
                 ("⇧enter", "new line (alt-enter and ^j too)"),
                 ("↑ ↓", "move one screen line; from the top/bottom line, your"),
