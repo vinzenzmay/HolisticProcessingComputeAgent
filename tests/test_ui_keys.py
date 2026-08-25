@@ -262,3 +262,17 @@ def test_the_newline_key_decodes(data: bytes, name: str):
 
 def test_plain_return_is_still_a_send():
     assert keys(b"\r") == ["enter"]
+
+
+# ------------------------------------------------------------ undo and redo
+
+
+@pytest.mark.parametrize("data,name", [(b"\x1a", "ctrl-z"), (b"\x19", "ctrl-y")])
+def test_the_undo_keys_decode(data: bytes, name: str):
+    assert keys(data) == [name]
+
+
+def test_ctrl_z_is_named_rather_than_typed():
+    # ISIG is off under raw mode, so ^Z arrives here as a byte instead of
+    # suspending the process; before it was named it was dropped on the floor.
+    assert keys(b"a\x1ab") == ["a", "ctrl-z", "b"]

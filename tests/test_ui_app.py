@@ -23,7 +23,7 @@ from hpca.ui.app import (
 from hpca.ui import demo
 from hpca.ui.demo import build
 from hpca.ui.keys import PASTE, decode
-from hpca.ui.state import Interrupt
+from hpca.ui.state import ChatEntry, Interrupt
 from tests.ui_harness import (
     clocked,
     footer,
@@ -1358,3 +1358,139 @@ class TestOnlyOneRowIsEverInverted:
         assert len(picked) == 1
         ui.focus = INPUT
         assert picked[0] not in ui.render(96, 30)
+
+
+# ------------------------------------------------- the message history (↑/↓)
+
+
+def with_messages(*texts: str, width: int = 120, height: int = 40) -> RowUI:
+    """A UI whose chat is exactly these messages of the user's, in the box."""
+    ui = in_the_box()
+    ui.session.reset(
+        [
+            ChatEntry(kind="user", text=text, seq=i + 1, index=i)
+            for i, text in enumerate(texts)
+        ]
+    )
+    ui.render(width, height)  # the box learns its width; ↑/↓ measure at it
+    return ui
+
+
+def test_up_on_an_empty_box_recalls_the_last_message():
+    ui = with_messages("first", "second")
+    ui.handle("up", 120, 40)
+    assert ui.input.text() == "second"
+
+
+def test_up_again_walks_further_back():
+    ui = with_messages("first", "second")
+    ui.handle("up", 120, 40)
+    ui.handle("up", 120, 40)
+    assert ui.input.text() == "first"
+
+
+def test_it_stops_at_the_oldest_rather_than_wrapping():
+    ui = with_messages("first", "second")
+    for _ in range(5):
+        ui.handle("up", 120, 40)
+    assert ui.input.text() == "first"
+
+
+def test_down_walks_back_towards_the_newest():
+    ui = with_messages("first", "second")
+    ui.handle("up", 120, 40)
+    ui.handle("up", 120, 40)
+    ui.handle("down", 120, 40)
+    assert ui.input.text() == "second"
+
+
+def test_down_past_the_newest_gives_the_draft_back():
+    ui = with_messages("first", "second")
+    typed(ui, "half a thought")
+    ui.handle("up", 120, 40)
+    assert ui.input.text() == "second"
+    ui.handle("down", 120, 40)
+    assert ui.input.text() == "half a thought"
+
+
+def test_the_stashed_draft_comes_back_with_its_cursor():
+    ui = with_messages("first")
+    typed(ui, "abcdef")
+    ui.input.col = 3
+    ui.handle("up", 120, 40)
+    ui.handle("down", 120, 40)
+    assert (ui.input.row, ui.input.col) == (0, 3)
+
+
+def test_a_recalled_message_is_navigable_with_the_same_arrows():
+    # The edge rule: ↑ from anywhere but the top line moves the cursor.
+    ui = with_messages("alpha", "one\ntwo\nthree")
+    ui.handle("up", 120, 40)
+    assert ui.input.text() == "one\ntwo\nthree"
+    ui.handle("up", 120, 40)  # from the last line to the middle one
+    assert ui.input.text() == "one\ntwo\nthree"
+    assert ui.input.row == 1
+
+
+def test_and_steps_back_once_it_reaches_the_top_line():
+    ui = with_messages("alpha", "one\ntwo")
+    ui.handle("up", 120, 40)
+    ui.handle("up", 120, 40)  # onto the top line of the recalled message
+    ui.handle("up", 120, 40)  # and off it, to the older message
+    assert ui.input.text() == "alpha"
+
+
+def test_the_same_message_twice_running_is_recalled_once():
+    ui = with_messages("first", "again", "again")
+    ui.handle("up", 120, 40)
+    ui.handle("up", 120, 40)
+    assert ui.input.text() == "first"
+
+
+def test_a_session_with_nothing_sent_leaves_the_arrows_alone():
+    ui = with_messages()
+    typed(ui, "a draft")
+    ui.handle("up", 120, 40)
+    assert ui.input.text() == "a draft"
+
+
+def test_editing_ends_the_browse():
+    ui = with_messages("first", "second")
+    ui.handle("up", 120, 40)
+    typed(ui, "!")
+    assert ui.input.text() == "second!"
+    # A fresh browse, not a continuation: the edited text is what gets stashed.
+    ui.handle("up", 120, 40)
+    assert ui.input.text() == "second"
+    ui.handle("down", 120, 40)
+    assert ui.input.text() == "second!"
+
+
+def test_the_command_menu_still_owns_the_arrows():
+    ui = with_messages("first", "second")
+    typed(ui, "/")
+    ui.handle("up", 120, 40)
+    assert ui.input.text() == "/"
+
+
+def test_leaving_the_box_ends_the_browse():
+    ui = with_messages("first", "second")
+    ui.handle("up", 120, 40)
+    ui.handle("ctrl-up", 120, 40)
+    assert ui.session.history is None
+
+
+def test_a_send_forgets_the_undo_stack():
+    ui = in_the_box()
+    typed(ui, "a message")
+    ui.handle("enter", 120, 40)
+    assert ui.input.text() == ""
+    ui.handle("ctrl-z", 120, 40)
+    assert ui.input.text() == ""
+
+
+def test_ctrl_z_still_undoes_what_is_being_written():
+    ui = in_the_box()
+    typed(ui, "alpha beta")
+    ui.handle("ctrl-z", 120, 40)
+    assert ui.input.text() == "alpha "

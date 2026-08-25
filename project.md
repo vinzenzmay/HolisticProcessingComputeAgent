@@ -182,6 +182,25 @@ Terminals in 2026 are assumed wider than 80 columns
     the last 300 characters of the log (a toast that expires, not a screen to
     dismiss), `(d)` stops watching and removes the box, `alt+↑` / `alt+↓` carry
     it past its neighbour. The log itself is never touched.
+  * *Entry (message box):* **Enter** sends and `alt`/`shift`+**Enter** opens a
+    new line; **⇧tab** changes the mode and `ctrl+l` the model; `ctrl+e` opens
+    the draft in `$EDITOR`; `ctrl+u` empties it. **`ctrl+z` / `ctrl+y`** undo
+    and redo inside it — a run of typing undoes a word at a time, a paste
+    undoes whole, and a send starts the stack again, because a message already
+    sent is reached through the history rather than by putting a copy of it
+    back in the box. The same two keys work in every other buffer that takes
+    typing (the config editor, a profile's learnings): the undo lives in
+    `ui.editor.Editor`, which all three share.
+    **↑ / ↓** walk this session's own messages, the way a shell walks its
+    history — read out of the chat log itself, so there is no second copy and a
+    session closed and reopened still has it. They step only from the *edges*:
+    ↑ from the top screen line and ↓ from the bottom one, so a recalled
+    multi-line message is still navigable with the arrows that recalled it. The
+    draft in the box when the walk starts is stashed as the newest entry, so
+    one ↓ brings it back verbatim and a stray ↑ mid-sentence costs nothing.
+    Editing ends the walk. `/`-commands are not in it — only a real submission
+    becomes a chat entry — and while a command is being named the `/` menu owns
+    ↑/↓ as it always did.
 
 The right column held the session's own run history too — every subprocess and
 sbatch hpca had started, under a "── this session ──" heading, with **Enter** to
@@ -243,6 +262,11 @@ reserved rule still holds — under zellij or tmux the keypress may never arrive
 so `shift+↑` / `shift+↓` are bound to the same action as a fallback, the same
 belt-and-braces as `ChatInput.NEWLINE_KEYS`. Treat that pairing as the pattern
 for any future binding that has to use a reserved key.
+
+`ctrl+z` is *not* on the list, which is worth saying because it looks as though
+it should be: the UI puts the terminal in raw mode, so ISIG is off and ^Z
+arrives as a byte instead of suspending the process. It and `ctrl+y` are undo
+and redo in the editors (§3.3).
 
 Otherwise prefer a bare letter gated (via `check_action`) to a non-typing
 column, or a safe `ctrl` combo (`ctrl+l`, `ctrl+e`, `ctrl+r`, …). Keep this list

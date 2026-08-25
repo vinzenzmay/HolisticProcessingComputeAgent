@@ -1,3 +1,3 @@
 """HolisticProcessingComputeAgent."""
 
-__version__ = "0.32.2"
+__version__ = "0.33.0"

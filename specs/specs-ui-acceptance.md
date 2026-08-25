@@ -516,6 +516,40 @@ off file by file.
 - A parked `/…` draft brings its autocomplete menu back with it; a session with
   no draft does not inherit the previous menu.
 
+## Undo in an editor — `test_ui_editor.py`
+
+`ctrl+z` / `ctrl+y` in every buffer that takes typing: the message box, the
+config editor and a profile's learnings.
+
+- A run of typed characters undoes as one step, broken after whitespace, so one
+  press takes back one word; a run of backspaces is one step too.
+- A paste undoes whole, however many lines it turned out to be. So does a
+  newline, a word deletion, `ctrl+u`, and anything that replaces a selection.
+- Moving the cursor ends the run: what is typed after it is a step of its own.
+- Undo restores the cursor to where the edit began, and leaves nothing selected.
+- Redo goes forward as far as the last undo went; a new edit discards it.
+- The stack is capped, and the oldest steps are dropped rather than the newest.
+- A send forgets the stack: what has gone to the core is reached through the
+  history below, not by undoing the box back into holding a copy of it.
+
+## Message history — `test_ui_app.py`
+
+↑/↓ in the message box walk this session's own messages, taken from the chat
+log, so they come back with a conversation that is closed and reopened.
+
+- ↑ steps back only from the top screen line of the box, ↓ forward only from the
+  bottom one; anywhere else in a recalled multi-line message the arrows move the
+  cursor as they always did.
+- The draft in the box when the walk begins is stashed as the newest entry: ↓
+  past the newest restores it, cursor and all.
+- ↑ stops at the oldest rather than wrapping.
+- The same message twice running is recalled once.
+- A session with nothing sent in it leaves the arrows to the cursor.
+- Editing ends the walk and drops the stash; so do escape, sending, leaving the
+  box and switching session.
+- The `/` menu still owns ↑/↓ while a command is being named.
+- A recall does not go on the undo stack: the other arrow is the way back.
+
 ## Slash-command menu — `test_tui_autocomplete.py`
 
 - Command usage counts are recorded and read back.

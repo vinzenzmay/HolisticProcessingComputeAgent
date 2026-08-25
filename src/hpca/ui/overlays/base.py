@@ -418,6 +418,7 @@ class EditorOverlay(Overlay):
         return [
             ("↑↓←→", "move"),
             ("^u", "clear"),
+            ("^z ^y", "undo / redo"),
             ("esc", "back — asks to keep changes"),
         ]
 

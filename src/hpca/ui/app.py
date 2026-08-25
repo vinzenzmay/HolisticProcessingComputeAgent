@@ -993,6 +993,12 @@ class RowUI:
         if session_id == self.active_id:
             self.note = "already open"
             return
+        # The browse the session being left was in the middle of. The draft
+        # stays — it is that session's, and parking one is the point — but a
+        # half-walked history is a gesture, not a document, and coming back to
+        # a box whose ↑ resumes a walk begun before you went away reads as the
+        # key having a memory it should not have.
+        self.session.end_history()
         self.open_session(session_id)
 
     def toast(
@@ -1951,6 +1957,7 @@ class RowUI:
             review.comment.insert_text(text)
             return
         self.focus = INPUT
+        self.session.end_history()
         self.input.insert_text(text)
 
     def _closed(self, overlay: Overlay) -> None:
@@ -2621,10 +2628,19 @@ class RowUI:
         return True
 
     def _handle_input(self, key: str) -> bool:
+        # What tells an edit from a motion, and so what ends a browse through
+        # the message history: anything that *changes* the draft drops the
+        # stash and hands ↑/↓ back to the cursor. Read here rather than in
+        # each branch because the edit can happen four levels down — a paste,
+        # the "/" menu filling in a name, the draft coming back from $EDITOR.
+        before = self.input.revision
         if key == "esc":
+            self.session.end_history()
             self._escape()
         elif self._menu_key(key):
             pass  # the "/" menu had it: see `_menu_key`
+        elif key in ("up", "down") and self._history_key(key):
+            return True  # a recall: it changed the draft, and is not an edit
         elif key == "enter":
             self._send()
         elif key in NEWLINE_KEYS:
@@ -2638,6 +2654,7 @@ class RowUI:
             # up the ring, as tab is the way down; ctrl+↑ leaves the box.
             self._cycle_mode()
         elif key == "tab":
+            self.session.end_history()
             # The ring does not stop here. Tab walked the focus down every
             # other row and then went quiet at the box, where it fell through
             # to the draft as whitespace — so the one row it is hardest to
@@ -2647,8 +2664,10 @@ class RowUI:
             # this is not symmetric: the way back up is ctrl+↑.
             self.focus = WATCHERS
         elif key == "ctrl-up":
+            self.session.end_history()
             self.focus = CHAT
         elif key == "ctrl-down":
+            self.session.end_history()
             self.focus = WATCHERS
         elif key == "ctrl-l":
             # From the box too: which model answers is a thought you have while
@@ -2661,7 +2680,58 @@ class RowUI:
             return False
         else:
             self.input.handle(key)
+        if self.input.revision != before:
+            self.session.end_history()
         return True
+
+    def _history_key(self, key: str) -> bool:
+        """↑/↓ read as a walk through this session's own messages (§4.3).
+
+        The trigger is the *edge*, not an empty box: ↑ steps back only from
+        the top screen line and ↓ forward only from the bottom one, so a
+        recalled ten-line message is still navigable with the arrows that
+        recalled it. A single-line draft is on both edges at once, which is
+        why the draft is stashed on the way in — one ↓ brings it back
+        verbatim, cursor included.
+
+        False means the key was not a recall and belongs to the cursor.
+        """
+        session = self.session
+        if key == "up":
+            if not self.input.at_first_row():
+                return False
+            if session.history is None and not session.start_history(
+                self.input.text(), (self.input.row, self.input.col)
+            ):
+                return False  # nothing ever sent here: ↑ is just a cursor key
+            if session.history_at == 0:
+                # The oldest, and it stops there. Wrapping round to the newest
+                # message is a jump nobody asked for, and the key has already
+                # done all it can: at the top line there is no row to move to.
+                return True
+            session.history_at -= 1
+        else:
+            if session.history is None or not self.input.at_last_row():
+                return False
+            if session.history_at >= len(session.history) - 1:
+                return True  # the stashed draft is already back
+            session.history_at += 1
+        self._recall()
+        return True
+
+    def _recall(self) -> None:
+        """Put the message the browse is pointing at into the box."""
+        session = self.session
+        assert session.history is not None
+        self.input.replace(session.history[session.history_at])
+        if session.history_at == len(session.history) - 1:
+            # Back at the stash, so the cursor goes back where it was too —
+            # a ↑ pressed by accident mid-sentence must put the sentence back
+            # the way it found it, not with the cursor at the end.
+            row, col = session.history_home
+            self.input.row = max(0, min(row, len(self.input.lines) - 1))
+            self.input.col = max(0, min(col, len(self.input.lines[self.input.row])))
+        session.menu_at = 0
 
     def _menu_key(self, key: str) -> bool:
         """The keys the "/" menu takes while a command is being named.
@@ -2692,6 +2762,19 @@ class RowUI:
         self.session.menu_at = 0
         return True
 
+    def _clear_input(self) -> None:
+        """Empty the box for the next message, and start it clean.
+
+        The undo stack goes with the text. It is about the message being
+        written, and once that one has gone to the core the way back to it is
+        the history ↑ walks — an undo that staged a second copy of something
+        already sent would be a second mechanism for the same job, and the one
+        that does it by surprise.
+        """
+        self.input.clear()
+        self.input.reset_undo()
+        self.session.end_history()
+
     def _send(self) -> None:
         """Ask for the turn. The row it becomes comes back as a `chat.append`.
 
@@ -2712,7 +2795,7 @@ class RowUI:
             self.note = "no session open"
             return
         self.send(Submit(self.active_id, text))
-        self.input.clear()
+        self._clear_input()
         self.note = "sent"
 
     # The three built-ins this side answers by drawing something instead of
@@ -2734,7 +2817,7 @@ class RowUI:
                 self.note = "no session open"
                 return
             self.send(Submit(self.active_id, text, forced_skill=name))
-            self.input.clear()
+            self._clear_input()
             self.note = f"sent, with the “{name}” skill"
             return
         if name not in commands.BUILTIN_NAMES:
@@ -2751,7 +2834,7 @@ class RowUI:
             # refuse. Picking a thinking level while the model is thinking is
             # the case that makes the point.
             if self._screen_command(name, args):
-                self.input.clear()
+                self._clear_input()
                 return
         if self.session.turn.busy:
             # A command that *does* reach the core acts on the UI and runs its
@@ -2767,7 +2850,7 @@ class RowUI:
             # `/skill-creator <request>`, which is a model call — answered
             # here, behind the guard, where the rest of the core-bound
             # commands are.
-            self.input.clear()
+            self._clear_input()
             return
         command = next(x for x in commands.BUILTINS if x.name == name)
         if command.session and not self.active_id:
@@ -2792,7 +2875,7 @@ class RowUI:
         # the *fold*, which now happens a review later or not at all
         # (`_resolve_compact`). Marking it stale on the keystroke
         # would draw the `~` over a summary the user is about to discard.
-        self.input.clear()
+        self._clear_input()
         self.note = f"/{name}"
 
     def _asks_the_core(self, name: str, args: str) -> bool:
@@ -2821,7 +2904,7 @@ class RowUI:
                 # the wait is a spinner in the conversation, which is where
                 # the core reports it.
                 self.send(DraftSkill(self.profile, args, self.active_id))
-                self.input.clear()
+                self._clear_input()
                 self.note = "drafting a skill…"
                 return True
             self.overlay = self._skill_form()
@@ -3097,6 +3180,12 @@ class RowUI:
         it replaced is gone, so the one case that can lose work says so.
         """
         draft.set_text(text)
+        # The session that *owns* this draft, which need not be the one on
+        # screen: the answer arrives from `client.py` whenever the editor
+        # exits, and the user may have switched away in the meantime.
+        for session in self._states.values():
+            if session.draft is draft:
+                session.end_history()
         self.focus = INPUT
         if not text.strip():
             self.toast("the editor left the message empty", "warning")

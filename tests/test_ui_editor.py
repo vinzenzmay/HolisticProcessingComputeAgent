@@ -256,3 +256,139 @@ class TestPasting:
         editor.insert_text("cd")
         assert editor.text() == "abcd"
         assert editor.row == 0
+
+
+def typed(text: str, editor: Editor | None = None) -> Editor:
+    """`text` typed one key at a time, which is what makes it undoable in the
+    runs a person would expect rather than in one lump."""
+    editor = Editor("", wrap=True) if editor is None else editor
+    for ch in text:
+        editor.handle(ch)
+    return editor
+
+
+class TestUndo:
+    def test_a_typed_word_comes_back_in_one_press(self):
+        editor = typed("hello world")
+        assert editor.undo() is True
+        assert editor.text() == "hello "
+
+    def test_the_word_before_it_takes_a_second_press(self):
+        editor = typed("hello world")
+        editor.undo()
+        editor.undo()
+        assert editor.text() == ""
+
+    def test_an_empty_stack_says_so(self):
+        assert Editor("", wrap=True).undo() is False
+
+    def test_redo_puts_it_back(self):
+        editor = typed("hello world")
+        editor.undo()
+        assert editor.redo() is True
+        assert editor.text() == "hello world"
+
+    def test_typing_after_an_undo_discards_the_redo(self):
+        editor = typed("hello world")
+        editor.undo()
+        typed("there", editor)
+        assert editor.redo() is False
+        assert editor.text() == "hello there"
+
+    def test_the_cursor_goes_back_to_where_the_edit_began(self):
+        editor = Editor("alpha omega", wrap=True)
+        editor.row, editor.col = 0, 6
+        typed("beta", editor)
+        editor.undo()
+        assert (editor.row, editor.col) == (0, 6)
+
+    def test_a_paste_is_one_step_however_many_lines(self):
+        editor = Editor("", wrap=True)
+        editor.insert_text("one\ntwo\nthree")
+        editor.undo()
+        assert editor.text() == ""
+
+    def test_a_run_of_backspaces_is_one_step(self):
+        editor = typed("abcdef")
+        for _ in range(3):
+            editor.handle("backspace")
+        editor.undo()
+        assert editor.text() == "abcdef"
+
+    def test_moving_the_cursor_breaks_the_run(self):
+        editor = typed("abc")
+        editor.handle("home")
+        typed("X", editor)
+        editor.undo()
+        assert editor.text() == "abc"
+
+    def test_typing_over_a_selection_is_its_own_step(self):
+        editor = marked("alpha beta", 5)
+        typed("X", editor)
+        assert editor.text() == "X beta"
+        editor.undo()
+        assert editor.text() == "alpha beta"
+
+    def test_a_word_deletion_is_one_step(self):
+        editor = typed("alpha beta")
+        editor.handle("ctrl-backspace")
+        assert editor.text() == "alpha "
+        editor.undo()
+        assert editor.text() == "alpha beta"
+
+    def test_ctrl_u_is_undoable(self):
+        editor = typed("alpha")
+        editor.handle("ctrl-u")
+        editor.handle("ctrl-z")
+        assert editor.text() == "alpha"
+
+    def test_the_keys_reach_it(self):
+        editor = typed("alpha")
+        editor.handle("ctrl-z")
+        assert editor.text() == ""
+        editor.handle("ctrl-y")
+        assert editor.text() == "alpha"
+
+    def test_the_stack_stops_at_its_depth(self):
+        from hpca.ui.editor import UNDO_DEPTH
+
+        editor = Editor("", wrap=True)
+        for _ in range(UNDO_DEPTH + 20):
+            editor.insert_text("x")  # a paste: one whole step each time
+        for _ in range(UNDO_DEPTH + 20):
+            editor.undo()
+        # The oldest steps were dropped, so it cannot get all the way back.
+        assert editor.text() == "x" * 20
+
+    def test_a_reset_forgets_both_stacks(self):
+        editor = typed("alpha")
+        editor.reset_undo()
+        assert editor.undo() is False
+        assert editor.redo() is False
+
+    def test_a_replace_leaves_the_stack_alone(self):
+        editor = typed("alpha")
+        editor.replace("something recalled")
+        editor.undo()
+        assert editor.text() == ""  # the typing, not the recall
+
+    def test_an_undo_drops_the_selection(self):
+        editor = marked("alpha beta", 5)
+        typed("X", editor)
+        editor.undo()
+        assert editor.sel_range() is None
+
+
+class TestRowEdges:
+    def test_a_fresh_buffer_is_on_both_edges(self):
+        editor = Editor("", wrap=True)
+        editor.render(20, 3, focused=True)
+        assert editor.at_first_row() and editor.at_last_row()
+
+    def test_a_wrapped_line_has_rows_between_its_edges(self):
+        editor = Editor(SPACED, wrap=True)
+        editor.render(8, 3, focused=True)
+        editor.row, editor.col = 0, 0
+        assert editor.at_first_row() and not editor.at_last_row()
+        editor.handle("end")
+        assert editor.at_last_row() and not editor.at_first_row()

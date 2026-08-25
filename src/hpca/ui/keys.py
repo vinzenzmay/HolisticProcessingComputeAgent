@@ -129,6 +129,12 @@ KEYS = {
     "\x0c": "ctrl-l",  # switch this session's LLM (§5)
     "\x13": "ctrl-s",
     "\x15": "ctrl-u",
+    # Undo and redo in whatever editor has the cursor (`editor.Editor`). Safe
+    # to take: neither is on project.md's reserved list, and ^Z cannot suspend
+    # us because raw mode has already turned ISIG off — the byte arrives here
+    # either way, and today it is silently dropped.
+    "\x1a": "ctrl-z",
+    "\x19": "ctrl-y",
     "\x03": "quit",
     "\x04": "quit",
     ESC: "esc",

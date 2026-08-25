@@ -954,6 +954,19 @@ class SessionState:
         # draft, so restoring the draft restores them. Only the cursor is
         # state, and this is the one place it can belong to the same session.
         self.menu_at = 0
+        # The messages ↑/↓ walks, while they are being walked. Per session for
+        # the same reason `menu_at` is: it is about this conversation's draft,
+        # and switching away and back must not leave a browse half-done.
+        #
+        # Snapshotted when browsing starts rather than read live, because a
+        # turn can append to the chat mid-browse — a queued message of yours
+        # becoming a real one is exactly that — and an index into a list that
+        # grew under it points at the wrong message. The draft that was in the
+        # box when browsing began is the last element, so walking forward off
+        # the end restores it: nothing typed is lost to a stray ↑.
+        self.history: list[str] | None = None
+        self.history_at = 0
+        self.history_home = (0, 0)  # the stashed draft's cursor
         # The one flush pane: its rows are prose somebody is going to select
         # with the mouse, so it spends no columns in front of them. And the
         # one spaced pane, for the same reason one level on: the rows are
@@ -1211,6 +1224,39 @@ class SessionState:
     def entry_of(self, seq: int) -> ChatEntry | None:
         row = self._rows.get(seq)
         return None if row is None else self.entries[row]
+
+    # ------------------------------------------------------- message history
+
+    def start_history(self, draft: str, cursor: tuple[int, int]) -> bool:
+        """Open a browse over this session's own messages, oldest first, with
+        ``draft`` stashed on the end. False when there is nothing to walk.
+
+        The chat log *is* the history — no second copy, no new protocol, and
+        it comes back with the conversation because reopening one replays the
+        log from the core. What it costs is that `/`-commands are not in it:
+        only a real submission becomes a chat entry, so ↑ recalls messages,
+        which is the thing the box is for.
+        """
+        texts: list[str] = []
+        for entry in self.entries:
+            if entry.kind not in OWN_MESSAGE_KINDS or not entry.text:
+                continue
+            if texts and texts[-1] == entry.text:
+                # The same message twice running is one thing to recall.
+                # Walking through three identical rows is not history, it is
+                # a key that looks broken.
+                continue
+            texts.append(entry.text)
+        if not texts:
+            return False
+        self.history = texts + [draft]
+        self.history_at = len(self.history) - 1
+        self.history_home = cursor
+        return True
+
+    def end_history(self) -> None:
+        """Stop browsing; whatever is in the box stays in it."""
+        self.history = None
 
     # ---------------------------------------------------------- the decision
 
