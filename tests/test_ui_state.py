@@ -755,7 +755,13 @@ class TestTheCompactionBoundaryDrawsAsADivider:
         assert self.row().head.startswith(f"compacted {when('2026-08-27T13:34:29+00:00')}")
 
     def test_and_is_filled_out_to_the_edge_of_the_pane(self):
-        assert self.row().fill == "─"
+        assert self.row().fill.startswith("─")
+
+    def test_dashed_rather_than_solid(self):
+        # A gapless rule is the line drawn over every panel. This is a mark
+        # inside the conversation, not the edge of one, and the gaps are what
+        # say so before the words are read.
+        assert " " in self.row().fill
 
     def test_with_a_space_before_the_rule_starts(self):
         # Otherwise the seconds run straight into the dashes.

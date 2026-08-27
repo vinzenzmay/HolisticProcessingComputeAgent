@@ -403,7 +403,12 @@ def entry_item(entry: ChatEntry, *, stamps: bool = True) -> Item:
         return Item(
             head=f'{_label("compacted", entry.at, stamps)} ',
             body=body,
-            fill="─",
+            # Dashed, not solid: a gapless rule here is the same line the
+            # pane draws over every panel, and this is not a panel edge — it
+            # is a mark inside the conversation. The gaps are what say so at
+            # a glance, and they are made of the rule's own character so the
+            # two read as the same weight rather than as two kinds of line.
+            fill="── ",
             accent=theme.faint,
             **row,
         )

@@ -142,11 +142,18 @@ class Item(Wrapped):
     kind: str = ""
     text: str = ""
     key: str = ""
-    # A head that is a *divider* rather than a sentence: run this character out
-    # to the pane's width behind the words. It is a field rather than dashes
-    # baked into `head` for the same reason `label` is a flag — the caller
-    # building the row has no width, and a head that arrived already stretched
-    # would be measured, wrapped and clipped at whatever width it guessed.
+    # A head that is a *divider* rather than a sentence: repeat this pattern
+    # out to the pane's width behind the words. It is a field rather than
+    # dashes baked into `head` for the same reason `label` is a flag — the
+    # caller building the row has no width, and a head that arrived already
+    # stretched would be measured, wrapped and clipped at whatever width it
+    # guessed.
+    #
+    # A pattern rather than one character, so a divider can be *dashed*: the
+    # chat's compaction boundary uses "── " and would otherwise be a solid
+    # rule indistinguishable from the one over every panel. Single-width
+    # characters only — the fill is cut to length by character count, which
+    # is the same thing as cell count only while that holds.
     fill: str = ""
     folds: list[Fold] = field(default_factory=list)
     # Colour inside the head line, for the one row that needs it. Everything
@@ -339,7 +346,8 @@ class Pane:
             # possible row ends, rather than one that overhangs it.
             room = width - cell_width(f"{marker}{gap}{head}")
             if room > 0:
-                head = f"{head}{item.fill * room}"
+                repeats = room // len(item.fill) + 1
+                head = f"{head}{(item.fill * repeats)[:room]}"
         lines.append((index, f"{marker}{gap}{head}", True))
         keys.append(key)
         if not opened:

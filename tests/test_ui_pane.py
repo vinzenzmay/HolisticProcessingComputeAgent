@@ -1282,6 +1282,15 @@ class TestAFilledHeadIsADivider:
         pane = Pane("chat", [Item(head="x" * (INNER + 20), fill="─")], flush=True)
         assert "─" not in self.head(pane)
 
+    def test_a_pattern_repeats_and_is_cut_to_the_edge(self):
+        # The dashed case: the rule has to stop at the same column a solid one
+        # would, whether or not the pattern divides into the room left.
+        for pattern in ("── ", "─ ", "-"):
+            pane = Pane("chat", [Item(head="compacted ", fill=pattern)], flush=True)
+            head = pane.flat(INNER)[0][1]
+            assert cell_width(head) == INNER, pattern
+            assert head.startswith(f"     compacted {pattern}"), pattern
+
     def test_the_fill_lands_behind_the_fold_marker_not_over_it(self):
         # A row that opens keeps its marker column; the rule starts after the
         # head, so the two never compete for the same cells.
