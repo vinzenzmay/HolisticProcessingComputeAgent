@@ -34,6 +34,7 @@ stat may be asked, not of how fast something draws.
 
 from __future__ import annotations
 
+import asyncio
 import re
 import sqlite3
 from datetime import datetime, timezone
@@ -86,6 +87,22 @@ JOB_WATCH_SECONDS = 15.0
 # Floor under the configured sacct cadence. Accounting is a shared database on
 # a login node, and asking it faster than this tells nobody anything new.
 MIN_JOB_POLL_SECONDS = 5.0
+
+
+def _read_process_logs(
+    change: ProcessChange,
+) -> tuple[LogFinding | None, str]:
+    """The finding and the event text for one finished process.
+
+    The two steps are held together in one function so that the whole of the
+    log reading — the triage scan and the tail that `format_process_event`
+    takes when triage found nothing — crosses to a worker thread once, rather
+    than the poller hopping threads twice per process.
+    """
+    finding = (
+        analyse_process_failure(change) if change.state != "finished" else None
+    )
+    return finding, format_process_event(change, finding)
 
 
 def panel_profile(
@@ -409,12 +426,11 @@ class Pollers:
             deps.emit(Notify(severity="warning", text=f"Process watch failed: {e}"))
             return
         for change in changes:
-            finding = (
-                analyse_process_failure(change)
-                if change.state != "finished"
-                else None
-            )
-            text = format_process_event(change, finding)
+            # Off the loop: both of these read the process's logs. The reads
+            # are bounded (hpca.filetail), but the logs sit on the cluster
+            # filesystem, and this loop has one socket with every session's
+            # commands behind it.
+            finding, text = await asyncio.to_thread(_read_process_logs, change)
             if finding is not None and finding.tier == 2:
                 # Tier 3: the keyword scan found candidates but cannot say
                 # which one caused it. That judgment is worth a model call.

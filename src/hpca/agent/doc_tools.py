@@ -238,6 +238,10 @@ async def read_manpage(args: ReadManpageParams, ctx: ToolContext) -> str:
     return "\n".join(lines)
 
 
+def _read_lines(path: Path) -> list[str]:
+    return path.read_text(errors="replace").splitlines()
+
+
 class ReadSourceParams(BaseModel):
     path: str = Field(description="Path of the source file")
     start_line: int = Field(default=1, ge=1)
@@ -248,7 +252,9 @@ async def read_source(args: ReadSourceParams, ctx: ToolContext) -> str:
     path = resolve_path(args.path, ctx.workdir)
     if not path.is_file():
         return f"Nothing to read at {path}. {hints.PATH_NOT_FOUND}"
-    lines = path.read_text(errors="replace").splitlines()
+    # Addressed by line number from either end of the range, so the read is
+    # whole-file by contract; off the loop is what is available here.
+    lines = await asyncio.to_thread(_read_lines, path)
     end = min(args.end_line, args.start_line + SOURCE_MAX_LINES - 1, len(lines))
     excerpt = lines[args.start_line - 1 : end]
     numbered = [
@@ -330,9 +336,11 @@ async def index_docs(args: IndexDocsParams, ctx: ToolContext) -> str:
         for path in sorted(root.rglob("*")):
             if path.suffix.lower() not in DOC_SUFFIXES or not path.is_file():
                 continue
-            outcome = await _rag_index_text(
-                ctx, str(path), path.read_text(errors="replace")
-            )
+            # One document at a time, and each read off the loop: a docs dir
+            # is arbitrary user content, indexing walks all of it, and every
+            # file read here is a stretch of the UI not repainting.
+            text = await asyncio.to_thread(path.read_text, errors="replace")
+            outcome = await _rag_index_text(ctx, str(path), text)
             if isinstance(outcome, str):
                 problems.append(f"{path.name}: {outcome}")
             elif outcome:
