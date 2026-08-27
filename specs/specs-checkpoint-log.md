@@ -1,8 +1,8 @@
 # Spec: log-structured checkpoints ("checkpoint log")
 
 **Status:** implemented (2026-08-27), `src/hpca/checkpointer.py`, wired in
-`src/hpca/ui/boot.py`, covered by `tests/test_checkpointer.py`. Lever C of §5;
-A and B were not needed separately and were not done. Where building it
+`src/hpca/ui/boot.py`, covered by `tests/test_checkpointer.py`. Lever C of §5; A is subsumed by
+its retention (§3.5), and B landed in half — see §5.1. Where building it
 contradicted the design, this document has been corrected to describe what
 exists — the places that moved are §3.1 (columns), §3.2 (how a channel that
 did not change is deduplicated), §3.3 (one snapshot mechanism, not two), §3.5
@@ -315,14 +315,14 @@ Three independent levers. Land them in this order; each is useful alone.
 
 What actually happened: C was built on its own. A is subsumed — retention
 (§3.5) is part of the saver, so the 1.5 GB file and the sync storm are fixed by
-the same change. B is still open and still worth doing; it is now a ~40% cut of
-a database that is already two orders of magnitude smaller, so it has stopped
-being urgent.
+the same change. B was attempted alongside C and landed in half: the `calls`
+duplication is gone, `thinking` is still in the state. §5.1 records why, because
+the reason is a fact about this codebase and not a matter of effort.
 
 | | change | file size | write per step | risk |
 |---|---|---|---|---|
 | **A** | prune superseded checkpoints (§3.5) behind today's saver | O(1) | unchanged | low |
-| **B** | shrink what is in the state (§5.1) | ~40% | ~40% | low |
+| **B** | shrink what is in the state (§5.1) | ~40% | ~40% | low — but see §5.1 |
 | **C** | this spec | O(N) | O(Δ) | medium |
 
 A is a thin `BaseCheckpointSaver` wrapper around `AsyncSqliteSaver` that after
@@ -331,18 +331,48 @@ It is hours of work, it needs no schema, and it is what stops a 1.5 GB file and
 the sync storm today. It does not reduce the per-step write, which is why it is
 not the whole answer.
 
-### 5.1 Lever B, because it makes everything else cheaper
+### 5.1 Lever B, and what it ran into
 
-`thinking` is 67 KB of a 150 KB state — as large as `messages` — and it is
-explicitly firewalled from the model (`graph.py:148`), already persisted to the
-transcript and the chatlog. It is in the checkpoint only so `TurnResult` can
-hand it back to the scheduler. `calls` stores the full unfolded `arguments`
-(`graph.py:401`) that `messages` already holds whole.
+Two duplications were named here. **`calls`** stored the full unfolded
+`arguments` that `messages` already holds whole, and **`thinking`** was 67 KB of
+a 150 KB state despite being explicitly firewalled from the model
+(`graph.py:148`).
 
-Taking both out of the checkpointed state is a ~40% cut with no interface risk
-and no dependency on C. It is a separate change with its own spec-sized
-question (where does the transcript then read them from), and it is named here
-only so the sequencing is deliberate.
+The `calls` half is **done**. `transcript.recorded_call`, applied in
+`execute_tool`, drops from a stored call record exactly what the two functions
+that ever read that dict — `call_text` and `call_target` — would drop at paint
+time: the plumbing keys, and the raw `content_lines` / `old_lines` / `new_lines`
+when the record already carries the rendered `script` block. It sits beside
+`call_arguments` so the storage rule and the rendering rule stay in one place.
+Every call record of every checkpoint of the thread in §1 was pushed through
+`call_step` before and after, with no rendering difference. Measured on that
+thread: `calls` 20.9 KB → 13.1 KB (−37%), whole state 145.6 KB → 137.8 KB
+(−5.4%).
+
+The `thinking` half is **not done**, and the sentence above that motivated it —
+"already persisted to the transcript and the chatlog" — is wrong.
+`core.service._reset_chat` rebuilds a re-opened session's entire chat from
+thread values alone,
+`build_entries(values["messages"], values["thinking"], values["calls"])`, and
+reasoning reaches the UI through no other route: the chatlog
+(`hpca.logs.SessionLog`) is append-only text that nothing reads back, and
+`episodic.py` excludes thinking deliberately. Take `thinking` out of the
+checkpoint and every re-opened session loses its reasoning boxes.
+
+So the smallest honest version is a new store, not a deletion: a `thinking`
+table in `hpca.db` with its migration; a write path, since the graph takes
+callbacks and never a db, so `_thinking` needs a hook the scheduler persists;
+three read sites (`service._reset_chat`, `service._unfinished_turn_entries`,
+`scheduler._fold_rows`); trim in `rollback_thread`, copy in `fork_thread`,
+cleanup in `adelete_thread`; and a compatibility read for sessions whose
+thinking is still in the checkpoint, without which every conversation that
+already exists loses its reasoning on first open. That is its own spec.
+`tests/test_graph.py::TestThinkingState` now pins the dependency, so the next
+attempt trips over the requirement here rather than discovering it on a cluster.
+
+After C, that remaining ~44% is a cut of a database two orders of magnitude
+smaller than the one that motivated this spec. It is still real. It is no
+longer urgent.
 
 ## 6. Cost, stated honestly
 
