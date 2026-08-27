@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from hpca.ui import theme
-from hpca.ui.ansi import BOLD, RESET, REVERSE, clip, fold, pad, rule
+from hpca.ui.ansi import BOLD, RESET, REVERSE, cell_width, clip, fold, pad, rule
 
 # How far a row's head sits from its fold marker, on the two kinds of pane.
 #
@@ -142,6 +142,12 @@ class Item(Wrapped):
     kind: str = ""
     text: str = ""
     key: str = ""
+    # A head that is a *divider* rather than a sentence: run this character out
+    # to the pane's width behind the words. It is a field rather than dashes
+    # baked into `head` for the same reason `label` is a flag — the caller
+    # building the row has no width, and a head that arrived already stretched
+    # would be measured, wrapped and clipped at whatever width it guessed.
+    fill: str = ""
     folds: list[Fold] = field(default_factory=list)
     # Colour inside the head line, for the one row that needs it. Everything
     # said above about `label` applies twice over here: the row is built plain,
@@ -325,7 +331,16 @@ class Pane:
         # opened and closed would read as the pane twitching rather than as a
         # fold.
         marker = ("▾" if opened else "▸") if item.openable else " "
-        lines.append((index, f"{marker}{gap}{item.head}", True))
+        head = item.head
+        if item.fill:
+            # To the same right edge every other line of this pane reaches —
+            # `render` reserves two columns whether or not it spends them, so
+            # filling to `width` here is a divider that ends where the longest
+            # possible row ends, rather than one that overhangs it.
+            room = width - cell_width(f"{marker}{gap}{head}")
+            if room > 0:
+                head = f"{head}{item.fill * room}"
+        lines.append((index, f"{marker}{gap}{head}", True))
         keys.append(key)
         if not opened:
             # Closed: neither its words nor its steps — both hang off the same

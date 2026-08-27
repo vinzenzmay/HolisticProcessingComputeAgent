@@ -718,3 +718,94 @@ class TestEntriesCarryTheirInstant:
             calls=[{"after": 1, "tool": "read_file", "arguments": {}}],
         )
         assert [e.at for e in entries if e.kind == "thinking"] == [""]
+
+
+class TestCompactionBoundary:
+    """The row that says where the model's verbatim view begins.
+
+    Everything above it reaches the model as a summary; everything below it
+    whole. The tests are about *where* it lands and what it may never be,
+    because the row is the only entry in a chat that is not a message.
+    """
+
+    FOLD = {
+        "upto": 2,
+        "summary": {"role": "user", "content": "earlier: the cohort was indexed"},
+        STAMP_KEY: "2026-08-27T13:34:29+00:00",
+    }
+
+    def test_no_record_draws_no_row(self):
+        entries = build_entries([USER_MSG, ANSWER], [])
+        assert "compaction" not in kinds(entries)
+
+    def test_it_lands_in_front_of_the_first_message_still_seen_whole(self):
+        entries = build_entries(
+            [USER_MSG, ANSWER, USER_MSG, ANSWER], [], compacted=self.FOLD
+        )
+        assert kinds(entries) == [
+            "user",
+            "assistant",
+            "compaction",
+            "user",
+            "assistant",
+        ]
+
+    def test_it_opens_into_the_summary_that_stands_for_what_is_above(self):
+        entries = build_entries(
+            [USER_MSG, ANSWER, USER_MSG, ANSWER], [], compacted=self.FOLD
+        )
+        row = next(e for e in entries if e.kind == "compaction")
+        assert row.text == "earlier: the cohort was indexed"
+        assert row.at == "2026-08-27T13:34:29+00:00"
+
+    def test_it_is_never_a_rewind_target(self):
+        # `index` is what a fork or a rollback cuts at. This row is a view of
+        # the thread and not a message in it, so it must not name one — a
+        # fork aimed here would cut the thread at a row it does not contain.
+        entries = build_entries(
+            [USER_MSG, ANSWER, USER_MSG, ANSWER], [], compacted=self.FOLD
+        )
+        row = next(e for e in entries if e.kind == "compaction")
+        assert row.index == -1
+
+    def test_a_fold_with_no_summary_draws_nothing(self):
+        # An older build stored the key with nothing in it. A bare divider
+        # would be furniture that opens into an empty box.
+        fold = {**self.FOLD, "summary": {"role": "user", "content": ""}}
+        entries = build_entries([USER_MSG, ANSWER, USER_MSG], [], compacted=fold)
+        assert "compaction" not in kinds(entries)
+
+    def test_a_summary_stored_as_a_bare_string_still_reads(self):
+        fold = {**self.FOLD, "summary": "earlier: the cohort was indexed"}
+        entries = build_entries([USER_MSG, ANSWER, USER_MSG], [], compacted=fold)
+        row = next(e for e in entries if e.kind == "compaction")
+        assert row.text == "earlier: the cohort was indexed"
+
+    def test_a_thread_folded_before_there_were_stamps_says_nothing_about_when(self):
+        fold = {k: v for k, v in self.FOLD.items() if k != STAMP_KEY}
+        entries = build_entries([USER_MSG, ANSWER, USER_MSG], [], compacted=fold)
+        row = next(e for e in entries if e.kind == "compaction")
+        assert row.at == ""
+
+    def test_it_closes_the_thinking_box_above_it(self):
+        # A marker drawn inside an open box would read as one of its steps.
+        fold = {**self.FOLD, "upto": 3}
+        entries = build_entries(
+            [USER_MSG, STEP, ANSWER, USER_MSG], [], compacted=fold
+        )
+        assert kinds(entries) == ["user", "thinking", "assistant", "compaction", "user"]
+
+    def test_everything_folded_still_draws_the_boundary(self):
+        # `upto` at the end of the history: nothing is kept verbatim, and the
+        # row is still the truth about what the model sees.
+        fold = {**self.FOLD, "upto": 2}
+        entries = build_entries([USER_MSG, ANSWER], [], compacted=fold)
+        assert kinds(entries) == ["user", "assistant", "compaction"]
+
+    def test_a_tail_does_not_repeat_it(self):
+        # The chatlog is appended to, and a boundary redrawn per turn would
+        # file the same one once a turn. Only whole-chat callers pass it.
+        entries = build_entries(
+            [USER_MSG, ANSWER, USER_MSG, ANSWER], [], start=2
+        )
+        assert "compaction" not in kinds(entries)

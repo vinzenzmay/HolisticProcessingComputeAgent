@@ -386,6 +386,27 @@ def entry_item(entry: ChatEntry, *, stamps: bool = True) -> Item:
             accent=theme.faint,
             **row,
         )
+    if entry.kind == "compaction":
+        # A divider, not a message. The head names the moment the model's view
+        # was cut and the rest of the line is drawn out to the edge of the
+        # pane, because what this row marks is a *boundary* across the whole
+        # conversation rather than an event at a point in it — the one row
+        # here whose meaning is "everything above this is different from
+        # everything below".
+        #
+        # It opens into the summary that stands in for what is above it, which
+        # is the question a boundary immediately raises: the user can see that
+        # the context was cut, and the only useful next thing is what the model
+        # kept of it. No preview — a closed divider is a line, and one clipped
+        # line of a thousand-character summary hanging under it would read as
+        # a message somebody sent.
+        return Item(
+            head=f'{_label("compacted", entry.at, stamps)} ',
+            body=body,
+            fill="─",
+            accent=theme.faint,
+            **row,
+        )
     if entry.kind in ("event", "recall"):
         mark = "↺" if entry.kind == "recall" else "·"
         return Item(head=f"{mark} {said}", accent=theme.faint, **row)

@@ -728,3 +728,53 @@ class TestRestylingAChatThatIsAlreadyOnScreen:
         session.reset(self.rows())
         session.restyle(Display(chat_stamps=False))
         assert session.chat.items[1].body == ["done", "and dusted"]
+
+
+class TestTheCompactionBoundaryDrawsAsADivider:
+    """The fold marker: a rule across the chat, not a message in it.
+
+    Its shape is the claim — a message row has a nameplate and a preview of
+    what it hides, and this has neither, because what it marks is a boundary
+    over the whole conversation rather than something somebody said at a point
+    in it.
+    """
+
+    def row(self, **kw):
+        return entry_item(
+            ChatEntry(
+                kind="compaction",
+                text="earlier: the cohort was indexed",
+                seq=3,
+                index=-1,
+                at="2026-08-27T13:34:29+00:00",
+            ),
+            **kw,
+        )
+
+    def test_the_head_names_the_moment_the_view_was_cut(self):
+        assert self.row().head.startswith(f"compacted {when('2026-08-27T13:34:29+00:00')}")
+
+    def test_and_is_filled_out_to_the_edge_of_the_pane(self):
+        assert self.row().fill == "─"
+
+    def test_with_a_space_before_the_rule_starts(self):
+        # Otherwise the seconds run straight into the dashes.
+        assert self.row().head.endswith(" ")
+
+    def test_it_opens_into_the_summary(self):
+        assert self.row().body == ["earlier: the cohort was indexed"]
+        assert self.row().openable
+
+    def test_but_shows_none_of_it_closed(self):
+        # One clipped line of a thousand-character summary hanging under a
+        # divider would read as a message somebody sent.
+        assert self.row().preview == ""
+
+    def test_it_is_furniture_rather_than_a_nameplate(self):
+        # `label` is what draws a head bold, and the weight is there to say
+        # where one turn ends and the next begins. This says something else.
+        assert not self.row().label
+        assert self.row().accent == theme.faint
+
+    def test_turning_stamps_off_leaves_the_bare_word(self):
+        assert self.row(stamps=False).head == "compacted "

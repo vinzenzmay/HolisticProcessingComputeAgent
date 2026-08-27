@@ -231,7 +231,10 @@ class Entry(_Model):
 
     # queued is the one kind the thread has never seen: a message typed ahead
     # of a running turn, drawn as chat because that is what it will become.
+    # compaction is not a thread message either: it is the boundary row that
+    # says where the model's verbatim view begins (`transcript.COMPACTION`).
     kind: str  # user | assistant | thinking | error | event | recall | queued
+    #       | compaction
     text: str
     steps: int = 0
     reasoning_chars: int = 0

@@ -4707,8 +4707,8 @@ class TestMemoryReview:
 
 
 class TestCompact:
-    """`/compact`: write the fold, offer it, and — deliberately — do not reset
-    the chat.
+    """`/compact`: write the fold, offer it, and re-state the chat once it
+    lands.
 
     The summary is the one thing this core produces that cannot be undone from
     the front-end, so it lands only on `compact.resolve` with `accept`. Every
@@ -4876,11 +4876,14 @@ class TestCompact:
         values = await service._thread_values(session.session_id)
         assert not values.get("compacted")
 
-    async def test_the_chat_is_not_re_stated(self, service, session, llm):
-        # The rollback next to it removes messages, so only a reset can
-        # un-draw their rows. A fold writes a *view*: the stored history is
-        # untouched and every row on screen still names a message the thread
-        # has, so a reset here would be the per-turn rebuild §4.2 deletes.
+    async def test_the_chat_is_re_stated_so_the_boundary_can_be_drawn(
+        self, service, session, llm
+    ):
+        # This used to assert the opposite, and the reason it flipped is the
+        # boundary row: `build_entries` draws the fold where the model's
+        # verbatim view begins, which is a position in the MIDDLE of a chat
+        # that is already on screen. No append reaches there, so the reset is
+        # what puts it in — one rebuild per accepted fold, not per turn.
         await run_turn(service, session.session_id, "how many reads?")
         llm._outputs = ["a summary"]
         queue = subscribe(service)
@@ -4890,9 +4893,12 @@ class TestCompact:
         await wait_for(queue, "CompactProposed")
         await self.accept(service, session.session_id)
         events = await wait_for(queue, "Notify")
-        assert "ChatReset" not in kinds(events)
-        # The fill is restated, though: the measured count described the
-        # unfolded prompt.
+        assert "ChatReset" in kinds(events)
+        reset = next(e for e in events if type(e).__name__ == "ChatReset")
+        assert "compaction" in [entry.kind for entry in reset.entries]
+        # The fill is restated with it: the measured count described the
+        # unfolded prompt. The reset carries it, which is why nothing
+        # estimates twice.
         assert "ContextEstimate" in kinds(events)
 
     async def test_the_instruction_after_the_command_steers_the_summary(
@@ -5489,3 +5495,57 @@ async def _settle():
 
     for _ in range(40):
         await asyncio.sleep(0)
+
+
+class TestAnAutomaticFoldIsDrawnToo:
+    """The compaction that happens inside a turn, without anybody asking.
+
+    `/compact` folds outside a turn and resets for itself. The automatic path
+    folds in the middle of one, and the only news of it used to be the context
+    meter moving — so the boundary row would not have appeared until the
+    session was next opened. `after_turn` is where that is caught.
+    """
+
+    class Result:
+        """A turn that folded, as `graph.run_turn` reports one."""
+
+        def __init__(self, upto):
+            self.reply = "done"
+            self.interrupt = None
+            self.messages = []
+            self.thinking = []
+            self.calls = []
+            self.first_new = 0
+            self.compacted = (
+                None if upto is None else {"upto": upto, "summary": {"content": "s"}}
+            )
+
+    async def test_a_turn_that_folded_re_states_the_chat(self, service, session):
+        await run_turn(service, session.session_id, "how many reads?")
+        queue = subscribe(service)
+        await service.after_turn(session, self.Result(2), None)
+        assert "ChatReset" in kinds(await drain(queue))
+
+    async def test_a_turn_that_did_not_fold_does_not(self, service, session):
+        # The guard that keeps this from being the per-turn rebuild §4.2
+        # removed: this runs after every single turn.
+        await run_turn(service, session.session_id, "how many reads?")
+        queue = subscribe(service)
+        await service.after_turn(session, self.Result(None), None)
+        assert "ChatReset" not in kinds(await drain(queue))
+
+    async def test_and_a_second_turn_at_the_same_fold_does_not_either(
+        self, service, session
+    ):
+        await run_turn(service, session.session_id, "how many reads?")
+        await service.after_turn(session, self.Result(2), None)
+        queue = subscribe(service)
+        await service.after_turn(session, self.Result(2), None)
+        assert "ChatReset" not in kinds(await drain(queue))
+
+    async def test_but_folding_further_does(self, service, session):
+        await run_turn(service, session.session_id, "how many reads?")
+        await service.after_turn(session, self.Result(2), None)
+        queue = subscribe(service)
+        await service.after_turn(session, self.Result(6), None)
+        assert "ChatReset" in kinds(await drain(queue))

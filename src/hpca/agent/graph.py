@@ -104,6 +104,23 @@ def _append_messages(left: list, right) -> list:
     ]
 
 
+def _fold_record(upto: int, summary) -> dict:
+    """The `compacted` record, stamped with the moment the fold happened.
+
+    Stamped here rather than at either call site so the automatic path and
+    `/compact` cannot disagree about the format — it is the same ISO-8601 UTC
+    a message carries (`STAMP_KEY`), and the front-end is what turns it into a
+    local clock. The stamp is what lets the chat say *when* the model's view
+    was cut; a thread folded before it existed has none, and the row drawn for
+    it says so by leaving the time off rather than inventing one.
+    """
+    return {
+        "upto": upto,
+        "summary": summary,
+        STAMP_KEY: datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def _resolve(provider, thread_id):
     """Resolve a per-session dependency for the running ``thread_id``.
 
@@ -293,12 +310,7 @@ def build_graph(
                 await on_evict(older)
             except Exception:
                 pass  # extraction is best-effort too
-        return {
-            "compacted": {
-                "upto": already + len(older),
-                "summary": summary.message,
-            }
-        }
+        return {"compacted": _fold_record(already + len(older), summary.message)}
 
     async def orchestrator(state: AgentState, config) -> dict:
         thread_id = _thread_id(config)
@@ -625,6 +637,11 @@ class TurnResult:
     # Index of the first message this turn appended: everything from here on
     # is new, which is what the session log needs and history does not.
     first_new: int = 0
+    # The fold record as of the end of this turn (None when nothing is folded).
+    # Carried because the automatic compaction happens *inside* a turn: without
+    # it the only news of a fold is the meter moving, and the caller cannot
+    # tell a turn that folded from one that did not (`service.after_turn`).
+    compacted: dict | None = None
 
 
 async def deliver_event(graph, *, session_id: str, text: str) -> None:
@@ -732,7 +749,7 @@ async def apply_compaction(
     # otherwise infers it from the last node that wrote, which is ambiguous on
     # a thread whose most recent write was itself an external one.
     await graph.aupdate_state(
-        config, {"compacted": {"upto": upto, "summary": summary}}, as_node=START
+        config, {"compacted": _fold_record(upto, summary)}, as_node=START
     )
     return True
 
@@ -922,6 +939,7 @@ async def run_turn(
     calls = result.get("calls", [])
     interrupts = result.get("__interrupt__") or []
     plan = result.get("plan")
+    compacted = result.get("compacted")
     if interrupts:
         return TurnResult(
             reply=None,
@@ -931,6 +949,7 @@ async def run_turn(
             calls=calls,
             plan=plan,
             first_new=first_new,
+            compacted=compacted,
         )
     reply = next(
         (m["content"] for m in reversed(messages) if m["role"] == "assistant"), None
@@ -943,4 +962,5 @@ async def run_turn(
         calls=calls,
         plan=plan,
         first_new=first_new,
+        compacted=compacted,
     )
