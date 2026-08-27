@@ -1557,3 +1557,61 @@ def test_ctrl_z_still_undoes_what_is_being_written():
     typed(ui, "alpha beta")
     ui.handle("ctrl-z", 120, 40)
     assert ui.input.text() == "alpha "
+
+
+class TestTheFlashFollowsFocusWhereverItGoes:
+    """Every way focus moves lights the pane it lands on, not just the ring.
+
+    The flash used to be stamped in `_move_focus`, on the belief that walking
+    the ring was the only way focus travelled. The message box answers ctrl+↑
+    and ctrl+↓ itself, so leaving the box for the chat — one of the most
+    common moves there is — flashed nothing at all.
+    """
+
+    def ui(self, focus: int, hold: float = 0.1):
+        ui = clocked(demo.build())
+        theme.apply(flash_hold=hold)
+        ui.focus = focus
+        ui._focus_lit_at = None  # arrive without a flash; the test moves it
+        return ui
+
+    def washed(self, ui) -> list[str]:
+        return [row for row in ui.render(100, 30) if theme.flash in row]
+
+    def test_ctrl_up_out_of_the_message_box_lights_the_chat(self):
+        ui = self.ui(INPUT)
+        ui.handle("ctrl-up", 100, 30)
+        assert ui.focus == CHAT
+        assert self.washed(ui), "the pane focus arrived at is lit"
+
+    def test_ctrl_down_out_of_the_message_box_lights_the_watchers(self):
+        ui = self.ui(INPUT)
+        ui.handle("ctrl-down", 100, 30)
+        assert ui.focus == WATCHERS
+        assert self.washed(ui)
+
+    def test_tab_out_of_the_message_box_lights_too(self):
+        ui = self.ui(INPUT)
+        ui.handle("tab", 100, 30)
+        assert self.washed(ui)
+
+    def test_and_the_ring_still_does(self):
+        ui = self.ui(SESSIONS)
+        ui.handle("tab", 100, 30)
+        assert self.washed(ui)
+
+    def test_focus_re_asserted_where_it_already_is_lights_nothing(self):
+        # Half the app says `self.focus = INPUT` on a path that may or may not
+        # be a move. Only a change is one.
+        ui = self.ui(CHAT)
+        ui.focus = CHAT
+        assert self.washed(ui) == []
+
+    def test_a_screen_books_no_frame_for_a_wash_it_hides(self):
+        # Focus moves under a confirmation — `q` is pressed from a pane — and
+        # the panes are blanked behind it, so there is nothing to repaint.
+        ui = self.ui(CHAT)
+        ui.focus = SESSIONS
+        assert ui._flash_wake() is not None
+        ui.ask("really?")
+        assert ui._flash_wake() is None

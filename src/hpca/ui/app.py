@@ -325,7 +325,10 @@ class RowUI:
         self.send: Callable[[Intent], None] = send or self.intents.append
         self.session_pane = Pane("sessions", [])
         self.refresh_sidebar()
-        self.focus = CHAT
+        # The field rather than the property: `focus` lights the flash when it
+        # changes, and the pane the app opens on was not arrived at. It also
+        # runs before `self.clock` exists, which the setter reads.
+        self._focus = CHAT
         self.frame_ms = 0.0
         self._note = ""
         self.note_style = theme.warn
@@ -363,7 +366,8 @@ class RowUI:
         # When focus last *moved*, for the flash that says where it went
         # (`_flash`). None until it has moved at all: the pane the app opens
         # on was not arrived at, so lighting it would be an answer to a
-        # question nobody asked.
+        # question nobody asked. Stamped by the `focus` setter and by nothing
+        # else.
         self._focus_lit_at: float | None = None
         # Everything the overlays draw and nothing else reads. Handed in
         # rather than fetched, for the reason every screen in `overlays/` is:
@@ -608,16 +612,38 @@ class RowUI:
             )
         return session
 
-    def _move_focus(self, slots: list[int], step: int) -> None:
-        """Move focus one pane along the ring, and light the pane it lands on.
+    @property
+    def focus(self) -> int:
+        return self._focus
 
-        The flash is here rather than in `render` because this is the only
-        place that knows focus *changed* as opposed to merely being somewhere:
-        a frame drawn for any other reason must not relight the pane, or the
-        wash would come back every time a token arrived.
+    @focus.setter
+    def focus(self, slot: int) -> None:
+        """Where the keys go — and, when that *changes*, the flash saying so.
+
+        The stamp lives here because assignment is the only event that knows
+        focus moved as opposed to merely being somewhere: a frame drawn for
+        any other reason must not relight the pane, or the wash would come
+        back every time a token arrived.
+
+        It used to live in `_move_focus`, on the belief that walking the ring
+        was the only way focus travelled. It is not — the message box answers
+        ctrl+↑/ctrl+↓ itself, an arriving decision takes the cursor,
+        `_settle_focus` moves it off a pane that stopped being drawn — and
+        every one of those paths flashed nothing. Sitting on the assignment
+        instead of on one caller of it is what makes that unforgettable: the
+        next path to move focus gets the flash without knowing it exists.
+
+        Guarded on the value actually changing, so the many places that
+        re-assert the focus they already have stay silent.
         """
-        self.focus = slots[(slots.index(self.focus) + step) % len(slots)]
+        if slot == self._focus:
+            return
+        self._focus = slot
         self._focus_lit_at = self.clock()
+
+    def _move_focus(self, slots: list[int], step: int) -> None:
+        """Move focus one pane along the ring. The `focus` setter lights it."""
+        self.focus = slots[(slots.index(self.focus) + step) % len(slots)]
 
     @staticmethod
     def _wash(rows: list[str], tint: str) -> list[str]:
@@ -651,6 +677,15 @@ class RowUI:
         since nothing ever clears the timestamp.
         """
         if theme.flash_hold <= 0 or self._focus_lit_at is None:
+            return None
+        if self.overlay is not None or self.confirm is not None:
+            # The panes are not on the frame: a screen replaces them
+            # (`render`) and a confirmation blanks every row it covers
+            # (`_over_confirm`). The wash is therefore not drawn, and no
+            # repaint will make it appear. Focus still moves under both —
+            # answering an approval hands the cursor back to the box, `q` is
+            # pressed from a pane — and booking a wake for a tint nobody can
+            # see is the poll this whole list exists to avoid.
             return None
         left = theme.flash_hold - (self.clock() - self._focus_lit_at)
         return left if left > 0 else None
