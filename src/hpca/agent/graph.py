@@ -45,6 +45,7 @@ from hpca.agent.file_tools import edit_target_path
 from hpca.agent.prompts import orchestrator_system_prompt
 from hpca.agent.tools import ToolRegistry
 from hpca.llm import STAMP_KEY, Message
+from hpca.transcript import recorded_call
 
 # Fallback per-turn tool budget for callers that do not pass one. The app
 # passes llm.max_tool_rounds, whose default is -1 (no cap); a non-positive
@@ -153,12 +154,16 @@ class AgentState(TypedDict, total=False):
     # and optionally "script"/"details"} — anchored to the message index of the
     # call itself (the assistant message execute_tool appends, immediately
     # followed by the result). Kept out of `messages` because this is the
-    # record the *user* reads, and it is never folded: `messages` keeps the
-    # call whole too, but the view sent to the model describes the payload of
-    # any but the most recent few (hpca.agent.history.fold_old_payloads), and
-    # the user, who never made the call, needs the script in full — after the
-    # approval prompt is answered this is the only place it survives (see
-    # hpca.transcript.call_text).
+    # record the *user* reads, and it is never folded by age the way the
+    # model's view is (hpca.agent.history.fold_old_payloads): after the
+    # approval prompt is answered this is the only place the script survives,
+    # and the user, who never made the call, needs it in full.
+    #
+    # What it does not keep is a payload the "script" block beside it already
+    # carries — that would be the same lines twice in a state LangGraph
+    # rewrites whole every super-step. `hpca.transcript.recorded_call` draws
+    # that line, and draws it where `call_text` reads, so the record holds
+    # what the chat renders and nothing else.
     calls: Annotated[list[dict], _append]
     pending_tool: dict | None
     tool_rounds: int
@@ -404,6 +409,12 @@ def build_graph(
             call["script"] = preview
         if details:
             call["details"] = details
+        # Stored as the chat will read it, which is not always as the model
+        # made it: a payload the script block already carries whole is not
+        # kept a second time here (hpca.transcript.recorded_call). The same
+        # dict is what the live announcement below sends, so what the user
+        # watches happen and what a re-opened session shows stay one thing.
+        call = recorded_call(call)
         recorded = {"calls": [call]}
         # Full-auto is the one mode that waives the destructive gate (§3.5);
         # every other mode keeps §5.3's "always ask".
