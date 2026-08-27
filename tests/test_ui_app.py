@@ -88,8 +88,36 @@ def test_chat_offers_the_row_copy():
     assert "c copy" in footer_of(CHAT)
 
 
-def test_chat_offers_the_cuts_under_enter():
-    assert "enter rollback/fork" in footer_of(CHAT)
+def test_chat_offers_the_cuts_under_enter_on_your_own_message():
+    ui = build()
+    on_own_message(ui)
+    assert "enter rollback/fork" in footer(ui, 160)
+
+
+def test_and_not_on_the_agent_s_rows():
+    # Enter has never opened a rewind on a reply or on a turn's working — it
+    # moves the focus to the message box, which is what an Enter with nothing
+    # better to do means. The footer used to name the key on every chat row
+    # regardless, which is the kind of key list `?` exists to make unnecessary.
+    ui = build()
+    ui.focus = CHAT
+    for kind in ("assistant", "thinking"):
+        entry = next(e for e in ui.session.entries if e.kind == kind and e.seq)
+        ui.chat.show(str(entry.seq))
+        assert "enter rollback/fork" not in footer(ui, 160), kind
+        assert "c copy" in footer(ui, 160), kind
+
+
+def test_and_a_queued_message_is_named_for_what_enter_does_there():
+    # It has not reached the model, so there is no cut to offer — the one
+    # message that can simply be taken back.
+    ui = build()
+    ui.focus = CHAT
+    ui.session.append(ChatEntry(kind="queued", text="and then plot it", seq=9001))
+    ui.chat.show("9001")
+    drawn = footer(ui, 160)
+    assert "enter take it back" in drawn
+    assert "rollback/fork" not in drawn
 
 
 def test_chat_no_longer_offers_a_key_to_write():

@@ -1894,14 +1894,11 @@ class RowUI:
         elif self.focus == SESSIONS:
             rows += [("enter", "open"), ("r", "rename"), ("t", "retitle"), ("d", "delete")]
         elif self.focus == CHAT:
-            # `enter` only where it does something, the same rule the session
-            # pane's new-session row follows above: on a row above the
-            # compaction line there is nothing to rewind to, and a key list
-            # that lies is worse than a short one.
-            rows += [("c", "copy")] if self._folded_row() else [
-                ("enter", "rollback/fork"),
-                ("c", "copy"),
-            ]
+            # `enter` only where it does something, and named for what it does
+            # *there* — the same rule the session pane's new-session row
+            # follows above, and the same one the arrows follow here.
+            enter = self._chat_enter()
+            rows += ([enter] if enter else []) + [("c", "copy")]
         else:
             rows += [("enter", "peek"), ("d", "unwatch"), ("alt-↑↓", "move")]
         # Only where they do something. `m` and `a` are the sessions row's and
@@ -2472,25 +2469,35 @@ class RowUI:
 
     # -------------------------------------------------------- the chat rewind
 
-    def _folded_row(self) -> bool:
-        """Is the chat cursor on a row above the compaction line?
+    def _chat_enter(self) -> tuple[str, str] | None:
+        """The verb Enter has on the chat row under the cursor, or None.
 
-        The question the footer asks before offering `enter rollback/fork`.
+        The footer names the key only where pressing it does something, and
+        with the word that is true on that row. In the chat that is narrower
+        than the old hint claimed: Enter opens the rewind on one of your own
+        messages, offers to take back a queued one, and on everything else —
+        the agent's replies, a turn's working, the compaction line, a row at
+        or above it — it moves the focus to the message box, which is what
+        `app.py` answers an Enter it has nothing better to do with. That is
+        not a thing to advertise as "rollback/fork".
+
         `here()` rather than a position, for the reason it exists: the footer
-        has a cursor and no terminal width.
-
-        Any row, not only the user's own. Neither cut is aimed at a *message*
-        — both are aimed at a point in the conversation, and every point above
-        the fold is one the model no longer holds — so a reply, a turn's
-        working and a question are equally not rewind targets up there. The
-        footer offering the key on the agent's rows while withholding it on
-        the user's would be describing a distinction that does not exist.
+        has a cursor and no terminal width. The live working row is not an
+        entry, so it falls out here as None and names its own key inline
+        instead ("enter or esc esc to interrupt").
         """
         key = self.chat.here()
-        if not key.isdigit():
-            return False
-        entry = self.session.entry_of(int(key))
-        return entry is not None and self._no_rewind(entry)
+        entry = self.session.entry_of(int(key)) if key.isdigit() else None
+        if entry is None:
+            return None
+        if entry.kind == "queued":
+            # It has not reached the model, so there is nothing behind it to
+            # roll back to — the one message that can simply be taken back
+            # (`overlays/queued.py`).
+            return ("enter", "take it back")
+        if entry.kind in OWN_MESSAGE_KINDS and not self._no_rewind(entry):
+            return ("enter", "rollback/fork")
+        return None
 
     def _no_rewind(self, entry) -> bool:
         """Whether that row is one no cut can be aimed at.
