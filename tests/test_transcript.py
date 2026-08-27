@@ -8,6 +8,8 @@ from hpca.transcript import (
     Entry,
     build_entries,
     call_step,
+    live_step,
+    recorded_call,
     result_text,
 )
 
@@ -215,6 +217,130 @@ class TestToolCalls:
     def test_calls_are_optional(self):
         box = build_entries([USER_MSG, STEP, ANSWER], [])[1]
         assert [p.kind for p in box.parts] == ["step"]
+
+
+class TestRecordedCall:
+    """What a call record stores, against what the chat reads out of it.
+
+    The record is checkpointed state, rewritten whole once per super-step, so
+    an argument nobody renders is paid for hundreds of times. The contract is
+    that dropping it changes nothing on screen — so every case here asserts
+    the *rendering*, and only then what is missing underneath it.
+    """
+
+    LINES = [f"line {i}" for i in range(40)]
+
+    def rendered(self, call: dict) -> tuple[str, str, str]:
+        step = call_step(call)
+        return step.text, step.label(), step.body()
+
+    def test_a_payload_the_script_block_carries_is_not_stored_twice(self):
+        call = {
+            "after": 1,
+            "tool": "create_file",
+            "arguments": {"path": "/work/notes.md", "content_lines": self.LINES},
+            "script": "\n".join(self.LINES),
+        }
+        stored = recorded_call(call)
+        assert self.rendered(stored) == self.rendered(call)
+        assert "content_lines" not in stored["arguments"]
+        # every line is still one open of the chat away, from the block
+        assert all(line in stored["script"] for line in self.LINES)
+        # and the record still says which file, which is the collapsed row
+        assert stored["arguments"] == {"path": "/work/notes.md"}
+
+    def test_an_edits_two_sides_live_in_the_diff(self):
+        call = {
+            "after": 1,
+            "tool": "edit_file",
+            "arguments": {
+                "path": "/work/run.sh",
+                "old_lines": ["echo one"],
+                "new_lines": ["echo two"],
+            },
+            "script": "- echo one\n+ echo two",
+        }
+        stored = recorded_call(call)
+        assert self.rendered(stored) == self.rendered(call)
+        assert set(stored["arguments"]) == {"path"}
+
+    def test_a_payload_with_no_block_to_carry_it_is_kept(self):
+        # The other half of the rule, and the reason it is conditional: with
+        # no script the raw lines are what `call_arguments` prints, so
+        # dropping them would blank the row.
+        call = {
+            "after": 1,
+            "tool": "create_file",
+            "arguments": {"path": "/work/notes.md", "content_lines": ["one"]},
+        }
+        stored = recorded_call(call)
+        assert self.rendered(stored) == self.rendered(call)
+        assert stored["arguments"]["content_lines"] == ["one"]
+
+    def test_a_blank_preview_is_not_a_block(self):
+        # `call_text` tests the script with .strip(), so a preview of nothing
+        # but whitespace falls back to printing the arguments — and the
+        # record has to make the same call or the row loses its content.
+        call = {
+            "after": 1,
+            "tool": "run_bash",
+            "arguments": {"content_lines": ["", ""]},
+            "script": "\n",
+        }
+        stored = recorded_call(call)
+        assert self.rendered(stored) == self.rendered(call)
+        assert stored["arguments"]["content_lines"] == ["", ""]
+
+    def test_plumbing_is_never_stored(self):
+        call = {
+            "after": 1,
+            "tool": "run_bash",
+            "arguments": {"content_lines": ["ls"], "timeout_s": 30},
+            "script": "ls",
+        }
+        stored = recorded_call(call)
+        assert self.rendered(stored) == self.rendered(call)
+        assert stored["arguments"] == {}
+
+    def test_a_call_with_nothing_to_drop_is_left_alone(self):
+        call = {"after": 1, "tool": "list_dir", "arguments": {"path": "/data"}}
+        assert recorded_call(call) == call
+
+    def test_a_record_written_before_this_rule_renders_the_same(self):
+        # Sessions checkpointed by an older build still hold the full
+        # arguments. `call_arguments` has always stepped over them when there
+        # is a script, so those rows are unchanged — this is the storage
+        # side of a rule the renderer already had.
+        old = {
+            "after": 1,
+            "tool": "create_file",
+            "arguments": {"path": "/work/notes.md", "content_lines": self.LINES},
+            "script": "\n".join(self.LINES),
+        }
+        assert self.rendered(old) == self.rendered(recorded_call(old))
+
+    def test_the_step_the_user_watched_is_the_step_they_get_back(self):
+        # The live announcement and the stored record are the same dict (see
+        # the graph's execute_tool), so `live_step` and `call_step` have to
+        # agree about it — that agreement is what keeps a re-opened session
+        # from rearranging itself against what the user watched happen.
+        stored = recorded_call(
+            {
+                "after": 1,
+                "tool": "create_file",
+                "arguments": {"path": "/work/notes.md", "content_lines": self.LINES},
+                "script": "\n".join(self.LINES),
+            }
+        )
+        live = live_step({"kind": "call", **stored})
+        folded = call_step(stored)
+        assert (live.text, live.tool, live.target) == (
+            folded.text,
+            folded.tool,
+            folded.target,
+        )
+        assert (live.tool, live.target) == ("create_file", "notes.md")
+        assert all(line in live.text for line in self.LINES)
 
 
 class TestCallMessages:

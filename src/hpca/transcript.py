@@ -317,6 +317,44 @@ def call_arguments(arguments: dict, *, has_script: bool) -> str:
     return clip("\n".join(lines))
 
 
+def recorded_call(call: dict) -> dict:
+    """One call record as it is *stored*: the arguments the chat will read
+    back, and no others.
+
+    The storage half of :func:`call_arguments`, and it lives next to it so the
+    two cannot drift. The record rides in the checkpointed state, which
+    LangGraph rewrites whole once per super-step — so an argument nobody
+    renders is not stored once, it is stored a few hundred times over a
+    session, and the payload arguments are the large ones.
+
+    Exactly two functions ever read this dict, :func:`call_text` and
+    :func:`call_target`, so what is dropped here is what those two would drop
+    at paint time and nothing else:
+
+    * :data:`PLUMBING_ARG_KEYS`, which `call_arguments` never prints.
+    * :data:`SCRIPT_ARG_KEYS`, but only once the call carries a ``script``
+      block — and the same emptiness test `call_text` applies, because a
+      preview that is only whitespace is not a block and the raw lines are
+      what gets printed instead. Where there is one, that block *is* the
+      payload: the lines with their ``{key}`` references expanded, or the two
+      sides of the edit as a diff, kept whole to
+      ``modes.SCRIPT_PREVIEW_CHARS``, which is exactly why it is generous.
+
+    Nothing is lost that anyone was reading. The model's own copy of the call
+    keeps the arguments in full (`hpca.agent.history.call_json`), a message in
+    the same state; this was the second copy of them, and the unread one.
+    """
+    arguments = call.get("arguments") or {}
+    has_script = bool((call.get("script") or "").strip())
+    kept = {
+        name: value
+        for name, value in arguments.items()
+        if name not in PLUMBING_ARG_KEYS
+        and not (has_script and name in SCRIPT_ARG_KEYS)
+    }
+    return call if kept == arguments else {**call, "arguments": kept}
+
+
 def call_text(call: dict) -> str:
     """One tool call as the user reads it: what it does to what, and the script
     or the diff it would actually run.
