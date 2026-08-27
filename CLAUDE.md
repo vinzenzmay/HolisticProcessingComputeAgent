@@ -98,6 +98,18 @@ the backup API: no free pages to reclaim, and a rebuild would re-index it. And
 a periodic sync skips any database nothing has written to since it last went
 home; the final sync never skips. See §2.4–2.5 of the spec.
 
+`checkpoints.db` is not LangGraph's saver. `hpca.checkpointer.CheckpointLogSaver`
+stores `messages`/`thinking`/`calls` as an append log (`channel_items`, one row
+per item, written once) and the checkpoint as a manifest naming how much of each
+log is live — so a step's write is what it appended, not the whole conversation.
+It keeps the last 32 checkpoints per thread and nothing older, which is a
+property, not an oversight: the log is the *current* conversation, so a rewind
+overwrites what it rolled past and checkpoints before it cannot be restored.
+Nothing reads a historical checkpoint (every read is `aget_state` with no
+`checkpoint_id`). An old inline-format file is converted on first start —
+`migrate_inline_format`, off the loop, keeping the latest state per thread, with
+a notice on the wire. See specs/specs-checkpoint-log.md.
+
 Consequences when debugging: mid-run, the app dir's copies are stale by up to
 one sync interval — or longer for a database nothing is writing to, which is
 skipped entirely until it changes; `<app_dir>/dbcache.log` records recovery and
