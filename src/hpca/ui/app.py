@@ -201,7 +201,7 @@ PARKED_ON_A_DECISION = "this turn is waiting for your answer — decide it first
 # rest of that answer: the footer stops offering the key, and a press that
 # lands on the row anyway says why rather than moving the focus and looking
 # like a missed keystroke.
-BEHIND_THE_FOLD = "this message is behind the compaction line — nothing to rewind to"
+BEHIND_THE_FOLD = "nothing at or above the compaction line can be rewound to"
 
 # The title over the tunnel recipe an empty scan comes back with — the words
 # `tui/manage_llms.py` put on the same window, so a user who has seen it once
@@ -2473,24 +2473,35 @@ class RowUI:
     # -------------------------------------------------------- the chat rewind
 
     def _folded_row(self) -> bool:
-        """Is the chat cursor on one of your own messages, above the fold?
+        """Is the chat cursor on a row above the compaction line?
 
         The question the footer asks before offering `enter rollback/fork`.
         `here()` rather than a position, for the reason it exists: the footer
         has a cursor and no terminal width.
 
-        Only the rows the rewind would otherwise be offered on. An assistant
-        row has never had a rewind either and the footer has always named the
-        key there anyway; that is a separate inaccuracy and not one this
-        touches.
+        Any row, not only the user's own. Neither cut is aimed at a *message*
+        — both are aimed at a point in the conversation, and every point above
+        the fold is one the model no longer holds — so a reply, a turn's
+        working and a question are equally not rewind targets up there. The
+        footer offering the key on the agent's rows while withholding it on
+        the user's would be describing a distinction that does not exist.
         """
         key = self.chat.here()
         if not key.isdigit():
             return False
         entry = self.session.entry_of(int(key))
-        if entry is None or entry.kind not in OWN_MESSAGE_KINDS:
-            return False
-        return self.session.folded_away(entry.seq)
+        return entry is not None and self._no_rewind(entry)
+
+    def _no_rewind(self, entry) -> bool:
+        """Whether that row is one no cut can be aimed at.
+
+        Everything above the compaction line, and the line itself: the
+        boundary is a mark rather than a message (`index` -1), so a fork or a
+        rollback has nothing to name there either. Taken together they are the
+        contiguous top of the conversation, which is what makes the footer's
+        answer change exactly once as the cursor walks down.
+        """
+        return entry.kind == "compaction" or self.session.folded_away(entry.seq)
 
     def _activate_chat(self, width: int) -> None:
         """Enter in the chat log.
@@ -2504,19 +2515,21 @@ class RowUI:
             self._stop_from_the_row()
             return
         entry = self.session.entry_at(position)
+        if entry is not None and self._no_rewind(entry):
+            # At or above the fold, before anything is asked about the kind of
+            # row:
+            # nothing up there is a rewind target, the user's messages and the
+            # agent's alike, and the footer has already stopped naming the key
+            # here. Saying so beats moving the focus, which reads as a
+            # keystroke that missed.
+            self.note = BEHIND_THE_FOLD
+            self.note_style = theme.faint
+            return
         if entry is not None and entry.kind == "queued":
             # A message that has not reached the model yet: the offer is to
             # take it back, not to rewind to it (§4.3 item 34).
             self.overlay = QueuedOverlay(entry.text, entry.seq, self.active_id)
         elif entry is not None and entry.kind in OWN_MESSAGE_KINDS:
-            if self.session.folded_away(entry.seq):
-                # Above the fold: the footer has already stopped offering the
-                # key here, so this catches the press that was aimed anyway —
-                # and says why, rather than moving the focus and reading as a
-                # keystroke that missed.
-                self.note = BEHIND_THE_FOLD
-                self.note_style = theme.faint
-                return
             # The row's own name, not its position: the cut is decided by the
             # user now and carried out by the core later, and a turn appending
             # in between moves every position after it.
