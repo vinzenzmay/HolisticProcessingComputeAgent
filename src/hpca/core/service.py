@@ -162,7 +162,7 @@ from hpca.skills import (
     load_skills,
     summarize_skills,
 )
-from hpca.thinking import EFFORT_HINTS, EFFORTS, XHIGH_WARNING
+from hpca.thinking import EFFORT_HINTS, EFFORTS
 from hpca.transcript import (
     ASSISTANT,
     ERROR,
@@ -1440,12 +1440,10 @@ class AgentService:
         the level rides on `SessionRow`, so this is also the event the context
         meter's `· think medium` reads (see `protocol.SessionRow.thinking`).
 
-        xhigh gets a warning rather than a confirmation because it does not
-        work: the level is offered since the model advertises it, and a user
-        who picks it needs to be told before the first lost turn rather than
-        after it. The headline is in the title for the reason `tui/app.py`
-        gave — a toast is read in the order it is laid out, and this one has to
-        land even if the paragraph under it is skimmed.
+        Every level confirms the same way. xhigh used to answer with a warning
+        toast saying it did not work; it does work, and what is left to say
+        about the levels is how each behaves, which is the chooser's hint
+        (`thinking.EFFORT_HINTS`) rather than an alarm on one of them.
         """
         if self._known(session_id) is None:
             return
@@ -1459,16 +1457,6 @@ class AgentService:
             return
         self._sessions.set_thinking(session_id, effort)
         self._emit_rows()
-        if effort == "xhigh":
-            self._deps.emit(
-                Notify(
-                    severity="warning",
-                    title="Thinking: xhigh — NOT USABLE",
-                    text=XHIGH_WARNING,
-                    timeout=25,
-                )
-            )
-            return
         self._deps.emit(
             Notify(text=f"Thinking effort for this session: {effort}")
         )

@@ -1,10 +1,10 @@
 """`/thinking` (§4.3 item 30): how hard this session's model reasons.
 
-The four levels, what each costs, and a star on the one in force. Which levels
-exist and what they mean is `hpca.thinking`'s business and is imported rather
-than copied — a second list of them here would be the copy that disagrees with
-the server, and the whole reason `xhigh` is flagged is that a name is not
-enough to tell what a level costs.
+The four levels, what each does to a turn, and a star on the one in force.
+Which levels exist and what they mean is `hpca.thinking`'s business and is
+imported rather than copied — a second list of them here would be the copy that
+disagrees with the server, and the whole reason each level carries a hint is
+that a name is not enough to tell what it costs.
 
 Per session, like the mode and the backend, and for a sharper reason than
 either: two levels differ from the very first token of the prompt, so changing
@@ -16,27 +16,22 @@ from __future__ import annotations
 from hpca.ui.overlays.base import ListOverlay
 from hpca.ui.pane import Item
 from hpca.ui.state import SetThinking
-from hpca.thinking import (
-    EFFORT_HINTS,
-    EFFORTS,
-    XHIGH_INLINE_WARNING,
-    normalize_effort,
-)
+from hpca.thinking import EFFORT_HINTS, EFFORTS, normalize_effort
 
 NO_SESSION = "no session open — the level belongs to a conversation"
 
 
 def effort_item(effort: str, current: str) -> Item:
-    """One level: its name, the star if it is the one in force, and the cost.
+    """One level: its name, the star if it is the one in force, and the hint.
 
-    The warning rides on the option itself and not only on the toast
-    afterwards, because this is the moment the choice is made — and it says
-    "unusable" rather than "slow" because that is what was measured.
+    The hint rides on the option itself rather than on a toast afterwards,
+    because this is the moment the choice is made. Every level gets the same
+    treatment and none is flagged — the list orders them by how much they
+    think, and the hint is what says what that buys.
     """
     star = " ★" if effort == current else ""
-    warn = f"  {XHIGH_INLINE_WARNING}" if effort == "xhigh" else ""
     return Item(
-        head=f"{effort + star:<10}{EFFORT_HINTS[effort]}{warn}",
+        head=f"{effort + star:<10}{EFFORT_HINTS[effort]}",
         kind="effort",
         text=effort,
         key=effort,

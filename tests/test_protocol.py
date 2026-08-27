@@ -745,8 +745,8 @@ class TestNotifyTitle:
         # the front of `text` loses the renderer's ability to tell them apart.
         toast = Notify(
             severity="warning",
-            title="Thinking: xhigh — NOT USABLE",
-            text="any turn that writes a file is likely to be lost…",
+            title="Memory budget",
+            text="the system-prompt scope is full; condense it before adding…",
             timeout=25,
         )
         assert parse(decode(encode(toast.to_envelope()))) == toast

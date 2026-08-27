@@ -513,10 +513,17 @@ and they are the operational content of the feature:
   reassuring ones — the cut-off-decision retry (§4.3) turns the same overrun
   into a skeleton to fill rather than a dead turn, which is the behaviour the
   feature is supposed to have.
-* **`xhigh` is still not a "try harder" setting to reach for.** It is the
-  slowest by a wide margin — ~237s per thinking generation against 19.5s for
-  the same decision at `off` — and a tool-heavy turn pays that on every round.
-  The chooser says so, and `off` remains the default.
+* **`xhigh` is the slowest, and it is not flagged.** It is slowest by a wide
+  margin — ~237s per thinking generation against 19.5s for the same decision at
+  `off` — and a tool-heavy turn pays that on every round, so `off` remains the
+  default. It is not, however, unusable: it was shipped for a while with a
+  "⚠ NOT USABLE" flag in the chooser and a warning toast on selection, on the
+  strength of the lost-write rows above, and use since has been good. The flag
+  and the toast are gone (`hpca.thinking` no longer has `XHIGH_WARNING`); what
+  the chooser carries now is a one-line hint per level, which is where the
+  practical differences live: `off` suits simple tasks, `low` spends much of
+  its deliberation on correction steps, `medium` is the quickest of the three
+  that think, and `xhigh` overthinks everything.
 
 ## 4. Agent design
 

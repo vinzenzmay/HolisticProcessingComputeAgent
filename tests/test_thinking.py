@@ -19,8 +19,8 @@ from hpca.agent.tools import Tool, ToolRegistry
 from hpca.config import LLMSettings, Settings
 from hpca.llm import THINKING_TIMEOUT_S, LLMClient
 from hpca.thinking import (
+    EFFORT_HINTS,
     EFFORTS,
-    XHIGH_WARNING,
     normalize_effort,
     wire_thinking,
 )
@@ -44,13 +44,19 @@ class TestVocabulary:
         assert normalize_effort(None) == "off"
         assert normalize_effort("XHIGH") == "off"
 
-    def test_the_warning_leads_with_unusable_not_merely_slow(self):
-        # Measured: at xhigh a 200-line write lost the turn at a 4096 cap and
-        # again at 8192 (project.md §3.6). The notice has to say that outright
-        # — a user who reads only the first clause must still not pick it.
-        assert "does not currently work" in XHIGH_WARNING
-        assert "LOST" in XHIGH_WARNING
-        assert "minutes" in XHIGH_WARNING  # the cost, once the failure is stated
+    def test_every_level_carries_a_hint(self):
+        # The chooser indexes the dict directly (`overlays/thinking.py`), so a
+        # level without one is a KeyError on opening the screen.
+        assert set(EFFORT_HINTS) == set(EFFORTS)
+        assert all(EFFORT_HINTS[level] for level in EFFORTS)
+
+    def test_no_level_is_flagged_as_unusable(self):
+        # xhigh was once announced as not working. It does work, and the hints
+        # say what each level does rather than warning off one of them.
+        assert not any(
+            "NOT USABLE" in hint or "does not work" in hint
+            for hint in EFFORT_HINTS.values()
+        )
 
 
 class TestWireMapping:

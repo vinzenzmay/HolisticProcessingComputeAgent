@@ -439,10 +439,10 @@ class TestALongAnswerGetsAWindow:
         assert press(ui, "esc").overlay is None
 
     def test_a_one_liner_with_a_heading_is_still_a_toast(self):
-        # The xhigh warning is a heading over one long paragraph, and it is
-        # meant to be read and dismissed rather than opened.
+        # A heading over one long paragraph is meant to be read and dismissed
+        # rather than opened; only a genuinely multi-line body gets a window.
         ui = app()
-        ui.toast("x" * 400, title="Thinking: xhigh — NOT USABLE")
+        ui.toast("x" * 400, title="Memory budget")
         assert ui.overlay is None
 
     def test_and_so_is_a_block_with_no_heading_at_all(self):

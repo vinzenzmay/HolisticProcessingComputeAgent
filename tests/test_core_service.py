@@ -3045,18 +3045,17 @@ class TestTheTwoDials:
         assert SessionStore(conn).get(session.session_id).thinking == "medium"
         assert only(events, "Notify").severity == "information"
 
-    async def test_xhigh_says_that_it_does_not_work(self, service, session):
-        # Offered because the model advertises it, not because it is usable —
-        # and the headline is in the title so it lands even if the paragraph
-        # under it is skimmed.
+    async def test_xhigh_confirms_like_every_other_level(self, service, session):
+        # It used to answer with a warning toast saying it did not work. It
+        # does work, so it is a confirmation like the rest.
         queue = subscribe(service)
         await service.handle(
             ThinkingSet(session_id=session.session_id, effort="xhigh")
         )
         toast = only(await drain(queue), "Notify")
-        assert toast.severity == "warning"
-        assert "NOT USABLE" in toast.title
-        assert toast.timeout and toast.timeout > 10
+        assert toast.severity == "information"
+        assert "xhigh" in toast.text
+        assert "NOT USABLE" not in toast.title
 
     async def test_a_level_the_served_model_has_never_heard_of_is_refused(
         self, service, session, conn

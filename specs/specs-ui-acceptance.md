@@ -604,9 +604,9 @@ selection does this and these claims are satisfied by not interfering.
 
 ## Thinking effort — `test_tui_thinking.py`
 
-- `/thinking` opens a chooser with all four levels; xhigh is flagged unusable;
-  the current level is starred and preselected; escape leaves the level alone;
-  without a session it says so.
+- `/thinking` opens a chooser with all four levels, each with its hint and none
+  flagged unusable; the current level is starred and preselected; escape leaves
+  the level alone; without a session it says so.
 - A choice is stored on the session; new sessions start at the configured
   default; two sessions keep their own levels; an empty stored level follows the
   setting.

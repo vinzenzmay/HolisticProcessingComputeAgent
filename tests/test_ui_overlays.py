@@ -686,8 +686,14 @@ class TestThinking:
         for level in ("off", "low", "medium", "xhigh"):
             assert level in seen
 
-    def test_xhigh_is_flagged_unusable(self):
-        assert "NOT USABLE" in screen(self._open())
+    def test_and_a_hint_for_each_of_them(self):
+        seen = screen(self._open())
+        assert "good for simple tasks" in seen
+        assert "fastest" in seen
+
+    def test_and_flags_none_of_them_as_unusable(self):
+        # xhigh carried a "⚠ NOT USABLE" flag until it turned out to work.
+        assert "NOT USABLE" not in screen(self._open())
 
     def test_the_current_level_is_starred(self):
         assert "low ★" in screen(self._open())

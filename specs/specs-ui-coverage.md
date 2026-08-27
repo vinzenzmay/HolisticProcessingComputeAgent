@@ -739,14 +739,14 @@ sort can learn it ran", but `/thinking` always, and `/skill-creator` and
 core. The ordering `63d44c4` shipped will never promote them. *Low, and
 arguably correct — but it is not what the docstring says.*
 
-**9.12 A one-paragraph warning is still clipped, and it is the most
-consequential one in the app.** `RowUI.toast` opens the window on
-`len(text.splitlines()) > MAX_BODY` — *logical* lines. `XHIGH_WARNING` is a
-single 600-character logical line, so it is still cut to three wrapped lines
-plus "… more in the log". `test_a_one_liner_with_a_heading_is_still_a_toast`
-blesses this deliberately and names the xhigh warning as the case, so it is a
-judgement rather than an oversight; the judgement is worth revisiting, because
-the sentence that gets cut is "Use low or medium". *Medium.*
+**9.12 A one-paragraph warning is still clipped.** `RowUI.toast` opens the
+window on `len(text.splitlines()) > MAX_BODY` — *logical* lines — so a single
+long paragraph is cut to three wrapped lines plus "… more in the log" however
+much it says. `test_a_one_liner_with_a_heading_is_still_a_toast` blesses this
+deliberately, so it is a judgement rather than an oversight. It was written
+about the xhigh warning, which has since been removed (that level works, and
+the chooser's hints replaced the alarm), leaving the judgement standing with no
+consequential case behind it. *Low.*
 
 **9.13 `window`'s stated rule is not the rule it implements.** The docstring
 says "a modal must not land on top of someone mid-typing", but

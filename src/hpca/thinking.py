@@ -49,50 +49,21 @@ ThinkingEffort = Literal["off", "low", "medium", "xhigh"]
 EFFORTS: tuple[ThinkingEffort, ...] = ("off", "low", "medium", "xhigh")
 
 # One line each, for the chooser and the settings screen. The point of the
-# hints is the *cost*: the levels are indistinguishable by name, and the only
-# thing a user can act on is how long each makes a turn take.
+# hints is what a level *does to a turn*: the levels are indistinguishable by
+# name, the ordering least-to-most work says nothing about which is quickest,
+# and the one thing a user can act on is how each behaves in practice.
+#
+# These are field notes, not a benchmark. Measured cost is in project.md §3.6;
+# what is recorded here is what each level makes turns feel like on the
+# cluster's Qwen3.8 — including that "more thinking" is not monotonically
+# slower, because low spends its deliberation re-deciding steps it has already
+# taken and medium injects no preamble at all.
 EFFORT_HINTS: dict[str, str] = {
-    "off": "no thinking channel — fastest, and what every turn did before",
-    "low": "a short deliberation before answering",
-    "medium": "the model's own default amount of thinking",
-    "xhigh": "loses any turn that writes a file on Qwen3.8 — details on selecting",
+    "off": "no thinking channel — good for simple tasks",
+    "low": "spends much effort on correction steps",
+    "medium": "the model's own default amount of thinking — fastest",
+    "xhigh": "thinks hardest, and overthinks everything",
 }
-
-# The flag beside xhigh's *name* in the chooser, where the hint above is its
-# explanation. It lives here rather than in the screen so the list and the
-# confirmation toast cannot drift apart, and it says "unusable" rather than
-# "slow" because that is what was measured: not a caution about patience, a
-# level that does not currently work.
-XHIGH_INLINE_WARNING = "⚠ NOT USABLE"
-
-# Shown when xhigh is picked. This is a "does not work" notice, not a caution,
-# and it says so first because a user who reads only the opening clause should
-# still come away with the right decision.
-#
-# Measured on Qwen3.8-27B-FP8, a 200-line create_file — a write that costs
-# ~3400-3700 completion tokens with thinking off, i.e. ~85% of the base cap
-# before a single thinking token. At xhigh the turn was lost at a 4096 cap
-# (473s) and lost again at 8192 (947s): doubling the budget bought a failure
-# that cost twice as much, because thinking at this level expands into
-# whatever room it is given rather than being sized by the task. There is no
-# way to reserve the payload's room from it — ``thinking_budget`` is a no-op
-# on this server (see the module docstring).
-#
-# Deliberately not overstated: a short decision *does* complete at xhigh
-# (measured: a diagnostic question answered with a tool call in 1267 tokens).
-# What cannot be relied on is any turn that writes a file, which is most of
-# what this agent does, so the level is not usable as a session setting.
-XHIGH_WARNING = (
-    "xhigh does not currently work on Qwen3.8 — it is offered because the "
-    "model advertises it, not because it is usable. Any turn that writes a "
-    "file is likely to be LOST: thinking is spent from the same token budget "
-    "as the answer, and at this level it expands to fill whatever budget it "
-    "is given. Measured on a 200-line file write, the turn was lost after 8 "
-    "minutes at a 4096-token cap and lost again after 16 minutes at 8192. "
-    "Short question-answering turns do complete, but every round thinks for "
-    "minutes. Use low or medium; thinking is not generally better anyway, and "
-    "small models often route tools worse with it on."
-)
 
 
 def normalize_effort(effort: str | None) -> ThinkingEffort:
