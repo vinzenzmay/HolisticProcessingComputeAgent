@@ -91,6 +91,10 @@ EVENT = "event"
 # what the agent was reminded of — silent injection would make the agent's
 # behavior inexplicable from the transcript alone.
 RECALL = "recall"
+# The fold boundary drawn into the conversation: everything above it reaches
+# the model as a summary, everything below it verbatim. Not a thread message
+# and never a rewind target — see `compaction_entry`.
+COMPACTION = "compaction"
 
 FENCE_OPEN = "<memory-context>"
 FENCE_CLOSE = "</memory-context>"
@@ -317,6 +321,44 @@ def call_arguments(arguments: dict, *, has_script: bool) -> str:
     return clip("\n".join(lines))
 
 
+def recorded_call(call: dict) -> dict:
+    """One call record as it is *stored*: the arguments the chat will read
+    back, and no others.
+
+    The storage half of :func:`call_arguments`, and it lives next to it so the
+    two cannot drift. The record rides in the checkpointed state, which
+    LangGraph rewrites whole once per super-step — so an argument nobody
+    renders is not stored once, it is stored a few hundred times over a
+    session, and the payload arguments are the large ones.
+
+    Exactly two functions ever read this dict, :func:`call_text` and
+    :func:`call_target`, so what is dropped here is what those two would drop
+    at paint time and nothing else:
+
+    * :data:`PLUMBING_ARG_KEYS`, which `call_arguments` never prints.
+    * :data:`SCRIPT_ARG_KEYS`, but only once the call carries a ``script``
+      block — and the same emptiness test `call_text` applies, because a
+      preview that is only whitespace is not a block and the raw lines are
+      what gets printed instead. Where there is one, that block *is* the
+      payload: the lines with their ``{key}`` references expanded, or the two
+      sides of the edit as a diff, kept whole to
+      ``modes.SCRIPT_PREVIEW_CHARS``, which is exactly why it is generous.
+
+    Nothing is lost that anyone was reading. The model's own copy of the call
+    keeps the arguments in full (`hpca.agent.history.call_json`), a message in
+    the same state; this was the second copy of them, and the unread one.
+    """
+    arguments = call.get("arguments") or {}
+    has_script = bool((call.get("script") or "").strip())
+    kept = {
+        name: value
+        for name, value in arguments.items()
+        if name not in PLUMBING_ARG_KEYS
+        and not (has_script and name in SCRIPT_ARG_KEYS)
+    }
+    return call if kept == arguments else {**call, "arguments": kept}
+
+
 def call_text(call: dict) -> str:
     """One tool call as the user reads it: what it does to what, and the script
     or the diff it would actually run.
@@ -403,6 +445,38 @@ def thinking_entry(parts: list[Step]) -> Entry:
     )
 
 
+def compaction_summary(compacted: dict | None) -> str:
+    """The summary text out of a `compacted` record, or "".
+
+    Tolerant on purpose: the record is written by the graph
+    (`AgentState.compacted`) and read here two layers away, and a thread folded
+    by an older build has the same key holding a bare string rather than a
+    message.
+    """
+    if not compacted:
+        return ""
+    summary = compacted.get("summary")
+    if isinstance(summary, dict):
+        return str(summary.get("content", ""))
+    return str(summary or "")
+
+
+def compaction_entry(compacted: dict) -> Entry:
+    """The boundary row: where the model's verbatim view begins.
+
+    ``index`` stays -1 even though the record names one. It is deliberate and
+    it is the whole safety of this row: ``index`` is what the chat rewind cuts
+    at (`ui/state.py`'s rewind, `SessionFork` / `SessionRollback`), and this is
+    not a message — a fork aimed at it would cut the thread at a row that is
+    not in it. The boundary it draws is a *view* of the thread, not part of it.
+    """
+    return Entry(
+        kind=COMPACTION,
+        text=compaction_summary(compacted),
+        at=str(compacted.get("at") or ""),
+    )
+
+
 def clip(text: str) -> str:
     if len(text) <= ARGUMENTS_CHARS:
         return text
@@ -431,6 +505,7 @@ def build_entries(
     calls: list[dict] | None = None,
     *,
     start: int = 0,
+    compacted: dict | None = None,
 ) -> list[Entry]:
     """Entries for ``messages[start:]``, with reasoning, tool calls and their
     results folded in.
@@ -438,6 +513,12 @@ def build_entries(
     ``start`` selects a tail (one turn, for incremental logging) while keeping
     the absolute message indices that ``thinking`` and ``calls`` entries are
     anchored to.
+
+    ``compacted`` is the thread's fold record, and passing it draws one extra
+    row at the boundary it names: everything above reaches the model as a
+    summary, everything below verbatim. Only the callers that rebuild a *whole*
+    chat pass it — a tail is appended to a log that already has the row, and
+    drawing it again per turn would file the same boundary once a turn.
     """
     reasoning_at: dict[int, list[str]] = {}
     for entry in thinking or []:
@@ -470,8 +551,23 @@ def build_entries(
         for call in calls_at.get(index, []):
             pending.append(call_step(call))
 
+    # Where the fold boundary goes, or -1. Read once: `upto` is an index into
+    # the same list this walks, so the row lands in front of the first message
+    # the model still sees whole.
+    fold_at = -1
+    if compacted and compaction_summary(compacted):
+        upto = int(compacted.get("upto", 0) or 0)
+        if start <= upto <= len(messages):
+            fold_at = upto
+
     for index in range(start, len(messages)):
         message = messages[index]
+        if index == fold_at:
+            # Before anything this message contributes, and after flushing the
+            # box above: the boundary separates turns, and a marker inside an
+            # open thinking box would read as one of its steps.
+            flush()
+            entries.append(compaction_entry(compacted or {}))
         for reasoning in reasoning_at.get(index, []):
             if reasoning.strip():
                 pending.append(Step(kind="reasoning", text=reasoning))
@@ -516,4 +612,9 @@ def build_entries(
                 # can still name an instant.
                 entries.append(Entry(kind=RECALL, text=recalled, at=at))
     flush()  # a turn interrupted for approval leaves its box open
+    if fold_at == len(messages):
+        # Nothing was kept verbatim — every message is behind the fold. The
+        # boundary is still the truth about what the model sees, so it is
+        # drawn at the end rather than dropped.
+        entries.append(compaction_entry(compacted or {}))
     return entries

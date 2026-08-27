@@ -710,6 +710,11 @@ class TestTheRuleSaysWhereTheKeysAre:
         await parked(wire, BASH_GATE)
         focused = self.rule_row(wire)
         wire.ui.focus = CHAT
+        # Moving focus washes the pane it lands on for a moment
+        # (`RowUI._flash`). Let it expire: what is compared here is the title
+        # style, and a tint in front of it is a different sentence.
+        landed = wire.ui.clock()
+        wire.ui.clock = lambda: landed + theme.flash_hold + 1
         unfocused = self.rule_row(wire)
         chat = [x for x in wire.ui.render(120, 40) if "── chat ─" in x][0]
         wire.ui.focus = CHAT
@@ -879,6 +884,11 @@ class TestTheAnswerLinePulses:
     async def test_and_stops_booking_them_when_it_is_answered(self, wire):
         await parked(wire, BASH_GATE)
         await wire.press("y")
+        # Answering hands the cursor back to the message box, which flashes
+        # once — a one-shot wash, not a thing that keeps repainting. Past its
+        # hold, the claim this test makes is the whole of what is left.
+        answered = wire.ui.clock()
+        wire.ui.clock = lambda: answered + theme.flash_hold + 1
         assert wire.ui.next_wake() is None
 
     async def test_a_prompt_in_another_session_asks_for_no_frames(self, wire):

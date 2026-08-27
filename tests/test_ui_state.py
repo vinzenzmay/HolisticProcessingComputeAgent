@@ -728,3 +728,118 @@ class TestRestylingAChatThatIsAlreadyOnScreen:
         session.reset(self.rows())
         session.restyle(Display(chat_stamps=False))
         assert session.chat.items[1].body == ["done", "and dusted"]
+
+
+class TestTheCompactionBoundaryDrawsAsADivider:
+    """The fold marker: a rule across the chat, not a message in it.
+
+    Its shape is the claim — a message row has a nameplate and a preview of
+    what it hides, and this has neither, because what it marks is a boundary
+    over the whole conversation rather than something somebody said at a point
+    in it.
+    """
+
+    def row(self, **kw):
+        return entry_item(
+            ChatEntry(
+                kind="compaction",
+                text="earlier: the cohort was indexed",
+                seq=3,
+                index=-1,
+                at="2026-08-27T13:34:29+00:00",
+            ),
+            **kw,
+        )
+
+    def test_the_head_names_the_moment_the_view_was_cut(self):
+        assert self.row().head.startswith(f"compacted {when('2026-08-27T13:34:29+00:00')}")
+
+    def test_and_is_filled_out_to_the_edge_of_the_pane(self):
+        assert self.row().fill.startswith("─")
+
+    def test_dashed_rather_than_solid(self):
+        # A gapless rule is the line drawn over every panel. This is a mark
+        # inside the conversation, not the edge of one, and the gaps are what
+        # say so before the words are read.
+        assert " " in self.row().fill
+
+    def test_with_a_space_before_the_rule_starts(self):
+        # Otherwise the seconds run straight into the dashes.
+        assert self.row().head.endswith(" ")
+
+    def test_it_opens_into_the_summary(self):
+        assert self.row().body == ["earlier: the cohort was indexed"]
+        assert self.row().openable
+
+    def test_but_shows_none_of_it_closed(self):
+        # One clipped line of a thousand-character summary hanging under a
+        # divider would read as a message somebody sent.
+        assert self.row().preview == ""
+
+    def test_it_is_furniture_rather_than_a_nameplate(self):
+        # `label` is what draws a head bold, and the weight is there to say
+        # where one turn ends and the next begins. This says something else.
+        assert not self.row().label
+        assert self.row().accent == theme.faint
+
+    def test_turning_stamps_off_leaves_the_bare_word(self):
+        assert self.row(stamps=False).head == "compacted "
+
+
+class TestWhatIsBehindTheFold:
+    """`SessionState.folded_away`: which rows the rewind is no longer for."""
+
+    def chat(self, *kinds_and_seqs):
+        session = SessionState("s1")
+        session.reset([
+            ChatEntry(kind=kind, text="x", seq=seq, index=-1 if kind == "compaction" else seq)
+            for kind, seq in kinds_and_seqs
+        ])
+        return session
+
+    def test_nothing_is_behind_a_fold_that_never_happened(self):
+        session = self.chat(("user", 1), ("assistant", 2), ("user", 3))
+        assert not session.folded_away(1)
+        assert not session.folded_away(3)
+
+    def test_rows_above_the_boundary_are(self):
+        session = self.chat(("user", 1), ("compaction", 2), ("user", 3))
+        assert session.folded_away(1)
+
+    def test_and_rows_below_it_are_not(self):
+        session = self.chat(("user", 1), ("compaction", 2), ("user", 3))
+        assert not session.folded_away(3)
+
+    def test_nor_is_the_boundary_itself(self):
+        session = self.chat(("user", 1), ("compaction", 2), ("user", 3))
+        assert not session.folded_away(2)
+
+    def test_a_row_that_is_not_here_is_not_behind_anything(self):
+        # A seq from a chat that has since been reset. False rather than an
+        # error: this answers a footer being drawn, and a stale cursor must
+        # not be able to raise out of a repaint.
+        session = self.chat(("user", 1), ("compaction", 2), ("user", 3))
+        assert not session.folded_away(999)
+
+    def test_only_the_last_boundary_counts(self):
+        # The graph keeps one fold record and moves it, so a chat should never
+        # hold two — but if one ever did, the live boundary is the newest.
+        session = self.chat(
+            ("user", 1), ("compaction", 2), ("user", 3), ("compaction", 4), ("user", 5)
+        )
+        assert session.folded_away(3)
+        assert not session.folded_away(5)
+
+    def test_a_row_appended_after_the_reset_is_below_the_fold(self):
+        session = self.chat(("user", 1), ("compaction", 2), ("user", 3))
+        session.append(ChatEntry(kind="user", text="new", seq=4, index=4))
+        assert not session.folded_away(4)
+
+    def test_and_removing_a_row_does_not_move_the_line(self):
+        # `remove` renumbers positions under the map; the boundary is held by
+        # seq so it rides that rather than going stale.
+        session = self.chat(("user", 1), ("compaction", 2), ("user", 3))
+        session.append(ChatEntry(kind="queued", text="q", seq=4))
+        session.remove(4)
+        assert session.folded_away(1)
+        assert not session.folded_away(3)

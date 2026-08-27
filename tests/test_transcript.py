@@ -8,6 +8,8 @@ from hpca.transcript import (
     Entry,
     build_entries,
     call_step,
+    live_step,
+    recorded_call,
     result_text,
 )
 
@@ -215,6 +217,130 @@ class TestToolCalls:
     def test_calls_are_optional(self):
         box = build_entries([USER_MSG, STEP, ANSWER], [])[1]
         assert [p.kind for p in box.parts] == ["step"]
+
+
+class TestRecordedCall:
+    """What a call record stores, against what the chat reads out of it.
+
+    The record is checkpointed state, rewritten whole once per super-step, so
+    an argument nobody renders is paid for hundreds of times. The contract is
+    that dropping it changes nothing on screen — so every case here asserts
+    the *rendering*, and only then what is missing underneath it.
+    """
+
+    LINES = [f"line {i}" for i in range(40)]
+
+    def rendered(self, call: dict) -> tuple[str, str, str]:
+        step = call_step(call)
+        return step.text, step.label(), step.body()
+
+    def test_a_payload_the_script_block_carries_is_not_stored_twice(self):
+        call = {
+            "after": 1,
+            "tool": "create_file",
+            "arguments": {"path": "/work/notes.md", "content_lines": self.LINES},
+            "script": "\n".join(self.LINES),
+        }
+        stored = recorded_call(call)
+        assert self.rendered(stored) == self.rendered(call)
+        assert "content_lines" not in stored["arguments"]
+        # every line is still one open of the chat away, from the block
+        assert all(line in stored["script"] for line in self.LINES)
+        # and the record still says which file, which is the collapsed row
+        assert stored["arguments"] == {"path": "/work/notes.md"}
+
+    def test_an_edits_two_sides_live_in_the_diff(self):
+        call = {
+            "after": 1,
+            "tool": "edit_file",
+            "arguments": {
+                "path": "/work/run.sh",
+                "old_lines": ["echo one"],
+                "new_lines": ["echo two"],
+            },
+            "script": "- echo one\n+ echo two",
+        }
+        stored = recorded_call(call)
+        assert self.rendered(stored) == self.rendered(call)
+        assert set(stored["arguments"]) == {"path"}
+
+    def test_a_payload_with_no_block_to_carry_it_is_kept(self):
+        # The other half of the rule, and the reason it is conditional: with
+        # no script the raw lines are what `call_arguments` prints, so
+        # dropping them would blank the row.
+        call = {
+            "after": 1,
+            "tool": "create_file",
+            "arguments": {"path": "/work/notes.md", "content_lines": ["one"]},
+        }
+        stored = recorded_call(call)
+        assert self.rendered(stored) == self.rendered(call)
+        assert stored["arguments"]["content_lines"] == ["one"]
+
+    def test_a_blank_preview_is_not_a_block(self):
+        # `call_text` tests the script with .strip(), so a preview of nothing
+        # but whitespace falls back to printing the arguments — and the
+        # record has to make the same call or the row loses its content.
+        call = {
+            "after": 1,
+            "tool": "run_bash",
+            "arguments": {"content_lines": ["", ""]},
+            "script": "\n",
+        }
+        stored = recorded_call(call)
+        assert self.rendered(stored) == self.rendered(call)
+        assert stored["arguments"]["content_lines"] == ["", ""]
+
+    def test_plumbing_is_never_stored(self):
+        call = {
+            "after": 1,
+            "tool": "run_bash",
+            "arguments": {"content_lines": ["ls"], "timeout_s": 30},
+            "script": "ls",
+        }
+        stored = recorded_call(call)
+        assert self.rendered(stored) == self.rendered(call)
+        assert stored["arguments"] == {}
+
+    def test_a_call_with_nothing_to_drop_is_left_alone(self):
+        call = {"after": 1, "tool": "list_dir", "arguments": {"path": "/data"}}
+        assert recorded_call(call) == call
+
+    def test_a_record_written_before_this_rule_renders_the_same(self):
+        # Sessions checkpointed by an older build still hold the full
+        # arguments. `call_arguments` has always stepped over them when there
+        # is a script, so those rows are unchanged — this is the storage
+        # side of a rule the renderer already had.
+        old = {
+            "after": 1,
+            "tool": "create_file",
+            "arguments": {"path": "/work/notes.md", "content_lines": self.LINES},
+            "script": "\n".join(self.LINES),
+        }
+        assert self.rendered(old) == self.rendered(recorded_call(old))
+
+    def test_the_step_the_user_watched_is_the_step_they_get_back(self):
+        # The live announcement and the stored record are the same dict (see
+        # the graph's execute_tool), so `live_step` and `call_step` have to
+        # agree about it — that agreement is what keeps a re-opened session
+        # from rearranging itself against what the user watched happen.
+        stored = recorded_call(
+            {
+                "after": 1,
+                "tool": "create_file",
+                "arguments": {"path": "/work/notes.md", "content_lines": self.LINES},
+                "script": "\n".join(self.LINES),
+            }
+        )
+        live = live_step({"kind": "call", **stored})
+        folded = call_step(stored)
+        assert (live.text, live.tool, live.target) == (
+            folded.text,
+            folded.tool,
+            folded.target,
+        )
+        assert (live.tool, live.target) == ("create_file", "notes.md")
+        assert all(line in live.text for line in self.LINES)
 
 
 class TestCallMessages:
@@ -592,3 +718,94 @@ class TestEntriesCarryTheirInstant:
             calls=[{"after": 1, "tool": "read_file", "arguments": {}}],
         )
         assert [e.at for e in entries if e.kind == "thinking"] == [""]
+
+
+class TestCompactionBoundary:
+    """The row that says where the model's verbatim view begins.
+
+    Everything above it reaches the model as a summary; everything below it
+    whole. The tests are about *where* it lands and what it may never be,
+    because the row is the only entry in a chat that is not a message.
+    """
+
+    FOLD = {
+        "upto": 2,
+        "summary": {"role": "user", "content": "earlier: the cohort was indexed"},
+        STAMP_KEY: "2026-08-27T13:34:29+00:00",
+    }
+
+    def test_no_record_draws_no_row(self):
+        entries = build_entries([USER_MSG, ANSWER], [])
+        assert "compaction" not in kinds(entries)
+
+    def test_it_lands_in_front_of_the_first_message_still_seen_whole(self):
+        entries = build_entries(
+            [USER_MSG, ANSWER, USER_MSG, ANSWER], [], compacted=self.FOLD
+        )
+        assert kinds(entries) == [
+            "user",
+            "assistant",
+            "compaction",
+            "user",
+            "assistant",
+        ]
+
+    def test_it_opens_into_the_summary_that_stands_for_what_is_above(self):
+        entries = build_entries(
+            [USER_MSG, ANSWER, USER_MSG, ANSWER], [], compacted=self.FOLD
+        )
+        row = next(e for e in entries if e.kind == "compaction")
+        assert row.text == "earlier: the cohort was indexed"
+        assert row.at == "2026-08-27T13:34:29+00:00"
+
+    def test_it_is_never_a_rewind_target(self):
+        # `index` is what a fork or a rollback cuts at. This row is a view of
+        # the thread and not a message in it, so it must not name one — a
+        # fork aimed here would cut the thread at a row it does not contain.
+        entries = build_entries(
+            [USER_MSG, ANSWER, USER_MSG, ANSWER], [], compacted=self.FOLD
+        )
+        row = next(e for e in entries if e.kind == "compaction")
+        assert row.index == -1
+
+    def test_a_fold_with_no_summary_draws_nothing(self):
+        # An older build stored the key with nothing in it. A bare divider
+        # would be furniture that opens into an empty box.
+        fold = {**self.FOLD, "summary": {"role": "user", "content": ""}}
+        entries = build_entries([USER_MSG, ANSWER, USER_MSG], [], compacted=fold)
+        assert "compaction" not in kinds(entries)
+
+    def test_a_summary_stored_as_a_bare_string_still_reads(self):
+        fold = {**self.FOLD, "summary": "earlier: the cohort was indexed"}
+        entries = build_entries([USER_MSG, ANSWER, USER_MSG], [], compacted=fold)
+        row = next(e for e in entries if e.kind == "compaction")
+        assert row.text == "earlier: the cohort was indexed"
+
+    def test_a_thread_folded_before_there_were_stamps_says_nothing_about_when(self):
+        fold = {k: v for k, v in self.FOLD.items() if k != STAMP_KEY}
+        entries = build_entries([USER_MSG, ANSWER, USER_MSG], [], compacted=fold)
+        row = next(e for e in entries if e.kind == "compaction")
+        assert row.at == ""
+
+    def test_it_closes_the_thinking_box_above_it(self):
+        # A marker drawn inside an open box would read as one of its steps.
+        fold = {**self.FOLD, "upto": 3}
+        entries = build_entries(
+            [USER_MSG, STEP, ANSWER, USER_MSG], [], compacted=fold
+        )
+        assert kinds(entries) == ["user", "thinking", "assistant", "compaction", "user"]
+
+    def test_everything_folded_still_draws_the_boundary(self):
+        # `upto` at the end of the history: nothing is kept verbatim, and the
+        # row is still the truth about what the model sees.
+        fold = {**self.FOLD, "upto": 2}
+        entries = build_entries([USER_MSG, ANSWER], [], compacted=fold)
+        assert kinds(entries) == ["user", "assistant", "compaction"]
+
+    def test_a_tail_does_not_repeat_it(self):
+        # The chatlog is appended to, and a boundary redrawn per turn would
+        # file the same one once a turn. Only whole-chat callers pass it.
+        entries = build_entries(
+            [USER_MSG, ANSWER, USER_MSG, ANSWER], [], start=2
+        )
+        assert "compaction" not in kinds(entries)

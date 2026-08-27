@@ -196,6 +196,13 @@ NOTHING_TO_STOP = "nothing running to stop"
 # stopped again (specs/specs-ui-coverage.md §4).
 PARKED_ON_A_DECISION = "this turn is waiting for your answer — decide it first"
 
+# Enter on one of your own messages from *above* the compaction line. The
+# rewind is not offered there (`SessionState.folded_away`), and this is the
+# rest of that answer: the footer stops offering the key, and a press that
+# lands on the row anyway says why rather than moving the focus and looking
+# like a missed keystroke.
+BEHIND_THE_FOLD = "nothing at or above the compaction line can be rewound to"
+
 # The title over the tunnel recipe an empty scan comes back with — the words
 # `tui/manage_llms.py` put on the same window, so a user who has seen it once
 # recognises it. The recipe itself is the core's (`autoconnect.offcluster_help`).
@@ -318,7 +325,10 @@ class RowUI:
         self.send: Callable[[Intent], None] = send or self.intents.append
         self.session_pane = Pane("sessions", [])
         self.refresh_sidebar()
-        self.focus = CHAT
+        # The field rather than the property: `focus` lights the flash when it
+        # changes, and the pane the app opens on was not arrived at. It also
+        # runs before `self.clock` exists, which the setter reads.
+        self._focus = CHAT
         self.frame_ms = 0.0
         self._note = ""
         self.note_style = theme.warn
@@ -356,7 +366,8 @@ class RowUI:
         # When focus last *moved*, for the flash that says where it went
         # (`_flash`). None until it has moved at all: the pane the app opens
         # on was not arrived at, so lighting it would be an answer to a
-        # question nobody asked.
+        # question nobody asked. Stamped by the `focus` setter and by nothing
+        # else.
         self._focus_lit_at: float | None = None
         # Everything the overlays draw and nothing else reads. Handed in
         # rather than fetched, for the reason every screen in `overlays/` is:
@@ -601,16 +612,38 @@ class RowUI:
             )
         return session
 
-    def _move_focus(self, slots: list[int], step: int) -> None:
-        """Move focus one pane along the ring, and light the pane it lands on.
+    @property
+    def focus(self) -> int:
+        return self._focus
 
-        The flash is here rather than in `render` because this is the only
-        place that knows focus *changed* as opposed to merely being somewhere:
-        a frame drawn for any other reason must not relight the pane, or the
-        wash would come back every time a token arrived.
+    @focus.setter
+    def focus(self, slot: int) -> None:
+        """Where the keys go — and, when that *changes*, the flash saying so.
+
+        The stamp lives here because assignment is the only event that knows
+        focus moved as opposed to merely being somewhere: a frame drawn for
+        any other reason must not relight the pane, or the wash would come
+        back every time a token arrived.
+
+        It used to live in `_move_focus`, on the belief that walking the ring
+        was the only way focus travelled. It is not — the message box answers
+        ctrl+↑/ctrl+↓ itself, an arriving decision takes the cursor,
+        `_settle_focus` moves it off a pane that stopped being drawn — and
+        every one of those paths flashed nothing. Sitting on the assignment
+        instead of on one caller of it is what makes that unforgettable: the
+        next path to move focus gets the flash without knowing it exists.
+
+        Guarded on the value actually changing, so the many places that
+        re-assert the focus they already have stay silent.
         """
-        self.focus = slots[(slots.index(self.focus) + step) % len(slots)]
+        if slot == self._focus:
+            return
+        self._focus = slot
         self._focus_lit_at = self.clock()
+
+    def _move_focus(self, slots: list[int], step: int) -> None:
+        """Move focus one pane along the ring. The `focus` setter lights it."""
+        self.focus = slots[(slots.index(self.focus) + step) % len(slots)]
 
     @staticmethod
     def _wash(rows: list[str], tint: str) -> list[str]:
@@ -644,6 +677,15 @@ class RowUI:
         since nothing ever clears the timestamp.
         """
         if theme.flash_hold <= 0 or self._focus_lit_at is None:
+            return None
+        if self.overlay is not None or self.confirm is not None:
+            # The panes are not on the frame: a screen replaces them
+            # (`render`) and a confirmation blanks every row it covers
+            # (`_over_confirm`). The wash is therefore not drawn, and no
+            # repaint will make it appear. Focus still moves under both —
+            # answering an approval hands the cursor back to the box, `q` is
+            # pressed from a pane — and booking a wake for a tint nobody can
+            # see is the poll this whole list exists to avoid.
             return None
         left = theme.flash_hold - (self.clock() - self._focus_lit_at)
         return left if left > 0 else None
@@ -1260,21 +1302,27 @@ class RowUI:
     def _footer_note(self) -> tuple[str, str]:
         """What the footer says beside the keys, and in which colour.
 
-        Read here rather than in `render` because the note is part of what
-        decides how tall the footer is — it shares the row while there is one
-        and takes the bottom line once the hints wrap (`ansi.footer_lines`) —
-        so the measurement and the drawing ask the same question of it.
+        The note no longer decides anything about the footer's height: it is
+        drawn over the bottom row of whatever the keys came to
+        (`ansi.footer_lines`), so a toast arriving cannot move the panes
+        above it. This is read in one place all the same, because both halves
+        of the frame have to agree about *which* note is up — the armed stop
+        outranks whatever was last said, and it may not outrank it in the
+        drawing and not in the measuring.
         """
         if self._esc_armed():
             return "esc again to stop", theme.danger
         return self.note, self.note_style
 
     def _footer_h(self, width: int, height: int) -> int:
-        """How many rows the footer needs for the keys this row offers."""
-        note, _ = self._footer_note()
-        return len(
-            footer_wrap(self._keys(), width, note, self._footer_cap(height))
-        )
+        """How many rows the footer needs for the keys this row offers.
+
+        The keys, and nothing else: a note is drawn over the bottom row of
+        them rather than given one, which is what makes this number — and so
+        every band's share of the screen — the same whether or not a toast is
+        up.
+        """
+        return len(footer_wrap(self._keys(), width, self._footer_cap(height)))
 
     def _avail(self, width: int, height: int, footer_h: int | None = None) -> int:
         """Rows the four bands share: the screen, less the header and however
@@ -1846,7 +1894,11 @@ class RowUI:
         elif self.focus == SESSIONS:
             rows += [("enter", "open"), ("r", "rename"), ("t", "retitle"), ("d", "delete")]
         elif self.focus == CHAT:
-            rows += [("enter", "rollback/fork"), ("c", "copy")]
+            # `enter` only where it does something, and named for what it does
+            # *there* — the same rule the session pane's new-session row
+            # follows above, and the same one the arrows follow here.
+            enter = self._chat_enter()
+            rows += ([enter] if enter else []) + [("c", "copy")]
         else:
             rows += [("enter", "peek"), ("d", "unwatch"), ("alt-↑↓", "move")]
         # Only where they do something. `m` and `a` are the sessions row's and
@@ -2417,6 +2469,47 @@ class RowUI:
 
     # -------------------------------------------------------- the chat rewind
 
+    def _chat_enter(self) -> tuple[str, str] | None:
+        """The verb Enter has on the chat row under the cursor, or None.
+
+        The footer names the key only where pressing it does something, and
+        with the word that is true on that row. In the chat that is narrower
+        than the old hint claimed: Enter opens the rewind on one of your own
+        messages, offers to take back a queued one, and on everything else —
+        the agent's replies, a turn's working, the compaction line, a row at
+        or above it — it moves the focus to the message box, which is what
+        `app.py` answers an Enter it has nothing better to do with. That is
+        not a thing to advertise as "rollback/fork".
+
+        `here()` rather than a position, for the reason it exists: the footer
+        has a cursor and no terminal width. The live working row is not an
+        entry, so it falls out here as None and names its own key inline
+        instead ("enter or esc esc to interrupt").
+        """
+        key = self.chat.here()
+        entry = self.session.entry_of(int(key)) if key.isdigit() else None
+        if entry is None:
+            return None
+        if entry.kind == "queued":
+            # It has not reached the model, so there is nothing behind it to
+            # roll back to — the one message that can simply be taken back
+            # (`overlays/queued.py`).
+            return ("enter", "take it back")
+        if entry.kind in OWN_MESSAGE_KINDS and not self._no_rewind(entry):
+            return ("enter", "rollback/fork")
+        return None
+
+    def _no_rewind(self, entry) -> bool:
+        """Whether that row is one no cut can be aimed at.
+
+        Everything above the compaction line, and the line itself: the
+        boundary is a mark rather than a message (`index` -1), so a fork or a
+        rollback has nothing to name there either. Taken together they are the
+        contiguous top of the conversation, which is what makes the footer's
+        answer change exactly once as the cursor walks down.
+        """
+        return entry.kind == "compaction" or self.session.folded_away(entry.seq)
+
     def _activate_chat(self, width: int) -> None:
         """Enter in the chat log.
 
@@ -2429,6 +2522,16 @@ class RowUI:
             self._stop_from_the_row()
             return
         entry = self.session.entry_at(position)
+        if entry is not None and self._no_rewind(entry):
+            # At or above the fold, before anything is asked about the kind of
+            # row:
+            # nothing up there is a rewind target, the user's messages and the
+            # agent's alike, and the footer has already stopped naming the key
+            # here. Saying so beats moving the focus, which reads as a
+            # keystroke that missed.
+            self.note = BEHIND_THE_FOLD
+            self.note_style = theme.faint
+            return
         if entry is not None and entry.kind == "queued":
             # A message that has not reached the model yet: the offer is to
             # take it back, not to rewind to it (§4.3 item 34).

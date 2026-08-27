@@ -28,9 +28,11 @@ model to act on.
 
 from __future__ import annotations
 
+import asyncio
 import re
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal
 
@@ -41,6 +43,7 @@ from hpca.agent.context import ToolContext
 from hpca.agent.history import carries_elision_marker
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.checks import syntax_check
+from hpca.filetail import read_head, read_tail
 from hpca.paths import PathError, resolve_path
 from hpca.verify_code import format_gate_failure, format_gate_warnings, verify_script
 
@@ -53,6 +56,18 @@ RUN_TIMEOUT_DEFAULT = 60
 RUN_TIMEOUT_MAX = 600
 RUN_OUTPUT_LINES = 60  # per stream, before the model is pointed at the log
 RUN_OUTPUT_CHARS = 4000
+# How much of a log is read to produce that. It is a window taken from the end
+# of the file, not the file — a look-around that prints a gigabyte used to
+# cost a gigabyte of memory and a frozen UI to keep four kilobytes of it.
+#
+# Eight times the char cap, because the window has to be wider than what is
+# kept on three counts: RUN_OUTPUT_CHARS characters are up to four times that
+# many bytes in UTF-8, the seek lands mid-character (the decode replaces the
+# fragment, and the replacement is discarded with the rest of the front), and
+# RUN_OUTPUT_LINES lines have to fit too. They do at any ordinary line width;
+# where they do not, the lines are long enough that the char cap decides the
+# output anyway and the answer is the same either way.
+RUN_OUTPUT_WINDOW = RUN_OUTPUT_CHARS * 8
 # The same bound, applied to what goes *in*. run_bash always accepted a script
 # of any size, and what the live model does with that is not write a longer
 # look-around: asked for a design document with only run_bash available, it
@@ -384,6 +399,10 @@ def _list_dir(path: Path, max_lines: int) -> str:
     )
 
 
+def _read_lines(path: Path) -> list[str]:
+    return path.read_text(errors="replace").splitlines()
+
+
 async def read_file(args: ReadFileParams, ctx: ToolContext) -> str:
     try:
         path = resolve_path(args.path, ctx.workdir)
@@ -396,7 +415,12 @@ async def read_file(args: ReadFileParams, ctx: ToolContext) -> str:
         return f"Nothing at {path}. {hints.PATH_NOT_FOUND}"
     if path.is_dir():
         return _list_dir(path, args.max_lines)
-    lines = path.read_text(errors="replace").splitlines()
+    # Whole-file, unlike the run_bash tail above, and it has to be: the page
+    # this returns is addressed by line number and its continuation hint
+    # quotes the file's total, neither of which a window from one end knows.
+    # So this one only gets off the loop — a slow read is then a slow tool
+    # call rather than a frozen UI.
+    lines = await asyncio.to_thread(_read_lines, path)
     total = len(lines)
     if args.start_line > total:
         return (
@@ -578,12 +602,20 @@ def _describe_bash(args: RunBashParams, ctx: object = None) -> str:
     return "Flagged command(s): " + ", ".join(flagged)
 
 
-def _tail(text: str, stream: str, log_path: Path) -> str:
+def _tail(text: str, stream: str, log_path: Path, *, whole: bool = True) -> str:
     """Bound one stream for the prompt, pointing at the log for the rest.
 
     The log path is named only when something was actually cut: a look-around
     command whose output fits needs no pointer, and printing one per run fills
     the context with paths the model never reads.
+
+    ``text`` is what :func:`read_tail` returned and ``whole`` is its verdict on
+    whether that is the entire stream. When it is not, the count of earlier
+    lines is the one thing this cannot say — the window carries no evidence
+    about what precedes it, and counting means reading the gigabyte that was
+    deliberately not read — so the note drops the number and keeps the
+    sentence. Everything the model does with the note (there is more, it is at
+    this path) is unchanged by that.
     """
     lines = text.splitlines()
     kept = lines[-RUN_OUTPUT_LINES:]
@@ -593,12 +625,13 @@ def _tail(text: str, stream: str, log_path: Path) -> str:
     if not body.strip():
         return ""
     omitted = len(lines) - len(kept)
-    if omitted > 0 or cut_head:
-        what = (
-            f"{omitted} earlier {stream} lines"
-            if omitted > 0
-            else f"the start of {stream}"
-        )
+    if omitted > 0 or cut_head or not whole:
+        if not whole:
+            what = f"earlier {stream} lines"
+        elif omitted > 0:
+            what = f"{omitted} earlier {stream} lines"
+        else:
+            what = f"the start of {stream}"
         note = f"\n[... {what} omitted; read_file {str(log_path)!r} for all of it]"
     else:
         note = ""
@@ -629,6 +662,14 @@ def _cited_lines(script_lines: list[str], stderr: str, path: Path) -> str:
     Only bash's own messages about *this* script count — they carry its path,
     and `awk: line 3` or a Python traceback's "line 12" number something else
     entirely.
+
+    ``stderr`` is what :func:`_read_run_streams` gathered, which for a large
+    stderr is both ends of it and not the middle. Both ends, because a bounded
+    read has to choose one and the messages live at either: a script without
+    `set -e` prints its first failure at the front and keeps going, while a
+    script that dies at its last line prints there. The two windows overlap
+    for any stderr small enough — costing nothing, since what is collected
+    here is a *set* of line numbers.
     """
     marker = re.compile(rf"{re.escape(str(path))}: line (\d+):")
     numbers = sorted(
@@ -660,13 +701,61 @@ def _cited_lines(script_lines: list[str], stderr: str, path: Path) -> str:
     return "The script lines bash's messages point at:\n" + "\n".join(quoted)
 
 
-def _run_output(record, ctx: ToolContext, hint: str) -> str:
+@dataclass(frozen=True)
+class _RunStreams:
+    """What one finished run's logs had to say, already read.
+
+    Held as text rather than as paths so that every read a run_bash answer
+    needs happens in one place, off the loop, and nothing downstream is
+    tempted to open a log again while composing a string.
+    """
+
+    stdout: str
+    stdout_whole: bool
+    stderr: str
+    stderr_whole: bool
+    stderr_head: str  # empty unless the stderr tail fell short of the start
+
+
+async def _read_run_streams(record) -> _RunStreams:
+    """Every read a run_bash answer needs, bounded and off the event loop.
+
+    Bounded because the answer keeps a few kilobytes however much was printed;
+    off the loop because the UI and the agent share one, so a synchronous read
+    here is a freeze the user watches happen — and the logs live in the app
+    dir, which on a cluster node is NFS, where even a bounded read costs a
+    network round trip.
+
+    stderr's head is fetched only when its tail did not already reach the
+    start of the file, so the ordinary run — where stderr is a line or two —
+    still costs exactly two reads.
+    """
+    stdout, stderr = await asyncio.gather(
+        asyncio.to_thread(read_tail, record.stdout_path, RUN_OUTPUT_WINDOW),
+        asyncio.to_thread(read_tail, record.stderr_path, RUN_OUTPUT_WINDOW),
+    )
+    stderr_text, stderr_whole = stderr
+    head = ""
+    if not stderr_whole:
+        head = await asyncio.to_thread(
+            read_head, record.stderr_path, RUN_OUTPUT_WINDOW
+        )
+    return _RunStreams(
+        stdout=stdout[0],
+        stdout_whole=stdout[1],
+        stderr=stderr_text,
+        stderr_whole=stderr_whole,
+        stderr_head=head,
+    )
+
+
+def _run_output(streams: _RunStreams, record) -> str:
     """Both streams, bounded, each naming its log file only if it was cut."""
     parts = [
-        _tail(path.read_text(errors="replace"), stream, path)
-        for stream, path in (
-            ("stdout", record.stdout_path),
-            ("stderr", record.stderr_path),
+        _tail(text, stream, path, whole=whole)
+        for text, whole, stream, path in (
+            (streams.stdout, streams.stdout_whole, "stdout", record.stdout_path),
+            (streams.stderr, streams.stderr_whole, "stderr", record.stderr_path),
         )
     ]
     return "\n\n".join(part for part in parts if part) or "(no output)"
@@ -704,11 +793,13 @@ async def run_bash(args: RunBashParams, ctx: ToolContext) -> str:
         ["bash", str(path)], name=name, timeout_s=args.timeout_s
     )
     record = await ctx.runner.wait(record.pid)
-    cited = _cited_lines(
-        lines, record.stderr_path.read_text(errors="replace"), path
+    streams = await _read_run_streams(record)
+    seen_stderr = "\n".join(
+        part for part in (streams.stderr_head, streams.stderr) if part
     )
+    cited = _cited_lines(lines, seen_stderr, path)
     output = "\n\n".join(
-        part for part in [_run_output(record, ctx, "bash"), cited] if part
+        part for part in [_run_output(streams, record), cited] if part
     )
     if record.state == "killed":
         return (

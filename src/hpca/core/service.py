@@ -332,6 +332,12 @@ class AgentService:
         # answered before a restart is a summary of a conversation that has
         # moved on, and re-asking costs one generation.
         self._compactions: dict[str, _Compaction] = {}
+        # How far each session's context was folded when this core last drew
+        # its chat, so `_redraw_if_folded` can tell the turn that folded from
+        # the many that did not. Starts empty and that is correct: a session
+        # opened in this process is reset once on open, and its first turn
+        # compares against the fold it was opened with.
+        self._folded_at: dict[str, int] = {}
         # Sessions carrying a provisional name — the truncated first message —
         # and waiting for the model to write a real one after the exchange.
         #
@@ -841,6 +847,7 @@ class AgentService:
                     list(values.get("messages", [])),
                     values.get("thinking", []),
                     values.get("calls", []),
+                    compacted=values.get("compacted"),
                 ),
                 start=1,
             )
@@ -852,6 +859,13 @@ class AgentService:
         # deltas that follow revise the rows this reset actually drew.
         entries += self._scheduler.rebase_rows(session_id, entries=entries)
         self._deps.emit(ChatReset(session_id=session_id, entries=entries))
+        # The rows just drawn include the fold boundary as it stands, so this
+        # is the baseline `_redraw_if_folded` measures the next turn against —
+        # seeded here rather than at open, so every path that re-states a chat
+        # (open, rollback, fork, stop) agrees about what is already on screen.
+        self._folded_at[session_id] = int(
+            (values.get("compacted") or {}).get("upto", 0) or 0
+        )
         self._backends.estimate_context(session_id, values)
 
     async def _thread_values(self, session_id: str) -> dict:
@@ -986,6 +1000,7 @@ class AgentService:
         )
         if getattr(result, "interrupt", None) is not None:
             return
+        await self._redraw_if_folded(session, getattr(result, "compacted", None))
         await self._title_after_turn(
             session, list(getattr(result, "messages", []) or []), plan
         )
@@ -1062,6 +1077,37 @@ class AgentService:
             list(getattr(result, "calls", []) or []),
             start=int(start or 0),
         )
+
+    async def _redraw_if_folded(self, session, compacted) -> None:
+        """Re-state the chat when a turn folded the context by itself.
+
+        The automatic compaction happens inside the graph, so nothing has told
+        the front-end that the model's view was cut — and the boundary row
+        `build_entries` draws lands in the middle of the conversation, not at
+        the end, which no `chat.append` can reach. A reset is the only thing
+        that can put a row *between* two that are already drawn.
+
+        Guarded on the fold having actually moved, because this runs after
+        every turn and a reset per turn is exactly the rebuild §4.2 removed.
+        `/compact` does not come through here: it lands its fold outside a turn
+        and resets for itself (`_land_compaction`).
+        """
+        session_id = getattr(session, "session_id", "")
+        if not session_id:
+            return
+        upto = int((compacted or {}).get("upto", 0) or 0)
+        if upto == self._folded_at.get(session_id, 0):
+            return
+        try:
+            await self._reset_chat(session_id)
+        except Exception:  # nothing here may cost the turn its record
+            logger.exception("could not redraw the chat after a fold")
+            return
+        # After the reset, and deliberately: the reset seeds this from the
+        # thread, and what was just drawn is what *this turn* reported. The
+        # two agree in every real case; recording last means a reset that
+        # threw leaves the fold un-drawn and the next turn tries again.
+        self._folded_at[session_id] = upto
 
     async def _record_turn_tail(self, session, entries: list, log) -> None:
         """The two records a turn leaves behind: the transcript and the index.
@@ -1234,6 +1280,7 @@ class AgentService:
         # fold, and holding it would leave the core answering `compact.resolve`
         # for a thread the graph no longer has.
         self._compactions.pop(session_id, None)
+        self._folded_at.pop(session_id, None)
         self._backends.forget_session(session_id)
         self._sessions.delete(session_id)
         await self._deps.db(
@@ -2638,18 +2685,26 @@ class AgentService:
     async def _land_compaction(self, offer: "_Compaction") -> None:
         """Write an accepted fold into the thread, and say what changed.
 
-        **No `chat.reset`, and this is the one to be careful about.** A fold
-        looks like the rollback next to it and is not: `rollback_thread`
-        removes messages, so the rows drawn for them describe messages that no
-        longer exist and only a reset can un-draw them, whereas this writes a
-        *view* — the stored history is untouched and every row on screen still
-        names a message the thread still has. Re-stating the chat here would be
-        the per-turn rebuild §4.2 exists to delete, in exchange for nothing.
+        **A `chat.reset`, and it was once deliberately not one.** A fold looks
+        like the rollback next to it and is not: `rollback_thread` removes
+        messages, so the rows drawn for them describe messages that no longer
+        exist, whereas this writes a *view* — the stored history is untouched
+        and every row on screen still names a message the thread still has.
+        For four milestones that made a reset here pure cost, and it was not
+        done.
 
-        So what crosses is what changed: a line saying it happened, and the
-        fill, because the last measured count described the unfolded prompt.
-        The summary itself no longer needs a toast — the user has just read it
-        and said yes to it.
+        What changed is that the fold is now *drawn*: `build_entries` puts a
+        boundary row where the model's verbatim view begins, and that row lands
+        between two rows that are already on screen. No append can reach a
+        position in the middle of a chat, so a reset is the only way to put it
+        there. It is one rebuild per accepted fold — a thing that costs a
+        generation and an answer to a prompt — and not the per-turn rebuild
+        §4.2 removed.
+
+        The rest crosses as it did: a line saying it happened, and the fill,
+        because the last measured count described the unfolded prompt. The
+        summary itself needs no toast — the user has just read it and said yes
+        to it.
         """
         session_id = offer.session_id
         landed = await apply_compaction(
@@ -2688,9 +2743,10 @@ class AgentService:
         # fill from the folded view, which `estimate_context` already accounts
         # for.
         self._backends.forget_session(session_id)
-        self._backends.estimate_context(
-            session_id, await self._thread_values(session_id)
-        )
+        # The reset re-estimates from the folded view on its way out, so the
+        # meter is right for the same reason the rows are, and it seeds
+        # `_folded_at` from the thread it just read — which is this fold.
+        await self._reset_chat(session_id)
         self._deps.emit(Notify(text=note))
 
     async def _memorize(self, session, note: str) -> None:

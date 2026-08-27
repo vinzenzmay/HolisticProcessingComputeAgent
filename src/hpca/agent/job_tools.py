@@ -8,6 +8,7 @@ the job DB (§5.4), and reports the log paths it resolved.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -129,8 +130,11 @@ async def get_job_report(args: GetJobReportParams, ctx: ToolContext) -> str:
     if status is not None:
         jobs.update_status(status)
     extra_logs = [Path(log.log_path) for log in jobs.logs(args.job_id)]
-    report = triage_job(
-        row, status, signatures=load_signatures(), extra_logs=extra_logs
+    # Off the loop: triage reads the tail of every log the job left behind,
+    # and those live on the cluster filesystem where a read is a network round
+    # trip. The UI draws from this loop.
+    report = await asyncio.to_thread(
+        triage_job, row, status, signatures=load_signatures(), extra_logs=extra_logs
     )
     matched = ", ".join(m.title for m in report.matches) or "no known signature"
     header = f"Job {args.job_id} ({row.script_key}): {report.state} — {matched}."

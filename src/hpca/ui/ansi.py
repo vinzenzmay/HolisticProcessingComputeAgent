@@ -443,7 +443,7 @@ def _footer_fill(
 
 
 def footer_wrap(
-    pairs: list[tuple[str, str]], width: int, note: str = "", max_rows: int = 1
+    pairs: list[tuple[str, str]], width: int, max_rows: int = 1
 ) -> list[list[tuple[str, str]]]:
     """Which ``key label`` pairs land on which footer row at this width.
 
@@ -458,14 +458,16 @@ def footer_wrap(
     hold it whole is dropped on its own and the rest carry on, rather than
     everything after it going with it.
 
-    An empty last row is the note's: see `footer_lines` for why it gets one.
+    **The note is not here, and that is the point.** The keys decide how tall
+    the footer is; a note is drawn over the bottom row of whatever they came
+    to (`footer_lines`). It used to be given a row of its own, which meant a
+    toast arriving took a row off the panes and one back when it expired —
+    and since the chat hangs from the bottom of its band, every line of the
+    conversation jumped by one, twice, for every "deleted …" the user ever
+    saw. A message about something that just happened may not move the thing
+    it happened to.
     """
-    note = _footer_note(note, width)
-    used = 1 + (cell_width(note) + 2 if note else 0)
-    rows = _footer_fill(pairs, width, used, max_rows)
-    if not note or len(rows) == 1:
-        return rows
-    return _footer_fill(pairs, width, 1, max_rows - 1) + [[]]
+    return _footer_fill(pairs, width, 1, max_rows)
 
 
 def footer_lines(
@@ -487,27 +489,40 @@ def footer_lines(
     fall off the end, since a footer that has eaten the conversation is worse
     than a hint ``?`` will still list in full.
 
-    The note shares the row while there is only one, exactly as it always has.
-    Once the hints need more than one, it takes the bottom line for itself: a
-    note is a sentence rather than a hint, it arrives and expires while the
-    keys sit still, and the bottom line of the screen is where a reader already
-    looks for one — under a stack of key rows is not where the eye would find
-    it. Costing a row is the price of that, and only while a note is up.
+    The note shares the bottom row, whether that row is the only one or the
+    last of several: a note is a sentence rather than a hint, it arrives and
+    expires while the keys sit still, and the bottom line of the screen is
+    where a reader already looks for one.
+
+    It is drawn *over* that row rather than given one of its own, so the
+    footer is exactly as tall with a note as without and nothing above it
+    moves (`footer_wrap`). The room it takes comes out of the hints beside
+    it: the pairs that no longer fit fall off the end of that row, which is
+    the same thing that happens to them at a narrow width, and they are the
+    trailing ones — the keys most likely to be known already, and all of them
+    still listed in full by `?`. A hint is help; a note is news about
+    something that just happened.
     """
     from hpca.ui import theme  # deferred: `theme` imports this module
 
     note = _footer_note(note, width)
     style = style or theme.warn
-    rows = footer_wrap(pairs, width, note, max_rows)
-    at = len(rows) - 1 if note and len(rows) > 1 else 0
+    rows = footer_wrap(pairs, width, max_rows)
+    at = len(rows) - 1 if note else -1
     key_style, label_style = theme.chrome, theme.faint
     out: list[str] = []
     for index, row in enumerate(rows):
-        head = f"{style}{note}{RESET}  " if note and index == at else ""
+        head = f"{style}{note}{RESET}  " if index == at else ""
         used = 1 + (cell_width(note) + 2 if head else 0)
         styled: list[str] = []
         for key, label in row:
-            used += cell_width(key) + 1 + cell_width(label) + (2 if styled else 0)
+            piece = cell_width(key) + 1 + cell_width(label) + (2 if styled else 0)
+            if used + piece > width - 1:
+                # Only reachable on the note's row: every other row was
+                # filled to fit. The note has the room and the rest of this
+                # row falls off, rather than the line running past the edge.
+                break
+            used += piece
             styled.append(f"{key_style}{key}{RESET} {label_style}{label}{RESET}")
         out.append(" " + head + "  ".join(styled) + " " * max(0, width - used))
     return out

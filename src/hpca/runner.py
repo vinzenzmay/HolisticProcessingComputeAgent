@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from hpca.filetail import read_tail
+
 if TYPE_CHECKING:
     from hpca.triage import LogFinding
 
@@ -369,6 +371,12 @@ def reconcile_orphans(conn: sqlite3.Connection) -> int:
 TERMINAL_STATES = {"finished", "failed", "killed"}
 EVENT_TAIL_LINES = 20
 EVENT_TAIL_CHARS = 1500
+# Read from the end of the log, not the whole log: a background script that
+# prints for an hour is the normal case, and this runs on the loop the TUI
+# draws from. Eight times the char cap for the same reasons as run_bash's
+# window (hpca.filetail): UTF-8 width, a seek that lands mid-character, and
+# EVENT_TAIL_LINES lines that have to fit inside it.
+EVENT_TAIL_WINDOW = EVENT_TAIL_CHARS * 8
 
 
 @dataclass
@@ -386,11 +394,17 @@ class ProcessChange:
 
 
 def _tail(path: Path) -> str:
-    """Last few lines of a log, bounded — this goes straight into a prompt."""
+    """Last few lines of a log, bounded — this goes straight into a prompt.
+
+    Bounded in what it *reads*, too: only the window at the end of the file,
+    which for anything smaller than the window is the file itself and for
+    anything larger is the only part this was ever going to keep.
+    """
     try:
-        lines = path.read_text(errors="replace").splitlines()
+        text, _ = read_tail(path, EVENT_TAIL_WINDOW)
     except OSError:
         return ""
+    lines = text.splitlines()
     body = "\n".join(lines[-EVENT_TAIL_LINES:]).strip()
     return body[-EVENT_TAIL_CHARS:]
 

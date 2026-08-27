@@ -207,8 +207,7 @@ class Core:
         on_no_backend=None,
     ) -> "Core":
         """Everything the runtime needs, opened in the one order that works."""
-        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-
+        from hpca.checkpointer import CheckpointLogSaver, migrate_inline_format
         from hpca.config import Settings, app_dir as default_app_dir
         from hpca.core.service import build_service
         from hpca.db import DbIO, connect, init_db
@@ -226,7 +225,19 @@ class Core:
         # be running forever.
         reconcile_orphans(db)
         dbio = DbIO(cache.path_for("hpca.db"))
-        saver_ctx = AsyncSqliteSaver.from_conn_string(
+        # Before the saver opens it and long before the graph is built: a
+        # database still in LangGraph's inline format has to be re-shaped into
+        # the checkpoint log, and on a file that grew to a gigabyte that is a
+        # minute of sqlite. Off the loop, because a minute of blocked frames
+        # at startup reads as a hang — and never fatal, because a conversation
+        # that cannot be converted is not a reason to refuse to start. What it
+        # has to say rides `notices`, the same wire the dbcache's warnings take
+        # (`_events_out`).
+        migration = await asyncio.to_thread(
+            migrate_inline_format, cache.path_for("checkpoints.db")
+        )
+        notices.extend(migration.notices())
+        saver_ctx = CheckpointLogSaver.from_conn_string(
             str(cache.path_for("checkpoints.db"))
         )
         checkpointer = await saver_ctx.__aenter__()

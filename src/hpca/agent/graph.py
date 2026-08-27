@@ -45,6 +45,7 @@ from hpca.agent.file_tools import edit_target_path
 from hpca.agent.prompts import orchestrator_system_prompt
 from hpca.agent.tools import ToolRegistry
 from hpca.llm import STAMP_KEY, Message
+from hpca.transcript import recorded_call
 
 # Fallback per-turn tool budget for callers that do not pass one. The app
 # passes llm.max_tool_rounds, whose default is -1 (no cap); a non-positive
@@ -103,6 +104,23 @@ def _append_messages(left: list, right) -> list:
     ]
 
 
+def _fold_record(upto: int, summary) -> dict:
+    """The `compacted` record, stamped with the moment the fold happened.
+
+    Stamped here rather than at either call site so the automatic path and
+    `/compact` cannot disagree about the format — it is the same ISO-8601 UTC
+    a message carries (`STAMP_KEY`), and the front-end is what turns it into a
+    local clock. The stamp is what lets the chat say *when* the model's view
+    was cut; a thread folded before it existed has none, and the row drawn for
+    it says so by leaving the time off rather than inventing one.
+    """
+    return {
+        "upto": upto,
+        "summary": summary,
+        STAMP_KEY: datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def _resolve(provider, thread_id):
     """Resolve a per-session dependency for the running ``thread_id``.
 
@@ -153,12 +171,16 @@ class AgentState(TypedDict, total=False):
     # and optionally "script"/"details"} — anchored to the message index of the
     # call itself (the assistant message execute_tool appends, immediately
     # followed by the result). Kept out of `messages` because this is the
-    # record the *user* reads, and it is never folded: `messages` keeps the
-    # call whole too, but the view sent to the model describes the payload of
-    # any but the most recent few (hpca.agent.history.fold_old_payloads), and
-    # the user, who never made the call, needs the script in full — after the
-    # approval prompt is answered this is the only place it survives (see
-    # hpca.transcript.call_text).
+    # record the *user* reads, and it is never folded by age the way the
+    # model's view is (hpca.agent.history.fold_old_payloads): after the
+    # approval prompt is answered this is the only place the script survives,
+    # and the user, who never made the call, needs it in full.
+    #
+    # What it does not keep is a payload the "script" block beside it already
+    # carries — that would be the same lines twice in a state LangGraph
+    # rewrites whole every super-step. `hpca.transcript.recorded_call` draws
+    # that line, and draws it where `call_text` reads, so the record holds
+    # what the chat renders and nothing else.
     calls: Annotated[list[dict], _append]
     pending_tool: dict | None
     tool_rounds: int
@@ -288,12 +310,7 @@ def build_graph(
                 await on_evict(older)
             except Exception:
                 pass  # extraction is best-effort too
-        return {
-            "compacted": {
-                "upto": already + len(older),
-                "summary": summary.message,
-            }
-        }
+        return {"compacted": _fold_record(already + len(older), summary.message)}
 
     async def orchestrator(state: AgentState, config) -> dict:
         thread_id = _thread_id(config)
@@ -404,6 +421,12 @@ def build_graph(
             call["script"] = preview
         if details:
             call["details"] = details
+        # Stored as the chat will read it, which is not always as the model
+        # made it: a payload the script block already carries whole is not
+        # kept a second time here (hpca.transcript.recorded_call). The same
+        # dict is what the live announcement below sends, so what the user
+        # watches happen and what a re-opened session shows stay one thing.
+        call = recorded_call(call)
         recorded = {"calls": [call]}
         # Full-auto is the one mode that waives the destructive gate (§3.5);
         # every other mode keeps §5.3's "always ask".
@@ -614,6 +637,11 @@ class TurnResult:
     # Index of the first message this turn appended: everything from here on
     # is new, which is what the session log needs and history does not.
     first_new: int = 0
+    # The fold record as of the end of this turn (None when nothing is folded).
+    # Carried because the automatic compaction happens *inside* a turn: without
+    # it the only news of a fold is the meter moving, and the caller cannot
+    # tell a turn that folded from one that did not (`service.after_turn`).
+    compacted: dict | None = None
 
 
 async def deliver_event(graph, *, session_id: str, text: str) -> None:
@@ -721,7 +749,7 @@ async def apply_compaction(
     # otherwise infers it from the last node that wrote, which is ambiguous on
     # a thread whose most recent write was itself an external one.
     await graph.aupdate_state(
-        config, {"compacted": {"upto": upto, "summary": summary}}, as_node=START
+        config, {"compacted": _fold_record(upto, summary)}, as_node=START
     )
     return True
 
@@ -911,6 +939,7 @@ async def run_turn(
     calls = result.get("calls", [])
     interrupts = result.get("__interrupt__") or []
     plan = result.get("plan")
+    compacted = result.get("compacted")
     if interrupts:
         return TurnResult(
             reply=None,
@@ -920,6 +949,7 @@ async def run_turn(
             calls=calls,
             plan=plan,
             first_new=first_new,
+            compacted=compacted,
         )
     reply = next(
         (m["content"] for m in reversed(messages) if m["role"] == "assistant"), None
@@ -932,4 +962,5 @@ async def run_turn(
         calls=calls,
         plan=plan,
         first_new=first_new,
+        compacted=compacted,
     )

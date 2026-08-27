@@ -88,8 +88,36 @@ def test_chat_offers_the_row_copy():
     assert "c copy" in footer_of(CHAT)
 
 
-def test_chat_offers_the_cuts_under_enter():
-    assert "enter rollback/fork" in footer_of(CHAT)
+def test_chat_offers_the_cuts_under_enter_on_your_own_message():
+    ui = build()
+    on_own_message(ui)
+    assert "enter rollback/fork" in footer(ui, 160)
+
+
+def test_and_not_on_the_agent_s_rows():
+    # Enter has never opened a rewind on a reply or on a turn's working — it
+    # moves the focus to the message box, which is what an Enter with nothing
+    # better to do means. The footer used to name the key on every chat row
+    # regardless, which is the kind of key list `?` exists to make unnecessary.
+    ui = build()
+    ui.focus = CHAT
+    for kind in ("assistant", "thinking"):
+        entry = next(e for e in ui.session.entries if e.kind == kind and e.seq)
+        ui.chat.show(str(entry.seq))
+        assert "enter rollback/fork" not in footer(ui, 160), kind
+        assert "c copy" in footer(ui, 160), kind
+
+
+def test_and_a_queued_message_is_named_for_what_enter_does_there():
+    # It has not reached the model, so there is no cut to offer — the one
+    # message that can simply be taken back.
+    ui = build()
+    ui.focus = CHAT
+    ui.session.append(ChatEntry(kind="queued", text="and then plot it", seq=9001))
+    ui.chat.show("9001")
+    drawn = footer(ui, 160)
+    assert "enter take it back" in drawn
+    assert "rollback/fork" not in drawn
 
 
 def test_chat_no_longer_offers_a_key_to_write():
@@ -259,15 +287,32 @@ def test_under_the_cap_the_hints_fall_off_the_end_as_they_always_did():
     assert "? keys" not in drawn
 
 
-def test_a_note_is_the_bottom_line_once_the_footer_wraps():
+def test_a_note_starts_the_bottom_line_of_the_footer():
     # Where a note has always been on a screen with one footer row, and where
     # `test_it_reaches_the_footer` (tests/test_ui_client.py) reads one from.
     ui = half_a_message()
     ui.handle("esc", 120, 40)
     rows = [plain(row) for row in ui._footer(60, 40)]
     assert len(rows) > 1
-    assert rows[-1].strip() == "esc again to stop"
-    assert plain(ui.render(60, 40)[-1]).strip() == "esc again to stop"
+    assert rows[-1].startswith(" esc again to stop")
+    assert plain(ui.render(60, 40)[-1]).startswith(" esc again to stop")
+
+
+def test_a_note_does_not_move_a_single_row_above_it():
+    # The bug this rule exists for: the note used to take a footer row, the
+    # row came off the panes, and the chat — which hangs from the bottom of
+    # its band — shifted every line of the conversation up by one. Twice per
+    # toast, since it shifted back when the note expired.
+    for width in (60, 100, 140):
+        quiet = build()
+        quiet.focus = SESSIONS
+        noisy = build()
+        noisy.focus = SESSIONS
+        noisy.note = "deleted “a session with a reasonably long title”"
+        before = [plain(row) for row in quiet.render(width, 30)]
+        after = [plain(row) for row in noisy.render(width, 30)]
+        assert before[:-1] == after[:-1], width
+        assert after[-1] != before[-1], width
 
 
 # ------------------------------------------------------------ the message row
@@ -1540,3 +1585,61 @@ def test_ctrl_z_still_undoes_what_is_being_written():
     typed(ui, "alpha beta")
     ui.handle("ctrl-z", 120, 40)
     assert ui.input.text() == "alpha "
+
+
+class TestTheFlashFollowsFocusWhereverItGoes:
+    """Every way focus moves lights the pane it lands on, not just the ring.
+
+    The flash used to be stamped in `_move_focus`, on the belief that walking
+    the ring was the only way focus travelled. The message box answers ctrl+↑
+    and ctrl+↓ itself, so leaving the box for the chat — one of the most
+    common moves there is — flashed nothing at all.
+    """
+
+    def ui(self, focus: int, hold: float = 0.1):
+        ui = clocked(demo.build())
+        theme.apply(flash_hold=hold)
+        ui.focus = focus
+        ui._focus_lit_at = None  # arrive without a flash; the test moves it
+        return ui
+
+    def washed(self, ui) -> list[str]:
+        return [row for row in ui.render(100, 30) if theme.flash in row]
+
+    def test_ctrl_up_out_of_the_message_box_lights_the_chat(self):
+        ui = self.ui(INPUT)
+        ui.handle("ctrl-up", 100, 30)
+        assert ui.focus == CHAT
+        assert self.washed(ui), "the pane focus arrived at is lit"
+
+    def test_ctrl_down_out_of_the_message_box_lights_the_watchers(self):
+        ui = self.ui(INPUT)
+        ui.handle("ctrl-down", 100, 30)
+        assert ui.focus == WATCHERS
+        assert self.washed(ui)
+
+    def test_tab_out_of_the_message_box_lights_too(self):
+        ui = self.ui(INPUT)
+        ui.handle("tab", 100, 30)
+        assert self.washed(ui)
+
+    def test_and_the_ring_still_does(self):
+        ui = self.ui(SESSIONS)
+        ui.handle("tab", 100, 30)
+        assert self.washed(ui)
+
+    def test_focus_re_asserted_where_it_already_is_lights_nothing(self):
+        # Half the app says `self.focus = INPUT` on a path that may or may not
+        # be a move. Only a change is one.
+        ui = self.ui(CHAT)
+        ui.focus = CHAT
+        assert self.washed(ui) == []
+
+    def test_a_screen_books_no_frame_for_a_wash_it_hides(self):
+        # Focus moves under a confirmation — `q` is pressed from a pane — and
+        # the panes are blanked behind it, so there is nothing to repaint.
+        ui = self.ui(CHAT)
+        ui.focus = SESSIONS
+        assert ui._flash_wake() is not None
+        ui.ask("really?")
+        assert ui._flash_wake() is None

@@ -13,7 +13,7 @@ review, manage-LLMs and the backend form.
 
 import pytest
 
-from hpca.ui.app import CHAT, SESSIONS, WATCHERS, RowUI
+from hpca.ui.app import BEHIND_THE_FOLD, CHAT, SESSIONS, WATCHERS, RowUI
 from hpca.ui.demo import build, sample_catalog
 from hpca.ui.overlays import (
     KEEP_CHANGES,
@@ -1591,3 +1591,138 @@ class TestAScreenFooterWraps:
         ui.overlay = LlmOverlay()
         drawn = len(ui._screen_footer(ui.overlay, 50, 40))
         assert ui._screen_h(ui.overlay, 50, 40) == 40 - 1 - drawn
+
+
+class TestTheRewindStopsAtTheFold:
+    """Above the compaction line there is nothing to rewind *to*.
+
+    Both cuts reach for history the model no longer holds — a rollback past
+    the boundary drops the summary standing in for it, a fork from up there
+    starts a conversation the summary does not describe. The core handles
+    both deliberately; the UI's answer is not to offer them behind a keystroke
+    on a row that looks like every other one.
+    """
+
+    def fold(self, ui: RowUI, kind: str = "user"):
+        """Put a boundary into the demo chat, half way down. Returns a row of
+        ``kind`` above it and a user message below."""
+        entries = list(ui.session.entries)
+        users = [e for e in entries if e.kind == "user"]
+        assert len(users) >= 2, "the demo chat needs two messages to cut between"
+        below = users[-1]
+        at = entries.index(below)
+        above = next(e for e in entries[:at] if e.kind == kind and e.seq)
+        boundary = ChatEntry(
+            kind="compaction",
+            text="earlier: the cohort was indexed",
+            seq=9000,
+            index=-1,
+            at="2026-08-27T13:34:29+00:00",
+        )
+        ui.session.reset(entries[:at] + [boundary] + entries[at:])
+        ui.focus = CHAT
+        # The fixture says what it means, so none of the tests below can pass
+        # by pointing at two rows on the same side of the line.
+        assert ui.session.folded_away(above.seq)
+        assert not ui.session.folded_away(below.seq)
+        return above, below
+
+    def aim(self, ui: RowUI, entry) -> RowUI:
+        ui.chat.show(str(entry.seq))
+        return ui
+
+    def test_below_the_fold_the_rewind_is_still_offered(self):
+        ui = build()
+        _, below = self.fold(ui)
+        press(self.aim(ui, below), "enter")
+        assert isinstance(ui.overlay, RewindOverlay)
+
+    def test_above_it_enter_opens_nothing(self):
+        ui = build()
+        above, _ = self.fold(ui)
+        press(self.aim(ui, above), "enter")
+        assert ui.overlay is None
+
+    def test_and_says_why_rather_than_moving_the_focus(self):
+        # A key that looked like it did something and did not is worse than
+        # one that explains itself — the rule `_stop_from_the_row` follows.
+        ui = build()
+        above, _ = self.fold(ui)
+        press(self.aim(ui, above), "enter")
+        assert ui.note == BEHIND_THE_FOLD
+        assert ui.focus == CHAT
+
+    def test_the_footer_stops_offering_the_key_there(self):
+        ui = build()
+        above, _ = self.fold(ui)
+        self.aim(ui, above)
+        assert "enter rollback/fork" not in screen(ui)
+
+    def test_and_still_offers_it_below(self):
+        ui = build()
+        _, below = self.fold(ui)
+        self.aim(ui, below)
+        assert "enter rollback/fork" in screen(ui)
+
+    def test_copy_is_offered_on_both_sides(self):
+        # Reading an old message is not the thing being withdrawn.
+        ui = build()
+        above, below = self.fold(ui)
+        assert "c copy" in screen(self.aim(ui, above))
+        assert "c copy" in screen(self.aim(ui, below))
+
+    def test_a_conversation_with_no_fold_is_untouched(self):
+        ui = build()
+        on_own_message(ui)
+        press(ui, "enter")
+        assert isinstance(ui.overlay, RewindOverlay)
+
+
+class TestTheFoldWithholdsItFromEveryRow:
+    """Not only the user's own messages. Neither cut is aimed at a *message*.
+
+    A rollback and a fork are aimed at a point in the conversation, and every
+    point above the fold is one the model no longer holds — so the agent's
+    replies and its working are as un-rewindable as the questions that
+    produced them. Offering the key on one and not the other would draw a
+    distinction that does not exist.
+    """
+
+    def test_an_agent_reply_above_the_fold_offers_nothing(self):
+        ui = build()
+        above, _ = TestTheRewindStopsAtTheFold().fold(ui, kind="assistant")
+        ui.chat.show(str(above.seq))
+        assert "enter rollback/fork" not in screen(ui)
+        press(ui, "enter")
+        assert ui.overlay is None
+        assert ui.note == BEHIND_THE_FOLD
+
+    def test_and_neither_does_a_turn_s_working(self):
+        ui = build()
+        above, _ = TestTheRewindStopsAtTheFold().fold(ui, kind="thinking")
+        ui.chat.show(str(above.seq))
+        assert "enter rollback/fork" not in screen(ui)
+        press(ui, "enter")
+        assert ui.note == BEHIND_THE_FOLD
+
+    def test_while_below_it_an_agent_reply_is_unchanged(self):
+        # The rewind has never been offered on a reply and still is not; what
+        # is withdrawn above the fold is the *hint*, which was there before.
+        ui = build()
+        _, below = TestTheRewindStopsAtTheFold().fold(ui, kind="assistant")
+        ui.chat.show(str(below.seq))
+        assert "enter rollback/fork" in screen(ui)
+
+    def test_nor_the_boundary_row_itself(self):
+        # It is a mark rather than a message (`index` -1), so there is nothing
+        # for a cut to name there either. Together with the rows above it that
+        # makes one contiguous region, and the footer's answer changes exactly
+        # once as the cursor walks down.
+        ui = build()
+        TestTheRewindStopsAtTheFold().fold(ui)
+        line = next(e for e in ui.session.entries if e.kind == "compaction")
+        ui.chat.show(str(line.seq))
+        assert "enter rollback/fork" not in screen(ui)
+        press(ui, "enter")
+        assert ui.overlay is None
+        assert ui.note == BEHIND_THE_FOLD

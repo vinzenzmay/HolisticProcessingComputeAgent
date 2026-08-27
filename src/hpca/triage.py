@@ -16,10 +16,19 @@ from pathlib import Path
 import yaml
 
 from hpca.config import app_dir
+from hpca.filetail import read_tail
 from hpca.jobs import JobRow
 from hpca.slurm import JobStatus
 
 TAIL_LINES = 5000
+# The byte window those lines are read out of. A job log is the one file here
+# that is routinely enormous — a gigabyte of progress bars is an ordinary
+# afternoon — and "the last 5000 lines" used to be reached by loading all of
+# it. 4 MiB holds 5000 lines at up to ~800 bytes each, which no ordinary log
+# exceeds; a log whose lines are wider than that is scanned over fewer of them
+# but still over its most recent 4 MiB, which is where a failure that just
+# happened is.
+TAIL_BYTES = 4 << 20
 EXCERPT_BEFORE = 9
 EXCERPT_AFTER = 20  # before + match + after ≤ 30 lines (§5.5)
 FALLBACK_TAIL = 30
@@ -124,6 +133,27 @@ def load_signatures(user_file: Path | None = None) -> list[Signature]:
     return list(by_id.values())
 
 
+def tail_of(path: Path | str, tail_lines: int = TAIL_LINES) -> list[str]:
+    """The last ``tail_lines`` lines of a log, read from the end of the file.
+
+    An unreadable log is not an error here — triage is a best effort over
+    whatever the job left behind, and every caller's answer to "no lines" is
+    already "no findings".
+
+    The first line of a window that did not reach the start of the file is
+    dropped: the seek landed in the middle of it, and half a line is not a
+    line to match a signature against.
+    """
+    try:
+        text, whole = read_tail(path, TAIL_BYTES)
+    except OSError:
+        return []
+    lines = text.splitlines()
+    if not whole and lines:
+        del lines[0]
+    return lines[-tail_lines:]
+
+
 def scan_log(
     path: Path,
     signatures: list[Signature],
@@ -131,9 +161,8 @@ def scan_log(
     tail_lines: int = TAIL_LINES,
 ) -> list[SignatureMatch]:
     """Scan a log tail; one match (the last occurrence) per signature."""
-    try:
-        lines = Path(path).read_text(errors="replace").splitlines()[-tail_lines:]
-    except OSError:
+    lines = tail_of(path, tail_lines)
+    if not lines:
         return []
     matches: list[SignatureMatch] = []
     for signature in signatures:
@@ -218,10 +247,7 @@ def scan_generic(
     disposes. Returning several candidates instead of one guess is the point
     — a regex cannot tell a cleanup message from the failure that caused it.
     """
-    try:
-        lines = Path(path).read_text(errors="replace").splitlines()[-tail_lines:]
-    except OSError:
-        return []
+    lines = tail_of(path, tail_lines)
     scored: list[Candidate] = []
     for index, line in enumerate(lines):
         if not line.strip():
@@ -365,15 +391,8 @@ def triage_job(
 
     fallback = None
     if not matches:
-        try:
-            tail = (
-                Path(job.sbatch_stderr_path)
-                .read_text(errors="replace")
-                .splitlines()[-FALLBACK_TAIL:]
-            )
-            fallback = "\n".join(tail) if tail else None
-        except OSError:
-            fallback = None
+        tail = tail_of(job.sbatch_stderr_path, FALLBACK_TAIL)
+        fallback = "\n".join(tail) if tail else None
 
     return TriageReport(
         job_id=job.job_id,

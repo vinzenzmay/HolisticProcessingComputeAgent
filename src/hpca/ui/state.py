@@ -386,6 +386,32 @@ def entry_item(entry: ChatEntry, *, stamps: bool = True) -> Item:
             accent=theme.faint,
             **row,
         )
+    if entry.kind == "compaction":
+        # A divider, not a message. The head names the moment the model's view
+        # was cut and the rest of the line is drawn out to the edge of the
+        # pane, because what this row marks is a *boundary* across the whole
+        # conversation rather than an event at a point in it — the one row
+        # here whose meaning is "everything above this is different from
+        # everything below".
+        #
+        # It opens into the summary that stands in for what is above it, which
+        # is the question a boundary immediately raises: the user can see that
+        # the context was cut, and the only useful next thing is what the model
+        # kept of it. No preview — a closed divider is a line, and one clipped
+        # line of a thousand-character summary hanging under it would read as
+        # a message somebody sent.
+        return Item(
+            head=f'{_label("compacted", entry.at, stamps)} ',
+            body=body,
+            # Dashed, not solid: a gapless rule here is the same line the
+            # pane draws over every panel, and this is not a panel edge — it
+            # is a mark inside the conversation. The gaps are what say so at
+            # a glance, and they are made of the rule's own character so the
+            # two read as the same weight rather than as two kinds of line.
+            fill="── ",
+            accent=theme.faint,
+            **row,
+        )
     if entry.kind in ("event", "recall"):
         mark = "↺" if entry.kind == "recall" else "·"
         return Item(head=f"{mark} {said}", accent=theme.faint, **row)
@@ -1025,6 +1051,15 @@ class SessionState:
         # The map, not a scan: a `chat.update` during a long turn arrives once
         # per tool call, and a linear search per update is O(chat) per step.
         self._rows: dict[int, int] = {}
+        # The `seq` of the compaction boundary row, or 0 for a conversation
+        # that has never been folded. Named by seq rather than by position so
+        # it survives `remove` shifting the rows under it — `_rows` is what
+        # keeps positions honest, and this rides it.
+        #
+        # One, not a list: the graph keeps a single fold record and moves it
+        # (`AgentState.compacted`), so a second compaction replaces the first
+        # rather than adding to it.
+        self._fold_seq = 0
         self.loaded = False
 
     # -------------------------------------------------------------- the chat
@@ -1077,6 +1112,12 @@ class SessionState:
         self._rows = {
             entry.seq: i for i, entry in enumerate(self.entries) if entry.seq
         }
+        # Only a reset can bring one in: `build_entries` draws the boundary
+        # for whole-chat builders alone, and an append arrives below it by
+        # construction. So this is the one place it needs finding.
+        self._fold_seq = next(
+            (e.seq for e in reversed(self.entries) if e.kind == "compaction"), 0
+        )
         self.chat.expanded.clear()
         self.chat.invalidate()
         self._auto = ""
@@ -1214,6 +1255,28 @@ class SessionState:
             self._auto = ""
             self._open_last()
         return entry
+
+    def folded_away(self, seq: int) -> bool:
+        """Is that row above this conversation's compaction boundary?
+
+        The rewind is not offered above the fold, and this is the question it
+        asks. Both halves of it — cutting the thread back to a message, and
+        forking a new one from it — reach for history that the model no longer
+        holds: rolling back past the boundary drops the summary standing for
+        it, and a fork from up there starts a conversation the summary does
+        not describe. Both are *defined* (`graph.rollback_thread` /
+        `fork_thread` handle the fold deliberately), and neither is a thing to
+        offer behind a keystroke on a row that looks like every other one.
+
+        Positions rather than seqs, because seqs are assigned in row order but
+        the comparison must survive a `remove` renumbering the map under it.
+        """
+        if not self._fold_seq:
+            return False
+        row, fold = self._rows.get(seq), self._rows.get(self._fold_seq)
+        if row is None or fold is None:
+            return False
+        return row < fold
 
     def entry_at(self, position: int) -> ChatEntry | None:
         """The entry a pane position is showing, if it is showing one."""

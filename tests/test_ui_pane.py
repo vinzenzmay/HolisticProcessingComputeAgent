@@ -6,7 +6,7 @@ on whether it has a body at all.
 """
 
 from hpca.ui import theme
-from hpca.ui.ansi import BOLD, REVERSE
+from hpca.ui.ansi import BOLD, REVERSE, cell_width
 from hpca.ui.app import CHAT, SESSIONS, WATCHERS
 from hpca.ui.demo import build
 from hpca.ui.pane import SPACER_KEY, Fold, Item, Pane
@@ -1249,3 +1249,50 @@ class TestOnlyTheFocusedPaneInvertsARow:
         head = next(x for x in drawn if plain(x).rstrip() == "▸    you")
         assert BOLD in head
         assert REVERSE not in head
+
+
+class TestAFilledHeadIsADivider:
+    """`Item.fill`: a head that runs out to the pane's width.
+
+    The chat's compaction boundary is the row this exists for. What is tested
+    here is the mechanism, not that row: a head with words in it, a rule
+    behind them, and the same right edge every other line of the pane has.
+    """
+
+    def pane(self, **kw):
+        return Pane("chat", [Item(head="compacted ", fill="─", **kw)], flush=True)
+
+    def head(self, pane) -> str:
+        return pane.flat(INNER)[0][1]
+
+    def test_the_rule_reaches_the_edge(self):
+        head = self.head(self.pane())
+        assert cell_width(head) == INNER
+        assert head.endswith("─")
+
+    def test_and_starts_after_the_words(self):
+        assert "compacted ─" in self.head(self.pane())
+
+    def test_a_head_without_fill_is_left_alone(self):
+        pane = Pane("chat", [Item(head="compacted ")], flush=True)
+        assert self.head(pane).rstrip() == self.head(pane).rstrip("─").rstrip()
+
+    def test_a_head_too_long_to_fill_is_not_stretched(self):
+        # No room left over: the rule is what is dropped, not the words.
+        pane = Pane("chat", [Item(head="x" * (INNER + 20), fill="─")], flush=True)
+        assert "─" not in self.head(pane)
+
+    def test_a_pattern_repeats_and_is_cut_to_the_edge(self):
+        # The dashed case: the rule has to stop at the same column a solid one
+        # would, whether or not the pattern divides into the room left.
+        for pattern in ("── ", "─ ", "-"):
+            pane = Pane("chat", [Item(head="compacted ", fill=pattern)], flush=True)
+            head = pane.flat(INNER)[0][1]
+            assert cell_width(head) == INNER, pattern
+            assert head.startswith(f"     compacted {pattern}"), pattern
+
+    def test_the_fill_lands_behind_the_fold_marker_not_over_it(self):
+        # A row that opens keeps its marker column; the rule starts after the
+        # head, so the two never compete for the same cells.
+        pane = self.pane(body=["the summary"])
+        assert self.head(pane).startswith("▸")

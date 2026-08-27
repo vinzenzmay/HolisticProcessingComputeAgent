@@ -19,6 +19,7 @@ from hpca.agent.history import (
 )
 from hpca.agent.tools import Tool, ToolRegistry
 from hpca.llm import ChatResponse
+from hpca.transcript import build_entries, call_step
 
 
 class EchoParams(BaseModel):
@@ -833,6 +834,39 @@ class TestThinkingState:
         result = await run_turn(graph, session_id="t4", user_text="hello")
         assert result.thinking == []
 
+    async def test_the_checkpoint_is_where_a_re_opened_session_finds_it(
+        self, tools
+    ):
+        # The reason `thinking` is checkpointed at all, pinned so a later
+        # attempt to take it out of the state has to answer this first: a
+        # session that is closed and re-opened rebuilds its whole chat from
+        # the thread values alone (`core.service._reset_chat`), and nothing
+        # streams reasoning to anyone — it reaches the UI only through here.
+        # It is also the fattest channel in a long conversation, so this is
+        # the property any storage change has to keep.
+        llm = FakeLLM(
+            [tool_json("echo", text="hi"), respond_json("done")],
+            reasoning=["I should echo first.", "Now I can answer."],
+        )
+        graph = make_graph(llm, tools)
+        await run_turn(graph, session_id="t6", user_text="echo hi")
+        # Read back the way an open does: a fresh state read, no TurnResult.
+        values = (
+            await graph.aget_state({"configurable": {"thread_id": "t6"}})
+        ).values
+        entries = build_entries(
+            list(values["messages"]),
+            list(values.get("thinking") or []),
+            list(values.get("calls") or []),
+        )
+        box = next(entry for entry in entries if entry.kind == "thinking")
+        assert "I should echo first." in box.text
+        assert "Now I can answer." in box.text
+        assert box.reasoning_chars == len("I should echo first.") + len(
+            "Now I can answer."
+        )
+        assert [part.kind for part in box.parts][0] == "reasoning"
+
     async def test_thinking_accumulates_across_turns(self, tools):
         llm = FakeLLM([respond_json("a"), respond_json("b")], reasoning=["one", "two"])
         graph = make_graph(llm, tools)
@@ -1115,7 +1149,10 @@ class TestCallsInTheHistory:
     async def test_the_record_the_user_reads_keeps_every_line(self, tools):
         # AgentState.calls is what the chat renders the step from, and it is
         # never a view: whatever the model is shown, the user's copy of what
-        # was written stays complete.
+        # was written stays complete. Asserted on what the step *renders*,
+        # because that is the promise — the record keeps the lines once, in
+        # the script block, and not a second time under `arguments` (see
+        # hpca.transcript.recorded_call).
         lines = self.register_writer(tools)
         llm = FakeLLM(
             [
@@ -1125,9 +1162,15 @@ class TestCallsInTheHistory:
         )
         graph = make_graph(llm, tools)
         result = await run_turn(graph, session_id="h4", user_text="write notes")
-        assert result.calls[0]["arguments"]["content_lines"] == lines
-        # …and so does the stored history the checkpoint holds, which is what
-        # makes the fold a view rather than a lossy rewrite.
+        rendered = call_step(result.calls[0]).body()
+        assert all(line in rendered for line in lines)
+        assert "notes.md" in rendered  # and what it was written to
+        # The copy that is *not* kept: the payload is in the script block, so
+        # the arguments do not carry it as well.
+        assert "content_lines" not in result.calls[0]["arguments"]
+        assert result.calls[0]["arguments"]["path"] == "notes.md"
+        # …while the stored history the checkpoint holds does keep them, which
+        # is what makes the model's fold a view rather than a lossy rewrite.
         stored = json.loads(result.messages[1]["content"])
         assert stored["arguments"]["content_lines"] == lines
 
