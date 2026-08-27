@@ -107,7 +107,7 @@ class TestFooterLine:
 
     def test_a_pair_too_wide_for_any_row_does_not_take_the_rest_with_it(self):
         pairs = [("k", "a hint far too long for this"), ("q", "quit")]
-        rows = footer_wrap(pairs, 20, max_rows=4)
+        rows = footer_wrap(pairs, 20, 4)
         assert rows == [[("q", "quit")]]
 
     def test_keys_are_bright_and_labels_dim(self):
@@ -123,20 +123,37 @@ class TestFooterLine:
         row = plain(footer_lines(PAIRS, 120, "sent")[0])
         assert row.startswith(" sent  enter send")
 
-    def test_a_note_takes_the_bottom_line_once_the_hints_wrap(self):
+    def test_a_note_starts_the_bottom_line_however_many_there_are(self):
         rows = [plain(row) for row in footer_lines(PAIRS, 30, "sent", max_rows=4)]
-        assert rows[-1].strip() == "sent"
+        assert len(rows) > 1
+        assert rows[-1].startswith(" sent")
         assert "sent" not in "".join(rows[:-1])
 
-    def test_the_note_costs_a_row_and_no_hints(self):
-        pairs = [("a", "one"), ("b", "two")]
-        assert footer_wrap(pairs, 20, max_rows=4) == [pairs]
-        assert footer_wrap(pairs, 20, "a note", 4) == [pairs, []]
+    def test_the_note_costs_no_row(self):
+        # It used to be given one, and that row came off the panes: a toast
+        # arriving moved every line of the conversation and moved it back
+        # when it expired. The footer is now exactly as tall either way.
+        for width in range(20, 121):
+            without = footer_wrap(PAIRS, width, 4)
+            assert len(footer_lines(PAIRS, width, "sent", max_rows=4)) == len(
+                without
+            ), width
 
-    def test_the_notes_row_counts_against_the_cap_like_any_other(self):
-        rows = footer_lines(PAIRS, 24, "sent", max_rows=2)
-        assert len(rows) == 2
-        assert plain(rows[-1]).strip() == "sent"
+    def test_it_costs_hints_instead_and_they_are_the_trailing_ones(self):
+        rows = [plain(row) for row in footer_lines(PAIRS, 40, "a fairly long note")]
+        assert "a fairly long note" in rows[0]
+        assert "enter send" in rows[0], "the first pairs are the ones that survive"
+        assert "? keys" not in rows[0]
+
+    def test_and_the_row_is_still_exactly_the_width(self):
+        # The dropped pairs must not leave the line short or long: every row
+        # is padded to an exact number of cells for the differential repaint.
+        # Cells, not characters — a note in CJK is half as many characters as
+        # it is columns, and it is the columns the terminal spends.
+        for note in ("a fairly long note", "送信しました" * 4, "x" * 400):
+            for width in range(20, 121):
+                for row in footer_lines(PAIRS, width, note, max_rows=4):
+                    assert cell_width(plain(row)) == width, (width, note[:8])
 
 
 # ------------------------------------------------------------ cell widths

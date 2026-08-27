@@ -259,15 +259,32 @@ def test_under_the_cap_the_hints_fall_off_the_end_as_they_always_did():
     assert "? keys" not in drawn
 
 
-def test_a_note_is_the_bottom_line_once_the_footer_wraps():
+def test_a_note_starts_the_bottom_line_of_the_footer():
     # Where a note has always been on a screen with one footer row, and where
     # `test_it_reaches_the_footer` (tests/test_ui_client.py) reads one from.
     ui = half_a_message()
     ui.handle("esc", 120, 40)
     rows = [plain(row) for row in ui._footer(60, 40)]
     assert len(rows) > 1
-    assert rows[-1].strip() == "esc again to stop"
-    assert plain(ui.render(60, 40)[-1]).strip() == "esc again to stop"
+    assert rows[-1].startswith(" esc again to stop")
+    assert plain(ui.render(60, 40)[-1]).startswith(" esc again to stop")
+
+
+def test_a_note_does_not_move_a_single_row_above_it():
+    # The bug this rule exists for: the note used to take a footer row, the
+    # row came off the panes, and the chat — which hangs from the bottom of
+    # its band — shifted every line of the conversation up by one. Twice per
+    # toast, since it shifted back when the note expired.
+    for width in (60, 100, 140):
+        quiet = build()
+        quiet.focus = SESSIONS
+        noisy = build()
+        noisy.focus = SESSIONS
+        noisy.note = "deleted “a session with a reasonably long title”"
+        before = [plain(row) for row in quiet.render(width, 30)]
+        after = [plain(row) for row in noisy.render(width, 30)]
+        assert before[:-1] == after[:-1], width
+        assert after[-1] != before[-1], width
 
 
 # ------------------------------------------------------------ the message row

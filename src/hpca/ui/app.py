@@ -1267,21 +1267,27 @@ class RowUI:
     def _footer_note(self) -> tuple[str, str]:
         """What the footer says beside the keys, and in which colour.
 
-        Read here rather than in `render` because the note is part of what
-        decides how tall the footer is — it shares the row while there is one
-        and takes the bottom line once the hints wrap (`ansi.footer_lines`) —
-        so the measurement and the drawing ask the same question of it.
+        The note no longer decides anything about the footer's height: it is
+        drawn over the bottom row of whatever the keys came to
+        (`ansi.footer_lines`), so a toast arriving cannot move the panes
+        above it. This is read in one place all the same, because both halves
+        of the frame have to agree about *which* note is up — the armed stop
+        outranks whatever was last said, and it may not outrank it in the
+        drawing and not in the measuring.
         """
         if self._esc_armed():
             return "esc again to stop", theme.danger
         return self.note, self.note_style
 
     def _footer_h(self, width: int, height: int) -> int:
-        """How many rows the footer needs for the keys this row offers."""
-        note, _ = self._footer_note()
-        return len(
-            footer_wrap(self._keys(), width, note, self._footer_cap(height))
-        )
+        """How many rows the footer needs for the keys this row offers.
+
+        The keys, and nothing else: a note is drawn over the bottom row of
+        them rather than given one, which is what makes this number — and so
+        every band's share of the screen — the same whether or not a toast is
+        up.
+        """
+        return len(footer_wrap(self._keys(), width, self._footer_cap(height)))
 
     def _avail(self, width: int, height: int, footer_h: int | None = None) -> int:
         """Rows the four bands share: the screen, less the header and however
