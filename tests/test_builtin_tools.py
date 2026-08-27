@@ -1,7 +1,11 @@
 """Tests for hpca.agent.builtin_tools (§5.1): script tools over the runner/registry."""
 
+import threading
+import tracemalloc
+
 import pytest
 
+from hpca.agent import builtin_tools
 from hpca.agent.builtin_tools import default_tool_registry
 from hpca.agent.builtin_tools import script_names, script_path
 from hpca.agent.context import ToolContext
@@ -575,6 +579,101 @@ class TestRunBash:
         record = ctx.runner.list()[0]
         assert str(record.stdout_path) in result
         assert "1\n" in record.stdout_path.read_text()
+
+
+class TestLargeOutputIsNotReadWhole:
+    """Keeping 4000 characters must not cost reading the whole log.
+
+    The UI and the agent share one event loop, so a synchronous read here is a
+    freeze the user sits through, and on a cluster node the log is on NFS.
+    Measured before the fix, on a 104 MB log: 170ms of blocked loop and 269 MB
+    of resident memory, to keep 4000 characters of it.
+    """
+
+    LOG_MB = 32
+
+    def _big_log(self, tmp_path):
+        path = tmp_path / "big.txt"
+        chunk = ("y" * 79 + "\n") * 13_000  # ~1 MB
+        with path.open("w") as handle:
+            for _ in range(self.LOG_MB):
+                handle.write(chunk)
+        return path
+
+    async def test_a_large_log_is_not_pulled_into_memory(self, tools, ctx, tmp_path):
+        """Python's own allocation peak across the call.
+
+        A whole-file read cannot hide from it — the text has to exist — while
+        a window read is invisible next to the threshold. Asserted on memory
+        rather than on elapsed time because a warm page cache makes the second
+        one say nothing.
+        """
+        big = self._big_log(tmp_path)
+        tracemalloc.start()
+        try:
+            tracemalloc.reset_peak()
+            result = await call(
+                tools, "run_bash", ctx,
+                content_lines=[f"cat {big}", "echo THE_VERY_LAST_LINE"],
+            )
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert "ran (exit 0)" in result
+        assert peak < 4 * 1024 * 1024, (
+            f"{peak / 1e6:.1f} MB allocated to summarise a {self.LOG_MB} MB log"
+        )
+
+    async def test_the_answer_is_still_the_end_of_the_log_and_says_it_was_cut(
+        self, tools, ctx, tmp_path
+    ):
+        big = self._big_log(tmp_path)
+        result = await call(
+            tools, "run_bash", ctx,
+            content_lines=[f"cat {big}", "echo THE_VERY_LAST_LINE"],
+        )
+        assert "THE_VERY_LAST_LINE" in result  # the tail, not the head
+        assert "omitted" in result
+        # and the pointer at the rest still has to be the file that holds it
+        record = ctx.runner.list()[0]
+        assert str(record.stdout_path) in result
+        assert len(result) < 6000
+
+    async def test_a_failure_at_the_top_of_a_huge_stderr_is_still_quoted(
+        self, tools, ctx, tmp_path
+    ):
+        """Why the citation scan reads both ends and not just the tail.
+
+        A script without `set -e` fails on line 1 and keeps going; bash's
+        message about line 1 is then buried under everything printed after
+        it, and a model told 'line 1' that cannot see line 1 can only rewrite
+        the whole script.
+        """
+        big = self._big_log(tmp_path)
+        result = await call(
+            tools, "run_bash", ctx,
+            content_lines=["not_a_command_xyz", f"cat {big} >&2"],
+        )
+        assert "> 1 | not_a_command_xyz" in result
+
+    async def test_the_reads_do_not_run_on_the_event_loop(self, tools, ctx, monkeypatch):
+        """Bounded is not enough: one NFS round trip on the loop is a stutter.
+
+        The assertion is the thread the read ran on, which is the property
+        being claimed, rather than which call was used to get off the loop.
+        """
+        loop_thread = threading.get_ident()
+        threads: list[int] = []
+        real = builtin_tools.read_tail
+
+        def spy(path, max_bytes):
+            threads.append(threading.get_ident())
+            return real(path, max_bytes)
+
+        monkeypatch.setattr(builtin_tools, "read_tail", spy)
+        await call(tools, "run_bash", ctx, content_lines=["echo hi"])
+        assert threads, "run_bash did not read its logs at all"
+        assert loop_thread not in threads
 
 
 class TestRunBashFailingLines:

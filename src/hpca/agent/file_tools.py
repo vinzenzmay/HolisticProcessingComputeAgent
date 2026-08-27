@@ -30,6 +30,7 @@ entirely.
 
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 import unicodedata
@@ -573,7 +574,10 @@ async def edit_file(args: EditFileParams, ctx: ToolContext) -> str:
             f"{hints.EDIT_FILE_ON_DIRECTORY}"
         )
     try:
-        text, bom, ending = _read_for_edit(path)
+        # An edit needs the whole file — it matches against every line and
+        # writes the result back — so this one cannot be bounded, only moved
+        # off the loop the UI shares.
+        text, bom, ending = await asyncio.to_thread(_read_for_edit, path)
     except (UnicodeDecodeError, OSError) as exc:
         return f"NOT edited: {path} could not be read as text ({type(exc).__name__})."
 
