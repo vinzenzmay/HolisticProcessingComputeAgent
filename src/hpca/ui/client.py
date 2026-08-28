@@ -15,9 +15,12 @@ Two properties from §3.2 are the whole point of the file and are asserted by
    thing a background session may change about the frame.
 2. **The chat is append-only between resets.** `chat.reset` is the only path
    that replaces rows; `chat.append` is the only path that adds one; and
-   `chat.update` revises a row it can already name. Nothing here rebuilds a
-   transcript from a snapshot, which is what the Textual app did every turn and
-   what its queued-message bugs were made of.
+   `chat.update` revises a row it can already name. `chat.truncate` is the
+   fourth and takes rows *away* without replacing any — the rewind's cut,
+   which is the one thing a suffix can be told to a client that already has
+   the prefix. Nothing here rebuilds a transcript from a snapshot, which is
+   what the Textual app did every turn and what its queued-message bugs were
+   made of.
 
 Anything not in §3.2's table is dropped, counted in `dropped` so a test can say
 so out loud rather than a frame quietly missing something.
@@ -989,6 +992,25 @@ class UIClient:
     def _append(self, msg: protocol.ChatAppend) -> None:
         self._session(msg.session_id).append(_entry(msg.entry))
 
+    def _truncate(self, msg: protocol.ChatTruncate) -> None:
+        """The rewind's cut, applied to rows this client already holds.
+
+        Counted like a dropped update when it names a row above everything on
+        screen, and for the same reason (`protocol.ChatUpdate`): the only way
+        to be above the newest row the core has handed out is to be out of
+        step with a reset, and a client that quietly did nothing would hide
+        that. Nothing is invented either way — the next reset settles it.
+
+        A session this client has never been given a chat for is not that
+        case, and is not counted: every event is addressed and a client drops
+        what it is not showing (§4.2), so a rewind in a conversation nobody
+        here has opened is a frame with nothing to do rather than a sign of
+        drift. Opening it asks for the transcript as it stands.
+        """
+        session = self._session(msg.session_id)
+        if not session.truncate(msg.after_seq) and session.loaded:
+            self.dropped["chat.truncate"] += 1
+
     def _update(self, msg: protocol.ChatUpdate) -> None:
         if not self._session(msg.session_id).update(_entry(msg.entry)):
             # An update for a row we do not have means we are out of step with
@@ -1359,6 +1381,7 @@ UIClient._HANDLERS = {
     protocol.ChatReset.__name__: UIClient._reset,
     protocol.ChatAppend.__name__: UIClient._append,
     protocol.ChatUpdate.__name__: UIClient._update,
+    protocol.ChatTruncate.__name__: UIClient._truncate,
     protocol.TurnStarted.__name__: UIClient._started,
     protocol.TurnActivity.__name__: UIClient._activity,
     protocol.TurnFinished.__name__: UIClient._finished,

@@ -1125,6 +1125,69 @@ class SessionState:
         self.chat.to_end()  # open at the newest, as the old app does
         self.loaded = True
 
+    def truncate(self, after_seq: int) -> bool:
+        """Drop the rows past ``after_seq``, keeping the rest exactly as they
+        are. False when there was nothing above the cut to drop.
+
+        `reset`'s cheap half (`protocol.ChatTruncate`), and the difference is
+        the whole point: a rollback removes a *suffix*, so the rows above the
+        cut are already right — already numbered, already wrapped, already
+        open where the reader opened them. Rebuilding them from a frame that
+        carried the conversation back again is what this replaces.
+
+        The cut is positional and not "every row whose seq is too high",
+        because a chat also holds rows the core never numbered — `turn.failed`
+        appends one with ``seq`` 0 — and such a row belongs with whatever it
+        was drawn under. Everything from the first row numbered above
+        ``after_seq`` goes, unnumbered rows among them.
+
+        What the user had done to the surviving rows survives with them:
+        `Pane.replace` keeps the cursor on its row by key and keeps open rows
+        open, and drops the state of rows that are gone so a later row cannot
+        inherit it. The exception is the row the cursor was *on*: a rollback
+        cuts at a message somebody pointed at, so if it went, the end is where
+        they are now looking.
+        """
+        cut = next(
+            (i for i, entry in enumerate(self.entries) if entry.seq > after_seq),
+            None,
+        )
+        if cut is None:
+            # Nothing on screen is above the cut. Either the core is naming a
+            # row this client never drew — the reset-drift `update` counts —
+            # or the cut fell at the end and removed nothing.
+            return False
+        here = self.chat.here()
+        self.entries = self.entries[:cut]
+        # The measured fill described the thread this cut removed part of, and
+        # a measured number outranks an estimate until the thread it described
+        # is gone (`Context`). Dropping it here is what lets the estimate the
+        # core sends after a rollback actually reach the meter.
+        self.context.reset()
+        # `replace` and not `items = items[:cut]`: the pane owns what is open
+        # and where the cursor is, and it is the only thing that can drop the
+        # keys of the rows that just went without stranding them.
+        self.chat.replace(self.chat.items[:cut])
+        self._rows = {
+            entry.seq: i for i, entry in enumerate(self.entries) if entry.seq
+        }
+        surviving = {self.chat.key_at(i) for i in range(len(self.entries))}
+        self._live &= surviving
+        # The boundary row is drawn by a whole-chat build and can only be cut
+        # away by one, so this is found again exactly as `reset` finds it.
+        self._fold_seq = next(
+            (e.seq for e in reversed(self.entries) if e.kind == "compaction"), 0
+        )
+        if self._auto not in surviving:
+            # The auto-opened row was the last one and the last one is now a
+            # different row. `_open_last` takes the title back; a row the user
+            # opened by hand is untouched, having survived `replace`.
+            self._auto = ""
+            self._open_last()
+        if here not in surviving:
+            self.chat.to_end()
+        return True
+
     def _open_last(self) -> None:
         """Show the newest row whole, and remember that nobody asked for it.
 
@@ -1228,15 +1291,15 @@ class SessionState:
         return True
 
     def remove(self, seq: int) -> ChatEntry | None:
-        """Take one row back off the chat. The single exception to §3.2.
+        """Take one row back off the chat, from the middle if need be.
 
-        Append-only "between resets" has exactly one hole in it, and the
-        protocol is the one that cuts it: `turn.unqueued` says "drop its row,
-        keep its text". A message that was never in the graph cannot be
-        removed by a `chat.reset` — there is nothing for the core to re-read
-        that would leave it out — so the event names the row and the UI drops
-        it. Nothing else may use this: every other row on screen is a record
-        of something that happened.
+        `turn.unqueued` says "drop its row, keep its text", and a message that
+        was never in the graph cannot be removed by re-reading the thread —
+        there is nothing for the core to leave out — so the event names the
+        row and the UI drops it. Nothing else may use this: every other row on
+        screen is a record of something that happened, and the only other way
+        one leaves is `truncate`, which removes a tail the thread no longer
+        has rather than a row from the middle of one it does.
         """
         row = self._rows.pop(seq, None) if seq else None
         if row is None:

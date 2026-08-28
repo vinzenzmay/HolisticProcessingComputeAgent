@@ -1097,12 +1097,22 @@ class DemoCore:
         self.emit(protocol.SessionRows(rows=list(self.rows)))
 
     def _do_SessionRollback(self, cmd: protocol.SessionRollback) -> None:
+        """The cut, as the real core states it: a `chat.truncate` (§ rewind).
+
+        The rows that survive a rollback are the rows already on screen, so
+        what crosses is where the cut fell and not the conversation again —
+        and a demo that answered with a reset would be a demo in which the
+        frame the real one sends is never drawn.
+        """
         entries = self.entries(cmd.session_id)
         cut = self._cut(cmd.session_id, cmd.index)
         dropped = len(entries) - cut
         del entries[cut:]
         self.emit(
-            protocol.ChatReset(session_id=cmd.session_id, entries=list(entries))
+            protocol.ChatTruncate(
+                session_id=cmd.session_id,
+                after_seq=entries[-1].seq if entries else 0,
+            )
         )
         self._estimate(cmd.session_id)
         self.emit(

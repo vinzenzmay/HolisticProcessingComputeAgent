@@ -113,7 +113,8 @@ that a client ignores what it cannot draw.
 |---|---|
 | `hello` | version check, profile into the header |
 | `session.rows` | rebuild the sessions pane, preserving cursor **by session id**, not by index — a row inserted above the cursor must not move the selection |
-| `chat.reset` | replace the open session's chat; only on open |
+| `chat.reset` | replace the open session's chat; on open, and on a stop, which is an open of what is left of the turn |
+| `chat.truncate` | drop every row after `after_seq`, keep the rest as they are — the rollback's frame; the surviving rows keep their numbering, so what the reader had open stays open |
 | `chat.append` | append one entry; the *only* path by which a chat grows |
 | `turn.started` / `turn.finished` / `turn.failed` | the working row appears and goes; failure becomes an `error` entry |
 | `turn.activity` | the working row's label and `started_at`; a repeated activity must not restart the clock |

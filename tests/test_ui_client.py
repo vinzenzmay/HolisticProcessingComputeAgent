@@ -441,6 +441,51 @@ class TestTheChat:
         )
         assert "revised" not in wire.screen()
 
+    async def test_a_truncate_takes_the_rows_past_the_cut_off_the_screen(
+        self, wire
+    ):
+        # The rollback's frame: the rows above it were right already, so this
+        # carries a number instead of the conversation (`ChatTruncate`).
+        await started(
+            wire,
+            [entry(1, text="one"), entry(2, text="two"), entry(3, text="three")],
+        )
+        await wire.tell(protocol.ChatTruncate(session_id="s1", after_seq=1))
+        assert [x.key for x in wire.ui.chat.items] == ["1"]
+        assert "three" not in wire.screen()
+
+    async def test_and_the_rows_it_left_answer_to_the_names_they_had(
+        self, wire
+    ):
+        await started(wire, [entry(1, text="one"), entry(2, text="two")])
+        await wire.tell(protocol.ChatTruncate(session_id="s1", after_seq=1))
+        await wire.tell(
+            protocol.ChatUpdate(session_id="s1", entry=entry(1, text="revised"))
+        )
+        assert "revised" in wire.screen()
+
+    async def test_and_the_ones_it_dropped_do_not(self, wire):
+        await started(wire, [entry(1, text="one"), entry(2, text="two")])
+        await wire.tell(protocol.ChatTruncate(session_id="s1", after_seq=1))
+        await wire.tell(
+            protocol.ChatUpdate(
+                session_id="s1", entry=entry(2, text="back from the dead")
+            )
+        )
+        assert "back from the dead" not in wire.screen()
+        assert wire.client.dropped["chat.update"] == 1
+
+    async def test_a_truncate_above_every_row_is_dropped_and_counted(
+        self, wire
+    ):
+        # Above the newest row the core has handed out means out of step with
+        # a reset; inventing nothing and saying so is the same bargain
+        # `chat.update` makes.
+        await started(wire, [entry(1, text="one")])
+        await wire.tell(protocol.ChatTruncate(session_id="s1", after_seq=97))
+        assert len(wire.ui.chat.items) == 1
+        assert wire.client.dropped["chat.truncate"] == 1
+
     async def test_a_reset_re_bases_the_numbering(self, wire):
         await started(wire, [entry(1, text="one"), entry(2, text="two")])
         await wire.tell(

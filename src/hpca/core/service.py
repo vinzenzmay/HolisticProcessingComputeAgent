@@ -86,7 +86,9 @@ from hpca.protocol import (
     BackendScan,
     BackendScanned,
     BackendSet,
+    ChatAppend,
     ChatReset,
+    ChatTruncate,
     CommandCounts,
     CommandList,
     CommandRun,
@@ -98,6 +100,7 @@ from hpca.protocol import (
     DecisionResolve,
     DisplayChanged,
     DisplaySettings,
+    Entry as WireEntry,
     Hello,
     JobCancel,
     LLMCatalog,
@@ -830,14 +833,67 @@ class AgentService:
         """The whole transcript for one session, renumbered from 1.
 
         The only frame that may carry a chat wholesale, and so the only place
-        this is allowed to be called from: an open, and a rollback — which is
-        an open of what is left (§4.2 property 1). Anything else that resends a
-        chat is the per-turn rebuild this protocol exists to delete.
+        this is allowed to be called from: an open, a stop — which is an open
+        of what is left of the turn — and a fold, which puts a boundary row in
+        the *middle* of rows already drawn, where no delta reaches (§4.2
+        property 1). Anything else that resends a chat is the per-turn rebuild
+        this protocol exists to delete. The rollback used to be here too and is
+        now `_truncate_chat`: it removes a suffix, which is a thing that can be
+        said without carrying what survives it.
+        """
+        values, entries = await self._chat_rows(session_id)
+        # What the checkpoint cannot know about: the message of a turn that is
+        # running right now, and everything typed ahead behind it. Numbered by
+        # the scheduler, which owns the counter this reset just re-based — and
+        # which also re-binds a running turn's rows to the names above, so the
+        # deltas that follow revise the rows this reset actually drew.
+        entries += self._scheduler.rebase_rows(session_id, entries=entries)
+        self._deps.emit(ChatReset(session_id=session_id, entries=entries))
+        self._settle_chat(session_id, values)
 
-        The context estimate goes with it because the two describe the same
-        thing: how much of the window this conversation already occupies. A
-        rollback in particular leaves the measured number describing a thread
-        that no longer exists.
+    async def _truncate_chat(self, session_id: str) -> None:
+        """Say that a chat now ends where the rollback left it (§ chat rewind).
+
+        A rollback shortens a thread to a prefix of itself, and `build_entries`
+        walks messages in order — so the rows that survive are the first *n*
+        rows of the generation already on screen, under the names they were
+        already drawn with. `chat.truncate` is that sentence: one number, and
+        every client cuts its own copy. A `chat.reset` said it by sending the
+        conversation back, which on a session holding a hundred tool results
+        is megabytes rebuilt, validated and copied to express a cut that
+        carries no text at all — and which cost the reader every row they had
+        opened along with it.
+
+        The number is still re-derived from the thread rather than remembered:
+        this builds exactly the rows a re-open would draw and takes their
+        count, so the two sides cannot drift into disagreeing about where row
+        *n* is. What it does not do is *send* them. (The walk is what
+        `transcript.result_text` was made cheap for; it is milliseconds now,
+        and a memo of the drawn rows is what would take it to none — see
+        `_chat_rows`.)
+
+        Whatever the thread cannot contain is appended afterwards rather than
+        left to the truncate, which by construction can only remove: a rewind
+        is refused while anything is queued or parked (`rewind_blocker`), so
+        there is normally nothing to append, and the loop is what keeps that
+        from being an assumption.
+        """
+        values, entries = await self._chat_rows(session_id)
+        self._deps.emit(
+            ChatTruncate(session_id=session_id, after_seq=len(entries))
+        )
+        for row in self._scheduler.rebase_rows(session_id, entries=entries):
+            self._deps.emit(ChatAppend(session_id=session_id, entry=row))
+        self._settle_chat(session_id, values)
+
+    async def _chat_rows(self, session_id: str) -> tuple[dict, list[WireEntry]]:
+        """One session's thread as numbered rows, and the values they came
+        from — what both frames that can re-state a whole chat are built on.
+
+        Numbered from 1 in list order, which is the invariant the truncate
+        rests on: row *n* of this list is `seq` *n*, and a prefix of the
+        thread produces a prefix of the list (`scheduler._fold_rows` keeps the
+        live path to the same rule).
         """
         values = await self._thread_values(session_id)
         entries = [
@@ -852,17 +908,21 @@ class AgentService:
                 start=1,
             )
         ]
-        # What the checkpoint cannot know about: the message of a turn that is
-        # running right now, and everything typed ahead behind it. Numbered by
-        # the scheduler, which owns the counter this reset just re-based — and
-        # which also re-binds a running turn's rows to the names above, so the
-        # deltas that follow revise the rows this reset actually drew.
-        entries += self._scheduler.rebase_rows(session_id, entries=entries)
-        self._deps.emit(ChatReset(session_id=session_id, entries=entries))
-        # The rows just drawn include the fold boundary as it stands, so this
-        # is the baseline `_redraw_if_folded` measures the next turn against —
-        # seeded here rather than at open, so every path that re-states a chat
-        # (open, rollback, fork, stop) agrees about what is already on screen.
+        return values, entries
+
+    def _settle_chat(self, session_id: str, values: dict) -> None:
+        """The bookkeeping every re-statement of a chat leaves behind.
+
+        The fold baseline: the rows just drawn include the boundary as it
+        stands, so this is what `_redraw_if_folded` measures the next turn
+        against — seeded on every path that re-states a chat (open, rollback,
+        fork, stop) so they all agree about what is on screen.
+
+        And the context estimate, because it describes the same thing the rows
+        do: how much of the window this conversation already occupies. A
+        rollback in particular leaves the measured number describing a thread
+        that no longer exists.
+        """
         self._folded_at[session_id] = int(
             (values.get("compacted") or {}).get("upto", 0) or 0
         )
@@ -1360,6 +1420,9 @@ class AgentService:
         `rewind_blocker` names either writes to the thread about to be
         shortened or is parked inside it. The answer comes back as the reason
         it gives, which is phrased to be shown.
+
+        What the front-end is told is a cut and not a chat: the rows that
+        survive a rollback are the rows already on screen (`_truncate_chat`).
         """
         if self._known(session_id) is None:
             return
@@ -1382,7 +1445,7 @@ class AgentService:
         # The measured fill described the untrimmed thread; re-derive it from
         # what is left, exactly as re-opening the session would.
         self._backends.forget_session(session_id)
-        await self._reset_chat(session_id)
+        await self._truncate_chat(session_id)
         self._deps.emit(
             Notify(text="Rolled back — edit your message and send again.")
         )

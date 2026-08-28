@@ -1555,6 +1555,40 @@ class ChatUpdate(Event):
     entry: Entry
 
 
+class ChatTruncate(Event):
+    """Every row after ``after_seq`` is gone; the ones above it stand as they
+    are — the chat rewind's frame (§ chat rewind).
+
+    A rollback shortens a thread to a prefix of itself, so what survives on
+    screen is what is already *on* screen: the same rows, in the same order,
+    under the same names. `chat.reset` could say that — it did — but only by
+    rebuilding every surviving entry, validating it, and copying a whole
+    conversation across the wire to express a cut that carries no text at all.
+    On a session holding a hundred tool results that is megabytes and hundreds
+    of milliseconds, on the loop the core shares with the front-end. This says
+    where the cut fell and nothing else.
+
+    **The numbering is not re-based**, which is the one way this differs from
+    a reset. The surviving rows keep the ``seq`` they were drawn with and the
+    core's counter resumes at ``after_seq``, so the generation continues
+    rather than restarting — that is what lets the rows stay where they are.
+    What a reset buys with its renumbering is bought here by the cut itself:
+    every name it removed is above the counter and can never be handed out
+    again, so neither side can address a row the other has dropped.
+
+    ``after_seq`` is the last row that survives, and 0 empties the chat. A
+    client applies it *positionally* — everything from the first row numbered
+    above ``after_seq`` onwards — because a chat can also hold rows the core
+    never numbered (`turn.failed` draws one), and an unnumbered row belongs
+    with whatever it was drawn under.
+    """
+
+    TYPE: ClassVar[str] = "chat.truncate"
+    session_id: str
+    # The last row that survives; 0 means none of them do.
+    after_seq: int = 0
+
+
 class TurnStarted(Event):
     """A turn began, and when.
 

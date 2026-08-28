@@ -1049,54 +1049,61 @@ def test_the_frame_is_still_exact_after_a_fork():
     assert widths(drawn) == {120}
 
 
-def rolled_back() -> tuple[RowUI, int, int, int]:
+def rolled_back() -> tuple[RowUI, int, int, int, str, str]:
+    """A rewound chat, plus the two rows opened by hand before the cut: one
+    above it and one below."""
     ui = build()
     index = on_own_message(ui)
     total = len(ui.chat.items)
     sessions = len(ui.sessions)
-    ui.chat.expanded = {ui.chat.key_at(1), ui.chat.key_at(index + 1)}
+    above, below = ui.chat.key_at(1), ui.chat.key_at(index + 1)
+    ui.chat.expanded = {above, below}
     ui.handle("enter", 120, 40)
     ui.handle("r", 120, 40)
-    return ui, index, total, sessions
+    return ui, index, total, sessions, above, below
 
 
 def test_r_drops_everything_from_there():
-    ui, index, _, _ = rolled_back()
+    ui, index, _, _, _, _ = rolled_back()
     assert len(ui.chat.items) == index
 
 
 def test_but_keeps_what_came_before():
-    ui, index, total, _ = rolled_back()
+    ui, index, total, _, _, _ = rolled_back()
     assert index > 0
     assert len(ui.chat.items) < total
 
 
 def test_a_rollback_makes_no_new_session():
-    ui, _, _, sessions = rolled_back()
+    ui, _, _, sessions, _, _ = rolled_back()
     assert len(ui.sessions) == sessions
 
 
 def test_it_says_how_much_went():
-    ui, index, total, _ = rolled_back()
+    ui, index, total, _, _, _ = rolled_back()
     assert f"({total - index} entries gone)" in ui.note
 
 
-def test_a_reset_forgets_every_open_entry():
-    # A rollback comes back as `chat.reset`, and a reset re-bases the row
-    # numbering — so a `seq` still held as open afterwards would be naming a
-    # row the core has renumbered, which is the one thing keying by identity
-    # must not be allowed to get wrong.
-    #
-    # Nothing survives it, and what is open afterwards is what the fresh
-    # transcript opened for itself — the newest row of what is left, which is
-    # a decision taken after the renumbering rather than a key that outlived
-    # it.
-    ui, _, _, _ = rolled_back()
-    assert ui.chat.expanded <= {ui.chat.key_at(len(ui.chat.items) - 1)}
+def test_a_rollback_keeps_what_the_reader_had_open_above_the_cut():
+    # A rollback comes back as `chat.truncate`, which does not re-base the
+    # numbering: the rows above the cut are the rows that were already there,
+    # under the names they already had, so a row the reader unfolded is still
+    # unfolded. Under the `chat.reset` this replaced, a rewind cost them every
+    # open row in the conversation.
+    ui, _, _, _, above, _ = rolled_back()
+    assert above in ui.chat.expanded
+
+
+def test_and_forgets_what_was_open_below_it():
+    # The other half, and the one keying by identity must not get wrong: a key
+    # belonging to a row that is gone would be inherited by whatever row
+    # arrives at that name next.
+    ui, _, _, _, _, below = rolled_back()
+    assert below not in ui.chat.expanded
 
 
 def test_the_frame_is_still_exact_after_a_rollback():
-    ui, _, _, _ = rolled_back()
+    ui, _, _, _, _, _ = rolled_back()
     drawn = ui.render(120, 40)
     assert len(drawn) == 40
     assert widths(drawn) == {120}

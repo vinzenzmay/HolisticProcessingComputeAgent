@@ -2713,9 +2713,13 @@ class TestSessionDelete:
 
 
 class TestRollback:
-    async def test_the_trimmed_conversation_comes_back_as_a_reset(
+    async def test_the_cut_comes_back_as_a_cut_and_not_a_chat(
         self, service, session
     ):
+        # The rows a rollback leaves are the rows already drawn, so what the
+        # core states is where the cut fell: `chat.truncate` naming the last
+        # row that survives it. A `chat.reset` would rebuild and re-send the
+        # whole conversation to say the same thing (§ chat rewind).
         await run_turn(service, session.session_id, "first")
         await run_turn(service, session.session_id, "second")
         queue = subscribe(service)
@@ -2724,11 +2728,70 @@ class TestRollback:
         await service.handle(
             SessionRollback(session_id=session.session_id, index=2)
         )
+        events = await drain(queue)
+        assert "ChatReset" not in kinds(events)
+        assert only(events, "ChatTruncate").after_seq == 2
+
+    async def test_the_rows_above_the_cut_are_the_ones_it_kept(
+        self, service, session
+    ):
+        # What the number means, checked against the reset that would have
+        # carried the same rows: `after_seq` is a length in the numbering
+        # already on screen, so re-opening the session must draw exactly that
+        # many rows and no more.
+        await run_turn(service, session.session_id, "first")
+        await run_turn(service, session.session_id, "second")
+        await service.handle(
+            SessionRollback(session_id=session.session_id, index=2)
+        )
+        queue = subscribe(service)
+        await service.handle(SessionOpen(session_id=session.session_id))
         reset = only(await drain(queue), "ChatReset")
-        assert [e.text for e in reset.entries] == ["first", "done"]
-        # Re-based numbering: the rows the cut removed cannot be addressed by
-        # either side afterwards.
-        assert [e.seq for e in reset.entries] == [1, 2]
+        assert [(e.text, e.seq) for e in reset.entries] == [
+            ("first", 1),
+            ("done", 2),
+        ]
+
+    async def test_the_next_row_carries_on_the_numbering_it_left(
+        self, service, session
+    ):
+        # The truncate does not re-base, so the counter has to resume at the
+        # cut: a row minted afterwards must be the next one up, not a name the
+        # surviving rows are already using.
+        await run_turn(service, session.session_id, "first")
+        await run_turn(service, session.session_id, "second")
+        await service.handle(
+            SessionRollback(session_id=session.session_id, index=2)
+        )
+        queue = subscribe(service)
+        await run_turn(service, session.session_id, "third")
+        appended = [e for e in await drain(queue) if type(e).__name__ == "ChatAppend"]
+        assert [e.entry.seq for e in appended][:1] == [3]
+
+    async def test_a_cut_after_a_stop_is_relative_to_the_rows_the_stop_drew(
+        self, service, session, llm
+    ):
+        # The sequence this frame was written for: a long turn is stopped —
+        # which re-states the chat and re-bases its numbering — and then rolled
+        # away. The cut has to be a length in *that* numbering, or it lands
+        # somewhere nobody pointed at.
+        await run_turn(service, session.session_id, "first")
+        release = await park_turn(service, llm, session.session_id)
+        await service.handle(TurnInterrupt(session_id=session.session_id))
+        release.set()
+        queue = subscribe(service)
+        # The message the stopped turn was about, back out of the thread.
+        await service.handle(
+            SessionRollback(session_id=session.session_id, index=2)
+        )
+        assert only(await drain(queue), "ChatTruncate").after_seq == 2
+        await service.handle(SessionOpen(session_id=session.session_id))
+        reset = only(await drain(queue), "ChatReset")
+        assert [(e.text, e.seq) for e in reset.entries] == [
+            ("first", 1),
+            ("done", 2),
+        ]
+        await service.stop()
 
     async def test_it_is_refused_while_a_turn_is_running(
         self, service, session, llm
@@ -2910,12 +2973,12 @@ class TestAConversationEndToEnd:
         await service.handle(SessionFork(session_id=session_id, index=2))
         fork_id = only(await drain(queue), "SessionCreated").row.session_id
 
+        # The cut comes back as a cut: the two rows that survive it are the
+        # two already on screen, so the wire carries where it fell and not
+        # the conversation over again.
         await service.handle(SessionRollback(session_id=session_id, index=2))
-        reset = only(await drain(queue), "ChatReset")
-        assert (reset.session_id, [e.text for e in reset.entries]) == (
-            session_id,
-            ["which BAMs are in /data?", "done"],
-        )
+        cut = only(await drain(queue), "ChatTruncate")
+        assert (cut.session_id, cut.after_seq) == (session_id, 2)
 
         # The fork kept the same two entries, and the source's rollback did
         # not touch it — two conversations now, numbered from 1 apiece.

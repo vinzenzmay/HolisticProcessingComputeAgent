@@ -162,6 +162,7 @@ SPEC_EVENTS = {
     "chat.reset",
     "chat.append",
     "chat.update",
+    "chat.truncate",
     "turn.started",
     "turn.activity",
     "turn.usage",

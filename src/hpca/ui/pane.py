@@ -616,8 +616,12 @@ class Pane:
         open. Rows that are gone take their state with them rather than leaving
         a key behind for a later row to inherit.
 
-        Only for the panes the core repaints whole (the sidebar, the watchers).
-        The chat is never rebuilt; it appends (specs/specs-ui-replacement.md §3.2).
+        For the panes the core repaints whole (the sidebar, the watchers), and
+        for the one thing that ever takes rows *off* the chat without
+        rebuilding it: `state.SessionState.truncate`, where the new list is
+        the old one cut short and everything this method preserves is what the
+        cut is supposed to leave alone. The chat still never grows through
+        here; it appends (specs/specs-ui-replacement.md §3.2).
         """
         # The client repaints a column without knowing the terminal size; the
         # width only decides which flattened line the cursor lands on, and the

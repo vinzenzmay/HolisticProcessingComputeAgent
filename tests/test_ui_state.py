@@ -321,6 +321,104 @@ class TestTheChatIsAppendOnly:
         session.reset([entry(5, text="renumbered")])
         assert session.update(entry(1, text="revised")) is False
 
+class TestTheCutTheRewindMakes:
+    """`chat.truncate`: the one frame that takes rows off a chat without
+    rebuilding it (`SessionState.truncate`)."""
+
+    def loaded(self) -> SessionState:
+        session = SessionState("s1")
+        session.reset([
+            entry(1, text="one"),
+            entry(2, "assistant", "two"),
+            entry(3, text="three"),
+            entry(4, "assistant", "four"),
+        ])
+        return session
+
+    def test_the_rows_past_the_cut_go(self):
+        session = self.loaded()
+        assert session.truncate(2) is True
+        assert [x.text for x in session.entries] == ["one", "two"]
+        assert len(session.chat.items) == 2
+
+    def test_and_the_ones_above_it_keep_their_names(self):
+        # Not re-based: that is the whole difference from a reset, and it is
+        # what lets the rows stay where they are.
+        session = self.loaded()
+        session.truncate(2)
+        assert session.update(entry(2, "assistant", "two, revised")) is True
+        assert session.entries[1].text == "two, revised"
+
+    def test_and_the_ones_below_it_are_not_addressable(self):
+        session = self.loaded()
+        session.truncate(2)
+        assert session.update(entry(3, text="from the other side")) is False
+
+    def test_a_row_the_reader_opened_stays_open(self):
+        # The reason this frame exists at all is on this line: a rollback used
+        # to cost the reader every row they had unfolded.
+        session = self.loaded()
+        session.chat.expanded.add("1")
+        session.truncate(2)
+        assert "1" in session.chat.expanded
+
+    def test_and_what_was_open_below_it_is_forgotten(self):
+        # Nothing may inherit a key from a row that is gone.
+        session = self.loaded()
+        session.chat.expanded.add("4")
+        session.truncate(2)
+        assert "4" not in session.chat.expanded
+
+    def test_an_unnumbered_row_goes_with_what_it_was_drawn_under(self):
+        # `turn.failed` appends a row the core never numbered; it belongs to
+        # the turn above it, so the cut is positional rather than by seq.
+        session = self.loaded()
+        session.append(entry(0, "error", "the UI wrote this one"))
+        session.truncate(2)
+        assert [x.kind for x in session.entries] == ["user", "assistant"]
+
+    def test_it_lets_an_estimate_speak_again(self):
+        # A measured number beats an estimate right up until the thread it
+        # described is gone, and a rollback is exactly that — so the fill the
+        # core re-derives for what is left has to be able to land.
+        session = self.loaded()
+        session.context.measured = True
+        session.truncate(2)
+        assert not session.context.measured
+
+    def test_a_cut_above_every_row_is_refused_rather_than_guessed_at(self):
+        # It means this client is out of step with a reset. Doing nothing and
+        # saying so is what lets the next reset put it right.
+        session = self.loaded()
+        assert session.truncate(9) is False
+        assert len(session.entries) == 4
+
+    def test_cutting_everything_leaves_an_empty_chat(self):
+        session = self.loaded()
+        assert session.truncate(0) is True
+        assert session.entries == [] and session.chat.items == []
+
+    def test_the_fold_boundary_is_found_again(self):
+        session = SessionState("s1")
+        session.reset([
+            entry(1, text="one"),
+            entry(2, "compaction", "everything above is a summary"),
+            entry(3, text="three"),
+        ])
+        session.truncate(2)
+        assert session.folded_away(1) is True
+
+    def test_and_a_boundary_that_was_cut_away_is_gone(self):
+        session = SessionState("s1")
+        session.reset([
+            entry(1, text="one"),
+            entry(2, "compaction", "everything above is a summary"),
+            entry(3, text="three"),
+        ])
+        session.truncate(1)
+        assert session.folded_away(1) is False
+
+
     def test_an_entry_can_be_found_by_the_row_it_is_under(self):
         assert self.loaded().entry_at(1).text == "two"
 
