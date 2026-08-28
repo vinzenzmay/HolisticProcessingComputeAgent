@@ -298,7 +298,7 @@ class SessionRow(_Model):
     # reasons, and the third is the deciding one. It is the same class of thing
     # as `mode` — a per-session dial the core stores and the front-end changes
     # — and `mode` is already here. Every path that can change it already
-    # restates the sidebar (`thinking.set`, `command.run` of `/thinking`, a new
+    # restates the sidebar (`thinking.set`, `command.run` of `/reasoning`, a new
     # session, a fork), so an event would be a second announcement of a change
     # that has just been announced. And a `thinking.changed` event could only
     # ever describe the session that just changed, whereas the meter has to

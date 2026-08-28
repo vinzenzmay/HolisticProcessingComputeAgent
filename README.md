@@ -43,7 +43,7 @@ so on any other cluster both of them need pointing at a directory your group can
 write to — change one and HPCA silently discovers nothing.
 
 ## Use HPCA like an expert
-* **Provide sources**: This agent has the thinking power but not the knowledge: always provide sources if you ask about facts.
+* **Provide sources**: This agent has the reasoning power but not the knowledge: always provide sources if you ask about facts.
 * **No web-search**: Sources must be lokal. HPCA is forbidden to web-search.
 * **Knowledge is power**: Let HPCA index any documentation or source code, so it can never invent facts. `please index this ~/my-source/`
 * **small context = smart agent**: if you do large chunks of work, ask the agent to write a **plan.md** and then let it execute it step by step and use `/compact` in between each sttep to keep the agent clever. context size <= 35k is good.
@@ -142,8 +142,8 @@ keyboard protocol can distinguish it from Enter — most cannot):
 
 Plan mode is gone. Instead, use the inbuilt `/plan` skill. It's very good!
 
-## Thinking effort
-You control it by typing in the chat entry: `/thinking + ENTER`
+## Reasoning effort
+You control it by typing in the chat entry: `/reasoning + ENTER`
 
 ## Skills
 

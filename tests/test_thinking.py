@@ -216,7 +216,7 @@ class TestSettingsDefault:
 class TestGraphResolvesItPerSession:
     """``effort_fn`` is a per-thread_id resolver, like ``mode_fn``: two turns
     running at once must each put their own session's level on the wire, and
-    the level is read per round so ``/thinking`` lands on the next decision
+    the level is read per round so ``/reasoning`` lands on the next decision
     rather than the next turn."""
 
     def _graph(self, llm, effort_fn):

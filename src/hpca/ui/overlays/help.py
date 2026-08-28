@@ -23,7 +23,7 @@ class HelpOverlay(Overlay):
                 ("a", "profiles & learnings — sessions row only"),
                 ("c", "config editor — anywhere but the chat row"),
                 ("^l", "switch llm for this session"),
-                ("/thinking", "how hard this session's model reasons"),
+                ("/reasoning", "how hard this session's model reasons"),
                 ("?", "this list — from one of the three rows, where"),
                 ("", "it is not a character somebody is typing"),
                 ("q", "quit"),

@@ -122,7 +122,7 @@ Terminals in 2026 are assumed wider than 80 columns
     take-back instead: **(x)** cancels it, dropping it from the queue and the
     log and handing the text back to the entry exactly as an interrupt does,
     and **(c / Enter)** copies it and leaves it queued.
-    Enter on a thinking box expands
+    Enter on a reasoning box expands
     it into its parts — each block of reasoning, and each tool *exchange* — every
     one its own collapsible row, so the script the agent wrote and the call it
     made stay readable long after the approval prompt that showed them is
@@ -438,12 +438,12 @@ Mode guidance is appended to the system prompt per render (§4.3), never stored,
 and the per-mode gating decision is made in the graph's `execute_tool` node —
 the same machinery as the destructive gate, with a different question.
 
-### 3.6 Thinking effort (off / low / medium / xhigh)
+### 3.6 Reasoning effort (off / low / medium / xhigh)
 
 The second per-session dial, with the same lifecycle as the mode: stored on the
 session (`sessions.thinking`, empty = the `agent.default_thinking` setting,
 default `off`), read fresh every graph round so a change reaches a turn already
-in flight, chosen through the `/thinking` chooser, and always visible — it rides
+in flight, chosen through the `/reasoning` chooser, and always visible — it rides
 the context bar at the top of the chat column, next to the fill and the
 generation speed. Implementation in `hpca.thinking`.
 
@@ -452,7 +452,7 @@ backend that has never heard of the parameter sees exactly the request HPCA
 always sent. The other three send both. The three levels are not ours to pick:
 vLLM validates `reasoning_effort` against the served model's own enum, and
 Qwen3.8 accepts only `low`, `medium` and `xhigh` — there is no `high` (a 400
-says so), and with thinking on and no level given the server defaults to
+says so), and with reasoning on and no level given the server defaults to
 `xhigh`, the slowest one. `thinking_budget`, which the chat template also
 accepts, is silently a no-op.
 
@@ -481,21 +481,21 @@ tok/s:
 | level | decision | requests | outcome |
 |---|---|---|---|
 | `off` | 74s | 1 | answered (1284 completion tokens) |
-| `low` | 234s | 1 | answered, but 4039 of the 4096 tokens went to thinking |
+| `low` | 234s | 1 | answered, but 4039 of the 4096 tokens went to reasoning |
 | `medium` | 411s | 2 | first request truncated at the cap; the retry produced a tool call |
 | `xhigh` | 474s | 2 | **both requests truncated at the cap — the decision failed** |
 
 Every decision of a turn pays this, not just the first. Three things follow,
 and they are the operational content of the feature:
 
-* **The 120s `request_timeout_s` does not size a thinking request.** Each of
+* **The 120s `request_timeout_s` does not size a reasoning request.** Each of
   those generations ran ~237s — the cap divided by the decode rate — so all of
   them would have died mid-flight on an httpx read timeout, having already
   spent the time. The deadline is therefore raised per request when the request
   thinks (`LLMClient._timeout_for`, `THINKING_TIMEOUT_S = 600`), and left alone
   otherwise: 120s is also what makes a wedged backend fail fast, and every
   other call would pay for a blanket increase.
-* **Thinking tokens come out of the decision cap, so the cap scales with the
+* **Reasoning tokens come out of the decision cap, so the cap scales with the
   level.** `decision_cap(effort)` (§4.3) keeps the base 4096 at `off` and
   `low`, and applies ×1.5 at `medium` and ×2.0 at `xhigh`
   (`DECISION_TOKEN_SCALE`). This is a token limit, not a time limit, so a
@@ -512,8 +512,8 @@ and they are the operational content of the feature:
 
   **And at `xhigh` they do not buy it.** Measured on the write that provokes
   the problem best — a 200-line `create_file`, which costs 3415–3732
-  completion tokens with thinking off, i.e. ~85% of the base cap before a
-  single thinking token:
+  completion tokens with reasoning off, i.e. ~85% of the base cap before a
+  single reasoning token:
 
   | level | flat 4096 | scaled |
   |---|---|---|
@@ -523,11 +523,11 @@ and they are the operational content of the feature:
 
   Doubling `xhigh`'s budget did not rescue the turn; it spent the whole 8192
   twice and failed the same way, for twice the wall time. The reason is that
-  thinking at this level is not sized by the task — it expands into whatever
+  reasoning at this level is not sized by the task — it expands into whatever
   budget is available — so headroom handed to the decision is taken by the
   deliberation rather than left for the answer. `thinking_budget`, which would
   bound the two separately, is a no-op on this server (hpca.thinking), so
-  there is no way to give the payload room that thinking cannot take.
+  there is no way to give the payload room that reasoning cannot take.
 
   What the scaling does buy is a smaller gap for `medium`, and what it costs is
   exactly this: the cap also bounds how long a looping generation hangs, so
@@ -536,7 +536,7 @@ and they are the operational content of the feature:
   into a skeleton to fill rather than a dead turn, which is the behaviour the
   feature is supposed to have.
 * **`xhigh` is the slowest, and it is not flagged.** It is slowest by a wide
-  margin — ~237s per thinking generation against 19.5s for the same decision at
+  margin — ~237s per reasoning generation against 19.5s for the same decision at
   `off` — and a tool-heavy turn pays that on every round, so `off` remains the
   default. It is not, however, unusable: it was shipped for a while with a
   "⚠ NOT USABLE" flag in the chooser and a warning toast on selection, on the
@@ -642,10 +642,10 @@ the orchestrator's or another subagent's context.
 * **Cut-off decisions:** a decision that stops at `max_tokens` is retried once with
   guidance to write the file in parts, rather than killing the turn (before this it
   raised out of the retry loop entirely — `LLMError` is not `DecisionError` — and
-  ended the turn). The base cap is 4096: measured live at the default (thinking
+  ended the turn). The base cap is 4096: measured live at the default (reasoning
   off), a document costs ~12 completion tokens per line, so 4096 holds ~330 lines,
   and raising it would mainly double how long a looping generation hangs. It is a
-  base rather than a constant because thinking is spent from the same budget —
+  base rather than a constant because reasoning is spent from the same budget —
   `decision_cap(effort)` applies ×1.5 at `medium` and ×2.0 at `xhigh` so the
   payload keeps its own room whatever the level (§3.6).
 * **Paths are paths** (`hpca.paths`). A tool argument that names a file is the

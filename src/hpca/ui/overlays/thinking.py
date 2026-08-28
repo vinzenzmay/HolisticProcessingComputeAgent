@@ -1,4 +1,4 @@
-"""`/thinking` (§4.3 item 30): how hard this session's model reasons.
+"""`/reasoning` (§4.3 item 30): how hard this session's model reasons.
 
 The four levels, what each does to a turn, and a star on the one in force.
 Which levels exist and what they mean is `hpca.thinking`'s business and is
@@ -46,7 +46,7 @@ class ThinkingOverlay(ListOverlay):
     change anything by accident.
     """
 
-    title = "thinking effort for this session"
+    title = "reasoning effort for this session"
     name = "levels"
 
     def __init__(self, current: str = "", session_id: str = "") -> None:
@@ -64,7 +64,7 @@ class ThinkingOverlay(ListOverlay):
             return False
         self.effort = item.text
         # Sent from here rather than read back by the caller: the level belongs
-        # to the session this screen was opened on, and a `/thinking` answered
+        # to the session this screen was opened on, and a `/reasoning` answered
         # after the user switched conversations must not move the new one.
         self.send(SetThinking(self.session_id, item.text))
         return False

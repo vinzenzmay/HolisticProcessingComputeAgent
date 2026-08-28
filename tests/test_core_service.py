@@ -2344,7 +2344,7 @@ class TestTheTranscriptLog:
         await run_turn(service, session.session_id, "which BAMs?")
         text = _transcript(home)
         assert "] user\nwhich BAMs?" in text
-        assert "thinking" in text and "Count them." in text
+        assert "reasoning" in text and "Count them." in text
         assert "] agent\nFour BAMs match." in text
         # In the order it happened: the file is read top to bottom.
         assert text.index("which BAMs?") < text.index("Count them.")
@@ -3033,7 +3033,7 @@ class TestTheTwoDials:
     async def test_the_thinking_level_rides_the_sidebar_row(
         self, service, session, conn
     ):
-        # The meter's `· think medium` reads it from here: an event of its own
+        # The meter's `· reason medium` reads it from here: an event of its own
         # could only describe the session that just changed, and the level of
         # whichever session is opened next is what has to be drawn.
         queue = subscribe(service)
@@ -4992,10 +4992,10 @@ class TestCompact:
 
 class TestTheOtherSlashCommands:
     async def test_thinking_with_a_level_sets_it(self, service, session, conn):
-        # `/thinking low` is `thinking.set` typed instead of picked, and goes
+        # `/reasoning low` is `thinking.set` typed instead of picked, and goes
         # through the same handler so the two cannot drift.
         await service.handle(
-            CommandRun(name="thinking", args="low", session_id=session.session_id)
+            CommandRun(name="reasoning", args="low", session_id=session.session_id)
         )
         assert SessionStore(conn).get(session.session_id).thinking == "low"
 
@@ -5004,10 +5004,10 @@ class TestTheOtherSlashCommands:
     ):
         queue = subscribe(service)
         await service.handle(
-            CommandRun(name="thinking", session_id=session.session_id)
+            CommandRun(name="reasoning", session_id=session.session_id)
         )
         toast = only(await drain(queue), "Notify")
-        assert toast.title == "Thinking effort"
+        assert toast.title == "Reasoning effort"
         for level in ("off", "low", "medium", "xhigh"):
             assert level in toast.text
 

@@ -226,7 +226,7 @@ def build_graph(
         return _resolve(mode_fn, thread_id)
 
     # The session's thinking level (hpca.thinking), read per round for the same
-    # reason as the mode: /thinking must apply from the next decision on, not
+    # reason as the mode: /reasoning must apply from the next decision on, not
     # from the next turn. None = no dial (tests, bare graphs), and then nothing
     # about thinking is put on the wire at all.
     def effort_for(thread_id):

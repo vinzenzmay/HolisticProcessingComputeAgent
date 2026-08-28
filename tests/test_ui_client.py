@@ -1512,11 +1512,11 @@ class TestTheScreenCommands:
         assert wire.peer.last(protocol.SkillDraft).session_id is None
 
     async def test_the_counts_sort_the_menu(self, wire):
-        await wire.tell(protocol.CommandCounts(counts={"thinking": 7}))
-        assert wire.ui.command_counts == {"thinking": 7}
+        await wire.tell(protocol.CommandCounts(counts={"reasoning": 7}))
+        assert wire.ui.command_counts == {"reasoning": 7}
         wire.ui.focus = INPUT
         await wire.press("/")
-        assert [x.name for x in wire.ui.menu()][0] == "thinking"
+        assert [x.name for x in wire.ui.menu()][0] == "reasoning"
 
     async def test_memory_resolve_is_positional(self, wire):
         wire.client.intent(state.ResolveMemory("s1", (True, False)))

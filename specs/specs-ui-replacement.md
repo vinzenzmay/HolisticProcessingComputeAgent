@@ -295,7 +295,7 @@ log, the episodic index and session titling" — and only titling is wired.
 `tui/app.py:_log_turn` has no counterpart, so in a core-driven run
 `<app_dir>/sessions/*.log` is never written and `session_search` indexes
 nothing, which silently breaks recall across sessions. Nine acceptance claims
-under "Thinking box, tool rows, logging" and two under "Core chat wiring"
+under "Reasoning box, tool rows, logging" and two under "Core chat wiring"
 depend on it. **This must close before M9**, because after M9 there is no
 implementation left to compare against.
 
@@ -327,9 +327,9 @@ Found during M4, recorded for the milestone that hits each:
 - **`turn.usage` carries no completion tokens and no wall clock**, so the
   meter's `· 14.2 tok/s` has no channel. The meter state is built and tested;
   nothing can set it. (M8.)
-- **Thinking effort has no event.** `ThinkingSet` is a command only, so the
+- **Reasoning effort has no event.** `ThinkingSet` is a command only, so the
   meter's `· think medium` likewise has state and no source. (M7, with
-  `/thinking`.)
+  `/reasoning`.)
 - **`TurnStarted` carries no `started_at`**, so the elapsed clock only starts at
   the first `turn.activity`. (M5.)
 - **`TurnActivity(activity="")` has two senders** — the scheduler just before
@@ -381,7 +381,7 @@ learned log signature — never wired into the Textual UI at all, so this is new
 behaviour arriving with the port.
 
 **Commands** — 24. the seven built-ins (`/memorize`, `/conclude`, `/compact`,
-`/skill-creator`, `/skills-list`, `/skill-remove`, `/thinking`) plus `/<skill>`
+`/skill-creator`, `/skills-list`, `/skill-remove`, `/reasoning`) plus `/<skill>`
 by name, 25. the autocomplete menu with most-used-first ordering, closing as
 soon as the token contains whitespace so ↑/↓ stay free for a multi-line draft.
 
@@ -389,7 +389,7 @@ soon as the token contains whitespace so ↑/↓ stay free for a multi-line draf
 while invalid), 27. profiles & learnings (list, memory editor, archive, skills,
 copy, delete), 28. manage LLMs (discovered/configured columns, the port scan
 with live progress, add-manually, the backend form with its probe, the
-model picker), 29. switch LLM (`ctrl+l`), 30. thinking effort, 31. the
+model picker), 29. switch LLM (`ctrl+l`), 30. reasoning effort, 31. the
 read-only inspect window, 32. the three memory screens (proposal, batch,
 reflection), 33. the two skill screens (creator, picker), 34. the queued-message
 dialog.

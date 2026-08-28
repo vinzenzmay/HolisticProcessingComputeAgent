@@ -2076,7 +2076,7 @@ class RowUI:
             session = self.session_for(overlay.session_id)
             session.thinking = overlay.effort
             session.context.effort = overlay.effort
-            self.note = f"thinking effort: {overlay.effort}"
+            self.note = f"reasoning effort: {overlay.effort}"
         elif isinstance(overlay, SkillCreatorOverlay) and overlay.saved:
             self.send(
                 SaveSkill(
@@ -2932,12 +2932,12 @@ class RowUI:
         self.note = "sent"
 
     # The three built-ins this side answers by drawing something instead of
-    # sending `command.run`. `/thinking` is a chooser the core expects a
+    # sending `command.run`. `/reasoning` is a chooser the core expects a
     # front-end to put up; `/skill-creator` is a form the core says outright it
     # does not own; a bare `/skill-remove` is a picker, because "the chosen
     # skill" should be a row you point at rather than a name you retype (the
     # core still answers `/skill-remove <name>` and that path is left alone).
-    SCREEN_COMMANDS = ("thinking", "skill-creator", "skill-remove")
+    SCREEN_COMMANDS = ("reasoning", "skill-creator", "skill-remove")
 
     def _command(self, name: str, args: str, text: str) -> None:
         """A typed `/name …`: a skill, a built-in, or a typo (§4.3 item 24)."""
@@ -3026,7 +3026,7 @@ class RowUI:
 
     def _screen_command(self, name: str, args: str) -> bool:
         """Draw the answer rather than send it. False falls through to the core."""
-        if name == "thinking":
+        if name == "reasoning":
             self.thinking()
             return True
         if name == "skill-creator":
@@ -3440,7 +3440,7 @@ class RowUI:
         )
 
     def thinking(self) -> None:
-        """`/thinking` (§4.3 item 30). A conversation's level, so it needs one."""
+        """`/reasoning` (§4.3 item 30). A conversation's level, so it needs one."""
         if not self.active_id:
             self.note = NO_SESSION
             return

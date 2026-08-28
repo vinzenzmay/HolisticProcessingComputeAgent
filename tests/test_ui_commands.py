@@ -216,11 +216,11 @@ class TestFrequencyOrdering:
 
     def test_and_most_used_first_once_they_do(self):
         ui = app()
-        ui.command_counts = {"thinking": 9, "conclude": 4}
+        ui.command_counts = {"reasoning": 9, "conclude": 4}
         offered = names(press(ui, "/"))
-        assert offered[:2] == ["thinking", "conclude"]
+        assert offered[:2] == ["reasoning", "conclude"]
         # Everything uncounted keeps definition order behind them.
-        rest = [x.name for x in BUILTINS if x.name not in ("thinking", "conclude")]
+        rest = [x.name for x in BUILTINS if x.name not in ("reasoning", "conclude")]
         assert [x for x in offered if x in rest] == rest
 
     def test_a_narrowed_menu_is_sorted_too(self):
@@ -306,7 +306,7 @@ class TestTheSevenBuiltins:
         assert (ran.name, ran.session_id) == ("skills-list", "s1")
 
     def test_thinking_opens_the_chooser_and_sends_nothing(self):
-        ui = press(app(), *"/thinking", "enter")
+        ui = press(app(), *"/reasoning", "enter")
         assert isinstance(ui.overlay, ThinkingOverlay)
         assert sent(ui, RunCommand) == []
 
@@ -322,7 +322,7 @@ class TestTheSevenBuiltins:
         # worker for the running turn to collide with.
         ui = app()
         ui.session.turn.working = True
-        press(ui, *"/thinking", "enter")
+        press(ui, *"/reasoning", "enter")
         assert isinstance(ui.overlay, ThinkingOverlay)
 
     def test_a_session_command_with_nothing_open_says_so(self):
@@ -457,7 +457,7 @@ class TestALongAnswerGetsAWindow:
 
     def test_it_waits_rather_than_covering_a_screen_the_user_opened(self):
         ui = app()
-        press(ui, *"/thinking", "enter")
+        press(ui, *"/reasoning", "enter")
         ui.toast(self.listing(), title="Skills")
         assert isinstance(ui.overlay, ThinkingOverlay)
         press(ui, "esc")

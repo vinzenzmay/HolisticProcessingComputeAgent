@@ -197,7 +197,7 @@ Per section, gaps only:
 | Rewind and fork | 15 | — | — | — |
 | Core chat wiring | 21 | 1 | 1 | 1 |
 | Agent modes | 8 | 1 | — | — |
-| Thinking box, tool rows, logging | 22 | 1 | — | — |
+| Reasoning box, tool rows, logging | 22 | 1 | — | — |
 | Titles, rename, delete | 20 | 2 | — | — |
 | Profiles | 21 | 2 | 1 | — |
 | Backends | 30 | 1 | — | 1 |
@@ -734,7 +734,7 @@ profile is current. *Medium — the second half is a real, if narrow, misfile.*
 
 **9.11 The frequency sort systematically under-counts three of the seven
 built-ins.** `service.py:2175` calls `command.run` "the one place the menu's
-sort can learn it ran", but `/thinking` always, and `/skill-creator` and
+sort can learn it ran", but `/reasoning` always, and `/skill-creator` and
 `/skill-remove` when bare, are answered by `_screen_command` and never reach the
 core. The ordering `63d44c4` shipped will never promote them. *Low, and
 arguably correct — but it is not what the docstring says.*

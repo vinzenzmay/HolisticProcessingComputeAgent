@@ -711,15 +711,15 @@ class TestTheContextMeterState:
         assert context.speed is None
 
     def test_the_thinking_level_is_shown_before_the_first_reply(self):
-        assert Context(window=32_768, effort="medium").bar().endswith("think medium")
+        assert Context(window=32_768, effort="medium").bar().endswith("reason medium")
 
     def test_and_after_the_fill_and_the_speed(self):
         context = Context(speed=4.2, effort="medium")
         context.measure(12_345, 32_768)
-        assert context.bar().endswith("· 4.2 tok/s · think medium")
+        assert context.bar().endswith("· 4.2 tok/s · reason medium")
 
     def test_off_is_shown_rather_than_hidden(self):
-        assert "think off" in Context(window=32_768, effort="off").bar()
+        assert "reason off" in Context(window=32_768, effort="off").bar()
 
     def test_and_none_clears_it(self):
         assert "think" not in Context(window=32_768, effort=None).bar()

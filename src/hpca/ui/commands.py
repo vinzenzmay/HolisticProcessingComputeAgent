@@ -91,8 +91,8 @@ BUILTINS: tuple[Command, ...] = (
         session=False,
     ),
     Command(
-        "thinking",
-        "/thinking — how hard this session's model reasons "
+        "reasoning",
+        "/reasoning — how hard this session's model reasons "
         "(off / low / medium / xhigh)",
     ),
 )

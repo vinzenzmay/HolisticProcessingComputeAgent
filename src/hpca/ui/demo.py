@@ -846,7 +846,7 @@ class DemoCore:
     def _do_ThinkingSet(self, cmd: protocol.ThinkingSet) -> None:
         self.rows[self._index(cmd.session_id)].thinking = cmd.effort
         self.emit(protocol.SessionRows(rows=list(self.rows)))
-        self.emit(protocol.Notify(text=f"Thinking effort: {cmd.effort}"))
+        self.emit(protocol.Notify(text=f"Reasoning effort: {cmd.effort}"))
 
     def _do_BackendSet(self, cmd: protocol.BackendSet) -> None:
         model = str(cmd.backend.get("model", "")) or "the new backend"

@@ -59,10 +59,10 @@ EFFORTS: tuple[ThinkingEffort, ...] = ("off", "low", "medium", "xhigh")
 # slower, because low spends its deliberation re-deciding steps it has already
 # taken and medium injects no preamble at all.
 EFFORT_HINTS: dict[str, str] = {
-    "off": "no thinking channel — good for simple tasks",
+    "off": "no reasoning channel — good for simple tasks",
     "low": "spends much effort on correction steps",
-    "medium": "the model's own default amount of thinking — fastest",
-    "xhigh": "thinks hardest, and overthinks everything",
+    "medium": "the model's own default amount of reasoning — fastest",
+    "xhigh": "reasons hardest, and overthinks everything",
 }
 
 

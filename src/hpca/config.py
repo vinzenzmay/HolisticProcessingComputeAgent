@@ -156,7 +156,7 @@ class LLMSettings(_Section):
     # thinking box. This is only the fallback for a caller that expresses no
     # opinion (the sub-agents that hard-code False, a bare client in a test):
     # a chat turn's thinking comes from the *session's* effort level
-    # (`agent.default_thinking`, `/thinking`, hpca.thinking), which reaches the
+    # (`agent.default_thinking`, `/reasoning`, hpca.thinking), which reaches the
     # wire per request. It has to be per request and not a client property,
     # because one client is shared by every session on the same backend
     # (core.backends.client_for_backend keys them by base_url||model).
@@ -182,7 +182,7 @@ class AgentSettings(_Section):
 
     ``default_thinking`` is the reasoning-effort dial (hpca.thinking), which
     has the same lifecycle: stored per session, empty there meaning "whatever
-    this says", changeable mid-session with ``/thinking``. It defaults to
+    this says", changeable mid-session with ``/reasoning``. It defaults to
     ``off`` so an upgrade changes nothing about how turns run — every level
     above off costs a thinking pass before *every* decision in a turn, and the
     server's own default once thinking is on is the slowest level (xhigh), so
@@ -510,7 +510,7 @@ class LLMBackend(_Section):
     the reasoning that thinking is a property of the model — true, but the
     thing a user actually adjusts is how hard *this conversation* should think,
     and answering that by editing the catalog changed every session on that
-    backend at once. It is now a per-session level (hpca.thinking, ``/thinking``).
+    backend at once. It is now a per-session level (hpca.thinking, ``/reasoning``).
     Entries written before v0.22.0 still carry the key; ``extra="ignore"`` on
     ``_Section`` drops it on load, so an old settings file needs no migration.
     """

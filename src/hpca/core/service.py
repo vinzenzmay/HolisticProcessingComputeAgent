@@ -193,14 +193,14 @@ def _write_entries(log, entries: list[Entry]) -> None:
     """Append one turn's entries to its session log. Blocking, by design: the
     caller runs it off the loop (see `AgentService._record_turn_tail`).
 
-    A thinking entry carries its gist in the heading — "thinking (2,104 chars
-    reasoning · 3 steps)" — because the block under it is long and the line
+    A reasoning entry carries its gist in the heading — "reasoning (2,104
+    chars reasoning · 3 steps)" — because the block under it is long and the line
     above it is what a reader skims.
     """
     for entry in entries:
         kind = LOG_KINDS.get(entry.kind, entry.kind)
         if entry.kind == THINKING:
-            kind = f"thinking ({entry.summary()})"
+            kind = f"reasoning ({entry.summary()})"
         log.write(kind, entry.text)
 
 
@@ -224,7 +224,7 @@ SLASH_COMMANDS = frozenset(
         "compact",
         "memorize",
         "conclude",
-        "thinking",
+        "reasoning",
         "skills-list",
         "skill-remove",
         "skill-creator",
@@ -1451,14 +1451,14 @@ class AgentService:
             self._deps.emit(
                 Notify(
                     severity="warning",
-                    text=f"There is no “{effort}” thinking level.",
+                    text=f"There is no “{effort}” reasoning level.",
                 )
             )
             return
         self._sessions.set_thinking(session_id, effort)
         self._emit_rows()
         self._deps.emit(
-            Notify(text=f"Thinking effort for this session: {effort}")
+            Notify(text=f"Reasoning effort for this session: {effort}")
         )
 
     async def _set_backend(self, command: BackendSet) -> None:
@@ -2268,7 +2268,7 @@ class AgentService:
             if session is not None:
                 self._spawn(self._conclude(session))
             return
-        if name == "thinking":
+        if name == "reasoning":
             self._thinking_command(command, args)
             return
         if name == "skills-list":
@@ -2431,7 +2431,7 @@ class AgentService:
         return self._known(command.session_id)
 
     def _thinking_command(self, command: CommandRun, args: str) -> None:
-        """`/thinking [level]`: set the session's level, or say what there is.
+        """`/reasoning [level]`: set the session's level, or say what there is.
 
         With a level it is `thinking.set` typed instead of picked, and goes
         through the same handler so the two cannot drift. Without one the
@@ -2445,7 +2445,7 @@ class AgentService:
                 self._deps.emit(
                     Notify(
                         severity="warning",
-                        text="Open a session first — thinking is per session.",
+                        text="Open a session first — reasoning is per session.",
                     )
                 )
                 return
@@ -2453,7 +2453,7 @@ class AgentService:
             return
         self._deps.emit(
             Notify(
-                title="Thinking effort",
+                title="Reasoning effort",
                 text="\n".join(
                     f"• {level} — {EFFORT_HINTS.get(level, '')}"
                     for level in EFFORTS
@@ -3326,7 +3326,7 @@ def _mode_for(sessions, settings, session_id: str) -> str:
 
 def _effort_for(sessions, settings, session_id: str) -> str:
     """The session's thinking level (hpca.thinking). Read from the store per
-    round, not from a Session copy, so ``/thinking`` reaches a turn already in
+    round, not from a Session copy, so ``/reasoning`` reaches a turn already in
     flight — the same rule as the mode above."""
     session = sessions.get(session_id)
     stored = getattr(session, "thinking", "") if session is not None else ""

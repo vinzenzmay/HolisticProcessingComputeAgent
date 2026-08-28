@@ -679,7 +679,7 @@ class Context:
         # Shown before the first reply too — a session left on xhigh looks
         # identical to one on off until the wait.
         if effort and self.effort:
-            text += f" · think {self.effort}"
+            text += f" · reason {self.effort}"
         return text
 
     def measure(
@@ -964,7 +964,7 @@ class SessionState:
         self.flags = list(flags)
         # `protocol.SessionRow.thinking`: how hard this conversation reasons,
         # empty when it never chose and follows the configured default. Held
-        # here and not only on the meter because `/thinking` opens with the
+        # here and not only on the meter because `/reasoning` opens with the
         # current level preselected, and "" is a different answer from "off".
         self.thinking = thinking
         # `protocol.SessionRow.model`: the backend this conversation is pinned
@@ -1959,7 +1959,7 @@ class RemoveBackend:
 
 @dataclass(frozen=True)
 class RunCommand:
-    """A slash command: `/compact`, `/thinking`, `/skills-list`, `/<skill>`.
+    """A slash command: `/compact`, `/reasoning`, `/skills-list`, `/<skill>`.
 
     ``session_id`` is empty for the profile-scoped ones, which is the
     difference `protocol.CommandRun` spells as None: `/skills-list` acts on the

@@ -180,10 +180,10 @@ class TestNotifyReachesIt:
     async def test_the_title_crosses_the_wire(self):
         async with connected() as wire:
             await wire.tell(
-                protocol.Notify(title="Thinking effort", text="• off\n• low")
+                protocol.Notify(title="Reasoning effort", text="• off\n• low")
             )
-            assert wire.ui.toasts[-1].title == "Thinking effort"
-            assert "Thinking effort" in wire.screen()
+            assert wire.ui.toasts[-1].title == "Reasoning effort"
+            assert "Reasoning effort" in wire.screen()
 
     async def test_and_the_timeout_does(self):
         async with connected() as wire:

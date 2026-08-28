@@ -668,7 +668,7 @@ class TestThinking:
         ui = recorded(build())
         ui.focus = CHAT
         press(ui, "ctrl-down")
-        type_text(ui, "/thinking")
+        type_text(ui, "/reasoning")
         press(ui, "enter")
         assert isinstance(ui.overlay, ThinkingOverlay)
 
@@ -676,7 +676,7 @@ class TestThinking:
         ui = recorded(build())
         ui.focus = CHAT
         press(ui, "i")
-        type_text(ui, "/thinking")
+        type_text(ui, "/reasoning")
         before = len(ui.intents)
         press(ui, "enter")
         assert len(ui.intents) == before
@@ -714,7 +714,7 @@ class TestThinking:
 
     def test_the_context_bar_shows_the_level(self):
         ui = press(self._open(), "down", "enter")
-        assert "think medium" in screen(ui)
+        assert "reason medium" in screen(ui)
 
     def test_without_a_session_it_says_so(self):
         ui = RowUI()

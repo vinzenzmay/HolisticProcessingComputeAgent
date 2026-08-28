@@ -200,12 +200,12 @@ off file by file.
 - Shift+tab only cycles from the chat column; the sessions and watchers columns
   leave the mode alone.
 
-## Thinking box, tool rows, logging — `test_tui_thinking_logs.py`
+## Reasoning box, tool rows, logging — `test_tui_thinking_logs.py`
 
 - Reasoning and tool steps share one collapsed box per turn.
 - Enter expands it into collapsible steps.
 - Parts are individually navigable and hold the highlight.
-- No thinking means no box.
+- No reasoning means no box.
 - The box survives reopening the session.
 - An approved script stays readable in the chat after the prompt is gone.
 - A skipped script is still there to read.
@@ -218,7 +218,7 @@ off file by file.
 - The result fills that same row rather than adding a second one.
 - A result with no call of its own still gets a row.
 - A rebuild between the two halves leaves the result standing.
-- A turn is logged with thinking and answer.
+- A turn is logged with reasoning and answer.
 - Sub-agent query and reply are logged under the tool.
 - Reopening a session does not re-log it.
 - Each session gets its own log file.
@@ -332,7 +332,7 @@ off file by file.
   changes nothing.
 - The UI stays responsive and closable during a slow scan.
 - The discovered panel fills incrementally while the scan is still running.
-- There is no per-backend thinking marker or toggle any more; an old catalog
+- There is no per-backend reasoning marker or toggle any more; an old catalog
   entry carrying one still loads.
 - The backend form: enter on a keyed endpoint opens with URL locked; key plus
   autofill saves; a rejected key warns and keeps the input; `a` opens a blank
@@ -595,16 +595,16 @@ selection does this and these claims are satisfied by not interfering.
 
 - Dragging across a message marks text.
 - Marking a message does not jump focus to the entry.
-- Marking the thinking box does not collapse it.
+- Marking the reasoning box does not collapse it.
 - A marked selection copies via the clipboard manager (OSC 52).
 - A plain click on a message still focuses the entry.
 - A plain click on your own message offers the rewind dialog: click activates
   like Enter.
-- A plain click toggles the thinking box once, not twice.
+- A plain click toggles the reasoning box once, not twice.
 
-## Thinking effort — `test_tui_thinking.py`
+## Reasoning effort — `test_tui_thinking.py`
 
-- `/thinking` opens a chooser with all four levels, each with its hint and none
+- `/reasoning` opens a chooser with all four levels, each with its hint and none
   flagged unusable; the current level is starred and preselected; escape leaves
   the level alone; without a session it says so.
 - A choice is stored on the session; new sessions start at the configured
@@ -673,7 +673,7 @@ state they feed must survive:
 - A window arriving after the usage is applied.
 - Speed is appended to the measured line, decimal for slow turns, waits for a
   measured fill, and is cleared by None or reset.
-- Thinking effort is shown before the first reply and appended after fill and
+- Reasoning effort is shown before the first reply and appended after fill and
   speed; "off" is shown; None clears it.
 
 ## Carried over from deleted Textual-mechanics tests
