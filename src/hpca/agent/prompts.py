@@ -224,8 +224,11 @@ WATCH_GUIDANCE = (
     "run's log, a tool's own log file), call watch_log with its path. Both "
     "give the user a live box — a job's Slurm state, a log's time since the "
     "last write — so they can see at a glance whether the work is still "
-    "alive instead of asking you to check. Do this as soon as you have the "
-    "id or the path in hand, without being asked, and say that you did. "
+    "alive instead of asking you to check. Each takes an array: pin "
+    "everything you found in ONE call — every id in one watch_job, every "
+    "path in one watch_log — rather than a call per target. Do this as soon "
+    "as you have the ids or the paths in hand, without being asked, and say "
+    "that you did. "
     "Watching costs the user nothing: they drop a box with one keypress."
 )
 

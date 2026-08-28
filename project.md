@@ -218,15 +218,37 @@ what runs on a cluster, and it is a slice already in the chat log — so the
 column's job is somebody *else's* work: an sbatch script submitted by hand, a
 pipeline run spawning tool after tool, the log some long-running tool appends
 to. Finding out whether any of that is alive otherwise means `squeue`, then ssh
-to the node, then `tail`. The agent pins one to the column instead:
+to the node, then `tail`. The agent pins what it found to the column instead:
 
-* `watch_log <path>` — a file. Its mtime is the signal: "last write 4s ago" is
-  alive, "last write 40m ago" is dead or wedged. Registering a log that does
-  not exist yet is normal (the job has not created it), and the box says so.
-* `watch_job <id>` — refreshed from `squeue` every 15 s; once the job leaves the
+* `watch_log <paths…>` — files. A log's mtime is the signal: "last write 4s
+  ago" is alive, "last write 40m ago" is dead or wedged. Registering a log that
+  does not exist yet is normal (the job has not created it), and the box says
+  so.
+* `watch_job <ids…>` — refreshed from `squeue` every 15 s; once a job leaves the
   queue `sacct` supplies the final state, so the box settles on COMPLETED or
-  FAILED rather than vanishing. A finished job stops being polled.
-* `list_watches`, `unwatch <name>` — the same operations from the model's side.
+  FAILED rather than vanishing. A finished job stops being polled. An id
+  neither `squeue` nor `sacct` knows is refused rather than pinned, and the
+  others in the same call are still watched.
+* `list_watches`, `unwatch <names…>` — the same operations from the model's
+  side.
+
+The two register tools and `unwatch` take an **array**, because what the agent
+finds it finds in bulk: a `squeue` listing is a dozen ids, a pipeline directory
+a dozen logs. One call per target was a decision per target — and, for jobs, a
+`squeue` process per target; the array is one decision and one `squeue` plus at
+most one `sacct` for the whole batch. A `label` names a single box, so it is
+dropped when the call carries several targets and each is named after itself.
+Duplicates within one call collapse to one box, as registering the same target
+twice always did.
+
+An array is applied **in part**: every element is resolved on its own, what
+resolved cleanly happens, and what did not is reported by name — one id
+`squeue` and `sacct` have both never heard of, or one `unwatch` name the panel
+does not have, must not cost the targets around it. The one thing an array does
+*not* buy is a guess: a name matching two watches is still refused rather than
+resolved, because the array is exactly how the model says which two it meant.
+There is deliberately no wildcard — clearing the column is the one removal that
+is not cheap to undo, since it takes the user's ordering with it.
 
 A watch belongs to the **session** that registered it, not to the profile: the
 column describes the conversation being read. It was profile-scoped originally,
