@@ -2793,6 +2793,64 @@ class TestRollback:
         ]
         await service.stop()
 
+    async def folded(self, service, session, llm, queue):
+        """Two turns and a summary standing for them, accepted and landed."""
+        await run_turn(service, session.session_id, "first")
+        await run_turn(service, session.session_id, "second")
+        llm._outputs = ["earlier: two questions were answered"]
+        await service.handle(
+            CommandRun(name="compact", session_id=session.session_id)
+        )
+        await wait_for(queue, "CompactProposed")
+        await service.handle(
+            CompactResolve(session_id=session.session_id, action="accept")
+        )
+        await wait_for(queue, "Notify")
+        values = await service._thread_values(session.session_id)
+        assert values["compacted"]["upto"] > 0, "nothing was folded"
+        return values
+
+    async def test_a_cut_above_a_compaction_is_carried_out(
+        self, service, session, llm
+    ):
+        # The UI used to withhold the rewind above the fold. It does not any
+        # more, and this is the path that has to hold underneath: the thread
+        # keeps every message a fold summarised, so a cut up there names a
+        # real message, and `graph.rollback_thread` drops the fold that
+        # reached past it rather than leaving a summary standing for messages
+        # the user has just removed.
+        queue = subscribe(service)
+        await self.folded(service, session, llm, queue)
+        await service.handle(
+            SessionRollback(session_id=session.session_id, index=0)
+        )
+        values = await service._thread_values(session.session_id)
+        assert values.get("messages") == []
+        assert values.get("compacted") is None
+
+    async def test_and_the_cut_still_names_a_length_the_ui_can_apply(
+        self, service, session, llm
+    ):
+        # The front-end's half. Whatever the fold arithmetic does with the
+        # boundary row — it is dropped with the tail when the summary goes,
+        # and re-drawn at the end of the prefix when it survives — the number
+        # the core sends has to be the length of the chat a re-open would
+        # draw. That is the whole invariant `chat.truncate` rests on, and a
+        # fold is the one thing that can move a row without a message moving.
+        queue = subscribe(service)
+        await self.folded(service, session, llm, queue)
+        await drain(queue)
+        await service.handle(
+            SessionRollback(session_id=session.session_id, index=2)
+        )
+        cut = only(await drain(queue), "ChatTruncate")
+        await service.handle(SessionOpen(session_id=session.session_id))
+        reset = only(await drain(queue), "ChatReset")
+        assert cut.after_seq == len(reset.entries)
+        assert [e.seq for e in reset.entries] == list(
+            range(1, len(reset.entries) + 1)
+        )
+
     async def test_it_is_refused_while_a_turn_is_running(
         self, service, session, llm
     ):

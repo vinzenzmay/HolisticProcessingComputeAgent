@@ -398,7 +398,9 @@ class TestTheCutTheRewindMakes:
         assert session.truncate(0) is True
         assert session.entries == [] and session.chat.items == []
 
-    def test_the_fold_boundary_is_found_again(self):
+    def test_a_boundary_row_above_the_cut_stays(self):
+        # It is drawn where the fold record puts it, so a cut below it leaves
+        # it exactly where a re-open would draw it.
         session = SessionState("s1")
         session.reset([
             entry(1, text="one"),
@@ -406,9 +408,12 @@ class TestTheCutTheRewindMakes:
             entry(3, text="three"),
         ])
         session.truncate(2)
-        assert session.folded_away(1) is True
+        assert [e.kind for e in session.entries] == ["user", "compaction"]
 
-    def test_and_a_boundary_that_was_cut_away_is_gone(self):
+    def test_and_one_below_it_goes_with_the_rest(self):
+        # The case a rollback past a fold makes: the graph drops a fold that
+        # reached past the cut (`graph.rollback_thread`), and the row it was
+        # drawn as is in the tail this removes.
         session = SessionState("s1")
         session.reset([
             entry(1, text="one"),
@@ -416,7 +421,7 @@ class TestTheCutTheRewindMakes:
             entry(3, text="three"),
         ])
         session.truncate(1)
-        assert session.folded_away(1) is False
+        assert [e.kind for e in session.entries] == ["user"]
 
 
     def test_an_entry_can_be_found_by_the_row_it_is_under(self):
@@ -882,62 +887,3 @@ class TestTheCompactionBoundaryDrawsAsADivider:
 
     def test_turning_stamps_off_leaves_the_bare_word(self):
         assert self.row(stamps=False).head == "compacted "
-
-
-class TestWhatIsBehindTheFold:
-    """`SessionState.folded_away`: which rows the rewind is no longer for."""
-
-    def chat(self, *kinds_and_seqs):
-        session = SessionState("s1")
-        session.reset([
-            ChatEntry(kind=kind, text="x", seq=seq, index=-1 if kind == "compaction" else seq)
-            for kind, seq in kinds_and_seqs
-        ])
-        return session
-
-    def test_nothing_is_behind_a_fold_that_never_happened(self):
-        session = self.chat(("user", 1), ("assistant", 2), ("user", 3))
-        assert not session.folded_away(1)
-        assert not session.folded_away(3)
-
-    def test_rows_above_the_boundary_are(self):
-        session = self.chat(("user", 1), ("compaction", 2), ("user", 3))
-        assert session.folded_away(1)
-
-    def test_and_rows_below_it_are_not(self):
-        session = self.chat(("user", 1), ("compaction", 2), ("user", 3))
-        assert not session.folded_away(3)
-
-    def test_nor_is_the_boundary_itself(self):
-        session = self.chat(("user", 1), ("compaction", 2), ("user", 3))
-        assert not session.folded_away(2)
-
-    def test_a_row_that_is_not_here_is_not_behind_anything(self):
-        # A seq from a chat that has since been reset. False rather than an
-        # error: this answers a footer being drawn, and a stale cursor must
-        # not be able to raise out of a repaint.
-        session = self.chat(("user", 1), ("compaction", 2), ("user", 3))
-        assert not session.folded_away(999)
-
-    def test_only_the_last_boundary_counts(self):
-        # The graph keeps one fold record and moves it, so a chat should never
-        # hold two — but if one ever did, the live boundary is the newest.
-        session = self.chat(
-            ("user", 1), ("compaction", 2), ("user", 3), ("compaction", 4), ("user", 5)
-        )
-        assert session.folded_away(3)
-        assert not session.folded_away(5)
-
-    def test_a_row_appended_after_the_reset_is_below_the_fold(self):
-        session = self.chat(("user", 1), ("compaction", 2), ("user", 3))
-        session.append(ChatEntry(kind="user", text="new", seq=4, index=4))
-        assert not session.folded_away(4)
-
-    def test_and_removing_a_row_does_not_move_the_line(self):
-        # `remove` renumbers positions under the map; the boundary is held by
-        # seq so it rides that rather than going stale.
-        session = self.chat(("user", 1), ("compaction", 2), ("user", 3))
-        session.append(ChatEntry(kind="queued", text="q", seq=4))
-        session.remove(4)
-        assert session.folded_away(1)
-        assert not session.folded_away(3)

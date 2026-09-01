@@ -196,13 +196,6 @@ NOTHING_TO_STOP = "nothing running to stop"
 # stopped again (specs/specs-ui-coverage.md §4).
 PARKED_ON_A_DECISION = "this turn is waiting for your answer — decide it first"
 
-# Enter on one of your own messages from *above* the compaction line. The
-# rewind is not offered there (`SessionState.folded_away`), and this is the
-# rest of that answer: the footer stops offering the key, and a press that
-# lands on the row anyway says why rather than moving the focus and looking
-# like a missed keystroke.
-BEHIND_THE_FOLD = "nothing at or above the compaction line can be rewound to"
-
 # The title over the tunnel recipe an empty scan comes back with — the words
 # `tui/manage_llms.py` put on the same window, so a user who has seen it once
 # recognises it. The recipe itself is the core's (`autoconnect.offcluster_help`).
@@ -2476,10 +2469,18 @@ class RowUI:
         with the word that is true on that row. In the chat that is narrower
         than the old hint claimed: Enter opens the rewind on one of your own
         messages, offers to take back a queued one, and on everything else —
-        the agent's replies, a turn's working, the compaction line, a row at
-        or above it — it moves the focus to the message box, which is what
-        `app.py` answers an Enter it has nothing better to do with. That is
-        not a thing to advertise as "rollback/fork".
+        the agent's replies, a turn's working, the compaction line — it moves
+        the focus to the message box, which is what `app.py` answers an Enter
+        it has nothing better to do with. That is not a thing to advertise as
+        "rollback/fork".
+
+        A compaction row falls out of `OWN_MESSAGE_KINDS` on its own and needs
+        no rule of its own: it is a mark rather than a message (`index` -1),
+        so there is nothing there for a cut to name. The rows *above* it are
+        ordinary messages and are offered like any other — the thread keeps
+        everything a fold summarised, and the graph decides what becomes of
+        the summary deliberately on both sides (`graph.rollback_thread` drops
+        a fold that reached past the cut, `fork_thread` declines to copy one).
 
         `here()` rather than a position, for the reason it exists: the footer
         has a cursor and no terminal width. The live working row is not an
@@ -2495,20 +2496,9 @@ class RowUI:
             # roll back to — the one message that can simply be taken back
             # (`overlays/queued.py`).
             return ("enter", "take it back")
-        if entry.kind in OWN_MESSAGE_KINDS and not self._no_rewind(entry):
+        if entry.kind in OWN_MESSAGE_KINDS:
             return ("enter", "rollback/fork")
         return None
-
-    def _no_rewind(self, entry) -> bool:
-        """Whether that row is one no cut can be aimed at.
-
-        Everything above the compaction line, and the line itself: the
-        boundary is a mark rather than a message (`index` -1), so a fork or a
-        rollback has nothing to name there either. Taken together they are the
-        contiguous top of the conversation, which is what makes the footer's
-        answer change exactly once as the cursor walks down.
-        """
-        return entry.kind == "compaction" or self.session.folded_away(entry.seq)
 
     def _activate_chat(self, width: int) -> None:
         """Enter in the chat log.
@@ -2522,16 +2512,6 @@ class RowUI:
             self._stop_from_the_row()
             return
         entry = self.session.entry_at(position)
-        if entry is not None and self._no_rewind(entry):
-            # At or above the fold, before anything is asked about the kind of
-            # row:
-            # nothing up there is a rewind target, the user's messages and the
-            # agent's alike, and the footer has already stopped naming the key
-            # here. Saying so beats moving the focus, which reads as a
-            # keystroke that missed.
-            self.note = BEHIND_THE_FOLD
-            self.note_style = theme.faint
-            return
         if entry is not None and entry.kind == "queued":
             # A message that has not reached the model yet: the offer is to
             # take it back, not to rewind to it (§4.3 item 34).

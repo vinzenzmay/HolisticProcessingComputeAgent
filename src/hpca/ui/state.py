@@ -1051,15 +1051,6 @@ class SessionState:
         # The map, not a scan: a `chat.update` during a long turn arrives once
         # per tool call, and a linear search per update is O(chat) per step.
         self._rows: dict[int, int] = {}
-        # The `seq` of the compaction boundary row, or 0 for a conversation
-        # that has never been folded. Named by seq rather than by position so
-        # it survives `remove` shifting the rows under it — `_rows` is what
-        # keeps positions honest, and this rides it.
-        #
-        # One, not a list: the graph keeps a single fold record and moves it
-        # (`AgentState.compacted`), so a second compaction replaces the first
-        # rather than adding to it.
-        self._fold_seq = 0
         self.loaded = False
 
     # -------------------------------------------------------------- the chat
@@ -1112,12 +1103,6 @@ class SessionState:
         self._rows = {
             entry.seq: i for i, entry in enumerate(self.entries) if entry.seq
         }
-        # Only a reset can bring one in: `build_entries` draws the boundary
-        # for whole-chat builders alone, and an append arrives below it by
-        # construction. So this is the one place it needs finding.
-        self._fold_seq = next(
-            (e.seq for e in reversed(self.entries) if e.kind == "compaction"), 0
-        )
         self.chat.expanded.clear()
         self.chat.invalidate()
         self._auto = ""
@@ -1173,11 +1158,6 @@ class SessionState:
         }
         surviving = {self.chat.key_at(i) for i in range(len(self.entries))}
         self._live &= surviving
-        # The boundary row is drawn by a whole-chat build and can only be cut
-        # away by one, so this is found again exactly as `reset` finds it.
-        self._fold_seq = next(
-            (e.seq for e in reversed(self.entries) if e.kind == "compaction"), 0
-        )
         if self._auto not in surviving:
             # The auto-opened row was the last one and the last one is now a
             # different row. `_open_last` takes the title back; a row the user
@@ -1318,28 +1298,6 @@ class SessionState:
             self._auto = ""
             self._open_last()
         return entry
-
-    def folded_away(self, seq: int) -> bool:
-        """Is that row above this conversation's compaction boundary?
-
-        The rewind is not offered above the fold, and this is the question it
-        asks. Both halves of it — cutting the thread back to a message, and
-        forking a new one from it — reach for history that the model no longer
-        holds: rolling back past the boundary drops the summary standing for
-        it, and a fork from up there starts a conversation the summary does
-        not describe. Both are *defined* (`graph.rollback_thread` /
-        `fork_thread` handle the fold deliberately), and neither is a thing to
-        offer behind a keystroke on a row that looks like every other one.
-
-        Positions rather than seqs, because seqs are assigned in row order but
-        the comparison must survive a `remove` renumbering the map under it.
-        """
-        if not self._fold_seq:
-            return False
-        row, fold = self._rows.get(seq), self._rows.get(self._fold_seq)
-        if row is None or fold is None:
-            return False
-        return row < fold
 
     def entry_at(self, position: int) -> ChatEntry | None:
         """The entry a pane position is showing, if it is showing one."""
