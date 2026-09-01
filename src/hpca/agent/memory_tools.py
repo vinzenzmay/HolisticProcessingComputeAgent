@@ -112,10 +112,12 @@ MEMORY_DESCRIPTION = (
     "array. Address an existing entry by a short unique substring of its text "
     "— including one you flagged earlier in this conversation; use 'demote' "
     "to move a system-prompt entry to rag. The result says what was queued "
-    "and what was refused: a substring that addresses nothing comes back with "
-    "the entries that DO exist, so correct it from that list rather than "
-    "retrying with a shorter substring. Reissuing a refused operation "
-    "unchanged is counted and stops the tool for the session."
+    "and what was refused, and what is now waiting for review (newest last). "
+    "A substring that addresses nothing comes back with the entries that DO "
+    "exist, one per line, each already a substring that works: copy one of "
+    "those lines exactly into match. Do NOT shorten a substring that missed — "
+    "a trimmed or extended version of a refused address counts as the same "
+    "attempt, and the third attempt stops the tool for the session."
 )
 
 

@@ -3,8 +3,11 @@
 import pytest
 
 from hpca.memory_ops import (
+    ADDRESS_LISTED,
     MemoryOp,
     MemoryOpError,
+    address_for,
+    address_help,
     apply_batch,
     drift_detected,
     resolve,
@@ -50,6 +53,102 @@ class TestResolve:
         with pytest.raises(MemoryOpError) as excinfo:
             resolve(profile, SP, "STAR")
         assert "Use mamba." in str(excinfo.value)
+
+
+class TestAddresses:
+    """What a refusal hands back has to be reissuable as `match`.
+
+    The loop this answers: the listing used to elide every entry at 60
+    characters with an ellipsis, so the model copied the ellipsis into
+    `match`, missed, and shortened — forever. An address is therefore checked
+    here by feeding it straight back to `resolve`.
+    """
+
+    LONG = (
+        "IGV-like Godot alignment viewer: backend is a separate Rust binary "
+        "(htslib bindings); Godot 4.7 is the frontend."
+    )
+    SIBLING = (
+        "IGV-like Godot alignment viewer: backend is a separate Rust process "
+        "launched by the Godot app over stdio."
+    )
+
+    def test_every_offered_address_resolves_to_its_own_entry(self):
+        profile = profile_with((self.LONG, RAG), (self.SIBLING, RAG))
+        for memory in profile.memories:
+            assert resolve(profile, RAG, address_for(profile, memory)) is memory
+
+    def test_an_address_is_never_elided(self):
+        """The ellipsis is the bug: it cannot be matched, and it is the one
+        character a model copying the listing is sure to bring along."""
+        profile = profile_with((self.LONG, RAG))
+        assert "…" not in address_help(profile, RAG, "nope")
+
+    def test_entries_sharing_an_opening_get_addresses_that_separate_them(self):
+        profile = profile_with((self.LONG, RAG), (self.SIBLING, RAG))
+        first, second = (address_for(profile, m) for m in profile.memories)
+        assert first != second
+        assert "Rust binary" in first and "Rust process" in second
+
+    def test_a_short_entry_is_addressed_by_all_of_it(self):
+        profile = profile_with(("Use mamba.", SP))
+        assert address_for(profile, profile.memories[0]) == "Use mamba."
+
+    def test_a_multiline_entry_is_addressed_by_its_first_line(self):
+        """`resolve` matches the raw text, so a whitespace-collapsed address
+        would be quoted back and then not be found."""
+        profile = profile_with(("first line here\nsecond line here", RAG))
+        memory = profile.memories[0]
+        assert address_for(profile, memory) == "first line here"
+        assert resolve(profile, RAG, address_for(profile, memory)) is memory
+
+    def test_the_lines_of_the_help_are_addresses_on_their_own(self):
+        """Indented and unquoted, because `resolve` strips whitespace and
+        nothing else — a bullet or a quote would be copied back into `match`."""
+        profile = profile_with((self.LONG, RAG), (self.SIBLING, RAG))
+        help_text = address_help(profile, RAG, "backend is a separate Ru")
+        offered = [
+            line.strip() for line in help_text.splitlines() if line.startswith("    ")
+        ]
+        assert len(offered) == 2
+        for line in offered:
+            assert resolve(profile, RAG, line) in profile.memories
+
+    def test_the_closest_entry_is_offered_first(self):
+        profile = profile_with(("Use mamba, not conda.", RAG), (self.LONG, RAG))
+        help_text = address_help(profile, RAG, "IGV-like Godot alignment")
+        first = next(
+            line.strip()
+            for line in help_text.splitlines()
+            if line.startswith("    ")
+        )
+        assert first.startswith("IGV-like Godot")
+
+    def test_a_long_scope_is_capped_and_says_so(self):
+        profile = profile_with(*((f"entry number {n} of many", RAG) for n in range(20)))
+        help_text = address_help(profile, RAG, "entry number 3 of many")
+        offered = [
+            line for line in help_text.splitlines() if line.startswith("    ")
+        ]
+        assert len(offered) == ADDRESS_LISTED + 1  # the listed ones, and the tally
+        assert f"and {20 - ADDRESS_LISTED} more" in help_text
+
+    def test_an_empty_scope_says_so_rather_than_listing_nothing(self):
+        with pytest.raises(MemoryOpError) as excinfo:
+            resolve(profile_with(("in the other scope", SP)), RAG, "anything")
+        assert "no rag memories" in str(excinfo.value)
+
+    def test_the_ambiguous_case_offers_addresses_too(self):
+        """Told to use a longer substring, the model needs one it can copy —
+        it went shorter precisely because it had nothing else."""
+        profile = profile_with((self.LONG, RAG), (self.SIBLING, RAG))
+        with pytest.raises(MemoryOpError) as excinfo:
+            resolve(profile, RAG, "IGV-like Godot alignment viewer")
+        message = str(excinfo.value)
+        assert "matches 2" in message
+        for line in message.splitlines():
+            if line.startswith("    "):
+                assert resolve(profile, RAG, line.strip()) in profile.memories
 
     def test_scope_scoped(self):
         # a system-prompt memory is not found when addressing the rag scope

@@ -431,7 +431,7 @@ class TestFlaggingIsAnswerable:
         answer = harness.service.queue_edits(
             session.session_id, [self.add_op("another fact")]
         )
-        assert "(2, nothing saved yet)" in answer
+        assert "(2, nothing saved yet, newest last)" in answer
         assert "one fact" in answer and "another fact" in answer
 
     def test_the_good_half_of_a_batch_is_kept_and_the_bad_half_named(
@@ -446,6 +446,25 @@ class TestFlaggingIsAnswerable:
         assert "Queued 1 of 2" in answer
         queued = harness.service.pending_edits(session.session_id)
         assert [op.text for op in queued] == ["a good fact"]
+
+    def test_the_waiting_line_shows_the_change_just_made(self, harness, session):
+        """A change is appended, so a listing of the first six could never
+        contain the one the call just made — and a model that checks the
+        listing for its own work and does not find it reissues it."""
+        for n in range(10):
+            answer = harness.service.queue_edits(
+                session.session_id, [self.add_op(f"fact {n}", scope=RAG)]
+            )
+        assert "fact 9" in answer
+        assert "fact 0" not in answer
+        assert "4 earlier" in answer
+
+    def test_a_short_queue_is_listed_whole(self, harness, session):
+        answer = harness.service.queue_edits(
+            session.session_id, [self.add_op("only fact", scope=RAG)]
+        )
+        assert "only fact" in answer
+        assert "earlier" not in answer
 
     def test_the_queue_fills_up_and_then_refuses_terminally(self, harness, session):
         """The one answer the model cannot act on and reissue, which is what
@@ -521,6 +540,19 @@ class TestRepeatedRefusalsStop:
     def miss(self, n=0):
         """An operation that can never apply: nothing contains this."""
         return MemoryOp(op="demote", scope=SP, match=f"never matches anything {n}")
+
+    #: Distinct misses that are not substrings of one another, so each is a
+    #: genuinely new attempt rather than the same address trimmed again.
+    WORDS = (
+        "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo "
+        "lima mike november oscar papa quebec romeo sierra tango uniform "
+        "victor whiskey xray yankee zulu"
+    ).split()
+
+    def unrelated_miss(self, n=0):
+        return MemoryOp(
+            op="demote", scope=SP, match=f"absent {self.WORDS[n % len(self.WORDS)]}"
+        )
 
     def test_the_same_failing_demote_forty_times_ends_in_a_refusal(
         self, harness, session
@@ -606,17 +638,36 @@ class TestRepeatedRefusalsStop:
         )
         assert "Do not call this tool again" in last
 
-    def test_a_queued_change_clears_the_run_of_refusals(self, harness, session):
-        """Progress is evidence the model is using the tool rather than
-        looping in it, so the ceiling counts refusals *since* the last one
-        that landed. A long working session must not be shut down for misses
-        it recovered from."""
+    def test_a_queued_change_pays_back_one_refusal_and_not_the_run(
+        self, harness, session
+    ):
+        """Progress forgives, but one for one. A model that corrects itself
+        after a miss is charged nothing — that is what this is for — while a
+        session landing one change per eleven misses is looping with a
+        garnish, and the old reset let it do that forever."""
         for n in range(MEMORY_REJECT_LIMIT - 1):
-            harness.service.queue_edits(session.session_id, [self.miss(n)])
+            harness.service.queue_edits(session.session_id, [self.unrelated_miss(n)])
         harness.service.queue_edits(session.session_id, [self.add_op("a good fact")])
-        for n in range(MEMORY_REJECT_LIMIT - 1):
+        # one miss bought back, so one more is survivable and the next is not
+        answer = harness.service.queue_edits(
+            session.session_id, [self.unrelated_miss(100)]
+        )
+        assert "Do not call this tool again" not in answer
+        last = harness.service.queue_edits(
+            session.session_id, [self.unrelated_miss(200)]
+        )
+        assert "Do not call this tool again" in last
+
+    def test_one_miss_corrected_at_once_leaves_no_debt(self, harness, session):
+        """The forgiving half, at the size it is meant for: a model that reads
+        the addresses and gets it right must be able to do that all day."""
+        write_memory("scratch space is under /work")
+        for n in range(20):
+            harness.service.queue_edits(
+                session.session_id, [self.unrelated_miss(n)]
+            )
             answer = harness.service.queue_edits(
-                session.session_id, [self.miss(100 + n)]
+                session.session_id, [self.add_op(f"fact {n}", scope=RAG)]
             )
             assert "Do not call this tool again" not in answer
 
@@ -632,6 +683,106 @@ class TestRepeatedRefusalsStop:
         harness.service.queue_edits(session.session_id, [self.add_op("another fact")])
         final = harness.service.queue_edits(session.session_id, [self.miss()])
         assert "Do not call this tool again" in final
+
+    def test_the_same_address_trimmed_again_is_the_same_attempt(
+        self, harness, session
+    ):
+        """The loop as it was actually shipped: told a substring matches
+        nothing, the model shaves characters off it and comes back. Every
+        shortening used to be a fresh key, so the ladder stayed on rung one
+        while the model bisected."""
+        write_memory("A real entry.", scope=RAG)
+        shrinking = [
+            "IGV viewer read-track: a 'break' = ANY clipped end (soft clip S)",
+            "a 'break' = ANY clipped end (soft clip S)",
+            "a 'break' = ANY clipped end",
+        ]
+        answers = [
+            harness.service.queue_edits(
+                session.session_id, [MemoryOp(op="remove", scope=RAG, match=m)]
+            )
+            for m in shrinking
+        ]
+        assert "told this once already" in answers[1]
+        assert "Do not call this tool again" in answers[2]
+
+    def test_lengthening_a_refused_address_counts_the_same(
+        self, harness, session
+    ):
+        """Both directions, because a model that pastes an elided listing back
+        walks outwards from the miss as readily as inwards."""
+        write_memory("A real entry.", scope=RAG)
+        growing = ["nothing here", "nothing here at all", "well, nothing here at all"]
+        answers = [
+            harness.service.queue_edits(
+                session.session_id, [MemoryOp(op="remove", scope=RAG, match=m)]
+            )
+            for m in growing
+        ]
+        assert "Do not call this tool again" in answers[2]
+
+    def test_the_ellipsis_a_model_copied_is_not_what_makes_it_new(
+        self, harness, session
+    ):
+        """The elided listing is gone, but a session that has one in its
+        history will paste it back — and "…" must not read as a new attempt."""
+        write_memory("A real entry.", scope=RAG)
+        for match in ("backend is a separate Rust…", "backend is a separate Rust"):
+            answer = harness.service.queue_edits(
+                session.session_id, [MemoryOp(op="remove", scope=RAG, match=match)]
+            )
+        assert "told this once already" in answer
+
+    def test_changing_the_verb_does_not_start_a_new_ladder(self, harness, session):
+        """demote-then-remove on the same missing address is one wrong idea
+        expressed twice, which is how the reported session spent its calls."""
+        write_memory("A real entry.")
+        for op in ("demote", "remove", "replace"):
+            answer = harness.service.queue_edits(
+                session.session_id,
+                [MemoryOp(op=op, scope=SP, match="absent address", text="x")],
+            )
+        assert "Do not call this tool again" in answer
+
+    def test_two_genuinely_different_addresses_each_get_their_own_ladder(
+        self, harness, session
+    ):
+        """Grouping must not punish a model that moves on to another entry."""
+        write_memory("A real entry.")
+        first = harness.service.queue_edits(
+            session.session_id, [MemoryOp(op="remove", scope=SP, match="alpha")]
+        )
+        second = harness.service.queue_edits(
+            session.session_id, [MemoryOp(op="remove", scope=SP, match="bravo")]
+        )
+        assert "told this once already" not in second
+        assert "Do not call this tool again" not in first + second
+
+    def test_the_same_address_in_another_scope_is_another_attempt(
+        self, harness, session
+    ):
+        """Scope is half of an address: the same words may well name an entry
+        in the scope the model has not tried yet."""
+        write_memory("A real entry.")
+        write_memory("A real entry.", scope=RAG)
+        for scope in (SP, RAG, SP):
+            answer = harness.service.queue_edits(
+                session.session_id,
+                [MemoryOp(op="remove", scope=scope, match="absent address")],
+            )
+        assert "told this once already" in answer
+        assert "Do not call this tool again" not in answer
+
+    def test_two_adds_that_differ_by_a_word_are_two_facts(self, harness, session):
+        """`add` keeps exact identity — grouping texts by containment would
+        make a rewrite look like a repeat, and rewriting is what the tool is
+        for."""
+        for text in ("STAR needs 40G", "STAR needs 40G on this cluster"):
+            answer = harness.service.queue_edits(
+                session.session_id, [self.add_op(text)]
+            )
+        assert "NOT queued" not in answer
+        assert len(harness.service.pending_edits(session.session_id)) == 2
 
     def test_one_sessions_refusals_do_not_stop_another(self, harness, session):
         """The ledger is per session, like the queue it shadows."""

@@ -17,6 +17,7 @@ Two ideas are taken from Hermes' memory tool:
 
 from __future__ import annotations
 
+import difflib
 import re
 from dataclasses import dataclass, field
 from datetime import date
@@ -37,6 +38,23 @@ THREAT_PATTERNS = [
         r"</?(system|memory-context)>",
     )
 ]
+
+
+# How much of an entry is offered back as a *copyable address* when an
+# operation has to be corrected. The old answer here was 60 characters with an
+# ellipsis on the end, and that ellipsis was a bug: the tool told the model to
+# correct its `match` from the listing, and the listing was not something that
+# could be matched. Models copied the elided string — U+2026 and all — or
+# spliced two entries across the "; " that joined them, and every such attempt
+# missed. So an address is never elided: it is a prefix long enough to be
+# unique among the scope's entries (they share openings — "IGV-like Godot
+# alignment viewer: …" twice over) and short enough to be reissued verbatim.
+ADDRESS_MIN = 48
+ADDRESS_MAX = 160
+
+# How many entries a refusal lists, nearest-first, so the one that was meant
+# is at the top even when the scope holds dozens.
+ADDRESS_LISTED = 8
 
 
 class MemoryOpError(Exception):
@@ -76,8 +94,10 @@ def scan_threats(text: str) -> list[str]:
 def resolve(profile: Profile, scope: MemoryScope, match: str) -> Memory:
     """The one memory in ``scope`` containing ``match``.
 
-    Raises with the candidates when the substring is ambiguous or absent —
-    guessing on the model's behalf is how the wrong memory gets deleted.
+    Raises with usable addresses when the substring is ambiguous or absent —
+    guessing on the model's behalf is how the wrong memory gets deleted, and
+    an unusable listing is how a model ends up bisecting its way to shorter
+    and shorter substrings that can never hit.
     """
     if not match.strip():
         raise MemoryOpError("Give a short substring of the memory to address.")
@@ -90,25 +110,101 @@ def resolve(profile: Profile, scope: MemoryScope, match: str) -> Memory:
     if not candidates:
         raise MemoryOpError(
             f"No {scope.value} memory contains “{match}”. "
-            f"Current {scope.value} memories: {_inventory(profile, scope)}"
+            f"{address_help(profile, scope, match)}"
         )
     if len(candidates) > 1:
-        shown = "; ".join(_summarize(m.text) for m in candidates[:4])
         raise MemoryOpError(
-            f"“{match}” matches {len(candidates)} {scope.value} memories "
-            f"({shown}) — use a longer, unique substring."
+            f"“{match}” matches {len(candidates)} {scope.value} memories and "
+            "must address exactly one — use a longer, unique substring by "
+            f"copying one of these:\n{_address_lines(profile, candidates)}"
         )
     return candidates[0]
+
+
+def _prefixes(text: str) -> list[str]:
+    """Word-boundary prefixes of ``text``, shortest usable first, then all of
+    it — so a scope whose entries share a long opening still gets an address
+    that separates them."""
+    ends = [
+        m.end()
+        for m in re.finditer(r"\S+", text)
+        if ADDRESS_MIN <= m.end() <= ADDRESS_MAX
+    ]
+    return [text[:end] for end in ends] + [text]
+
+
+def address_for(profile: Profile, memory: Memory) -> str:
+    """A substring of ``memory`` that :func:`resolve` maps back to it alone.
+
+    Built from the entry's first line rather than a whitespace-collapsed copy,
+    because `resolve` matches against the raw text: a collapsed prefix of a
+    multi-line memory would be quoted back as an address and then not be found.
+    """
+    others = [
+        other
+        for other in profile.memories
+        if other.scope == memory.scope and other is not memory
+    ]
+    head = memory.text.split("\n", 1)[0].strip()
+    for candidate in _prefixes(head):
+        low = candidate.lower()
+        if low and not any(low in other.text.lower() for other in others):
+            return candidate
+    # Entries identical for their whole first line: only the rest of the text
+    # can separate them, so hand back all of it rather than a prefix that is
+    # certain to come back ambiguous.
+    return memory.text.strip()
+
+
+def _address_lines(profile: Profile, memories: list[Memory]) -> str:
+    """One address per line, indented and unquoted.
+
+    Both of those are deliberate. Indentation is stripped by `resolve`, so a
+    model that copies the whole line still hits; a quote character or a bullet
+    would not be, and the failure mode being fixed here is exactly a model
+    copying a decoration back into `match`.
+    """
+    return "\n".join(f"    {address_for(profile, memory)}" for memory in memories)
+
+
+def _nearest_first(memories: list[Memory], match: str) -> list[Memory]:
+    """The scope's entries, closest to the failed address first."""
+    needle = match.strip().lower()
+    if not needle:
+        return memories
+    return sorted(
+        memories,
+        key=lambda memory: difflib.SequenceMatcher(
+            None, needle, memory.text[: ADDRESS_MAX * 2].lower()
+        ).ratio(),
+        reverse=True,
+    )
+
+
+def address_help(profile: Profile, scope: MemoryScope, match: str = "") -> str:
+    """What a scope's entries are, in a form that can be reissued as ``match``."""
+    entries = [memory for memory in profile.memories if memory.scope == scope]
+    if not entries:
+        return f"There are no {scope.value} memories to address."
+    ordered = _nearest_first(entries, match)
+    shown, rest = ordered[:ADDRESS_LISTED], len(entries) - ADDRESS_LISTED
+    lines = [
+        f"Address a {scope.value} memory by copying ONE of the indented lines "
+        "below into `match`, exactly as written. Each line is the *opening* "
+        "of one entry, closest first, and is enough to address it. Leading "
+        "spaces are ignored; nothing else is — a shortened, retyped or "
+        "truncated version will not be found, and shortening it again counts "
+        "as the same failed attempt.",
+        _address_lines(profile, shown),
+    ]
+    if rest > 0:
+        lines.append(f"    … and {rest} more not listed.")
+    return "\n".join(lines)
 
 
 def _summarize(text: str, limit: int = 60) -> str:
     flat = " ".join(text.split())
     return flat if len(flat) <= limit else flat[: limit - 1] + "…"
-
-
-def _inventory(profile: Profile, scope: MemoryScope) -> str:
-    texts = [_summarize(m.text) for m in profile.memories if m.scope == scope]
-    return "; ".join(texts) if texts else "(none)"
 
 
 def inventory_report(profile: Profile, cap: int) -> str:
@@ -117,15 +213,15 @@ def inventory_report(profile: Profile, cap: int) -> str:
 
     Demotion is offered before removal — a situational memory moved to RAG stops
     costing context on every turn but stays retrievable, so nothing has to be
-    thrown away to make room.
+    thrown away to make room. The entries come back as addresses, not as an
+    elided inventory: the next call has to name one of them in `match`.
     """
     return (
         f"The system-prompt memory is full ({profile.usage_meter(cap)}). "
-        f"Current system-prompt memories: "
-        f"{_inventory(profile, MemoryScope.SYSTEM_PROMPT)}. "
         "Reissue ONE batch that frees room and adds: prefer 'demote' on "
         "situational entries (they move to rag and stay retrievable) over "
-        "removing them outright."
+        "removing them outright. "
+        f"{address_help(profile, MemoryScope.SYSTEM_PROMPT)}"
     )
 
 

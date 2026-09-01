@@ -120,32 +120,39 @@ KIND_FLAGGED = "flagged"
 # couple of dozen entries that dialog stops being read.
 MEMORY_QUEUE_LIMIT = 25
 
-# How many times one operation may be refused, unchanged, before the tool
-# stops for the rest of the session. Three, because the ladder needs a rung
-# between "here is what is wrong" and "stop": the first refusal names the
-# entries that do exist, the second says the model has already been told, and
-# a model that reissues the same bytes a third time is not reading the answer
-# at all — which is the runaway this whole path exists to end.
+# How many times one operation may be refused before the tool stops for the
+# rest of the session. Three, because the ladder needs a rung between "here is
+# what is wrong" and "stop": the first refusal names the entries that do
+# exist, the second says the model has already been told, and a model that
+# comes back a third time is not reading the answer at all — which is the
+# runaway this whole path exists to end.
 MEMORY_REPEAT_LIMIT = 3
 
-# How many operations may be refused *since the last one that made it into the
-# queue* before the tool stops for the session. Twelve: four operations run to
-# the end of their three-strike ladder, or twelve distinct misses in a row.
-# Since every refusal now comes back with the scope's actual entries, one miss
-# should be enough for a model that reads it; twelve in a row with nothing at
-# all landing in between is not a model that is going to arrive. The count is
-# deliberately of *wasted* calls — ones that leave nothing for the user to
-# review — which is why it is much tighter than the queue limit above.
+# The ops that address an existing entry, and are therefore counted by the
+# address they name rather than by their exact bytes. See `_rejection_key`.
+ADDRESSING_OPS = frozenset({"remove", "replace", "demote"})
+
+# How many refusals may stand outstanding before the tool stops for the
+# session. Twelve: four operations run to the end of their three-strike
+# ladder, or twelve distinct misses. Since every refusal now comes back with
+# addresses that can be copied, one miss should be enough for a model that
+# reads it; twelve outstanding is not a model that is going to arrive. The
+# count is deliberately of *wasted* calls — ones that leave nothing for the
+# user to review — which is why it is much tighter than the queue limit above.
+# A queued change pays one refusal back rather than clearing the tally: a
+# session that lands one change per dozen misses is looping with a garnish,
+# and zeroing on progress is what let it do so unbounded.
 MEMORY_REJECT_LIMIT = 12
 
-# Said the second time an operation is refused unchanged. The point is less
+# Said the second time an attempt is refused. The point is less
 # the content than that the string *moved*: an answer that never changes is
 # the only thing a looping model is actually reacting to, so the second
 # refusal must not read like the first, and must say what happens next.
 REPEATED = (
-    "You were told this once already in this session; reissuing it unchanged "
-    "will not change the answer. Correct it from the entries listed above or "
-    "drop it — one more identical attempt stops this tool for the session."
+    "You were told this once already in this session; reissuing it — or the "
+    "same address with a few characters added or taken off — will not change "
+    "the answer. Copy one of the addresses listed above exactly, or drop the "
+    "operation: one more attempt at it stops this tool for the session."
 )
 
 
@@ -156,10 +163,25 @@ def _brief(text: str, limit: int = 70) -> str:
     return flat if len(flat) <= limit else flat[: limit - 1] + "…"
 
 
+def _canonical(match: str) -> str:
+    """One address, normalised for comparison with another.
+
+    The ellipsis goes because a model that copies an elided listing brings it
+    along, and "…" is not what makes the two attempts different."""
+    return " ".join(match.replace("…", " ").split()).strip().lower()
+
+
 def _listing(operations: list[MemoryOp], shown: int = 6) -> str:
-    items = "; ".join(_brief(operation.describe()) for operation in operations[:shown])
+    """The last ``shown`` changes, oldest of them first.
+
+    The tail rather than the head, because a change is appended: a listing of
+    the first six could never contain the change the call just made, so a
+    model that checks the listing for its own work never finds it and reissues
+    it. What is dropped is the *old* end, which the model has seen confirmed
+    already."""
     rest = len(operations) - shown
-    return items + (f"; … and {rest} more" if rest > 0 else "")
+    items = "; ".join(_brief(operation.describe()) for operation in operations[-shown:])
+    return (f"… {rest} earlier; " if rest > 0 else "") + items
 
 
 @dataclass
@@ -521,8 +543,11 @@ class MemoryService:
         original runaway, only with a better sentence in it. So refusals get
         their own ledger, and the answer to a repeat escalates: the second
         says it has been said before, the third stops the tool for the
-        session. Every shape of the loop now ends somewhere — the same
-        operation at :data:`MEMORY_REPEAT_LIMIT`, different bad operations at
+        session. A repeat is recognised by the *address* it names, not by its
+        bytes, or the commonest loop of all — the same miss with two
+        characters shaved off it — reads as a fresh attempt every time. Every
+        shape of the loop now ends somewhere: the same attempt at
+        :data:`MEMORY_REPEAT_LIMIT`, different bad operations at
         :data:`MEMORY_REJECT_LIMIT`, and good ones at
         :data:`MEMORY_QUEUE_LIMIT`.
         """
@@ -554,48 +579,77 @@ class MemoryService:
             if not problem:
                 accepted.append(operation)
                 continue
-            strikes, run = self._record_rejection(session_id, operation)
+            strikes, run, grouped = self._record_rejection(session_id, operation)
             if strikes >= MEMORY_REPEAT_LIMIT or run >= MEMORY_REJECT_LIMIT:
                 queued.extend(accepted)
                 return self._close_edits(
-                    session_id, operation, strikes, run, queued
+                    session_id, operation, strikes, run, queued, grouped=grouped
                 )
             refused.append(problem if strikes == 1 else f"{problem} {REPEATED}")
         queued.extend(accepted)
         if accepted:
-            # Progress resets the run: a session that is landing changes is
-            # using the tool, not looping in it, and should not be shut down
-            # hours later for misses it recovered from. Safe to reset because
-            # it is not the only bound — the repeat ledger below is never
-            # reset, so alternating a good change with the *same* bad one
-            # still hits the third strike, and alternating it with distinct
-            # good ones fills the queue to its own limit instead.
-            self._rejected_run[session_id] = 0
+            # Progress pays refusals back one for one rather than clearing
+            # them. A model that corrects itself after a miss is charged
+            # nothing, which is the case this forgiveness exists for; a
+            # session that lands one change per eleven misses is looping with
+            # a garnish, and a reset let it do that forever. The repeat ledger
+            # below is never reduced at all.
+            run = self._rejected_run.get(session_id, 0)
+            self._rejected_run[session_id] = max(0, run - len(accepted))
         return self._queue_report(len(operations), accepted, refused, queued)
 
     def _record_rejection(
         self, session_id: str, operation: MemoryOp
-    ) -> tuple[int, int]:
-        """Book one refusal: how often *this* operation has been refused this
-        session, and how many refusals have gone by without one landing.
+    ) -> tuple[int, int, bool]:
+        """Book one refusal: how often *this attempt* has been refused this
+        session, how many refusals are outstanding, and whether the attempt was
+        recognised by its address rather than by its bytes.
 
-        Identity is the operation's four fields, compared exactly. The loop
-        this bounds reissues the same bytes, and an exact key cannot punish a
-        model for a genuinely new attempt — a shortened substring is a
-        different operation and starts its own count, which is what the run
-        limit is for.
+        Exact identity is not enough, and that gap is the loop this guard was
+        supposed to end. A model that cannot address an entry does not reissue
+        the same bytes — it shortens the substring and tries again, and every
+        shortening is a new key, so the ladder stays on its first rung forever
+        while the model bisects. So an operation that *addresses* an entry
+        (:data:`ADDRESSING_OPS`) is counted by its address, and two addresses
+        in one scope are the same attempt when either contains the other:
+        "IGV-like Godot alignment viewer: backend" is not a fresh idea after
+        "IGV-like Godot alignment viewer: backend is a separate Rust…" was
+        refused. `add` keeps exact identity — two adds that differ by a word
+        are two different facts, and grouping them would punish a rewrite.
         """
-        key = (
-            operation.op,
-            operation.scope.value,
-            operation.match,
-            operation.text,
-        )
         seen = self._rejected_ops.setdefault(session_id, {})
+        key, grouped = self._rejection_key(seen, operation)
         seen[key] = seen.get(key, 0) + 1
         run = self._rejected_run.get(session_id, 0) + 1
         self._rejected_run[session_id] = run
-        return seen[key], run
+        return seen[key], run, grouped
+
+    @staticmethod
+    def _rejection_key(
+        seen: dict[tuple[str, ...], int], operation: MemoryOp
+    ) -> tuple[tuple[str, ...], bool]:
+        """The ledger key for one refused operation, and whether it joined a
+        group already there. Addresses are compared with the same normalising
+        `resolve` applies (case and whitespace), plus the ellipsis a model
+        picks up when it copies an elided listing."""
+        if operation.op not in ADDRESSING_OPS:
+            return (
+                "op",
+                operation.op,
+                operation.scope.value,
+                operation.match,
+                operation.text,
+            ), False
+        needle = _canonical(operation.match)
+        if not needle:
+            return ("addr", operation.scope.value, ""), False
+        for key in seen:
+            if key[0] != "addr" or key[1] != operation.scope.value:
+                continue
+            other = key[2]
+            if other and (needle in other or other in needle):
+                return key, True
+        return ("addr", operation.scope.value, needle), False
 
     def _close_edits(
         self,
@@ -604,6 +658,8 @@ class MemoryService:
         strikes: int,
         run: int,
         queued: list[MemoryOp],
+        *,
+        grouped: bool = False,
     ) -> str:
         """Stop answering `memory` for this session, and say so once and for
         all.
@@ -615,7 +671,15 @@ class MemoryService:
         the remaining work to the user, which is the one move that still
         works. Whatever *was* queued is listed, so nothing looks lost.
         """
-        if strikes >= MEMORY_REPEAT_LIMIT:
+        if strikes >= MEMORY_REPEAT_LIMIT and grouped:
+            why = (
+                f"Refused: this entry has now been addressed and refused "
+                f"{strikes} times in this session — {_brief(operation.describe())}. "
+                "Every attempt named a substring that matches nothing, and "
+                "trimming or extending it again is the same attempt, not a "
+                "new one."
+            )
+        elif strikes >= MEMORY_REPEAT_LIMIT:
             why = (
                 f"Refused: the same operation has now been refused {strikes} "
                 f"times in this session, unchanged — {_brief(operation.describe())}. "
@@ -623,9 +687,8 @@ class MemoryService:
             )
         else:
             why = (
-                f"Refused: {run} memory operations have been refused in this "
-                f"session without one being queued, which is the limit "
-                f"({MEMORY_REJECT_LIMIT})."
+                f"Refused: {run} memory operations are outstanding as refused "
+                f"in this session, which is the limit ({MEMORY_REJECT_LIMIT})."
             )
         message = (
             f"{why} Do not call this tool again in this session — tell the "
@@ -646,10 +709,10 @@ class MemoryService:
         loop, and it is the one case where "you already did this" is both true
         and enough to stop. Everything else is delegated to `apply_batch`
         against the projection, so queue-time addressing and /conclude-time
-        addressing cannot drift apart — and `resolve`'s refusal already names
-        the scope's current entries, which is what lets the model correct
-        itself in one step instead of bisecting its way to a shorter
-        substring.
+        addressing cannot drift apart — and `resolve`'s refusal hands back the
+        scope's entries as substrings that already work, which is what lets
+        the model correct itself in one step instead of bisecting its way to
+        a shorter one.
         """
         if len(queued) >= MEMORY_QUEUE_LIMIT:
             return (
@@ -729,7 +792,7 @@ class MemoryService:
             return "Nothing is waiting for review."
         return (
             f"Waiting for the user's review at /conclude ({len(queued)}, "
-            f"nothing saved yet): {_listing(queued)}"
+            f"nothing saved yet, newest last): {_listing(queued)}"
         )
 
     def pending_edits(self, session_id: str) -> list[MemoryOp]:
