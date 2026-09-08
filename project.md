@@ -37,6 +37,21 @@ sessions, and supervise running sub-processes and cluster jobs.
 * **Standardize on the OpenAI-compatible chat completions API.** vLLM,
   llama.cpp-server and commercial providers all speak it, so "local or remote
   LLM" is a single config switch, one code path.
+* **Where they disagree, the difference is configuration** (`LLMSettings.extra_body`,
+  and per entry `LLMBackend.extra_body`), merged last into every request. The
+  floor is OpenAI's; every server extends it, and the extensions do not agree.
+  The case that forced this: turning thinking off is
+  `chat_template_kwargs.enable_thinking` on vLLM and `reasoning_effort: "none"`
+  on Ollama, which drops the former — and sending both is not an option, since
+  Qwen3.8 under vLLM answers a `reasoning_effort` outside xhigh/medium/low with
+  a 400 (§3.6). `model`, `messages`, `stream` and `tools` are refused at load:
+  those are the client's, decided from the conversation it is having.
+* **A window nobody reports is a window nobody compacts.** vLLM puts
+  `max_model_len` on each `/v1/models` row and the meter needs no configuration;
+  llama.cpp-server and Ollama put nothing there, `compact.should_compact` is a
+  no-op on an unknown window, and the session simply fills up. Startup says so
+  once (`backends.NO_WINDOW_MESSAGE`); the fix is `max_model_len` on the
+  catalog entry.
 * Prefer backends that support **structured output / JSON-schema-constrained
   decoding** (vLLM `guided_json`, llama.cpp grammars). Use it for all
   tool calls so they are syntactically valid *by construction*; retries then only
@@ -48,6 +63,47 @@ sessions, and supervise running sub-processes and cluster jobs.
   locally).
 
 ## 3. Interface (TUI)
+
+### 3.0 The other front-end: `hpca -p`
+
+The TUI is one front-end, not the interface. `hpca -p "..."` runs a single turn
+with no terminal at all — the same `Core`, the same `InProcessConnection`, the
+same protocol — and writes the reply to stdout. It exists for the user the TUI
+cannot serve: another agent, a CI step, a `for` loop.
+
+That this needed no change to the runtime is the protocol split's claim being
+paid off (§4.2). What it did need is a home for the runtime that is not
+`hpca.ui`: `Core` lives in `hpca.core.boot`, where `tests/test_core_headless.py`
+holds it to importing no front-end, and `hpca/ui/boot.py` is now the wiring
+between it and the screen.
+
+The four things a front-end with nobody behind it has to decide, and the
+reasoning, are in `hpca/headless.py`'s docstring. One of them is worth
+repeating here, because it looks like a safety question and is not:
+
+> **A gated call is approved by default.** Refusing is the intuitive default
+> and does not do what it looks like. Measured, on the first real run: an
+> `edit_file` was refused, and the model — following the denial message, which
+> asks for an amended operation — did the same edit through `run_bash` with
+> `sed -i`. The edit happened either way; refusing only chose the route with no
+> trash backup (§5.3) and no diff in the log. The gate is a *question*, and an
+> unanswered question moves work somewhere less observable rather than
+> preventing it. The dial that does prevent it is `--mode` (§3.5); the net is
+> the trash layer, which is what full-auto has always relied on.
+> `--refuse-gated` restores the refusal for a run that must not write, and
+> tells the model not to reroute — guidance, not a guarantee, because
+> `run_bash` runs arbitrary bash and always could.
+
+Exit codes are the interface: 0 answered, 1 usage, 2 no backend answering,
+3 timed out, 4 the turn failed. stdout carries the reply and nothing else, so
+`$(hpca -p ...)` is the answer; `--json` swaps it for one object carrying the
+session id, the tool record and the usage. `--session` continues a conversation
+with its checkpointed history.
+
+The session is pinned to a named backend (`SessionNew.backend`) rather than to
+whatever is active when the turn starts — `service.startup()` runs
+`backends.auto_connect()`, which on a cluster node can activate a backend the
+run never asked for, between reading the settings and submitting.
 
 ### 3.1 Framework
 

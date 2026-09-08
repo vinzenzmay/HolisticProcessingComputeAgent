@@ -45,6 +45,22 @@ reach for it when a change touches how a file is *named*, and see
 specs/specs-path-registry.md for what it settled. `shift` measured the key-vs-path
 friction of an interface that no longer exists; it is history, not a check.
 
+## Two front-ends, one runtime
+
+`hpca` draws a TUI; `hpca -p "..."` runs one turn and prints the reply. Both
+build the same `Core`, which lives in **`hpca.core.boot`** — not `hpca.ui.boot`,
+which is now only the wiring between that class and a screen. So a change to
+how the runtime starts or stops belongs in `core/boot.py`, and
+`tests/test_core_headless.py` will fail it if it reaches for a front-end.
+
+`hpca/headless.py` is the second front-end and its docstring is the reasoning:
+what a run answers when there is no human (gated call → yes, triage offer → no,
+compaction → yes), why the session pins its backend by label, and why the exit
+code rather than the message is the interface. The approval default is the one
+that looks wrong and is not — refusing an `edit_file` does not stop the edit,
+it moves it into `run_bash` and `sed -i`, losing the trash backup; that is
+measured, not assumed (§3.0 of project.md).
+
 ## Colours
 
 There are no colour constants. Every colour is a setting

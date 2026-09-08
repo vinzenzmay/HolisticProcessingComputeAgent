@@ -25,6 +25,7 @@ from hpca.agent.compact import CHARS_PER_TOKEN
 from hpca.config import LLMBackend, Settings
 from hpca.core.backends import (
     NO_BACKEND_MESSAGE,
+    NO_WINDOW_MESSAGE,
     BackendRegistry,
     autoconnect_logger,
 )
@@ -1008,6 +1009,33 @@ class TestTheStartupCheck:
         assert await h.registry.ensure_connected() is False
         assert h.notices[-1].severity == "warning"
         assert h.notices[-1].text == NO_BACKEND_MESSAGE
+
+    async def test_a_backend_that_will_not_say_how_big_it_is_says_so(self, home):
+        """The failure this warning exists for is invisible without it.
+
+        `compact.should_compact` is a no-op on an unknown window, so a session
+        against a backend that reports no `max_model_len` — llama.cpp-server,
+        Ollama — is never compacted and simply fills up. Nothing looks wrong
+        until the turn that does not fit.
+        """
+        h = Harness(
+            home,
+            probe_transport=make_transport({20001: serve("qwen-a", max_model_len=None)}),
+        )
+        self.active(h, 20001)
+        assert await h.registry.ensure_connected() is True
+        assert h.notices[-1].text == NO_WINDOW_MESSAGE
+
+    async def test_but_not_when_the_catalog_entry_declares_one(self, home):
+        # Which is the fix the message names, so taking it must silence it.
+        h = Harness(
+            home,
+            probe_transport=make_transport({20001: serve("qwen-a", max_model_len=None)}),
+        )
+        backend = self.active(h, 20001, max_model_len=42000)
+        h.settings.backends = [backend]
+        assert await h.registry.ensure_connected() is True
+        assert h.events == []
 
     async def test_a_key_locked_backend_is_not_connected(self, home):
         # Up, but not for us: without a working key the first turn would 401

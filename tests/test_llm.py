@@ -224,6 +224,50 @@ class TestThinking:
         await client.supports_constrained_decoding()
         assert seen["chat_template_kwargs"] == {"enable_thinking": False}
 
+
+class TestExtraBody:
+    """A backend's own spelling of things this client says another way.
+
+    `chat_template_kwargs` is vLLM's; a server that ignores it needs the same
+    instruction under a different name, and there is no probe that could tell
+    us which — so it is configuration (`config.ExtraBody`).
+    """
+
+    def payload_of(self, seen, **settings_kwargs):
+        def handler(request):
+            seen.update(json.loads(request.content))
+            return httpx.Response(200, json=completion_body())
+
+        return make_client(handler, **settings_kwargs)
+
+    async def test_it_reaches_the_request(self):
+        seen = {}
+        client = self.payload_of(seen, extra_body={"reasoning_effort": "none"})
+        await client.chat([{"role": "user", "content": "hi"}])
+        assert seen["reasoning_effort"] == "none"
+
+    async def test_it_wins_over_what_the_client_decided(self):
+        # The whole point: correcting a field this client already set is what
+        # a backend with a different dialect needs to do.
+        seen = {}
+        client = self.payload_of(
+            seen,
+            enable_thinking=True,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        )
+        await client.chat([{"role": "user", "content": "hi"}])
+        assert seen["chat_template_kwargs"] == {"enable_thinking": False}
+
+    async def test_an_empty_one_changes_nothing(self):
+        seen = {}
+        plain, extra = {}, {}
+        await self.payload_of(plain).chat([{"role": "user", "content": "hi"}])
+        await self.payload_of(extra, extra_body={}).chat(
+            [{"role": "user", "content": "hi"}]
+        )
+        assert plain == extra
+        assert seen == {}
+
 class TestChatStream:
     async def test_yields_content_deltas(self):
         chunks = [

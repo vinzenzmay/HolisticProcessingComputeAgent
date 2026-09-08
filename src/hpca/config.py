@@ -12,7 +12,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Annotated, Iterable, Literal
+from typing import Annotated, Any, Iterable, Literal
 from urllib.parse import urlparse
 
 from pydantic import (
@@ -111,6 +111,41 @@ class _Section(BaseModel):
     model_config = ConfigDict(extra="ignore", validate_assignment=True)
 
 
+# Request fields `extra_body` may never carry. Every one of them is decided by
+# the client from the conversation it is having, and a settings file that could
+# set them would not be configuring a backend, it would be silently answering a
+# different question than the one the agent asked. Refused at load, the way
+# PaletteSettings refuses a colour it cannot draw, rather than at request time
+# where the failure is one 400 in the middle of a turn.
+_RESERVED_BODY_KEYS = frozenset({"model", "messages", "stream", "tools"})
+
+
+def _no_reserved_keys(body: dict[str, Any]) -> dict[str, Any]:
+    clashes = sorted(_RESERVED_BODY_KEYS & set(body))
+    if clashes:
+        raise ValueError(
+            f"extra_body may not set {', '.join(clashes)} — "
+            "those are the client's, not the backend entry's"
+        )
+    return body
+
+
+# What a backend needs *sent* that no other backend does. The OpenAI shape is
+# a floor, not a ceiling: every server extends it, and the extensions disagree.
+# Measured case, and the reason this exists — turning thinking off:
+#
+#   vLLM   chat_template_kwargs.enable_thinking = false   (what `llm.py` sends)
+#   Ollama reasoning_effort = "none"                      (drops the above)
+#
+# Sending both unconditionally is not an option: Qwen3.8 under vLLM answers a
+# reasoning_effort outside xhigh/medium/low with a 400 (`hpca.thinking`), so
+# the value that fixes one backend breaks the other. It is a property of how
+# the server was launched — exactly like `tool_protocol` below it — so it is
+# configuration, and a generic one, because the next backend's quirk will not
+# be this one.
+ExtraBody = Annotated[dict[str, Any], AfterValidator(_no_reserved_keys)]
+
+
 class LLMSettings(_Section):
     base_url: str = "http://localhost:8000/v1"
     api_key: str | None = None
@@ -171,6 +206,9 @@ class LLMSettings(_Section):
     # default is -1: no cap, the agent works until it is done. Set a positive
     # number to keep turns snappy or to bound autonomous work.
     max_tool_rounds: int = -1
+    # Merged into every chat/completions body this client sends, last, so
+    # it wins over what `_payload` built. See ExtraBody above.
+    extra_body: ExtraBody = Field(default_factory=dict)
 
 
 class AgentSettings(_Section):
@@ -525,6 +563,10 @@ class LLMBackend(_Section):
     # one that 400s on `tools`. None means "whatever llm.tool_protocol says",
     # which is what every entry written before v0.22.0 has.
     tool_protocol: Literal["envelope", "native"] | None = None
+    # This entry's own extra fields, merged over `llm.extra_body` rather
+    # than replacing it: the base can carry what every backend here needs
+    # and an entry only states its difference. Empty means the base as-is.
+    extra_body: ExtraBody = Field(default_factory=dict)
 
 
 def llm_settings_for(backend: LLMBackend, base: LLMSettings) -> LLMSettings:
@@ -537,6 +579,8 @@ def llm_settings_for(backend: LLMBackend, base: LLMSettings) -> LLMSettings:
     settings.api_key = backend.api_key
     if backend.tool_protocol is not None:
         settings.tool_protocol = backend.tool_protocol
+    if backend.extra_body:
+        settings.extra_body = {**settings.extra_body, **backend.extra_body}
     return settings
 
 
@@ -603,6 +647,12 @@ class Settings(_Section):
         self.llm.api_key = backend.api_key
         if backend.tool_protocol is not None:
             self.llm.tool_protocol = backend.tool_protocol
+        # Carried for the same reason as tool_protocol: the bootstrap client
+        # is built from `self.llm`, so an entry whose extra fields stayed in
+        # the catalog would be correct for every session that pinned it and
+        # wrong for the one that did not.
+        if backend.extra_body:
+            self.llm.extra_body = {**self.llm.extra_body, **backend.extra_body}
 
     def remember_llm_ports(self, base_urls: Iterable[str]) -> bool:
         """Record ports that have served an LLM, so scans probe them first.

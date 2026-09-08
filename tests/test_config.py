@@ -3,6 +3,7 @@
 import json
 
 import pytest
+from pydantic import ValidationError
 
 from hpca.config import (LLMBackend, LLMSettings, Settings, SettingsError,
                          app_dir, llm_settings_for, settings_path)
@@ -324,6 +325,48 @@ class TestBackendCatalog:
         s.llm.tool_protocol = "native"
         s.activate_backend(LLMBackend(model="m", base_url="http://localhost:9/v1"))
         assert s.llm.tool_protocol == "native"
+
+    def test_a_backends_extra_fields_reach_the_active_client(self):
+        # The measured case: Ollama drops `chat_template_kwargs`, so thinking
+        # only goes off if `reasoning_effort: "none"` is sent — and the
+        # bootstrap client is built from `llm`, not from the catalog entry.
+        s = Settings()
+        s.activate_backend(
+            LLMBackend(
+                model="m",
+                base_url="http://localhost:9/v1",
+                extra_body={"reasoning_effort": "none"},
+            )
+        )
+        assert s.llm.extra_body == {"reasoning_effort": "none"}
+
+    def test_an_entrys_extra_fields_are_merged_over_the_base_not_swapped_in(self):
+        # The base carries what every backend here needs; an entry states only
+        # its difference.
+        base = LLMSettings(extra_body={"seed": 1, "reasoning_effort": "low"})
+        entry = LLMBackend(
+            model="m",
+            base_url="http://localhost:8/v1",
+            extra_body={"reasoning_effort": "none"},
+        )
+        assert llm_settings_for(entry, base).extra_body == {
+            "seed": 1,
+            "reasoning_effort": "none",
+        }
+
+    def test_extra_fields_may_not_take_over_the_request(self, tmp_path):
+        # Refused at load, not at request time: `model` set from a settings
+        # file would send every turn to a model nobody chose, and the only
+        # symptom would be answers from the wrong place.
+        for key, value in (("model", "other"), ("messages", []), ("stream", True)):
+            with pytest.raises(ValidationError):
+                LLMBackend(
+                    model="m", base_url="http://x/v1", extra_body={key: value}
+                )
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"llm": {"extra_body": {"tools": []}}}))
+        with pytest.raises(SettingsError):
+            Settings.load(path)
 
     def test_per_session_settings_do_not_carry_a_thinking_flag(self):
         # One client is shared by every session on a backend

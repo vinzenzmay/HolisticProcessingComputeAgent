@@ -69,6 +69,19 @@ NO_BACKEND_MESSAGE = (
     "No LLM backend is answering — pick or configure one here (m reopens this)."
 )
 
+# Said once, at the end of startup, when the active backend answers but will
+# not say how big its context window is. It matters more than it reads:
+# `compact.should_compact` is a no-op on an unknown window, so a session that
+# nobody told simply fills up and fails, with nothing having gone wrong that
+# anyone could see. vLLM puts `max_model_len` on every /v1/models row;
+# llama.cpp-server and Ollama do not, and for those the number has to be
+# configuration (`LLMBackend.max_model_len`) because there is nowhere to read
+# it from that is not a non-OpenAI endpoint.
+NO_WINDOW_MESSAGE = (
+    "This backend does not report a context window, so long conversations "
+    "will not be compacted. Set max_model_len on the backend entry."
+)
+
 # How a client is built from the settings that describe it. A seam rather than
 # a bare `LLMClient(...)` call so a test can count constructions and closes
 # without a socket ever being opened.
@@ -1220,9 +1233,30 @@ class BackendRegistry:
                 )
                 return True
             if any(row.model != KEY_REQUIRED for row in rows):
+                self._warn_if_window_unknown(rows)
                 return True
         self._deps.emit(Notify(severity="warning", text=NO_BACKEND_MESSAGE))
         return False
+
+    def _warn_if_window_unknown(self, rows: list[DiscoveredBackend]) -> None:
+        """Say so when nothing knows how much context there is.
+
+        Read off the rows the check above already fetched rather than probed
+        for: `/v1/models` is where `max_model_len` lives, the round trip has
+        just been made, and a second one would be the same question asked
+        twice. A vLLM therefore never sees this — it answers with the number —
+        which is the point: the warning has to be rare enough to be read.
+
+        Once, at startup, and only for the backend a new session will use: the
+        same scope as the check it hangs off, and for the same reason — the
+        other entries are one keypress away and not yet anyone's problem.
+        """
+        model = self._deps.settings.llm.model
+        if any(row.max_model_len for row in rows if row.model == model):
+            return
+        if self.max_model_len_for(None) is not None:
+            return
+        self._deps.emit(Notify(severity="warning", text=NO_WINDOW_MESSAGE))
 
     def ensure_catalog(self, discovered: DiscoveredBackend) -> LLMBackend:
         """The catalog entry for a discovered endpoint, adding it if new."""

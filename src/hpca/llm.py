@@ -250,6 +250,13 @@ class LLMClient:
             payload["temperature"] = temperature
         if stream:
             payload["stream"] = True
+        # Last, so a backend entry can correct anything decided above — which
+        # is the point of it: `chat_template_kwargs.enable_thinking` is a vLLM
+        # extension, and a server that ignores it needs its own spelling of
+        # the same instruction (`config.ExtraBody`). It cannot reach `model`,
+        # `messages`, `stream` or `tools`; the settings model refuses those at
+        # load, so nothing here has to defend them.
+        payload.update(self._settings.extra_body)
         return payload
 
     async def chat(

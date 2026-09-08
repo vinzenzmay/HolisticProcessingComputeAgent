@@ -26,6 +26,38 @@ then `cd HolisticProcessingComputeAgent; pixi install; pixi shell`
 
 now cd into the project or wherever you want to start the agent and run it: `hpca`
 
+### Without a terminal: `hpca -p`
+
+One turn, no TUI, the reply on stdout — for scripts, CI, and other agents:
+
+```bash
+hpca -p "which of these BAMs is missing an index?"
+```
+
+It is the same agent with the same tools, working in the directory you launch it
+from. What is worth knowing before you point something automated at it:
+
+* **`--json`** gives you the session id, every tool call it made, and the token
+  usage instead of the bare reply. **`--session <id>`** continues that
+  conversation, with its history.
+* **`--mode`** is the safety dial: `manual` stops at every command, `auto`
+  (default) only at destructive ones, `full-auto` at nothing. Since nobody is
+  there to answer, a stop is *approved* by default — refusing does not prevent
+  the work, it only pushes the model into doing it through `run_bash`, where
+  there is no backup and no diff. Use `--mode manual --refuse-gated` for a run
+  that must not touch anything, and `--max-rounds N` to bound one.
+* **Exit codes**: 0 answered, 1 bad arguments, 2 no LLM answering, 3 timed out,
+  4 the turn failed. Progress and warnings go to stderr; stdout is the answer
+  and nothing else.
+* **`--home <dir>`** gives the run its own app dir. Worth doing — otherwise its
+  sessions turn up in the sidebar of whoever is using the TUI.
+
+```bash
+# a scripted, bounded, read-only look at a failed job
+hpca -p "why did job 4711 fail?" --json --mode manual --refuse-gated \
+     --max-rounds 8 --home ~/.hpca-ci
+```
+
 ### The LLM behind it
 
 HPCA brings no model of its own — it needs an OpenAI-compatible endpoint to talk
@@ -217,6 +249,38 @@ SETUP.md is the how. The *why* — memory arithmetic per card, why two cards are
 load-bearing rather than merely faster, why the KV cache must not be quantised —
 lives in the comment blocks of `llmServer/llm.a40-l40.sh`, next to the values it
 explains. Read those before changing a number in that script.
+
+### A local llama.cpp or Ollama instead
+
+Any OpenAI-compatible server works, and two of them need a line of settings that
+vLLM does not, because the OpenAI shape is a floor and every server extends it
+differently. In `<app dir>/settings.json`, on the backend entry:
+
+```json
+{
+  "model": "qwen27_42k:latest",
+  "base_url": "http://localhost:11434/v1",
+  "max_model_len": 42000,
+  "extra_body": { "reasoning_effort": "none" }
+}
+```
+
+* **`max_model_len`** — vLLM reports the window on `/v1/models` and nothing
+  needs configuring; llama.cpp-server and Ollama report nothing, and a window
+  HPCA does not know is one it never compacts, so the session fills up and the
+  turn fails. Startup warns once when it hits this.
+* **`extra_body`** — merged into every request, last. Ollama ignores the
+  `chat_template_kwargs.enable_thinking` that turns thinking off on vLLM, so
+  without `reasoning_effort: "none"` the model reasons on every call: measured
+  on Qwen3-27B, a file-edit turn took 81s instead of 45s, and the automatic
+  session titler failed on every turn — it asks for 64 tokens of JSON and got
+  64 tokens of reasoning. (Do not set this on a vLLM backend: Qwen3.8 there
+  accepts only xhigh/medium/low and answers anything else with a 400.)
+
+One thing to expect from a local box rather than a cluster: a 27B at Q4 needs
+~20 GB with its KV cache, so on a 20 GB card Ollama offloads a fifth of it to
+CPU and you get ~7 tokens/s — a task that takes seconds on the cluster takes a
+minute. A smaller quant is the lever, not a smaller context.
 
 ## Development
 
