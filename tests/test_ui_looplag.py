@@ -58,7 +58,7 @@ def local(monkeypatch, tmp_path):
 @pytest.fixture(autouse=True)
 def no_slurm(monkeypatch):
     """A dev box may well have `sbatch` on it; a test must not care."""
-    monkeypatch.setattr("hpca.ui.boot._detect_slurm", lambda settings: None)
+    monkeypatch.setattr("hpca.core.boot._detect_slurm", lambda settings: None)
 
 
 def working(session_id: str, activity: str) -> SessionState:

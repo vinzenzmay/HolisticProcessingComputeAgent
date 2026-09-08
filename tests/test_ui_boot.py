@@ -30,6 +30,7 @@ from hpca import protocol
 from hpca.config import Settings
 from hpca.llm import ChatResponse
 from hpca.transport import InProcessConnection
+from hpca.core import boot as core_boot
 from hpca.ui import boot
 from hpca.ui.boot import (
     DB_SYNC_DONE_MESSAGE,
@@ -68,7 +69,7 @@ def local(monkeypatch, tmp_path):
 @pytest.fixture(autouse=True)
 def no_slurm(monkeypatch):
     """A dev box may well have `sbatch` on it; a test must not care."""
-    monkeypatch.setattr("hpca.ui.boot._detect_slurm", lambda settings: None)
+    monkeypatch.setattr("hpca.core.boot._detect_slurm", lambda settings: None)
 
 
 # ------------------------------------------------------------ the order alone
@@ -320,13 +321,13 @@ class TestTheNotices:
         # reason is what becomes the notice.
         settings = Settings.load()
         settings.database.local_cache = False
-        cache, notices = boot._open_db_cache(settings, home)
+        cache, notices = core_boot._open_db_cache(settings, home)
         assert notices == [], "declining what was never asked for is not news"
         settings.database.local_cache = True
         monkeypatch.setattr(
             "hpca.dbcache.DbCache.acquire", lambda self: False
         )
-        cache, notices = boot._open_db_cache(settings, home)
+        cache, notices = core_boot._open_db_cache(settings, home)
         assert notices, "a cache that could not be taken is"
 
 
