@@ -202,11 +202,10 @@ class TestTimeout:
 
 
 class TestSettingsDefault:
-    def test_new_sessions_start_off(self):
-        # Preserves exactly what every turn did before the dial existed: any
-        # level above off costs a thinking pass on every decision of a turn,
-        # and the server's own default once thinking is on is the slowest one.
-        assert Settings().agent.default_thinking == "off"
+    def test_new_sessions_start_at_xhigh(self):
+        # The slowest level, and the one that has worked best in use: every
+        # decision of a turn pays a thinking pass for it (project.md §3.6).
+        assert Settings().agent.default_thinking == "xhigh"
 
     def test_it_is_configurable(self):
         settings = Settings.model_validate({"agent": {"default_thinking": "low"}})

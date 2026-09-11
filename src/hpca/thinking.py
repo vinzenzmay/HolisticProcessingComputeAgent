@@ -6,9 +6,9 @@ exactly three levels — measured against the cluster's
 ``Qwen3.8-27B-FP8`` (vLLM, ``--reasoning-parser qwen3``): sending anything
 else comes back a 400 saying *"Supported types are xhigh (default), medium,
 and low"*. There is no ``high``, however much the name suggests one. With
-thinking on and no level given the server picks ``xhigh``, which is why "on"
-is never a safe default here — the unqualified switch this replaces meant the
-slowest setting the model has.
+thinking on and no level given the server picks ``xhigh``, which is why the
+level is always sent explicitly — the unqualified switch this replaces meant
+the slowest setting the model has without ever saying so.
 
 ``off`` is the fourth choice HPCA offers, and the only one that is not a value
 of that enum: it turns thinking off outright (``enable_thinking: False``) and
@@ -45,7 +45,7 @@ from typing import Literal
 ThinkingEffort = Literal["off", "low", "medium", "xhigh"]
 
 # Ordered least to most work, which is the order the chooser lists them in.
-# "off" leads because it is the shipped default.
+# The shipped default is the last one (config.AgentSettings.default_thinking).
 EFFORTS: tuple[ThinkingEffort, ...] = ("off", "low", "medium", "xhigh")
 
 # One line each, for the chooser and the settings screen. The point of the

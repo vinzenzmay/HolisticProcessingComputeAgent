@@ -498,7 +498,7 @@ the same machinery as the destructive gate, with a different question.
 
 The second per-session dial, with the same lifecycle as the mode: stored on the
 session (`sessions.thinking`, empty = the `agent.default_thinking` setting,
-default `off`), read fresh every graph round so a change reaches a turn already
+default `xhigh`), read fresh every graph round so a change reaches a turn already
 in flight, chosen through the `/reasoning` chooser, and always visible — it rides
 the context bar at the top of the chat column, next to the fill and the
 generation speed. Implementation in `hpca.thinking`.
@@ -528,7 +528,9 @@ by editing the catalog changed every session on that backend at once. Old
 settings files still carry the key on their catalog entries; it is ignored on
 load.
 
-The cost is real and is why `off` stays the default. On an idle backend an easy
+The cost is real, and since 0.38.1 it is paid by default — `xhigh` became the
+default on the strength of use rather than of the table below, which is the
+worst case. On an idle backend an easy
 decision took 2.7s off against 17.2s low, 14.9s medium and 33.9s xhigh. The
 interesting measurement is the hard one — a multi-part diagnostic question, one
 full agent decision (system prompt, tool listing, 4096 cap), backend at ~17
@@ -593,8 +595,8 @@ and they are the operational content of the feature:
   feature is supposed to have.
 * **`xhigh` is the slowest, and it is not flagged.** It is slowest by a wide
   margin — ~237s per reasoning generation against 19.5s for the same decision at
-  `off` — and a tool-heavy turn pays that on every round, so `off` remains the
-  default. It is not, however, unusable: it was shipped for a while with a
+  `off` — and a tool-heavy turn pays that on every round. It is not, however,
+  unusable, and since 0.38.1 it is the default. It was shipped for a while with a
   "⚠ NOT USABLE" flag in the chooser and a warning toast on selection, on the
   strength of the lost-write rows above, and use since has been good. The flag
   and the toast are gone (`hpca.thinking` no longer has `XHIGH_WARNING`); what
@@ -1303,7 +1305,7 @@ editor (`c`) and by hand. Sketch:
     "backup_limit_gb": 1,
     "trash_ttl_days": 7
   },
-  "agent": { "default_mode": "manual", "default_thinking": "off" },
+  "agent": { "default_mode": "manual", "default_thinking": "xhigh" },
   "memory": {
     "system_prompt_token_cap": 2400,
     "rag_prefetch_chars": 800,

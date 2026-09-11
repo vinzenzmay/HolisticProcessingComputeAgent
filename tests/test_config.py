@@ -140,9 +140,9 @@ class TestDefaults:
         assert s.llm.constrained_decoding == "auto"
         assert s.llm.max_retries == 3
         assert s.llm.request_timeout_s == 120
-        # thinking is slow and not generally better: opt in, per session
+        # the client-level fallback stays off; sessions reason at xhigh
         assert s.llm.enable_thinking is False
-        assert s.agent.default_thinking == "off"
+        assert s.agent.default_thinking == "xhigh"
         # -1 = no cap by default; the user may set a positive bound
         assert s.llm.max_tool_rounds == -1
 

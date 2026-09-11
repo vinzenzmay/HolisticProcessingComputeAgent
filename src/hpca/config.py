@@ -221,14 +221,15 @@ class AgentSettings(_Section):
     ``default_thinking`` is the reasoning-effort dial (hpca.thinking), which
     has the same lifecycle: stored per session, empty there meaning "whatever
     this says", changeable mid-session with ``/reasoning``. It defaults to
-    ``off`` so an upgrade changes nothing about how turns run — every level
-    above off costs a thinking pass before *every* decision in a turn, and the
-    server's own default once thinking is on is the slowest level (xhigh), so
-    "on" is not a defensible default for a dial the user has not touched.
+    ``xhigh``, the slowest level and the one that has worked best in use on
+    the cluster's Qwen3.8 — it costs a thinking pass before *every* decision
+    in a turn, and that is the price paid for it (project.md §3.6). ``off``
+    is one ``/reasoning`` away for a session that wants speed, and is what a
+    backend with no reasoning channel should be set to.
     """
 
     default_mode: Literal["manual", "auto", "full-auto"] = "manual"
-    default_thinking: ThinkingEffort = "off"
+    default_thinking: ThinkingEffort = "xhigh"
 
 
 class ClusterSettings(_Section):
