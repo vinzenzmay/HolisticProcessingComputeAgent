@@ -36,7 +36,7 @@ import logging
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from pydantic import ValidationError
 
@@ -46,6 +46,7 @@ from hpca.agent.context import ToolContext
 from hpca.agent.doc_tools import add_ask_docs, add_doc_tools
 from hpca.agent.file_tools import add_file_tools
 from hpca.agent.graph import (
+    answer_pending,
     build_graph,
     apply_compaction,
     propose_compaction,
@@ -96,8 +97,11 @@ from hpca.protocol import (
     CompactProposed,
     CompactResolve,
     ConfirmResolve,
+    DecisionAsk,
+    DecisionDialog,
     DecisionRequested,
     DecisionResolve,
+    DialogTurn,
     DisplayChanged,
     DisplaySettings,
     Entry as WireEntry,
@@ -190,6 +194,14 @@ LOG_KINDS = {
     EVENT: "background",
     RECALL: "recalled from memory",
 }
+
+
+def _dialog_event(session_id: str, dialog) -> DecisionDialog:
+    """A `SideDialog` as its wire frame — the whole thread, every time."""
+    return DecisionDialog(
+        session_id=session_id,
+        turns=[DialogTurn(**turn) for turn in dialog.turns],
+    )
 
 
 def _write_entries(log, entries: list[Entry]) -> None:
@@ -307,6 +319,9 @@ class AgentService:
         pollers: Pollers,
         sessions,
         checkpointer: Any = None,
+        answer_pending: (
+            Callable[[str, list[tuple[str, str]], str], Awaitable[str]] | None
+        ) = None,
     ) -> None:
         self._deps = deps
         self._sessions = sessions
@@ -320,6 +335,11 @@ class AgentService:
         # service that could read checkpoints would have a second way to know
         # what a thread contains, next to `aget_state`.
         self._checkpointer = checkpointer
+        # (session_id, earlier questions and answers, question) -> the agent's
+        # answer about the call that session is parked on. Built where the
+        # graph is, because it needs what the graph's rounds use — the
+        # session's prompt, tools, mode and thinking level (`build_service`).
+        self._answer_pending = answer_pending
         self._subscribers: list[asyncio.Queue] = []
         # Questions raised by a poll and not yet answered, keyed by the id that
         # crossed the wire. The continuation stays here: only the yes/no comes
@@ -394,6 +414,10 @@ class AgentService:
             queue.put_nowait(
                 DecisionRequested(session_id=session_id, payload=dict(payload))
             )
+        # After the decisions they belong to: a dialog arriving first would be
+        # about a question the front-end has not been asked yet.
+        for session_id, dialog in self._scheduler.dialogs().items():
+            queue.put_nowait(_dialog_event(session_id, dialog))
         return queue
 
     def unsubscribe(self, queue: asyncio.Queue) -> None:
@@ -545,6 +569,9 @@ class AgentService:
                 approved=command.approved,
                 reason=command.reason,
             )
+            return
+        if isinstance(command, DecisionAsk):
+            self._ask_decision(command)
             return
         if isinstance(command, ConfirmResolve):
             await self._resolve_confirmation(command.id, command.confirmed)
@@ -2242,6 +2269,100 @@ class AgentService:
             logger.exception("confirmed action failed")
             self._deps.emit(Notify(severity="error", text=str(e)))
 
+    # ------------------------------------------ questions about a parked call
+
+    def _ask_decision(self, command: DecisionAsk) -> None:
+        """`decision.ask`: the agent explains the call it is parked on.
+
+        The question joins the dialog at once, before a word of the answer
+        exists — so every attached front-end draws it, and a second question
+        cannot be sent over the top of one still being answered — and the
+        answer is written in the background: it is a generation, and the
+        dispatch loop must not wait on one.
+
+        A question about a decision that is no longer there is dropped
+        quietly. It is the ordinary race — the call was answered from another
+        front-end, or its session deleted — and the user already sees the
+        prompt gone.
+        """
+        session_id, question = command.session_id, command.question.strip()
+        dialog = self._scheduler.dialog(session_id)
+        session = self._session(session_id)
+        if dialog is None or session is None or not question:
+            return
+        if dialog.waiting:
+            self._deps.emit(
+                Notify(
+                    severity="warning",
+                    text="The agent is still answering the last question.",
+                )
+            )
+            return
+        turn = {"question": question, "answer": None, "failed": False}
+        dialog.turns.append(turn)
+        self._deps.emit(_dialog_event(session_id, dialog))
+        dialog.task = self._spawn(self._answer_question(session, dialog, turn))
+
+    async def _answer_question(self, session, dialog, turn: dict) -> None:
+        """Write the answer into the dialog, and both halves into the log.
+
+        The session log is the one record this exchange gets. Not the thread —
+        that is the point of it (`protocol.DecisionAsk`) — and not the chat
+        rows either, which are a reading of the thread and would lose it on the
+        next `chat.reset`. So a later reader of the log sees what the user
+        asked and was told before they decided, right where they decided it.
+
+        Cancelled when the decision goes (`TurnScheduler._drop_dialog`): an
+        answer nobody will read is a generation the resumed turn is queued
+        behind on the same backend.
+        """
+        session_id = session.session_id
+        from hpca.logs import open_log
+
+        log = open_log(self._deps.settings, session)
+        tool = (self._scheduler.pending_decisions().get(session_id) or {}).get(
+            "tool", "the call"
+        )
+        asked = [
+            (t["question"], t["answer"])
+            for t in dialog.turns[:-1]
+            if t.get("answer") is not None and not t.get("failed")
+        ]
+        await self._log_side(log, f"side question about {tool}", turn["question"])
+        self._working(session_id, "answering your question")
+        try:
+            if self._answer_pending is None:
+                raise RuntimeError("this core cannot ask the agent")
+            turn["answer"] = await self._answer_pending(
+                session_id, asked, turn["question"]
+            )
+        except asyncio.CancelledError:
+            await self._log_side(
+                log, "side answer", "(not written: the call was decided first)"
+            )
+            raise
+        except Exception as e:
+            logger.exception("answering a question about a parked call failed")
+            turn["answer"], turn["failed"] = f"The agent could not answer: {e}", True
+        # Recorded before it is shown, as a turn is: what a client is told
+        # about is what has already been written down.
+        await self._log_side(log, "side answer", turn["answer"])
+        if self._scheduler.dialogs().get(session_id) is dialog:
+            # Only while this is still the dialog on screen: once the decision
+            # is answered the resumed turn owns the activity line, and clearing
+            # it would blank that turn's spinner.
+            self._working(session_id, "")
+            self._deps.emit(_dialog_event(session_id, dialog))
+
+    async def _log_side(self, log, kind: str, text: str) -> None:
+        """One block of the side dialog, off the loop like every log write."""
+        if log is None:
+            return
+        try:
+            await asyncio.to_thread(log.write, kind, text)
+        except Exception:  # SessionLog swallows OSError; this is the rest
+            logger.exception("writing the session log failed")
+
     # ------------------------------------------------------ memory proposals
 
     def _resolve_memory(self, command: MemoryResolve) -> None:
@@ -3286,6 +3407,25 @@ def build_service(
         llm=lambda: backends.bootstrap,
     )
 
+    async def answer_about_call(
+        session_id: str, turns: list[tuple[str, str]], question: str
+    ) -> str:
+        """The side dialog's answer, from what the parked round was working
+        with: the session's own client, prompt, tools, mode and level, read
+        now — the same reads `build_graph`'s rounds make."""
+        return await answer_pending(
+            graph,
+            session_id=session_id,
+            llm=backends.client_for(session_id),
+            tools=tools,
+            system=system_prompt_for(session_id),
+            mode=_mode_for(sessions, settings, session_id),
+            effort=_effort_for(sessions, settings, session_id),
+            turns=turns,
+            question=question,
+            max_retries=settings.llm.max_retries,
+        )
+
     service = AgentService(
         deps,
         graph=graph,
@@ -3295,6 +3435,7 @@ def build_service(
         pollers=pollers,
         sessions=sessions,
         checkpointer=checkpointer,
+        answer_pending=answer_about_call,
     )
     service_ref["service"] = service
     # Triage's "shall I learn this signature?" offer needs somewhere to ask.

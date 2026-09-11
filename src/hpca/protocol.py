@@ -681,6 +681,31 @@ class DecisionResolve(Command):
     reason: str = ""
 
 
+class DecisionAsk(Command):
+    """A question about the call a decision is parked on, before answering it.
+
+    The third answer to a gated call, and not an answer at all: the decision
+    stays parked, and the agent explains the call in a side dialog
+    (`decision.dialog`) that is never written into the conversation or its
+    checkpoints. It is the session log's, and only the log's — the model that
+    resumes the turn meets the call exactly as it would have without the
+    question, so asking costs the main context nothing.
+
+    Why this exists at all is the approval default `hpca.headless` defends: a
+    refusal the user did not really mean does not stop the work, it moves it
+    somewhere less safe. A user who cannot tell *why* a delete is wanted is
+    left choosing between trusting it and pushing the agent onto `run_bash`;
+    asking is the way out of that choice.
+
+    Only the finished question crosses, like the refusal's reason — the box
+    it is typed in is a UI draft until it is sent.
+    """
+
+    TYPE: ClassVar[str] = "decision.ask"
+    session_id: str
+    question: str
+
+
 class CommandRun(Command):
     """A slash command: `/compact`, `/memorize`, `/conclude`, `/skill-*`."""
 
@@ -1735,6 +1760,37 @@ class DecisionRequested(Event):
 class DecisionCleared(Event):
     TYPE: ClassVar[str] = "decision.cleared"
     session_id: str
+
+
+class DialogTurn(_Model):
+    """One question about a parked call, and what the agent said to it.
+
+    ``answer`` is None while the agent is still answering — the one state a
+    front-end has to draw differently, and the reason this is not a pair of
+    strings. ``failed`` marks an answer that is an error message rather than
+    the agent's: the backend went away, or the question outlived the call.
+    """
+
+    question: str
+    answer: str | None = None
+    failed: bool = False
+
+
+class DecisionDialog(Event):
+    """The side dialog about a parked decision, whole (`decision.ask`).
+
+    Whole rather than one turn at a time, for the reason `panel.update` is: a
+    front-end that attaches mid-dialog, or reconnects while an answer is being
+    written, needs the thread and not the last line of it — and the core
+    re-emits this on subscribe, after the `decision.requested` it belongs to.
+
+    It dies with the decision. There is no event for that: `decision.cleared`
+    already says the thing the dialog was about is gone.
+    """
+
+    TYPE: ClassVar[str] = "decision.dialog"
+    session_id: str
+    turns: list[DialogTurn] = Field(default_factory=list)
 
 
 class PanelUpdate(Event):

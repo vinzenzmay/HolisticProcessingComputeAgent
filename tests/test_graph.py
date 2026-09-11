@@ -10,7 +10,13 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from hpca.agent import compact
-from hpca.agent.graph import MAX_TOOL_ROUNDS, build_graph, compact_now, run_turn
+from hpca.agent.graph import (
+    MAX_TOOL_ROUNDS,
+    answer_pending,
+    build_graph,
+    compact_now,
+    run_turn,
+)
 from hpca.agent.history import (
     ELISION_SENTINEL,
     KEEP_RECENT_CALLS,
@@ -1741,3 +1747,120 @@ class TestPerFileEditApproval:
         assert second.interrupt is not None
         assert notes.resolve() in context.approved_edit_paths
         conn.close()
+
+
+class TestAnswerPending:
+    """A question about the parked call, answered from the thread and never
+    written to it (`protocol.DecisionAsk`)."""
+
+    async def _parked(self, llm, tools, session_id="s1"):
+        graph = make_graph(llm, tools)
+        first = await run_turn(graph, session_id=session_id, user_text="delete results")
+        assert first.interrupt is not None
+        return graph
+
+    async def test_the_answer_is_read_from_the_turns_own_view(self, tools):
+        llm = FakeLLM(
+            [tool_json("delete", target="results/"), respond_json("they are stale")],
+            reasoning=["the old results would mix with the new run"],
+        )
+        graph = await self._parked(llm, tools)
+        answer = await answer_pending(
+            graph, session_id="s1", llm=llm, tools=tools, system="SYS",
+            question="why delete them?",
+        )
+        assert answer == "they are stale"
+        sent = llm.calls[1]["messages"]
+        assert sent[0]["role"] == "system" and sent[0]["content"].startswith("SYS")
+        assert any(m["content"] == "delete results" for m in sent)
+        # The call as the model made it, then the note in its result's place —
+        # carrying the reasoning the main path never feeds back — then the
+        # question.
+        assert is_tool_call_message(sent[-3])
+        assert "has not run" in sent[-2]["content"]
+        assert "the old results would mix" in sent[-2]["content"]
+        assert sent[-1]["role"] == "user"
+        assert sent[-1]["content"].endswith("why delete them?")
+
+    async def test_nothing_reaches_the_thread_or_the_resumed_turn(self, tools):
+        llm = FakeLLM(
+            [
+                tool_json("delete", target="results/"),
+                respond_json("they are stale"),
+                respond_json("gone"),
+            ]
+        )
+        graph = await self._parked(llm, tools)
+        config = {"configurable": {"thread_id": "s1"}}
+        before = (await graph.aget_state(config)).values
+        await answer_pending(
+            graph, session_id="s1", llm=llm, tools=tools, system="SYS",
+            question="why delete them?",
+        )
+        after = (await graph.aget_state(config)).values
+        assert after["messages"] == before["messages"]
+        assert after["pending_tool"] == before["pending_tool"]
+        resumed = await run_turn(
+            graph, session_id="s1", resume=Command(resume={"approved": True})
+        )
+        assert resumed.reply == "gone"
+        seen = json.dumps(llm.calls[2]["messages"])
+        assert "why delete them?" not in seen and "they are stale" not in seen
+
+    async def test_earlier_questions_and_answers_ride_along(self, tools):
+        llm = FakeLLM([tool_json("delete", target="results/"), respond_json("yes")])
+        graph = await self._parked(llm, tools)
+        await answer_pending(
+            graph, session_id="s1", llm=llm, tools=tools, system="SYS",
+            turns=[("why?", "they are stale")], question="all of them?",
+        )
+        tail = [m["content"] for m in llm.calls[1]["messages"][-3:]]
+        assert tail[0].endswith("why?")
+        assert tail[1] == "they are stale"
+        assert tail[2].endswith("all of them?")
+
+    async def test_a_tool_call_instead_of_an_answer_is_asked_again_with_none(
+        self, tools
+    ):
+        llm = FakeLLM(
+            [
+                tool_json("delete", target="results/"),
+                tool_json("echo", text="let me check"),
+                respond_json("they are stale"),
+            ]
+        )
+        graph = await self._parked(llm, tools)
+        answer = await answer_pending(
+            graph, session_id="s1", llm=llm, tools=tools, system="SYS",
+            question="why?",
+        )
+        assert answer == "they are stale"
+        # Offered the session's tools first (the prefix the parked round
+        # used), then none at all.
+        assert "echo" in json.dumps(llm.calls[1]["json_schema"])
+        assert "echo" not in json.dumps(llm.calls[2]["json_schema"])
+
+    async def test_on_the_native_channel_the_note_answers_the_call_by_id(self, tools):
+        llm = NativeFakeLLM(
+            [native_json("delete", call_id="call_del", target="results/"), "stale"]
+        )
+        graph = await self._parked(llm, tools, session_id="n1")
+        answer = await answer_pending(
+            graph, session_id="n1", llm=llm, tools=tools, system="SYS",
+            question="why?",
+        )
+        assert answer == "stale"
+        call, note, question = llm.calls[1]["messages"][-3:]
+        assert call["tool_calls"][0]["id"] == "call_del"
+        assert note["role"] == "tool" and note["tool_call_id"] == "call_del"
+        assert question["role"] == "user"
+
+    async def test_a_thread_that_is_not_parked_has_nothing_to_explain(self, tools):
+        llm = FakeLLM([respond_json("hello")])
+        graph = make_graph(llm, tools)
+        await run_turn(graph, session_id="s1", user_text="hi")
+        with pytest.raises(LookupError):
+            await answer_pending(
+                graph, session_id="s1", llm=llm, tools=tools, system="SYS",
+                question="why?",
+            )

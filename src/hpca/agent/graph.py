@@ -75,6 +75,25 @@ STOPPED_NOTE = (
     "what they say next is where they want you to go instead."
 )
 
+# The side dialog about a parked call (`answer_pending`). Addressed to the
+# model in the slot the call's result will take once the user decides — the
+# one position a template accepts right after a call — and saying the two
+# things that keep the answer honest: nothing has run, and nothing will until
+# the user says so, so there is no tool to reach for.
+ASK_NOTE = (
+    "[awaiting approval] {tool} has not run. The user is deciding whether to "
+    "allow it and has a question about it first. Answer the question plainly "
+    "and briefly: why this call, why now, what it will change, and what the "
+    "alternative would be if they refuse. Do not call a tool — nothing runs "
+    "until the user decides."
+)
+# What the model was thinking when it made the call, shown back to it under
+# the note. It is the truest answer to "why" there is, and the one thing the
+# conversation does not already carry: reasoning is never fed back on the main
+# path. The tail, because that is where a decision gets made.
+ASK_REASONING_CHARS = 4000
+ASK_PREFIX = "[question about the pending call] "
+
 
 def _append(left: list, right) -> list:
     if isinstance(right, dict) and TRUNCATE_TO in right:
@@ -195,6 +214,28 @@ class AgentState(TypedDict, total=False):
     compacted: dict | None
 
 
+def model_view(state: dict) -> list[Message]:
+    """The history as the model sees it (``build_graph``'s ``_view``).
+
+    Module-level so a call made *about* a thread rather than *in* it —
+    :func:`answer_pending` — reads the conversation exactly the way the turn
+    that parked it did, and a prefix-caching backend can reuse what it
+    already computed for that turn.
+    """
+    messages = fold_old_payloads(list(state.get("messages", [])))
+    compacted = state.get("compacted")
+    if not compacted:
+        return messages
+    return [compacted["summary"]] + messages[compacted["upto"] :]
+
+
+def round_system_text(text: str, mode: str | None, plan: list[dict] | None) -> str:
+    """One round's system prompt: the app's render plus the mode rules and the
+    plan. Shared with :func:`answer_pending` for the reason ``model_view`` is."""
+    suffix = mode_prompt_suffix(mode, plan)
+    return f"{text}\n\n{suffix}" if suffix else text
+
+
 def build_graph(
     *,
     llm: Any,
@@ -272,11 +313,7 @@ def build_graph(
         whether to summarize at all — is the size the window actually pays,
         not the size before the cheapest possible saving.
         """
-        messages = fold_old_payloads(list(state.get("messages", [])))
-        compacted = state.get("compacted")
-        if not compacted:
-            return messages
-        return [compacted["summary"]] + messages[compacted["upto"] :]
+        return model_view(state)
 
     async def _maybe_compact(state: AgentState, thread_id) -> dict:
         """Fold the older history into a summary before it overflows.
@@ -520,9 +557,7 @@ def build_graph(
 
         Rendered for the running session (``thread_id``) so a background turn
         uses its own profile's memories, not the session on screen."""
-        text = system_text_for(thread_id)
-        suffix = mode_prompt_suffix(mode, state.get("plan"))
-        return f"{text}\n\n{suffix}" if suffix else text
+        return round_system_text(system_text_for(thread_id), mode, state.get("plan"))
 
     def _thinking(state: AgentState, reasoning: str) -> dict:
         if not reasoning.strip():
@@ -776,6 +811,86 @@ async def compact_now(
         summary=proposed["summary"],
     )
     return proposed
+
+
+async def answer_pending(
+    graph,
+    *,
+    session_id: str,
+    llm,
+    tools: ToolRegistry,
+    system: str,
+    mode: str | None = None,
+    effort: str | None = None,
+    turns: list[tuple[str, str]] = (),
+    question: str,
+    max_retries: int = 3,
+) -> str:
+    """The agent's answer to a question about the call it is parked on.
+
+    Read-only, and that is the contract: nothing here writes to the thread,
+    so the question and the answer never become the conversation the turn
+    resumes into, and never reach a checkpoint. What the model is shown is
+    the turn's own context — the same system prompt and the same view of the
+    history the parked round saw — with the call it made, a note in its
+    result's place saying it has not run (``ASK_NOTE``), and the questions
+    asked so far with the answers given to them (``turns``).
+
+    The first attempt offers the session's whole tool registry although no
+    tool may be called, and that is on purpose: the tools are part of the
+    prompt's prefix — the listing in the system message, or the backend's own
+    tool channel — so offering the same ones keeps the prefix byte-identical
+    to the round that parked, and a prefix-caching backend answers without
+    prefilling the conversation again. A model that calls a tool anyway gets
+    a second attempt with nothing to call (the respond-only branch of
+    `decide`, as ``_summarise_and_stop`` uses).
+
+    Raises LookupError when the thread is not parked on a call.
+    """
+    config = {"configurable": {"thread_id": session_id}}
+    snapshot = await graph.aget_state(config)
+    values = snapshot.values or {}
+    pending = values.get("pending_tool")
+    if not pending:
+        raise LookupError("this session is not waiting on a call")
+    tool, call_id = pending["tool"], pending.get("call_id") or ""
+    note = ASK_NOTE.format(tool=tool)
+    count = len(values.get("messages", []))
+    reasoning = next(
+        (
+            str(item.get("reasoning") or "")
+            for item in reversed(values.get("thinking", []) or [])
+            if item.get("after") == count
+        ),
+        "",
+    ).strip()
+    if reasoning:
+        note += (
+            "\n\nYour reasoning when you made the call:\n"
+            + reasoning[-ASK_REASONING_CHARS:]
+        )
+    messages: list[Message] = [
+        {
+            "role": "system",
+            "content": round_system_text(system, mode, values.get("plan")),
+        },
+        *model_view(values),
+        call_message(tool, pending.get("arguments") or {}, call_id),
+        result_message(tool, note, call_id),
+    ]
+    for asked, answered in turns:
+        messages.append({"role": "user", "content": ASK_PREFIX + asked})
+        messages.append({"role": "assistant", "content": answered})
+    messages.append({"role": "user", "content": ASK_PREFIX + question})
+    for registry in (tools, ToolRegistry()):
+        decision = await decide(
+            llm, messages, registry, max_retries=max_retries, effort=effort
+        )
+        if isinstance(decision, DirectResponse):
+            return decision.text
+    return (
+        "(The agent answered with another tool call instead of an explanation.)"
+    )
 
 
 async def thread_message_count(graph, *, session_id: str) -> int:

@@ -65,6 +65,7 @@ from hpca.ui.rain import rain
 from hpca.ui.state import (
     OWN_MESSAGE_KINDS,
     Answer,
+    Ask,
     BackendInfo,
     Confirm,
     CycleMode,
@@ -1832,6 +1833,13 @@ class RowUI:
             ]
         if self.focus == DECISION:
             decision = self.session.decision
+            if decision is not None and decision.questioning:
+                return [
+                    ("enter", "ask"),
+                    ("esc", "back"),
+                    ("⇧enter", "new line"),
+                    ("^↑^↓", "panel"),
+                ]
             if decision is not None and not decision.asking:
                 return [
                     ("enter", "send the reason"),
@@ -1842,12 +1850,10 @@ class RowUI:
                     # ring always comes back to this row (`_ring`).
                     ("^↑^↓", "panel"),
                 ]
-            return [
-                ("y", "approve"),
-                ("n", "deny"),
-                ("esc", "deny, no reason"),
-                ("tab ^↑^↓", "cycle"),
-            ]
+            keys = [("y", "approve"), ("n", "deny")]
+            if decision is None or not decision.waiting:
+                keys.append(("a", "ask the agent"))
+            return keys + [("esc", "deny, no reason"), ("tab ^↑^↓", "cycle")]
         if self.focus == INPUT:
             # Spelled out rather than built from ``common`` so that send and
             # stop come first — the message box is where you sit while a turn
@@ -2018,10 +2024,11 @@ class RowUI:
             # question there is not, and the text goes into the draft it was
             # aimed at and waits there with it. Dropping a payload because a
             # gate happened to be open is the worse of the two answers.
-            if decision.asking:
+            editor = decision.editor()
+            if editor is None:
                 self.input.insert_text(text)
             else:
-                decision.reason.insert_text(text)
+                editor.insert_text(text)
             return
         review = self.session.review
         if review.up and not review.asking:
@@ -2216,7 +2223,7 @@ class RowUI:
             self.focus = INPUT
 
     def _handle_decision(self, key: str) -> bool:
-        """The two stages, and the keys each of them owns.
+        """The stages, and the keys each of them owns.
 
         The reason box takes the letters the y/n stage was using — it is a
         text field, and "n" in the middle of "not this path" is not a verdict
@@ -2243,6 +2250,12 @@ class RowUI:
                 # Not an answer yet: the refusal is sent once the box says
                 # why, or says nothing.
                 decision.decline()
+            elif key == "a":
+                # Not an answer at all. Refused while one is being answered
+                # rather than queued: the core takes one question at a time,
+                # and the hint has already stopped offering the key.
+                if not decision.waiting:
+                    decision.ask()
             elif key == "esc":
                 self._resolve(False)
             elif key in ("ctrl-up", "shift-tab"):
@@ -2250,6 +2263,8 @@ class RowUI:
             elif key in ("ctrl-down", "tab"):
                 self.focus = WATCHERS
             return True
+        if decision.questioning:
+            return self._handle_question(decision, key)
         if key == "enter":
             self._resolve(False, decision.reason_text())
         elif key == "esc":
@@ -2262,6 +2277,35 @@ class RowUI:
             self.focus = WATCHERS
         else:
             decision.reason.handle(key)
+        return True
+
+    def _handle_question(self, decision, key: str) -> bool:
+        """The box for a question to the agent about the call.
+
+        The reason box's keys with one difference, and it is the important
+        one: escape goes *back*, unsent, and does not refuse. Nothing has been
+        decided here — the user is finding out whether to — and a key that
+        refused on the way out of a question would turn "never mind" into a
+        verdict. An empty question goes back the same way.
+        """
+        if key == "enter":
+            text = decision.question_text()
+            if not text:
+                decision.back()
+                return True
+            decision.asked(text)
+            self.send(Ask(self.session.session_id, text))
+            self.note = "asked the agent"
+        elif key == "esc":
+            decision.back()
+        elif key in NEWLINE_KEYS:
+            decision.question.newline()
+        elif key == "ctrl-up":
+            self.focus = CHAT
+        elif key == "ctrl-down":
+            self.focus = WATCHERS
+        else:
+            decision.question.handle(key)
         return True
 
     def _handle_offer(self, key: str) -> bool:

@@ -10,6 +10,7 @@ what it means.
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -35,6 +36,7 @@ from hpca.protocol import (
     CommandRun,
     CompactResolve,
     ConfirmResolve,
+    DecisionAsk,
     DecisionResolve,
     JobCancel,
     LLMList,
@@ -1852,6 +1854,192 @@ class TestAParkedApproval:
         # message, and there is nothing left of it to roll back to.
         assert service._scheduler._anchors == {}
         await service.stop()
+
+
+class TestAskingAboutAParkedCall:
+    """`decision.ask`: the agent explains the call it is parked on, in a side
+    dialog the conversation never sees — driven through a real graph park."""
+
+    park = TestAParkedApproval.park
+
+    async def ask(self, service, session, queue, question="why?"):
+        await service.handle(
+            DecisionAsk(session_id=session.session_id, question=question)
+        )
+        events = await drain(queue)
+        while not any(
+            type(e).__name__ == "DecisionDialog"
+            and e.turns
+            and e.turns[-1].answer is not None
+            for e in events
+        ):
+            events += await wait_for(queue, "DecisionDialog")
+        return events
+
+    async def test_the_answer_arrives_in_a_dialog_under_the_same_decision(
+        self, service, session, llm
+    ):
+        queue, _ = await self.park(service, session, llm)
+        llm._outputs.insert(0, respond("it only holds last week's runs"))
+        events = await self.ask(service, session, queue)
+        dialogs = [e for e in events if type(e).__name__ == "DecisionDialog"]
+        # Drawn first as a question waiting on its answer, then answered.
+        assert dialogs[0].turns[0].question == "why?"
+        assert dialogs[0].turns[0].answer is None
+        assert dialogs[-1].turns[0].answer == "it only holds last week's runs"
+        assert not dialogs[-1].turns[0].failed
+        # Still parked: a question is not an answer.
+        assert "DecisionCleared" not in kinds(events)
+        assert session.session_id in service._scheduler.pending_decisions()
+        await service.stop()
+
+    async def test_the_resumed_turn_and_the_thread_never_see_it(
+        self, service, session, llm
+    ):
+        queue, _ = await self.park(service, session, llm)
+        llm._outputs.insert(0, respond("it only holds last week's runs"))
+        await self.ask(service, session, queue, "why delete it?")
+        await service.handle(
+            DecisionResolve(session_id=session.session_id, approved=False)
+        )
+        await wait_for(queue, "TurnFinished")
+        resumed = json.dumps(llm.prompts[-1])
+        assert "why delete it?" not in resumed
+        assert "last week's runs" not in resumed
+        state = await service._graph.aget_state(
+            {"configurable": {"thread_id": session.session_id}}
+        )
+        stored = json.dumps(state.values["messages"])
+        assert "why delete it?" not in stored and "last week's runs" not in stored
+        await service.stop()
+
+    async def test_both_halves_are_in_the_session_log(
+        self, service, session, llm, home
+    ):
+        queue, _ = await self.park(service, session, llm)
+        llm._outputs.insert(0, respond("it only holds last week's runs"))
+        await self.ask(service, session, queue, "why delete it?")
+        (log,) = (home / "chatlogs").glob("*.log")
+        text = log.read_text()
+        assert "side question about run_bash" in text
+        assert "why delete it?" in text
+        assert "side answer" in text and "last week's runs" in text
+        await service.stop()
+
+    async def test_the_question_sees_what_the_turn_saw(self, service, session, llm):
+        queue, _ = await self.park(service, session, llm)
+        llm._outputs.insert(0, respond("because you asked"))
+        await self.ask(service, session, queue, "why delete it?")
+        asked = llm.prompts[-1]
+        # The session's own prompt and history, the call, and the question.
+        assert asked[0]["role"] == "system"
+        assert any(m.get("content") == "clear the scratch dir" for m in asked)
+        assert "has not run" in json.dumps(asked)
+        assert asked[-1]["content"].endswith("why delete it?")
+        await service.stop()
+
+    async def test_a_second_question_waits_for_the_first(self, service, session, llm):
+        queue, _ = await self.park(service, session, llm)
+        release = asyncio.Event()
+
+        async def slow(session_id, turns, question):
+            await release.wait()
+            return "done"
+
+        service._answer_pending = slow
+        for question in ("why?", "and why now?"):
+            await service.handle(
+                DecisionAsk(session_id=session.session_id, question=question)
+            )
+        events = await drain(queue)
+        assert "still answering" in only(events, "Notify").text
+        dialog = only(events, "DecisionDialog")
+        assert [t.question for t in dialog.turns] == ["why?"]
+        release.set()
+        await service.stop()
+
+    async def test_answering_the_call_cancels_an_answer_still_being_written(
+        self, service, session, llm, home
+    ):
+        queue, _ = await self.park(service, session, llm)
+        started = asyncio.Event()
+
+        async def forever(session_id, turns, question):
+            started.set()
+            await asyncio.Event().wait()
+
+        service._answer_pending = forever
+        await service.handle(
+            DecisionAsk(session_id=session.session_id, question="why?")
+        )
+        await asyncio.wait_for(started.wait(), 5)
+        task = service._scheduler.dialog(session.session_id).task
+        await service.handle(
+            DecisionResolve(session_id=session.session_id, approved=False)
+        )
+        events = await wait_for(queue, "TurnFinished")
+        assert task.cancelled()
+        # Nothing about the dead dialog reached a client after the decision
+        # went: its answer was never written, and there is nothing to restate.
+        cleared = kinds(events).index("DecisionCleared")
+        assert "DecisionDialog" not in kinds(events)[cleared:]
+        assert "not written" in next((home / "chatlogs").glob("*.log")).read_text()
+        await service.stop()
+
+    async def test_a_failed_answer_says_so_and_leaves_the_decision_up(
+        self, service, session, llm
+    ):
+        queue, _ = await self.park(service, session, llm)
+
+        async def broken(session_id, turns, question):
+            raise RuntimeError("backend went away")
+
+        service._answer_pending = broken
+        events = await self.ask(service, session, queue)
+        turn = [e for e in events if type(e).__name__ == "DecisionDialog"][-1].turns[0]
+        assert turn.failed and "backend went away" in turn.answer
+        assert session.session_id in service._scheduler.pending_decisions()
+        await service.stop()
+
+    async def test_follow_ups_carry_the_dialog_so_far(self, service, session, llm):
+        queue, _ = await self.park(service, session, llm)
+        seen = []
+
+        async def remember(session_id, turns, question):
+            seen.append((list(turns), question))
+            return f"answer to {question}"
+
+        service._answer_pending = remember
+        await self.ask(service, session, queue, "why?")
+        await self.ask(service, session, queue, "all of it?")
+        assert seen == [([], "why?"), ([("why?", "answer to why?")], "all of it?")]
+        await service.stop()
+
+    async def test_a_client_arriving_later_gets_the_dialog_after_its_decision(
+        self, service, session, llm
+    ):
+        queue, _ = await self.park(service, session, llm)
+        llm._outputs.insert(0, respond("it only holds last week's runs"))
+        await self.ask(service, session, queue)
+        events = await drain(service.subscribe())
+        assert kinds(events).index("DecisionRequested") < kinds(events).index(
+            "DecisionDialog"
+        )
+        assert only(events, "DecisionDialog").turns[0].answer == (
+            "it only holds last week's runs"
+        )
+        await service.stop()
+
+    async def test_a_question_about_no_decision_is_dropped_quietly(
+        self, service, session
+    ):
+        queue = subscribe(service)
+        await service.handle(
+            DecisionAsk(session_id=session.session_id, question="why?")
+        )
+        # The ordinary race — the call was answered from another front-end —
+        # and the user already sees the prompt gone.
+        assert await drain(queue) == []
 
 
 class TestAResumeAfterACoreRestart:

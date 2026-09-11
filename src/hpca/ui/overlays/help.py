@@ -68,6 +68,7 @@ class HelpOverlay(Overlay):
                 ("y", "approve — run it"),
                 ("n", "refuse, and say what should be different"),
                 ("esc", "refuse without saying why"),
+                ("a", "ask the agent about it — the decision stays open"),
                 ("enter", "in the box: send the reason with the refusal"),
                 ("⇧enter", "in the box: new line"),
                 ("^↑", "leave it unanswered — the half-typed reason waits"),

@@ -90,6 +90,9 @@ SPEC_COMMANDS = {
     "turn.interrupt",
     "turn.unqueue",
     "decision.resolve",
+    # Not an answer: a question about the call, answered in a side dialog
+    # that never reaches the conversation (`decision.dialog` below).
+    "decision.ask",
     "command.run",
     "confirm.resolve",
     "memory.resolve",
@@ -172,6 +175,7 @@ SPEC_EVENTS = {
     "turn.interrupted",
     "decision.requested",
     "decision.cleared",
+    "decision.dialog",
     "panel.update",
     "watch.peeked",
     "memory.proposals",

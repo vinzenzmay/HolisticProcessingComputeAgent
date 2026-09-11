@@ -1301,6 +1301,23 @@ class TestLifecycle:
         sched.forget_session("s1")
         assert sched.pending_decisions() == {}
 
+    async def test_a_dialog_goes_with_its_decision(self, sched, graph_calls):
+        # What ends a decision ends the questions about it, and an answer
+        # still being written is not left to spend the backend on nothing.
+        graph_calls["results"]["s1"] = TurnResult(reply=None, interrupt={"tool": "x"})
+        sched.submit_user("s1", "x")
+        await sched.drain()
+        await settle()
+        assert sched.dialog("s2") is None, "nothing parked, nothing to ask"
+        dialog = sched.dialog("s1")
+        dialog.turns.append({"question": "why?", "answer": None})
+        dialog.task = asyncio.ensure_future(asyncio.Event().wait())
+        assert sched.dialogs() == {"s1": dialog}
+        sched.forget_session("s1")
+        await settle()
+        assert dialog.task.cancelled()
+        assert sched.dialog("s1") is None and sched.dialogs() == {}
+
     async def test_shutdown_drops_the_queue_and_unwinds_the_turn(
         self, sched, graph_calls
     ):

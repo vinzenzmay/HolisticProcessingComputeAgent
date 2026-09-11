@@ -243,6 +243,10 @@ class UIClient:
                     reason=intent.reason,
                 )
             )
+        elif isinstance(intent, state.Ask):
+            self.command(
+                protocol.DecisionAsk(session_id=session, question=intent.question)
+            )
         elif isinstance(intent, state.Unqueue):
             self.command(
                 protocol.TurnUnqueue(session_id=session, seq=intent.seq)
@@ -1114,6 +1118,11 @@ class UIClient:
         self._session(msg.session_id).request_decision(dict(msg.payload))
         self.ui.decision_arrived(msg.session_id)
 
+    def _decision_dialog(self, msg: protocol.DecisionDialog) -> None:
+        self._session(msg.session_id).decision_dialog(
+            [turn.model_dump() for turn in msg.turns]
+        )
+
     def _decision_cleared(self, msg: protocol.DecisionCleared) -> None:
         self._session(msg.session_id).clear_decision()
         self.ui.decision_cleared(msg.session_id)
@@ -1392,6 +1401,7 @@ UIClient._HANDLERS = {
     protocol.ContextEstimate.__name__: UIClient._estimate,
     protocol.DecisionRequested.__name__: UIClient._decision,
     protocol.DecisionCleared.__name__: UIClient._decision_cleared,
+    protocol.DecisionDialog.__name__: UIClient._decision_dialog,
     protocol.ConfirmRequested.__name__: UIClient._confirm,
     protocol.PanelUpdate.__name__: UIClient._panel,
     protocol.MemoryProposals.__name__: UIClient._proposals,

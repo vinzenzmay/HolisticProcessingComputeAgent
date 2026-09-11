@@ -188,6 +188,26 @@ off file by file.
 - A manually skipped script carries the reason back.
 - A half-written reason waits in its own session across a session switch.
 
+## Asking the agent about the call — `test_ui_approvals.py`
+
+- Both gates offer `(a) ask the agent` next to the verdicts.
+- `a` opens a box for a question and decides nothing; the call stays on screen.
+- The box takes the letters the verdicts use.
+- Enter sends the question and hands the verdict keys back; the question shows
+  as waiting for its answer.
+- The answer is drawn under the call, and the decision is still there to make:
+  `y` approves, `n` still asks why, `a` asks again.
+- Escape goes back without asking or refusing, and the draft waits in the box.
+- An empty question asks nothing.
+- While an answer is being written, `a` is neither offered nor acted on.
+- A long answer is read from its first line; older exchanges give way to the
+  newest; the keys never give way.
+- The dialog goes with its decision.
+- Core side (`test_core_service.py`): neither the thread nor the resumed turn
+  ever sees the dialog; both halves are in the session log; answering the call
+  cancels an answer still being written; a client arriving later gets the
+  dialog after its decision.
+
 ## Agent modes — `test_tui_modes.py`
 
 - The mode bar is hidden without a session, shown with one.

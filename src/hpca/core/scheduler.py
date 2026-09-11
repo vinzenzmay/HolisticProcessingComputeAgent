@@ -284,6 +284,29 @@ class TurnState:
     )
 
 
+@dataclass
+class SideDialog:
+    """The questions asked about one parked decision, and the answers.
+
+    Held beside the decision it is about, in the scheduler, because that is
+    where decisions end — answered, or their session deleted — and a dialog
+    that outlived its call would be answering a question about nothing. What
+    ends a decision ends this; an answer still being written is cancelled
+    (``task``) rather than left to spend the backend on a call that is gone.
+
+    Not the conversation's, and never written to it: see `protocol.DecisionAsk`.
+    ``turns`` are `protocol.DialogTurn` dicts, the last one with no answer
+    while the agent is still writing it.
+    """
+
+    turns: list[dict] = field(default_factory=list)
+    task: asyncio.Task | None = None
+
+    @property
+    def waiting(self) -> bool:
+        return bool(self.turns) and self.turns[-1].get("answer") is None
+
+
 class TurnScheduler:
     """Runs turns, one per session at a time, many sessions at once."""
 
@@ -334,6 +357,9 @@ class TurnScheduler:
         # session_id -> the graph interrupt payload it is parked on. See the
         # module docstring: this used to live in the UI and die with it.
         self._decisions: dict[str, dict] = {}
+        # session_id -> what the user asked about that decision (SideDialog).
+        # Created on the first question, dropped with the decision.
+        self._dialogs: dict[str, SideDialog] = {}
         # What an interrupt needs — (the thread length before the message, the
         # message) — kept per session for as long as the *exchange* lasts and
         # not just for one turn. An approval ends the turn it parked; the
@@ -409,6 +435,28 @@ class TurnScheduler:
         otherwise mutate under itself.
         """
         return dict(self._decisions)
+
+    def dialog(self, session_id: str) -> SideDialog | None:
+        """The side dialog about this session's parked decision, opened on
+        first use; None when nothing is parked, so there is nothing to ask
+        about."""
+        if session_id not in self._decisions:
+            return None
+        return self._dialogs.setdefault(session_id, SideDialog())
+
+    def dialogs(self) -> dict[str, SideDialog]:
+        """Every dialog with something in it, for re-emitting on subscribe
+        after the decision it belongs to."""
+        return {
+            session_id: dialog
+            for session_id, dialog in self._dialogs.items()
+            if dialog.turns and session_id in self._decisions
+        }
+
+    def _drop_dialog(self, session_id: str) -> None:
+        dialog = self._dialogs.pop(session_id, None)
+        if dialog is not None and dialog.task is not None:
+            dialog.task.cancel()
 
     def busy_sessions(self) -> set[str]:
         return set(self._turns)
@@ -1171,6 +1219,9 @@ class TurnScheduler:
             # The row record stays — the resume continues this same turn, and
             # its next tool call belongs in the box already on screen.
             self._awaiting_approval.add(session_id)
+            # A new call is a new question; nothing asked about the last one
+            # is about this one.
+            self._drop_dialog(session_id)
             self._decisions[session_id] = dict(result.interrupt)
             self._deps.emit(
                 DecisionRequested(session_id=session_id, payload=dict(result.interrupt))
@@ -1197,6 +1248,7 @@ class TurnScheduler:
         if session_id not in self._decisions:
             return False  # stale answer: already resolved, or never parked
         self._decisions.pop(session_id, None)
+        self._drop_dialog(session_id)
         self._awaiting_approval.discard(session_id)
         self._deps.emit(DecisionCleared(session_id=session_id))
         session = self._session_for(session_id)
@@ -1343,6 +1395,7 @@ class TurnScheduler:
         starts against a thread that no longer exists."""
         self._pending = [w for w in self._pending if w.session_id != session_id]
         self._decisions.pop(session_id, None)
+        self._drop_dialog(session_id)
         self._awaiting_approval.discard(session_id)
         self._anchors.pop(session_id, None)
         # Its rows went with it; nothing can address them again.
@@ -1358,6 +1411,8 @@ class TurnScheduler:
         """
         self._shutting_down = True
         self._pending.clear()
+        for session_id in list(self._dialogs):
+            self._drop_dialog(session_id)
         tasks = [ts.task for ts in self._turns.values() if ts.task is not None]
         for task in tasks:
             task.cancel()

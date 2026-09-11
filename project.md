@@ -1046,6 +1046,20 @@ gate (§5.3) or actual submission proceed.
   the common case: a script that is nearly right, where retyping the whole
   request is the only way to say "wrong partition". Half-written reasons are
   parked per session like chat drafts, so switching away does not lose them.
+* **Asking is the third answer, and it is not an answer.** `a` opens a box for
+  a question to the agent about the call — "why this file?", "what else does
+  the script touch?" — and the agent's reply is drawn under the call with the
+  decision still open, so the user can approve, refuse, or ask again. The reply
+  is built from the parked thread's own view (the same system prompt and
+  history the round saw, the call it made, and the reasoning that made it) but
+  is **never written to it**: no message, no checkpoint, so the resumed turn
+  meets the call exactly as it would have without the question, and asking
+  costs the main context nothing. The session log is the dialog's only record
+  ("side question about …" / "side answer"). It exists because of the default
+  `hpca -p` defends above: a refusal the user did not really mean moves the
+  work somewhere less safe, and a user who cannot tell *why* a delete is wanted
+  otherwise has only that refusal or blind trust to choose from.
+  `agent.graph.answer_pending`; `decision.ask` / `decision.dialog` on the wire.
 * **Recovery for small files (< 1 GB, configurable):**
   * *Deletions:* do **not** copy — **hardlink the file into a trash directory**
     (`~/.HolisticProcessingComputeAgent/trash/<timestamp>/…`) before unlinking.

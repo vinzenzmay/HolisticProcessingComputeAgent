@@ -177,6 +177,7 @@ One envelope in both directions:
 | `turn.interrupt` | `session_id` |
 | `turn.unqueue` | `session_id`, `seq` — take a typed-ahead message back out of the queue, named by the `Entry.seq` of the `queued` row the core drew for it. Not a queue position: the turn ahead can finish while the user is deciding, and a position would then quietly name the neighbour |
 | `decision.resolve` | `session_id`, `approved: bool`, `reason: str` |
+| `decision.ask` | `session_id`, `question` — not an answer: the agent explains the call the session is parked on, in a side dialog (`decision.dialog`) built from the thread's own view but never written to it — no message, no checkpoint. The session log is its only record. One question at a time; a question about a decision that is gone is dropped |
 | `command.run` | `name`, `args`, `session_id?` — `/compact`, `/memorize`, `/conclude`, `/skill-*`. Session-scoped commands carry the id explicitly rather than letting the core infer it from the last `session.focus`, which may have moved on between the keystroke and the frame arriving |
 | `confirm.resolve` | `id`, `confirmed` — answers a `confirm.requested`; the core holds the continuation, only the yes/no crosses |
 | `memory.resolve` | `session_id`, `approved: [bool]` — answers a `memory.proposals` offer, positionally. The core holds the proposal objects; only the yes/no crosses, so a front-end cannot smuggle an edited memory back in an approval |
@@ -214,6 +215,7 @@ One envelope in both directions:
 | `turn.unqueued` | `session_id`, `seq`, `text` — a queued message was taken back: drop that row, and the text returns to the entry box, where an interrupt would also have left it |
 | `decision.requested` | `session_id`, `payload` (the graph interrupt value) |
 | `decision.cleared` | `session_id` |
+| `decision.dialog` | `session_id`, `turns: [{question, answer?, failed}]` — the side dialog about the parked call, whole on every change, and re-emitted on subscribe after its `decision.requested`. `answer` is null while it is being written. Dies with the decision — `decision.cleared` says so, and an answer still in flight is cancelled |
 | `panel.update` | `profile`, `session_id?`, `rows: [PanelRow]` |
 | `watch.peeked` | `watch_id`, `title`, `text` — the answer to a `watch.peek`. Deliberately not a `notify`: it answers a keypress (so it echoes `reply_to`), two peeks can cross so the answer must name its box, and how long a tail stays on screen is the renderer's decision, not a timeout the core sets |
 | `memory.proposals` | `session_id`, `proposals` |

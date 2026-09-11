@@ -630,6 +630,172 @@ class TestDecliningWithAReason:
         assert wire.peer.last(protocol.DecisionResolve).reason == "one\ntwo"
 
 
+class TestAskingTheAgent:
+    """The third key: a question about the call, answered under it, with the
+    decision still open (`protocol.DecisionAsk`)."""
+
+    async def asked(self, wire, question="why?", payload=DELETE_GATE):
+        await parked(wire, payload)
+        await wire.press("a", *question, "enter")
+        return wire
+
+    async def answered(self, wire, answer="the old runs are stale"):
+        await wire.tell(
+            protocol.DecisionDialog(
+                session_id="s1",
+                turns=[protocol.DialogTurn(question="why?", answer=answer)],
+            )
+        )
+        return wire
+
+    @pytest.mark.parametrize("payload", [DELETE_GATE, BASH_GATE])
+    async def test_both_gates_offer_it(self, wire, payload):
+        await parked(wire, payload)
+        assert "(a) ask the agent" in wire.screen()
+
+    async def test_a_opens_a_box_and_decides_nothing(self, wire):
+        await parked(wire, DELETE_GATE)
+        await wire.press("a")
+        assert "(enter) ask · (esc) back" in wire.screen()
+        assert wire.peer.took(protocol.DecisionResolve) == []
+        assert wire.peer.took(protocol.DecisionAsk) == []
+
+    async def test_the_box_takes_the_letters_the_verdicts_use(self, wire):
+        await parked(wire, DELETE_GATE)
+        await wire.press("a", *"why not y or n")
+        assert "why not y or n" in wire.screen()
+        assert wire.peer.took(protocol.DecisionResolve) == []
+
+    async def test_the_call_stays_on_screen_while_it_is_asked_about(self, wire):
+        await parked(wire, DELETE_GATE)
+        await wire.press("a")
+        text = wire.screen()
+        assert "Destructive operation — delete_file?" in text
+        assert "delete /scratch/proj/cohort.bam" in text
+
+    async def test_enter_sends_it_and_hands_the_verdict_keys_back(self, wire):
+        await self.asked(wire, "why this file?")
+        sent = wire.peer.last(protocol.DecisionAsk)
+        assert (sent.session_id, sent.question) == ("s1", "why this file?")
+        assert wire.peer.took(protocol.DecisionResolve) == []
+        text = wire.screen()
+        assert "why this file?" in text
+        assert "answering…" in text
+        assert wire.ui.session.decision.asking
+
+    async def test_the_answer_is_drawn_under_the_call(self, wire):
+        await self.asked(wire)
+        await self.answered(wire)
+        text = wire.screen()
+        assert "the old runs are stale" in text
+        assert "answering…" not in text
+        assert "(a) ask again" in text
+
+    async def test_after_the_answer_the_decision_is_still_there_to_make(self, wire):
+        await self.asked(wire)
+        await self.answered(wire)
+        await wire.press("y")
+        assert wire.peer.last(protocol.DecisionResolve).approved is True
+
+    async def test_and_refusing_still_asks_why(self, wire):
+        await self.asked(wire)
+        await self.answered(wire)
+        await wire.press("n", *"keep it", "enter")
+        answer = wire.peer.last(protocol.DecisionResolve)
+        assert (answer.approved, answer.reason) == (False, "keep it")
+
+    async def test_the_dialog_can_go_on(self, wire):
+        await self.asked(wire)
+        await self.answered(wire)
+        await wire.press("a", *"all of it?", "enter")
+        assert [q.question for q in wire.peer.took(protocol.DecisionAsk)] == [
+            "why?",
+            "all of it?",
+        ]
+
+    async def test_escape_goes_back_and_neither_asks_nor_refuses(self, wire):
+        # A question is not an answer, and "never mind" must not become one.
+        await parked(wire, DELETE_GATE)
+        await wire.press("a", *"half a question", "esc")
+        assert wire.peer.took(protocol.DecisionAsk) == []
+        assert wire.peer.took(protocol.DecisionResolve) == []
+        assert wire.ui.session.decision.asking
+        await wire.press("a")
+        assert "half a question" in wire.screen(), "the draft waits in the box"
+
+    async def test_an_empty_question_asks_nothing(self, wire):
+        await parked(wire, DELETE_GATE)
+        await wire.press("a", "enter")
+        assert wire.peer.took(protocol.DecisionAsk) == []
+        assert wire.ui.session.decision.asking
+
+    async def test_while_the_answer_is_written_a_is_not_offered(self, wire):
+        # The core takes one question at a time; a key that does nothing is
+        # not one to offer.
+        await self.asked(wire)
+        assert "(a) ask" not in wire.screen()
+        await wire.press("a")
+        assert wire.ui.session.decision.asking, "no box opened"
+        assert len(wire.peer.took(protocol.DecisionAsk)) == 1
+
+    async def test_a_paste_lands_in_the_question(self, wire):
+        await parked(wire, DELETE_GATE)
+        await wire.press("a")
+        await wire.press(PASTE + "is /scratch/proj backed up?")
+        await wire.press("enter")
+        assert wire.peer.last(protocol.DecisionAsk).question == (
+            "is /scratch/proj backed up?"
+        )
+
+    async def test_a_long_answer_is_read_from_its_first_line(self, wire):
+        await self.asked(wire, payload=LONG_SCRIPT)
+        answer = "\n".join(f"reason number {i}" for i in range(60))
+        await self.answered(wire, answer)
+        drawn = [plain(x) for x in wire.ui.render(100, 30)]
+        text = "\n".join(drawn)
+        assert "reason number 0" in text, "an answer read from the middle is not one"
+        assert "more line" in text
+        assert "(y) run script" in text, "the keys are never what gives way"
+
+    async def test_older_exchanges_give_way_to_the_newest(self, wire):
+        await self.asked(wire, payload=LONG_SCRIPT)
+        old = [
+            protocol.DialogTurn(question=f"question {i}", answer="x\n" * 6)
+            for i in range(5)
+        ]
+        await wire.tell(
+            protocol.DecisionDialog(
+                session_id="s1",
+                turns=[*old, protocol.DialogTurn(question="latest?", answer="yes")],
+            )
+        )
+        text = "\n".join(plain(x) for x in wire.ui.render(100, 30))
+        assert "latest?" in text and "yes" in text
+        assert "question 0" not in text
+        assert "earlier line" in text
+
+    @pytest.mark.parametrize(
+        "width,height", [(80, 24), (120, 40), (60, 14), (40, 10), (100, 8)]
+    )
+    async def test_a_dialog_in_a_small_terminal_still_gets_a_frame(
+        self, wire, width, height
+    ):
+        await self.asked(wire, payload=LONG_SCRIPT)
+        await self.answered(wire, "because " * 80)
+        await wire.press("a", *"and?")
+        drawn = wire.ui.render(width, height)
+        assert len(drawn) == height
+        assert widths(drawn) == {width}
+
+    async def test_it_goes_with_the_decision(self, wire):
+        await self.asked(wire)
+        await self.answered(wire)
+        await wire.tell(protocol.DecisionCleared(session_id="s1"))
+        await parked(wire, BASH_GATE)
+        assert "the old runs are stale" not in wire.screen()
+        assert "(a) ask the agent" in wire.screen()
+
+
 class TestTheHalfWrittenReasonIsADraft:
     """specs/specs-core-process.md §4.4: the decision moves to the core, the reason
     stays in the UI — "a draft, same class as ``_drafts``"."""

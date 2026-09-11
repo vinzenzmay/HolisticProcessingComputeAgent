@@ -1362,6 +1362,17 @@ class SessionState:
         self.decision = Decision(payload=payload)
         return self.decision
 
+    def decision_dialog(self, turns: list[dict]) -> None:
+        """`decision.dialog`: the side thread about the parked call, whole.
+
+        Replaces what was drawn rather than merging into it: the core's thread
+        is the fact, and the one guess the UI makes (`Decision.asked`) is a
+        copy of a question the core has since confirmed. With no decision up
+        there is nothing for it to be about, and it is dropped.
+        """
+        if self.decision is not None:
+            self.decision.turns = [dict(turn) for turn in turns]
+
     def clear_decision(self) -> None:
         self.decision = None
         # Answered, or its turn died. Either way the wait is over: the resume
@@ -1644,6 +1655,18 @@ class Decide:
     session_id: str
     approved: bool
     reason: str = ""
+
+
+@dataclass(frozen=True)
+class Ask:
+    """Ask the agent about the call this session is parked on.
+
+    Not a verdict: the decision stays up, and the answer comes back as a
+    `decision.dialog` that never enters the conversation (`protocol.DecisionAsk`).
+    """
+
+    session_id: str
+    question: str
 
 
 @dataclass(frozen=True)
