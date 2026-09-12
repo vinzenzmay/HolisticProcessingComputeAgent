@@ -14,11 +14,20 @@ BATCH_SIZE = 64
 # What an OpenAI-compatible server says when the input overruns the model's
 # window. Matched on text because the status code alone does not distinguish
 # it from a malformed request, and only this case is worth re-trying smaller.
+#
+# The last three are llama.cpp's wording. llama-server refuses a sequence
+# longer than its physical batch (`-ub`, 512 by default) with "input (733
+# tokens) is too large to process. increase the physical batch size" - the
+# same condition vLLM reports as a context overrun, in words none of the
+# OpenAI markers match.
 _TOO_LONG_MARKERS = (
     "maximum context length",
     "longer than the maximum",
     "reduce the length",
     "too long",
+    "too large to process",
+    "increase the physical batch size",
+    "exceeds the maximum",
 )
 
 
@@ -80,7 +89,12 @@ class EmbeddingClient:
                 message = (
                     f"Embedding request failed ({response.status_code}): {detail}"
                 )
-                if response.status_code == 400 and _is_too_long(detail):
+                # The status code is not the discriminator; the message is.
+                # llama-server answers an over-long sequence with 500, not
+                # 400, and a 500 taken at face value here is a whole document
+                # dropped from the index instead of split and retried - which
+                # is how 941 of 1609 Godot doc pages came to be missing.
+                if _is_too_long(detail):
                     raise InputTooLong(message)
                 raise EmbeddingError(message)
             data = sorted(response.json()["data"], key=lambda d: d["index"])

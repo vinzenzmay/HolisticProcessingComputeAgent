@@ -96,6 +96,39 @@ class TestEmbeddingClient:
         with pytest.raises(EmbeddingError):
             await client.embed(["x"])
 
+    async def test_llama_cpp_batch_refusal_is_too_long(self):
+        """llama-server refuses an over-long sequence with 500, not 400, and in
+        wording none of the OpenAI markers match. Taken at face value that is
+        an EmbeddingError, and the caller drops the whole document instead of
+        splitting it and retrying - which is how 941 of 1609 Godot doc pages
+        came to be missing from an index that reported no failures."""
+
+        def handler(request):
+            return httpx.Response(
+                500,
+                text=(
+                    "input (733 tokens) is too large to process. "
+                    "increase the physical batch size"
+                ),
+            )
+
+        client = make_client(handler)
+        with pytest.raises(InputTooLong):
+            await client.embed(["x"])
+
+    async def test_openai_context_overrun_is_still_too_long(self):
+        """The status code stopped being part of the test; the OpenAI shape
+        must still be recognised on the 400 it has always arrived with."""
+
+        def handler(request):
+            return httpx.Response(
+                400, text="This model's maximum context length is 8192 tokens"
+            )
+
+        client = make_client(handler)
+        with pytest.raises(InputTooLong):
+            await client.embed(["x"])
+
     async def test_empty_input_no_request(self):
         def handler(request):
             raise AssertionError("no request expected")
