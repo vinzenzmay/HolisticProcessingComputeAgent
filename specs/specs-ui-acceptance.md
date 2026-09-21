@@ -174,6 +174,15 @@ off file by file.
 - The lines of a script shown below are not repeated above it.
 - A pathological, huge argument is clipped.
 - `details` replace the arguments entirely when present.
+- The call is shown whole and scrolls: nothing about it is merely cut off, the
+  tail of a long diff or script is reachable with ↑↓/pgup/pgdn/home/end, and
+  the rule says how far down it the reader is.
+- The sentence naming the call — which file, and whether it is backed up —
+  stays above the scroll while there is room for it and for the body under it.
+- The arrows read the call at the y/n; while a box is open ↑↓ and home/end are
+  the cursor's and alt+↑/↓ and the page keys read it instead.
+- Reading it decides nothing.
+- The arrows are offered only when there is something below the fold.
 
 ## Declining with a reason — `test_tui_decline_reason.py`
 

@@ -16,6 +16,17 @@ session is what reveals its prompt (specs/specs-ui-acceptance.md, "Inline approv
 prompts"). This is the rationale written down at ``tui/approval_screen.py``
 lines 9-15, kept because it is the reason the shape is what it is.
 
+The call itself scrolls, and that is the point of the block in the middle
+rather than a detail of it. A gated ``edit_file`` is a diff and a gated
+``create_file`` is a whole file, and both are routinely longer than the rows
+the prompt may have; showing the first dozen lines and counting the rest asked
+the user to approve a change they had been shown the beginning of, and the
+tail — whether the heredoc closed, whether the last hunk touched anything else
+— is where the reason to say no usually is. So the block is kept whole and the
+frame draws a window on it (``Decision.offset``, :func:`render_decision`), the
+rule carries how far down it the reader is, and the arrows move it at every
+stage, including while the refusal about it is being typed.
+
 Saying no has a second step, the box asking why (:func:`approval_reason_hint`);
 the graph resumes with a verdict either way. Nothing crosses the wire until
 that box is answered, so the refusal and the reason reach the model together
@@ -52,19 +63,29 @@ from hpca.ui.editor import Editor
 # "reason" it leads back to "ask": a question is not an answer.
 ASK, REASON, QUESTION = "ask", "reason", "question"
 
-# What the three blocks are allowed to cost, in rows. The same figures the
-# Textual bar's CSS carried (`max-height: 12` on the script, `6` on the box):
-# the prompt shares the chat column, and a four-hundred-line diff that pushed
-# the conversation off the screen would be answering a question nobody could
-# still see the context for.
-DETAIL_LINES = 8
-SCRIPT_LINES = 12
+# What the box under the prompt is allowed to cost, in rows — the figure the
+# Textual bar's CSS carried (`max-height: 6`).
+#
+# The call above it has no such number any more, and that is the point. It
+# used to be capped at eight rows of detail and twelve of script, head-first,
+# so a forty-line diff was answered on its first twelve lines and the rest was
+# a "… 28 more lines" that no key could open. What bounds it now is the room
+# the prompt has (`DECISION_SHARE`, still half the column, so the conversation
+# stays behind it) and what bounds *reading* it is the scroll: the whole call
+# is there, a window at a time, with the rule saying where in it you are.
 REASON_LINES = 6
 # What the call keeps of its rows once there is a dialog under it and not room
 # for both. The dialog is what is being read by then — the call was read before
 # the question was asked — but a question about "line 3" still wants line 3 in
-# sight, so the call is squeezed rather than dropped.
+# sight, so the call is squeezed rather than dropped. Squeezed and not cut: the
+# three rows are a window on the whole call, and the arrows still move it.
 CALL_LINES_ASKED = 3
+
+# How far the arrows move the call, by key. ↑↓ are the call's own at the y/n
+# stage, where nothing else wants them; once a box is open they belong to its
+# cursor (:meth:`Decision.scroll` hands them back), and alt+↑/↓ and the page
+# keys — none of which the editor takes — are what is left to read with.
+BOXED_KEYS = ("up", "down", "home", "end")
 
 
 # What a clipped block says instead of the lines it dropped. Counted rather
@@ -97,6 +118,15 @@ class Decision:
     # restates the whole thread on every change), with the one exception
     # :meth:`asked` makes for the moment between sending and hearing back.
     turns: list[dict] = field(default_factory=list)
+    # How far down the call the reader is, and how many rows of it the last
+    # frame had room for. The offset is the UI's, like the half-typed reason,
+    # and it lives here for the same reason: switching session parks it, so a
+    # diff read down to line 90 is still at line 90 on the way back. The
+    # window is kept because two things need it at different moments — the
+    # rule draws "34/210" before the height has been worked out, and page-down
+    # has to move by what was actually shown or it skips what was never read.
+    offset: int = 0
+    window: int = 1
 
     @property
     def asking(self) -> bool:
@@ -145,6 +175,40 @@ class Decision:
         self.question.clear()
         self.stage = ASK
 
+    def scroll(self, key: str) -> bool:
+        """The call under the arrows. True if the key was one of them.
+
+        ↑↓ and home/end are refused while a box is open: there is a cursor in
+        it, and a key that scrolled the call instead of moving that cursor
+        would be the reason box refusing to be typed in. What is left works at
+        every stage — alt+↑/↓ and the page keys are ones no editor takes — so
+        the call can still be read while the refusal about it is being
+        written, which is exactly when a reader wants to go back and check a
+        line.
+        """
+        if self.editor() is not None and key in BOXED_KEYS:
+            return False
+        view = max(1, self.window)
+        steps = {
+            "up": -1,
+            "down": 1,
+            "alt-up": -1,
+            "alt-down": 1,
+            "pgup": -view,
+            "pgdn": view,
+        }
+        if key in steps:
+            self.offset = max(0, self.offset + steps[key])
+        elif key == "home":
+            self.offset = 0
+        elif key == "end":
+            # Clamped against the real length when it is next drawn, which is
+            # the only place the number of folded rows is known.
+            self.offset = 10**9
+        else:
+            return False
+        return True
+
     def editor(self) -> Editor | None:
         """The box under the prompt, if this stage has one."""
         if self.stage == REASON:
@@ -176,17 +240,29 @@ def approval_title(payload: dict) -> str:
     return f"Destructive operation — {payload.get('tool')}?"
 
 
-def approval_hint(payload: dict, *, asked: bool = False, waiting: bool = False) -> str:
+def approval_hint(
+    payload: dict,
+    *,
+    asked: bool = False,
+    waiting: bool = False,
+    scrolls: bool = False,
+) -> str:
     """The keys the question takes. ``a`` is left off while an answer is being
     written — the core takes one question at a time, and a key that does
-    nothing is not one to offer — and says "again" once there is a dialog."""
+    nothing is not one to offer — and says "again" once there is a dialog.
+
+    ``scrolls`` adds the arrows, and only when there is something under the
+    fold for them to reach: the count on the rule says there is more, and this
+    says which key brings it. Offered on a call that fits, it would be a key
+    that does nothing — the same reason ``a`` comes off while one is out.
+    """
     if approval_kind(payload) == "execution":
         keys = "(y) run script · (n) skip script"
     else:
         keys = "(y) approve · (n) deny"
-    if waiting:
-        return keys
-    return keys + (" · (a) ask again" if asked else " · (a) ask the agent")
+    if not waiting:
+        keys += " · (a) ask again" if asked else " · (a) ask the agent"
+    return keys + (" · (↑↓) scroll" if scrolls else "")
 
 
 def approval_question_hint() -> str:
@@ -257,16 +333,19 @@ def approval_script(payload: dict) -> str | None:
 # ---------------------------------------------------------- what it looks like
 
 
-def _wrapped(text: str, width: int, cap: int) -> list[str]:
-    """A block folded to the width it has, and cut to the rows it may have."""
+def _wrapped(text: str, width: int) -> list[str]:
+    """A block folded to the width it has, whole — never cut.
+
+    Cutting is the drawing's business now, and it does it by windowing rather
+    than by dropping: whatever is not on screen is one arrow key away
+    (:func:`render_decision`).
+    """
     if not text:
         return []
     lines: list[str] = []
     for paragraph in text.split("\n"):
         lines += fold(paragraph, max(8, width)) or [""]
-    if len(lines) <= cap:
-        return lines
-    return lines[: max(1, cap - 1)] + [_more(len(lines) - max(1, cap - 1))]
+    return lines
 
 
 def _said(style: str, who: str, text: str, width: int) -> list[tuple[str, str]]:
@@ -310,6 +389,55 @@ def _exchanges(
     return blocks
 
 
+def detail_rows(decision: Decision, width: int) -> list[tuple[str, str]]:
+    """What this call does, in a sentence or two — ``rm /scratch/x.bam`` and
+    what that costs. Short by construction (`agent.file_tools._describe_edit`
+    and its siblings), which is what lets :func:`render_decision` hold it
+    above the scroll: it names the file, and the file is the one fact that
+    must be true of every row of the diff below it."""
+    return [
+        ("", f"  {line}")
+        for line in _wrapped(approval_details(decision.payload), width - 4)
+    ]
+
+
+def script_rows(decision: Decision, width: int) -> list[tuple[str, str]]:
+    """The script, the command or the diff — the body of what is being decided.
+
+    Whole, always. A verdict on the first twelve lines of a diff is not a
+    verdict on the diff, so nothing is dropped here, and how much of it is on
+    screen at once is a question of room (:func:`render_decision`) rather
+    than one of content.
+    """
+    script = approval_script(decision.payload)
+    if not script:
+        return []
+    # Set off by a gutter rather than a box: what is in here is the thing
+    # being decided on, and it has to be told apart from the sentence above
+    # it at a glance.
+    return [(theme.faint, f"  │ {line}") for line in _wrapped(script, width - 6)]
+
+
+def call_lines(decision: Decision, width: int) -> list[tuple[str, str]]:
+    """The call end to end: what it does, then the body under it. What the
+    prompt would draw given all the rows it wanted (:func:`decision_height`)."""
+    return detail_rows(decision, width) + script_rows(decision, width)
+
+
+def _position(decision: Decision, total: int) -> str:
+    """How far down the call the reader is, for the rule.
+
+    The one thing the rows themselves cannot say. There is no cursor here and
+    no scrollbar, so "is there more of this below?" — the question a user
+    reading a diff before approving it is asking — is answered on the rule, in
+    the same "34/210" the compaction review uses. Nothing while it all fits,
+    which is what most calls look like.
+    """
+    if total <= decision.window:
+        return ""
+    return f"{min(decision.offset + decision.window, total)}/{total}"
+
+
 def _sections(
     decision: Decision,
     width: int,
@@ -317,38 +445,49 @@ def _sections(
     *,
     focused: bool,
     period: float,
+    call: list[tuple[str, str]] | None = None,
+    scrolling: int | None = None,
 ) -> tuple[list, list, list, list]:
     """The prompt in four parts: the heading, the call, the dialog about it,
     and the key hint. :func:`prompt_rows` is them end to end;
     :func:`render_decision` is them fitted to a height, which is why they are
-    kept apart until then."""
+    kept apart until then.
+
+    ``call`` is an already-folded block to use instead of folding one — what
+    :func:`render_decision` passes on its second pass, so that settling the
+    window does not cost a second fold of a forty-thousand-character diff.
+    ``scrolling`` is how many of those rows are the part that scrolls, which
+    is what the count on the rule and the arrows in the hint are about; the
+    whole block, when the caller does not say otherwise.
+    """
     payload = decision.payload
     accent = theme.warn if approval_kind(payload) == "execution" else theme.danger
-    head = [(BOLD + theme.chrome if focused else theme.faint, rule("decision", width))]
+    call = call_lines(decision, width) if call is None else call
+    total = len(call) if scrolling is None else scrolling
+    head = [
+        (
+            BOLD + theme.chrome if focused else theme.faint,
+            rule("decision", width, _position(decision, total)),
+        )
+    ]
     title = (
         approval_reason_title(payload)
         if decision.stage == REASON
         else approval_title(payload)
     )
     head.append((accent + BOLD, f"  {title}"))
-    call = [
-        ("", f"  {line}")
-        for line in _wrapped(approval_details(payload), width - 4, DETAIL_LINES)
-    ]
-    script = approval_script(payload)
-    if script:
-        # Set off by a gutter rather than a box: what is in here is the thing
-        # being decided on, and it has to be told apart from the sentence
-        # above it at a glance.
-        for line in _wrapped(script, width - 6, SCRIPT_LINES):
-            call.append((theme.faint, f"  │ {line}"))
     dialog = _exchanges(decision, width, now, period)
     if decision.stage == REASON:
         hint = approval_reason_hint()
     elif decision.stage == QUESTION:
         hint = approval_question_hint()
     else:
-        hint = approval_hint(payload, asked=bool(decision.turns), waiting=decision.waiting)
+        hint = approval_hint(
+            payload,
+            asked=bool(decision.turns),
+            waiting=decision.waiting,
+            scrolls=total > decision.window,
+        )
     breathes = decision.asking and not decision.waiting and now is not None
     return head, call, dialog, [(pulse(now, period) if breathes else theme.faint, f"  {hint}")]
 
@@ -460,31 +599,68 @@ def render_decision(
 
     When the room is short the middle goes first: the rule, the heading, the
     key hint and the box are what the prompt *is*, and the details and the
-    script are what it is about — clipping those says "there is more here",
-    while clipping the hint would leave a question with no visible way to
-    answer it.
+    script are what it is about — showing part of those says "there is more
+    here", while clipping the hint would leave a question with no visible way
+    to answer it.
+
+    Part, and not the *first* part. The call is a window on a block that is
+    kept whole (:func:`call_lines`), positioned by ``decision.offset``, and
+    the arrows move it — because what this prompt is asking is whether to make
+    a change, and the tail of a diff is where the answer usually is: whether
+    the heredoc was closed, whether the last hunk touched something else. A
+    prompt that showed the head and counted the rest was asking the user to
+    approve a file they had not been shown.
 
     With a dialog in the middle too, the call gives way to it first — down to
     ``CALL_LINES_ASKED`` — and then the dialog to the call: the answer is what
     the user is reading, and the call is what they already read before they
     asked about it (:func:`_fit_dialog` for how the dialog itself gives way).
+    Down to three rows it is still a window, so the line the question was
+    about is still reachable while the answer is on screen.
     """
-    head, call, dialog, tail = _sections(
-        decision, width, now, focused=focused, period=period
+    details = detail_rows(decision, width)
+    script = script_rows(decision, width)
+    call = details + script
+    head, _, dialog, tail = _sections(
+        decision, width, now, focused=focused, period=period, call=call
     )
     box = min(box_height(decision, width), max(0, height - 3))
     room = max(0, height - box)
     middle = max(0, room - len(head) - len(tail))
+    # The sentence naming the call is held above the scroll while there is
+    # room for it and for something of the body underneath: it says *which*
+    # file, and which file has to stay true of whatever row of the diff is on
+    # screen. When it is itself the long thing — a call with no script, whose
+    # arguments are all there is to judge by — it is what scrolls instead, so
+    # nothing is ever merely cut off.
+    pinned = details if script and len(details) + CALL_LINES_ASKED <= middle else []
+    body = script if pinned else call
+    space = max(0, middle - len(pinned))
     talked = sum(len(block) for block in dialog)
-    if len(call) + talked > middle:
-        if dialog:
-            keep = min(len(call), max(CALL_LINES_ASKED, middle - talked), middle)
-        else:
-            keep = middle
-        call = _cut(call, keep)
-        rows = head + call + _fit_dialog(dialog, middle - len(call)) + tail
+    if len(body) + talked > space and dialog:
+        keep = min(len(body), max(CALL_LINES_ASKED, space - talked), space)
     else:
-        rows = head + call + [row for block in dialog for row in block] + tail
+        keep = min(len(body), space)
+    # Settled here and nowhere else: this is the only place that knows both how
+    # many rows the body folded to and how many of them there is room for, and
+    # both the count on the rule and the keys under it are answers to that.
+    decision.window = max(1, keep)
+    decision.offset = max(0, min(decision.offset, len(body) - keep))
+    # So the head and the tail are built again now that it is known — the first
+    # pass worked them out from the window of the frame before this one, which
+    # is right often enough to be wrong exactly when the terminal is resized.
+    head, _, dialog, tail = _sections(
+        decision,
+        width,
+        now,
+        focused=focused,
+        period=period,
+        call=call,
+        scrolling=len(body),
+    )
+    shown = body[decision.offset : decision.offset + max(0, keep)]
+    rows = head + pinned + shown
+    rows += _fit_dialog(dialog, max(0, space - len(shown))) + tail
     out = [f"{style}{pad(text, width)}{RESET}" for style, text in rows[:room]]
     while len(out) < room:
         out.append(" " * width)

@@ -16,6 +16,8 @@ asserted to show is what it shows in the app.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from hpca import protocol
@@ -130,6 +132,14 @@ async def wire():
         )
         w.peer.clear()
         yield w
+
+
+def position(wire) -> tuple[int, int] | None:
+    """The "34/210" the rule carries while the call is longer than its window,
+    or None while the whole of it is on screen."""
+    rule = next(x for x in wire.frame() if "── decision ─" in x)
+    found = re.search(r"(\d+)/(\d+)", rule)
+    return (int(found[1]), int(found[2])) if found else None
 
 
 async def parked(wire, payload: dict, session_id: str = "s1"):
@@ -525,6 +535,134 @@ class TestThePromptShowsTheCallAndNothingElse:
         assert "key: merge_vcf" in text
         assert "timeout_s" not in text, "plumbing"
         assert "content_lines" not in text, "the script block already says it"
+
+
+class TestTheWholeCallCanBeRead:
+    """The prompt shows all of what it is asking about, a window at a time.
+
+    The thing it is asking about is routinely longer than the rows it has — a
+    diff, a file being written, a forty-line script — and the old prompt drew
+    the first dozen rows of it and counted the rest, so the answer was given
+    on a head and the tail (did the heredoc close? what did the last hunk
+    touch?) was unreachable. Nothing is dropped now: the block is kept whole
+    and the arrows move the window over it.
+    """
+
+    async def test_the_tail_of_a_long_script_is_reachable(self, wire):
+        await parked(wire, LONG_SCRIPT)
+        assert "step_59.sh" not in wire.screen(), "not on the first screenful"
+        await wire.press("end")
+        assert "step_59.sh" in wire.screen(), "the last line, which decides it"
+
+    async def test_and_nothing_between_the_ends_is_skipped(self, wire):
+        await parked(wire, LONG_SCRIPT)
+        seen, last = set(), None
+        for _ in range(60):  # page to the bottom, collecting what went past
+            text = wire.screen()
+            seen |= {i for i in range(60) if f"step_{i}.sh " in text}
+            if text == last:
+                break
+            last = text
+            await wire.press("pgdn")
+        assert seen == set(range(60))
+
+    async def test_the_rule_says_how_far_down_it_you_are(self, wire):
+        await parked(wire, LONG_SCRIPT)
+        shown, total = position(wire)
+        assert total > shown > 0, "a count, not a bare ellipsis"
+        await wire.press("end")
+        assert position(wire) == (total, total), "at the bottom it says so"
+
+    async def test_and_offers_the_key_that_moves_it(self, wire):
+        await parked(wire, LONG_SCRIPT)
+        assert "(↑↓) scroll" in wire.screen()
+        assert ("↑↓", "scroll") in wire.ui._keys()
+
+    async def test_a_call_that_fits_says_neither(self, wire):
+        await parked(wire, BASH_GATE)
+        assert "(↑↓) scroll" not in wire.screen(), "a key that would do nothing"
+        assert position(wire) is None, "nothing below the fold to count"
+
+    async def test_home_goes_back_to_the_top(self, wire):
+        await parked(wire, LONG_SCRIPT)
+        first = wire.screen()
+        await wire.press("end", "home")
+        assert wire.screen() == first
+
+    async def test_reading_it_decides_nothing(self, wire):
+        await parked(wire, LONG_SCRIPT)
+        await wire.press("down", "pgdn", "end", "home", "up")
+        assert wire.peer.took(protocol.DecisionResolve) == []
+        assert "── decision ─" in wire.screen()
+
+    async def test_the_file_being_changed_stays_on_screen(self, wire, tmp_path):
+        # The one line that must be true of every row of the diff below it.
+        path, _, payload = edit_call_payload(tmp_path)
+        payload["script"] = "\n".join(f"+ line {i}" for i in range(80))
+        await parked(wire, payload)
+        await wire.press("end")
+        assert "+ line 79" in wire.screen(), "scrolled to the bottom"
+        assert str(path) in wire.screen(), "and it still says which file"
+
+    async def test_the_call_scrolls_while_the_reason_is_typed(self, wire):
+        # Where ↑↓ belong to the cursor in the box, alt+↑↓ and the page keys
+        # still read the call — which is how a refusal gets written *about* a
+        # particular line of it.
+        await parked(wire, LONG_SCRIPT)
+        await wire.press("n", *"line 40 is wrong")
+        assert "step_59.sh" not in wire.screen()
+        for _ in range(30):
+            await wire.press("pgdn")
+        assert "step_59.sh" in wire.screen()
+        assert "line 40 is wrong" in wire.screen(), "and the box is untouched"
+        await wire.press("enter")
+        assert wire.peer.last(protocol.DecisionResolve).reason == "line 40 is wrong"
+
+    async def test_the_arrows_are_the_cursor_s_while_a_box_is_open(self, wire):
+        # ↑ in a two-line reason moves between its lines, keeping its column;
+        # it must not be spent on the call instead.
+        await parked(wire, LONG_SCRIPT)
+        await wire.press("n", *"second", "shift-enter", *"third", "up", *"X")
+        await wire.press("enter")
+        assert wire.peer.last(protocol.DecisionResolve).reason == "seconXd\nthird"
+
+    async def test_the_question_box_reads_the_call_the_same_way(self, wire):
+        await parked(wire, LONG_SCRIPT)
+        await wire.press("a", *"what is step 59?")
+        await wire.press("alt-down")
+        assert "what is step 59?" in wire.screen(), "the draft is untouched"
+        assert wire.ui.session.decision.offset == 1
+
+    @pytest.mark.parametrize(
+        "width,height", [(80, 24), (120, 40), (60, 14), (40, 10), (100, 8)]
+    )
+    async def test_a_scrolled_prompt_still_gets_an_exact_frame(
+        self, wire, width, height
+    ):
+        await parked(wire, LONG_SCRIPT)
+        wire.ui.handle("end", width, height)
+        drawn = wire.ui.render(width, height)
+        assert len(drawn) == height
+        assert widths(drawn) == {width}
+
+    async def test_an_answer_being_read_still_leaves_the_call_reachable(self, wire):
+        # Squeezed to `CALL_LINES_ASKED` by a dialog, it is squeezed and not
+        # cut: the line the question was about is still three keys away.
+        await parked(wire, LONG_SCRIPT)
+        await wire.press("a", *"is this safe?", "enter")
+        await wire.tell(
+            protocol.DecisionDialog(
+                session_id="s1",
+                turns=[
+                    protocol.DialogTurn(
+                        question="is this safe?", answer="yes\n" * 20
+                    )
+                ],
+            )
+        )
+        assert "step_59.sh" not in wire.screen()
+        await wire.press("end")
+        assert "step_59.sh" in wire.screen()
 
 
 class TestTheHelpersTheArgumentsAreBuiltBy:

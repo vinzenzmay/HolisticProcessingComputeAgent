@@ -1853,6 +1853,10 @@ class RowUI:
             keys = [("y", "approve"), ("n", "deny")]
             if decision is None or not decision.waiting:
                 keys.append(("a", "ask the agent"))
+            # The arrows, on the same terms the review row offers them: the
+            # call is longer than the prompt often enough that a verdict is
+            # being asked for on rows nobody has seen yet.
+            keys.append(("↑↓", "scroll"))
             return keys + [("esc", "deny, no reason"), ("tab ^↑^↓", "cycle")]
         if self.focus == INPUT:
             # Spelled out rather than built from ``common`` so that send and
@@ -2236,6 +2240,13 @@ class RowUI:
         message box — it is not on screen while this is, and tab used to aim
         at it. Nothing here can strand the prompt: every step of the ring
         comes back to it.
+
+        Everything the stage does not claim goes to the call, which scrolls
+        (`approval.Decision.scroll`): ↑↓ and home/end at the y/n, where
+        nothing else wants them, and alt+↑/↓ and the page keys at either box,
+        where the cursor does. A diff longer than the prompt is the ordinary
+        case rather than the exotic one, and the user is being asked to
+        approve all of it.
         """
         if key == "quit":
             return False
@@ -2262,6 +2273,11 @@ class RowUI:
                 self.focus = CHAT
             elif key in ("ctrl-down", "tab"):
                 self.focus = WATCHERS
+            else:
+                # Whatever is left is the call's own: the arrows read the
+                # thing being decided on, and anything else is a key this
+                # stage does not have.
+                decision.scroll(key)
             return True
         if decision.questioning:
             return self._handle_question(decision, key)
@@ -2275,7 +2291,9 @@ class RowUI:
             self.focus = CHAT  # the half-written reason stays where it is
         elif key == "ctrl-down":
             self.focus = WATCHERS
-        else:
+        elif not decision.scroll(key):
+            # The box has the cursor, so it has ↑↓ and home/end; what `scroll`
+            # refuses is what the editor is owed.
             decision.reason.handle(key)
         return True
 
@@ -2304,7 +2322,10 @@ class RowUI:
             self.focus = CHAT
         elif key == "ctrl-down":
             self.focus = WATCHERS
-        else:
+        elif not decision.scroll(key):
+            # The same split the reason box makes: the call still scrolls
+            # under alt+↑/↓ and the page keys while the question is typed,
+            # because a question about line 90 is written by looking at it.
             decision.question.handle(key)
         return True
 
