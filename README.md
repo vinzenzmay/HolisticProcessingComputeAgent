@@ -277,11 +277,6 @@ differently. In `<app dir>/settings.json`, on the backend entry:
   64 tokens of reasoning. (Do not set this on a vLLM backend: Qwen3.8 there
   accepts only xhigh/medium/low and answers anything else with a 400.)
 
-One thing to expect from a local box rather than a cluster: a 27B at Q4 needs
-~20 GB with its KV cache, so on a 20 GB card Ollama offloads a fifth of it to
-CPU and you get ~7 tokens/s — a task that takes seconds on the cluster takes a
-minute. A smaller quant is the lever, not a smaller context.
-
 ## Development
 
 ```bash
