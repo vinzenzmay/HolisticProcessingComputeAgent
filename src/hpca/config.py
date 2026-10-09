@@ -285,7 +285,7 @@ class LoggingSettings(_Section):
 
 
 class RagSettings(_Section):
-    embedding: str = "sentence-transformers/all-MiniLM-L6-v2"
+    embedding: str = "BAAI/bge-m3"
     embedding_base_url: str = "http://localhost:20000/v1"
 
 

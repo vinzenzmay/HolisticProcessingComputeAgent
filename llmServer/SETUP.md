@@ -407,7 +407,8 @@ Qwen3-Embedding) work, but lose some of what they are good at.
 
 1. **Name the model.** In `<app dir>/settings.json`, under `rag`, set
    `"embedding"` to exactly the `id` from `/v1/models`. Discovery sets only the
-   URL, never the model, and vLLM answers any other name with a 404:
+   URL, never the model, and vLLM answers any other name with a 404. HPCA's
+   default is `BAAI/bge-m3`, so only a different model needs this step:
 
    ```json
    "rag": {

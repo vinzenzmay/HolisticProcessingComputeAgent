@@ -1397,7 +1397,7 @@ editor (`c`) and by hand. Sketch:
   "editor": null,
   "rag": {
     "store": "sqlite-vec",
-    "embedding": "sentence-transformers/all-MiniLM-L6-v2",
+    "embedding": "BAAI/bge-m3",
     "embedding_base_url": "http://localhost:51943/v1"
   }
 }

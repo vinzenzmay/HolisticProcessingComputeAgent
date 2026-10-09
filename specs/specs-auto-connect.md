@@ -28,7 +28,7 @@ backend is a vLLM server on a GPU node, launched via `sbatch` scripts that live
 
 | Instance | id | Port |
 |---|---|---|
-| embeddings sidecar (`embed.sh`, all-MiniLM-L6-v2) | — | `20000` |
+| embeddings sidecar (`embed.sh`, BAAI/bge-m3) | — | `20000` |
 | Qwen3.6 35B (`llm.35B.sh`) | 1 | `20001` |
 | Qwen3.6 35B dp3 (`llm.35B.dp3.sh`) | 2 | `20002` |
 | Qwen3.6 27B (`llm.27B.sh`) | 3 | `20003` |

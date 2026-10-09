@@ -1,7 +1,7 @@
 """Embedded vector store on sqlite-vec (§5.6.2) — daemon-free, one file.
 
 ``chunk_text`` splits documents on paragraph boundaries under a character
-budget (the MiniLM-class embedders cap at ~256 tokens). ``RagStore`` pairs a
+budget (small embedders such as MiniLM cap at ~256 tokens). ``RagStore`` pairs a
 plain ``chunks`` table with a ``vec0`` virtual table for KNN queries; the
 vector dimension is fixed by the first insert and recorded in ``meta``.
 

@@ -169,7 +169,7 @@ class TestDefaults:
     def test_editor_and_rag_defaults(self):
         s = Settings()
         assert s.editor is None
-        assert s.rag.embedding == "sentence-transformers/all-MiniLM-L6-v2"
+        assert s.rag.embedding == "BAAI/bge-m3"
         assert s.rag.embedding_base_url == "http://localhost:20000/v1"
 
 

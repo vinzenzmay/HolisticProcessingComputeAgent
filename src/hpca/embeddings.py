@@ -1,7 +1,7 @@
 """OpenAI-compatible embeddings client (§5.6.2).
 
 Embeddings come from the backend's ``/v1/embeddings`` endpoint (a small vLLM
-sidecar serving e.g. all-MiniLM-L6-v2), keeping HPCA itself free of local ML
+sidecar serving e.g. BAAI/bge-m3), keeping HPCA itself free of local ML
 dependencies.
 """
 
