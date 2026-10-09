@@ -24,7 +24,12 @@ and the rule is that **a toast must never break the frame**:
 Drawn over the frame rather than taking rows from it, the way
 `RowUI._over_confirm` draws the yes/no: a toast comes and goes on a timer, and
 a layout that changed under one would move the conversation up and down while
-the user reads it.
+the user reads it. Drawn at the *bottom*, just above the key hints: the top of
+the frame is the header and the sessions list, the controls a user reaches for
+first, and a notification that sat on them hid exactly what mattered most.
+And always on its own ground, `theme.overlay`: the one thing in the frame that
+is not part of the interactive UI says so by looking different from it, which
+is also what draws the eye to it.
 """
 
 from __future__ import annotations
@@ -51,8 +56,8 @@ def severity_style(severity: str) -> str:
     return getattr(theme, ROLES.get(severity, "faint"))
 
 # At most three at once and at most eight rows between them: a toast covers the
-# top of the sessions column, and a stack that could cover the column entirely
-# would be a modal nobody asked for.
+# bottom of the frame, and a stack that could cover the panes entirely would be
+# a modal nobody asked for.
 MAX_TOASTS = 3
 MAX_ROWS = 8
 # Rows of body one toast may spend before it is clipped. The rest is a line

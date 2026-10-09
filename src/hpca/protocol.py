@@ -1200,6 +1200,7 @@ class Palette(_Model):
     faint: str = "245"
     spinner: list[str] = ["73", "66", "23", "236"]
     flash: str = "23"
+    overlay: str = "236"
 
 
 class DisplaySettings(_Model):

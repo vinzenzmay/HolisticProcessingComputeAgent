@@ -56,10 +56,11 @@ def valid(spec: str) -> bool:
 def sgr(spec: str, *, background: bool = False) -> str:
     """The escape sequence that selects `spec`.
 
-    ``background`` picks layer 48 over 38, and is used by exactly one caller —
-    the focus flash, which is the first thing in this UI ever to set a
-    background colour. Everything else has always been foreground over whatever
-    ground the user's terminal paints.
+    ``background`` picks layer 48 over 38, and is used by two callers — the
+    focus flash, which was the first thing in this UI ever to set a background
+    colour, and the ground every toast is drawn on.
+    Everything else is foreground over whatever ground the user's terminal
+    paints.
     """
     if not valid(spec):
         raise ValueError(f"{spec!r} is not a colour")
@@ -169,6 +170,9 @@ class Theme:
     # the second one would arrive.
     flash: str
     flash_hold: float
+    # The ground every toast is drawn on — the second background, after the
+    # flash.
+    overlay: str
     # The decision prompt's breath, palest first.
     pulse: tuple[str, ...]
 
@@ -186,6 +190,7 @@ def build(
     spinner: tuple[str, ...] | list[str],
     flash: str,
     flash_hold: float,
+    overlay: str,
 ) -> Theme:
     """A `Theme` from the colour *specs* a settings file holds."""
     return Theme(
@@ -200,6 +205,7 @@ def build(
         spinner=tuple(sgr(s) for s in spinner),
         flash=sgr(flash, background=True),
         flash_hold=flash_hold,
+        overlay=sgr(overlay, background=True),
         # Between the colour prose is written in and the colour the chrome is,
         # which is what the ramp has always walked — it was written as two
         # hard-coded triples when both ends were constants, and it is the same
@@ -230,6 +236,7 @@ DEFAULTS = dict(
     spinner=("73", "66", "23", "236"),
     flash="23",
     flash_hold=FLASH_HOLD,
+    overlay="236",
 )
 
 _current = build(**DEFAULTS)  # type: ignore[arg-type]

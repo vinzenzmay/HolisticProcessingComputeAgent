@@ -1576,26 +1576,29 @@ class RowUI:
     def _over_toasts(self, out: list[str], width: int, footer_h: int) -> list[str]:
         """What the core said, over the finished frame (§4.3 item 35).
 
-        Directly under the header, and full-width rows replaced whole. Both
-        halves of that are about the differential repaint. Full rows, because
-        splicing a box into the middle of an already-styled line means cutting
-        SGR sequences, and a cut escape is a colour that never ends. Under the
-        header, because that is the one band of the frame whose height never
-        depends on what is in it — put the block over the chat and a toast
-        arriving mid-turn would cover the rows the user is reading; put it over
-        the message box and it would cover what they are typing.
+        Directly above the footer, and full-width rows replaced whole. Full
+        rows because of the differential repaint: splicing a box into the
+        middle of an already-styled line means cutting SGR sequences, and a cut
+        escape is a colour that never ends. Above the footer because the top of
+        the frame is the header and the sessions list — the controls a user
+        reaches for first — and the bottom is the watchers pane, the band that
+        least needs reading this second. The key hints themselves stay
+        uncovered: they are how the user acts on what the toast said.
+
+        Always on `theme.overlay`: a toast is not part of the interactive UI,
+        and a ground of its own says so — and draws the eye — where rows in
+        the panes' colours would pass for more of the pane under them.
         """
         if not self.toasts:
             return out
-        rows = toasts.render(
-            self.toasts, self.clock(), width, max(0, len(out) - 1 - footer_h)
-        )
+        bottom = max(1, len(out) - footer_h)
+        rows = toasts.render(self.toasts, self.clock(), width, bottom - 1)
         if not rows:
             # Nothing live: drop what has expired so the list cannot grow for
             # the length of a session.
             self.toasts = []
             return out
-        out[1 : 1 + len(rows)] = rows
+        out[bottom - len(rows) : bottom] = self._wash(rows, theme.overlay)
         return out
 
     def _render_decision(self, width: int, height: int) -> list[str]:

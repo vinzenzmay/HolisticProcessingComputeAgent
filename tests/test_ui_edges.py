@@ -15,7 +15,8 @@ import os
 import pytest
 
 from hpca import protocol
-from hpca.ui import toasts
+from hpca.ui import theme, toasts
+from hpca.ui.ansi import RESET
 from hpca.ui.app import CHAT, INPUT, SESSIONS, WATCHERS, RowUI
 from hpca.ui.demo import build
 from hpca.ui.overlays import ConfigOverlay, HelpOverlay
@@ -128,6 +129,78 @@ class TestWhatAToastSays:
         ui = clocked(build())
         ui.toast("line one\nline two")
         assert "line one line two" in footer(ui, 120, 24)
+
+
+class TestWhereAToastIsDrawn:
+    """At the bottom, over the panes and never over the key hints.
+
+    It used to sit directly under the header, over the sessions list — the
+    controls a user reaches for first — so a notification hid the rows that
+    mattered most for as long as it was up.
+    """
+
+    def rows(self, ui: RowUI, height: int = 40) -> tuple[list[str], int]:
+        return ui.render(120, height), len(ui._footer(120, height))
+
+    def test_it_ends_on_the_row_above_the_footer(self):
+        ui = clocked(build())
+        ui.toast("look down here")
+        drawn, footer_h = self.rows(ui)
+        text = [plain(x) for x in drawn]
+        last = len(text) - footer_h - 1
+        assert "look down here" in text[last]
+        assert "── information" in "".join(text[last - 3 : last])
+
+    def test_the_top_of_the_frame_is_left_alone(self):
+        quiet = clocked(build())
+        before = frame(quiet, 120, 40)
+        ui = clocked(build())
+        ui.toast("look down here")
+        after = frame(ui, 120, 40)
+        assert after[:20] == before[:20]
+
+    def test_and_so_are_the_key_hints(self):
+        ui = clocked(build())
+        ui.toast("look down here")
+        assert "── information" not in footer(ui, 120, 40)
+
+    def test_it_always_has_a_ground_of_its_own(self):
+        ui = clocked(build())
+        ui.toast("look down here")
+        drawn, footer_h = self.rows(ui)
+        # Above the footer: the footer's note says the same thing in one line.
+        toast_rows = [x for x in drawn[:-footer_h] if "look down here" in plain(x)]
+        assert toast_rows and all(theme.overlay in x for x in toast_rows)
+        # The ground is restated after every reset, or it would stop at the
+        # first run that states its own style.
+        for row in toast_rows:
+            for piece in row.split(RESET)[1:-1]:
+                assert piece.startswith(theme.overlay)
+
+    def test_nothing_else_is_drawn_on_it(self):
+        ui = clocked(build())
+        ui.toast("look down here")
+        drawn, footer_h = self.rows(ui)
+        top = len(drawn) - footer_h - 4
+        assert not any(theme.overlay in x for x in drawn[:top])
+        assert not any(theme.overlay in x for x in drawn[-footer_h:])
+
+    def test_every_row_of_it_does(self):
+        ui = clocked(build())
+        ui.toast("one\ntwo", "warning", title="Several rows")
+        drawn, footer_h = self.rows(ui)
+        bottom = len(drawn) - footer_h
+        block = drawn[bottom - 4 : bottom]
+        assert "Several rows" in plain(block[1])
+        assert all(x.startswith(theme.overlay) for x in block)
+
+    def test_over_a_screen_it_is_at_the_bottom_too(self):
+        ui = clocked(build())
+        ui.overlay = HelpOverlay()
+        ui.toast("look down here")
+        text = [plain(x) for x in ui.render(120, 40)]
+        footer_h = len(ui._screen_footer(ui.overlay, 120, 40))
+        assert "look down here" in text[len(text) - footer_h - 1]
 
 
 class TestAToastGoesOnItsOwn:
