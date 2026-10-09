@@ -885,6 +885,58 @@ command. The name is normalised to a kebab-case handle before it reaches the for
 since a name with spaces can never be invoked as `/<skill>`. Nothing here writes a
 skill without the user reading it — the same rule as memory (§6).
 
+**User tools: the agent extends itself without touching the source.** A tool the
+user wants and HPCA lacks is written as a Python file in `<app_dir>/tools/`, never in
+the checkout, because HPCA is updated from main and an edit to its source would be
+lost or conflict. A file has one entry point, `register(registry)`, which is the same
+shape as HPCA's own `add_*_tools`. Every `*.py` there is a candidate
+(`_`/`.`-prefixed files are skipped), and `hpca.user_tools` can reload them *hot*.
+The registry is read on every decision, so swapping entries in place reaches the
+next round of every session without a graph rebuild. A file gets in whole or not at
+all, and only if the following hold:
+- its tools render into both tool protocols;
+- each handler is `async def`;
+- each name is an identifier that is neither a built-in's nor another user file's.
+
+A user `edit_file` would take the trash backup and the approval gate with it, which
+is why built-in names are off limits. A broken edit keeps the previous version
+loaded, so a mid-session mistake never costs a working tool. Two tools are the
+model's doors to this:
+- `check_user_tool` loads a file into a staging area and can call one of its tools
+  once as a test. With no file, it reports where the HPCA source and the tools dir
+  are.
+- `reload_user_tools` always gates outside full-auto. It is the moment new code
+  enters the agent's own process, and `create_file` never asked about a new file.
+  The approval shows the full source of each new file and the diff of each changed
+  one.
+
+**Startup loads only what a reload approved.** There are two ways to reload, and
+each one approves what it loads:
+- the agent's `reload_user_tools`, behind its approval gate;
+- the user's own `/reload-tools` command, where typing the command is the consent.
+
+A reload records the digest of every file it let in, in `tools/.approved.json`.
+Startup runs a file only while its bytes still hash to that digest. Anything else is
+listed in one notice ("waiting for approval") and never executed; a missing or
+unreadable record approves nothing. Without this rule, a draft written with
+`create_file`, which never asks, would run inside the agent on the next start, and a
+restart would walk around the approval. A tool written or edited by hand therefore
+costs one `/reload-tools`.
+
+A test call gates by what it calls. A tool already checked in its current form asks
+only if it would itself; one not yet checked asks, because what it does is unknown.
+Manual mode treats every user tool, and every check that runs one, as an execution
+tool. The shipped `new-tool` skill is the procedure that uses all of this:
+1. find the source;
+2. read the conventions;
+3. draft the file;
+4. grill the user (`grillme`);
+5. implement;
+6. check, reload, and call.
+
+A built-in added later under a user tool's name wins: the user file is refused at
+the next start, with a notice.
+
 Core tools:
 
 * `create_script(kind: bash|python, name, content)` — writes the script,

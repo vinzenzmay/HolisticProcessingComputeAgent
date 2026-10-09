@@ -74,14 +74,17 @@ def next_mode(mode: str) -> str:
     return MODES[(MODES.index(mode) + 1) % len(MODES)]
 
 
-def requires_execution_approval(mode: str | None, tool_name: str) -> bool:
+def requires_execution_approval(
+    mode: str | None, tool_name: str, *, executes: bool = False
+) -> bool:
     """Whether this mode shows every execution tool for approval first.
 
     Only manual mode does; auto and full-auto rely on the destructive-op gate
     (§5.3), which run_bash trips only when its script would actually destroy
-    something.
+    something. ``executes`` is the call's own say (`Tool.executes`): a user
+    tool, or a check that runs one, is execution whatever its name.
     """
-    return mode == "manual" and tool_name in EXECUTION_TOOLS
+    return mode == "manual" and (tool_name in EXECUTION_TOOLS or executes)
 
 
 def destructive_approval_required(mode: str | None) -> bool:

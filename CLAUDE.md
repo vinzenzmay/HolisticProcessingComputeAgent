@@ -61,6 +61,18 @@ that looks wrong and is not — refusing an `edit_file` does not stop the edit,
 it moves it into `run_bash` and `sed -i`, losing the trash backup; that is
 measured, not assumed (§3.0 of project.md).
 
+## The tool registry changes at runtime
+
+User tools (`<app_dir>/tools/*.py`, `hpca.user_tools`, project.md §5.1) are
+loaded into the same `ToolRegistry` the graph decides from, and
+`reload_user_tools` swaps them in place. So a tool can disappear between a
+decision and its execution: the graph answers that call with a tool error
+rather than raising. Startup loads only file versions a reload approved
+(`tools/.approved.json`); a test that wants a tool live at startup has to
+record that first. A new built-in whose name a user's tool already has wins,
+and that user file stops loading. Only `build_service`'s default registry gets
+user tools; a test that passes its own `tools=` gets none.
+
 ## Colours
 
 There are no colour constants. Every colour is a setting

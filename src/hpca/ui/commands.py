@@ -59,7 +59,7 @@ class Command:
     session: bool = True
 
 
-# The seven built-ins (§4.3 item 24), in definition order — which is also the
+# The built-ins (§4.3 item 24), in definition order — which is also the
 # order the menu shows them in until the first `command.counts` arrives.
 # The strings are `tui/app.py`'s COMMANDS, kept word for word: they are the
 # only documentation most of these commands have.
@@ -94,6 +94,12 @@ BUILTINS: tuple[Command, ...] = (
         "reasoning",
         "/reasoning — how hard this session's model reasons "
         "(off / low / medium / xhigh)",
+    ),
+    Command(
+        "reload-tools",
+        "/reload-tools — load the user tools directory into the agent; "
+        "what loads is approved for future starts",
+        session=False,
     ),
 )
 
