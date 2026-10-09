@@ -4,7 +4,7 @@
 # The runtime (pip install of vLLM + torch, ~15 GB)
 venv/
 
-# Model weights (~30.4 GB for Qwen3.8-27B-FP8, ~0.09 GB for the embedder)
+# Model weights (~30.4 GB for Qwen3.8-27B-FP8, ~2.2 GB for the embedder)
 weights/
 
 # Job output: vllm.a40-l40.out, embed-server.log

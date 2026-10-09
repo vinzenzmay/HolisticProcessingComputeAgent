@@ -3,7 +3,7 @@
 HPCA has no model of its own: it is a client for an OpenAI-compatible endpoint.
 This directory is the server side of that — a Slurm job that runs **vLLM** on a
 GPU node of your cluster, serving **Qwen3.8-27B-FP8** on port 20001, with a
-small embedding model on port 20000 for HPCA's document search.
+small embedding model (**BAAI/bge-m3**) on port 20000 for HPCA's document search.
 
 This guide assumes no prior knowledge of vLLM or Slurm. It takes about an hour,
 most of it downloading.
@@ -16,7 +16,7 @@ most of it downloading.
 | speed | ~47 tokens/s on 2× L40, ~27 without speculative decoding |
 | concurrent users | 6 (`MAX_NUM_SEQS`); ~5 can hold a *full* 262k window at once |
 | ports | **20001** chat/completions (API key required), **20000** embeddings (open) |
-| disk | ~15 GB runtime + ~30.4 GB weights |
+| disk | ~15 GB runtime + ~32.6 GB weights (LLM 30.4, embedder 2.2) |
 
 ---
 
@@ -47,6 +47,8 @@ If you know your cluster, this is the whole thing:
 cd llmServer
 ./setup_venv.sh                                                   # ~15 GB of runtime
 HF_HOME=$PWD/weights ./venv/bin/hf download Qwen/Qwen3.8-27B-FP8  # ~30 GB, needs 16 GB RAM
+HF_HOME=$PWD/weights ./venv/bin/hf download BAAI/bge-m3 \
+    --include "*.json" "pytorch_model.bin" "sentencepiece.bpe.model" "1_Pooling/*"  # ~2.2 GB
 head -c 32 /dev/urandom | base64 > ~/.vllm_api_key && chmod 600 ~/.vllm_api_key
 sbatch llm.a40-l40.sh                                             # 2× L40, TP=2
 tail -f vllm.a40-l40.out                                          # wait for "Application startup complete"
@@ -107,8 +109,19 @@ srun -p standard --mem=32G --time=4:00:00 --pty bash
 
 It resumes if interrupted. If your `huggingface_hub` is older and has no `hf`
 command, `./venv/bin/huggingface-cli download Qwen/Qwen3.8-27B-FP8` does the
-same. The embedding model (~90 MB) is fetched automatically on the sidecar's
-first run.
+same.
+
+Then the embedding model, ~2.2 GB:
+
+```bash
+HF_HOME=$PWD/weights ./venv/bin/hf download BAAI/bge-m3 \
+    --include "*.json" "pytorch_model.bin" "sentencepiece.bpe.model" "1_Pooling/*"
+```
+
+The `--include` list is what vLLM loads. Without it you also get an ONNX export
+and two heads it never reads, which triples the download. Skip this step and the
+sidecar fetches the model itself on its first run, from the GPU node. That works
+only if the node has internet, and the LLM then waits for the download.
 
 ## 3. Make an API key
 
@@ -123,8 +136,9 @@ The job reads that file and passes the key through the environment, never on
 the command line — command lines are world-readable in `ps aux` on a shared
 node, the environment is not.
 
-The embedding endpoint on 20000 is deliberately *not* key-protected: it is a
-90 MB sentence embedder, and HPCA's manifest advertises it as open.
+The embedding endpoint on 20000 is deliberately *not* key-protected: it only
+turns text into vectors, and HPCA's manifest advertises it as open. HPCA has
+no setting for an embeddings key.
 
 ## 4. Adapt it to your cluster
 
@@ -169,9 +183,10 @@ sbatch --gres=gpu:l40:1 llm.a40-l40.sh    # 1 card: ~30 tok/s, 112k window, shor
 ```
 
 Output goes to `vllm.a40-l40.out` in this directory, and the embedding
-sidecar's to `embed-server.log`. Startup takes a few minutes — the weights are
-read off shared storage and CUDA graphs are compiled. You are up when the log
-says:
+sidecar's to `embed-server.log`. The sidecar starts first, and the LLM waits
+until it answers (`embedding sidecar is up` in the log). Startup takes a few
+minutes — the weights are read off shared storage and CUDA graphs are compiled.
+You are up when the log says:
 
 ```
 Application startup complete.
@@ -329,12 +344,108 @@ images.
 
 ---
 
+## Using a different embedding model or server
+
+The sidecar serves `BAAI/bge-m3`. Until October 2026 it served
+`all-MiniLM-L6-v2`, which reads at most 256 tokens, knows only English, and is
+weak on scientific text. Any server that speaks the OpenAI `/v1/embeddings` API
+can replace it — either a different model in the same sidecar (A), or a server
+somewhere else (B). Both end in the same three HPCA steps.
+
+**Choosing a model.** HPCA sends documents and queries as plain text, with no
+`query:`/`passage:` prefix and no instruction. Prefer a model that does not
+need one, as bge-m3 does not. Models built around prefixes (E5, nomic-embed,
+Qwen3-Embedding) work, but lose some of what they are good at.
+
+### A. A different model in the sidecar
+
+1. **Download it** on a node with internet, into the same cache as the LLM,
+   as in [step 2](#2-download-the-weights), so the job does not fetch it from
+   the compute node: `HF_HOME=$PWD/weights ./venv/bin/hf download <hf id>`.
+
+2. **Name it**, without editing anything: `export EMBED_MODEL=<hf id>` before
+   `sbatch`. Slurm passes your environment into the job. To make it the
+   default, change the `MODEL=` line in `embed.sh`.
+
+3. **Check its memory.** The sidecar shares the LLM's first card.
+   `llm.a40-l40.sh` gives it a budget of 0.07 of the card (3.1 GiB) and
+   the LLM 0.88. The budget is not a footprint: a pooling model holds its
+   weights plus activations and nothing more (bge-m3 ~2.3 GiB, MiniLM 0.7). A
+   model up to ~600M parameters fits as it is. For a larger one, raise
+   `EMBED_GPU_MEM_UTIL=0.07` in the sidecar launch in `llm.a40-l40.sh`, and
+   lower `GPU_UTIL` by the same amount. The LLM's KV cache pays for it.
+
+4. **Restart the job:** `scancel <jobid>`, then `sbatch llm.a40-l40.sh`. The
+   sidecar cannot be swapped under a running LLM: vLLM refuses to start unless
+   its whole budget is free, and by then the LLM has taken it.
+
+5. **Check what it serves.** The `id` is the name HPCA must use:
+
+   ```bash
+   curl http://<gpu-node>:20000/v1/models
+   ```
+
+### B. A server somewhere else
+
+1. **Start it** with any OpenAI-compatible server: vLLM
+   (`vllm serve <model>`), Hugging Face text-embeddings-inference, Ollama, or
+   llama.cpp `llama-server --embeddings`. **Leave it without an API key:** HPCA
+   has no setting for an embeddings key and sends none.
+
+2. **Stop the sidecar**, if the LLM job still starts one. Comment out the
+   `embed.sh` launch in `llm.a40-l40.sh`. On the cluster, HPCA auto-connects to
+   whatever embedding server a manifest advertises, and it rewrites
+   `rag.embedding_base_url` to point there on every start. A running sidecar
+   would quietly pull HPCA back to itself.
+
+3. **Make it reachable.** On the cluster, if the server runs as a Slurm job,
+   `source write_manifest.sh embedding "<model>" <port> false` in its job
+   script lets HPCA discover it the way it discovers the sidecar. From a
+   workstation, tunnel its port the way 20000 is tunnelled above.
+
+### Then, in HPCA (both cases)
+
+1. **Name the model.** In `<app dir>/settings.json`, under `rag`, set
+   `"embedding"` to exactly the `id` from `/v1/models`. Discovery sets only the
+   URL, never the model, and vLLM answers any other name with a 404:
+
+   ```json
+   "rag": {
+     "embedding": "BAAI/bge-m3",
+     "embedding_base_url": "http://localhost:20000/v1"
+   }
+   ```
+
+   The URL is the tunnel's local end. On the cluster, auto-discovery fills it
+   in for you.
+
+2. **Delete the old indexes, with HPCA closed:** `rm -r <app dir>/rag/`, plus
+   `<app dir>/rag.db` if a version from before per-profile indexes left one.
+   Vectors from two models cannot be compared, and an index keeps the dimension
+   of the model that built it. Searching an old index with the new model fails
+   with `Embedding dimension mismatch`.
+
+3. **Index again** from each profile that needs its documents. Each profile
+   has its own index (`rag/<profile>.db`).
+
+**Check it end to end:**
+
+```bash
+curl -s http://localhost:20000/v1/embeddings -H 'Content-Type: application/json' \
+     -d '{"model": "BAAI/bge-m3", "input": ["hello"]}' | head -c 200
+```
+
+That should return a vector, 1024 numbers for bge-m3. A 404 means the model
+name does not match the server's `id`.
+
+---
+
 ## Where things get written
 
 | what | default | how to move it |
 |---|---|---|
 | runtime | `llmServer/venv` (~15 GB) | move the whole directory |
-| weights | `llmServer/weights` (~30.4 GB) | `export HF_HOME=/work/.../weights` (or `HPCA_WEIGHTS_DIR`) before both the download **and** `sbatch` |
+| weights | `llmServer/weights` (~32.6 GB) | `export HF_HOME=/work/.../weights` (or `HPCA_WEIGHTS_DIR`) before both the download **and** `sbatch` |
 | API key | `~/.vllm_api_key` | `API_KEY_FILE` in `llm.a40-l40.sh` |
 | job log | `llmServer/vllm.a40-l40.out` | `#SBATCH --output=` |
 | manifests | the shared endpoints dir | `HPCA_ENDPOINTS_DIR` |
@@ -417,6 +528,12 @@ the job resolved to 112 000 on one card.
 
 **401** — the request needs `Authorization: Bearer <~/.vllm_api_key>`.
 
+**`WARNING: embedding sidecar exited`**, or `Free memory on device ... is less
+than desired` in `embed-server.log` — the sidecar did not get its memory. The
+LLM still started, and only document search is down. Check the model name in
+`embed-server.log`, and that its weights are in `HF_HOME`. If it was restarted
+by hand beside a running LLM, restart the whole job instead.
+
 **Connection refused** — the tunnel is down, or the job picked a different port;
 check the `vLLM port:` line in `vllm.a40-l40.out`.
 
@@ -437,7 +554,7 @@ trying, each with the evidence behind it.
 |---|---|
 | `llm.a40-l40.sh` | the Slurm job: vLLM serving Qwen3.8-27B-FP8 on 20001. Every non-obvious number in it is explained in place — read it before changing one |
 | `setup_venv.sh` | one-time: creates `./venv` with mainline vLLM. `--upgrade` bumps it |
-| `embed.sh` | the embedding sidecar on 20000, launched in the background by the job |
+| `embed.sh` | the embedding sidecar on 20000 (BAAI/bge-m3), started by the job before the LLM |
 | `write_manifest.sh` | sourced by both, drops the JSON discovery manifest HPCA reads |
 | `draining_gpu_nodes.sh` | convenience: which GPU nodes are draining, and what all of them look like |
 

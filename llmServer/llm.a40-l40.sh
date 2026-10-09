@@ -194,8 +194,13 @@ if [[ ! -s "$API_KEY_FILE" ]]; then
 fi
 export VLLM_API_KEY="$(cat "$API_KEY_FILE")"
 
-# 0.90 here + 0.05 for the embedding sidecar = 0.95 of the card.
-GPU_UTIL=0.90
+# 0.88 here, and the embedding sidecar beside it. That was 0.90 while the
+# sidecar was all-MiniLM-L6-v2 (0.7 GiB held); BAAI/bge-m3 holds ~2.3 GiB, and an
+# LLM holds ~2.2 GiB beyond its own budget (measured on the 4-bit sibling of this
+# job: 42.2 GiB in nvidia-smi against 39.98 budgeted), so 0.02 (~0.9 GiB per
+# card, ~28k KV tokens on one card) moved to the sidecar. The SIZING figures
+# below predate this and are 0.9 GiB per card high.
+GPU_UTIL=0.88
 
 # 20001 by convention, and every client assumes it: HPCA's SSH-tunnel template,
 # the VS Code entry, SETUP.md. Only if it is already taken on the node does the
@@ -274,11 +279,30 @@ fi
 # native FP8. Inert and harmless on L40, so it stays unconditional.
 export VLLM_MARLIN_USE_ATOMIC_ADD=1
 
-# Embedding sidecar on GPU 0 of the allocation (~5%), pinned explicitly so it
-# cannot land on a different card than the one whose budget was reduced for it.
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES%%,*}" \
+# Embedding sidecar on GPU 0 of the allocation, pinned explicitly so it cannot
+# land on a different card than the one whose budget was reduced for it.
+#
+# STARTED FIRST, AND WAITED FOR. Both servers refuse to start unless their whole
+# budget is free at that moment, and the LLM ends up holding more than its own
+# budget (see GPU_UTIL). Launched side by side, which one fit was a race the
+# sidecar won by luck while it was MiniLM; restarting it beside a running LLM
+# found 1.76 GiB free. Up to 5 minutes: the LLM starts anyway after that, and a
+# sidecar that failed leaves only document search down, not the chat model.
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES%%,*}" EMBED_GPU_MEM_UTIL=0.07 \
     "$SCRIPT_DIR/embed.sh" > "$SCRIPT_DIR/embed-server.log" 2>&1 &
+EMBED_PID=$!
 echo "embedding sidecar launched in background (port 20000, see embed-server.log)"
+for _ in $(seq 150); do
+    if curl -sf -o /dev/null "http://127.0.0.1:${EMBED_PORT:-20000}/health"; then
+        echo "embedding sidecar is up"
+        break
+    fi
+    if ! kill -0 "$EMBED_PID" 2>/dev/null; then
+        echo "WARNING: embedding sidecar exited — see embed-server.log" >&2
+        break
+    fi
+    sleep 2
+done
 
 # Discovery manifest for HPCA, now that both $PORT and $MAX_MODEL_LEN are known.
 source "$SCRIPT_DIR/write_manifest.sh" llm "$SERVED_NAME" "$PORT" true "$MAX_MODEL_LEN"
@@ -364,8 +388,9 @@ python -m vllm.entrypoints.openai.api_server \
 #    to expect is not a startup error — it starts clean and serves garbage, and
 #    only the teacher-forcing test in FALLBACK 1 will tell you. Separately, do
 #    NOT reach for `nvfp4`: it needs SM100 trtllm-gen kernels, i.e. Blackwell.
-# 7) Reclaiming the sidecar's 5%: comment out the embed.sh launch and raise
-#    GPU_UTIL to 0.95. Worth ~2.2 GiB, ~68k more fp8 KV tokens.
+# 7) Reclaiming the sidecar's share: comment out the embed.sh launch (and its
+#    wait loop) and raise GPU_UTIL to 0.93. Worth ~3.1 GiB per card, ~95k more
+#    fp8 KV tokens on one card.
 # 8) JOB STUCK PENDING — the two-card default is the likeliest reason on a busy
 #    partition (`squeue -u $USER --start`). One card needs no edit but serves
 #    112000; check the VS Code maxInputTokens before a long session.
