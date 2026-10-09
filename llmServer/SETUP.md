@@ -265,7 +265,7 @@ Both services live on the GPU node, so both forwards target it. Get the node
 name from `squeue -u $USER`:
 
 ```bash
-ssh -N -L 20001:<gpu-node>:20001 -L 20000:<gpu-node>:20000 <you>@<login-host>
+ssh -fN -L 20001:<gpu-node>:20001 -L 20000:<gpu-node>:20000 <you>@<login-host>
 ```
 
 Verify, then point HPCA at localhost:
