@@ -341,6 +341,7 @@ class TestHandshake:
             "flash",
             "muted",
             "ok",
+            "overlay",
             "spinner",
             "user",
             "warn",

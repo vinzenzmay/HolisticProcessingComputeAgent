@@ -434,9 +434,13 @@ class PaletteSettings(_Section):
     spinner: list[Colour] = Field(
         default=["73", "66", "23", "236"], min_length=1, max_length=4
     )
-    # The background the pane that just took focus is washed in. The only
-    # background colour this UI draws; see `focus_flash_seconds`.
+    # The background the pane that just took focus is washed in; see
+    # `focus_flash_seconds`.
     flash: Colour = "23"
+    # The background every notification is drawn on: a toast is not part of
+    # the interactive UI, and a ground of its own says so and draws the eye.
+    # Off the flash's teal, because a toast is not a pane taking focus.
+    overlay: Colour = "236"
 
 
 class DisplaySettings(_Section):

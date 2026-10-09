@@ -3577,6 +3577,7 @@ def _display_settings(settings) -> DisplaySettings:
             faint=palette.faint,
             spinner=list(palette.spinner),
             flash=palette.flash,
+            overlay=palette.overlay,
         ),
     )
 

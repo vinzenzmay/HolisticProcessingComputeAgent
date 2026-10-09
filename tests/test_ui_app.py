@@ -4,6 +4,7 @@
 feed keys, read the frame back and look at it".
 """
 
+import time
 from dataclasses import replace
 
 import pytest
@@ -25,6 +26,7 @@ from hpca.ui.demo import build
 from hpca.ui.keys import PASTE, decode
 from hpca.ui.state import ChatEntry, Interrupt
 from tests.ui_harness import (
+    at_wall,
     clocked,
     footer,
     frame,
@@ -308,6 +310,13 @@ def test_a_note_does_not_move_a_single_row_above_it():
         quiet.focus = SESSIONS
         noisy = build()
         noisy.focus = SESSIONS
+        # One turn start and one wall clock for both frames: the demo's
+        # working row has a spinner drawn off the time since its turn began,
+        # and two demos built a tick apart would differ there.
+        noisy.session.turn.started_epoch = quiet.session.turn.started_epoch
+        now = time.time()
+        at_wall(quiet, now)
+        at_wall(noisy, now)
         noisy.note = "deleted “a session with a reasonably long title”"
         before = [plain(row) for row in quiet.render(width, 30)]
         after = [plain(row) for row in noisy.render(width, 30)]
