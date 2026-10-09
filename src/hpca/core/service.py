@@ -36,6 +36,7 @@ import logging
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from pydantic import ValidationError
@@ -65,6 +66,7 @@ from hpca.agent.prompts import (
     orchestrator_system_prompt,
 )
 from hpca.agent.skill_drafter import propose_skill
+from hpca.agent.selfmod_tools import add_selfmod_tools
 from hpca.agent.skill_tools import add_skill_tools
 from hpca.agent.titler import propose_title
 from hpca.agent.watch_tools import add_watch_tools
@@ -180,6 +182,7 @@ from hpca.transcript import (
     Entry,
     build_entries,
 )
+from hpca.user_tools import USER_TOOLS_SUBDIR, UserTools
 from hpca.watches import KIND_LOG, WatchStore, peek, watch_lines
 
 logger = logging.getLogger("hpca.core.service")
@@ -230,7 +233,7 @@ def _count_use(conn, name: str) -> dict[str, int]:
     return command_use_counts(conn)
 
 
-# The slash commands this core answers — the seven built-ins of §4.1. Kept as
+# The slash commands this core answers — the built-ins of §4.1. Kept as
 # a set rather than inferred from the handler chain because it is also what
 # decides whether a command is worth counting for the front-end's frequency
 # sort: an unknown one must not teach the menu a name nothing can run.
@@ -243,6 +246,7 @@ SLASH_COMMANDS = frozenset(
         "skills-list",
         "skill-remove",
         "skill-creator",
+        "reload-tools",
     }
 )
 
@@ -307,6 +311,12 @@ class AgentService:
     # and no server is running — so every core built in a test would open a
     # socket to say so. The tests that cover the check turn it back on.
     startup_backend_check = True
+    # The user tools (hpca.user_tools) and what their startup load said; set
+    # by `build_service` when it built the registry, None when a caller
+    # passed its own. The report is told in `startup`, because nothing is
+    # subscribed to the events while the service is still being assembled.
+    user_tools: Any = None
+    user_tools_report: Any = None
 
     def __init__(
         self,
@@ -2414,7 +2424,7 @@ class AgentService:
     # ----------------------------------------------------------- slash commands
 
     async def _run_slash(self, command: CommandRun) -> None:
-        """`command.run`: the seven built-in slash commands.
+        """`command.run`: the built-in slash commands.
 
         The front-end parses `/name rest` and sends both halves; what ``rest``
         means is each handler's business (a note, a level, a skill name,
@@ -2457,6 +2467,9 @@ class AgentService:
             return
         if name == "skills-list":
             self._list_skills(command.session_id)
+            return
+        if name == "reload-tools":
+            self._spawn(self._reload_tools())
             return
         if name == "skill-remove":
             self._remove_skill(command.session_id, args)
@@ -3072,6 +3085,7 @@ class AgentService:
         startup that cannot sweep a directory is still a startup.
         """
         self._sweep_trash()
+        self._tell_user_tool_failures()
         self._memory.run_curator_if_due()
         # Discover and connect what the cluster offers *first*, so that the
         # check below probes the backend auto-connect just activated rather
@@ -3080,6 +3094,59 @@ class AgentService:
         if not self.startup_backend_check:
             return True
         return await self._backends.ensure_connected()
+
+    async def _reload_tools(self) -> None:
+        """`/reload-tools`: the user loads — and so approves — what is in the
+        user tools directory. The command is the consent, so nothing asks
+        again; it is the same reload the agent's `reload_user_tools` makes
+        behind its gate (hpca.user_tools)."""
+        if self.user_tools is None:
+            self._deps.emit(
+                Notify(severity="warning", text="This core has no user tools.")
+            )
+            return
+        report = await self.user_tools.reload()
+        self._deps.emit(
+            Notify(
+                severity="warning" if report.failed or report.unrecorded else "information",
+                title="User tools",
+                text=report.render(),
+            )
+        )
+
+    def _tell_user_tool_failures(self) -> None:
+        """Say which user tool files did not load at startup, once.
+
+        A tool that silently is not there reads, from the chat, like a model
+        that forgot it — the user has to be told the file is the problem.
+        Files waiting for approval are one quiet line, not a warning each:
+        a draft mid-way through the new-tool skill is that, every start."""
+        report = self.user_tools_report
+        self.user_tools_report = None
+        if report is None or not report.failed:
+            return
+        waiting = [f.path.name for f in report.failed if f.unapproved]
+        if waiting:
+            self._deps.emit(
+                Notify(
+                    title="User tools waiting for approval",
+                    text=f"{', '.join(waiting)} — not loaded. /reload-tools "
+                    "loads and approves them.",
+                )
+            )
+        for loaded in report.failed:
+            if loaded.unapproved:
+                continue
+            logger.warning(
+                "user tool %s did not load: %s", loaded.path, "; ".join(loaded.problems)
+            )
+            self._deps.emit(
+                Notify(
+                    severity="warning",
+                    title=f"User tool {loaded.path.name} did not load",
+                    text="\n".join(loaded.problems),
+                )
+            )
 
     def _sweep_trash(self) -> None:
         """Drop file backups past their TTL (`safety.trash_ttl_days`).
@@ -3200,6 +3267,15 @@ def build_service(
         add_skill_tools(tools)
         add_memory_tools(tools)
         add_plan_tool(tools)
+        # Last: every name above is a built-in, which no user file may take.
+        user_tools = UserTools(
+            tools,
+            Path(app_dir) / USER_TOOLS_SUBDIR if app_dir is not None else None,
+        )
+        add_selfmod_tools(tools, user_tools)
+        user_tools_report = user_tools.load_now()
+    else:
+        user_tools = user_tools_report = None
 
     backends = BackendRegistry(deps, sessions=sessions, llm=llm)
     # Declared before the memory service, which needs to ask it a question
@@ -3438,6 +3514,8 @@ def build_service(
         answer_pending=answer_about_call,
     )
     service_ref["service"] = service
+    service.user_tools = user_tools
+    service.user_tools_report = user_tools_report
     # Triage's "shall I learn this signature?" offer needs somewhere to ask.
     # Wired after construction because the service is what holds the pending
     # question, and the poller is built before it.

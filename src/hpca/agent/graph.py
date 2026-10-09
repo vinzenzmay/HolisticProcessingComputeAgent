@@ -423,6 +423,23 @@ def build_graph(
         thread_id = _thread_id(config)
         pending = state["pending_tool"]
         assert pending is not None
+        if pending["tool"] not in tools.names():
+            # Only a user tool can vanish between the decision and this node:
+            # a reload in another session, or a restart while the call was
+            # parked for approval and its file no longer loads. Answered like
+            # any failed call — raising here would take the turn down with it.
+            content = (
+                f"[tool error] {pending['tool']}: that tool is no longer "
+                "loaded — the user tools changed since this call was made. "
+                "Nothing ran."
+            )
+            report_step(thread_id, {"kind": "step", "text": content})
+            return _tool_exchange(
+                pending["tool"],
+                pending["arguments"],
+                content,
+                pending.get("call_id") or "",
+            )
         tool = tools.get(pending["tool"])
         report(thread_id, f"running {tool.name}")
         arguments = tool.params.model_validate(pending["arguments"])
@@ -437,6 +454,11 @@ def build_graph(
         # there was never one). Built here because both readings — the prompt
         # below and the record — must describe the same call.
         preview = script_preview(tool.name, pending["arguments"], context)
+        if preview is None and tool.show_call is not None:
+            try:
+                preview = tool.show_call(arguments, context) or None
+            except Exception:  # a preview never costs the call
+                preview = None
         # A repair rides with the description: it is part of what this call is,
         # and the user judging a script has to be told a line was taken out of
         # it — the preview above already shows the shortened version.
@@ -483,7 +505,9 @@ def build_graph(
                 destructive = False
         # Manual mode gates execution tools too (§3.5) — same
         # interrupt/resume machinery, a different question to the user.
-        execution = not destructive and requires_execution_approval(mode, tool.name)
+        execution = not destructive and requires_execution_approval(
+            mode, tool.name, executes=tool.executes(arguments, context)
+        )
         approved, reason = True, ""
         if destructive or execution:
             payload = {
