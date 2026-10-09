@@ -1370,12 +1370,13 @@ class MemoryService:
         Profile.create(cleaned)
         return None
 
-    def duplicate_profile(self, source: str, name: str) -> str | None:
+    async def duplicate_profile(self, source: str, name: str) -> str | None:
         """Fork a profile: same learnings, its own future.
 
-        Copies the memories and the source's own skills, then the two are
-        independent — which is the point, a shared base that specialises in
-        different directions. Returns an error message, or None on success.
+        Copies the memories, the source's own skills and its document index,
+        then the two are independent — which is the point, a shared base that
+        specialises in different directions. Returns an error message, or None
+        on success.
         """
         try:
             cleaned = Profile.validate_name(name)
@@ -1385,12 +1386,15 @@ class MemoryService:
             return f"There is no profile called “{source}”."
         Profile.duplicate(source, cleaned)
         skills = copy_profile_skills(source, cleaned)
+        stores = self._deps.extras.get("rag_stores")
+        index = stores is not None and await stores.copy(source, cleaned)
         self.invalidate(cleaned)
         memories = len(Profile.load(cleaned).memories)
         self._notify(
             f"Copied “{source}” to “{cleaned}” "
             f"({memories} memor{'y' if memories == 1 else 'ies'}"
             + (f", {skills} skill{'' if skills == 1 else 's'}" if skills else "")
+            + (", its document index" if index else "")
             + "). They diverge from here."
         )
         return None
@@ -1404,6 +1408,13 @@ class MemoryService:
         """
         if name in self._busy_profiles():
             return f"“{name}” has a reply in progress — wait for it to finish."
+        indexer = self._deps.extras.get("doc_indexer")
+        job = indexer.busy() if indexer is not None else None
+        if job is not None and job.profile == name:
+            return (
+                f"“{name}” is indexing documents into its index — wait for it "
+                "to finish."
+            )
 
         def busy(conn) -> bool:
             ids = {s.session_id for s in SessionStore(conn).list(profile=name)}
@@ -1429,6 +1440,9 @@ class MemoryService:
         )
         Profile.delete(name)
         delete_profile_skills(name)
+        stores = self._deps.extras.get("rag_stores")
+        if stores is not None:
+            await stores.remove(name)
         self.invalidate(name)
         if self._index is not None:
             self._index.forget_profile(name)

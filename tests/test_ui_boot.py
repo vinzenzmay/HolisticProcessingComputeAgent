@@ -157,7 +157,7 @@ def build_core(
         dbio=Aio(order, "dbio"),
         db=Recorder(order, "sqlite"),
         saver_ctx=Recorder(order, "checkpointer"),
-        rag=Recorder(order, "rag"),
+        rag_stores=Recorder(order, "rag"),
     )
 
 
@@ -481,12 +481,15 @@ class TestPlacement:
         assert str(core.dbcache.path_for("checkpoints.db")).startswith(str(local))
         assert core.dbcache.path_for("checkpoints.db").exists()
 
-    async def test_and_so_does_the_rag_store(self, core, local):
-        # `build_service` has no parameter for it and would have opened it in
-        # home; boot hands it over through `extras` instead.
-        assert core.service._deps.extras["rag"] is core.rag
-        opened = core.rag._conn.execute("PRAGMA database_list").fetchone()[2]
+    async def test_and_so_do_the_document_indexes(self, core, local):
+        # `build_service` has no parameter for them and would have opened them
+        # in home; boot hands its own over through `extras` instead.
+        stores = core.service._deps.extras["rag_stores"]
+        assert stores is core.rag_stores
+        store = await stores.open("default")
+        opened = store._conn.execute("PRAGMA database_list").fetchone()[2]
         assert opened.startswith(str(local))
+        assert opened == str(core.dbcache.local_dir / "rag" / "default.db")
 
     async def test_home_is_written_back_on_exit(self, home, local):
         built = await Core.start(llm=FakeLLM())

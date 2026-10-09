@@ -70,17 +70,19 @@ from hpca.agent.selfmod_tools import add_selfmod_tools
 from hpca.agent.skill_tools import add_skill_tools
 from hpca.agent.titler import propose_title
 from hpca.agent.watch_tools import add_watch_tools
-from hpca.config import LLMBackend, Settings, settings_path
+from hpca.config import LLMBackend, Settings, app_dir as default_app_dir, settings_path
 from hpca.core.backends import BackendRegistry
 from hpca.core.deps import CoreDeps
 from hpca.core.memory_service import KIND_REFLECTION, MemoryService
 from hpca.core.pollers import Pollers
 from hpca.core.scheduler import TurnPlan, TurnScheduler, wire_entry
 from hpca.db import command_use_counts, record_command_use
+from hpca.doc_index import DocIndexer
 from hpca.episodic import EpisodicStore
 from hpca.jobs import JobStore
 from hpca.logs import open_log
 from hpca.profiles import DEFAULT_PROFILE, Profile
+from hpca.rag import RagStores
 from hpca.protocol import (
     PROTOCOL_VERSION,
     BackendProbe,
@@ -642,7 +644,7 @@ class AgentService:
             self._create_profile(command.name)
             return
         if isinstance(command, ProfileDuplicate):
-            self._duplicate_profile(command)
+            await self._duplicate_profile(command)
             return
         if isinstance(command, ProfileDelete):
             await self._delete_profile(command.name)
@@ -1805,13 +1807,13 @@ class AgentService:
         self._deps.emit(Notify(text=f"Created profile “{name.strip()}”."))
         self._emit_profiles()
 
-    def _duplicate_profile(self, command: ProfileDuplicate) -> None:
+    async def _duplicate_profile(self, command: ProfileDuplicate) -> None:
         """`profile.duplicate`: same learnings, its own future.
 
         ``source`` defaults to the working profile, which is what "duplicate
         this one" means from a screen that is already showing it.
         """
-        error = self._memory.duplicate_profile(
+        error = await self._memory.duplicate_profile(
             command.source or self._deps.profile, command.name
         )
         if error is not None:
@@ -3209,6 +3211,9 @@ class AgentService:
                 await task
         self._timers.clear()
         self._tasks.clear()
+        indexer = self._deps.extras.get("doc_indexer")
+        if indexer is not None:
+            await indexer.stop()
         await self._scheduler.shutdown()
         await self._backends.aclose()
 
@@ -3476,6 +3481,14 @@ def build_service(
         on_turn_stopped=after_stopped_turn,
     )
     scheduler_ref["scheduler"] = scheduler
+    # Large docs_dir indexing runs here, in the background; what it finished
+    # reaches the session that asked the way a finished process does.
+    # Each profile's document index, opened by the turns that need it. Boot
+    # replaces this with one that works through the database cache.
+    deps.extras["rag_stores"] = RagStores(Path(app_dir or default_app_dir()))
+    deps.extras["doc_indexer"] = DocIndexer(
+        emit=emit, submit_event=scheduler.submit_event
+    )
 
     pollers = Pollers(
         deps,
@@ -3634,12 +3647,12 @@ def _make_tool_ctx(
     from hpca.config import app_dir as _app_dir
     from hpca.jobs import JobStore
     from hpca.logs import LoggedLLM
-    from hpca.rag import RagStore
     from hpca.runner import ProcessRunner
     from hpca.symbols import SymbolIndex
     from hpca.trash import TrashManager
 
     root = deps.app_dir or _app_dir()
+    stores = deps.extras.get("rag_stores")
     ctx = ToolContext(
         runner=ProcessRunner(
             deps.conn,
@@ -3662,7 +3675,13 @@ def _make_tool_ctx(
             ),
         ),
         symbols=SymbolIndex(deps.conn),
-        rag=deps.extras.get("rag") or RagStore(root / "rag.db"),
+        # The session's profile's document index (`RagStores`), opened by the
+        # first doc tool that needs it: opening may copy it to the node, and a
+        # turn that never touches the docs should not pay for that.
+        open_rag=(
+            (lambda: stores.open(session.profile)) if stores is not None else None
+        ),
+        doc_indexer=deps.extras.get("doc_indexer"),
         embedder=backends.embedder,
         episodic=EpisodicStore(deps.conn),
         skills=skills,

@@ -49,7 +49,19 @@ logger = logging.getLogger("hpca.dbcache")
 # checkpointer writes through its own aiosqlite connection during graph
 # execution, and sharing one file produced writer contention ("database is
 # locked") with tool code updating the app tables mid-turn.
-DB_NAMES = ("hpca.db", "checkpoints.db", "rag.db")
+DB_NAMES = ("hpca.db", "checkpoints.db")
+
+# Where the per-profile document indexes live, one ``<profile>.db`` each
+# (`hpca.rag.RagStores`). Not in ``DB_NAMES``: a user with ten profiles would
+# copy ten indexes of a few hundred megabytes to the node at every start to use
+# one. A profile's index joins the cache when it is first opened (``adopt``).
+RAG_DIR = "rag"
+
+# Databases an older HPCA kept here. Recovered from a crashed run's working
+# dir like the rest, and then never seeded or synced again: ``rag.db`` was the
+# one document index every profile shared, and boot moves it into ``RAG_DIR``
+# (`hpca.rag.migrate_shared_index`).
+LEGACY_NAMES = ("rag.db",)
 
 # The databases every copy of which is written *compacted* — rebuilt with
 # ``VACUUM INTO`` rather than page-copied with the backup API.
@@ -63,7 +75,7 @@ DB_NAMES = ("hpca.db", "checkpoints.db", "rag.db")
 # every sync and every exit. Rebuilding copies only the live pages, which
 # makes the copy both smaller *and* cheaper to make.
 #
-# rag.db is deliberately absent, and not because a rebuild would fail — VACUUM
+# The document indexes (rag/*.db, formerly rag.db) are deliberately absent, and not because a rebuild would fail — VACUUM
 # copies a virtual table's shadow tables and carries its schema row across
 # without ever instantiating the module, so vec0 survives it untouched. It is
 # absent because it has nothing to reclaim: an embedding index grows, it does
@@ -414,6 +426,45 @@ class DbCache:
             return self._local / name
         return self.home / name
 
+    @staticmethod
+    def adoptable(name: str) -> bool:
+        """Whether ``name`` is a database ``adopt`` may take on: one file
+        directly inside ``RAG_DIR``, so a name can never reach outside it."""
+        path = Path(name)
+        return (
+            len(path.parts) == 2
+            and path.parts[0] == RAG_DIR
+            and path.suffix == ".db"
+            and not path.name.startswith(".")
+        )
+
+    def adopt(self, name: str) -> Path:
+        """Take ``name`` into the cache, and say where to open it.
+
+        In local mode a home copy is seeded into the working dir the first
+        time, and from then on it is synced like the fixed databases. Blocking
+        — a seed can be hundreds of megabytes over NFS — so call it off the
+        loop.
+        """
+        if not self.adoptable(name):
+            raise ValueError(f"not a database the cache can take on: {name!r}")
+        with self._lock:
+            if name not in self.names:
+                self.names = (*self.names, name)
+                if self.active and self._local is not None:
+                    self._seed_one(name)
+            return self.path_for(name)
+
+    def forget(self, name: str) -> None:
+        """Stop caching ``name`` and delete its working copy. Home is the
+        caller's: this is half of deleting a database, not all of it."""
+        with self._lock:
+            self.names = tuple(n for n in self.names if n != name)
+            self._synced.pop(name, None)
+            if self._local is not None:
+                for suffix in ("", "-wal", "-shm", ".backup-tmp"):
+                    (self._local / (name + suffix)).unlink(missing_ok=True)
+
     # -------------------------------------------------------------- lifecycle
 
     def acquire(self) -> bool:
@@ -549,7 +600,15 @@ class DbCache:
         overwrites them. Returns the names recovered."""
         recovered: set[str] = set()
         assert self._local is not None
-        for name in self.names:
+        # Beside the fixed names, whatever a crashed run had adopted — which
+        # this run has not, yet — and what an older HPCA left under a name no
+        # longer in use.
+        left = sorted(
+            f"{RAG_DIR}/{path.name}"
+            for path in (self._local / RAG_DIR).glob("*.db")
+            if self.adoptable(f"{RAG_DIR}/{path.name}")
+        )
+        for name in dict.fromkeys([*self.names, *LEGACY_NAMES, *left]):
             src = self._local / name
             if not src.exists():
                 continue
@@ -582,25 +641,28 @@ class DbCache:
         for name in self.names:
             if name in skip:
                 continue
-            src = self.home / name
-            if not src.exists():
-                continue  # first run for this database; the app creates it
-            try:
-                copy_database(
-                    src, self._local / name, compact=name in COMPACT_DB_NAMES
+            self._seed_one(name)
+
+    def _seed_one(self, name: str) -> None:
+        """Copy one database from home into the working dir, if home has it."""
+        assert self._local is not None
+        src = self.home / name
+        if not src.exists():
+            return  # first run for this database; the app creates it
+        try:
+            copy_database(src, self._local / name, compact=name in COMPACT_DB_NAMES)
+        except Exception:
+            logger.exception("could not seed %s from %s", name, src)
+            if not _is_sqlite(src):
+                # The home copy itself is destroyed and there is no local
+                # copy to prefer. Move it aside so the app can start this
+                # database afresh — leaving it would also block every
+                # sync-back for the rest of the run.
+                aside = quarantine_corrupt(src)
+                self.warnings.append(
+                    f"home copy of {name} is corrupt; moved it to "
+                    f"{aside.name} and starting this database afresh"
                 )
-            except Exception:
-                logger.exception("could not seed %s from %s", name, src)
-                if not _is_sqlite(src):
-                    # The home copy itself is destroyed and there is no local
-                    # copy to prefer. Move it aside so the app can start this
-                    # database afresh — leaving it would also block every
-                    # sync-back for the rest of the run.
-                    aside = quarantine_corrupt(src)
-                    self.warnings.append(
-                        f"home copy of {name} is corrupt; moved it to "
-                        f"{aside.name} and starting this database afresh"
-                    )
 
     # ------------------------------------------------------------------ lease
 

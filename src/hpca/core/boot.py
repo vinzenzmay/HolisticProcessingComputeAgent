@@ -162,7 +162,7 @@ class Core:
         dbio=None,
         db=None,
         saver_ctx=None,
-        rag=None,
+        rag_stores=None,
         sync_interval: float = 0.0,
         notices: list[str] | None = None,
         profile: str = "default",
@@ -175,7 +175,7 @@ class Core:
         self.dbio = dbio
         self.db = db
         self.saver_ctx = saver_ctx
-        self.rag = rag
+        self.rag_stores = rag_stores
         self.profile = profile
         self.sync_interval = sync_interval
         # Things the user should be told that happened before there was a UI to
@@ -217,7 +217,7 @@ class Core:
         from hpca.config import Settings, app_dir as default_app_dir
         from hpca.core.service import build_service
         from hpca.db import DbIO, connect, init_db
-        from hpca.rag import RagStore
+        from hpca.rag import RagStores, migrate_shared_index
         from hpca.runner import reconcile_orphans
         from hpca.sessions import SessionStore
 
@@ -247,7 +247,12 @@ class Core:
             str(cache.path_for("checkpoints.db"))
         )
         checkpointer = await saver_ctx.__aenter__()
-        rag = RagStore(cache.path_for("rag.db"))
+        # One document index per profile, each opened when its profile first
+        # needs it — and through the cache, so it is worked on node-locally
+        # like the rest. The one index earlier versions shared becomes the
+        # default profile's first.
+        notices.extend(migrate_shared_index(root))
+        rag_stores = RagStores(root, cache)
 
         service = build_service(
             settings=settings,
@@ -261,13 +266,13 @@ class Core:
             llm=llm,
             session_store=SessionStore(db),
         )
-        # The RAG store is the one database whose location `build_service` has
-        # no parameter for — it falls back to `<app_dir>/rag.db`, which is
-        # home, which is the NFS mount this whole cache exists to keep off the
-        # hot path. `extras` is the sanctioned way to hand a service something
-        # without widening `CoreDeps`; a `rag=` argument on `build_service`
+        # The document indexes are the databases whose location `build_service`
+        # has no parameter for — its own `RagStores` opens them in home, which
+        # is the NFS mount this whole cache exists to keep off the hot path.
+        # `extras` is the sanctioned way to hand a service something without
+        # widening `CoreDeps`; a `rag_stores=` argument on `build_service`
         # would be tidier and belongs to whoever next edits `hpca.core`.
-        service._deps.extras["rag"] = rag
+        service._deps.extras["rag_stores"] = rag_stores
 
         core = cls(
             service,
@@ -276,7 +281,7 @@ class Core:
             dbio=dbio,
             db=db,
             saver_ctx=saver_ctx,
-            rag=rag,
+            rag_stores=rag_stores,
             sync_interval=settings.database.sync_interval_s,
             notices=notices,
             profile=profile,
@@ -445,10 +450,10 @@ class Core:
             with contextlib.suppress(Exception):
                 self.db.close()
             self.db = None
-        if self.rag is not None:
+        if self.rag_stores is not None:
             with contextlib.suppress(Exception):
-                self.rag.close()
-            self.rag = None
+                self.rag_stores.close()
+            self.rag_stores = None
         await self._final_sync(say)
         with contextlib.suppress(Exception):
             await self.wire.close()

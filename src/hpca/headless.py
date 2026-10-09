@@ -353,6 +353,11 @@ async def run(args) -> Outcome:
         wire=core_end,
         on_no_backend=no_backend.set,
     )
+    # A run that lives for one turn has no background for a large `index_docs`
+    # job to finish in: it would be cancelled at exit. Without the indexer the
+    # tool indexes the whole directory inside the call (`hpca.doc_index`), and
+    # the reply waits for it — which is what a script asking for an index wants.
+    core.service._deps.extras.pop("doc_indexer", None)
     session = _Session(ui_end, approve=not args.refuse_gated, quiet=args.quiet)
     with logs_to_file("headless.log"):
         core.run()

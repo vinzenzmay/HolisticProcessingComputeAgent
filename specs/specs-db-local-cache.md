@@ -42,7 +42,9 @@ All three sqlite files, so there is one uniform mechanism:
 
 - `hpca.db` — jobs, sessions, path registry, processes, symbols, messages
 - `checkpoints.db` — LangGraph conversation checkpoints (the heaviest writer)
-- `rag.db` — sqlite-vec vector store
+- `rag.db` — sqlite-vec vector store. *(Since replaced by one index per
+  profile, `rag/<profile>.db`, taken into the cache when a profile's index is
+  first opened rather than at start — `DbCache.adopt`.)*
 
 Everything else in the app dir (`settings.json`, `profiles/`, `skills/`,
 `chatlogs/`, `scripts/`, `proc_logs/`, `job_logs/`, `trash/`) stays in home and

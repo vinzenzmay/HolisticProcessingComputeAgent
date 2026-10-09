@@ -112,16 +112,24 @@ from the config editor.
 
 ## Where the databases are
 
-`hpca.db`, `checkpoints.db` and `rag.db` are *kept* in the app dir, but while
-the app runs they are opened from a node-local working dir (`$TMPDIR`, else
-`/tmp`) and synced back every 60s and on exit — `$HOME` is NFS on a cluster
-node, where each sqlite call costs network round-trips. See `hpca.dbcache` and
-specs/specs-db-local-cache.md; `settings.database.local_cache` turns it off.
+`hpca.db`, `checkpoints.db` and the document indexes are *kept* in the app
+dir, but while the app runs they are opened from a node-local working dir
+(`$TMPDIR`, else `/tmp`) and synced back every 60s and on exit — `$HOME` is NFS
+on a cluster node, where each sqlite call costs network round-trips. See
+`hpca.dbcache` and specs/specs-db-local-cache.md;
+`settings.database.local_cache` turns it off.
+
+The document index is per profile: `rag/<profile>.db`, opened by the first
+doc tool a turn calls (`ToolContext.rag_store()`, `hpca.rag.RagStores`), and
+taken into the cache only then (`DbCache.adopt`) — so a start copies no index,
+and a profile nobody opens never crosses NFS. The single `rag.db` of earlier
+versions is moved to `rag/default.db` at boot (`migrate_shared_index`).
+Duplicating a profile copies its index; deleting one deletes it.
 
 Copies are not naive. `hpca.db` and `checkpoints.db` are *rebuilt* on every
 copy (`VACUUM INTO`) rather than page-copied, because sqlite never shrinks a
 file and checkpoint churn had left one 94% free pages — 160 MB of file around
-9 MB of live rows, all of it crossing NFS four times a run. `rag.db` stays on
+9 MB of live rows, all of it crossing NFS four times a run. The indexes stay on
 the backup API: no free pages to reclaim, and a rebuild would re-index it. And
 a periodic sync skips any database nothing has written to since it last went
 home; the final sync never skips. See §2.4–2.5 of the spec.

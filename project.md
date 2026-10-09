@@ -1263,6 +1263,36 @@ precisely when it matters. Indexing builds **two** structures:
    default `rag.embedding` value is a model **name** sent to the remote endpoint,
    not a locally-loaded model.)*
 
+   **Each agent profile has its own index**, `<app_dir>/rag/<profile>.db`
+   (`hpca.rag.RagStores`): what was indexed for one line of work — a game
+   engine's manual, a few thousand papers — is not searched from another.
+   `search_docs`, `index_docs` and `ask_docs` use the session's profile's
+   index, opened by the first of them a turn calls, so a start copies no index
+   to the node and a profile nobody opens never crosses NFS (`DbCache.adopt`).
+   Duplicating a profile copies its index; deleting a profile deletes it, and
+   is refused while a background job is indexing into it. Earlier versions had
+   one `rag.db` shared by every profile; boot moves it to the default
+   profile's, and the user renames it to give it to another.
+
+   **A docs directory is indexed incrementally, and a large one in the
+   background** (`hpca.doc_index`). The store records each indexed file's size,
+   mtime, content digest and embedding model (`indexed_files` in its index), so
+   indexing a directory again embeds only what changed: a matching size and
+   mtime skip the file unread, a matching digest skips it after the read, and a
+   different model re-embeds everything. A file gone from the directory leaves
+   the index — an indexed directory mirrors it. Up to 20 documents to embed are
+   done inside the `index_docs` call. Beyond that the call returns at once and
+   the core runs the job as a background task, one directory at a time. The
+   user gets a notification at each quarter and at the end, and the session
+   that asked receives the outcome as an `[indexing finished]` message, the way
+   a finished process reports (§5.4). Asking again for the same directory
+   reports progress. Each document is stored before the next is read, so a job
+   stopped part-way keeps what it finished. Three embedding-backend failures in
+   a row stop the job, and the next run picks up where it stopped. It runs in
+   the core rather than as a separate process because the index is the core's: it
+   is opened from a node-local copy and synced home (`hpca.dbcache`), so a
+   second process writing the home copy would be overwritten by the next sync.
+
 ## 6. Agent profiles & memory (two-scope model)
 
 An **agent profile** is a per-user, named memory document recording what the agent

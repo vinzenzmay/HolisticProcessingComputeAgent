@@ -346,6 +346,60 @@ class TestRecovery:
         DbCache(home, local_dir=local).acquire()
         assert read_notes(home / "rag.db") == ["only-local"]
 
+    def test_recovers_a_profile_index_this_run_has_not_adopted_yet(self, home, local):
+        make_db(local / "rag" / "godot.db", rows=("unsynced",))
+        DbCache(home, local_dir=local).acquire()
+        assert read_notes(home / "rag" / "godot.db") == ["unsynced"]
+
+    def test_the_old_shared_index_is_recovered_but_not_seeded_again(self, home, local):
+        make_db(home / "rag.db", rows=("home",))
+        cache = DbCache(home, local_dir=local)
+        cache.acquire()
+        assert not (local / "rag.db").exists()
+        assert "rag.db" not in cache.names
+
+
+class TestAdopt:
+    def test_a_profile_index_is_seeded_from_home_when_first_opened(self, home, local):
+        make_db(home / "rag" / "godot.db", rows=("indexed",))
+        cache = DbCache(home, local_dir=local)
+        cache.acquire()
+        assert not (local / "rag").exists()  # not at startup
+        path = cache.adopt("rag/godot.db")
+        assert path == local / "rag" / "godot.db"
+        assert read_notes(path) == ["indexed"]
+
+    def test_and_synced_home_from_then_on(self, home, local):
+        cache = DbCache(home, local_dir=local)
+        cache.acquire()
+        make_db(cache.adopt("rag/new.db"), rows=("written here",))
+        assert cache.sync() is True
+        assert read_notes(home / "rag" / "new.db") == ["written here"]
+
+    def test_without_local_mode_it_is_the_home_path(self, home, local):
+        cache = DbCache(home, local_dir=local, enabled=False)
+        cache.acquire()
+        assert cache.adopt("rag/godot.db") == home / "rag" / "godot.db"
+
+    @pytest.mark.parametrize(
+        "name", ["hpca.db", "rag/../hpca.db", "rag/x/y.db", "rag/.hidden.db", "rag/x.txt"]
+    )
+    def test_nothing_outside_the_index_dir_is_adopted(self, home, local, name):
+        cache = DbCache(home, local_dir=local)
+        cache.acquire()
+        with pytest.raises(ValueError):
+            cache.adopt(name)
+
+    def test_forget_stops_syncing_and_drops_the_working_copy(self, home, local):
+        cache = DbCache(home, local_dir=local)
+        cache.acquire()
+        path = cache.adopt("rag/gone.db")
+        make_db(path, rows=("x",))
+        cache.forget("rag/gone.db")
+        assert not path.exists()
+        cache.sync(force=True)
+        assert not (home / "rag" / "gone.db").exists()
+
 
 class TestSync:
     def test_writes_local_changes_back_to_home(self, home, local):
@@ -379,11 +433,11 @@ class TestSync:
         cache = DbCache(home, local_dir=local)
         cache.acquire()
         (local / "hpca.db").write_bytes(b"this is not a database")
-        make_db(local / "rag.db", rows=("fine",))
+        make_db(cache.adopt("rag/default.db"), rows=("fine",))
 
         cache.sync()  # must not raise
 
-        assert read_notes(home / "rag.db") == ["fine"]
+        assert read_notes(home / "rag" / "default.db") == ["fine"]
 
     def test_reports_success(self, home, local):
         cache = DbCache(home, local_dir=local)
@@ -923,12 +977,14 @@ class TestSeedCompacts:
         assert free_pages(local / "checkpoints.db") == 0
         assert read_notes(local / "checkpoints.db") == ["kept"]
 
-    def test_rag_db_is_seeded_page_for_page(self, home, local):
-        # Not in COMPACT_DB_NAMES: its vec0 tables need the extension loaded
-        # before a rebuild could re-create them.
-        make_churned_db(home / "rag.db")
-        DbCache(home, local_dir=local).acquire()
-        assert free_pages(local / "rag.db") == free_pages(home / "rag.db")
+    def test_a_document_index_is_seeded_page_for_page(self, home, local):
+        # Not in COMPACT_DB_NAMES: it has no free list worth a rebuild.
+        (home / "rag").mkdir()
+        make_churned_db(home / "rag" / "default.db")
+        cache = DbCache(home, local_dir=local)
+        cache.acquire()
+        seeded = cache.adopt("rag/default.db")
+        assert free_pages(seeded) == free_pages(home / "rag" / "default.db")
 
     def test_recovery_compacts_too(self, home, local):
         local.mkdir(parents=True)

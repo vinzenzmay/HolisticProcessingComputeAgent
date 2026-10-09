@@ -20,16 +20,17 @@ from pydantic import BaseModel, Field
 from hpca.agent import hints
 from hpca.agent.context import ToolContext
 from hpca.agent.tools import Tool, ToolRegistry
+from hpca import doc_index
 from hpca.embeddings import EmbeddingError
 from hpca.paths import resolve_path
-from hpca.rag import chunk_text, embed_fitting
+from hpca.rag import index_text
 from hpca.symbols import index_python_source, parse_help_flags, parse_manpage_flags
 from hpca.verify_code import basename, commands_needing_docs
 
 MANPAGE_MAX_LINES = 400
 SOURCE_MAX_LINES = 200
 SEARCH_TOP_K = 5
-DOC_SUFFIXES = {".md", ".txt", ".rst", ".text"}
+DOC_SUFFIXES = doc_index.DOC_SUFFIXES
 OVERSTRIKE_RE = re.compile(".\x08")
 
 HELP_TIMEOUT_SECONDS = 10
@@ -270,15 +271,16 @@ class SearchDocsParams(BaseModel):
 
 async def search_docs(args: SearchDocsParams, ctx: ToolContext) -> str:
     """Semantic retrieval over indexed docs (§5.6.2)."""
-    if ctx.rag is None or ctx.embedder is None:
+    rag = await ctx.rag_store()
+    if rag is None or ctx.embedder is None:
         return f"Semantic search is not configured; {hints.NO_SEMANTIC_SEARCH}"
-    if ctx.rag.count() == 0:
+    if rag.count() == 0:
         return f"The document index is empty — {hints.EMPTY_DOC_INDEX}"
     try:
         vectors = await ctx.embedder.embed([args.query])
     except EmbeddingError as e:
         return f"Semantic search unavailable (embedding backend error: {e})."
-    hits = ctx.rag.query(vectors[0], k=SEARCH_TOP_K)
+    hits = rag.query(vectors[0], k=SEARCH_TOP_K)
     parts = []
     for hit in hits:
         parts.append(f"── {hit.source} (distance {hit.distance:.3f}) ──\n{hit.text}")
@@ -291,18 +293,10 @@ async def _rag_index_text(ctx: ToolContext, source: str, text: str) -> int | str
     Embedding goes through ``embed_fitting`` so a chunk the model finds too
     long is split rather than taken as a verdict on the whole document (§5.6.2).
     """
-    chunks = chunk_text(text)
-    if not chunks:
-        return 0
     try:
-        chunks, vectors = await embed_fitting(ctx.embedder, chunks)
+        return await index_text(await ctx.rag_store(), ctx.embedder, source, text)
     except EmbeddingError as e:
         return f"embedding backend error: {e}"
-    if not chunks:
-        return 0
-    ctx.rag.clear_source(source)
-    ctx.rag.add(source, chunks, vectors)
-    return len(chunks)
 
 
 class IndexDocsParams(BaseModel):
@@ -318,7 +312,8 @@ class IndexDocsParams(BaseModel):
 async def index_docs(args: IndexDocsParams, ctx: ToolContext) -> str:
     if ctx.symbols is None:
         raise RuntimeError("No symbol index configured in this session")
-    rag_ready = ctx.rag is not None and ctx.embedder is not None
+    rag = await ctx.rag_store()
+    rag_ready = rag is not None and ctx.embedder is not None
 
     if args.what == "python_source":
         root = resolve_path(args.target, ctx.workdir)
@@ -332,33 +327,40 @@ async def index_docs(args: IndexDocsParams, ctx: ToolContext) -> str:
                 "(no embedding backend)."
             )
         root = resolve_path(args.target, ctx.workdir)
-        indexed, problems = 0, []
-        for path in sorted(root.rglob("*")):
-            if path.suffix.lower() not in DOC_SUFFIXES or not path.is_file():
-                continue
-            # One document at a time, and each read off the loop: a docs dir
-            # is arbitrary user content, indexing walks all of it, and every
-            # file read here is a stretch of the UI not repainting.
-            text = await asyncio.to_thread(path.read_text, errors="replace")
-            outcome = await _rag_index_text(ctx, str(path), text)
-            if isinstance(outcome, str):
-                problems.append(f"{path.name}: {outcome}")
-            elif outcome:
-                indexed += 1
-        message = f"Indexed {indexed} documents from {args.target!r} for search."
-        if problems:
-            # The count leads, and the examples follow it. Reporting only the
-            # first three read as a footnote on a success when in fact most of
-            # a manual had been dropped, which is how a 100-of-1597 index came
-            # to be announced as done.
-            message += (
-                f" {len(problems)} could NOT be indexed"
-                + (f" (of {indexed + len(problems)} found)" if indexed else "")
-                + ": "
-                + "; ".join(problems[:3])
-                + ("; ..." if len(problems) > 3 else "")
+        if not await asyncio.to_thread(root.is_dir):
+            return f"Cannot index docs_dir: {root} is not a directory."
+        # Only what changed is embedded, and a large job runs in the core's
+        # background rather than in this call (hpca.doc_index).
+        indexer = ctx.doc_indexer
+        running = indexer.busy() if indexer is not None else None
+        if running is not None:
+            if running.root == root and running.rag is rag:
+                return (
+                    f"{running.progress()} Still running; you will get a "
+                    "message when it finishes."
+                )
+            return (
+                f"Already indexing another directory — {running.progress()} "
+                "One directory at a time: index this one once that finishes."
             )
-        return message
+        job = await doc_index.prepare(
+            root, args.target, rag, ctx.embedder, profile=ctx.profile
+        )
+        if indexer is None or len(job.todo) <= doc_index.INLINE_LIMIT:
+            await doc_index.run(job)
+            return job.report()
+        indexer.start(job, ctx.session_id)
+        skipped = (
+            f"; {job.unchanged} unchanged since they were last indexed are skipped"
+            if job.unchanged
+            else ""
+        )
+        return (
+            f"Indexing {len(job.todo)} documents from {args.target!r} into "
+            f"profile {ctx.profile!r}'s index in the background{skipped}. Nothing to wait for: the user sees progress, "
+            "you get a message when it finishes, and search_docs already finds "
+            "what is done. index_docs on this directory again reports progress."
+        )
 
     indexed, missing, searchable = [], [], 0
     for command in args.target.split():
@@ -438,7 +440,12 @@ def add_doc_tools(registry: ToolRegistry) -> ToolRegistry:
     registry.register(
         Tool(
             name="index_docs",
-            description="Index Python source or man pages into the symbol index",
+            description=(
+                "Index Python source or man pages into the symbol index, or a "
+                "directory of .md/.txt/.rst documents for search_docs. Only "
+                "changed files are re-embedded; a large directory is indexed "
+                "in the background"
+            ),
             params=IndexDocsParams,
             handler=index_docs,
         )

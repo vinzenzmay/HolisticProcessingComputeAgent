@@ -18,6 +18,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -37,6 +38,7 @@ from hpca.memory_index import MemoryIndex
 from hpca.memory_ops import MemoryOp
 from hpca.profiles import MemoryScope, Profile
 from hpca.protocol import MemoryProposals, Notify, TurnActivity
+from hpca.rag import RagStores
 from hpca.sessions import Session, SessionStore
 from hpca.skills import Skill, load_skills, write_skill
 
@@ -1066,15 +1068,40 @@ class TestProfileLifecycle:
         assert harness.service.create_profile("lab") is None
         assert "lab" in Profile.list_profiles()
 
-    def test_duplicating_carries_the_learnings_over(self, harness):
+    async def test_duplicating_carries_the_learnings_over(self, harness):
         Profile.create("lab")
         write_memory("STAR needs 40G here.", profile="lab")
-        assert harness.service.duplicate_profile("lab", "lab2") is None
+        assert await harness.service.duplicate_profile("lab", "lab2") is None
         assert stored("lab2") == ["STAR needs 40G here."]
         assert harness.said("They diverge from here")
 
-    def test_duplicating_an_absent_profile_is_refused(self, harness):
-        assert harness.service.duplicate_profile("ghost", "copy") is not None
+    async def test_duplicating_an_absent_profile_is_refused(self, harness):
+        assert await harness.service.duplicate_profile("ghost", "copy") is not None
+
+    async def test_duplicating_copies_the_document_index(self, harness, hpca_home):
+        stores = harness.deps.extras["rag_stores"] = RagStores(hpca_home)
+        Profile.create("lab")
+        (await stores.open("lab")).add("paper.txt", ["a finding"], [[1.0, 0.0]])
+        assert await harness.service.duplicate_profile("lab", "lab2") is None
+        copy = await stores.open("lab2")
+        assert copy.count() == 1
+        assert harness.said("its document index")
+        stores.close()
+
+    async def test_deleting_takes_the_document_index_with_it(self, harness, hpca_home):
+        stores = harness.deps.extras["rag_stores"] = RagStores(hpca_home)
+        Profile.create("lab")
+        (await stores.open("lab")).add("paper.txt", ["a finding"], [[1.0, 0.0]])
+        await harness.service.delete_profile("lab")
+        assert not (hpca_home / "rag" / "lab.db").exists()
+        assert (await stores.open("lab")).count() == 0  # a new one, empty
+        stores.close()
+
+    async def test_a_profile_being_indexed_into_cannot_go(self, harness):
+        job = SimpleNamespace(profile="lab")
+        harness.deps.extras["doc_indexer"] = SimpleNamespace(busy=lambda: job)
+        assert "indexing documents" in await harness.service.profile_delete_blocker("lab")
+        assert await harness.service.profile_delete_blocker("other") is None
 
     def test_saving_hand_edited_memories_reports_problems_but_keeps_them(
         self, harness

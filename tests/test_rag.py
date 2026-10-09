@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from hpca.embeddings import EmbeddingClient, EmbeddingError, InputTooLong
-from hpca.rag import RagStore, chunk_text, embed_fitting
+from hpca.rag import RagStore, RagStores, chunk_text, embed_fitting, migrate_shared_index
 
 # ---------------------------------------------------------------- chunking
 
@@ -274,3 +274,62 @@ class TestEmbedFitting:
 
     async def test_empty_input(self):
         assert await embed_fitting(LengthCappedEmbedder(cap=10), []) == ([], [])
+
+
+class TestThereIsOneIndexPerProfile:
+    """``rag/<profile>.db``, and the shared ``rag.db`` of earlier versions."""
+
+    def test_the_shared_index_becomes_the_default_profile_s(self, tmp_path):
+        RagStore(tmp_path / "rag.db").close()
+        (tmp_path / "rag.db-wal").write_bytes(b"")
+        notices = migrate_shared_index(tmp_path)
+        assert not (tmp_path / "rag.db").exists()
+        assert (tmp_path / "rag" / "default.db").exists()
+        assert (tmp_path / "rag" / "default.db-wal").exists()
+        assert "per profile" in notices[0]
+
+    def test_nothing_to_move_says_nothing(self, tmp_path):
+        assert migrate_shared_index(tmp_path) == []
+
+    def test_an_existing_default_index_is_never_overwritten(self, tmp_path):
+        RagStore(tmp_path / "rag.db").close()
+        (tmp_path / "rag").mkdir()
+        (tmp_path / "rag" / "default.db").write_bytes(b"keep me")
+        notices = migrate_shared_index(tmp_path)
+        assert (tmp_path / "rag.db").exists()
+        assert (tmp_path / "rag" / "default.db").read_bytes() == b"keep me"
+        assert "left rag.db where it is" in notices[0]
+
+    async def test_profiles_get_separate_stores(self, tmp_path):
+        stores = RagStores(tmp_path)
+        a = await stores.open("a")
+        a.add("doc", ["only in a"], [[1.0, 0.0]])
+        assert (await stores.open("b")).count() == 0
+        assert await stores.open("a") is a
+        stores.close()
+
+    async def test_through_the_cache_they_are_worked_on_locally(self, tmp_path):
+        from hpca.dbcache import DbCache
+
+        home, local = tmp_path / "home", tmp_path / "local"
+        home.mkdir()
+        cache = DbCache(home, local_dir=local)
+        cache.acquire()
+        stores = RagStores(home, cache)
+        store = await stores.open("lab")
+        assert store.path == local / "rag" / "lab.db"
+        store.add("doc", ["x"], [[1.0, 0.0]])
+        cache.sync()
+        assert (home / "rag" / "lab.db").exists()
+        await stores.remove("lab")
+        assert not (home / "rag" / "lab.db").exists()
+        assert not (local / "rag" / "lab.db").exists()
+        cache.sync(force=True)
+        assert not (home / "rag" / "lab.db").exists()  # not synced back
+        stores.close()
+        cache.release()
+
+    async def test_a_copy_of_nothing_is_nothing(self, tmp_path):
+        stores = RagStores(tmp_path)
+        assert await stores.copy("never-indexed", "copy") is False
+        assert not (tmp_path / "rag" / "copy.db").exists()
