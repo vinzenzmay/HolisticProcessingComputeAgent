@@ -415,6 +415,18 @@ async def read_file(args: ReadFileParams, ctx: ToolContext) -> str:
         return f"Nothing at {path}. {hints.PATH_NOT_FOUND}"
     if path.is_dir():
         return _list_dir(path, args.max_lines)
+    # An image read as text is kilobytes of replacement characters, straight
+    # into the context — and tells the model nothing. Say what it is and which
+    # tool looks at it. Not for SVG: its source is text, and often exactly
+    # what the caller is after (to edit it).
+    from hpca.images import sniff  # here: hpca.images pulls in Pillow
+
+    kind = sniff(path)
+    if kind is not None and kind != "SVG":
+        return (
+            f"{path} is a {kind} file, not text. To see what it shows, call "
+            "inspect_image with a question about it."
+        )
     # Whole-file, unlike the run_bash tail above, and it has to be: the page
     # this returns is addressed by line number and its continuation hint
     # quotes the file's total, neither of which a window from one end knows.

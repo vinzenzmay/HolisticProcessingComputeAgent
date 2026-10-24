@@ -141,6 +141,72 @@ Both were failures the eval caught, fixed in `skill_drafter.SYSTEM_PROMPT`:
 
 ---
 
+# vision_eval — how well the live model answers inspect_image
+
+`vision_eval.py` runs `inspect_image` — real image loading (`hpca.images`),
+the real sub-loop (`hpca.agent.vision`), real middleware decisions — over
+pictures drawn in code, so every answer is known by construction: a bar chart
+whose bar count was chosen, run ids built from confusable characters (O/Q,
+0/O, 1/l), panels with one left empty, a legend, a 16-bit "micrograph" with a
+known number of spots, an SVG label that does or does not run off the canvas,
+a value on page 2 of a PDF, and a blank image beside a chart.
+
+It compares **arms**, the same tool with one part switched off, interleaved
+task by task so backend load hits every arm alike: `full` (as shipped),
+`nozoom` (overview only), `nofacts` (the model is not told what code
+measured). Answers are scored on their
+headline — the `ANSWER:` field, else the first paragraph — so a right answer
+is not failed for naming other labels in its evidence.
+
+```sh
+pixi run -e dev python evals/vision_eval.py --self-check   # ~1s, no backend
+export HPCA_TEST_LLM_KEY=...
+pixi run -e dev python evals/vision_eval.py --repeats 3 --out vision.json
+#   --arms full,nozoom   --tasks tiny-id,svg   --label name
+```
+
+The self-check runs before every live run and aborts it on failure: each
+predicate must accept the task's known-right answers and refuse its
+known-wrong ones, and each fixture must load and show what it should (an SVG
+rendered blank means the machine has no fonts for resvg). Needs a backend
+that sees (`llmServer/llm.a40-l40.sh`, VISION); exits 2 if the vision probe
+fails. Costs real generations — run it deliberately, never in a default suite.
+
+## Measured, 2026-10-23 (Qwen3.8-27B-INT4, vLLM, one L40)
+
+12 tasks × 4 arms × 3 repeats, run twice; the second run after two fixes the
+first run exposed (below), so its numbers are the ones that stand:
+
+| arm | ok | 95% CI | model calls |
+|---|---|---|---|
+| full | 32/36 (89%) | 75–96% | 1.25 |
+| nozoom | 30/36 (83%) | 68–92% | 1.00 |
+| noenlarge | 34/36 (94%) | 82–98% | 1.25 |
+| nofacts | 31/36 (86%) | 71–94% | 1.14 |
+
+* **Everything but tiny text is at ceiling** — bar count and tallest label,
+  the empty panel, the legend, the 16-bit spots (one 7-for-6), both SVG
+  verdicts, page 2 of a PDF, the blank image: 3/3 in every arm. The arms
+  differ only on the three 16px run ids in a 3000px image.
+* **Zoom is what reads small text**: the run ids, both runs pooled, 12/18 in
+  `full` against 5/18 in `nozoom`.
+* **Enlarging zoom crops is not shown to help** (12/18 full, 14/18
+  noenlarge) — and at a 3x3 grid it barely acts: a cell of a 3000px image
+  is ~1100px, enlarged only 1.4x. Dropped on 2026-10-24, with its arm;
+  `full` in this table is the tool *with* enlargement.
+* **The failure that remains is a confident misread**, overwhelmingly Q read
+  as O (`QX-7741-b` → `OX-7741-b`): at 16px the Q's tail is ~2px even at
+  native resolution, which a 3x3 cell does not magnify. A finer zoom (a cell
+  of a cell) is the next thing to measure. The model never said "unsure".
+
+Two fixes from the first run, both found by reading every failure rather
+than the rate: the scorer failed right answers for naming other labels in
+their evidence (now: first sentence, cut at SEEN:/UNSURE:), and the
+rendered-edge check called a rounded frame near an SVG's edge a cut — every
+`svg-fits` run carried the false fact, and `noenlarge` believed it 3/3. SVG
+overflow is now measured (`hpca.images.text_overflow`: the text rendered
+alone on a widened canvas) rather than guessed.
+
 # smoke_pty — does the real binary come up in a real terminal?
 
 Everything else in `tests/` drives the UI through a harness that never opens a

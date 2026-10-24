@@ -62,7 +62,7 @@ hpca -p "why did job 4711 fail?" --json --mode manual --refuse-gated \
 
 HPCA brings no model of its own — it needs an OpenAI-compatible endpoint to talk
 to. [llmServer/SETUP.md](llmServer/SETUP.md) sets one up from nothing: a Slurm
-job running vLLM with Qwen3.8-27B-FP8 on two L40s (262k context), plus the
+job running vLLM with Qwen3.8-27B-INT4 on two L40s (262k context, vision on), plus the
 embedding sidecar that document search uses.
 
 Started servers announce themselves by dropping a JSON manifest into a shared
@@ -229,7 +229,7 @@ Everything for that is in **[llmServer/](llmServer/)**, and the guide to read is
 vLLM or Slurm and walks the whole way:
 
 1. `./setup_venv.sh` — installs vLLM into `llmServer/venv` (~15 GB).
-2. Download the weights — `Qwen/Qwen3.8-27B-FP8`, ~30 GB. Needs 16 GB of RAM,
+2. Download the weights — `RedHatAI/Qwen3.8-27B-INT4`. Needs 16 GB of RAM,
    which is the step that most often fails silently.
 3. Make an API key — `~/.vllm_api_key`, or the job refuses to start.
 4. Point `--gres` and `--partition` at your cluster's GPU nodes. **The one edit
@@ -238,7 +238,7 @@ vLLM or Slurm and walks the whole way:
 5. `sbatch llm.a40-l40.sh`, then read the four log lines SETUP.md tells you to
    grep. Each explains a disappointing result on its own.
 
-What you end up with: `Qwen3.8-27B-FP8` on port 20001 with a 262k context window
+What you end up with: `Qwen3.8-27B-INT4` on port 20001 with a 262k context window
 on two L40s at ~60 tokens/s, and an embedding sidecar on port 20000
 that document search uses. The job announces itself, so HPCA on the cluster
 connects with nothing configured — but see the endpoints-directory warning under

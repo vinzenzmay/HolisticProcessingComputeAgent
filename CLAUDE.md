@@ -45,6 +45,22 @@ reach for it when a change touches how a file is *named*, and see
 specs/specs-path-registry.md for what it settled. `shift` measured the key-vs-path
 friction of an interface that no longer exists; it is history, not a check.
 
+## Images
+
+`inspect_image` (`hpca.agent.vision`) is a firewalled sub-loop: images live
+only in its throwaway conversation, never in a session's messages — which is
+why nothing that stores, folds, compacts or renders a session has to know
+about them. Keep it that way unless the plan to put images in the main
+conversation is taken up (a sidecar key expanded in `llm.wire_messages`, not
+list content: ~26 places read `content` as a string). Loading, scaling and
+the measured facts are `hpca.images`, plain code with no model.
+
+A change to either is measured with `evals/vision_eval.py` (README in
+evals/), not eyeballed; `--self-check` alone takes a second and is the thing
+to run after touching a task. It needs a backend that sees: the cluster job
+has vision on, and `llm.vision` / `LLMClient.supports_images` is how HPCA
+finds out.
+
 ## Two front-ends, one runtime
 
 `hpca` draws a TUI; `hpca -p "..."` runs one turn and prints the reply. Both

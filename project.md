@@ -629,6 +629,7 @@ its own tools:
 |---|---|---|
 | doc-researcher | answer technical questions & verify API usage against man pages, docs, source (RAG) | `search_docs`, `lookup_symbol`, `read_manpage`, `read_source` |
 | log-explainer | diagnose failing/finished jobs from triaged logs | (fed a structured triage report; no tools) |
+| image-inspector | look at plots, figures, PDF pages and SVGs and answer a question about them | `zoom` (a 3×3 grid cell at higher resolution) |
 
 **Implementation note (design vs. code).** The original design imagined a
 router node dispatching to five distinct subagents (script-writer, job-runner,
@@ -642,6 +643,16 @@ would-be script-writer, job-runner and process-QA "subagents" are simply regular
 tools on the one orchestrator (`create_script`, `submit_job`, …). The
 context-firewall contract below still holds for the two real sub-loops: raw
 retrieval and raw logs never enter the orchestrator's context.
+
+The **image-inspector** (`inspect_image`, `hpca.agent.vision`) is
+a third, and the firewall is what made it cheap: images live only in its
+throwaway conversation, so nothing that stores, folds, compacts or renders a
+session — all of which assume text content — ever meets one. Code measures
+each image first (`hpca.images`: size, a stretched bit depth, blankness,
+content running off an edge, SVG defects) and those facts go to the model with
+the picture and back to the caller with the answer. It needs a backend that
+sees (`llm.vision`, probed once per client with a red square); the cluster job
+has vision on (llmServer/llm.a40-l40.sh, VISION).
 
 The orchestrator itself holds the full tool registry — file/script/job/doc/memory
 tools plus `list_scripts` — and answers directly only for trivial

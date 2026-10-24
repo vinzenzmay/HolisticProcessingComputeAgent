@@ -151,6 +151,13 @@ class LLMSettings(_Section):
     api_key: str | None = None
     model: str = "qwen3-6b"
     constrained_decoding: Literal["auto", "on", "off"] = "auto"
+    # Whether the backend accepts images (inspect_image's sub-loop). "auto"
+    # asks it once per client (`LLMClient.supports_images`), which is already
+    # per backend — so unlike tool_protocol this needs no catalog override:
+    # a vision server and a text-only one in the same catalog each get the
+    # right answer. "on"/"off" skip the probe, for a server whose answer is
+    # known and a probe that would only cost a warm-up.
+    vision: Literal["auto", "on", "off"] = "auto"
     # How a tool call travels. "native" uses the backend's own tool-calling
     # channel — the shape agent-trained models were post-trained on, and it
     # moves the tool listing out of the prompt into the chat template.

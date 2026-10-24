@@ -45,6 +45,7 @@ from hpca.agent import compact
 from hpca.agent.builtin_tools import default_tool_registry
 from hpca.agent.context import ToolContext
 from hpca.agent.doc_tools import add_ask_docs, add_doc_tools
+from hpca.agent.vision import add_inspect_image
 from hpca.agent.file_tools import add_file_tools
 from hpca.agent.graph import (
     answer_pending,
@@ -3263,7 +3264,9 @@ def build_service(
     sessions = session_store or SessionStore(conn)
 
     if tools is None:
-        tools = add_ask_docs(add_doc_tools(add_file_tools(default_tool_registry())))
+        tools = add_inspect_image(
+            add_ask_docs(add_doc_tools(add_file_tools(default_tool_registry())))
+        )
         if slurm is not None:
             add_job_tools(tools)
         # Watching is useful with or without Slurm: watch_job needs a cluster,

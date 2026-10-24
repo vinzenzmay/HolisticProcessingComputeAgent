@@ -16,8 +16,11 @@ Design notes for the small-model reality (§1):
 
 from __future__ import annotations
 
+import base64
 import json
+import struct
 import time
+import zlib
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
@@ -94,6 +97,72 @@ PROBE_SCHEMA = {
     "additionalProperties": False,
 }
 
+# Read timeout for the vision probe (LLMClient.supports_images). The first
+# image a vLLM server sees after starting pays a one-off warm-up: measured
+# 137s for a 64x64 square on the cluster's Qwen3.8-27B, against ~1s for a
+# 1200x800 chart right after. That is past request_timeout_s (120), and a
+# probe that times out answers "cannot see" about a server that can.
+VISION_PROBE_TIMEOUT_S = 300
+
+
+def image_part(data: bytes, mime: str = "image/png") -> dict[str, Any]:
+    """One image as an OpenAI-style content part, inlined as a data URL.
+
+    Inlined rather than linked because the backend sits on another node and
+    cannot read this one's files; a data URL is the one form every
+    OpenAI-compatible server takes.
+    """
+    encoded = base64.b64encode(data).decode("ascii")
+    return {
+        "type": "image_url",
+        "image_url": {"url": f"data:{mime};base64,{encoded}"},
+    }
+
+
+def content_text(content: Any) -> str:
+    """A message's content as text, image parts reduced to ``[image]``.
+
+    For everything that writes content somewhere a person reads it — the
+    session log above all. A data URL is megabytes of base64 nobody can read,
+    and the log is appended to on every sub-agent call.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content)
+    pieces = []
+    for part in content:
+        if isinstance(part, dict) and part.get("type") == "text":
+            pieces.append(str(part.get("text", "")))
+        elif isinstance(part, dict) and part.get("type") == "image_url":
+            pieces.append("[image]")
+        else:
+            pieces.append(str(part))
+    return "\n".join(pieces)
+
+
+def _solid_png(width: int, height: int, rgb: tuple[int, int, int]) -> bytes:
+    """A one-colour PNG, built by hand so the probe needs no imaging library."""
+
+    def chunk(kind: bytes, body: bytes) -> bytes:
+        crc = zlib.crc32(kind + body)
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", crc)
+
+    row = b"\x00" + bytes(rgb) * width
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(row * height))
+        + chunk(b"IEND", b"")
+    )
+
+
+# 64x64 rather than 1x1: Qwen's processor scales anything below its minimum
+# up anyway, and a square that size is unambiguous to any encoder.
+VISION_PROBE_IMAGE = _solid_png(64, 64, (220, 30, 30))
+VISION_PROBE_QUESTION = "What colour is this square? Answer with one word."
+
 
 class LLMError(Exception):
     """Any failure talking to the LLM backend."""
@@ -154,6 +223,7 @@ class LLMClient:
             transport=transport,
         )
         self._constrained_supported: bool | None = None
+        self._vision_supported: bool | None = None
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -446,3 +516,63 @@ class LLMClient:
             except LLMError:
                 self._constrained_supported = False
         return self._constrained_supported
+
+    async def supports_images(self) -> bool:
+        """Whether this backend can see images (the ``vision`` setting).
+
+        ``auto`` shows the backend a red square and asks its colour, once.
+        Accepting the request is not the test: some servers drop image parts
+        they cannot use and answer from the text alone, which would read as
+        support. Only "red" in the reply counts.
+
+        A verdict is cached only when the backend answered. A request that
+        never got a response (tunnel down, server still starting, the warm-up
+        outlasting even VISION_PROBE_TIMEOUT_S) says nothing about the
+        model, so the next call asks again instead of pinning "cannot see"
+        for the life of the client.
+        """
+        if self._settings.vision == "on":
+            return True
+        if self._settings.vision == "off":
+            return False
+        if self._vision_supported is not None:
+            return self._vision_supported
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": VISION_PROBE_QUESTION},
+                    image_part(VISION_PROBE_IMAGE),
+                ],
+            }
+        ]
+        payload = self._payload(
+            messages,
+            json_schema=None,
+            schema_name="output",
+            max_tokens=10,
+            temperature=0,
+            # Same reason as the constrained-decoding probe: reasoning would
+            # spend the cap before the one word arrives.
+            enable_thinking=False,
+            stream=False,
+        )
+        try:
+            response = await self._client.post(
+                "chat/completions",
+                json=payload,
+                timeout=httpx.Timeout(VISION_PROBE_TIMEOUT_S, connect=10),
+            )
+        except httpx.HTTPError:
+            return False
+        if response.status_code != 200:
+            # The answer of a text-only server: vLLM with
+            # --language-model-only, or an image limit of 0, says 400.
+            self._vision_supported = False
+            return False
+        try:
+            reply = response.json()["choices"][0]["message"].get("content") or ""
+        except (ValueError, LookupError, AttributeError):
+            reply = ""
+        self._vision_supported = "red" in reply.lower()
+        return self._vision_supported

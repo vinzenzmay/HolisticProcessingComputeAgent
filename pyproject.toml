@@ -12,6 +12,12 @@ dependencies = [
     "langgraph-checkpoint-sqlite>=3.0",
     "langchain-core>=1.0",
     "sqlite-vec>=0.1.6",
+    # Vision (hpca.images): decoding/scaling, PDF pages, SVG. All three ship
+    # self-contained manylinux wheels — resvg-py over cairosvg because the
+    # latter needs a system libcairo a compute node may not have.
+    "pillow>=10.0",
+    "pypdfium2>=4.0",
+    "resvg-py>=0.2",
 ]
 
 [project.optional-dependencies]

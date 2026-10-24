@@ -6,6 +6,7 @@ $HPCA_TEST_LLM_URL (default http://localhost:20001/v1) and are skipped when it
 is unreachable.
 """
 
+import base64
 import json
 import os
 
@@ -16,10 +17,12 @@ from hpca.config import LLMSettings
 from hpca.llm import (
     PROBE_SCHEMA,
     STAMP_KEY,
+    VISION_PROBE_IMAGE,
     ChatResponse,
     LLMClient,
     LLMError,
     TruncatedOutput,
+    image_part,
     wire_messages,
 )
 
@@ -340,6 +343,86 @@ class TestConstrainedDecodingProbe:
         assert await client.supports_constrained_decoding() is False
 
 
+class TestVisionProbe:
+    async def test_auto_sends_an_image_and_caches_a_yes(self):
+        calls = []
+
+        def handler(request):
+            calls.append(json.loads(request.content))
+            return httpx.Response(200, json=completion_body(content=" Red."))
+
+        client = make_client(handler, vision="auto")
+        assert await client.supports_images() is True
+        assert await client.supports_images() is True
+        assert len(calls) == 1
+        parts = calls[0]["messages"][0]["content"]
+        assert [part["type"] for part in parts] == ["text", "image_url"]
+        url = parts[1]["image_url"]["url"]
+        assert url.startswith("data:image/png;base64,")
+        assert base64.b64decode(url.split(",", 1)[1]) == VISION_PROBE_IMAGE
+        assert calls[0]["chat_template_kwargs"] == {"enable_thinking": False}
+
+    async def test_text_only_server_is_cached_as_blind(self):
+        calls = []
+
+        def handler(request):
+            calls.append(1)
+            return httpx.Response(
+                400, json={"error": "At most 0 image(s) may be provided"}
+            )
+
+        client = make_client(handler, vision="auto")
+        assert await client.supports_images() is False
+        assert await client.supports_images() is False
+        assert len(calls) == 1
+
+    async def test_a_server_that_drops_the_image_is_blind(self):
+        # Accepted the request, answered from the text alone.
+        def handler(request):
+            return httpx.Response(200, json=completion_body(content="Blue"))
+
+        client = make_client(handler, vision="auto")
+        assert await client.supports_images() is False
+
+    async def test_no_response_is_not_cached(self):
+        replies = iter([httpx.ConnectError("tunnel down"), None])
+
+        def handler(request):
+            reply = next(replies)
+            if reply is not None:
+                raise reply
+            return httpx.Response(200, json=completion_body(content="red"))
+
+        client = make_client(handler, vision="auto")
+        assert await client.supports_images() is False
+        assert await client.supports_images() is True
+
+    @pytest.mark.parametrize("setting, expected", [("on", True), ("off", False)])
+    async def test_setting_skips_probe(self, setting, expected):
+        def handler(request):
+            raise AssertionError("no request expected")
+
+        client = make_client(handler, vision=setting)
+        assert await client.supports_images() is expected
+
+
+def test_image_part_is_a_data_url():
+    part = image_part(b"\xff\xd8jpeg", "image/jpeg")
+    assert part == {
+        "type": "image_url",
+        "image_url": {
+            "url": "data:image/jpeg;base64," + base64.b64encode(b"\xff\xd8jpeg").decode()
+        },
+    }
+
+
+def test_wire_messages_passes_content_parts_through():
+    parts = [{"type": "text", "text": "look"}, image_part(b"png")]
+    assert wire_messages([{"role": "user", "content": parts}]) == [
+        {"role": "user", "content": parts}
+    ]
+
+
 TOOL_SPEC = {
     "type": "function",
     "function": {
@@ -497,6 +580,11 @@ class TestLiveBackend:
 
     async def test_constrained_decoding_supported(self, live_client):
         assert await live_client.supports_constrained_decoding() is True
+
+    async def test_sees_images(self, live_client):
+        # The cluster job runs with vision on (llm.a40-l40.sh, VISION). A
+        # backend started with --language-model-only fails this, correctly.
+        assert await live_client.supports_images() is True
 
     async def test_json_schema_output_validates(self, live_client):
         schema = {

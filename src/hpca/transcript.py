@@ -311,6 +311,14 @@ def call_target(arguments: dict) -> str:
         value = (arguments or {}).get(key)
         if isinstance(value, str) and value.strip():
             return value.strip().rstrip("/").rsplit("/", 1)[-1]
+    # A call about several files (inspect_image): the first, and how many more.
+    paths = [
+        v.strip().rstrip("/").rsplit("/", 1)[-1]
+        for v in (arguments or {}).get("paths") or []
+        if isinstance(v, str) and v.strip()
+    ]
+    if paths:
+        return paths[0] + (f" +{len(paths) - 1}" if len(paths) > 1 else "")
     return ""
 
 

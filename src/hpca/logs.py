@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from hpca.config import Settings, app_dir
-from hpca.llm import Message
+from hpca.llm import Message, content_text
 from hpca.sessions import Session
 
 LOG_DIR_NAME = "chatlogs"
@@ -73,8 +73,11 @@ class SessionLog:
 
 
 def render_messages(messages: list[Message]) -> str:
+    # content_text, not the raw content: a vision sub-agent's message carries
+    # its images as base64 data URLs, megabytes per call into this file.
     return "\n".join(
-        f"{message['role']}: {message['content']}" for message in messages
+        f"{message['role']}: {content_text(message['content'])}"
+        for message in messages
     )
 
 
