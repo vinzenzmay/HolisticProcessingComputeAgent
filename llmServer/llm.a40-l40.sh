@@ -7,19 +7,24 @@
 #SBATCH --time=5-0
 #SBATCH --partition=gpu
 #
-# Qwen3.8-27B-FP8 on A40 or L40 (48GB), mainline vLLM. LLM on port 20001, with
-# the embedding sidecar riding along on 20000.
+# Qwen3.8-27B-INT4 (RedHatAI, 4-bit weights) on A40 or L40 (48GB), mainline
+# vLLM, vision on. LLM on port 20001, with the embedding sidecar riding along
+# on 20000.
 #
 #   sbatch llm.a40-l40.sh                     # 2x L40, TP=2 (the default)
 #   sbatch --gres=gpu:a40:2 llm.a40-l40.sh    # 2x A40, TP=2
-#   sbatch --gres=gpu:l40:1 llm.a40-l40.sh    # 1 card, smaller window
+#   sbatch --gres=gpu:l40:1 llm.a40-l40.sh    # 1 card, 163840 window
 #   PARALLEL_MODE=dp sbatch llm.a40-l40.sh    # 2 replicas instead of TP
 #
-# TWO CARDS ARE LOAD-BEARING, not just faster: TP=2 shards the ~27.5 GiB of
-# weights to ~13.75/card AND the 4 KV heads 2/2, and only that combination
-# leaves room for the full 262144 window. One card serves 112000 instead — THE
-# CONTEXT WINDOW FOLLOWS THE ALLOCATION, resolved from $TP and printed at
-# startup. Expect ~27 tok/s bare, ~47 with MTP, on two cards.
+# 4-BIT IS THE DEFAULT SINCE 2026-10-23, and that changed what one card is
+# worth. At 8-bit, TP=2 was load-bearing: only sharding ~27.5 GiB of weights
+# AND the 4 KV heads left room for the full window, and one card served
+# 112000. At 4-bit one card has been run at 163840 with vision on (the
+# 2026-10-23 job, `--gres=gpu:l40:1`); two cards serve the full 262144. THE
+# CONTEXT WINDOW STILL FOLLOWS THE ALLOCATION, resolved from $TP and printed at
+# startup. The speed and sizing figures in this file were MEASURED AT 8-BIT and
+# are kept as that; 4-bit reads roughly half the weight bytes per token, so
+# expect faster, and replace them once a 4-bit run has been measured.
 #
 # The served name is advertised at /v1/models and every client selects the model
 # by it: SETUP.md, HPCA's model picker and any VS Code custom-model entry must
@@ -51,8 +56,9 @@
 #
 # So turboquant_4bit_nc is broken on this hybrid architecture (16 full-attention
 # layers of 64, head_dim 256), not merely lossy. Worth reporting upstream.
-# The WEIGHTS were never implicated — 8-bit is here because it is the known-good
-# configuration, not because 4-bit was proven bad. FALLBACK 1 is the way back.
+# The WEIGHTS were never implicated, which is why 4-bit weights could come back
+# as the default — with the KV cache kept at fp8. FALLBACK 1 is the way back to
+# 8-bit, the configuration known-good before that.
 #
 # ---- DECODE SPEED ------------------------------------------------------------
 # Decode at batch 1 reads the whole model once per token, so it is pure memory
@@ -71,8 +77,8 @@
 # TP=2 keeps ~1.6x of the theoretical 2x over PCIe (L40 has no NVLink — Ada
 # removed it), ~1.9x over an A40 bridge. The job measures and prints which.
 #
-# Levers: TP (~1.6x) and MTP (~1.76x) are both taken. 4-bit weights would add
-# ~1.5x — FALLBACK 1. A quantised KV cache is NOT a lever; it is what broke the
+# Levers: TP (~1.6x), MTP (~1.76x) and 4-bit weights (~1.5x predicted from
+# the bytes, unmeasured) are all taken. A quantised KV cache is NOT a lever; it is what broke the
 # endpoint. FlashAttention is unavailable at any --kv-cache-dtype (head_dim 256
 # is past the bundled kernels), so do not pass --attention-backend: vLLM picks
 # FLASHINFER on its own and is right to.
@@ -81,23 +87,25 @@
 # script dir from the submit dir instead ($0 fallback for direct runs).
 SCRIPT_DIR="${SLURM_SUBMIT_DIR:-$(dirname "$(readlink -f "$0")")}"
 
-# WHERE THE WEIGHTS LIVE. Default: ./weights beside this script. That is 30 GB,
-# so on a cluster whose $HOME has a quota, point it at work/scratch instead —
+# WHERE THE WEIGHTS LIVE. Default: ./weights beside this script. That is tens
+# of GB, so on a cluster whose $HOME has a quota, point it at work/scratch instead —
 # export HF_HOME (or HPCA_WEIGHTS_DIR) before sbatch, or edit the default here.
 # It must be the SAME directory the download used, or the job silently starts a
-# second 30 GB download from the compute node.
+# second full download from the compute node.
 export HF_HOME="${HF_HOME:-${HPCA_WEIGHTS_DIR:-$SCRIPT_DIR/weights}}"
 
 # Download once, on a node with network and >=16GB RAM:
-#   HF_HOME=$PWD/weights ./venv/bin/hf download Qwen/Qwen3.8-27B-FP8
-# ~30.4 GB plus a separate 0.48 GB mtp.safetensors head, which IS read here
-# because NUM_SPEC_TOKENS is non-zero.
-MODEL="Qwen/Qwen3.8-27B-FP8"
-SERVED_NAME="Qwen3.8-27B-FP8"
+#   HF_HOME=$PWD/weights ./venv/bin/hf download RedHatAI/Qwen3.8-27B-INT4
+# The MTP head comes with it and IS read here, because NUM_SPEC_TOKENS is
+# non-zero (the 2026-10-23 job started with MTP on, so the head is there).
+MODEL="RedHatAI/Qwen3.8-27B-INT4"
+SERVED_NAME="Qwen3.8-27B-INT4"
 
 # ---- CONTEXT WINDOW: FOLLOWS THE ALLOCATION ----------------------------------
-# The two allocations differ by 5.24x in capacity, not 2x, so no single value is
-# defensible across both. Worst-case concurrent users at MAX_NUM_SEQS=6:
+# THE TABLE BELOW IS THE 8-BIT ONE. At 4-bit every column has more room; only
+# 163840 on one card has been run (2026-10-23). The two allocations differed by
+# 5.24x in capacity at 8-bit, not 2x, so no single value was defensible across
+# both. Worst-case concurrent users at MAX_NUM_SEQS=6:
 #
 #     MAX_MODEL_LEN     1 card    2 cards
 #        112000           2.25      11.4
@@ -121,7 +129,7 @@ SERVED_NAME="Qwen3.8-27B-FP8"
 # static 163840 in both slots: too-high in VS Code is a 400 at the worst
 # possible moment, whereas too-low only silently caps.
 MAX_MODEL_LEN_TP2=262144    # full native window,        ~5.1 users on two cards
-MAX_MODEL_LEN_TP1=112000    # the 8-bit revision's value, ~2.25 on one card
+MAX_MODEL_LEN_TP1=163840    # run at 4-bit with vision, 2026-10-23 (8-bit: 112000)
 
 # Costs 144 MiB of pool per slot whether occupied or not — the 48
 # linear-attention layers preallocate recurrent state per sequence, so this is
@@ -135,19 +143,19 @@ MAX_MODEL_LEN_TP1=112000    # the 8-bit revision's value, ~2.25 on one card
 # past ~8 concurrent decodes the ~1.76x shrinks noticeably.
 MAX_NUM_SEQS=6
 
-# 8-bit weights, 8-bit KV: ~33.4 kB/token, half of fp16, which is what makes the
-# full window fit on two cards. DO NOT swap this for a quantised-KV option
+# 8-bit KV: ~33.4 kB/token, half of fp16 — independent of the weights' bit
+# width, and what made the full window fit on two cards at 8-bit. DO NOT swap this for a quantised-KV option
 # without reading THE 4-BIT REVERT — turboquant_4bit_nc loaded clean, logged
 # nothing, and served garbage for a day. fp8 keeps FLASHINFER, which is the
 # backend the working configuration used.
 KV_CACHE_DTYPE=fp8
 
-# MTP speculative decoding, and the reason the 8-bit roofline is survivable.
+# MTP speculative decoding, and the reason the 8-bit roofline was survivable.
 # The checkpoint's own mtp.safetensors drafts NUM_SPEC_TOKENS tokens per step
 # and the 27B model verifies the block in ONE pass over its weights. Rejection
 # sampling makes it exactly lossless — only speed is ever at risk. Worth ~1.76x
-# MEASURED ON THIS BUILD (17 -> 30 tok/s on one card), not carried over from the
-# 4-bit job. 3 is Qwen's recommendation; higher adds progressively worse guesses
+# MEASURED ON THE 8-BIT BUILD (17 -> 30 tok/s on one card); not yet re-measured
+# at 4-bit. 3 is Qwen's recommendation; higher adds progressively worse guesses
 # at the cost of a real forward pass each step.
 #
 # Costs ~0.5 GiB of draft weights plus a 17th cached layer (the draft layer is
@@ -167,7 +175,7 @@ source "$VENV_DIR/bin/activate"
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
 if [[ "$GPU_NAME" == *V100* || -z "$GPU_NAME" ]]; then
     echo "ERROR: got '${GPU_NAME:-none}'. This script needs an A40 or L40." >&2
-    echo "       V100 cannot run an 8-bit build; llm.sh serves 4-bit AWQ." >&2
+    echo "       V100 (sm_70) has no Marlin kernels for these weights." >&2
     exit 1
 fi
 echo "GPU: $GPU_NAME"
@@ -314,8 +322,14 @@ source "$SCRIPT_DIR/write_manifest.sh" llm "$SERVED_NAME" "$PORT" true "$MAX_MOD
 # than the 1.8 GiB an older, rosier profile suggested; prefer the pessimistic.
 #
 # Weights ~27.5 GiB resident (30.4 GB on disk, minus the ~0.9 GB vision tower
-# --language-model-only never loads, plus ~0.5 GiB of MTP). fp8 with MTP loaded
-# costs ~34,800 B/token.
+# --language-model-only never loaded, plus ~0.5 GiB of MTP). fp8 with MTP loaded
+# costs ~34,800 B/token. THE FIGURES BELOW PREDATE VISION (see VISION): the
+# tower now loads, ~0.84 GiB more on one card (~26k KV tokens), half that per
+# card on two, plus whatever the encoder's profiling pass adds to peak
+# activation — unmeasured until the first vision run's log.
+#
+# ALL OF THIS IS THE 8-BIT SIZING (27.5 GiB of weights); 4-bit weights free
+# roughly half of that. Redo it from "Actual usage ... for weight" in a 4-bit log.
 #
 #   ONE CARD   39.95 - 27.5 - 3.97 - 0.84 slots = ~7.6 GiB  = ~236k tokens
 #              112000 -> 2.1 users;  262144 does not fit, vLLM refuses to start
@@ -334,12 +348,44 @@ if [[ "$NUM_SPEC_TOKENS" -gt 0 ]]; then
     echo "MTP speculative decoding: $NUM_SPEC_TOKENS draft tokens"
 fi
 
+# ---- VISION ------------------------------------------------------------------
+# The checkpoint is Qwen3_5ForConditionalGeneration: one set of weights with a
+# ~0.9 GB vision tower, which this job used to switch off with
+# --language-model-only. HPCA's inspect_image sub-loop needs it on.
+#
+# MM_LIMIT caps what one request may carry. 4 images is what inspect_image
+# sends at most (four paths per call); video stays 0 because nothing sends it,
+# and a non-zero limit makes vLLM profile and reserve for a worst-case video.
+#
+# MM_MAX_PIXELS bounds one image's cost, and is the lever on the one-card
+# margin. Image tokens scale with pixels (about one per 32x32 block on this
+# encoder family), and vLLM sizes its encoder profiling pass — real peak
+# activation memory, taken from the KV pool — for the LARGEST image the
+# processor would accept. The processor's own ceiling is ~16 MP (~16k tokens);
+# 1536x1536 (~2.4 MP, ~2.3k tokens) is plenty to read a plot, and HPCA scales
+# images down to that before sending anyway. The cap here protects the box from
+# every other client (VS Code with vision on) as well.
+#
+# CHECK AT STARTUP: if the log warns that `max_pixels` was dropped as an
+# unknown processor kwarg, the processor wants
+#   MM_PROCESSOR_KWARGS='{"size": {"longest_edge": 2359296, "shortest_edge": 3136}}'
+# instead (both spellings mean total pixels). Then read "GPU KV cache size":
+# against the last language-only run it shows what vision really cost.
+MM_LIMIT='{"image": 4, "video": 0}'
+MM_MAX_PIXELS=$((1536 * 1536))
+if [[ -z "${MM_PROCESSOR_KWARGS:-}" ]]; then
+    MM_PROCESSOR_KWARGS="{\"max_pixels\": $MM_MAX_PIXELS}"
+fi
+echo "Vision: limit $MM_LIMIT, processor kwargs $MM_PROCESSOR_KWARGS"
+
 python -m vllm.entrypoints.openai.api_server \
    --model "$MODEL" \
    --served-model-name "$SERVED_NAME" \
    --trust-remote-code \
    --host 0.0.0.0 --port $PORT \
-   --language-model-only \
+   --limit-mm-per-prompt "$MM_LIMIT" \
+   --mm-processor-kwargs "$MM_PROCESSOR_KWARGS" \
+   --mm-encoder-tp-mode data \
    --data-parallel-size $DP \
    --tensor-parallel-size $TP \
    --gpu-memory-utilization $GPU_UTIL \
@@ -355,14 +401,12 @@ python -m vllm.entrypoints.openai.api_server \
    --reasoning-parser qwen3
 
 # ---- TUNING / FALLBACKS ------------------------------------------------------
-# 1) WANTING THE 4-BIT TOK/S BACK (~1.5x). Legitimate: THE 4-BIT REVERT shows
-#    the 4-bit WEIGHTS were never implicated, only turboquant_4bit_nc.
-#      MODEL="cyankiwi/Qwen3.8-27B-AWQ-INT4"
-#      SERVED_NAME="Qwen3.8-27B-AWQ"
-#      KV_CACHE_DTYPE=fp8              # NOT turboquant_*
-#    ~8.7 GiB of weights come back, taking the single-card path from ~236k to
-#    ~490k tokens, so both MAX_MODEL_LEN_* can collapse to one 262144 constant.
-#    VERIFY WITH THE TEACHER-FORCING TEST FIRST — eyeballing a short reply will
+# 1) BACK TO 8-BIT (the known-good configuration before 2026-10-23):
+#      MODEL="Qwen/Qwen3.8-27B-FP8"
+#      SERVED_NAME="Qwen3.8-27B-FP8"
+#      MAX_MODEL_LEN_TP1=112000        # one card cannot hold more at 8-bit
+#    The served name changes, so every client's model id changes with it.
+#    Whichever way you switch, VERIFY WITH THE TEACHER-FORCING TEST FIRST — eyeballing a short reply will
 #    not catch this class of bug, since the first ~8 tokens looked perfect
 #    throughout the incident. /v1/completions, "Count from one to twenty in
 #    words:", 40 tokens, temperature 0. Correct output counts; broken repeats.
@@ -397,9 +441,15 @@ python -m vllm.entrypoints.openai.api_server \
 # 9) Landed on 2 GPUs but only one used: check "GPUs allocated". It counts
 #    `nvidia-smi -L`, which respects CUDA_VISIBLE_DEVICES, so a 1 there means
 #    SLURM gave you one card regardless of what --gres asked for.
-# 10) `--language-model-only` rejected: the portable equivalent keeps the
-#    ~0.9 GB vision tower loaded but refuses images —
-#      --limit-mm-per-prompt '{"image": 0, "video": 0}'
+# 10) VISION COSTS TOO MUCH (OOM at startup on one card, or a window that no
+#    longer fits): first lower MM_MAX_PIXELS — 1024x1024 roughly halves the
+#    encoder's profiling peak. (`--mm-encoder-tp-mode data` replicates the
+#    small encoder on each card instead of sharding it: faster at TP=2, a
+#    no-op at TP=1, accepted by this model on 2026-10-23.) To go back to
+#    text only, replace the three --*mm* lines with `--language-model-only`
+#    (frees the tower), or with --limit-mm-per-prompt '{"image": 0, "video":
+#    0}' where that flag is rejected. HPCA notices either way: its vision
+#    probe gets a 400 and inspect_image says the backend cannot see.
 # 11) MTP MISBEHAVING. NUM_SPEC_TOKENS=0 removes it; nothing else depends on it.
 #    a) Startup fails on the speculative config — verify rather than upgrade:
 #         ./venv/bin/python -c "from vllm.model_executor.models.registry import \

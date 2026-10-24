@@ -2,7 +2,7 @@
 
 HPCA has no model of its own: it is a client for an OpenAI-compatible endpoint.
 This directory is the server side of that — a Slurm job that runs **vLLM** on a
-GPU node of your cluster, serving **Qwen3.8-27B-FP8** on port 20001, with a
+GPU node of your cluster, serving **Qwen3.8-27B-INT4** (vision on) on port 20001, with a
 small embedding model (**BAAI/bge-m3**) on port 20000 for HPCA's document search.
 
 This guide assumes no prior knowledge of vLLM or Slurm. It takes about an hour,
@@ -10,13 +10,13 @@ most of it downloading.
 
 | | |
 |---|---|
-| model | `Qwen3.8-27B-FP8` (27B parameters, 8-bit weights) |
+| model | `Qwen3.8-27B-INT4` (27B parameters, 4-bit weights, reads images) |
 | hardware | **2× L40** (48 GB each); 2× A40 also works, 1 card works with a smaller window |
-| context window | **262 144 tokens** on two cards, 112 000 on one |
-| speed | ~47 tokens/s on 2× L40, ~27 without speculative decoding |
+| context window | **262 144 tokens** on two cards, 163 840 on one |
+| speed | ~47 tokens/s on 2× L40 measured with the 8-bit weights; 4-bit is faster, not yet re-measured |
 | concurrent users | 6 (`MAX_NUM_SEQS`); ~5 can hold a *full* 262k window at once |
 | ports | **20001** chat/completions (API key required), **20000** embeddings (open) |
-| disk | ~15 GB runtime + ~32.6 GB weights (LLM 30.4, embedder 2.2) |
+| disk | ~15 GB runtime + the LLM weights (4-bit, roughly half the 30.4 GB of the 8-bit build) + 2.2 GB embedder |
 
 ---
 
@@ -46,7 +46,7 @@ If you know your cluster, this is the whole thing:
 ```bash
 cd llmServer
 ./setup_venv.sh                                                   # ~15 GB of runtime
-HF_HOME=$PWD/weights ./venv/bin/hf download Qwen/Qwen3.8-27B-FP8  # ~30 GB, needs 16 GB RAM
+HF_HOME=$PWD/weights ./venv/bin/hf download RedHatAI/Qwen3.8-27B-INT4  # needs 16 GB RAM
 HF_HOME=$PWD/weights ./venv/bin/hf download BAAI/bge-m3 \
     --include "*.json" "pytorch_model.bin" "sentencepiece.bpe.model" "1_Pooling/*"  # ~2.2 GB
 head -c 32 /dev/urandom | base64 > ~/.vllm_api_key && chmod 600 ~/.vllm_api_key
@@ -91,10 +91,11 @@ the script warns you if it sees one of your jobs running.
 ## 2. Download the weights
 
 ```bash
-HF_HOME=$PWD/weights ./venv/bin/hf download Qwen/Qwen3.8-27B-FP8
+HF_HOME=$PWD/weights ./venv/bin/hf download RedHatAI/Qwen3.8-27B-INT4
 ```
 
-~30.4 GB, plus a separate 0.48 GB `mtp.safetensors` head that **is** used here
+Roughly half the 30.4 GB of the 8-bit build, including the MTP head that **is**
+used here
 (it is what makes speculative decoding work — see
 [Why it is fast](#why-it-is-fast)).
 
@@ -108,7 +109,7 @@ srun -p standard --mem=32G --time=4:00:00 --pty bash
 ```
 
 It resumes if interrupted. If your `huggingface_hub` is older and has no `hf`
-command, `./venv/bin/huggingface-cli download Qwen/Qwen3.8-27B-FP8` does the
+command, `./venv/bin/huggingface-cli download RedHatAI/Qwen3.8-27B-INT4` does the
 same.
 
 Then the embedding model, ~2.2 GB:
@@ -179,7 +180,7 @@ From inside this directory (the script resolves its own paths from
 ```bash
 sbatch llm.a40-l40.sh                     # 2× L40, tensor-parallel — the default
 sbatch --gres=gpu:a40:2 llm.a40-l40.sh    # 2× A40, same thing
-sbatch --gres=gpu:l40:1 llm.a40-l40.sh    # 1 card: ~30 tok/s, 112k window, shorter queue
+sbatch --gres=gpu:l40:1 llm.a40-l40.sh    # 1 card: 163k window, shorter queue
 ```
 
 Output goes to `vllm.a40-l40.out` in this directory, and the embedding
@@ -194,10 +195,11 @@ Application startup complete.
 
 To stop it: `scancel <jobid>`. The sidecar dies with the job.
 
-**Two cards is not merely faster, it is what makes the full context window
-fit.** Tensor parallelism splits the ~27.5 GiB of weights *and* the 4 KV heads
-across both cards; only that combination leaves room for 262 144 tokens. One
-card serves 112 000 instead. The script resolves this at startup and prints it
+**Two cards buy the full context window.** Tensor parallelism splits the
+weights *and* the 4 KV heads across both cards, which leaves room for 262 144
+tokens. One card serves 163 840 — with the 4-bit weights that is a real
+working setup, not only a fallback (with the old 8-bit weights it was 112 000).
+The script resolves this at startup and prints it
 — there is nothing to edit either way, and HPCA reads the resolved value from
 the discovery manifest.
 
@@ -213,7 +215,7 @@ grep -E "GPUs allocated|Context window|Interconnect|Maximum concurrency" vllm.a4
   actually gave you (`nvidia-smi -L`), not what `--gres` asked for. A `1` here
   accounts for the entire gap between ~27 and ~47 tok/s.
 * **`Context window: 262144 (TP=2)`** — what the server resolved and what the
-  manifest advertises. `112000 (TP=1)` means you landed on one card.
+  manifest advertises. `163840 (TP=1)` means you landed on one card.
 * **`Interconnect: no active NVLink -> PCIe`** — expected on L40 (Ada has no
   NVLink at all) and already priced into the ~47 tok/s. On an **A40** pair it
   means the NVLink bridge is not fitted, which is worth asking your admins
@@ -227,7 +229,7 @@ Then ask the server what it is serving. The node name is in `squeue -u $USER`:
 curl -H "Authorization: Bearer $(cat ~/.vllm_api_key)" http://<gpu-node>:20001/v1/models
 ```
 
-The `id` it returns is `Qwen3.8-27B-FP8`, and **every client selects the model
+The `id` it returns is `Qwen3.8-27B-INT4`, and **every client selects the model
 by exactly that string**.
 
 ---
@@ -293,7 +295,7 @@ curl -H "Authorization: Bearer $(cat ~/.vllm_api_key)" http://localhost:20001/v1
 {
   "llm": {
     "base_url": "http://localhost:20001/v1",
-    "model": "Qwen3.8-27B-FP8",
+    "model": "Qwen3.8-27B-INT4",
     "api_key": "<contents of ~/.vllm_api_key>"
   },
   "rag": { "embedding_base_url": "http://localhost:20000/v1" }
@@ -320,11 +322,11 @@ The same endpoint serves Copilot's custom-model feature. Command Palette →
     "apiType": "chat-completions",
     "models": [
         {
-            "id": "Qwen3.8-27B-FP8",
-            "name": "Qwen3.8-27B-FP8",
+            "id": "Qwen3.8-27B-INT4",
+            "name": "Qwen3.8-27B-INT4",
             "url": "http://localhost:20001/v1/chat/completions",
             "toolCalling": true,
-            "vision": false,
+            "vision": true,
             "maxInputTokens": 262144,
             "maxOutputTokens": 32000
         }
@@ -333,14 +335,17 @@ The same endpoint serves Copilot's custom-model feature. Command Palette →
 ```
 
 Reload the window afterwards. `maxInputTokens` here is **static and set for the
-two-card job**: on a one-card run the server serves 112 000 while VS Code still
+two-card job**: on a one-card run the server serves 163 840 while VS Code still
 believes 262 144, and an over-long request gets a 400 at the worst possible
-moment. If you run one card regularly, set it to 112000 (too low only silently
+moment. If you run one card regularly, set it to 163840 (too low only silently
 caps, which is the safer failure). HPCA is immune — it reads the resolved value
 from the manifest.
 
-`vision: false` is correct: the job loads the language model only and refuses
-images.
+`vision: true` is correct: the job loads the vision tower and accepts up to 4
+images per request, each scaled down to at most ~2.4 MP by the server
+(`MM_LIMIT` / `MM_MAX_PIXELS` in `llm.a40-l40.sh`). A job started from an older
+copy of the script, with `--language-model-only`, refuses images — set it back
+to `false` for that one.
 
 ---
 
@@ -446,14 +451,14 @@ name does not match the server's `id`.
 | what | default | how to move it |
 |---|---|---|
 | runtime | `llmServer/venv` (~15 GB) | move the whole directory |
-| weights | `llmServer/weights` (~32.6 GB) | `export HF_HOME=/work/.../weights` (or `HPCA_WEIGHTS_DIR`) before both the download **and** `sbatch` |
+| weights | `llmServer/weights` (tens of GB) | `export HF_HOME=/work/.../weights` (or `HPCA_WEIGHTS_DIR`) before both the download **and** `sbatch` |
 | API key | `~/.vllm_api_key` | `API_KEY_FILE` in `llm.a40-l40.sh` |
 | job log | `llmServer/vllm.a40-l40.out` | `#SBATCH --output=` |
 | manifests | the shared endpoints dir | `HPCA_ENDPOINTS_DIR` |
 
-The weights are the one to think about: 30 GB in `$HOME` fails on many clusters,
-and the download and the job must agree on the location or the job silently
-starts a second 30 GB download from the compute node. Set `HF_HOME` in both
+The weights are the one to think about: tens of GB in `$HOME` fails on many
+clusters, and the download and the job must agree on the location or the job
+silently starts a second full download from the compute node. Set `HF_HOME` in both
 places, or edit the default in `llm.a40-l40.sh` once.
 
 ---
@@ -464,7 +469,9 @@ Decoding one token at batch size 1 reads the entire model out of GPU memory, so
 tokens/second is pure memory bandwidth — not compute. Three things buy speed
 here, and the script's comments explain each in full:
 
-* **8-bit (FP8) weights** — ~27.5 GiB read per token instead of ~55.
+* **4-bit weights** — roughly a quarter of the ~55 GiB a 16-bit model reads per
+  token (the 8-bit build read ~27.5). The speed figures here were measured on
+  the 8-bit build; 4-bit should beat them.
 * **Tensor parallelism over two cards** — each card reads half, ~1.6× on L40
   (PCIe), ~1.9× with an A40 NVLink bridge.
 * **MTP speculative decoding** (~1.76×) — the checkpoint's own small draft head
@@ -489,8 +496,8 @@ forever. The full evidence is in the `THE 4-BIT REVERT` block at the top of
 
 **Job sits pending forever** — the two-card default on a busy partition.
 `squeue -u $USER --start` estimates when it will run;
-`sbatch --gres=gpu:l40:1 llm.a40-l40.sh` trades the big window and a third of
-the speed for a slot. Also check `./draining_gpu_nodes.sh`: a draining node never
+`sbatch --gres=gpu:l40:1 llm.a40-l40.sh` trades the full window (163 840
+instead of 262 144) and some speed for a slot. Also check `./draining_gpu_nodes.sh`: a draining node never
 starts new jobs. If it is *rejected* rather than pending, `--gres`/`--partition`
 do not match your cluster — see [step 4](#4-adapt-it-to-your-cluster).
 
@@ -499,20 +506,20 @@ the job looked, usually because you submitted from another directory. The script
 
 **`ERROR: API key file missing or empty`** — [step 3](#3-make-an-api-key).
 
-**`ERROR: got 'Tesla V100...'. This script needs an A40 or L40.`** — 8-bit needs
-Marlin kernels, which need compute capability 8.0+. A V100 (7.0) cannot run this
+**`ERROR: got 'Tesla V100...'. This script needs an A40 or L40.`** — the
+quantised weights need Marlin kernels, which need compute capability 8.0+. A V100 (7.0) cannot run this
 model; that path needs a patched vLLM fork in a container and is out of scope
 here.
 
 **Model or `qwen3_5` architecture rejected** — the venv is too old:
 `./setup_venv.sh --upgrade` (vLLM ≥ 0.26.0 registers it).
 
-**A second 30 GB download starts on the GPU node** — `HF_HOME` at submit time
+**A second weights download starts on the GPU node** — `HF_HOME` at submit time
 differs from the one used for the download. See
 [Where things get written](#where-things-get-written).
 
-**Only ~30 tok/s when expecting ~47** — you got one card. Check the
-`GPUs allocated` line; `Context window: 112000 (TP=1)` confirms it.
+**Slower than expected** — you may have got one card. Check the
+`GPUs allocated` line; `Context window: 163840 (TP=1)` confirms it.
 
 **OOM, or "No available memory for the cache blocks"** — lower `MAX_NUM_SEQS`
 (each slot costs 144 MiB whether used or not) before touching the window. If it
@@ -525,7 +532,7 @@ reliable check is teacher forcing: same prompt at temperature 0, one-shot versus
 one-token-per-request. See `THE 4-BIT REVERT`.
 
 **400 on a long request** — the client is configured for the two-card window but
-the job resolved to 112 000 on one card.
+the job resolved to 163 840 on one card.
 
 **401** — the request needs `Authorization: Bearer <~/.vllm_api_key>`.
 
@@ -553,7 +560,7 @@ trying, each with the evidence behind it.
 
 | file | what it is |
 |---|---|
-| `llm.a40-l40.sh` | the Slurm job: vLLM serving Qwen3.8-27B-FP8 on 20001. Every non-obvious number in it is explained in place — read it before changing one |
+| `llm.a40-l40.sh` | the Slurm job: vLLM serving Qwen3.8-27B-INT4 (vision on) on 20001. Every non-obvious number in it is explained in place — read it before changing one |
 | `setup_venv.sh` | one-time: creates `./venv` with mainline vLLM. `--upgrade` bumps it |
 | `embed.sh` | the embedding sidecar on 20000 (BAAI/bge-m3), started by the job before the LLM |
 | `write_manifest.sh` | sourced by both, drops the JSON discovery manifest HPCA reads |
